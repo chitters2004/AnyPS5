@@ -19,7 +19,9 @@ Commits, oldest first:
 9. `0beed21ce` feat(agc): read pending leases' written-page tables in the label store GPU compare
 10. `fe1a7b9e9` docs: report update
 11. `8a7ab13ae` feat(agc): split the label store fallback refusals by cause in shadow mode
-12. this report update
+12. `67a758ec0` docs: report update
+13. `98a77161f` fix(agc): keep GPU-compared label stores exact against completion-time stamps
+14. this report update
 
 Line references below are at commit 7 unless noted; search by function name if they moved. Paths are under `core/libs/prx/libSceAgcDriver/`.
 
@@ -257,10 +259,63 @@ and it still falls back when a fault table overflows. Do the cheap part when the
 histogram shows `fallback-block` costing frame time; consider the full tracker only if non-label
 flush waits dominate after this.
 
+## Independent review and fixes (commit 13)
+
+A separate agent reviewed the whole diff without my notes. It confirmed the push-constant layout,
+staging layout, flag words, lease key and mask, table bounds, barriers, usage flags, lifetimes and
+the in-flight and shared-table refusals, and found four issues. I verified each in the code:
+
+1. Compared memory: a write-back starting before the store's batch completed (eviction,
+   `WriteBack`) reset the completion's ticket, the completion cancelled the stored save, and the
+   next write-back failed `Require(!unsavedOutsideWatch)`. Fixed: the save is applied whenever the
+   GPU stored every range; `applyStoredSave`'s own ticket drops it after a later store.
+2. The completion settled at the generation collected when recorded, but leases and non-reusable
+   writers of the same batch stamp at completion, after it; the waited path settled after them, so
+   a later label store kept a block it used to store. Fixed: settle only if nothing in the range
+   was stamped after that generation (completions run in push order, so same-batch stamps land
+   first). Such images now stay stale and re-upload, where the waited path did not (cost only).
+3. The store's own stamps make the image look changed until completion, so a use in that window
+   re-uploads it. Content is correct (the upload is GPU-ordered); cost only. Documented in the
+   debt file, not changed.
+4. A non-reusable resource whose completion runs `WriteBackBuffers` re-stamps its direct writes
+   (`GuestBufferMemory::WriteBack` → `StampKeepingNewerResults` → `MarkPossiblyWritten`), and is
+   listed as a copied writer only with copied writes (`VulkanDevice.cpp:5439`). The rule assumed
+   explicit writers stamp only when recorded. Fixed: `ShaderResources::MarkGpuWrites` notes such
+   writes as late stamps; a watched label store over one waits (`late-stamping-writer`). Not
+   covered by a dedicated test.
+
+## Guard and differential tests (commit 13)
+
+- Differential sweep (`--label-gpu-compare`): 24 cases (linear or tiled image, prior GPU fill or
+  not, lease storing other bytes, the same bytes or outside the image, prior CPU store or not),
+  each run waiting and on the GPU in separate memory; bytes must be identical. All 24 match in both
+  watch modes; 21 of 24 took the GPU path on watched memory (the other 3 refuse `no-baseline`:
+  block-unit images after a fill), 24 of 24 on compared memory.
+- Ignoring later stamps at completion fails the baseline-bytes case on watched memory.
+- Settle and generation/ticket guards: the positive settle case and the upload-before-completion
+  case skip here, printing why. On watched lavapipe the GPU's own writes are collected as CPU
+  stores, so a completion can never settle; on compared memory the second use's CPU refresh syncs
+  the batch first. Removing either guard therefore changes nothing on this machine. Both tests are
+  written to run on a GPU whose import probe keeps imports watched; run them there.
+
+## Extensions: what the code says (no title needed)
+
+- Edge blocks: a lease's completion stamps go in as byte-range `possiblePieces`, checked exactly
+  by `storedOver`, but each 64 KiB block keeps 4 pieces (`GuestMemory.cpp:1071`); a fifth evicts
+  the oldest into `possibleDropped`, and the whole block then counts as stored. An exact edge
+  extension must reproduce that 4-slot eviction, including pieces left by earlier completions.
+  Not worth it unless `fallback-edge` dominates.
+- In-flight leases: dispatch resources are reusable (`VulkanDevice.cpp:5422`), so one fault table
+  can hold several pending uses, and each use's completion reads and clears it. Moving the clear
+  to the GPU would break today's stamping when a resource is reused. The safe design is a per-use
+  copy of the table (about 24 KiB of GPU copy on every BDA dispatch), a hot-path cost.
+
 ## Not verified
 
 - Any title; no frame-time number. Hardware GPUs; Windows.
-- Import lifetime at runtime; the completion guards against an intervening write-back or upload.
+- Import lifetime at runtime. The completion's generation and ticket guards and the positive settle
+  on watched memory (tests exist but skip on this machine, see above).
+- The late-stamping-writer refusal (no test builds a non-reusable direct writer).
 - Concurrent CPU stores during the window (same race class as today's decision after the wait),
   including the baseline-filled bytes a stored block-unit range rewrites.
 - `captureGuestBytes` reads unsynced (`Texture.cpp:2628`): an image that becomes pending again
@@ -289,13 +344,14 @@ flush waits dominate after this.
 ## Next steps, ranked
 
 1. Measure (above); the refusal histogram decides the rest.
-2. If `fallback-block` still costs time, extend lease tables to in-flight leases (pin a table
-   against its completion's clear until the compare's batch completes) and to edge blocks
-   (verify `StoredOver`'s granularity against the 4 KiB page bits).
-3. Block units above 64 KiB (gate the unit-shadow publish the same way) if `units` costs time.
-4. Device-side baseline and in-place scratch reads if `large` costs time.
-5. DCC images with a test if `keys` costs time.
-6. Rebase on #8887, #12070, #10382 and #13920 once they merge.
+2. Run the branch's tests on a GPU whose import probe keeps imports watched (the settle and guard
+   cases run there instead of skipping).
+3. If `fallback-lease-in-flight` costs time, per-use lease tables; if `fallback-edge` does, an
+   exact model of the 4-piece tracker (see "Extensions").
+4. Block units above 64 KiB (gate the unit-shadow publish the same way) if `units` costs time.
+5. Device-side baseline and in-place scratch reads if `large` costs time.
+6. DCC images with a test if `keys` costs time.
+7. Rebase on #8887, #12070, #10382 and #13920 once they merge.
 
 ## Rules for agents on this branch
 
