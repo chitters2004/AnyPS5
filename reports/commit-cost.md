@@ -62,6 +62,22 @@ Then:
 - Run the same commands on `upstream/main` and diff the VUID counts. `ctest` can report Passed while validation errors are logged.
 - The baseline on main `dc9dc7eaa` (23 tests) is 72 `VUID-VkDeviceCreateInfo-pNext-pNext`, 216 `VUID-vkCmdCopyImage-srcImage-01548` and 216 `VUID-vkCmdCopyImage-srcImage-01551`. Every head so far matches it exactly.
 
+**Full suite.** Configure with `-DANYPS5_AGC_EXECUTION_TESTS=` (empty builds all 564 execution tests; about 9 minutes on 4 cores, and each binary is about 75 KB), then run every `agc_` test:
+
+```bash
+ANYPS5_REQUIRE_VULKAN=1 ANYPS5_NO_SHADER_CACHE=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json ctest --test-dir build -R '^agc_' -E fuzz -V -j4 --timeout 900 > all.log 2>&1
+```
+
+It takes about 20 minutes. Compare results and VUID counts per test name, not per test number: head registers extra tests, which shifts the numbering.
+
+Results on main `dc9dc7eaa`: 1,151 tests, 1,074 passed, 75 skipped (lavapipe features), 2 failed. The two failures:
+- `agc_driver_guest_memory_lifetime_converted` needs `build/core/relinker/relinker`, which this configuration does not build.
+- `agc_driver_image_table` has a failure regex that rejects any VUID, and it gets the baseline `VUID-VkDeviceCreateInfo-pNext-pNext`.
+
+Head `89c31547d` gives identical results and identical per-test VUID counts, plus `agc_revalidate_split`, which passes. Watch for a false positive: a grep for "was not found but was requested" also matches ctest echoing a test's failure regex, so check the matching line.
+
+**Windows check.** With `g++-mingw-w64-x86-64-posix`, compile the changed sources with `-fsyntax-only`, using the Linux build's commands (`ninja -C build -t commands libSceAgcDriver`) with the compiler swapped and `-fPIC` and the dependency flags removed. Do the same for main from a `git worktree`, then diff. Ubuntu's MinGW lacks `PROCESSOR_RELATIONSHIP::EfficiencyClass` and `_fflush_nolock` (both errors also appear on main); nothing else differs.
+
 Extra cross-check: `APS5_VERIFY_SET_LAYOUTS=1` makes the pipelined draw path compare `DescribeSetLayouts` with the built layouts; it passes on head.
 
 Before pushing:
@@ -99,7 +115,7 @@ Paths are in `core/libs/prx/libSceAgcDriver/`.
 - **PrepareDrawBindings** (`ShaderResources.cpp`): builds per-draw descriptor bindings for a template hit whose buffers moved. Data words are uploaded to `Recorder::DrawUpload`. Read-only guest buffers read in place get per-draw snapshots, to protect against later CPU writes.
 - **copyRegion and snapshotCopy** (`Graphics/src/GuestBufferMemory.cpp`): a snapshot-backed region uploads a snapshot taken before the device lock. The snapshot copy cache (`Graphics/include/SnapshotCopies.hpp`) shares one buffer between identical snapshots.
 - **CopyDrawInput** (`Draw.cpp`): copies vertex and index bytes into a pooled Buffer that is bound exactly to size (BindExactBuffer). Exact size matters for robust vertex fetch bounds, so it was left alone.
-- **ShaderData** (`core/shader/recompiler/RuntimeAbi.hpp`): a fixed 16,064 bytes per stage. Only about 640 bytes of it (userData and bufferOffsets) normally change between draws; the rest is image and sampler metadata.
+- **ShaderData**: `RuntimeAbi::ShaderData` (`core/shader/recompiler/RuntimeAbi.hpp`) is the 16,064-byte maximum layout. A compiled program's data is compact: `IrBindingLayout::ShaderDataDwords()` counts the user-data registers it reads, the optional dispatch limit, 12 dwords per runtime image and its runtime state, and `program.shaderDataDwords` holds the result. Small data with no runtime images goes into push constants instead (`BindingAllocator.cpp`, `pushDataStartDword`). The worker builds it per draw in `ShaderDataDwordsFor` (`Optimization/src/DescriptorBindingBuilder.cpp`). Correction: the commit messages of `f8eedb639` and `d2b0314fb` describe 16 to 32 KiB per draw. That is the maximum, not the usual case; fix the wording when squashing for upstream.
 
 ## 6. Commits on the branch (base `dc9dc7eaa`)
 
@@ -115,8 +131,19 @@ Each code commit was timed alone and validated as in section 3.
 | `d2b0314fb` | `Recorder::DrawUploadChunk` goes from 1 MiB to 16 MiB | dynamicDrawDataTests: 200 full draws need at most one new ring set | Fewer chunk allocations and ring set writes; costs one live 16 MiB chunk per recorder |
 | `4ae6f4bc8` | Fixed-size offsets; the batch keeps the ring set and chunk once (`Recorder::KeptOnce`) | dynamicDrawDataTests use_count check | Removes per-draw keeps and two per-draw allocations |
 | `4df6d3109` | Profile-only `[revalidate-split]` and `[lookup-split]` lines (APS5_PROFILE_DRAW) | `agc_revalidate_split` (new ctest; does not compile without the change) | Measurement for the next step; no behaviour change |
+| `78647781b` | The Revalidate pre-pass checks `AnyPendingCpuWrites` once and walks its ranges for pending CPU writes only when some are pending (re-checked after a depth-plane flush that did work) | `agc_revalidate_split`: a revalidation with nothing pending makes no checks (fails when the old always-check is forced); with copied writers pending it still checks | Per range and proof: drops a `DrawCopiedWriters()` shared_ptr copy, the per-thread `InCompletion` read (emutls on Windows) and an atomic load. The `[revalidate-split]` line prints checks per call |
 
 The A/B switch for the ring is `APS5_NO_DYNAMIC_DRAW_DATA=1`, which restores the old layouts and bindings. Standalone benchmarks are in `reports/bench/` (build commands in section 9).
+
+**Per-draw CPU benchmark** (`reports/bench/draw-bindings.cpp`, standalone; mock Vulkan with descriptor updates stubbed, so the Vulkan driver's own cost is excluded). It measures MovedReadOnlyBuffers plus PrepareDrawBindings for a template whose ShaderData and SRT both change, in us per draw, ring on versus off:
+
+| Shader data | Small template | Template with 16 samplers |
+|---|---|---|
+| 32 dwords | 0.97 vs 2.65 | 1.08 vs 2.82 |
+| 256 dwords | 2.24 vs 3.29 | 1.78 vs 2.74 |
+| 4,016 dwords (the ABI maximum) | 4.22 vs 4.29 | 3.80 vs 4.38 |
+
+At realistic sizes the ring saves about 1 to 1.7 us per draw before the driver's descriptor writes, which it also avoids. perf at the maximum size shows memmove at 37%. The kernel page-fault time in that profile is a mock artefact: the mock maps each new chunk fresh.
 
 ## 7. What the owner should measure on GTA
 
@@ -132,16 +159,23 @@ Run once with and once without `APS5_DRAW_PIPELINE=1`: epoch proofs exist only w
 ## 8. Next steps, ranked
 
 1. **Revalidate.** Read `[lookup-split]` and `[revalidate-split]` from GTA first, then pick by the numbers:
-   - **The pre-pass dominates** (the CompletePendingCpuWrites and FlushDepthPlanes loops run on every proof, before any check): gate them per template on a generation of pending CPU writes and depth planes over its ranges, like the epoch gate on imports.
+   - **The pre-pass still dominates** after `78647781b` (check the pending-write checks per call): the remaining per-range work is FlushDepthPlanes' `overlapsStalePlane` and the multisample-target Require. Gate those per template on a depth-plane generation, like the epoch gate on imports.
    - **Images dominate with fast-fail reasons, or full walks:** fix the fast-fail reasons the existing revalidate line names. The other option is a per-template proof keyed on the write generations of its own ranges, instead of the global epoch, proof and pending serials.
    - **Epoch proofs are rarely reused because a global serial moves:** scope the reuse test to the template's ranges.
 2. **The ring path's coverage.** If `rewritten sets` dominate, make small read-only guest snapshots (at most `DrawUploadLimit`, 4 KiB, already taken from `DrawUpload`) dynamic bindings in the same ring.
-3. **The ShaderData copy.** If the ring dominates but the per-draw copy of 16 to 32 KiB still costs, the fix is moving userData and bufferOffsets out of ShaderData (push constants or a small binding). That is a recompiler change: it invalidates every shader cache (a one-time recompile for all players, and A/B timing needs separate warm caches) and touches every title's shaders. It needs the owner's decision.
+3. **The ShaderData copy.** Program data is compact (see section 5), so this is unlikely to matter. Only if a profile shows the per-draw copy in PrepareDrawBindings or ringDrawBindings costing would the fix be moving userData and bufferOffsets out of ShaderData (push constants or a small binding). That is a recompiler change: it invalidates every shader cache (a one-time recompile for all players, and A/B timing needs separate warm caches) and touches every title's shaders. It needs the owner's decision.
 4. **The ShaderResources constructor (23.8%).** With 98.6% draw template hits this is probably dispatch builds; split draw and dispatch in the profile before acting.
 5. **CopyDrawInput (9.2%).** Exact-size buffers per input; any change must keep robust vertex fetch bounds (vkCmdBindVertexBuffers2 sizes are an option).
 6. **Before upstream:** squash `c42c773d8` into `eb2f5b50f`, drop the `docs:` commits that touch `reports/`, run `tools/pr_overlap.py`, and run the section 3 validation on real NVIDIA and AMD GPUs. The dynamic offsets depend on `maxDescriptorSetStorageBuffersDynamic` and `minStorageBufferOffsetAlignment`.
 
 ## 9. Standalone benchmarks (`reports/bench/`)
+
+`draw-bindings.cpp` includes `tests/Graphics.cpp` for its mock Vulkan device, so it builds and links like `agc_driver_graphics_tests`, with Graphics.cpp's object swapped:
+- Take the compile command of `tests/Graphics.cpp` from `ninja -C build -t commands agc_driver_graphics_tests`.
+- In it, compile `reports/bench/draw-bindings.cpp` instead, adding `-Icore/libs/prx/libSceAgcDriver`.
+- Link with that target's link command (its last line), with `tests/Graphics.cpp.o` replaced by the new object.
+- Run `./draw-bindings small|many only|both <dwords>`. Prefix it with `APS5_NO_DYNAMIC_DRAW_DATA=1` for the rewrite path.
+
 
 ```bash
 g++ -std=c++20 -O2 -Icore/libs -I3rdparty/Vulkan-Headers/include -Icore/libs/prx/libSceAgcDriver -Icore reports/bench/snapshot.cpp -o snapshot-bench
