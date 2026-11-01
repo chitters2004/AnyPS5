@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03`, `26c7b2105` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,8 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `5293a5cc7` | test: race the full color target and native depth registrations against checks, and reads spanning a color and a depth guard (see "Registration races"). |
+| `b7a439237` | fix: a snapshot lookup ORs the tags of every interval the read covers (see "Independent review"). |
 | `7d96fe73e` | fix: `GuardOneFragmentFmask` marks the color guard resident before its registration finishes (see "Bug found by the range proofs"). |
 | `ac35a7e35` | test: the mapping proof test aligns its block at run time (MinGW rejects static objects aligned above 8192 bytes; the convention checker flagged it). |
 | `cff455dfe` | perf: `GuestMemory::CheckRangeProved` and mapping proofs on draw recipes, so a draw-cache hit skips re-querying its index and vertex mappings until guest memory changes (see "Mapping proofs"). |
@@ -148,7 +150,7 @@ Ship the snapshot.
 
 ## Reproducing
 
-The sources are in this folder: `guard_bench.cpp` (the benchmark), `guard_model.cpp` (the concurrency model) `probe_bench.cpp` (the proof-owner benchmark) and `log_bench.cpp` (the registration-log benchmark). The last two include `guard_bench.cpp`; build them from this folder with `g++ -O2 -std=c++20 -pthread probe_bench.cpp -o probe_bench` (likewise `log_bench`). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
+The sources are in this folder: `guard_bench.cpp` (the benchmark), `guard_model.cpp` (the concurrency model) `probe_bench.cpp` (the proof-owner benchmark), `log_bench.cpp` (the registration-log benchmark), `driver_guard_cost.cpp` (in-driver costs; build it by copying it into `core/libs/prx/libSceAgcDriver/tests/execution/DriverGuardCost.cpp` and adding `DriverGuardCost` to `ANYPS5_AGC_EXECUTION_TESTS`) and `windows_teardown.cpp` (build with `x86_64-w64-mingw32-g++-posix -O2 -std=c++20 -static [-DFIXED] -Icore/libs`). The last two include `guard_bench.cpp`; build them from this folder with `g++ -O2 -std=c++20 -pthread probe_bench.cpp -o probe_bench` (likewise `log_bench`). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
 
 Benchmark. The first argument is milliseconds per cell. The second is `table` (the grid above), `full` (every rate for every guard count) or `quick` (4 threads, 12 guards). Run it on an idle machine; a concurrent build roughly halves main's measured contention. Output is CSV, one row per design × threads × guards × pattern × rate. Subtract the `null` design's `total_ns_per_op` to remove harness overhead.
 
@@ -299,6 +301,101 @@ If guest-memory reads turn out to be large, proofs on the top few callers are th
 
 **Recommendation:** take the trace first. Add a proof only at a caller that is hot, repeats exact ranges, and already has a long-lived owner; prefer batching where reads are contiguous; otherwise leave `Read` as it is.
 
+## Registration races (`5293a5cc7`)
+
+The FMASK bug showed that a check could read state published after a registration finished. The stress test covered only FMASK registrations, so the other two sites now have race tests that start with nothing resident.
+
+- **Full color target** (`GuardSnapshot.cpp`, inside `CheckTargets`, lavapipe):
+  - 8000 rounds. Each round clears the device's targets, then 3 readers check the target's range with a range proof and a key proof while the main thread acquires the target. A proof or snapshot accepted after publication fails.
+  - Overlapping reads of a host-only target refuse without side effects, so the readers drive the real `RequireNoMultisampleTargetProved` path, early-return flags included.
+  - Planted bug (flag set after the registration finishes): with 60 rounds, 0/5 runs failed; with 1000, 0/5; with 8000, 3/4 (about 5 s per run). The window is a single atomic operation wide, so 8000 rounds is the setting kept.
+- **Native depth** (`NativeMultisampleDepth.cpp`, `CheckRegistrationRace`, D32 with 4 samples):
+  - 400 rounds. Overlapping reads of an unwritten depth surface retire the guard, which would mask a stale proof, so the readers use side-effect-free classification with a key proof.
+  - They also check the invariant directly: a check that loaded the registration's final growth must never see the resident-depth flag false.
+  - Planted bug (flag set after the registration finishes): 3/4 runs fail, with "saw no resident depth guard in 1 (or 2) rounds".
+- **Spanning reads:** at the end of the depth race, two FMASK color guards are registered 2 MiB before and after the depth surface; reads from each into the depth guard across the gap must report both registries. This fails without `b7a439237`.
+
+## Independent review
+
+A separate agent reviewed the code diff without the author's conclusions (full summary in `data/independent_review.md`).
+- **Its main finding was a real, high-severity bug that every earlier test missed.** The snapshot lookup returned only the first covered interval's tags, so a read spanning a color guard and a depth guard skipped one registry, and a proof could then hide it. It is fixed in `b7a439237` and covered by the spanning-read test above, which fails without the fix.
+- **Everything else it checked was clear:** registration ordering at all three sites, the seqlocks, rebuild and log ABA, proof keys, mapping-epoch invalidation, exceptions and lock order.
+- **Low-severity notes:**
+  - Finish's exception path advances growth without the writer mutex, which is harmless because it disables the log.
+  - A Windows-only mapping path was not audited.
+  - Two includes were dropped from `MultisampleTarget.hpp`; both builds pass.
+- **The bench and model share the simplified lookup.** `guard_bench.cpp` and `probe_bench.cpp` select the exact path from the first interval's tags only. Their reads never span intervals, so the published numbers are unaffected. `guard_model.cpp` uses a yes/no overlap test, which is correct.
+
+## Windows (MinGW and Wine)
+
+A full Windows cross-build of the libraries and tests was not attempted here (the project's Windows build expects a native MinGW environment, prebuilt FFmpeg and SDL). What was done instead:
+
+- **MinGW compile check** (`data/mingw_syntax_check.log`): Ubuntu's `x86_64-w64-mingw32-g++-posix` (GCC 13), with each file's Linux compile flags. All seven changed sources compile: `MultisampleTarget.cpp`, `DepthSurface.cpp`, `GuestMemory.cpp`, `ShaderResources.cpp`, `Draw.cpp`, `GuardSnapshot.cpp` and `NativeMultisampleDepth.cpp`.
+  - Covered: `constinit` atomics, `alignas(64)`, and the TEB thread-slot code.
+  - One unrelated header, `prx/libc/include/CpuTopology.hpp` (unchanged from upstream main), uses `PROCESSOR_RELATIONSHIP::EfficiencyClass`, which Ubuntu's older MinGW headers lack; it was shimmed for the check only.
+- **Thread-teardown fix under Wine** (`windows_teardown.cpp`, `data/windows_teardown_wine.log`):
+  - A static MinGW program reproduces the certificate's teardown with the real `HostThreadSlot` TEB code: a `thread_local` object constructed first reads the slot in its destructor, after the certificate's owner has been destroyed.
+  - The original design read a dead certificate in 64 of 64 threads; the fixed design (`1241edd3c`) read the retired sentinel in 64 of 64 threads.
+  - A first version used a plain `bool` "alive" marker, which the compiler removed as a dead store in the destructor; it showed no bug, and the atomic marker shows the real one.
+- **Benchmark under Wine** (`data/bench_wine_quick.csv`, 4 threads, 12 guards; ns per check net of harness overhead; rate 0, then rate 1000):
+
+| Pattern | main | cert draft | cert fixed | snapshot |
+|---|---|---|---|---|
+| disjoint-local | 3292 / 4996 | 158 / 125 | 134 / 127 | 22 / 27 |
+| disjoint-spread | 3017 / 5864 | 3430 / 2976 | 3174 / 4583 | 34 / 39 |
+| cyclic-5gaps | 5758 / 4928 | 4685 / 4223 | 4652 / 5076 | 25 / 22 |
+| overlap | 2858 / 4610 | 9134 / 12024 | 6140 / 9059 | 1915 / 1784 |
+
+  Under winpthreads, main is 3–5× its Linux cost; the snapshot stays at 18–39 ns on disjoint reads. The certificate's hits (110–170 ns) are inflated here, because the benchmark's certificate uses plain `thread_local` (emutls on MinGW) while the driver uses a direct TEB slot. Wine is not Windows: the winpthreads lock code is the same, kernel waits differ.
+- **Not done:** the Windows-only page-state tests, the Vulkan guard tests on Windows, and a real Windows machine.
+
+## Costs inside the driver
+
+`driver_guard_cost.cpp` links against the real driver (it was built as a temporary execution test and moved here; it is not part of the CMake build). Medians of 3 runs on this machine, in ns per operation (`data/driver_cost_summary.txt`):
+
+| Operation | 1 thread | 4 threads |
+|---|---|---|
+| `RequireNoMultisampleTarget`, no guard resident | 6.7 | — |
+| `RequireNoMultisampleTarget`, 12 guards, snapshot hit | 11.4 | 13.6 |
+| `GuardRead`, 12 guards, snapshot hit | 13.0 | 15.1 |
+| `RequireNoMultisampleTargetProved`, held proof | 7.4 | 6.1 |
+| `ResidentGuardOverlaps`, overlapping a guard (registry scans) | 31 | 755 |
+| `ResidentGuardsUnchangedSince`, 8 registrations behind | 10.4 | — |
+| `CheckRange`, page-cached, 64 B / 4 KiB | 33.6 / 32.9 | — |
+| `CheckRange`, uncached mapping, 64 B / 4 KiB | 284 / 369 | — |
+| `CheckRangeProved`, held proof, 64 B / 4 KiB | 11.2 / 12.0 | — |
+| `FlushGpuWrites` (no hook work) | 2.5 | — |
+| `GuestMemory::Read`, page-cached, 64 B / 4 KiB | 81 / 176 | — |
+| `GuestMemory::Read`, uncached mapping, 64 B / 4 KiB | 340 / 456 | — |
+| `memcpy`, 64 B / 4 KiB | 5.3 / 123 | — |
+
+- **Guard proofs save little.** A snapshot hit is already 11–15 ns, and a held guard proof is 6–7 ns, so a guard proof saves about 5–7 ns per range. The standalone `probe_bench` estimate (about 1 ns against 10–37 ns) overstated it; the driver adds call overhead and the seqlock read.
+- **Mapping proofs save more.** About 22 ns per range on page-cached memory.
+- **Within a small `GuestMemory::Read`,** the guard check is about 13 of 81 ns and the mapping check about 34 ns. On uncached memory the mapping check (a `process_vm_readv` system call) dominates at about 280 ns.
+- **Overlapping reads under contention are the expensive path** (755 ns with 4 threads, from the registry locks). They are rare by design.
+- **The first 4-thread run was wrong.** Every thread wrote to one shared `volatile` sink, which bounced its cache line; the harness now uses per-thread sinks.
+
+## `GuestMemory::Read` caller census
+
+From the source, by grepping direct calls (`data/read_callers.txt`): 76 direct calls of `Read`, `ReadCommitted`, `ReadCommittedUnsynced` and `GuardRead` outside tests, in 18 files. Calls through other wrappers are not covered.
+
+| Class | Calls | Examples | Guard share | Action |
+|---|---|---|---|---|
+| Large copies (surfaces, textures, DCC, buffer mirrors, shader code) | 38 | `Texture.cpp`, `DccMetadata.cpp`, `GuestBufferMemory.cpp`, `ColorTargetTransfer.cpp`, `Draw.cpp` color and index copies, `ShaderRegistry.cpp` | small: the copy dominates (4 KiB: 176 ns, 123 of it `memcpy`) | none |
+| One small read per packet, draw or dispatch | 23 | `Pm4.cpp` indirect arguments, predication, index attributes; `BufferFill.cpp`; `PacketMemory.cpp`; `VulkanDevice.cpp`; `DepthSurface.cpp` HTILE and clear words | about 13 of 60–80 ns | none: no long-lived owner, about 13 ns each |
+| Polling while waiting on the GPU | 3 | `Pm4.cpp` WAIT_REG_MEM, semaphore, conditional write | negligible next to the wait | none |
+| Per-element loops | 9 | `Draw.cpp` index expansion; `ShaderInputState.cpp` per-entry fallback; `ShaderMemory.cpp` per-word reads | about 13 of 60–80 ns, per element | see below |
+| The read APIs themselves | 3 | `GuestMemory.cpp` | — | — |
+
+- **The strongest finding is batching, not proofs.** `Draw.cpp` (about line 1590) expands quad lists and strip patches on the CPU by calling `GuestMemory::Read` once per index (2 or 4 bytes). The index range was already flushed and `CheckRange`d just above.
+  - At about 60–80 ns per call, a 10,000-quad draw (40,000 index reads) costs about 3 ms in read overhead (estimate from the measured per-read cost).
+  - One guarded read of the whole index range into a local buffer would cut this to roughly the cost of a copy.
+  - Not implemented here.
+- **Others to look at:**
+  - `ShaderMemory.cpp` reads shader memory one word at a time in its pending-write and verification policies, a path that mainly runs during captures.
+  - `ShaderInputState.cpp` already reads in one batch and only falls back per entry when the whole range is not accessible.
+- **Conclusion:** proofs at `GuestMemory::Read` callers are not worth it. The guard is about 13 ns of a read, and the large-read and per-packet callers have no owner. Batching the per-element loops, starting with index expansion, is the useful change. A GTA trace (`CountReadCaller`) would confirm which of these paths run per frame.
+
 ## Summary of results
 
 The snapshot is the better design. It is never slower than the certificate in a regime that matters, and it is much faster once a thread reads more than four separate gaps.
@@ -328,6 +425,12 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
 | `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
 | `ctest_proof_validation.log` | The same tests on `9a7128ddb` (proofs). |
+| `driver_cost_run1..3.csv`, `driver_cost_summary.txt` | In-driver cost harness results (`driver_guard_cost.cpp`). |
+| `bench_wine_quick.csv` | `guard_bench.cpp` built with MinGW and run under Wine, 4 threads and 12 guards. |
+| `windows_teardown_wine.log` | The thread-teardown reproduction (`windows_teardown.cpp`) under Wine. |
+| `mingw_syntax_check.log` | MinGW compile check of the changed sources. |
+| `read_callers.txt` | The direct `GuestMemory` read calls found by the census. |
+| `independent_review.md` | The independent review's findings. |
 | `ctest_final_validation.log` | 18 tests on `7d96fe73e` (after the fix). |
 | `ctest_log_mapping_validation.log` | 16 tests on `cff455dfe` (registration log and mapping proofs). |
 | `ctest_guestmemory.log` | `agc_write_tracking` and `agc_write_watch_coverage` on `cff455dfe`. |

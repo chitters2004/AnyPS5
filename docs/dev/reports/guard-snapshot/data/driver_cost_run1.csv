@@ -1,0 +1,27 @@
+cost,name,threads,ns_per_op
+cost,RequireNoMultisampleTarget, no guard resident,1,6.8
+cost,RequireNoMultisampleTarget, 12 guards, snapshot hit,1,9.9
+cost,ResidentGuardOverlaps, 12 guards, snapshot hit,1,11.1
+cost,GuardRead, 12 guards, snapshot hit,1,11.9
+cost,RequireNoMultisampleTargetProved, held proof,1,7.4
+cost,ResidentGuardOverlaps, overlapping a guard (scan and exact),1,37.7
+cost,RequireNoMultisampleTarget, 12 guards, snapshot hit,4,13.6
+cost,ResidentGuardOverlaps, 12 guards, snapshot hit,4,12.0
+cost,GuardRead, 12 guards, snapshot hit,4,15.1
+cost,RequireNoMultisampleTargetProved, held proof,4,6.1
+cost,ResidentGuardOverlaps, overlapping a guard (scan and exact),4,615.4
+cost,ResidentGuardsUnchangedSince, 8 registrations behind,1,16.3
+cost,CheckRange, page-cached image, 64 bytes,1,50.9
+cost,CheckRange, uncached mapping, 64 bytes,1,324.2
+cost,CheckRangeProved, held proof, 64 bytes,1,15.2
+cost,FlushGpuWrites, 64 bytes,1,3.1
+cost,GuestMemory::Read, page-cached image, 64 bytes,1,92.9
+cost,GuestMemory::Read, uncached mapping, 64 bytes,1,471.1
+cost,memcpy, 64 bytes,1,5.3
+cost,CheckRange, page-cached image, 4096 bytes,1,32.9
+cost,CheckRange, uncached mapping, 4096 bytes,1,369.0
+cost,CheckRangeProved, held proof, 4096 bytes,1,12.0
+cost,FlushGpuWrites, 4096 bytes,1,3.9
+cost,GuestMemory::Read, page-cached image, 4096 bytes,1,207.8
+cost,GuestMemory::Read, uncached mapping, 4096 bytes,1,419.8
+cost,memcpy, 4096 bytes,1,119.7

@@ -1,0 +1,26 @@
+RequireNoMultisampleTarget, no guard resident | T1                           6.8     6.7     5.7   median 6.7
+RequireNoMultisampleTarget, 12 guards, snapshot hit | T1                     9.9    11.4    11.9   median 11.4
+ResidentGuardOverlaps, 12 guards, snapshot hit | T1                         11.1     9.4     7.1   median 9.4
+GuardRead, 12 guards, snapshot hit | T1                                     11.9    13.3    13.0   median 13.0
+RequireNoMultisampleTargetProved, held proof | T1                            7.4     6.1     8.5   median 7.4
+ResidentGuardOverlaps, overlapping a guard (scan and exact) | T1            37.7    25.2    31.0   median 31.0
+RequireNoMultisampleTarget, 12 guards, snapshot hit | T4                    13.6    11.8    14.1   median 13.6
+ResidentGuardOverlaps, 12 guards, snapshot hit | T4                         12.0     8.5    10.0   median 10.0
+GuardRead, 12 guards, snapshot hit | T4                                     15.1    15.8    14.8   median 15.1
+RequireNoMultisampleTargetProved, held proof | T4                            6.1     5.8     6.6   median 6.1
+ResidentGuardOverlaps, overlapping a guard (scan and exact) | T4           615.4   754.7   801.9   median 754.7
+ResidentGuardsUnchangedSince, 8 registrations behind | T1                   16.3    10.4     9.6   median 10.4
+CheckRange, page-cached image, 64 bytes | T1                                50.9    33.6    32.5   median 33.6
+CheckRange, uncached mapping, 64 bytes | T1                                324.2   279.7   283.6   median 283.6
+CheckRangeProved, held proof, 64 bytes | T1                                 15.2    11.2    11.0   median 11.2
+FlushGpuWrites, 64 bytes | T1                                                3.1     2.5     2.4   median 2.5
+GuestMemory::Read, page-cached image, 64 bytes | T1                         92.9    80.9    67.6   median 80.9
+GuestMemory::Read, uncached mapping, 64 bytes | T1                         471.1   337.9   339.7   median 339.7
+memcpy, 64 bytes | T1                                                        5.3     5.7     3.4   median 5.3
+CheckRange, page-cached image, 4096 bytes | T1                              32.9    46.4    31.1   median 32.9
+CheckRange, uncached mapping, 4096 bytes | T1                              369.0   400.7   293.5   median 369.0
+CheckRangeProved, held proof, 4096 bytes | T1                               12.0    15.2    10.9   median 12.0
+FlushGpuWrites, 4096 bytes | T1                                              3.9     3.1     2.8   median 3.1
+GuestMemory::Read, page-cached image, 4096 bytes | T1                      207.8   176.0   174.1   median 176.0
+GuestMemory::Read, uncached mapping, 4096 bytes | T1                       419.8   458.4   456.3   median 456.3
+memcpy, 4096 bytes | T1                                                    119.7   123.7   122.8   median 122.8
