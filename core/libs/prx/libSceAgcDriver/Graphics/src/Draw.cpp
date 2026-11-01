@@ -1473,7 +1473,17 @@ struct DrawPlan {
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
-DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, DrawOutcome& outcome, DrawTimer& timer) {
+bool EarlyDrawKeys() {
+    static const bool enabled = std::getenv("APS5_NO_EARLY_DRAW_KEY") == nullptr;
+    return enabled;
+}
+
+bool KeyForDevice(const std::vector<std::uint32_t>& key, VkDevice device) {
+    const auto handle = reinterpret_cast<std::uint64_t>(device);
+    return key.size() >= 3 && key[0] == 0xffffffffu && key[1] == static_cast<std::uint32_t>(handle) && key[2] == static_cast<std::uint32_t>(handle >> 32u);
+}
+
+DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, DrawOutcome& outcome, DrawTimer& timer, const PreparedAhead* ahead = nullptr, const std::vector<std::uint32_t>* contentKey = nullptr) {
     DrawPlan plan;
     APS5_LOG_OUT_DEBUG("Draw indices=%u instances=%u indexSize=%u flags=%u indexAddress=0x%llx", draw.indexCount, draw.instanceCount, draw.indexSize, draw.flags, static_cast<unsigned long long>(draw.indexAddress));
     APS5_LOG_OUT_DEBUG("State colorTarget=%u render=%ux%u colorAddress=0x%llx colorBytes=%llu colorExtent=%ux%u", state.hasColorTarget ? 1u : 0u, state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.color.address), static_cast<unsigned long long>(state.color.bytes), state.color.extent.width, state.color.extent.height);
@@ -1509,6 +1519,11 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     if (recipe != nullptr) {
         plan.fragmentOutputs = recipe->fragmentOutputs;
         plan.shaderStages = recipe->shaderStages;
+    } else if (ahead != nullptr) {
+        plan.fragmentOutputs = ahead->fragmentOutputs;
+        plan.shaderStages = ahead->shaderStages;
+        outcome.validateMemoized = ahead->validateMemoized;
+        outcome.validateHit = ahead->validateHit;
     } else {
         plan.fragmentOutputs = CachedFragmentOutputs(context, shaders, state, outcome.validateMemoized, outcome.validateHit);
         plan.shaderStages = PipelineStages(shaders);
@@ -1543,6 +1558,9 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     const auto& attributes = shaders.front().program->vertexAttributes;
     if (recipe != nullptr) {
         plan.vertexInput = recipe->vertexInput;
+    } else if (ahead != nullptr) {
+        plan.retainedVertexInput = ahead->retainedVertexInput;
+        if (plan.retainedVertexInput == nullptr) plan.vertexInput = ahead->vertexInput;
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) plan.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (plan.retainedVertexInput == nullptr) plan.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -1554,7 +1572,13 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.keyed = recipe == nullptr && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        if (contentKey != nullptr && KeyForDevice(*contentKey, context.device)) {
+            plan.contentKey = *contentKey;
+            static const bool verify = std::getenv("APS5_VERIFY_EARLY_DRAW_KEY") != nullptr;
+            if (verify) Require(plan.contentKey == DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey), "the draw resource key made before the commit differs from the commit's");
+        } else {
+            plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        }
         timer.charge(PhaseLookup, keyStart);
     }
     return plan;
@@ -2722,6 +2746,11 @@ bool RecordDraws() {
     return recordDraws;
 }
 
+bool DrawTransitions() {
+    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    return drawTransitions;
+}
+
 }
 
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
@@ -2764,6 +2793,8 @@ struct PreparedDraw {
     std::shared_ptr<const DrawRecipe>* recipeOut = nullptr;
     const DrawTraceContext* trace = nullptr;
     std::uint64_t shape = 0;
+    const std::vector<std::uint32_t>* contentKey = nullptr;
+    PreparedAhead* ahead = nullptr;
     std::vector<std::uint32_t> stencilReferences;
     std::optional<PerformanceTimer> timing;
     DrawTimer timer;
@@ -2973,7 +3004,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.ahead, prepared.contentKey);
     if (plan.nothing) return false;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer);
     if (inputs.nothing) {
@@ -3252,8 +3283,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
-    static const bool drawTransitions = std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
-    const bool lean = prepared.lean = recorded && !drawTransitions;
+    const bool lean = prepared.lean = recorded && !DrawTransitions();
     const bool multisampled = prepared.multisampled = std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; });
     Require(lean || !multisampled, "multisampled draws are only rendered as recorded draws");
     for (const auto& binding : targets) {
@@ -3305,7 +3335,20 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     auto& pipeline = prepared.pipeline;
     const auto attachmentLayout = lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    if (!stencilReplay.empty()) {
+    if (auto* ahead = prepared.ahead; ahead != nullptr && stencilReplay.empty()) {
+        const auto layouts = resources->SetLayouts();
+        const auto& described = ahead->setLayouts;
+        if (ahead->attachmentLayout != attachmentLayout) {
+            ahead->outcome = PreparedAheadOutcome::Layout;
+        } else if (layouts.main != described.layouts.main || layouts.fragment != described.layouts.fragment || layouts.split != described.layouts.split || !std::ranges::equal(layouts.mainKey, described.mainKey) || !std::ranges::equal(layouts.fragmentKey, described.fragmentKey)) {
+            ahead->outcome = PreparedAheadOutcome::SetLayouts;
+        } else {
+            ahead->outcome = PreparedAheadOutcome::Adopted;
+            pipeline = ahead->pipeline;
+        }
+    }
+    if (pipeline != nullptr) {
+    } else if (!stencilReplay.empty()) {
         pipeline = stencilReplay.front().second;
     } else {
         const bool memoized = stencilReferences.empty() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.multisampled; });
@@ -3786,7 +3829,14 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
     Draw(context, meshed, captured, second, snapshots, nullptr, trace);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
+std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (!EarlyDrawKeys() || shaders.empty() || std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return {};
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+}
+
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, PreparedAhead* ahead) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -3797,6 +3847,12 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.recipeOut = recipeOut;
     prepared.trace = trace;
     prepared.shape = shape;
+    prepared.contentKey = contentKey;
+    if (ahead != nullptr && ahead->device != context.device) {
+        ahead->outcome = PreparedAheadOutcome::Device;
+        ahead = nullptr;
+    }
+    prepared.ahead = ahead;
     if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
 }
 
@@ -3998,6 +4054,36 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
         }
         storeClearTexels(context, color, texel);
     }
+}
+
+std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (draw.indirect || state.stages.mesh || state.stages.tessellation || state.quadList || StripPatches(state, shaders) || context.descriptorCache == nullptr) return nullptr;
+    if (shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr || !shader.program->stencilReferences.empty(); })) return nullptr;
+    if (std::ranges::any_of(state.colors, [&](const auto& color) { return AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED; })) return nullptr;
+    auto ahead = std::make_shared<PreparedAhead>();
+    ahead->device = context.device;
+    try {
+        ahead->fragmentOutputs = CachedFragmentOutputs(context, shaders, state, ahead->validateMemoized, ahead->validateHit);
+        ahead->shaderStages = PipelineStages(shaders);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        if (!attributes.empty()) {
+            if (context.vertexInputs != nullptr) ahead->retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
+            if (ahead->retainedVertexInput == nullptr) ahead->vertexInput = BuildVertexInputLayout(context, attributes);
+        }
+        const VertexInputLayout& vertexInput = ahead->retainedVertexInput != nullptr ? *ahead->retainedVertexInput : ahead->vertexInput;
+        ahead->setLayouts = DescribeSetLayouts(context, shaders);
+        ahead->attachmentLayout = RecordDraws() && !DrawTransitions() ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        const auto masked = maskedState(state, ahead->fragmentOutputs);
+        ahead->pipeline = CachedPipeline(context, masked.has_value() ? *masked : state, vertexInput, ahead->setLayouts.View(), shaders, ahead->attachmentLayout);
+    } catch (const std::exception&) {
+        return nullptr;
+    }
+    return ahead;
+}
+
+bool DrawPrepareAhead() {
+    static const bool enabled = std::getenv("APS5_DRAW_PREPARE_AHEAD") != nullptr;
+    return enabled;
 }
 
 bool DrawPipelineEnabled() {

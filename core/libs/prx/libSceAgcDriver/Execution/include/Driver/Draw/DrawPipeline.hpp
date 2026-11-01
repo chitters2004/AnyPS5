@@ -38,6 +38,19 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
+    enum class PrepareAheadRedo : std::uint8_t { Device, Layout, SetLayouts, NotReady, Count };
+    enum class PrepareAheadEvent : std::uint8_t { Prepared, Adopted, Refused, Unused };
+    struct PrepareAheadCounts {
+        std::uint64_t prepared = 0;
+        std::uint64_t adopted = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t unused = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(PrepareAheadRedo::Count)> redone{};
+    };
+    static PrepareAheadCounts PrepareAhead();
+    static const char* PrepareAheadRedoName(PrepareAheadRedo reason);
+    static void CountPrepareAhead(PrepareAheadEvent event);
+    static void CountPrepareAheadRedo(PrepareAheadRedo reason);
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
@@ -106,6 +119,31 @@ private:
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+class DrawPreparer {
+public:
+    using Job = std::function<void()>;
+    static DrawPreparer& Get();
+    static bool OnPreparerThread();
+    static std::uint64_t TakeBusyNanoseconds();
+    bool Enqueue(Job job);
+    void Settle();
+    void ReleaseRan();
+
+private:
+    DrawPreparer() = default;
+    void run();
+    inline static std::atomic<std::size_t> outstanding{0};
+    inline static std::atomic<std::uint64_t> busyNanoseconds{0};
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable idle;
+    std::deque<Job> jobs;
+    std::vector<Job> ran;
+    bool running = false;
+    bool sleeping = false;
+    std::thread thread;
 };
 
 class DrawFinisher {

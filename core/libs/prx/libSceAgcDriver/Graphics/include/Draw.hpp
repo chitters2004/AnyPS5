@@ -25,7 +25,9 @@ struct DrawTraceContext {
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
+struct PreparedAhead;
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr, PreparedAhead* ahead = nullptr);
+std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 
 struct PixelFunctionLdsLayouts {
     VkDescriptorSetLayout empty = VK_NULL_HANDLE;
@@ -157,6 +159,23 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
+
+enum class PreparedAheadOutcome : std::uint8_t { Unused, Adopted, Device, Layout, SetLayouts };
+struct PreparedAhead {
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint32_t fragmentOutputs = 0;
+    VkPipelineStageFlags shaderStages = 0;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    VertexInputLayout vertexInput;
+    std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    DescribedSetLayouts setLayouts;
+    VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::shared_ptr<Pipeline> pipeline;
+    PreparedAheadOutcome outcome = PreparedAheadOutcome::Unused;
+};
+std::shared_ptr<PreparedAhead> PrepareDrawAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+bool DrawPrepareAhead();
 bool CommitTrims();
 
 }

@@ -36,7 +36,77 @@ std::atomic<std::uint64_t> heldReadHits{0};
 
 namespace {
 thread_local bool finisherThread = false;
+thread_local bool preparerThread = false;
 thread_local bool finisherProducer = false;
+}
+
+DrawPreparer& DrawPreparer::Get() {
+    static DrawPreparer* preparer = new DrawPreparer();
+    return *preparer;
+}
+
+bool DrawPreparer::OnPreparerThread() {
+    return preparerThread;
+}
+
+std::uint64_t DrawPreparer::TakeBusyNanoseconds() {
+    return busyNanoseconds.exchange(0, std::memory_order_relaxed);
+}
+
+bool DrawPreparer::Enqueue(Job job) {
+    constexpr std::size_t depth = 64;
+    struct PreparerReclaimStorage {};
+    auto& reclaim = HostThreadLocal<std::vector<Job>, PreparerReclaimStorage>();
+    reclaim.clear();
+    std::lock_guard lock(mutex);
+    if (!ran.empty()) std::swap(ran, reclaim);
+    if (jobs.size() >= depth) return false;
+    jobs.push_back(std::move(job));
+    outstanding.fetch_add(1, std::memory_order_release);
+    if (!running) {
+        running = true;
+        thread = std::thread([this] {
+            preparerThread = true;
+            run();
+        });
+    }
+    if (sleeping) wake.notify_one();
+    return true;
+}
+
+void DrawPreparer::run() {
+    PerformanceTrace::BindThread("draw preparer");
+    for (;;) {
+        Job* job = nullptr;
+        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        {
+            std::unique_lock lock(mutex);
+            sleeping = true;
+            wake.wait(lock, [&] { return !jobs.empty(); });
+            sleeping = false;
+            job = &jobs.front();
+        }
+        const auto start = std::chrono::steady_clock::now();
+        (*job)();
+        busyNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        std::lock_guard lock(mutex);
+        ran.push_back(std::move(jobs.front()));
+        jobs.pop_front();
+        outstanding.fetch_sub(1, std::memory_order_release);
+        idle.notify_all();
+    }
+}
+
+void DrawPreparer::Settle() {
+    if (OnPreparerThread() || outstanding.load(std::memory_order_acquire) == 0) return;
+    std::unique_lock lock(mutex);
+    idle.wait(lock, [&] { return jobs.empty(); });
+}
+
+void DrawPreparer::ReleaseRan() {
+    std::vector<Job> done;
+    std::lock_guard lock(mutex);
+    std::swap(done, ran);
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -283,6 +353,58 @@ unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
 
+namespace {
+struct PrepareAheadTotals {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> adopted{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> unused{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::PrepareAheadRedo::Count)> redone{};
+    DrawPipeline::PrepareAheadCounts reported;
+};
+
+PrepareAheadTotals& PrepareAheadStats() {
+    static PrepareAheadTotals totals;
+    return totals;
+}
+}
+
+DrawPipeline::PrepareAheadCounts DrawPipeline::PrepareAhead() {
+    auto& totals = PrepareAheadStats();
+    PrepareAheadCounts counts;
+    counts.prepared = totals.prepared.load(std::memory_order_relaxed);
+    counts.adopted = totals.adopted.load(std::memory_order_relaxed);
+    counts.refused = totals.refused.load(std::memory_order_relaxed);
+    counts.unused = totals.unused.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < counts.redone.size(); ++i) counts.redone[i] = totals.redone[i].load(std::memory_order_relaxed);
+    return counts;
+}
+
+void DrawPipeline::CountPrepareAhead(PrepareAheadEvent event) {
+    auto& totals = PrepareAheadStats();
+    switch (event) {
+        case PrepareAheadEvent::Prepared: totals.prepared.fetch_add(1, std::memory_order_relaxed); break;
+        case PrepareAheadEvent::Adopted: totals.adopted.fetch_add(1, std::memory_order_relaxed); break;
+        case PrepareAheadEvent::Refused: totals.refused.fetch_add(1, std::memory_order_relaxed); break;
+        case PrepareAheadEvent::Unused: totals.unused.fetch_add(1, std::memory_order_relaxed); break;
+    }
+}
+
+void DrawPipeline::CountPrepareAheadRedo(PrepareAheadRedo reason) {
+    PrepareAheadStats().redone[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* DrawPipeline::PrepareAheadRedoName(PrepareAheadRedo reason) {
+    switch (reason) {
+        case PrepareAheadRedo::Device: return "device";
+        case PrepareAheadRedo::Layout: return "attachment layout";
+        case PrepareAheadRedo::SetLayouts: return "set layouts";
+        case PrepareAheadRedo::NotReady: return "not ready";
+        case PrepareAheadRedo::Count: break;
+    }
+    return "?";
+}
+
 void DrawPipeline::rethrowFailure() {
     if (failure == nullptr) return;
     auto error = std::exchange(failure, nullptr);
@@ -364,6 +486,21 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
+    {
+        auto& totals = PrepareAheadStats();
+        const auto current = PrepareAhead();
+        char ahead[192];
+        std::snprintf(ahead, sizeof(ahead), "; prepared ahead %llu (preparer busy %.1f ms), adopted %llu, refused %llu, unused %llu, redone:", static_cast<unsigned long long>(current.prepared - totals.reported.prepared), static_cast<double>(DrawPreparer::TakeBusyNanoseconds()) / 1e6, static_cast<unsigned long long>(current.adopted - totals.reported.adopted), static_cast<unsigned long long>(current.refused - totals.reported.refused), static_cast<unsigned long long>(current.unused - totals.reported.unused));
+        drainText += ahead;
+        for (std::size_t i = 0; i < current.redone.size(); ++i) {
+            const auto count = current.redone[i] - totals.reported.redone[i];
+            if (count == 0) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), " %s %llu", PrepareAheadRedoName(static_cast<PrepareAheadRedo>(i)), static_cast<unsigned long long>(count));
+            drainText += item;
+        }
+        totals.reported = current;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
