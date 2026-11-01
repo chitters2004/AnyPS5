@@ -167,7 +167,7 @@ Results on main `dc9dc7eaa`: 1,151 tests, 1,074 passed, 75 skipped (lavapipe fea
 - `agc_driver_guest_memory_lifetime_converted` needs `build/core/relinker/relinker`, which this configuration does not build.
 - `agc_driver_image_table` has a failure regex that rejects any VUID, and it gets the baseline `VUID-VkDeviceCreateInfo-pNext-pNext`.
 
-Heads `89c31547d` and `78647781b` (with the pre-pass gate) give identical results and identical per-test VUID counts, plus `agc_revalidate_split`, which passes. Watch for a false positive: a grep for "was not found but was requested" also matches ctest echoing a test's failure regex, so check the matching line.
+Heads `89c31547d`, `78647781b`, `fb98baaeb` and `fcac8f0d9` (with every code commit, 1,156 tests) give identical results and identical per-test VUID counts. Their only additions are the new tests (`agc_draw_bindings*` and `agc_revalidate_split*`), which pass. Watch for a false positive: a grep for "was not found but was requested" also matches ctest echoing a test's failure regex, so check the matching line.
 
 **Windows check.** With `g++-mingw-w64-x86-64-posix`, compile the changed sources with `-fsyntax-only`, using the Linux build's commands (`ninja -C build -t commands libSceAgcDriver`) with the compiler swapped and `-fPIC` and the dependency flags removed. Do the same for main from a `git worktree`, then diff. Ubuntu's MinGW lacks `PROCESSOR_RELATIONSHIP::EfficiencyClass` and `_fflush_nolock` (both errors also appear on main); nothing else differs.
 
