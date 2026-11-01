@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. The `notes-file` rule in `tools/check_conventions.py` rejects it, so drop the two `docs(agc)` commits at the tip before opening a pull request and move the text into the PR body.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop the `docs(agc)` commits (`88079274b`, `af5a4f28e`, `aabfd6e43` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,7 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `9a7128ddb` | perf: growth-stamped proofs (see "Skipping repeated checks"). `requireGuestBuffers` skips its whole loop while nothing has registered, and every registration now advances the growth when it starts and again when it finishes. |
 
 ## Snapshot design
 
@@ -107,6 +108,10 @@ Worst-case latencies are 0.5–8 ms in every design: that is preemption on a 4-v
 | snapshot, insertion not added | violations on almost every check |
 | snapshot, rebuild without the growth check | 19,466 violations |
 | snapshot, plain stores instead of atomics | TSan data race in `publish` |
+| snapshot, proofs, no finishing growth advance (mutant 6) | 160,033 violations |
+| certificate, proofs, no finishing growth advance (mutant 6) | 0 violations: the certificate's slow path waits on the registry lock, so it cannot run mid-registration |
+
+After `9a7128ddb` the model also caches verdicts the way the driver does: each reader keeps 8 per-thread proofs keyed by guard slot and growth, and a registration yields between its snapshot insertion and its `push_back` to widen the race window. Mutant 1 now removes both growth advances, and mutant 5 skips the finishing advance on the throw path; both still model the original bugs. The numbers in `data/model_*.log` come from this final model, so some differ from the earlier table values (for example mutant 5 on the certificate now shows 31,143 violations).
 
 Limits: on x86 (TSO), TSan does not model fence reordering, so a missing or wrong fence would not be caught. Weak-memory hosts are unverified.
 
@@ -117,7 +122,8 @@ Run with `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ANYPS5_REQUIRE_VULKAN=1
 - **Results:** all pass on main (`cf79276fe`), on `2a4339321` (certificate with fixes), on `7133b7d37` and on `edaacd785`. The layer loaded in every run.
 - **Validation:** the only validation error, in every build, is `VUID-VkDeviceCreateInfo-pNext-pNext` at device creation (the layer is older than the headers), 3 per test. No new VUIDs.
 - **New guard tests:** the snapshot test adds the stale-rebuild check, the overflow check (300 guards) and rebuilds running concurrently in the stress test. The hit paths are checked with the driver image's writable segments frozen read-only.
-- **Conventions:** `tools/check_conventions.py --base upstream/main` passes on every code commit; this report commit fails `notes-file`.
+- **Conventions:** `tools/check_conventions.py --base upstream/main` passes on every commit, including these docs commits (the checker allows `.md` and `.log` under `docs/dev/`). An earlier version of this report wrongly said they fail `notes-file`.
+- **`9a7128ddb`:** all 11 tests pass under validation, with the same 30 device-creation VUIDs and nothing new (`data/ctest_proof_validation.log`).
 
 ## Verdict
 
@@ -149,17 +155,28 @@ g++ -O2 -std=c++20 -pthread docs/dev/reports/guard-snapshot/guard_bench.cpp -o g
 ./guard_bench 200 table > bench_table.csv
 ```
 
-Model. `MUTANT` selects the planted bug: 0 clean, 1 no growth bump, 2 snapshot insertion skipped, 3 rebuild without the growth check, 4 plain stores (TSan race), 5 growth bumped after the inserts with a throw between. The first argument picks the design (`c` certificate, `s` snapshot), the second the number of rounds. Exit code 0 means no violations, 1 means violations, and 66 is a TSan report. Clang on this image lacks the TSan runtime, so use g++.
+Model. `MUTANT` selects the planted bug: 0 clean, 1 no growth bump, 2 snapshot insertion skipped, 3 rebuild without the growth check, 4 plain stores (TSan race), 5 growth bumped after the inserts with a throw between, 6 no finishing growth advance (matters only with proofs on the snapshot). The first argument picks the design (`c` certificate, `s` snapshot), the second the number of rounds. Exit code 0 means no violations, 1 means violations, and 66 is a TSan report. Clang on this image lacks the TSan runtime, so use g++.
 
 ```bash
-for m in 0 1 2 3 4 5; do g++ -std=c++20 -O1 -g -fsanitize=thread -Wno-tsan -DMUTANT=$m docs/dev/reports/guard-snapshot/guard_model.cpp -o model_$m; done
+for m in 0 1 2 3 4 5 6; do g++ -std=c++20 -O1 -g -fsanitize=thread -Wno-tsan -DMUTANT=$m docs/dev/reports/guard-snapshot/guard_model.cpp -o model_$m; done
 ```
 
 ```bash
-for m in 0 1 5; do ./model_$m c 3000; echo "certificate mutant $m rc=$?"; done; for m in 0 2 3 4 5; do ./model_$m s 3000; echo "snapshot mutant $m rc=$?"; done
+for m in 0 1 5 6; do ./model_$m c 3000; echo "certificate mutant $m rc=$?"; done; for m in 0 2 3 4 5 6; do ./model_$m s 3000; echo "snapshot mutant $m rc=$?"; done
 ```
 
-Expected: certificate mutants 1 and 5 and snapshot mutants 2, 3, 4 and 5 fail; both clean runs pass.
+Expected: certificate mutants 1 and 5 and snapshot mutants 2, 3, 4, 5 and 6 fail; both clean runs and certificate mutant 6 pass.
+
+## Skipping repeated checks (`9a7128ddb`)
+
+Idea: only a registration can make a clear range overlap a guard, so a caller that re-reads the same ranges can remember "proven clear at growth g" and skip the check while the growth is still g. `ShaderResources::Revalidate` already did this for its own checks (`provedGuards`).
+
+- **`ResidentGuardProof`** (in `MultisampleTarget.hpp`) packs growth and a 16-bit key into one atomic, so concurrent writers can never pair a growth with the wrong key. `Holds(growth, key)` is one acquire load and a compare. A growth or key that does not fit packs to 0, which never holds, so those callers just keep checking.
+- **`ShaderResources::requireGuestBuffers`**, run on every `Bind` and `PrepareDrawBindings` of a cached object, loads the growth first. If the proof holds for that growth and the allocation count it returns at once. Otherwise it checks every buffer and records the proof only if all were proven clear: no moved buffers, and no buffer accepted only through an HTILE clear (that acceptance depends on surface state the growth does not track). Allocations only grow during the build and are never edited, which is why the count is enough as a key.
+- **Two growth advances per registration.** `ResidentGuardRegistration` (RAII) advances the growth and updates the snapshot before inserting, and advances it again in its destructor after inserting, also when an insert throws. With only the first advance, a lock-free snapshot lookup between that advance and the insertion saw no guard and recorded a proof at the new growth that kept holding afterwards. The same window existed in `Revalidate`'s epoch proof once fix 1 moved the advance before the insertion; the second advance closes both. The certificate design does not have the window, because its slow path waits on the registry lock.
+- **Not covered:** draw-time vertex and index checks (`Draw.cpp`) and DMA checks (`PacketMemory.cpp`) rebuild their ranges on every draw or packet and have no object that persists between them, so they still do a snapshot lookup each. Giving them proofs needs a per-pipeline or per-draw-state cache, which is a larger change. The generic `GuestMemory::Read` → `GuardRead` path has no owner either.
+- **Tests:** `CheckProof` covers recording, key mismatch, oversize growth and key, invalidation by a registration, survival across removals, and a read of a held proof writing nothing in the driver image. The stress test's readers also keep proofs, and fail if one holds for a guard that was published before the check. Removing the finishing advance makes this test fail in 3 of 3 runs (855, 1264 and 1598 stale acceptances); the code was restored before committing.
+- **Not measured:** a proof check is one load and a compare against N snapshot lookups (8–58 ns each in the benchmark) per bind. The in-driver saving per frame needs the GTA trace.
 
 ## Summary of results
 
@@ -189,7 +206,8 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `ctest_cert_validation.log` | The same tests plus `guard_certificate`, on `2a4339321`. |
 | `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
 | `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
-| `build2.log` … `build5.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
+| `ctest_proof_validation.log` | The same tests on `9a7128ddb` (proofs). |
+| `build2.log` … `build6.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
 
 Validation-error counts in the ctest logs: `VUID-VkDeviceCreateInfo-pNext-pNext` appears 27 times on main and 30 times on each change (3 per test, device creation only). No other VUIDs, and no `was not found but was requested by env var VK_INSTANCE_LAYERS` line.
 

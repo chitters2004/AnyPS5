@@ -196,15 +196,25 @@ void insert(Registry& reg, std::initializer_list<Range> ranges) {
 #endif
         if (snapshotDesign) for (const auto& r : ranges) overflow |= !snapshotInsert(r.a, r.b);
 #endif
+        const auto finish = [] {
+#if MUTANT != 6 && MUTANT != 1
+            growth.fetch_add(1, std::memory_order_release);
+#endif
+        };
+        std::this_thread::yield();
         bool first = true;
         for (const auto& r : ranges) {
             if (!first && failInsert.load(std::memory_order_relaxed)) {
+#if MUTANT != 5
+                finish();
+#endif
                 lock.unlock();
                 throw std::bad_alloc();
             }
             reg.ranges.push_back(r);
             first = false;
         }
+        finish();
 #if MUTANT == 5
         growth.fetch_add(1, std::memory_order_release);
         if (snapshotDesign) for (const auto& r : ranges) overflow |= !snapshotInsert(r.a, r.b);
@@ -218,7 +228,20 @@ void removeBelow(Registry& reg, u64 limit) {
     std::erase_if(reg.ranges, [&](const Range& r) { return r.a < limit; });
 }
 
-bool check(u64 a, u64 n) { return snapshotDesign ? checkSnapshot(a, n) : checkCertificate(a, n); }
+bool checkOnce(u64 a, u64 n) { return snapshotDesign ? checkSnapshot(a, n) : checkCertificate(a, n); }
+
+struct Proof { u64 growth = 0; u64 key = 0; };
+thread_local std::array<Proof, 8> proofs{};
+
+bool check(u64 a, u64 n) {
+    const u64 key = a / Stride;
+    auto& proof = proofs[key % proofs.size()];
+    const auto g = growth.load(std::memory_order_acquire);
+    if (proof.growth == g && proof.key == key) return false;
+    const bool hit = checkOnce(a, n);
+    if (!hit) proof = {g, key};
+    return hit;
+}
 
 u64 slot(u64 i) { return Base + i * Stride; }
 
