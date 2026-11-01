@@ -96,7 +96,6 @@ UploadFinish plus copyRegion (31.7%) is the real cap. Only step 4 or batched upl
 - `Graphics/src/Draw.cpp`: the plan's alias check uses main's `state.color.MemoryAddress()`. Main's occlusion partial-write check stays in `prepareDrawInputs`, because it reads `Recorder::Active()` (record-time state).
 - `CMakeLists.txt`: dropped the PR's copy of the old test block, which main moved in #12862. The `_plan_verify` registration now sits inside `agc_add_draw_pipeline_test`.
 
-Not built or tested yet.
 
 ## Next: merge the preparer branch (open)
 
@@ -111,13 +110,31 @@ Merging `johandavidcm/feat/agc-draw-prepare-ahead` on top conflicts in:
 - `Graphics/src/Draw.cpp`
 - `docs/dev/ENVIRONMENT.md`
 
-Both his stage A and #14051 restructure `prepareDraw`. That merge is unresolved.
+Both his stage A and #14051 restructure `prepareDraw`. Resolved in `98e9ff33a`; see above.
+
+## Preparer branch merged, exit crash fixed, built and tested
+
+- `98e9ff33a` merges johandavidcm `feat/agc-draw-prepare-ahead` (`4c1af4f48`, with #10678) onto the #14051 merge.
+  - The prepared-ahead fragment outputs, stages and vertex layout, and the early resource key, feed `planDraw`.
+  - An adopted pipeline takes precedence over main's shape memo.
+  - Main's `shape` parameter sits before `contentKey` and `ahead` in every `Draw` and `commitDraw` signature.
+  - The pipelined summary keeps main's separate read-range field.
+- `d73ca62fb` fixes the `agc_driver_draw_prepare_ahead` exit crash.
+  - Cause: `AheadDraw` is shared by the commit and the preparer job. Either can outlive the other in a thread's reclaim list until the thread exits, so the device could be destroyed before the prepared pipeline.
+  - Fix: `AheadDraw` now holds the device ahead of `prepared`, so the pipeline is always released first.
+- Built on Linux: GCC 13, Release, `BUILD_TESTING=ON`, targets `libSceAgcDriver`, the preparer test and the 22 draw-pipeline tests. No compile errors.
+- Tests on lavapipe (llvmpipe, LLVM 20.1.2) with `ANYPS5_REQUIRE_VULKAN=1 ANYPS5_NO_SHADER_CACHE=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation`:
+  - `agc_driver_draw_prepare_ahead` before the fix: 6 of 6 runs segfault at exit, with `VUID-vkDestroyDevice-device-05137`.
+  - After the fix: 6 of 6 pass, with no `05137`.
+  - The 22 draw-pipeline tests in their default, `_draw_pipeline` and `_plan_verify` variants, plus the preparer test: 67 of 67 pass, none skipped. They also pass 67 of 67 with `APS5_DRAW_PREPARE_AHEAD=1` added.
+  - The only validation error is `VUID-VkDeviceCreateInfo-pNext-pNext`. It comes from the installed validation layer (1.3.275) being older than a structure the driver passes, and is environmental.
+  - No log has the layer-missing line.
+  - `main` was not run as a comparison arm, and no Windows build was made.
 
 ## What could not be verified
 
 - About 3 hidden comments on #7895 (26 Oct) and the end of panicDa3m0n's 26 Oct comment: read only as a summary.
 - #14051: inline review threads, per-job CI results, the "needs rebase" label as shown on the page, and janzezno's comment (summary only).
-- No build or test was run for this branch.
 
 ## Commands
 
