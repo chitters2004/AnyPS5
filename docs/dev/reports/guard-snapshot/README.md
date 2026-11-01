@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -254,6 +254,32 @@ After the fix the guard test passed 0-fail in 40, 20 and 30 consecutive runs. Th
 4. **Formal check of the seqlocks** (snapshot and range proof) with a C11 model checker such as GenMC: x86 and TSan cannot catch a misplaced fence.
 5. **Range proof in the TSan model,** so the no-claim variant fails every run, not 1 in 5.
 6. **Windows and the GTA trace:** still the deciding gaps (see "Not verified").
+
+## Impact of the remaining improvements
+
+These are estimates, not measurements. Per-check costs come from this machine's benchmarks: a snapshot lookup is about 10–60 ns depending on threads and guards, and an owner-held proof about 1 ns. The per-frame counts are assumptions for scale, not GTA numbers.
+
+| Improvement | Saves | Likely impact |
+|---|---|---|
+| Proofs for draws without a recipe (first draws, cache misses) | about 30–110 ns per draw (3 lookups) | Depends on the draw-cache hit rate: near zero if it is high; about 0.15–0.5 ms per frame at an extreme 5,000 uncached draws. |
+| Proofs for DMA checks | 10–60 ns per DMA packet | Negligible (a few hundred packets is about 10 µs per frame), and it needs a new cache because nothing outlives a packet. |
+| Proofs on the generic `GuestMemory::Read` → `GuardRead` path | 10–60 ns per driver read of guest memory | The biggest unknown: about 0.1–0.6 ms per frame at 10,000 reads (up to about 4% of a 60 fps frame). There is no single owner, so it means per-caller work on the hottest callers; `GuestMemory::Read` already counts callers (`CountReadCaller`), so a GTA run shows which ones matter. |
+| Paged bitmap instead of the sorted array | a few ns per lookup at 12 guards | Negligible at GTA-like guard counts; only matters with hundreds of guards. |
+| Merging the miss scan into the exact path | one lock per overlapping read | Negligible: overlapping reads throw or retire the guard, so they are rare. |
+| Formal check of the seqlocks (GenMC) | none | Confidence only. Releases are x86-64 (TSO), so the remaining risk is mainly compiler reordering. |
+| Range proof in the TSan model | none | Test quality: the no-claim variant would fail every run instead of 1 in 5. |
+| Windows run | — | High value: nothing here has run on Windows, and its `shared_mutex` goes through a global spinlock, so main's cost and the gains are probably larger there. |
+| GTA trace | — | Highest value: it replaces every estimate in this table with a measurement. |
+
+Recommended next steps, before more code:
+1. Run the guard and recipe tests and the benchmark on Windows.
+2. Capture a GTA trace on main and on this branch, from the same machine and scene, summarised with `tools/trace_digest.py`. Per frame it should count:
+   - draws with and without a recipe;
+   - guest-memory reads per caller;
+   - DMA packets;
+   - registrations per second.
+
+If guest-memory reads turn out to be large, proofs on the top few callers are the one remaining change likely to matter.
 
 ## Summary of results
 
