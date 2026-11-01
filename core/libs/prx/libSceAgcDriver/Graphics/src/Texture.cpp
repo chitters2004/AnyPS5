@@ -178,7 +178,6 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
-    if (const auto labelCompare = LabelCompareReport(); !labelCompare.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s", labelCompare.c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -4329,10 +4328,24 @@ struct LabelCompareTotals {
     std::map<std::string, std::pair<std::uint64_t, double>> refusals;
     std::uint64_t waitsSkipped = 0;
     std::uint64_t skippedBlocks[5] = {};
-    std::map<std::string, std::uint64_t> gpuRefusals;
+    std::map<std::string, std::pair<std::uint64_t, double>> gpuRefusals;
 };
 
 std::atomic<std::uint64_t> conditionalStored{0}, conditionalKept{0}, conditionalSettled{0}, conditionalLeftStale{0};
+
+std::string LabelCompareReport();
+
+void ReportLabelCompareEvery10s() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    if (const auto text = LabelCompareReport(); !text.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s", text.c_str());
+}
 
 LabelCompareTotals& LabelCompareCounts() {
     static LabelCompareTotals totals;
@@ -4350,7 +4363,11 @@ std::string LabelCompareReport() {
         refusals += " " + why + text;
     }
     std::string gpuRefusals;
-    for (const auto& [why, count] : totals.gpuRefusals) gpuRefusals += " " + why + " " + std::to_string(count);
+    for (const auto& [why, entry] : totals.gpuRefusals) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %llu/%.1f ms", static_cast<unsigned long long>(entry.first), entry.second);
+        gpuRefusals += " " + why + text;
+    }
     char gpu[512];
     std::snprintf(gpu, sizeof(gpu), "[label-compare] GPU compare: waits skipped %llu, blocks store %llu keep %llu gpu %llu gpu-lease %llu; GPU-compared blocks stored %llu kept %llu; images in sync at completion %llu, left stale %llu; waits kept:%s\n", static_cast<unsigned long long>(totals.waitsSkipped), static_cast<unsigned long long>(totals.skippedBlocks[0]), static_cast<unsigned long long>(totals.skippedBlocks[1]), static_cast<unsigned long long>(totals.skippedBlocks[2]), static_cast<unsigned long long>(totals.skippedBlocks[4]), static_cast<unsigned long long>(conditionalStored.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalKept.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalSettled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalLeftStale.exchange(0, std::memory_order_relaxed)), gpuRefusals.c_str());
     char text[512];
@@ -4473,6 +4490,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     std::optional<LabelCompareCheck> labelCheck;
     std::optional<LabelCompareCheck> gpuCompare;
+    const char* gpuRefusal = nullptr;
     const auto shadowMode = LabelCompareShadowMode();
     const bool labelCheckWanted = shadowMode != LabelCompareShadow::Off && flush.size() == 1 && (shadowMode == LabelCompareShadow::Any || LabelStoreReason(reason));
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
@@ -4487,9 +4505,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 if (refusal == nullptr) gpuCompare = std::move(check);
                 else {
                     if (shadowMode == LabelCompareShadow::Any) std::fprintf(stderr, "[label-compare] GPU compare refused for image 0x%llx: %s\n", static_cast<unsigned long long>(flush.front()->descriptor.baseAddress), refusal);
-                    auto& totals = LabelCompareCounts();
-                    std::lock_guard lock(totals.mutex);
-                    ++totals.gpuRefusals[refusal];
+                    gpuRefusal = refusal;
                 }
             }
             if (writer != 0 && labelCheckWanted && !gpuCompare) labelCheck = flush.front()->labelCompareClassify(*recorder);
@@ -4505,7 +4521,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
             }
-            if (labelCheck) labelCheck->waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count();
+            const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count();
+            if (labelCheck) labelCheck->waitedMs = waitedMs;
+            if (gpuRefusal != nullptr) {
+                auto& totals = LabelCompareCounts();
+                std::lock_guard lock(totals.mutex);
+                auto& entry = totals.gpuRefusals[gpuRefusal];
+                ++entry.first;
+                entry.second += waitedMs;
+            }
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
@@ -4534,6 +4558,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     flushReason = previousReason;
     if (failure) std::rethrow_exception(failure);
     if (labelCheck) tallyLabelCompare(*labelCheck, flush.front()->descriptor.baseAddress, reason);
+    if (labelCheck || gpuCompare || gpuRefusal != nullptr) ReportLabelCompareEvery10s();
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
@@ -4982,6 +5007,10 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
         if (FlushPending(address, bytes, nullptr, reason)) ++stored;
     }
     return stored;
+}
+
+bool StorageTexture::LabelCompareActive() {
+    return LabelGpuCompareEnabled() || LabelCompareShadowMode() != LabelCompareShadow::Off;
 }
 
 void StorageTexture::StoreReadbackBeforeLabel(const char* reason) {

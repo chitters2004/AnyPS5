@@ -226,6 +226,7 @@ public:
     static constexpr std::uint64_t LabelCompareMaxBytes = 1024 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
+    static bool LabelCompareActive();
     static std::size_t StoreDrawnLinear(const char* reason);
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();

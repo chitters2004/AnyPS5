@@ -5984,8 +5984,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+    const bool labelCompare = StorageTexture::LabelCompareActive();
     if (auto split = guestMemory.SplitInPlaceReads()) {
-        if (kind == Recorder::ReadKind::AddressBased) {
+        if (labelCompare && kind == Recorder::ReadKind::AddressBased) {
             if (bda != nullptr && faultChecks) {
                 recorder.NoteLeaseTable(bda->Fault().buffer, split->space);
                 recorder.NoteLeaseTable(bda->Fault().buffer, std::make_shared<const Recorder::ReadList>(split->own.begin(), split->own.end()));
@@ -5997,7 +5998,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReads(split->own, kind);
     } else {
         const auto reads = guestMemory.InPlaceReads();
-        if (kind == Recorder::ReadKind::AddressBased) {
+        if (labelCompare && kind == Recorder::ReadKind::AddressBased) {
             if (bda != nullptr && faultChecks) recorder.NoteLeaseTable(bda->Fault().buffer, std::make_shared<const Recorder::ReadList>(reads.begin(), reads.end()));
             else recorder.NoteUntabledLease();
         }
@@ -6016,7 +6017,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
-    if (!reusable && NeedsCompletion()) recorder.NoteLateStamps(guestMemory.Writes());
+    if (labelCompare && !reusable && NeedsCompletion()) recorder.NoteLateStamps(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
