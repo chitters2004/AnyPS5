@@ -3433,7 +3433,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     return uploadedBytes;
 }
 
-std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save) {
+std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save, std::span<const std::pair<std::uint64_t, std::uint64_t>> conditional, std::pair<std::shared_ptr<Buffer>, std::size_t>* conditionalFlags) {
     const auto elementBytes = BytesPerElement(descriptor.format);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     std::uint64_t storedBytes = 0;
@@ -3554,6 +3554,19 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         });
         if (intoSlabs) slabRetiled.push_back({i, first, last});
     }
+    std::vector<VkBufferCopy> conditionalSources;
+    if (!conditional.empty()) {
+        Require(segments.size() == 1 && slabPieces.empty() && slabRetiled.empty() && conditionalFlags != nullptr, "a GPU-compared label store reached a write-back through unit shadows");
+        const auto& import = *segments.front().import;
+        std::vector<VkBufferCopy> plain;
+        for (const auto& copy : importCopies.front()) {
+            const auto guestBegin = descriptor.baseAddress + (copy.dstOffset - HostImportOffset(import, descriptor.baseAddress));
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> piece{{guestBegin, guestBegin + copy.size}};
+            for (const auto& [begin, end] : withoutRanges(piece, std::vector<std::pair<std::uint64_t, std::uint64_t>>(conditional.begin(), conditional.end()))) plain.push_back({copy.srcOffset + (begin - guestBegin), copy.dstOffset + (begin - guestBegin), end - begin});
+            conditionalSources.push_back({copy.srcOffset, guestBegin, copy.size});
+        }
+        importCopies.front() = std::move(plain);
+    }
     std::sort(seeds.begin(), seeds.end(), [](const SeedUnit& a, const SeedUnit& b) { return a.begin < b.begin; });
     std::vector<CopiedBytes> copied;
     for (std::size_t i = 0; i < windows.size(); ++i) {
@@ -3660,7 +3673,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     }
     const bool direct = singlePass();
     auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-    const bool scratchUsed = std::any_of(directRanges.begin(), directRanges.end(), [](const auto& range) { return range.first == range.second; }) || std::any_of(slabPieces.begin(), slabPieces.end(), [](const SlabPieces& pieces) { return !pieces.copies.empty(); }) || std::any_of(importCopies.begin(), importCopies.end(), [](const auto& copies) { return !copies.empty(); }) || !saves.empty() || !padding.copies.empty() || !seeds.empty();
+    const bool scratchUsed = std::any_of(directRanges.begin(), directRanges.end(), [](const auto& range) { return range.first == range.second; }) || std::any_of(slabPieces.begin(), slabPieces.end(), [](const SlabPieces& pieces) { return !pieces.copies.empty(); }) || std::any_of(importCopies.begin(), importCopies.end(), [](const auto& copies) { return !copies.empty(); }) || !saves.empty() || !padding.copies.empty() || !seeds.empty() || !conditional.empty();
     auto tiledScratch = scratchUsed ? std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(scratchTotal), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
     detiler.BeginBatch();
     auto* recorder = Recorder::Active();
@@ -3781,7 +3794,12 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             if (!importCopies[segment].empty()) copyBuffer(commands, tiledScratch->Handle(), segments[segment].import->buffer, static_cast<std::uint32_t>(importCopies[segment].size()), importCopies[segment].data());
         }
         if (!saves.empty()) copyBuffer(commands, tiledScratch->Handle(), save->Handle(), static_cast<std::uint32_t>(saves.size()), saves.data());
+        if (!conditional.empty()) {
+            Require(recorder != nullptr, "a GPU-compared label store has no recorder");
+            *conditionalFlags = recordConditionalStores(*recorder, commands, *segments.front().import, tiledScratch->Handle(), conditional, conditionalSources);
+        }
     }
+    Require(conditional.empty() || tiledScratch, "a GPU-compared label store retiled without its scratch");
     VkImageMemoryBarrier backToGeneral = toSource;
     backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -4516,7 +4534,7 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     };
     const auto base = descriptor.baseAddress;
     const auto size = static_cast<std::size_t>(guestBytes);
-    if (blockUnits || trackedLayers != 1) return refuse("units");
+    if ((blockUnits && guestBytes > SmallStoreBytes) || trackedLayers != 1) return refuse("units");
     if (descriptor.dccAddress != 0) return refuse("keys");
     if (descriptor.baseAddress % 4 != 0 || guestBytes % 4 != 0) return refuse("unaligned");
     if (!layerPending[0]) return refuse("not-pending");
@@ -4563,6 +4581,8 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     }
     check.classified = true;
     if (fallback) return refuse("fallback-block");
+    const bool onGpu = std::any_of(check.modes.begin(), check.modes.end(), [](LabelCompare::BlockMode mode) { return mode == LabelCompare::BlockMode::OnGpu; });
+    if (onGpu && !originalHolds(base, size) && generationBaseline.size() != guestBytes) return refuse("no-baseline");
     if (guestBytes > LabelCompareMaxBytes) return refuse("large");
     check.eligible = true;
     return check;
@@ -6263,7 +6283,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::withoutRang
     return left;
 }
 
-std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::span<const VkBufferCopy> sources) {
     std::size_t bytes = 0;
     for (const auto& [from, to] : ranges) {
         Require(from % 4 == 0 && to % 4 == 0 && to > from, "a GPU-compared label store range is not whole words");
@@ -6280,12 +6300,21 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditiona
         const auto& baseline = originalHolds(from, length) ? original : generationBaseline;
         Require(baseline.size() == guestBytes, "a GPU-compared label store has no baseline");
         std::memcpy(memory.data() + bytes + at, baseline.data() + offset, length);
-        copies.push_back({offset, at, length});
+        if (sources.empty()) {
+            copies.push_back({offset, at, length});
+        } else {
+            std::memcpy(memory.data() + at, baseline.data() + offset, length);
+            for (const auto& source : sources) {
+                const auto begin = std::max<std::uint64_t>(from, source.dstOffset);
+                const auto end = std::min<std::uint64_t>(to, source.dstOffset + source.size);
+                if (begin < end) copies.push_back({source.srcOffset + (begin - source.dstOffset), at + (begin - from), end - begin});
+            }
+        }
         at += length;
     }
     std::memset(memory.data() + flagsOffset, 0, 4 * ranges.size());
-    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, results, staging->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, results, staging->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     const auto address = staging->DeviceAddress();
     at = 0;
     for (std::size_t index = 0; index < ranges.size(); ++index) {
@@ -6548,11 +6577,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
         // Outside the write watch the stored bytes are what the next store compares with.
         const auto saveUnits = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored)) ? std::vector<std::uint32_t>{} : prepareStoredSave(layers, skippedLayer);
-        Require(conditional.empty() || (!blockUnits && !drawn.rect && saveUnits.empty() && segments.size() == 1), "a GPU-compared label store took a write-back path without the compare");
+        Require(conditional.empty() || ((!blockUnits || guestBytes <= SmallStoreBytes) && !drawn.rect && saveUnits.empty() && segments.size() == 1), "a GPU-compared label store took a write-back path without the compare");
+        const bool conditionalSave = !conditional.empty() && skipped == 0 && !GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+        if (conditionalSave && !savedBytes) savedBytes = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::pair<std::shared_ptr<Buffer>, std::size_t> conditionalFlags;
         if (blockUnits) {
             if (guestBytes <= SmallStoreBytes) PublishShadow(firstStored, static_cast<std::size_t>(lastStored - firstStored), PublishScope::PartialUnits, PublishReason::Upload);
             // The kept blocks alone pass through the retiler (windows of their slices).
-            const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() ? nullptr : savedBytes.get());
+            const auto storedBytes = writeBackWindows(segments, keep, firstStored, lastStored, shadowed, imported, saveUnits.empty() && !conditionalSave ? nullptr : savedBytes.get(), conditional, &conditionalFlags);
             countStorageWriteBack(storedBytes, true);
             if (profile) Profile().storageGpu += timer.lap();
             forgetStored();
@@ -6562,6 +6594,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
             commitStoredSave(saveUnits);
+            if (!conditional.empty() && skipped == 0) settleConditionalAtCompletion(*Recorder::Active(), conditionalFlags, conditional.size(), conditionalSave, firstStored, lastStored);
             ++Profile().storageDirectWriteBacks;
             return;
         }
@@ -6604,9 +6637,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             for (const auto& [begin, end] : coveredBytes(runs)) importStores.emplace_back(descriptor.baseAddress + begin, descriptor.baseAddress + end);
             padding = {};
         }
-        const bool conditionalSave = !conditional.empty() && skipped == 0 && !GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored));
-        if (conditionalSave && !savedBytes) savedBytes = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        std::pair<std::shared_ptr<Buffer>, std::size_t> conditionalFlags;
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;

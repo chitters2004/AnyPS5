@@ -223,7 +223,7 @@ public:
     static bool WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr);
     static void SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes);
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
-    static constexpr std::uint64_t LabelCompareMaxBytes = 256 * 1024;
+    static constexpr std::uint64_t LabelCompareMaxBytes = 1024 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
     static std::size_t StoreDrawnLinear(const char* reason);
@@ -433,7 +433,7 @@ private:
     void noteLabelCompareBlock(std::uint64_t at, bool written, std::uint64_t from, std::uint64_t to);
     static void tallyLabelCompare(const LabelCompareCheck& check, std::uint64_t image, const char* reason);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> withoutRanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& removed);
-    std::pair<std::shared_ptr<Buffer>, std::size_t> recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+    std::pair<std::shared_ptr<Buffer>, std::size_t> recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::span<const VkBufferCopy> sources = {});
     void settleConditionalAtCompletion(Recorder& recorder, const std::pair<std::shared_ptr<Buffer>, std::size_t>& flags, std::size_t count, bool save, std::uint64_t firstStored, std::uint64_t lastStored);
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
@@ -511,7 +511,7 @@ private:
     // The write-back retiles into the import's unit shadow where a slab takes the piece
     // (`shadowed` receives those guest ranges, `imported` the pieces written to the import).
     std::uint64_t uploadWindows(const HostImport& import, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool discard = false);
-    std::uint64_t writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save = nullptr);
+    std::uint64_t writeBackWindows(std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::uint64_t firstStored, std::uint64_t lastStored, std::vector<ShadowedRange>& shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>& imported, Buffer* save = nullptr, std::span<const std::pair<std::uint64_t, std::uint64_t>> conditional = {}, std::pair<std::shared_ptr<Buffer>, std::size_t>* conditionalFlags = nullptr);
     struct DrawnRect {
         std::uint32_t left = 0;
         std::uint32_t top = 0;

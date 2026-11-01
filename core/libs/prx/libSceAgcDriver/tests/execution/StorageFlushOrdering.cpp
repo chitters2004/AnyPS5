@@ -122,11 +122,58 @@ std::vector<std::uint32_t> GlobalUserData(std::uint64_t base) {
     return userData;
 }
 
-bool AddressBasedStorePending(std::uint64_t image, bool open) {
+bool AddressBasedStorePending(std::uint64_t image, bool open, std::size_t bytes = ImageBytes) {
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     const auto* recorder = AgcDriver::Graphics::Recorder::Active();
-    const auto read = recorder != nullptr ? recorder->DescribePendingRead(image + ImageBytes, 4u) : std::nullopt;
+    const auto read = recorder != nullptr ? recorder->DescribePendingRead(image + bytes, 4u) : std::nullopt;
     return read.has_value() && read->kind == AgcDriver::Graphics::Recorder::ReadKind::AddressBased && read->open == open;
+}
+
+constexpr std::uint32_t TiledSide = 128;
+constexpr std::size_t TiledBytes = TiledSide * TiledSide * 4u;
+constexpr std::uint32_t TileStandard64KB = 9;
+
+std::vector<std::uint32_t> TiledUserData(std::uint64_t base) {
+    std::vector<std::uint32_t> userData(12, 0u);
+    userData[4] = static_cast<std::uint32_t>(base >> 8u);
+    userData[5] = static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format32UInt << 20u) | (((TiledSide - 1u) & 3u) << 30u);
+    userData[6] = ((TiledSide - 1u) >> 2u) | ((TiledSide - 1u) << 14u);
+    userData[7] = 0xfacu | (TileStandard64KB << 20u) | (Type2D << 28u);
+    return userData;
+}
+
+void RunTiled(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, const char* name, bool baseline) {
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = guest.Address() + offset;
+    const auto target = device.Target();
+    const auto& globalCode = baseline ? StoreBaselineCode : StoreGlobalCode;
+    const auto storeImage = Compile(StoreImageCode, TiledUserData(image), target);
+    const auto storeGlobal = Compile(globalCode, GlobalUserData(image), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(globalCode.data()));
+    const std::string what = std::string("storage flush ordering, tiled ") + name + ": ";
+    Require(AddressBasedStorePending(image, true, TiledBytes), what + "the address-based store was not pending in the open batch at the flush");
+    std::shared_ptr<AgcDriver::Graphics::StorageTexture> texture;
+    std::uint64_t before = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        texture = AgcDriver::Graphics::StorageTexture::FindLive(image, TiledBytes);
+        if (texture != nullptr) before = texture->Generation();
+    }
+    Require(texture != nullptr, what + "the image has no storage texture");
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, TiledBytes, nullptr, "readback before label"), what + "the image store left no results pending");
+    Require(AddressBasedStorePending(image, true, TiledBytes), what + "the label store waited for the address-based store instead of comparing on the GPU");
+    device.WaitIdle();
+    const auto stored = std::count(words, words + TiledBytes / 4u, Stored);
+    if (baseline) {
+        Require(stored == 2 && words[OverwrittenDword] == Initial, what + "the image's two texels were not stored over a write of the same bytes");
+    } else {
+        Require(stored == 0 && words[OverwrittenDword] == Overwritten, what + "the image's store put its older texels over a newer address-based store");
+    }
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const bool synced = AgcDriver::GuestMemory::Watched(image, TiledBytes) ? texture->Generation() > before : texture->GuestSnapshotValid();
+    if (baseline) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
+    else Require(!synced, what + "the image whose block the GPU kept was put back in sync at completion");
 }
 
 void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, bool gpuCompare, bool baseline = false) {
@@ -186,7 +233,11 @@ int main(int argc, char** argv) {
         else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
         else Run(*device, guest, 0, true, "writer in flight", gpuCompare);
         Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch", gpuCompare);
-        if (gpuCompare) Run(*device, guest, BlockBytes / 4u, false, "writer of the baseline bytes in the open batch", gpuCompare, true);
+        if (gpuCompare) {
+            Run(*device, guest, BlockBytes / 4u, false, "writer of the baseline bytes in the open batch", gpuCompare, true);
+            RunTiled(*device, guest, BlockBytes / 8u, "writer in the open batch", false);
+            RunTiled(*device, guest, 3u * BlockBytes / 4u, "writer of the baseline bytes in the open batch", true);
+        }
         std::puts("storage flush ordering tests passed");
         return 0;
     } catch (const std::exception& error) {
