@@ -17,7 +17,9 @@ Commits, oldest first:
 7. `08811bbd3` feat(agc): compare small block-unit label stores on the GPU and allow images up to 1 MiB
 8. `43de569b4` docs: report update
 9. `0beed21ce` feat(agc): read pending leases' written-page tables in the label store GPU compare
-10. this report update
+10. `fe1a7b9e9` docs: report update
+11. `8a7ab13ae` feat(agc): split the label store fallback refusals by cause in shadow mode
+12. this report update
 
 Line references below are at commit 7 unless noted; search by function name if they moved. Paths are under `core/libs/prx/libSceAgcDriver/`.
 
@@ -273,8 +275,11 @@ flush waits dominate after this.
 1. Note the `[write-watch] host imports ...` line.
 2. Same machine and scene, `main` and head, `tools/trace_digest.py` summaries.
 3. Head with `APS5_LABEL_COMPARE_SHADOW=1` and the storage profile: mismatches must be 0; eligible
-   wait time bounds the saving; refusal reasons (`large`, `units`, `keys`, `fallback-block`,
-   `no-baseline`, ...) rank the next work.
+   wait time bounds the saving; each refusal reason is printed as `count/ms waited`
+   (`large`, `units`, `keys`, `no-baseline`, ...). Fallback blocks are split (commit 11):
+   `fallback-edge`, `fallback-lease-in-flight`, `fallback-lease-untabled`,
+   `fallback-lease-table-shared`, `fallback-lease-no-table`, and `fallback-edge+<lease reason>`
+   when both apply. The in-flight and edge numbers decide the two extensions discussed below.
 4. Head with `APS5_LABEL_GPU_COMPARE=1`: the `[label-compare] GPU compare` line gives waits
    skipped, blocks per mode, GPU ranges stored and kept, images in sync at completion and left
    stale, and why waits stayed; compare frame p50, the label wait and storage uploads per 10 s
