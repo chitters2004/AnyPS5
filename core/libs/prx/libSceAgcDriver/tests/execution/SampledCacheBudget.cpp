@@ -636,6 +636,31 @@ void replacedEntryTests(Context context) {
     std::puts("template over a replaced sampled cache entry passed");
 }
 
+void stampedCompareTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    auto* bytes = reinterpret_cast<volatile std::uint8_t*>(surface.Address());
+    constexpr std::size_t Stamped = 2 * 65536 + 0x1234;
+    const auto first = Sampled(context, surface.Address());
+    Require(!first->ViewsStorageImage(), "the stamped compare fixture is not a snapshot");
+    Require(Sampled(context, surface.Address()) == first, "an unchanged tracked surface did not serve its snapshot");
+    const auto before = AgcDriver::GuestMemory::CollectWritesUncached(surface.Address(), SurfaceBytes);
+    bytes[Stamped] = bytes[Stamped];
+    AgcDriver::GuestMemory::CollectWritesUncached(surface.Address(), SurfaceBytes);
+    Require(before != 0 && !AgcDriver::GuestMemory::UnchangedSince(surface.Address(), SurfaceBytes, before), "the rewritten block was not stamped");
+    Require(Sampled(context, surface.Address()) == first, "a stamped block rewritten with its own bytes rebuilt the snapshot");
+    bytes[Stamped] = static_cast<std::uint8_t>(bytes[Stamped] ^ 0x3c);
+    const auto changed = Sampled(context, surface.Address());
+    Require(changed != first, "a changed stamped block did not rebuild the snapshot");
+    Require(Sampled(context, surface.Address()) == changed, "the rebuilt snapshot of an unchanged surface was not served");
+    bytes[SurfaceBytes - 1] = static_cast<std::uint8_t>(bytes[SurfaceBytes - 1] ^ 0x3c);
+    Require(Sampled(context, surface.Address()) != changed, "a changed last page did not rebuild the snapshot");
+    ClearCachedTextures(context.device);
+    std::puts("stamped compare of a tracked sampled snapshot passed");
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1372,6 +1397,11 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!lookupChangedTests(context)) return VulkanTestSkipped;
             std::puts("resource cache lookup-changed tests passed");
+            return 0;
+        }
+        if (mode == "stamped-compare") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            stampedCompareTests(context);
             return 0;
         }
         if (mode == "collect-refusals") {
