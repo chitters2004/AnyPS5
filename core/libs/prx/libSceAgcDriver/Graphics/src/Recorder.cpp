@@ -3187,6 +3187,16 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     return 0;
 }
 
+bool Recorder::PendingLeaseOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    if (open != nullptr && readOverlap(*open, address, end, ReadKind::AddressBased).has_value()) return true;
+    for (const auto& batch : inFlight) {
+        if (readOverlap(*batch, address, end, ReadKind::AddressBased).has_value()) return true;
+    }
+    return false;
+}
+
 bool Recorder::signaled(const Batch& batch) const {
     return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
 }

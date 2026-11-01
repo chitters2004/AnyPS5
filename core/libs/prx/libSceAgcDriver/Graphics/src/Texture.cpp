@@ -144,6 +144,7 @@ struct DrawnPending {
 };
 
 DrawnPending drawnPending();
+std::string LabelCompareReport();
 
 void reportStorageTraffic(StorageTraffic& traffic) {
     const auto now = std::chrono::steady_clock::now();
@@ -177,6 +178,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    if (const auto labelCompare = LabelCompareReport(); !labelCompare.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s", labelCompare.c_str());
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -4256,6 +4258,59 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 namespace {
 
+enum class LabelCompareShadow { Off, Label, Any };
+
+LabelCompareShadow LabelCompareShadowMode() {
+    static const LabelCompareShadow mode = [] {
+        const char* value = std::getenv("APS5_LABEL_COMPARE_SHADOW");
+        if (value == nullptr) return LabelCompareShadow::Off;
+        if (std::strcmp(value, "1") == 0) return LabelCompareShadow::Label;
+        if (std::strcmp(value, "any") == 0) return LabelCompareShadow::Any;
+        throw std::runtime_error(std::string("APS5_LABEL_COMPARE_SHADOW=") + value + ": expected 1 or any");
+    }();
+    return mode;
+}
+
+bool LabelStoreReason(const char* reason) {
+    return reason != nullptr && std::strncmp(reason, "readback before ", 16) == 0;
+}
+
+struct LabelCompareTotals {
+    std::mutex mutex;
+    std::uint64_t checks = 0;
+    std::uint64_t eligible = 0;
+    std::uint64_t blocks[4] = {};
+    std::uint64_t compared = 0;
+    std::uint64_t mismatches = 0;
+    double eligibleWaitMs = 0;
+    double refusedWaitMs = 0;
+    std::map<std::string, std::uint64_t> refusals;
+};
+
+LabelCompareTotals& LabelCompareCounts() {
+    static LabelCompareTotals totals;
+    return totals;
+}
+
+std::string LabelCompareReport() {
+    if (LabelCompareShadowMode() == LabelCompareShadow::Off) return {};
+    auto& totals = LabelCompareCounts();
+    std::lock_guard lock(totals.mutex);
+    std::string refusals;
+    for (const auto& [why, count] : totals.refusals) refusals += " " + why + " " + std::to_string(count);
+    char text[512];
+    std::snprintf(text, sizeof(text), "[label-compare] waits checked %llu, eligible %llu (%.1f ms waited), refused %llu (%.1f ms waited:%s); blocks store %llu keep %llu gpu %llu fallback %llu; decisions compared %llu, mismatches %llu\n", static_cast<unsigned long long>(totals.checks), static_cast<unsigned long long>(totals.eligible), totals.eligibleWaitMs, static_cast<unsigned long long>(totals.checks - totals.eligible), totals.refusedWaitMs, refusals.c_str(), static_cast<unsigned long long>(totals.blocks[0]), static_cast<unsigned long long>(totals.blocks[1]), static_cast<unsigned long long>(totals.blocks[2]), static_cast<unsigned long long>(totals.blocks[3]), static_cast<unsigned long long>(totals.compared), static_cast<unsigned long long>(totals.mismatches));
+    totals.checks = 0;
+    totals.eligible = 0;
+    for (auto& count : totals.blocks) count = 0;
+    totals.compared = 0;
+    totals.mismatches = 0;
+    totals.eligibleWaitMs = 0;
+    totals.refusedWaitMs = 0;
+    totals.refusals.clear();
+    return text;
+}
+
 void waitForIdlePublish(const char* reason) {
     if (reason == nullptr || std::strcmp(reason, "idle") != 0 || Recorder::InCompletion()) return;
     if (auto* recorder = Recorder::Active()) {
@@ -4358,15 +4413,22 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
+    std::optional<LabelCompareCheck> labelCheck;
+    const auto shadowMode = LabelCompareShadowMode();
+    const bool labelCheckWanted = shadowMode != LabelCompareShadow::Off && flush.size() == 1 && (shadowMode == LabelCompareShadow::Any || LabelStoreReason(reason));
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion() && recorder->PendingWriterSerial(address, bytes, ownNotes) != 0) {
         try {
             recorder->Reap();
-            if (const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes); writer == recorder->OpenSerial()) {
+            const auto writer = recorder->PendingWriterSerial(address, bytes, ownNotes);
+            if (writer != 0 && labelCheckWanted) labelCheck = flush.front()->labelCompareClassify(*recorder);
+            const auto waitStarted = std::chrono::steady_clock::now();
+            if (writer == recorder->OpenSerial()) {
                 Recorder::CountSync(recorder->OpenWriteOverlaps(address, bytes) ? 1 : 3);
                 recorder->Sync();
             } else if (writer != 0) {
                 recorder->FinishUpTo(writer);
             }
+            if (labelCheck) labelCheck->waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count();
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
@@ -4378,6 +4440,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
+            struct Attach {
+                StorageTexture& texture;
+                ~Attach() { texture.labelCompareCheck = nullptr; }
+            } attach{*texture};
+            if (labelCheck) texture->labelCompareCheck = &*labelCheck;
             texture->writeBack(address, bytes);
         } catch (...) {
             if (!failure) failure = std::current_exception();
@@ -4385,6 +4452,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     flushReason = previousReason;
     if (failure) std::rethrow_exception(failure);
+    if (labelCheck) tallyLabelCompare(*labelCheck, flush.front()->descriptor.baseAddress, reason);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
@@ -4393,6 +4461,97 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         if (published != nullptr) *published = units != 0;
     }
     return true;
+}
+
+StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Recorder& recorder) {
+    LabelCompareCheck check;
+    const auto refuse = [&](const char* why) {
+        check.refusal = why;
+        return check;
+    };
+    const auto base = descriptor.baseAddress;
+    const auto size = static_cast<std::size_t>(guestBytes);
+    if (blockUnits || trackedLayers != 1) return refuse("units");
+    if (descriptor.dccAddress != 0) return refuse("keys");
+    if (!layerPending[0]) return refuse("not-pending");
+    if (drawnListed) return refuse("drawn");
+    if (const auto drawn = drawnArea(); drawn.drawn || drawn.rect) return refuse("drawn");
+    if (ExistingHostImportFor(context, base, size) == nullptr) return refuse("import");
+    if (!GuestMemory::Watched(base, size)) return refuse("unwatched");
+    if (AnyShadowedOverlaps(base, size)) return refuse("shadowed");
+    if (Recorder::PendingCompletionStores() != 0 || Recorder::PendingCompletionLabels() != 0) return refuse("completion-stores");
+    if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse("copied-writers");
+    constexpr std::uint64_t block = 65536;
+    const auto end = base + guestBytes;
+    check.spanBegin = base & ~(block - 1);
+    const auto blocks = static_cast<std::size_t>((end - check.spanBegin + block - 1) / block);
+    GuestMemory::CollectWritesUncached(base, size);
+    std::vector<std::uint64_t> generations(blocks);
+    for (std::size_t k = 0; k < blocks; ++k) generations[k] = unitBlockGeneration(0, check.spanBegin + k * block);
+    std::vector<std::uint8_t> changed(blocks);
+    if (!GuestMemory::ChangedBlocks(base, size, generations, changed)) return refuse("untracked");
+    check.written.assign(blocks, -1);
+    check.changedAfter.assign(blocks, -1);
+    bool fallback = false;
+    for (std::size_t k = 0; k < blocks; ++k) {
+        const auto at = check.spanBegin + k * block;
+        const auto from = std::max(at, base);
+        const auto to = std::min(at + block, end);
+        const bool edge = from != at || to != at + block;
+        LabelCompare::BlockState state;
+        state.kept = keptAtUnwatchHolds(from, 0);
+        state.unknown = layerGeneration[0] == 0;
+        state.stampedNow = changed[k] == GuestMemory::BlockWritten && (!edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), unitBlockGeneration(0, at)));
+        state.changedNow = !unchangedSinceBaseline(from, to);
+        state.writerOver = recorder.PendingWriteOverlaps(from, static_cast<std::size_t>(to - from));
+        state.leaseOver = recorder.PendingLeaseOverlaps(from, static_cast<std::size_t>(to - from));
+        const auto mode = LabelCompare::Classify(state);
+        fallback = fallback || mode == LabelCompare::BlockMode::Fallback;
+        check.modes.push_back(mode);
+    }
+    check.classified = true;
+    if (fallback) return refuse("fallback-block");
+    if (guestBytes > SmallStoreBytes) return refuse("large");
+    check.eligible = true;
+    return check;
+}
+
+void StorageTexture::noteLabelCompareBlock(std::uint64_t at, bool written, std::uint64_t from, std::uint64_t to) {
+    auto& check = *labelCompareCheck;
+    if (at < check.spanBegin) return;
+    const auto k = static_cast<std::size_t>((at - check.spanBegin) / 65536);
+    if (k >= check.written.size()) return;
+    check.written[k] = written ? 1 : 0;
+    check.changedAfter[k] = unchangedSinceBaseline(from, to) ? 0 : 1;
+}
+
+void StorageTexture::tallyLabelCompare(const LabelCompareCheck& check, std::uint64_t image, const char* reason) {
+    static std::atomic<int> reports{0};
+    auto& totals = LabelCompareCounts();
+    std::size_t mismatched = 0, compared = 0;
+    std::string modes;
+    for (std::size_t k = 0; k < check.modes.size(); ++k) {
+        modes += std::string(" ") + LabelCompare::ModeName(check.modes[k]);
+        if (!check.classified || check.modes[k] == LabelCompare::BlockMode::Fallback || check.written[k] < 0) continue;
+        ++compared;
+        const bool predicted = LabelCompare::Written(check.modes[k], check.changedAfter[k] == 1);
+        if (predicted == (check.written[k] == 1)) continue;
+        ++mismatched;
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[label-compare] mismatch image 0x%llx block %zu mode %s changed-after %d written %d for %s\n", static_cast<unsigned long long>(image), k, LabelCompare::ModeName(check.modes[k]), check.changedAfter[k], check.written[k], reason != nullptr ? reason : "?");
+    }
+    if (LabelCompareShadowMode() == LabelCompareShadow::Any) std::fprintf(stderr, "[label-compare] checked image 0x%llx for %s: %s, blocks%s, %zu compared, %zu mismatched\n", static_cast<unsigned long long>(image), reason != nullptr ? reason : "?", check.eligible ? "eligible" : check.refusal, modes.c_str(), compared, mismatched);
+    std::lock_guard lock(totals.mutex);
+    ++totals.checks;
+    if (check.eligible) {
+        ++totals.eligible;
+        totals.eligibleWaitMs += check.waitedMs;
+    } else {
+        totals.refusedWaitMs += check.waitedMs;
+        ++totals.refusals[check.refusal != nullptr ? check.refusal : "?"];
+    }
+    for (const auto mode : check.modes) ++totals.blocks[static_cast<std::size_t>(mode)];
+    totals.compared += compared;
+    totals.mismatches += mismatched;
 }
 
 bool StorageTexture::WaitForFlushing(std::uint64_t address, std::size_t bytes, const StorageTexture* except) {
@@ -6139,6 +6298,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto index = static_cast<std::size_t>((at - spanBegin) / block);
             const bool kept = keptAtUnwatchHolds(from, layer);
             const bool written = kept || unknown || (changedBlocks[index] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), unitBlockGeneration(layer, at))) && !unchangedSinceBaseline(from, to));
+            if (labelCompareCheck != nullptr && layer == 0) noteLabelCompareBlock(at, written, from, to);
             if (written && (!drawn.rect || (tracked && !kept && !unknown && cpuBlocks[index] == 0))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;

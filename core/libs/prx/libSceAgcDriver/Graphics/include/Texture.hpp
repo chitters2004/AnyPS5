@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/LabelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -416,6 +417,19 @@ private:
     void writeBack(std::uint64_t address, std::size_t bytes);
     void writeBackLayers(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
+    struct LabelCompareCheck {
+        bool eligible = false;
+        bool classified = false;
+        const char* refusal = nullptr;
+        std::uint64_t spanBegin = 0;
+        std::vector<LabelCompare::BlockMode> modes;
+        std::vector<std::int8_t> written;
+        std::vector<std::int8_t> changedAfter;
+        double waitedMs = 0;
+    };
+    LabelCompareCheck labelCompareClassify(const Recorder& recorder);
+    void noteLabelCompareBlock(std::uint64_t at, bool written, std::uint64_t from, std::uint64_t to);
+    static void tallyLabelCompare(const LabelCompareCheck& check, std::uint64_t image, const char* reason);
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
@@ -682,6 +696,7 @@ private:
     bool pendingFromOthers = false;
     std::vector<DrawnRect> drawnRects;
     std::vector<std::uint64_t> storeNotes;
+    LabelCompareCheck* labelCompareCheck = nullptr;
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
