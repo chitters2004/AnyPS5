@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/Api.hpp"
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
@@ -6512,6 +6513,34 @@ void descriptorSnapshotTests() {
             recorder.Sync();
         }
         Require(mock.live == 0, "snapshot descriptor resources leaked Vulkan objects");
+    }
+}
+
+void performanceContextTests() {
+    using AgcDriver::PerformanceContext;
+    AgcDriver::FrameTiming outerFrame(1, true), threadFrame(2, true);
+    const auto base = PerformanceContext::TimedContexts();
+    Require(PerformanceContext::Current() == nullptr, "a thread without a timing context has a frame");
+    {
+        PerformanceContext untimed(nullptr);
+        Require(PerformanceContext::Current() == nullptr && PerformanceContext::TimedContexts() == base, "a context without a frame was counted or gave a frame");
+        {
+            PerformanceContext outer(&outerFrame);
+            Require(PerformanceContext::Current() == &outerFrame && PerformanceContext::TimedContexts() == base + 1, "a timed context did not give its frame");
+            {
+                PerformanceContext inner(nullptr);
+                Require(PerformanceContext::Current() == nullptr, "a nested context without a frame did not hide the outer frame");
+                bool other = false;
+                std::thread([&] {
+                    const bool clean = PerformanceContext::Current() == nullptr;
+                    PerformanceContext own(&threadFrame);
+                    other = clean && PerformanceContext::Current() == &threadFrame;
+                }).join();
+                Require(other && PerformanceContext::Current() == nullptr, "another thread saw this thread's frame or lost its own");
+            }
+            Require(PerformanceContext::Current() == &outerFrame, "leaving a nested context did not restore the outer frame");
+        }
+        Require(PerformanceContext::Current() == nullptr && PerformanceContext::TimedContexts() == base, "leaving a timed context left it counted or its frame current");
     }
 }
 
@@ -13336,6 +13365,7 @@ int main(int argc, char** argv) {
         oversizedDescriptorTests();
         guestBufferViewBytesTests();
         descriptorSnapshotTests();
+        performanceContextTests();
         writtenSetReuseTests();
         dynamicDrawDataTests();
         dispatchMoveTests();

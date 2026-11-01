@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -239,7 +240,8 @@ private:
 
 class PerformanceContext {
 public:
-    explicit PerformanceContext(FrameTiming* frame) : previous(current) {
+    explicit PerformanceContext(FrameTiming* frame) : previous(current), counted(frame != nullptr) {
+        if (counted) timed.fetch_add(1, std::memory_order_relaxed);
         current = frame;
     }
 
@@ -248,15 +250,23 @@ public:
 
     ~PerformanceContext() {
         current = previous;
+        if (counted) timed.fetch_sub(1, std::memory_order_relaxed);
     }
 
     static FrameTiming* Current() {
+        if (timed.load(std::memory_order_relaxed) == 0) return nullptr;
         return current;
+    }
+
+    static std::uint32_t TimedContexts() {
+        return timed.load(std::memory_order_relaxed);
     }
 
 private:
     inline static thread_local FrameTiming* current = nullptr;
+    inline static std::atomic<std::uint32_t> timed{0};
     FrameTiming* previous;
+    bool counted;
 };
 
 class PerformanceTimer {
