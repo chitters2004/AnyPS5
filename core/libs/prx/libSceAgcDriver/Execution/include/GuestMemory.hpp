@@ -13,6 +13,40 @@
 
 namespace AgcDriver::GuestMemory {
 
+class RangeProof {
+public:
+    bool Holds(std::uint64_t address, std::uint64_t bytes, std::uint64_t epoch) const noexcept {
+        return epoch != 0u && Stamp(address, bytes) == epoch;
+    }
+
+    std::uint64_t Stamp(std::uint64_t address, std::uint64_t bytes) const noexcept {
+        const auto version = sequence.load(std::memory_order_acquire);
+        if ((version & 1u) != 0u) return 0u;
+        const auto provedEpoch = this->epoch.load(std::memory_order_relaxed);
+        const auto provedAddress = this->address.load(std::memory_order_relaxed);
+        const auto provedBytes = this->bytes.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (sequence.load(std::memory_order_relaxed) != version || provedAddress != address || provedBytes != bytes) return 0u;
+        return provedEpoch;
+    }
+
+    void Record(std::uint64_t address, std::uint64_t bytes, std::uint64_t epoch) noexcept {
+        auto version = sequence.load(std::memory_order_relaxed);
+        if ((version & 1u) != 0u || !sequence.compare_exchange_strong(version, version + 1u, std::memory_order_relaxed)) return;
+        std::atomic_thread_fence(std::memory_order_release);
+        this->epoch.store(epoch, std::memory_order_relaxed);
+        this->address.store(address, std::memory_order_relaxed);
+        this->bytes.store(bytes, std::memory_order_relaxed);
+        sequence.store(version + 2u, std::memory_order_release);
+    }
+
+private:
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint64_t> epoch{0};
+    std::atomic<std::uint64_t> address{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);

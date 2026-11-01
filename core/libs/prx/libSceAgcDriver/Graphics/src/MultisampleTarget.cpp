@@ -916,6 +916,36 @@ void rebuildGuardSnapshot() {
     publishGuardSnapshot(merged);
 }
 
+constexpr std::uint64_t GuardLogCapacity = 64;
+
+struct GuardLog {
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint64_t> count{0};
+    std::array<std::atomic<std::uint64_t>, GuardLogCapacity> finish{};
+    std::array<std::atomic<std::uint64_t>, GuardLogCapacity> begin{};
+    std::array<std::atomic<std::uint64_t>, GuardLogCapacity> end{};
+    std::atomic<bool> lost{false};
+};
+
+constinit GuardLog guardLog{};
+
+void logGuardRanges(std::uint64_t finish, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    const auto sequence = guardLog.sequence.load(std::memory_order_relaxed);
+    guardLog.sequence.store(sequence + 1u, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    auto count = guardLog.count.load(std::memory_order_relaxed);
+    for (const auto& [address, bytes] : ranges) {
+        const auto interval = guardInterval(address, bytes, 0u);
+        const auto slot = static_cast<std::size_t>(count % GuardLogCapacity);
+        guardLog.finish[slot].store(finish, std::memory_order_relaxed);
+        guardLog.begin[slot].store(interval.begin, std::memory_order_relaxed);
+        guardLog.end[slot].store(interval.end, std::memory_order_relaxed);
+        ++count;
+    }
+    guardLog.count.store(count, std::memory_order_relaxed);
+    guardLog.sequence.store(sequence + 2u, std::memory_order_release);
+}
+
 bool colorOverlaps(std::uint64_t address, std::uint64_t end) {
     std::shared_lock lock(guardedMutex());
     return std::ranges::any_of(guarded(), [&](const auto& range) { return address < range.address + range.bytes && range.address < end; });
@@ -1645,8 +1675,8 @@ std::uint64_t ResidentGuardGrowth_nid_no_patch() {
 }
 
 void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap) {
-    guardGrowth().fetch_add(1, std::memory_order_release);
     std::lock_guard lock(guardSnapshotWriter());
+    guardGrowth().fetch_add(1, std::memory_order_release);
     const auto count = guardSnapshot.count.load(std::memory_order_relaxed);
     if (count == GuardSnapshotOverflow) return;
     std::vector<GuardInterval> intervals;
@@ -1659,8 +1689,43 @@ void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_
     publishGuardSnapshot(mergedGuardIntervals(std::move(intervals)));
 }
 
-void FinishResidentGuardRegistration_nid_no_patch() {
+void FinishResidentGuardRegistration_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) noexcept {
+    try {
+        std::lock_guard lock(guardSnapshotWriter());
+        logGuardRanges(guardGrowth().load(std::memory_order_relaxed) + 1u, ranges);
+        guardGrowth().fetch_add(1, std::memory_order_release);
+        return;
+    } catch (...) {
+        guardLog.lost.store(true, std::memory_order_release);
+    }
     guardGrowth().fetch_add(1, std::memory_order_release);
+}
+
+bool ResidentGuardsUnchangedSince_nid_no_patch(std::uint64_t proved, std::uint64_t address, std::uint64_t bytes, std::uint64_t growth) {
+    if (proved == growth) return proved != 0u;
+    if (proved == 0u || proved > growth || bytes > std::numeric_limits<std::uint64_t>::max() - address || guardLog.lost.load(std::memory_order_acquire)) return false;
+    const auto end = address + bytes;
+    for (unsigned attempt = 0; attempt < GuardSnapshotAttempts; ++attempt) {
+        const auto sequence = guardLog.sequence.load(std::memory_order_acquire);
+        if ((sequence & 1u) != 0u) continue;
+        const auto count = guardLog.count.load(std::memory_order_relaxed);
+        const auto first = count > GuardLogCapacity ? count - GuardLogCapacity : 0u;
+        bool covered = first == 0u;
+        bool clear = true;
+        for (auto index = count; index > first; --index) {
+            const auto slot = static_cast<std::size_t>((index - 1u) % GuardLogCapacity);
+            const auto finish = guardLog.finish[slot].load(std::memory_order_relaxed);
+            if (finish <= proved) {
+                covered = true;
+                break;
+            }
+            if (finish > growth) continue;
+            if (guardLog.begin[slot].load(std::memory_order_relaxed) < end && address < guardLog.end[slot].load(std::memory_order_relaxed)) clear = false;
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (guardLog.sequence.load(std::memory_order_relaxed) == sequence) return covered && clear;
+    }
+    return false;
 }
 
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes) {
@@ -1795,10 +1860,15 @@ bool RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const 
     return false;
 }
 
-bool RequireNoMultisampleTargetProved(ResidentGuardRangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access) {
+bool RequireNoMultisampleTargetProved(GuestMemory::RangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access) {
     if (proof == nullptr) return RequireNoMultisampleTarget(address, bytes, access);
     const auto growth = ResidentGuardGrowth_nid_no_patch();
-    if (proof->Holds(address, bytes, growth)) return true;
+    const auto stamp = proof->Stamp(address, bytes);
+    if (stamp != 0u && stamp == growth) return true;
+    if (stamp != 0u && ResidentGuardsUnchangedSince_nid_no_patch(stamp, address, bytes, growth)) {
+        proof->Record(address, bytes, growth);
+        return true;
+    }
     if (!RequireNoMultisampleTarget(address, bytes, access)) return false;
     proof->Record(address, bytes, growth);
     return true;

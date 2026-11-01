@@ -185,6 +185,7 @@ void CheckStress() {
     for (unsigned reader = 0; reader < Readers; ++reader) {
         readers.emplace_back([&, reader] {
             ResidentGuardProof proof;
+            AgcDriver::GuestMemory::RangeProof rangeProof;
             unsigned seen = 0;
             while (!done.load(std::memory_order_acquire)) {
                 const auto current = round.load(std::memory_order_acquire);
@@ -211,6 +212,10 @@ void CheckStress() {
                     const auto growth = ResidentGuardGrowth_nid_no_patch();
                     const bool proved = proof.Holds(growth, current) || (ResidentGuardsClear_nid_no_patch(address + 128u, 64u) && (proof.Record(growth, current), true));
                     if (after && proved) stale.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        if (RequireNoMultisampleTargetProved(&rangeProof, address + 192u, 64u, "a vertex buffer read") && after) stale.fetch_add(1, std::memory_order_relaxed);
+                    } catch (const std::runtime_error&) {
+                    }
                     if (current > 8u) {
                         try {
                             RequireNoMultisampleColorTarget(Base + 0x10000000ull + static_cast<std::uint64_t>(current - 8u) * 0x40000u, 64u, "a CPU read");
@@ -318,7 +323,7 @@ void CheckRangeProof() {
     const auto guardAddress = Base + 0x58000000ull;
     const auto clearAddress = Base + 0x5c000000ull;
     ClearMultisampleTargets(context.device);
-    ResidentGuardRangeProof proof;
+    AgcDriver::GuestMemory::RangeProof proof;
     const auto start = ResidentGuardGrowth_nid_no_patch();
     Require(!proof.Holds(clearAddress, 64u, start), "an empty range proof held");
     Require(RequireNoMultisampleTargetProved(&proof, clearAddress, 64u, "a vertex buffer read"), "a clear range was not proven");
@@ -357,6 +362,39 @@ void CheckRangeProof() {
     for (std::size_t index = 2; index < threads.size(); ++index) threads[index].join();
     Require(mixed.load() == 0u, "a range proof held for a range assembled from two writers " + std::to_string(mixed.load()) + " times");
     std::puts("range proof: an exact range holds until a registration, refused ranges are never proven, concurrent writers never mix a range");
+}
+
+void CheckGuardLog() {
+    const auto context = FakeContext(0xc000u);
+    const auto watched = Base + 0x68000000ull;
+    const auto elsewhere = Base + 0x6c000000ull;
+    ClearMultisampleTargets(context.device);
+    const auto proved = ResidentGuardGrowth_nid_no_patch();
+    Require(ResidentGuardsUnchangedSince_nid_no_patch(proved, watched, 64u, proved), "a proof was not unchanged at its own growth");
+    Require(!ResidentGuardsUnchangedSince_nid_no_patch(0u, watched, 64u, proved), "a missing proof was unchanged");
+    GuardOneFragmentFmask(context, Fmask(elsewhere));
+    auto growth = ResidentGuardGrowth_nid_no_patch();
+    Require(growth > proved, "a registration did not advance the growth");
+    Require(ResidentGuardsUnchangedSince_nid_no_patch(proved, watched, 64u, growth), "a registration elsewhere invalidated a proof");
+    Require(!ResidentGuardsUnchangedSince_nid_no_patch(proved, elsewhere + FmaskBytes - 1u, 2u, growth), "a registration over a proven range left it unchanged");
+    Require(!ResidentGuardsUnchangedSince_nid_no_patch(growth, watched, 64u, proved), "a proof newer than the growth was unchanged");
+    AgcDriver::GuestMemory::RangeProof proof;
+    Require(RequireNoMultisampleTargetProved(&proof, watched, 64u, "a vertex buffer read"), "a clear range was not proven");
+    const auto stamped = ResidentGuardGrowth_nid_no_patch();
+    GuardOneFragmentFmask(context, Fmask(elsewhere + 4u * FmaskBytes));
+    Require(proof.Stamp(watched, 64u) == stamped && !proof.Holds(watched, 64u, ResidentGuardGrowth_nid_no_patch()), "a registration did not leave the proof behind the growth");
+    Require(RequireNoMultisampleTargetProved(&proof, watched, 64u, "a vertex buffer read"), "a proof was not revalidated after a registration elsewhere");
+    Require(proof.Holds(watched, 64u, ResidentGuardGrowth_nid_no_patch()), "a revalidated proof was not advanced to the growth");
+    GuardOneFragmentFmask(context, Fmask(watched));
+    Refuses([&] { RequireNoMultisampleTargetProved(&proof, watched, 64u, "a vertex buffer read"); }, "FMASK");
+    ClearMultisampleTargets(context.device);
+    Require(RequireNoMultisampleTargetProved(&proof, watched, 64u, "a vertex buffer read"), "a removed range was not proven");
+    const auto beforeFlood = ResidentGuardGrowth_nid_no_patch();
+    for (std::uint64_t index = 0; index < 80u; ++index) GuardOneFragmentFmask(context, Fmask(elsewhere + (index + 8u) * 2u * FmaskBytes));
+    Require(!ResidentGuardsUnchangedSince_nid_no_patch(beforeFlood, watched, 64u, ResidentGuardGrowth_nid_no_patch()), "a proof older than the registration log was unchanged");
+    Require(RequireNoMultisampleTargetProved(&proof, watched, 64u, "a vertex buffer read"), "a range behind a full registration log was not proven by the full check");
+    ClearMultisampleTargets(context.device);
+    std::puts("guard log: registrations elsewhere keep proofs, overlapping ones and an overflowing log do not");
 }
 
 struct TeardownReads {
@@ -538,6 +576,7 @@ int main() {
         CheckStaleRebuild();
         CheckProof();
         CheckRangeProof();
+        CheckGuardLog();
         CheckOverflow();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;

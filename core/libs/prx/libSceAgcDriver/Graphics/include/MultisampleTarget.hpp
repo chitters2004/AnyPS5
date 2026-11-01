@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_MULTISAMPLETARGET_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_MULTISAMPLETARGET_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
@@ -95,14 +96,18 @@ inline constexpr unsigned DepthGuardOverlap = 2u;
 
 std::uint64_t ResidentGuardGrowth_nid_no_patch();
 void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap);
-void FinishResidentGuardRegistration_nid_no_patch();
+void FinishResidentGuardRegistration_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) noexcept;
+bool ResidentGuardsUnchangedSince_nid_no_patch(std::uint64_t proved, std::uint64_t address, std::uint64_t bytes, std::uint64_t growth);
 
 class ResidentGuardRegistration {
 public:
-    ResidentGuardRegistration(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap) { NoteResidentGuardRanges_nid_no_patch(ranges, overlap); }
-    ~ResidentGuardRegistration() { FinishResidentGuardRegistration_nid_no_patch(); }
+    ResidentGuardRegistration(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap) : ranges(ranges) { NoteResidentGuardRanges_nid_no_patch(ranges, overlap); }
+    ~ResidentGuardRegistration() { FinishResidentGuardRegistration_nid_no_patch(ranges); }
     ResidentGuardRegistration(const ResidentGuardRegistration&) = delete;
     ResidentGuardRegistration& operator=(const ResidentGuardRegistration&) = delete;
+
+private:
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges;
 };
 
 class ResidentGuardProof {
@@ -116,6 +121,12 @@ public:
 
     void Record(std::uint64_t growth, std::uint64_t key) noexcept { proved.store(pack(growth, key), std::memory_order_release); }
 
+    std::uint64_t Stamp(std::uint64_t key) const noexcept {
+        const auto packed = proved.load(std::memory_order_acquire);
+        if (packed == 0u || key >> KeyBits != 0u || (packed & ((std::uint64_t{1} << KeyBits) - 1u)) != key) return 0u;
+        return packed >> KeyBits;
+    }
+
 private:
     static std::uint64_t pack(std::uint64_t growth, std::uint64_t key) noexcept {
         if (growth == 0u || key >> KeyBits != 0u || growth >> (64u - KeyBits) != 0u) return 0u;
@@ -125,36 +136,7 @@ private:
     std::atomic<std::uint64_t> proved{0};
 };
 
-class ResidentGuardRangeProof {
-public:
-    bool Holds(std::uint64_t address, std::uint64_t bytes, std::uint64_t growth) const noexcept {
-        const auto version = sequence.load(std::memory_order_acquire);
-        if ((version & 1u) != 0u) return false;
-        const auto provedGrowth = this->growth.load(std::memory_order_relaxed);
-        const auto provedAddress = this->address.load(std::memory_order_relaxed);
-        const auto provedBytes = this->bytes.load(std::memory_order_relaxed);
-        std::atomic_thread_fence(std::memory_order_acquire);
-        return sequence.load(std::memory_order_relaxed) == version && provedGrowth != 0u && provedGrowth == growth && provedAddress == address && provedBytes == bytes;
-    }
-
-    void Record(std::uint64_t address, std::uint64_t bytes, std::uint64_t growth) noexcept {
-        auto version = sequence.load(std::memory_order_relaxed);
-        if ((version & 1u) != 0u || !sequence.compare_exchange_strong(version, version + 1u, std::memory_order_relaxed)) return;
-        std::atomic_thread_fence(std::memory_order_release);
-        this->growth.store(growth, std::memory_order_relaxed);
-        this->address.store(address, std::memory_order_relaxed);
-        this->bytes.store(bytes, std::memory_order_relaxed);
-        sequence.store(version + 2u, std::memory_order_release);
-    }
-
-private:
-    std::atomic<std::uint64_t> sequence{0};
-    std::atomic<std::uint64_t> growth{0};
-    std::atomic<std::uint64_t> address{0};
-    std::atomic<std::uint64_t> bytes{0};
-};
-
-bool RequireNoMultisampleTargetProved(ResidentGuardRangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access);
+bool RequireNoMultisampleTargetProved(GuestMemory::RangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access);
 
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);

@@ -5941,6 +5941,10 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
     const auto growth = ResidentGuardGrowth_nid_no_patch();
     const auto key = static_cast<std::uint64_t>(allocations.size());
     if (moved.empty() && guestBuffersProof.Holds(growth, key)) return;
+    if (const auto stamp = moved.empty() ? guestBuffersProof.Stamp(key) : 0u; stamp != 0u && std::ranges::all_of(allocations, [&](const Allocation& item) { return !item.guest || ResidentGuardsUnchangedSince_nid_no_patch(stamp, item.address, item.size, growth); })) {
+        guestBuffersProof.Record(growth, key);
+        return;
+    }
     bool clear = true;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
