@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop the `docs(agc)` commits (`88079274b`, `af5a4f28e`, `aabfd6e43` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,7 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `876e52aca` | perf: exact range proofs on draw recipes, so a draw-cache hit skips its index and vertex range checks while nothing has registered (see "Draw proofs"). |
 | `9a7128ddb` | perf: growth-stamped proofs (see "Skipping repeated checks"). `requireGuestBuffers` skips its whole loop while nothing has registered, and every registration now advances the growth when it starts and again when it finishes. |
 
 ## Snapshot design
@@ -143,7 +144,7 @@ Ship the snapshot.
 
 ## Reproducing
 
-The sources are in this folder: `guard_bench.cpp` (the benchmark) and `guard_model.cpp` (the concurrency model). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
+The sources are in this folder: `guard_bench.cpp` (the benchmark), `guard_model.cpp` (the concurrency model) and `probe_bench.cpp` (the proof-owner benchmark, which includes `guard_bench.cpp`; build it from this folder with `g++ -O2 -std=c++20 -pthread probe_bench.cpp -o probe_bench`). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
 
 Benchmark. The first argument is milliseconds per cell. The second is `table` (the grid above), `full` (every rate for every guard count) or `quick` (4 threads, 12 guards). Run it on an idle machine; a concurrent build roughly halves main's measured contention. Output is CSV, one row per design × threads × guards × pattern × rate. Subtract the `null` design's `total_ns_per_op` to remove harness overhead.
 
@@ -178,6 +179,35 @@ Idea: only a registration can make a clear range overlap a guard, so a caller th
 - **Tests:** `CheckProof` covers recording, key mismatch, oversize growth and key, invalidation by a registration, survival across removals, and a read of a held proof writing nothing in the driver image. The stress test's readers also keep proofs, and fail if one holds for a guard that was published before the check. Removing the finishing advance makes this test fail in 3 of 3 runs (855, 1264 and 1598 stale acceptances); the code was restored before committing.
 - **Not measured:** a proof check is one load and a compare against N snapshot lookups (8–58 ns each in the benchmark) per bind. The in-driver saving per frame needs the GTA trace.
 
+## Draw proofs (`876e52aca`)
+
+**Measurement first** (`probe_bench.cpp`, results in `data/probe.csv`): each simulated draw checks 3 ranges spread over the guard gaps, with no registrations, 1 or 4 threads, and 100 to 5000 distinct draws.
+
+| ns per draw | 12 guards, 1 thread | 12 guards, 4 threads | 256 guards, 4 threads |
+|---|---|---|---|
+| 3 snapshot lookups (before) | 26–34 | 51–83 | 93–111 |
+| proof held by the draw's owner | 0.8–1.6 | 0.8–1.2 | 1.1–2.3 |
+| per-thread 512-entry exact-range cache | 30–34 | 116–202 | 167–190 |
+
+A proof only pays when an object that persists between draws holds it; a per-thread cache is no faster than the snapshot, and slower with 4 threads. So proofs go where an owner exists.
+
+- **Owner:** `DrawRecipe`, the immutable record a draw-cache hit replays. Draws with no recipe (the first draw, draw-cache misses) keep the per-range check. The recipe's header comment still says "immutable"; the new member is `mutable`, and the comment was left alone because the project allows no new comments.
+- **What it holds:** `mutable std::array<ResidentGuardRangeProof, 8> guardProofs`: slot 0 for the index range, slots 1–7 for the first seven vertex copy ranges. `prepareDrawInputs` calls `RequireNoMultisampleTargetProved(proof, address, bytes, access)`, which loads the growth, returns if the proof holds for exactly that range, otherwise runs the full check and records the proof only when the range was proven clear.
+- **`ResidentGuardRangeProof`:** a seqlock of growth, address and size with its own sequence. A writer claims the sequence with a compare-exchange and skips recording if another writer holds it. A reader takes the sequence, reads the three fields, fences, rechecks, and needs an exact match. Recipes have no lock the proof could rely on (only a comment says recipe draws run under the GPU mutex), so the proof is safe on its own.
+- **A race the tests caught:** the first version used the growth itself as the sequence. Two writers recording at the same growth restore the same value (ABA), and a reader accepted a range assembled from both writers (seen 2 times in one run of the real code). The fix is the dedicated sequence. With a strengthened test (2 writers × 2,000,000 records, 2 readers): the ABA variant fails 5/5 runs (404 mixed ranges in one), the fixed code passes 20/20 and 10/10, and a variant that skips the compare-exchange claim fails only 1/5 (narrower window). Neither range-proof variant has been run under the TSan model.
+- **DMA:** not done. The DMA source check in `PacketMemory.cpp` runs on packets parsed from guest command buffers on each submission, and nothing persists per packet, so it has no owner; the per-thread cache measured above would make it slower. It stays at one snapshot lookup per DMA packet.
+- **Tests:** `CheckRangeProof` covers exact-match, other ranges, invalidation by a registration over the range, refused ranges never being proven, removal, held proofs writing nothing in the driver image, and the concurrent-writer check. 16 tests pass under validation, including `recorder` and `sample_order`, which replay recipes; `sample_order_grid_reference` and `sample_order_recipe_depth_locations` skip on lavapipe. The only validation error is still the device-creation `VUID-VkDeviceCreateInfo-pNext-pNext`, 3 per test (`data/ctest_drawproof_validation.log`).
+- **Not measured:** the saving in a real frame, which depends on the draw-cache hit rate (the GTA trace).
+
+## Further improvements (not done)
+
+1. **Invalidate only overlapping proofs.** Every registration currently voids every proof. Keeping a small ring of the last N registered ranges would let a proof stale by at most N registrations be revalidated by checking those N ranges instead of running the full check. This helps the regime with thousands of registrations per second.
+2. **Owners for the remaining sites.** Non-recipe draws, DMA and the generic `GuestMemory::Read` → `GuardRead` path have none. If decoded command buffers or descriptor fetches are cached anywhere, proofs could live there.
+3. **The same proof idea for `GuestMemory::CheckRange`,** which re-validates the same index and vertex ranges on every draw, with the unmap epoch in place of the guard growth.
+4. **Formal check of the seqlocks** (snapshot and range proof) with a C11 model checker such as GenMC: x86 and TSan cannot catch a misplaced fence.
+5. **Range proof in the TSan model,** so the no-claim variant fails every run, not 1 in 5.
+6. **Windows and the GTA trace:** still the deciding gaps (see "Not verified").
+
 ## Summary of results
 
 The snapshot is the better design. It is never slower than the certificate in a regime that matters, and it is much faster once a thread reads more than four separate gaps.
@@ -207,7 +237,9 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
 | `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
 | `ctest_proof_validation.log` | The same tests on `9a7128ddb` (proofs). |
-| `build2.log` … `build6.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
+| `ctest_drawproof_validation.log` | 16 tests, including `recorder` and `sample_order`, on `876e52aca`. |
+| `probe.csv` | `probe_bench.cpp` output: snapshot lookups against owner-held proofs against a per-thread range cache. |
+| `build2.log` … `build8.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
 
 Validation-error counts in the ctest logs: `VUID-VkDeviceCreateInfo-pNext-pNext` appears 27 times on main and 30 times on each change (3 per test, device creation only). No other VUIDs, and no `was not found but was requested by env var VK_INSTANCE_LAYERS` line.
 
