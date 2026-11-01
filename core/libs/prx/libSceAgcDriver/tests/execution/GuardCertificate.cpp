@@ -134,11 +134,11 @@ void WithoutSharedWrites(Reads&& reads) {
 void CheckHeadless() {
     const auto context = FakeContext(0x5000u);
     const auto guardAddress = Base + 0x100000u;
-    const auto far = Base + 0x4000000u;
+    const auto distant = Base + 0x4000000u;
     ClearMultisampleTargets(context.device);
     const auto start = ResidentGuardGrowth_nid_no_patch();
     Require(ResidentGuardsClear_nid_no_patch(guardAddress, 64u), "an unguarded range was not proven clear");
-    Require(ResidentGuardsClear_nid_no_patch(far, 4096u), "an unguarded far range was not proven clear");
+    Require(ResidentGuardsClear_nid_no_patch(distant, 4096u), "an unguarded distant range was not proven clear");
     GuardOneFragmentFmask(context, Fmask(guardAddress));
     const auto registered = ResidentGuardGrowth_nid_no_patch();
     Require(registered > start, "registering a guard did not advance the guard growth");
@@ -151,20 +151,20 @@ void CheckHeadless() {
     Require(ResidentGuardsClear_nid_no_patch(guardAddress + FmaskBytes, 1u), "the range starting at a guard end was not proven clear");
     Require(!ResidentGuardsClear_nid_no_patch(std::numeric_limits<std::uint64_t>::max() - 15u, 32u), "an overflowing range was proven clear");
     Refuses([&] { RequireNoMultisampleColorTarget(std::numeric_limits<std::uint64_t>::max() - 15u, 32u, "a CPU read"); }, "overflows");
-    Require(ResidentGuardsClear_nid_no_patch(far, 4096u), "a far range was not proven clear after a registration");
+    Require(ResidentGuardsClear_nid_no_patch(distant, 4096u), "a distant range was not proven clear after a registration");
     GuardOneFragmentFmask(context, Fmask(guardAddress));
     Require(ResidentGuardGrowth_nid_no_patch() == registered, "guarding an already guarded FMASK advanced the guard growth");
     WithoutSharedWrites([&] {
         for (int round = 0; round < 1000; ++round) {
-            Require(ResidentGuardsClear_nid_no_patch(far + round, 64u), "a certified range missed");
-            RequireNoMultisampleColorTarget(far + round, 64u, "a CPU read");
-            RequireNoMultisampleTarget(far + round, 64u, "a CPU read");
-            AgcDriver::GuestMemory::GuardRead(far + round, 64u);
+            Require(ResidentGuardsClear_nid_no_patch(distant + round, 64u), "a certified range missed");
+            RequireNoMultisampleColorTarget(distant + round, 64u, "a CPU read");
+            RequireNoMultisampleTarget(distant + round, 64u, "a CPU read");
+            AgcDriver::GuestMemory::GuardRead(distant + round, 64u);
         }
     });
     ClearMultisampleTargets(context.device);
     Require(ResidentGuardGrowth_nid_no_patch() == registered, "removing guards advanced the guard growth");
-    WithoutSharedWrites([&] { Require(ResidentGuardsClear_nid_no_patch(far, 64u), "a certificate did not survive a removal"); });
+    WithoutSharedWrites([&] { Require(ResidentGuardsClear_nid_no_patch(distant, 64u), "a certificate did not survive a removal"); });
     RequireNoMultisampleTarget(guardAddress, 64u, "a CPU read");
     std::puts("headless: registration invalidates, repeated and removed guards keep certificates, hits write nothing in the driver image");
 }
