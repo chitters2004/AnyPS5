@@ -53,6 +53,8 @@ struct DrawInputCopy {
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
 };
+std::uint32_t ExpandEmulatedPrimitives(std::span<const std::byte> indices, std::uint32_t indexSize, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out);
+std::uint32_t ExpandGuestEmulatedPrimitives(std::uint64_t indexAddress, std::size_t indexBytes, std::uint32_t indexSize, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out);
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);

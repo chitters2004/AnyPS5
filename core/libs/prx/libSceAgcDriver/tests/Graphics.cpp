@@ -64,6 +64,7 @@
 #include <tuple>
 #include <type_traits>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -12016,6 +12017,69 @@ void vertexCopyTests() {
     }
 }
 
+void emulatedPrimitiveTests() {
+    using AgcDriver::Graphics::ExpandEmulatedPrimitives;
+    const auto expand = [](std::span<const std::byte> indices, std::uint32_t indexSize, bool quadList, bool lastProvoking, std::uint32_t primitives) {
+        std::vector<std::uint32_t> out(static_cast<std::size_t>(primitives) * (quadList ? 6u : 3u));
+        const auto highest = ExpandEmulatedPrimitives(indices, indexSize, quadList, lastProvoking, primitives, out);
+        out.push_back(highest);
+        return out;
+    };
+    const std::array<std::uint16_t, 8> narrow{10, 11, 12, 13, 20, 21, 22, 23};
+    const std::array<std::uint32_t, 8> wide{10, 11, 12, 0x10013, 20, 21, 22, 23};
+    const auto narrowBytes = std::as_bytes(std::span(narrow));
+    const auto wideBytes = std::as_bytes(std::span(wide));
+    Require(expand(narrowBytes, 2, true, false, 2) == std::vector<std::uint32_t>{10, 11, 12, 10, 12, 13, 20, 21, 22, 20, 22, 23, 23}, "a quad list with the first vertex provoking expanded to other triangles");
+    Require(expand(narrowBytes, 2, true, true, 2) == std::vector<std::uint32_t>{10, 11, 13, 11, 12, 13, 20, 21, 23, 21, 22, 23, 23}, "a quad list with the last vertex provoking expanded to other triangles");
+    Require(expand(wideBytes, 4, true, false, 1) == std::vector<std::uint32_t>{10, 11, 12, 10, 12, 0x10013, 0x10013}, "a 32 bit quad list lost the high bits of an index");
+    Require(expand(narrowBytes.first(10), 2, false, false, 3) == std::vector<std::uint32_t>{10, 11, 12, 11, 13, 12, 12, 13, 20, 20}, "a strip with the first vertex provoking expanded to other triangles");
+    Require(expand(narrowBytes.first(10), 2, false, true, 3) == std::vector<std::uint32_t>{10, 11, 12, 12, 11, 13, 12, 13, 20, 20}, "a strip with the last vertex provoking expanded to other triangles");
+    Require(expand({}, 0, true, false, 2) == std::vector<std::uint32_t>{0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 7}, "an auto-indexed quad list expanded to other triangles");
+    Require(expand({}, 0, false, true, 2) == std::vector<std::uint32_t>{0, 1, 2, 2, 1, 3, 3}, "an auto-indexed strip expanded to other triangles");
+    Require(expand(narrowBytes, 2, true, false, 0) == std::vector<std::uint32_t>{0}, "an empty expansion wrote corners");
+    expectFailure([&] { expand(narrowBytes.first(14), 2, true, false, 2); }, "read past their index buffer");
+    expectFailure([&] { expand(narrowBytes.first(8), 2, false, false, 3); }, "read past their index buffer");
+    expectFailure([&] { expand(narrowBytes, 1, true, false, 2); }, "16 or 32 bit indices");
+    expectFailure([&] {
+        std::vector<std::uint32_t> out(5);
+        ExpandEmulatedPrimitives(narrowBytes, 2, true, false, 1, out);
+    }, "does not hold every corner");
+}
+
+void emulatedPrimitiveReadTests() {
+    using AgcDriver::Graphics::ExpandGuestEmulatedPrimitives;
+    static std::size_t guards = 0;
+    static std::size_t flushes = 0;
+    static std::uint64_t flushedAddress = 0;
+    static std::size_t flushedBytes = 0;
+    guards = flushes = 0;
+    AgcDriver::GuestMemory::SetReadGuard([](std::uint64_t, std::size_t) { ++guards; });
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t address, std::size_t bytes) {
+        ++flushes;
+        flushedAddress = address;
+        flushedBytes = bytes;
+    });
+    alignas(4) static std::array<std::uint16_t, 10> indices{10, 11, 12, 13, 20, 21, 22, 23, 30, 31};
+    const auto address = reinterpret_cast<std::uint64_t>(indices.data());
+    std::vector<std::uint32_t> out(12);
+    const auto highest = ExpandGuestEmulatedPrimitives(address, sizeof(indices), 2, true, false, 2, out);
+    const auto guarded = guards;
+    const auto flushed = flushes;
+    const auto flushedRange = std::pair(flushedAddress, flushedBytes);
+    bool misaligned = false;
+    try {
+        ExpandGuestEmulatedPrimitives(address + 2, 16, 4, true, false, 1, std::span(out).first(6));
+    } catch (const std::runtime_error&) {
+        misaligned = true;
+    }
+    AgcDriver::GuestMemory::SetReadGuard(nullptr);
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    Require(out == std::vector<std::uint32_t>{10, 11, 12, 10, 12, 13, 20, 21, 22, 20, 22, 23} && highest == 23, "quads expanded from guest memory differ from the guest's indices");
+    Require(guarded == 1, "an emulated primitive expansion read guest memory more than once");
+    Require(flushed == 1 && flushedRange == std::pair(address, sizeof(indices)), "an emulated primitive expansion flushed other than the whole index range once");
+    Require(misaligned, "an emulated primitive expansion accepted misaligned indices");
+}
+
 void vertexZeroFillTests() {
     using AgcDriver::Graphics::CopyZeroPaddedDrawInput;
     using AgcDriver::Graphics::VertexBufferReadSize;
@@ -13238,6 +13302,8 @@ int main(int argc, char** argv) {
         storeAtLabelTests();
         nullVertexDescriptorTests();
         vertexZeroFillTests();
+        emulatedPrimitiveTests();
+        emulatedPrimitiveReadTests();
         vertexOverhangTests();
         vertexZeroFillMergeTests();
         parallelCompareTests();

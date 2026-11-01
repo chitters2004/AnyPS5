@@ -1339,6 +1339,84 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+namespace {
+
+template <class Source>
+std::uint32_t expandPrimitives(const Source& source, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out) {
+    const std::uint32_t corners = quadList ? 6u : 3u;
+    std::uint32_t highest = 0;
+    for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
+        auto* corner = out.data() + static_cast<std::size_t>(primitive) * corners;
+        if (quadList) {
+            const auto i0 = source(primitive * 4u + 0u);
+            const auto i1 = source(primitive * 4u + 1u);
+            const auto i2 = source(primitive * 4u + 2u);
+            const auto i3 = source(primitive * 4u + 3u);
+            if (lastProvoking) {
+                corner[0] = i0;
+                corner[1] = i1;
+                corner[2] = i3;
+                corner[3] = i1;
+                corner[4] = i2;
+                corner[5] = i3;
+            } else {
+                corner[0] = i0;
+                corner[1] = i1;
+                corner[2] = i2;
+                corner[3] = i0;
+                corner[4] = i2;
+                corner[5] = i3;
+            }
+        } else {
+            const std::uint32_t odd = primitive & 1u;
+            if (lastProvoking) {
+                corner[0] = source(primitive + odd);
+                corner[1] = source(primitive + 1u - odd);
+                corner[2] = source(primitive + 2u);
+            } else {
+                corner[0] = source(primitive);
+                corner[1] = source(primitive + 1u + odd);
+                corner[2] = source(primitive + 2u - odd);
+            }
+        }
+        for (std::uint32_t at = 0; at < corners; ++at) highest = std::max(highest, corner[at]);
+    }
+    return highest;
+}
+
+template <class Index>
+std::uint32_t expandIndexed(std::span<const std::byte> indices, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out) {
+    return expandPrimitives([&](std::uint32_t at) {
+        Index value{};
+        std::memcpy(&value, indices.data() + static_cast<std::size_t>(at) * sizeof(Index), sizeof(Index));
+        return static_cast<std::uint32_t>(value);
+    }, quadList, lastProvoking, primitives, out);
+}
+
+}
+
+std::uint32_t ExpandEmulatedPrimitives(std::span<const std::byte> indices, std::uint32_t indexSize, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out) {
+    Require(indexSize == 0 || indexSize == 2 || indexSize == 4, "an emulated primitive expansion reads 16 or 32 bit indices");
+    const std::uint64_t corners = quadList ? 6u : 3u;
+    Require(out.size() == primitives * corners, "the expanded index buffer does not hold every corner");
+    const std::uint64_t read = primitives == 0 ? 0 : quadList ? static_cast<std::uint64_t>(primitives) * 4u : static_cast<std::uint64_t>(primitives) + 2u;
+    if (indexSize == 0) {
+        Require(indices.empty(), "an auto-indexed expansion got index bytes");
+        return expandPrimitives([](std::uint32_t at) { return at; }, quadList, lastProvoking, primitives, out);
+    }
+    Require(indices.size() >= read * indexSize, "the emulated primitives read past their index buffer");
+    return indexSize == 2 ? expandIndexed<std::uint16_t>(indices, quadList, lastProvoking, primitives, out) : expandIndexed<std::uint32_t>(indices, quadList, lastProvoking, primitives, out);
+}
+
+std::uint32_t ExpandGuestEmulatedPrimitives(std::uint64_t indexAddress, std::size_t indexBytes, std::uint32_t indexSize, bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<std::uint32_t> out) {
+    Require(indexSize == 2 || indexSize == 4, "an emulated primitive expansion reads 16 or 32 bit indices");
+    struct IndexScratch {};
+    auto& scratch = HostThreadLocal<std::vector<std::byte>, IndexScratch>();
+    scratch.resize(indexBytes);
+    GuestMemory::Read(indexAddress, scratch, indexSize);
+    return ExpandEmulatedPrimitives(scratch, indexSize, quadList, lastProvoking, primitives, out);
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
@@ -1561,67 +1639,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const std::uint32_t outputIndexCount = primitives * corners;
         const std::size_t expandedIndexBytes = static_cast<std::size_t>(outputIndexCount) * sizeof(std::uint32_t);
         auto indexCopy = std::make_shared<Buffer>(context, expandedIndexBytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-        auto* outIndices = reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data());
-        std::uint32_t maxIdx = 0;
         const bool lastProvoking = state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
-        const auto expand = [&](const auto& source) {
-            for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
-                auto* out = outIndices + static_cast<std::size_t>(primitive) * corners;
-                if (state.quadList) {
-                    const auto i0 = source(primitive * 4u + 0u);
-                    const auto i1 = source(primitive * 4u + 1u);
-                    const auto i2 = source(primitive * 4u + 2u);
-                    const auto i3 = source(primitive * 4u + 3u);
-                    if (lastProvoking) {
-                        out[0] = i0;
-                        out[1] = i1;
-                        out[2] = i3;
-                        out[3] = i1;
-                        out[4] = i2;
-                        out[5] = i3;
-                    } else {
-                        out[0] = i0;
-                        out[1] = i1;
-                        out[2] = i2;
-                        out[3] = i0;
-                        out[4] = i2;
-                        out[5] = i3;
-                    }
-                } else {
-                    const std::uint32_t odd = primitive & 1u;
-                    if (lastProvoking) {
-                        out[0] = source(primitive + odd);
-                        out[1] = source(primitive + 1u - odd);
-                        out[2] = source(primitive + 2u);
-                    } else {
-                        out[0] = source(primitive);
-                        out[1] = source(primitive + 1u + odd);
-                        out[2] = source(primitive + 2u - odd);
-                    }
-                }
-                for (std::uint32_t corner = 0; corner < corners; ++corner) maxIdx = std::max(maxIdx, out[corner]);
-            }
-        };
+        const std::span<std::uint32_t> expanded(reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data()), outputIndexCount);
+        std::uint32_t maxIdx = 0;
         if (draw.indexed) {
-            GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
-            const auto readIndex = [&](std::uint32_t idx) -> std::uint32_t {
-                if (draw.indexSize == 2) {
-                    std::uint16_t v = 0;
-                    GuestMemory::ReadUnsynced(draw.indexAddress + static_cast<std::uint64_t>(idx) * 2u, std::as_writable_bytes(std::span(&v, 1)), 2);
-                    return v;
-                } else {
-                    std::uint32_t v = 0;
-                    GuestMemory::ReadUnsynced(draw.indexAddress + static_cast<std::uint64_t>(idx) * 4u, std::as_writable_bytes(std::span(&v, 1)), 4);
-                    return v;
-                }
-            };
-            expand(readIndex);
+            maxIdx = ExpandGuestEmulatedPrimitives(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, state.quadList, lastProvoking, primitives, expanded);
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
         } else {
             const std::uint32_t lastVertex = state.quadList ? primitives * 4u - 1u : primitives + 1u;
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
-            expand([](std::uint32_t idx) { return idx; });
+            maxIdx = ExpandEmulatedPrimitives({}, 0, state.quadList, lastProvoking, primitives, expanded);
         }
         inputs.maxIndex = maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
