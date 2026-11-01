@@ -189,7 +189,7 @@ public:
     bool PendingLeaseOverlaps(std::uint64_t address, std::size_t bytes) const;
     void NoteLeaseTable(VkBuffer table, std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges);
     void NoteUntabledLease();
-    bool OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables) const;
+    bool OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables, const char** refusal = nullptr) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the

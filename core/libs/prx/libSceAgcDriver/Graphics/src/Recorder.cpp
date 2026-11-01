@@ -3280,23 +3280,27 @@ void Recorder::NoteUntabledLease() {
     open->untabledLease = true;
 }
 
-bool Recorder::OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables) const {
+bool Recorder::OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables, const char** refusal) const {
     tables.clear();
+    const auto refuse = [&](const char* why) {
+        if (refusal != nullptr) *refusal = why;
+        return false;
+    };
     if (bytes == 0) return true;
     const auto end = address + bytes;
     for (const auto& batch : inFlight) {
-        if (readOverlap(*batch, address, end, ReadKind::AddressBased).has_value()) return false;
+        if (readOverlap(*batch, address, end, ReadKind::AddressBased).has_value()) return refuse("lease-in-flight");
     }
     if (open == nullptr || !readOverlap(*open, address, end, ReadKind::AddressBased).has_value()) return true;
-    if (open->untabledLease) return false;
+    if (open->untabledLease) return refuse("lease-untabled");
     for (const auto& lease : open->leaseTables) {
         if (std::none_of(lease.ranges->begin(), lease.ranges->end(), [&](const auto& range) { return address < range.second && range.first < end; })) continue;
         for (const auto& batch : inFlight) {
-            if (std::any_of(batch->leaseTables.begin(), batch->leaseTables.end(), [&](const Batch::LeaseTable& other) { return other.table == lease.table; })) return false;
+            if (std::any_of(batch->leaseTables.begin(), batch->leaseTables.end(), [&](const Batch::LeaseTable& other) { return other.table == lease.table; })) return refuse("lease-table-shared");
         }
         if (std::find(tables.begin(), tables.end(), lease.table) == tables.end()) tables.push_back(lease.table);
     }
-    return !tables.empty();
+    return !tables.empty() || refuse("lease-no-table");
 }
 
 bool Recorder::signaled(const Batch& batch) const {

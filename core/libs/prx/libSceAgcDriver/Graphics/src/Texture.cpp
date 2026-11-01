@@ -4299,6 +4299,20 @@ bool LabelGpuCompareEnabled() {
     return enabled;
 }
 
+const char* FallbackReason(bool edge, const char* table) {
+    if (table == nullptr) return edge ? "fallback-edge" : "fallback-block";
+    if (!edge) {
+        if (std::strcmp(table, "lease-in-flight") == 0) return "fallback-lease-in-flight";
+        if (std::strcmp(table, "lease-untabled") == 0) return "fallback-lease-untabled";
+        if (std::strcmp(table, "lease-table-shared") == 0) return "fallback-lease-table-shared";
+        return "fallback-lease-no-table";
+    }
+    if (std::strcmp(table, "lease-in-flight") == 0) return "fallback-edge+lease-in-flight";
+    if (std::strcmp(table, "lease-untabled") == 0) return "fallback-edge+lease-untabled";
+    if (std::strcmp(table, "lease-table-shared") == 0) return "fallback-edge+lease-table-shared";
+    return "fallback-edge+lease-no-table";
+}
+
 bool LabelStoreReason(const char* reason) {
     return reason != nullptr && std::strncmp(reason, "readback before ", 16) == 0;
 }
@@ -4312,7 +4326,7 @@ struct LabelCompareTotals {
     std::uint64_t mismatches = 0;
     double eligibleWaitMs = 0;
     double refusedWaitMs = 0;
-    std::map<std::string, std::uint64_t> refusals;
+    std::map<std::string, std::pair<std::uint64_t, double>> refusals;
     std::uint64_t waitsSkipped = 0;
     std::uint64_t skippedBlocks[5] = {};
     std::map<std::string, std::uint64_t> gpuRefusals;
@@ -4330,7 +4344,11 @@ std::string LabelCompareReport() {
     auto& totals = LabelCompareCounts();
     std::lock_guard lock(totals.mutex);
     std::string refusals;
-    for (const auto& [why, count] : totals.refusals) refusals += " " + why + " " + std::to_string(count);
+    for (const auto& [why, entry] : totals.refusals) {
+        char text[64];
+        std::snprintf(text, sizeof(text), " %llu/%.1f ms", static_cast<unsigned long long>(entry.first), entry.second);
+        refusals += " " + why + text;
+    }
     std::string gpuRefusals;
     for (const auto& [why, count] : totals.gpuRefusals) gpuRefusals += " " + why + " " + std::to_string(count);
     char gpu[512];
@@ -4557,7 +4575,9 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     if (check.compared && savedTicket.size() == trackedLayers && savedTicket[0] != 0) return refuse("save-pending");
     check.written.assign(blocks, -1);
     check.changedAfter.assign(blocks, -1);
-    const bool leaseTabled = !check.compared && recorder.OpenLeaseTables(base, size, check.leaseTables);
+    const char* tableRefusal = "lease-no-table";
+    const bool leaseTabled = !check.compared && recorder.OpenLeaseTables(base, size, check.leaseTables, &tableRefusal);
+    bool fallbackEdge = false, fallbackTable = false;
     check.noBaseline = !check.compared && !originalHolds(base, size) && generationBaseline.size() != guestBytes;
     bool fallback = false;
     for (std::size_t k = 0; k < blocks; ++k) {
@@ -4585,10 +4605,14 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
             mode = LabelCompare::BlockMode::Keep;
         }
         fallback = fallback || mode == LabelCompare::BlockMode::Fallback;
+        if (mode == LabelCompare::BlockMode::Fallback) {
+            fallbackEdge = fallbackEdge || edge;
+            fallbackTable = fallbackTable || !leaseTabled;
+        }
         check.modes.push_back(mode);
     }
     check.classified = true;
-    if (fallback) return refuse("fallback-block");
+    if (fallback) return refuse(FallbackReason(fallbackEdge, fallbackTable ? tableRefusal : nullptr));
     const bool onGpu = std::any_of(check.modes.begin(), check.modes.end(), [](LabelCompare::BlockMode mode) { return mode == LabelCompare::BlockMode::OnGpu || mode == LabelCompare::BlockMode::OnGpuLease; });
     if (onGpu && check.noBaseline && blockUnits) return refuse("no-baseline");
     if (guestBytes > LabelCompareMaxBytes) return refuse("large");
@@ -4627,7 +4651,9 @@ void StorageTexture::tallyLabelCompare(const LabelCompareCheck& check, std::uint
         totals.eligibleWaitMs += check.waitedMs;
     } else {
         totals.refusedWaitMs += check.waitedMs;
-        ++totals.refusals[check.refusal != nullptr ? check.refusal : "?"];
+        auto& entry = totals.refusals[check.refusal != nullptr ? check.refusal : "?"];
+        ++entry.first;
+        entry.second += check.waitedMs;
     }
     for (const auto mode : check.modes) ++totals.blocks[static_cast<std::size_t>(mode)];
     totals.compared += compared;
