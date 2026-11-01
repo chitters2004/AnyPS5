@@ -2705,21 +2705,34 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
-void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
-    if (destination.empty()) return;
+namespace {
+
+void readGuest(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment, bool flush, const void* caller) {
     GuardRead(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    if (flush) FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
+    CountReadCaller(caller);
     const auto* source = reinterpret_cast<const void*>(address);
     try {
         CheckRange(source, destination.size(), alignment);
     } catch (const std::runtime_error&) {
         static const bool trace = std::getenv("APS5_TRACE_UNREADABLE") != nullptr;
-        if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(__builtin_return_address(0)));
+        if (trace) std::fprintf(stderr, "[unreadable]   read from +0x%llx\n", ModuleOffset(caller));
         throw;
     }
     CopyGuestBytes(destination.data(), source, destination.size());
+}
+
+}
+
+void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
+    if (destination.empty()) return;
+    readGuest(address, destination, alignment, true, __builtin_return_address(0));
+}
+
+void ReadUnsynced(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
+    if (destination.empty()) return;
+    readGuest(address, destination, alignment, false, __builtin_return_address(0));
 }
 
 #ifdef ANYPS5_ENABLE_ASAN

@@ -5449,6 +5449,24 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
     Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    static std::size_t inputFlushes = 0;
+    static std::uint64_t inputFlushAddress = 0;
+    static std::size_t inputFlushBytes = 0;
+    SetFlushHook([](std::uint64_t flushAddress, std::size_t flushBytes) {
+        ++inputFlushes;
+        inputFlushAddress = flushAddress;
+        inputFlushBytes = flushBytes;
+    });
+    const auto flushedOnce = [&] { return std::exchange(inputFlushes, 0) == 1 && inputFlushAddress == address + 512 && inputFlushBytes == 64; };
+    inputFlushes = 0;
+    const auto recorded = CopyDrawInput(context, &recorder, address + 512, 64, 4, Use::Index32);
+    const bool recordedOnce = flushedOnce();
+    const auto unrecorded = CopyDrawInput(context, nullptr, address + 512, 64, 4, Use::Index32);
+    const bool unrecordedOnce = flushedOnce();
+    recorder.Activate();
+    Require(!recorded.reused && recordedOnce, "a copied draw input flushed its range other than once");
+    Require(unrecordedOnce, "a draw input copied without a recorder flushed its range other than once");
+    Require(std::memcmp(recorded.buffer->Bytes().data(), reinterpret_cast<const void*>(address + 512), 64) == 0 && std::memcmp(unrecorded.buffer->Bytes().data(), reinterpret_cast<const void*>(address + 512), 64) == 0, "a draw input copied after one flush got other bytes");
     recorder.Sync();
 }
 
