@@ -4562,7 +4562,6 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     if (AnyShadowedOverlaps(base, size)) return refuse("shadowed");
     if (Recorder::PendingCompletionStores() != 0 || Recorder::PendingCompletionLabels() != 0) return refuse("completion-stores");
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse("copied-writers");
-    if (recorder.PendingLateStampOverlaps(base, size)) return refuse("late-stamping-writer");
     constexpr std::uint64_t block = 65536;
     const auto end = base + guestBytes;
     check.spanBegin = base & ~(block - 1);
@@ -4572,6 +4571,7 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     for (std::size_t k = 0; k < blocks; ++k) generations[k] = unitBlockGeneration(0, check.spanBegin + k * block);
     std::vector<std::uint8_t> changed(blocks);
     check.compared = !GuestMemory::ChangedBlocks(base, size, generations, changed);
+    if (!check.compared && recorder.PendingLateStampOverlaps(base, size)) return refuse("late-stamping-writer");
     if (check.compared && !originalHolds(base, size)) return refuse("unsaved");
     if (check.compared && savedTicket.size() == trackedLayers && savedTicket[0] != 0) return refuse("save-pending");
     check.written.assign(blocks, -1);

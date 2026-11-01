@@ -44,6 +44,7 @@ constexpr std::size_t FarDword = 100u * Width;
 
 alignas(256) constexpr std::array<std::uint32_t, 11> StoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Stored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 7> StoreGlobalCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Overwritten, 0xdc708100u, 0x007d0200u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 9> StoreGlobalAndBufferCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Overwritten, 0xdc708100u, 0x007d0200u, 0xe0700000u, 0x80000200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 7> StoreBaselineCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Initial, 0xdc708100u, 0x007d0200u, 0xbf810000u};
 
 class GuestBlock {
@@ -278,6 +279,52 @@ void RunSettled(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::s
     Require(texture->Generation() > stale, what + "the image stored whole with no later stamp was left stale at completion");
 }
 
+std::vector<std::uint32_t> GlobalAndBufferUserData(std::uint64_t global, std::uint64_t buffer) {
+    std::vector<std::uint32_t> userData(10, 0u);
+    userData[0] = static_cast<std::uint32_t>(buffer);
+    userData[1] = static_cast<std::uint32_t>(buffer >> 32u) & 0xffffu;
+    userData[2] = 64u;
+    userData[3] = 0x31016facu;
+    userData[8] = static_cast<std::uint32_t>(global);
+    userData[9] = static_cast<std::uint32_t>(global >> 32u);
+    return userData;
+}
+
+DifferentialRun RunLateStamp(AgcDriver::VulkanDevice& device, const GuestBlock& guest, bool bufferStore, bool label) {
+    const auto image = guest.Address();
+    const auto* words = guest.Words();
+    const auto target = device.Target();
+    const auto& writerCode = bufferStore ? std::span<const std::uint32_t>(StoreGlobalAndBufferCode) : std::span<const std::uint32_t>(StoreGlobalCode);
+    const auto writer = Compile(writerCode, bufferStore ? GlobalAndBufferUserData(image, image + 65536u + 0x400u) : GlobalUserData(image), target);
+    device.Dispatch(writer, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(writerCode.data()));
+    const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, label ? "readback before label" : "test"), "storage flush ordering, late stamp: the image store left no results pending");
+    const bool waited = !AddressBasedStorePending(image, true);
+    device.WaitIdle();
+    return {{words, words + (ImageBytes + 0x200u) / 4u}, waited};
+}
+
+void RunLateStamps(AgcDriver::VulkanDevice& device, bool watched) {
+    for (const bool bufferStore : {false, true}) {
+        GuestBlock waitedBlock(watched);
+        GuestBlock labelBlock(watched);
+        const auto waited = RunLateStamp(device, waitedBlock, bufferStore, false);
+        const auto stored = RunLateStamp(device, labelBlock, bufferStore, true);
+        const std::string what = std::string("storage flush ordering, late stamp ") + (bufferStore ? "with" : "without") + " a descriptor store: ";
+        Require(waited.waited, what + "the waited flush did not wait");
+        if (bufferStore) Require(stored.words[(65536u + 0x400u) / 4u] == Overwritten && waited.words[(65536u + 0x400u) / 4u] == Overwritten, what + "the descriptor store did not land");
+        for (std::size_t index = 0; index < waited.words.size(); ++index) {
+            if (waited.words[index] == stored.words[index]) continue;
+            std::fprintf(stderr, "late stamp %s: word 0x%zx waited 0x%08x label 0x%08x\n", bufferStore ? "with" : "without", index, waited.words[index], stored.words[index]);
+            Require(false, what + "the label store's bytes differ from the waited store's");
+        }
+        if (!AgcDriver::GuestMemory::Watched(labelBlock.Address(), BlockBytes)) continue;
+        if (bufferStore) Require(stored.waited, what + "the label store did not wait for a writer that stamps again at completion");
+        else Require(!stored.waited, what + "the label store waited although nothing stamps late on its decision");
+    }
+}
+
 void RunUploadBeforeCompletion(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
     const auto image = guest.Address() + offset;
     const auto target = device.Target();
@@ -406,6 +453,7 @@ int main(int argc, char** argv) {
             RunTiled(*device, guest, BlockBytes / 8u, "writer in the open batch", false);
             RunTiled(*device, guest, 3u * BlockBytes / 4u, "writer of the baseline bytes in the open batch", true);
             RunDifferentials(*device, watched);
+            RunLateStamps(*device, watched);
             if (AgcDriver::GuestMemory::Watched(guest.Address(), BlockBytes)) {
                 GuestBlock settledBlock(watched);
                 RunSettled(*device, settledBlock, 0);
