@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This file is for agents and reviewers reading the branch. The `notes-file` rule in `tools/check_conventions.py` rejects it, so drop this commit before opening a pull request and move the text into the PR body.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. The `notes-file` rule in `tools/check_conventions.py` rejects it, so drop the two `docs(agc)` commits at the tip before opening a pull request and move the text into the PR body.
 
 ## Commits
 
@@ -96,7 +96,7 @@ Worst-case latencies are 0.5–8 ms in every design: that is preemption on a 4-v
 
 ## Correctness model
 
-`guard_model.cpp` (not in the repo) is built with `g++ -fsanitize=thread`. Three readers check the most recently published guard while a writer registers guards (every fifth registration throws between two inserts), removes old ones and triggers rebuilds. The property: a registration that happens-before a check is always seen, unless that guard was later removed.
+`guard_model.cpp` (in this folder) is built with `g++ -fsanitize=thread`. Three readers check the most recently published guard while a writer registers guards (every fifth registration throws between two inserts), removes old ones and triggers rebuilds. The property: a registration that happens-before a check is always seen, unless that guard was later removed.
 
 | Variant | Result (3000 rounds) |
 |---|---|
@@ -134,3 +134,29 @@ Ship the snapshot.
 - Weak memory ordering.
 - No GTA trace.
 - `tools/pr_overlap.py` was not run (no PR).
+
+## Reproducing
+
+The sources are in this folder: `guard_bench.cpp` (the benchmark) and `guard_model.cpp` (the concurrency model). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
+
+Benchmark. The first argument is milliseconds per cell. The second is `table` (the grid above), `full` (every rate for every guard count) or `quick` (4 threads, 12 guards). Run it on an idle machine; a concurrent build roughly halves main's measured contention. Output is CSV, one row per design × threads × guards × pattern × rate. Subtract the `null` design's `total_ns_per_op` to remove harness overhead.
+
+```bash
+g++ -O2 -std=c++20 -pthread docs/dev/reports/guard-snapshot/guard_bench.cpp -o guard_bench
+```
+
+```bash
+./guard_bench 200 table > bench_table.csv
+```
+
+Model. `MUTANT` selects the planted bug: 0 clean, 1 no growth bump, 2 snapshot insertion skipped, 3 rebuild without the growth check, 4 plain stores (TSan race), 5 growth bumped after the inserts with a throw between. The first argument picks the design (`c` certificate, `s` snapshot), the second the number of rounds. Exit code 0 means no violations, 1 means violations, and 66 is a TSan report. Clang on this image lacks the TSan runtime, so use g++.
+
+```bash
+for m in 0 1 2 3 4 5; do g++ -std=c++20 -O1 -g -fsanitize=thread -Wno-tsan -DMUTANT=$m docs/dev/reports/guard-snapshot/guard_model.cpp -o model_$m; done
+```
+
+```bash
+for m in 0 1 5; do ./model_$m c 3000; echo "certificate mutant $m rc=$?"; done; for m in 0 2 3 4 5; do ./model_$m s 3000; echo "snapshot mutant $m rc=$?"; done
+```
+
+Expected: certificate mutants 1 and 5 and snapshot mutants 2, 3, 4 and 5 fail; both clean runs pass.
