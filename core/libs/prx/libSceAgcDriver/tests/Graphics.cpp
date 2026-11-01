@@ -12027,7 +12027,18 @@ void vertexZeroFillTests() {
     std::vector<std::byte> guest(extent);
     std::fill(guest.begin(), guest.begin() + static_cast<std::ptrdiff_t>(valid), std::byte{0x7a});
     std::fill(guest.begin() + static_cast<std::ptrdiff_t>(valid), guest.end(), std::byte{0x55});
+    static std::size_t flushes = 0;
+    static std::uint64_t flushedAddress = 0;
+    static std::size_t flushedBytes = 0;
+    flushes = 0;
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t address, std::size_t bytes) {
+        ++flushes;
+        flushedAddress = address;
+        flushedBytes = bytes;
+    });
     const auto copy = CopyZeroPaddedDrawInput(mockContext(), reinterpret_cast<std::uint64_t>(guest.data()), extent, valid);
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    Require(flushes == 1 && flushedAddress == reinterpret_cast<std::uint64_t>(guest.data()) && flushedBytes == extent, "a zero-padded vertex fetch flushed its range other than once");
     const auto bytes = copy.buffer->Bytes();
     Require(bytes.size() == extent, "a zero-padded vertex fetch changed its size");
     Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a vertex fetch did not copy the bytes within the record count");
