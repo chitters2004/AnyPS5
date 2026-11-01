@@ -5652,8 +5652,45 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
     return updateAfterBind;
 }
 
+std::optional<ShaderResources::WrittenSets::Pair> ShaderResources::WrittenSets::Take() {
+    std::lock_guard lock(mutex);
+    if (sets.empty()) return std::nullopt;
+    const auto taken = sets.back();
+    sets.pop_back();
+    return taken;
+}
+
+bool ShaderResources::WrittenSets::Give(DescriptorCache* from, VkDescriptorSetLayout main, VkDescriptorSetLayout fragment, const Pair& given) noexcept {
+    if (from == nullptr || (main == VK_NULL_HANDLE && given.allocation.set != VK_NULL_HANDLE) || (fragment == VK_NULL_HANDLE && given.fragmentAllocation.set != VK_NULL_HANDLE)) return false;
+    std::lock_guard lock(mutex);
+    if (sets.size() >= Capacity || (cache != nullptr && (cache != from || layout != main || fragmentLayout != fragment))) return false;
+    try {
+        sets.push_back(given);
+    } catch (...) {
+        return false;
+    }
+    cache = from;
+    layout = main;
+    fragmentLayout = fragment;
+    return true;
+}
+
+std::size_t ShaderResources::WrittenSets::Size() const {
+    std::lock_guard lock(mutex);
+    return sets.size();
+}
+
+ShaderResources::WrittenSets::~WrittenSets() {
+    if (cache == nullptr) return;
+    for (const auto& pair : sets) {
+        if (pair.allocation.set != VK_NULL_HANDLE) cache->Recycle(layout, pair.allocation);
+        if (pair.fragmentAllocation.set != VK_NULL_HANDLE) cache->Recycle(fragmentLayout, pair.fragmentAllocation);
+    }
+}
+
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
+    if (owner != nullptr && owner->Give(cache, layout, fragmentLayout, {allocation, fragmentAllocation})) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
@@ -5891,12 +5928,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
-    if (described[0] || splitSets) {
+    result->owner = writtenSets;
+    const bool mainSet = described[0] || splitSets;
+    const bool fragmentSet = described[1] || splitSets;
+    if (auto written = writtenSets->Take()) {
+        result->allocation = written->allocation;
+        result->fragmentAllocation = written->fragmentAllocation;
+        if (mainSet) result->layout = _layout;
+        if (fragmentSet) result->fragmentLayout = fragment.layout;
+        Require((result->allocation.set != VK_NULL_HANDLE) == mainSet && (result->fragmentAllocation.set != VK_NULL_HANDLE) == fragmentSet, "a written draw descriptor set disagrees with its template's sets");
+        result->rewroteBuffersOnly = true;
+    }
+    if (mainSet && result->allocation.set == VK_NULL_HANDLE) {
         result->allocation = result->cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
         result->layout = _layout;
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    if (described[1] || splitSets) {
+    if (fragmentSet && result->fragmentAllocation.set == VK_NULL_HANDLE) {
         result->fragmentAllocation = result->cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
         result->fragmentLayout = fragment.layout;
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
@@ -5929,6 +5977,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    if (result->rewroteBuffersOnly) writes.erase(std::remove_if(writes.begin(), writes.end(), [](const VkWriteDescriptorSet& write) { return write.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER; }), writes.end());
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());

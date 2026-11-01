@@ -188,6 +188,26 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    struct WrittenSets {
+        struct Pair {
+            DescriptorCache::SetAllocation allocation;
+            DescriptorCache::SetAllocation fragmentAllocation;
+        };
+        static constexpr std::size_t Capacity = 16;
+        WrittenSets() = default;
+        WrittenSets(const WrittenSets&) = delete;
+        WrittenSets& operator=(const WrittenSets&) = delete;
+        std::optional<Pair> Take();
+        bool Give(DescriptorCache* from, VkDescriptorSetLayout main, VkDescriptorSetLayout fragment, const Pair& sets) noexcept;
+        std::size_t Size() const;
+        ~WrittenSets();
+    private:
+        mutable AgcDriver::Mutex mutex;
+        DescriptorCache* cache = nullptr;
+        VkDescriptorSetLayout layout = VK_NULL_HANDLE;
+        VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
+        std::vector<Pair> sets;
+    };
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -205,6 +225,8 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<WrittenSets> owner;
+        bool rewroteBuffersOnly = false;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -213,6 +235,7 @@ public:
         std::size_t size;
         std::span<const std::uint32_t> words;
     };
+    std::size_t IdleDrawSets() const { return writtenSets->Size(); }
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
@@ -615,6 +638,7 @@ private:
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
+    std::shared_ptr<WrittenSets> writtenSets = std::make_shared<WrittenSets>();
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).

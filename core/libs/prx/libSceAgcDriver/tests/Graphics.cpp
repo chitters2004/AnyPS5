@@ -6513,6 +6513,89 @@ void descriptorSnapshotTests() {
     }
 }
 
+void writtenSetReuseTests() {
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    context.limits.maxSamplerAnisotropy = 1.0f;
+    context.limits.maxPerStageDescriptorSamplers = 16;
+    context.limits.maxDescriptorSetSamplers = 16;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto buffers = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+        buffers.bufferWritten = {false, false};
+        vertex.bindings.push_back(buffers);
+        auto sampler = makeBinding(Role::GuestSamplers, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers), 1, {0x92u, (4u * 256u) << 12u, 0u, 0u});
+        sampler.kind = Kind::Sampler;
+        sampler.samplerDepthCompare = {false};
+        sampler.samplerUnnormalized = {false};
+        sampler.samplerIntegerBorder = {false};
+        sampler.samplerCoordinatesIgnored = {false};
+        vertex.bindings.push_back(sampler);
+        fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const std::array<std::vector<VkDescriptorBufferInfo>, 2> resourcesOriginal{findWrite(0).buffers, findWrite(4).buffers};
+        mock.writes.clear();
+        ShaderResources other(context, vertex, fragment, state.color, 0, 0);
+        const std::array<std::vector<VkDescriptorBufferInfo>, 2> otherOriginal{findWrite(0).buffers, findWrite(4).buffers};
+        const auto samplerWrites = [] { return std::count_if(mock.writes.begin(), mock.writes.end(), [](const MockDescriptorWrite& write) { return write.type == VK_DESCRIPTOR_TYPE_SAMPLER; }); };
+        std::vector<std::uint32_t> words;
+        const auto settle = [&](const ShaderResources& from, std::size_t idle) {
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (from.IdleDrawSets() < idle && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            Require(from.IdleDrawSets() == idle, "a finished template draw did not return its descriptor sets to the template");
+        };
+        const auto draw = [&](const ShaderResources& from, std::size_t allocation, std::uint32_t value) {
+            const std::size_t bytes = allocation == 0 ? 24 : 12;
+            words.assign(bytes / 4, value);
+            const std::array<ShaderResources::MovedBuffer, 1> moved{{{allocation, 0, bytes, words}}};
+            mock.writes.clear();
+            auto bindings = from.PrepareDrawBindings(recorder, moved);
+            Require(bindings != nullptr && bindings->snapshots.size() == 1, "a template draw lost its snapshot");
+            const auto& write = *std::find_if(mock.writes.begin(), mock.writes.end(), [](const MockDescriptorWrite& item) { return item.binding == 0; });
+            const auto& third = *std::find_if(mock.writes.begin(), mock.writes.end(), [](const MockDescriptorWrite& item) { return item.binding == 4; });
+            const auto& original = &from == &resources ? resourcesOriginal[0] : otherOriginal[0];
+            const auto& originalThird = &from == &resources ? resourcesOriginal[1] : otherOriginal[1];
+            const auto& item = bindings->snapshots.front();
+            Require(write.count == 2 && write.buffers[allocation].buffer == item.buffer->Handle() && write.buffers[allocation].offset == item.offset && sameBytes(bufferBytes(write.buffers[allocation].buffer).subspan(write.buffers[allocation].offset), words.data(), bytes), "a template draw did not bind its own words");
+            const auto kept = 1u - allocation;
+            Require(write.buffers[kept].buffer == original[kept].buffer && write.buffers[kept].offset == original[kept].offset && write.buffers[kept].range == original[kept].range, "a template draw kept another draw's buffer in an unmoved element");
+            Require(third.count == 1 && third.buffers[0].buffer == originalThird[0].buffer && third.buffers[0].offset == originalThird[0].offset && third.buffers[0].range == originalThird[0].range, "a template draw changed a binding without snapshots");
+            return bindings;
+        };
+        auto first = draw(resources, 0, 0x11111111u);
+        const auto firstSet = first->allocation.set;
+        const auto firstFragment = first->fragmentAllocation.set;
+        Require(samplerWrites() == 1, "a fresh draw descriptor set did not get the template's sampler");
+        first.reset();
+        settle(resources, 1);
+        auto second = draw(resources, 1, 0x22222222u);
+        Require(second->allocation.set == firstSet && second->fragmentAllocation.set == firstFragment, "a template draw did not reuse the set an earlier draw of it finished with");
+        Require(samplerWrites() == 0 && mock.writes.size() == 2, "a reused draw descriptor set rewrote more than its buffer descriptors");
+        auto overlapping = draw(resources, 0, 0x33333333u);
+        Require(overlapping->allocation.set != firstSet && samplerWrites() == 1, "a set still in use was handed to another draw, or a fresh set lacked the sampler");
+        second.reset();
+        overlapping.reset();
+        settle(resources, 2);
+        auto foreign = draw(other, 1, 0x44444444u);
+        Require(foreign->allocation.set != firstSet && samplerWrites() == 1, "another template got a set holding this template's descriptors");
+        foreign.reset();
+        settle(other, 1);
+        Require(resources.IdleDrawSets() == 2, "another template's draw changed this template's idle sets");
+    }
+    Require(mock.live == 0, "reused draw descriptor sets leaked Vulkan objects");
+}
+
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
 alignas(16) std::array<std::uint32_t, 8> guestMovedSecond{0x61616161, 0x62626262, 0x63636363, 0x64646464, 0x65656565, 0x66666666, 0x67676767, 0x68686868};
 
@@ -13129,6 +13212,7 @@ int main(int argc, char** argv) {
         oversizedDescriptorTests();
         guestBufferViewBytesTests();
         descriptorSnapshotTests();
+        writtenSetReuseTests();
         dispatchMoveTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();
