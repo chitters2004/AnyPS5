@@ -8,9 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
 #include <cstddef>
-#include <algorithm>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -91,24 +89,11 @@ void InstallResidentImageReadGuard_nid_no_patch();
 void UpdateResidentImageUnmapObserver_nid_no_patch();
 void ClaimMultisampleTargetMemory(std::uint64_t address, std::uint64_t bytes);
 void GuardOneFragmentFmask(const Context& context, const ColorTarget& target);
-struct GuardGap {
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-};
-
-inline bool NarrowGuardGap(GuardGap& gap, std::uint64_t address, std::uint64_t end, std::uint64_t guardAddress, std::uint64_t guardBytes) {
-    const auto guardEnd = guardBytes > std::numeric_limits<std::uint64_t>::max() - guardAddress ? std::numeric_limits<std::uint64_t>::max() : guardAddress + guardBytes;
-    if (guardAddress < end && address < guardEnd) return false;
-    if (guardEnd <= address) gap.begin = std::max(gap.begin, guardEnd);
-    else gap.end = std::min(gap.end, guardAddress);
-    return true;
-}
-
 inline constexpr unsigned ColorGuardOverlap = 1u;
 inline constexpr unsigned DepthGuardOverlap = 2u;
 
 std::uint64_t ResidentGuardGrowth_nid_no_patch();
-void NoteResidentGuardGrowth_nid_no_patch();
+void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap);
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);

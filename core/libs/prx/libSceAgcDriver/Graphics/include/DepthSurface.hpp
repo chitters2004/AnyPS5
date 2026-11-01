@@ -16,7 +16,6 @@ namespace AgcDriver::Graphics {
 
 class Texture;
 class StorageTexture;
-struct GuardGap;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
@@ -43,7 +42,8 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
 void RequireNoResidentDepthReadExact_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 bool HasResidentDepthGuards_nid_no_patch();
-bool ResidentDepthGap_nid_no_patch(std::uint64_t address, std::uint64_t end, GuardGap& gap);
+bool ResidentDepthOverlaps_nid_no_patch(std::uint64_t address, std::uint64_t end);
+void AppendResidentDepthGuards_nid_no_patch(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void RequireNoNativeDepthFeedback_nid_no_patch(const Context& context, const DepthTarget& target, std::span<const std::shared_ptr<Texture>> sampled);
 void ClearDepthSurfaces(VkDevice device);

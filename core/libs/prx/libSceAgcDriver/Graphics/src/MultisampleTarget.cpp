@@ -16,7 +16,6 @@
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
-#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -809,43 +808,117 @@ std::atomic<std::uint64_t>& guardGrowth() {
     return growth;
 }
 
-struct GuardCertificate {
-    std::uint64_t growth = 0;
-    std::array<GuardGap, 4> gaps{};
-    std::size_t next = 0;
+constexpr std::size_t GuardSnapshotCapacity = 256;
+constexpr std::uint64_t GuardSnapshotOverflow = std::numeric_limits<std::uint64_t>::max();
+constexpr std::uint64_t GuardSnapshotTags = ColorGuardOverlap | DepthGuardOverlap;
+constexpr unsigned GuardSnapshotAttempts = 4;
+constexpr unsigned GuardSnapshotStaleRebuild = 64;
+
+struct GuardSnapshot {
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint64_t> count{0};
+    std::array<std::atomic<std::uint64_t>, GuardSnapshotCapacity> begin{};
+    std::array<std::atomic<std::uint64_t>, GuardSnapshotCapacity> end{};
+    alignas(64) std::atomic<unsigned> stale{0};
 };
 
-using GuardCertificateSlot = HostThreadSlot<GuardCertificate*, GuardCertificate>;
+constinit GuardSnapshot guardSnapshot{};
 
-constinit GuardCertificate retiredCertificate{};
-
-struct GuardCertificateRelease {
-    GuardCertificateRelease() = default;
-    GuardCertificateRelease(const GuardCertificateRelease&) = delete;
-    GuardCertificateRelease& operator=(const GuardCertificateRelease&) = delete;
-
-    ~GuardCertificateRelease() {
-        auto* certificate = GuardCertificateSlot::Get();
-        GuardCertificateSlot::Set(&retiredCertificate);
-        if (certificate != &retiredCertificate) delete certificate;
-    }
-};
-
-void rememberGap(std::uint64_t growth, const GuardGap& gap) {
-    auto* certificate = GuardCertificateSlot::Get();
-    if (certificate == &retiredCertificate) return;
-    if (certificate == nullptr) {
-        [[maybe_unused]] thread_local GuardCertificateRelease release;
-        certificate = new GuardCertificate{};
-        GuardCertificateSlot::Set(certificate);
-    }
-    if (certificate->growth != growth) *certificate = GuardCertificate{growth};
-    certificate->gaps[certificate->next++ % certificate->gaps.size()] = gap;
+std::mutex& guardSnapshotWriter() {
+    static std::mutex mutex;
+    return mutex;
 }
 
-bool colorGap(std::uint64_t address, std::uint64_t end, GuardGap& gap) {
+struct GuardInterval {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t overlap = 0;
+};
+
+GuardInterval guardInterval(std::uint64_t address, std::uint64_t bytes, std::uint64_t overlap) {
+    const auto span = std::max<std::uint64_t>(bytes, 1u);
+    const auto end = span > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + span;
+    return {address & ~GuardSnapshotTags, end, overlap};
+}
+
+std::vector<GuardInterval> mergedGuardIntervals(std::vector<GuardInterval> intervals) {
+    std::ranges::sort(intervals, {}, &GuardInterval::begin);
+    std::vector<GuardInterval> merged;
+    merged.reserve(intervals.size());
+    for (const auto& interval : intervals) {
+        if (!merged.empty() && interval.begin <= merged.back().end) {
+            merged.back().end = std::max(merged.back().end, interval.end);
+            merged.back().overlap |= interval.overlap;
+        } else {
+            merged.push_back(interval);
+        }
+    }
+    return merged;
+}
+
+void publishGuardSnapshot(std::span<const GuardInterval> intervals) {
+    const auto sequence = guardSnapshot.sequence.load(std::memory_order_relaxed);
+    guardSnapshot.sequence.store(sequence + 1u, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    const bool fits = intervals.size() <= GuardSnapshotCapacity;
+    if (fits) {
+        for (std::size_t index = 0; index < intervals.size(); ++index) {
+            guardSnapshot.begin[index].store(intervals[index].begin | intervals[index].overlap, std::memory_order_relaxed);
+            guardSnapshot.end[index].store(intervals[index].end, std::memory_order_relaxed);
+        }
+    }
+    guardSnapshot.count.store(fits ? intervals.size() : GuardSnapshotOverflow, std::memory_order_relaxed);
+    guardSnapshot.sequence.store(sequence + 2u, std::memory_order_release);
+}
+
+unsigned guardSnapshotOverlaps(std::uint64_t address, std::uint64_t end) {
+    for (unsigned attempt = 0; attempt < GuardSnapshotAttempts; ++attempt) {
+        const auto sequence = guardSnapshot.sequence.load(std::memory_order_acquire);
+        if ((sequence & 1u) != 0u) continue;
+        const auto count = guardSnapshot.count.load(std::memory_order_relaxed);
+        auto overlaps = static_cast<unsigned>(GuardSnapshotTags);
+        if (count != GuardSnapshotOverflow) {
+            const auto limit = static_cast<std::size_t>(std::min<std::uint64_t>(count, GuardSnapshotCapacity));
+            std::size_t low = 0;
+            std::size_t high = limit;
+            while (low < high) {
+                const auto middle = low + (high - low) / 2u;
+                if (guardSnapshot.end[middle].load(std::memory_order_relaxed) <= address) low = middle + 1u;
+                else high = middle;
+            }
+            overlaps = 0u;
+            if (low < limit) {
+                const auto begin = guardSnapshot.begin[low].load(std::memory_order_relaxed);
+                if ((begin & ~GuardSnapshotTags) < end) overlaps = static_cast<unsigned>(begin & GuardSnapshotTags);
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (guardSnapshot.sequence.load(std::memory_order_relaxed) == sequence) return overlaps;
+    }
+    return static_cast<unsigned>(GuardSnapshotTags);
+}
+
+void rebuildGuardSnapshot() {
+    const auto growth = guardGrowth().load(std::memory_order_acquire);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> depth;
+    AppendResidentDepthGuards_nid_no_patch(depth);
+    std::vector<GuardInterval> intervals;
+    {
+        std::shared_lock lock(guardedMutex());
+        intervals.reserve(guarded().size() + depth.size());
+        for (const auto& range : guarded()) intervals.push_back(guardInterval(range.address, range.bytes, ColorGuardOverlap));
+    }
+    for (const auto& [address, bytes] : depth) intervals.push_back(guardInterval(address, bytes, DepthGuardOverlap));
+    const auto merged = mergedGuardIntervals(std::move(intervals));
+    std::lock_guard lock(guardSnapshotWriter());
+    guardSnapshot.stale.store(0u, std::memory_order_relaxed);
+    if (guardGrowth().load(std::memory_order_relaxed) != growth) return;
+    publishGuardSnapshot(merged);
+}
+
+bool colorOverlaps(std::uint64_t address, std::uint64_t end) {
     std::shared_lock lock(guardedMutex());
-    return std::ranges::all_of(guarded(), [&](const auto& range) { return NarrowGuardGap(gap, address, end, range.address, range.bytes); });
+    return std::ranges::any_of(guarded(), [&](const auto& range) { return address < range.address + range.bytes && range.address < end; });
 }
 
 void guardReads(std::uint64_t address, std::size_t bytes) {
@@ -933,13 +1006,17 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
     const auto bytes = guardedColorBytes(target);
     stampUse(*use, target.address, bytes);
     std::unique_lock lock(guardedMutex());
-    guardGrowth().fetch_add(1, std::memory_order_release);
-    guarded().push_back({context.device, target.address, bytes, target.samples, active, nullptr, use});
+    std::vector<GuardedRange> ranges;
+    ranges.push_back({context.device, target.address, bytes, target.samples, active, nullptr, use});
     if (target.dccAddress != 0) {
-        guarded().push_back({context.device, target.dccAddress, MultisampledDccBytes(target), target.samples, active, metadataValid, use});
-        if (target.cmaskAddress != 0) guarded().push_back({context.device, target.cmaskAddress, target.cmaskBytes, target.samples, active, metadataValid, use});
-        if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) guarded().push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid, use});
+        ranges.push_back({context.device, target.dccAddress, MultisampledDccBytes(target), target.samples, active, metadataValid, use});
+        if (target.cmaskAddress != 0) ranges.push_back({context.device, target.cmaskAddress, target.cmaskBytes, target.samples, active, metadataValid, use});
+        if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) ranges.push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid, use});
     }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+    for (const auto& range : ranges) noted.emplace_back(range.address, range.bytes);
+    NoteResidentGuardRanges_nid_no_patch(noted, ColorGuardOverlap);
+    guarded().insert(guarded().end(), ranges.begin(), ranges.end());
     guardedGeneration().fetch_add(1, std::memory_order_release);
     anyGuarded().store(true, std::memory_order_release);
     InstallResidentImageReadGuard_nid_no_patch();
@@ -1554,7 +1631,8 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     std::unique_lock lock(guardedMutex());
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
     if (!known) {
-        guardGrowth().fetch_add(1, std::memory_order_release);
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> noted{{{target.fmaskAddress, bytes}}};
+        NoteResidentGuardRanges_nid_no_patch(noted, ColorGuardOverlap);
         guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
     }
     anyGuarded().store(true, std::memory_order_release);
@@ -1566,22 +1644,30 @@ std::uint64_t ResidentGuardGrowth_nid_no_patch() {
     return guardGrowth().load(std::memory_order_acquire);
 }
 
-void NoteResidentGuardGrowth_nid_no_patch() {
+void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap) {
     guardGrowth().fetch_add(1, std::memory_order_release);
+    std::lock_guard lock(guardSnapshotWriter());
+    const auto count = guardSnapshot.count.load(std::memory_order_relaxed);
+    if (count == GuardSnapshotOverflow) return;
+    std::vector<GuardInterval> intervals;
+    intervals.reserve(static_cast<std::size_t>(count) + ranges.size());
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto begin = guardSnapshot.begin[index].load(std::memory_order_relaxed);
+        intervals.push_back({begin & ~GuardSnapshotTags, guardSnapshot.end[index].load(std::memory_order_relaxed), begin & GuardSnapshotTags});
+    }
+    for (const auto& [address, bytes] : ranges) intervals.push_back(guardInterval(address, bytes, overlap & GuardSnapshotTags));
+    publishGuardSnapshot(mergedGuardIntervals(std::move(intervals)));
 }
 
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return ColorGuardOverlap | DepthGuardOverlap;
-    const auto growth = guardGrowth().load(std::memory_order_acquire);
-    if (const auto* certificate = GuardCertificateSlot::Get(); certificate != nullptr && certificate->growth == growth) {
-        for (const auto& gap : certificate->gaps) {
-            if (gap.begin <= address && address < gap.end && bytes <= gap.end - address) return 0u;
-        }
-    }
-    GuardGap gap{0, std::numeric_limits<std::uint64_t>::max()};
     const auto end = address + bytes;
-    const auto overlaps = (colorGap(address, end, gap) ? 0u : ColorGuardOverlap) | (ResidentDepthGap_nid_no_patch(address, end, gap) ? 0u : DepthGuardOverlap);
-    if (overlaps == 0u) rememberGap(growth, gap);
+    const auto possible = guardSnapshotOverlaps(address, end);
+    if (possible == 0u) return 0u;
+    auto overlaps = 0u;
+    if ((possible & ColorGuardOverlap) != 0u && colorOverlaps(address, end)) overlaps |= ColorGuardOverlap;
+    if ((possible & DepthGuardOverlap) != 0u && ResidentDepthOverlaps_nid_no_patch(address, end)) overlaps |= DepthGuardOverlap;
+    if (overlaps != possible && guardSnapshot.stale.fetch_add(1u, std::memory_order_relaxed) + 1u == GuardSnapshotStaleRebuild) rebuildGuardSnapshot();
     return overlaps;
 }
 

@@ -2193,9 +2193,14 @@ bool HasResidentDepthGuards_nid_no_patch() {
     return anyDepthGuard().load(std::memory_order_acquire);
 }
 
-bool ResidentDepthGap_nid_no_patch(std::uint64_t address, std::uint64_t end, GuardGap& gap) {
+bool ResidentDepthOverlaps_nid_no_patch(std::uint64_t address, std::uint64_t end) {
     std::shared_lock lock(depthGuardMutex());
-    return std::ranges::all_of(depthGuards(), [&](const auto& range) { return NarrowGuardGap(gap, address, end, range.address, range.bytes); });
+    return std::ranges::any_of(depthGuards(), [&](const auto& range) { return address < range.address + range.bytes && range.address < end; });
+}
+
+void AppendResidentDepthGuards_nid_no_patch(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    std::shared_lock lock(depthGuardMutex());
+    for (const auto& range : depthGuards()) ranges.emplace_back(range.address, range.bytes);
 }
 
 void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
@@ -2300,7 +2305,9 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         auto& fresh = *surfaces().back();
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
-            NoteResidentGuardGrowth_nid_no_patch();
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+            for (const auto& range : fresh.sampling.initial) noted.emplace_back(range.address, range.bytes);
+            NoteResidentGuardRanges_nid_no_patch(noted, DepthGuardOverlap);
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten});
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();

@@ -142,7 +142,7 @@ void CheckHeadless() {
     GuardOneFragmentFmask(context, Fmask(guardAddress));
     const auto registered = ResidentGuardGrowth_nid_no_patch();
     Require(registered > start, "registering a guard did not advance the guard growth");
-    Require(!ResidentGuardsClear_nid_no_patch(guardAddress, 64u), "a certificate taken before a registration was accepted after it");
+    Require(!ResidentGuardsClear_nid_no_patch(guardAddress, 64u), "a snapshot taken before a registration was accepted after it");
     Require(ResidentGuardOverlaps_nid_no_patch(guardAddress, 64u) == ColorGuardOverlap, "a read of a color guard was not classified as a color overlap only");
     Require(ResidentGuardOverlaps_nid_no_patch(distant, 64u) == 0u, "a distant read was classified as an overlap");
     Require(ResidentGuardOverlaps_nid_no_patch(std::numeric_limits<std::uint64_t>::max() - 15u, 32u) == (ColorGuardOverlap | DepthGuardOverlap), "an overflowing read was not sent to both exact paths");
@@ -159,7 +159,7 @@ void CheckHeadless() {
     Require(ResidentGuardGrowth_nid_no_patch() == registered, "guarding an already guarded FMASK advanced the guard growth");
     WithoutSharedWrites([&] {
         for (int round = 0; round < 1000; ++round) {
-            Require(ResidentGuardsClear_nid_no_patch(distant + round, 64u), "a certified range missed");
+            Require(ResidentGuardsClear_nid_no_patch(distant + round, 64u), "a range outside the snapshot was not proven clear");
             RequireNoMultisampleColorTarget(distant + round, 64u, "a CPU read");
             RequireNoMultisampleTarget(distant + round, 64u, "a CPU read");
             AgcDriver::GuestMemory::GuardRead(distant + round, 64u);
@@ -167,9 +167,9 @@ void CheckHeadless() {
     });
     ClearMultisampleTargets(context.device);
     Require(ResidentGuardGrowth_nid_no_patch() == registered, "removing guards advanced the guard growth");
-    WithoutSharedWrites([&] { Require(ResidentGuardsClear_nid_no_patch(distant, 64u), "a certificate did not survive a removal"); });
+    WithoutSharedWrites([&] { Require(ResidentGuardsClear_nid_no_patch(distant, 64u), "a range outside the snapshot was not proven clear after a removal"); });
     RequireNoMultisampleTarget(guardAddress, 64u, "a CPU read");
-    std::puts("headless: registration invalidates, repeated and removed guards keep certificates, hits write nothing in the driver image");
+    std::puts("headless: registration is seen, repeated and removed guards keep the snapshot, hits write nothing in the driver image");
 }
 
 void CheckStress() {
@@ -205,6 +205,12 @@ void CheckStress() {
                     } catch (const std::runtime_error&) {
                     }
                     RequireNoMultisampleTarget(warm, 64u, "a CPU read");
+                    if (current > 8u) {
+                        try {
+                            RequireNoMultisampleColorTarget(Base + 0x10000000ull + static_cast<std::uint64_t>(current - 8u) * 0x40000u, 64u, "a CPU read");
+                        } catch (const std::runtime_error&) {
+                        }
+                    }
                     if (spin > 50000000u) {
                         failures.fetch_add(1, std::memory_order_relaxed);
                         break;
@@ -228,8 +234,50 @@ void CheckStress() {
     for (auto& thread : readers) thread.join();
     ClearMultisampleTargets(context.device);
     Require(failures.load() == 0u, "a stress reader failed " + std::to_string(failures.load()) + " times");
-    Require(stale.load() == 0u, "a stale certificate was accepted " + std::to_string(stale.load()) + " times after a registration");
-    std::printf("stress: %u rounds of %u readers, no stale certificate accepted after a registration\n", Rounds, Readers);
+    Require(stale.load() == 0u, "a stale snapshot was accepted " + std::to_string(stale.load()) + " times after a registration");
+    std::printf("stress: %u rounds of %u readers with concurrent rebuilds, no stale snapshot accepted after a registration\n", Rounds, Readers);
+}
+
+void CheckStaleRebuild() {
+    const auto context = FakeContext(0x8000u);
+    const auto retired = Base + 0x30000000ull;
+    ClearMultisampleTargets(context.device);
+    GuardOneFragmentFmask(context, Fmask(retired));
+    Refuses([&] { RequireNoMultisampleTarget(retired, 64u, "a CPU read"); }, "FMASK");
+    ClearMultisampleTargets(context.device);
+    for (int round = 0; round < 256; ++round) {
+        Require(ResidentGuardsClear_nid_no_patch(retired + round, 64u), "a removed range was not proven clear");
+        RequireNoMultisampleTarget(retired + round, 64u, "a CPU read");
+    }
+    WithoutSharedWrites([&] {
+        for (int round = 0; round < 1000; ++round) {
+            Require(ResidentGuardsClear_nid_no_patch(retired + round, 64u), "a removed range was not proven clear after a rebuild");
+            RequireNoMultisampleTarget(retired + round, 64u, "a CPU read");
+        }
+    });
+    std::puts("stale: reads of removed guards rebuild the snapshot, after which they write nothing in the driver image");
+}
+
+void CheckOverflow() {
+    const auto context = FakeContext(0x9000u);
+    const auto first = Base + 0x40000000ull;
+    const auto distant = Base + 0x60000000ull;
+    constexpr std::uint64_t Count = 300;
+    ClearMultisampleTargets(context.device);
+    const auto at = [&](std::uint64_t index) { return first + index * 2u * FmaskBytes; };
+    for (std::uint64_t index = 0; index < Count; ++index) GuardOneFragmentFmask(context, Fmask(at(index)));
+    for (const std::uint64_t index : {std::uint64_t{0}, Count / 2u, Count - 1u}) {
+        Refuses([&] { RequireNoMultisampleTarget(at(index) + 64u, 64u, "a CPU read"); }, "FMASK");
+        Require(ResidentGuardOverlaps_nid_no_patch(at(index), 1u) == ColorGuardOverlap, "an overflowing snapshot lost a color guard");
+    }
+    for (std::uint64_t index = 0; index < Count; ++index) Require(ResidentGuardsClear_nid_no_patch(at(index) + FmaskBytes, FmaskBytes), "a gap between guards was not proven clear while the snapshot overflowed");
+    Require(ResidentGuardsClear_nid_no_patch(distant, 64u), "a distant range was not proven clear while the snapshot overflowed");
+    ClearMultisampleTargets(context.device);
+    for (int round = 0; round < 256; ++round) Require(ResidentGuardsClear_nid_no_patch(at(round), 64u), "a removed range was not proven clear after an overflow");
+    WithoutSharedWrites([&] {
+        for (int round = 0; round < 1000; ++round) Require(ResidentGuardsClear_nid_no_patch(distant + round, 64u), "a distant range was not proven clear after the snapshot recovered");
+    });
+    std::puts("overflow: an overflowing snapshot sends reads to the exact path and recovers after removals");
 }
 
 struct TeardownReads {
@@ -275,7 +323,7 @@ void CheckTeardown() {
     }
     ClearMultisampleTargets(context.device);
     Require(failures.load() == 0u, "a read during thread teardown failed " + std::to_string(failures.load()) + " times");
-    std::puts("teardown: reads after a thread released its certificate are still checked exactly");
+    std::puts("teardown: reads during thread teardown are still checked");
 }
 
 constexpr std::size_t BlockBytes = 1u << 20u;
@@ -397,7 +445,7 @@ bool CheckTargets() {
         ClearMultisampleTargets(context.device);
     }
     settle();
-    std::puts("targets: creation and address reuse invalidate, repeated host-only acquires, retirement and unmaps keep certificates, claimed targets still retire");
+    std::puts("targets: creation and address reuse are seen, repeated host-only acquires do not grow, retired and unmapped ranges are proven clear, claimed targets still retire");
     return true;
 }
 
@@ -408,6 +456,8 @@ int main() {
         CheckHeadless();
         CheckStress();
         CheckTeardown();
+        CheckStaleRebuild();
+        CheckOverflow();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;
     } catch (const std::exception& error) {
