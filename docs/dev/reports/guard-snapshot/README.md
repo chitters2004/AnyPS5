@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -280,6 +280,24 @@ Recommended next steps, before more code:
    - registrations per second.
 
 If guest-memory reads turn out to be large, proofs on the top few callers are the one remaining change likely to matter.
+
+## Proofs for the top `GuestMemory::Read` callers: for and against
+
+**For:**
+- **Volume.** `GuestMemory::Read` runs the guard check on every driver read of guest memory; at thousands of reads per frame and 10–60 ns each, that could be about 0.1–0.6 ms per frame (estimate).
+- **Proven pattern.** An owner-held proof costs about 1 ns, writes no shared memory, and already works for shader buffers and recipe draws, with exact ranges invalidated by the growth counter and the registration log.
+- **Safe by construction.** A proof is recorded only after a range was proven clear, so the refusing and retiring paths always run in full.
+- **Cheap to target.** `Read` already counts callers (`CountReadCaller`), so a trace names the hot ones.
+
+**Against:**
+- **Unknown benefit.** Without a trace, the read count and how often callers repeat an exact range are guesses; if ranges are fresh each time, proofs never hold and add a little cost.
+- **Only part of each read.** `Read` also calls the GPU-write flush hook, the timing counter, the caller counter and the copy; for larger reads the copy dominates.
+- **No single place for it.** `Read` is generic: every hot caller needs its own long-lived owner, an exact key, and its own concurrency and invalidation reasoning.
+- **Correctness risk per site.** The FMASK residency bug was an ordering subtlety that survived several test runs before a new stress check caught it; each new proof site needs its own stress test and planted-bug check.
+- **Untested on Windows.**
+- **Simpler alternatives.** At some callers, one check for a batch of contiguous reads, or moving the check out of a loop, needs no proof state at all.
+
+**Recommendation:** take the trace first. Add a proof only at a caller that is hot, repeats exact ranges, and already has a long-lived owner; prefer batching where reads are contiguous; otherwise leave `Read` as it is.
 
 ## Summary of results
 
