@@ -3,8 +3,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_storage_flush_ordering_label_compare PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LABEL_COMPARE_SHADOW=any" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "label-compare\\] mismatch" TIMEOUT 60)
     add_test(NAME agc_driver_storage_flush_ordering_gpu_compare COMMAND agc_driver_storage_flush_ordering_tests --label-gpu-compare)
     set_tests_properties(agc_driver_storage_flush_ordering_gpu_compare PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LABEL_GPU_COMPARE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_driver_storage_flush_ordering_gpu_compare_compared COMMAND agc_driver_storage_flush_ordering_tests --label-gpu-compare)
+    set_tests_properties(agc_driver_storage_flush_ordering_gpu_compare_compared PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_LABEL_GPU_COMPARE=1;APS5_WRITE_WATCH_IMPORTS=unwatch" SKIP_RETURN_CODE 77 TIMEOUT 60)
     if(WIN32)
-        set_tests_properties(agc_driver_storage_flush_ordering_label_compare agc_driver_storage_flush_ordering_gpu_compare PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_storage_flush_ordering_label_compare agc_driver_storage_flush_ordering_gpu_compare agc_driver_storage_flush_ordering_gpu_compare_compared PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

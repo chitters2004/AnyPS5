@@ -111,6 +111,37 @@ BlockMode UntrackedKept(const BlockState& block) {
     return Classify(block);
 }
 
+using ComparedRule = BlockMode (*)(bool, bool, bool);
+
+int ComparedMismatches(ComparedRule rule) {
+    int mismatches = 0;
+    for (unsigned bits = 0; bits < 8; ++bits) {
+        const bool kept = (bits & 1u) != 0, changedNow = (bits & 2u) != 0, pending = (bits & 4u) != 0;
+        const auto mode = rule(kept, changedNow, pending);
+        if (mode == BlockMode::Fallback) continue;
+        std::vector<bool> after{changedNow};
+        if (pending) after = {false, true};
+        for (const bool changedAfter : after) {
+            if (Written(mode, changedAfter) != (kept || changedAfter)) ++mismatches;
+        }
+    }
+    return mismatches;
+}
+
+BlockMode ComparedDecidedNow(bool kept, bool changedNow, bool) {
+    return kept || changedNow ? BlockMode::Keep : BlockMode::Store;
+}
+
+BlockMode ComparedKeptOnGpu(bool kept, bool changedNow, bool pending) {
+    if (kept && pending) return BlockMode::OnGpu;
+    return ClassifyCompared(kept, changedNow, pending);
+}
+
+BlockMode ComparedStoredUnderWriters(bool kept, bool changedNow, bool pending) {
+    if (pending && !kept) return BlockMode::Store;
+    return ClassifyCompared(kept, changedNow, pending);
+}
+
 }
 
 int main() {
@@ -150,6 +181,22 @@ int main() {
     Expect(Classify({false, false, false, false, true, true}) == BlockMode::Fallback, "an unstamped block under a lease and an explicit writer falls back");
     Expect(Written(BlockMode::OnGpu, true) && !Written(BlockMode::OnGpu, false), "a GPU-compared block is kept only when its bytes changed");
     Expect(!Written(BlockMode::Fallback, true), "a fallback block decides nothing");
+
+    Expect(ComparedMismatches(ClassifyCompared) == 0, "the compared-range rule decides every block as the flush does after its wait");
+    Expect(ClassifyCompared(false, false, true) == BlockMode::OnGpu && ClassifyCompared(true, false, true) == BlockMode::Keep, "compared ranges leave pending blocks to the GPU and keep blocks kept at unwatch");
+    const struct {
+        const char* name;
+        ComparedRule rule;
+    } comparedControls[] = {
+        {"compared ranges decided before the writers", ComparedDecidedNow},
+        {"compared kept blocks on the GPU", ComparedKeptOnGpu},
+        {"compared ranges stored under writers", ComparedStoredUnderWriters},
+    };
+    for (const auto& control : comparedControls) {
+        const auto mismatches = ComparedMismatches(control.rule);
+        std::printf("negative control %s: %d mismatches\n", control.name, mismatches);
+        Expect(mismatches > 0, control.name);
+    }
 
     if (failures != 0) {
         std::fprintf(stderr, "label compare tests: %d failures\n", failures);

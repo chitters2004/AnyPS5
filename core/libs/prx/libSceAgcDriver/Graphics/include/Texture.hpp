@@ -421,6 +421,7 @@ private:
     struct LabelCompareCheck {
         bool eligible = false;
         bool classified = false;
+        bool compared = false;
         const char* refusal = nullptr;
         std::uint64_t spanBegin = 0;
         std::vector<LabelCompare::BlockMode> modes;

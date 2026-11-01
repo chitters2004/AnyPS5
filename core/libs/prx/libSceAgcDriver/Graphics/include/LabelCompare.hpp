@@ -25,6 +25,12 @@ inline BlockMode Classify(const BlockState& block) {
     return BlockMode::Store;
 }
 
+inline BlockMode ClassifyCompared(bool kept, bool changedNow, bool pending) {
+    if (kept) return BlockMode::Keep;
+    if (!pending) return changedNow ? BlockMode::Keep : BlockMode::Store;
+    return BlockMode::OnGpu;
+}
+
 inline bool Written(BlockMode mode, bool changedOnGpu) {
     return mode == BlockMode::Keep || (mode == BlockMode::OnGpu && changedOnGpu);
 }

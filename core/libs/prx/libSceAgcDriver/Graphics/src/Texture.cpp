@@ -4523,7 +4523,6 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     if (drawnListed) return refuse("drawn");
     if (const auto drawn = drawnArea(); drawn.drawn || drawn.rect) return refuse("drawn");
     if (ExistingHostImportFor(context, base, size) == nullptr) return refuse("import");
-    if (!GuestMemory::Watched(base, size)) return refuse("unwatched");
     if (AnyShadowedOverlaps(base, size)) return refuse("shadowed");
     if (Recorder::PendingCompletionStores() != 0 || Recorder::PendingCompletionLabels() != 0) return refuse("completion-stores");
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse("copied-writers");
@@ -4535,7 +4534,9 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     std::vector<std::uint64_t> generations(blocks);
     for (std::size_t k = 0; k < blocks; ++k) generations[k] = unitBlockGeneration(0, check.spanBegin + k * block);
     std::vector<std::uint8_t> changed(blocks);
-    if (!GuestMemory::ChangedBlocks(base, size, generations, changed)) return refuse("untracked");
+    check.compared = !GuestMemory::ChangedBlocks(base, size, generations, changed);
+    if (check.compared && !originalHolds(base, size)) return refuse("unsaved");
+    if (check.compared && savedTicket.size() == trackedLayers && savedTicket[0] != 0) return refuse("save-pending");
     check.written.assign(blocks, -1);
     check.changedAfter.assign(blocks, -1);
     bool fallback = false;
@@ -4544,6 +4545,11 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
         const auto from = std::max(at, base);
         const auto to = std::min(at + block, end);
         const bool edge = from != at || to != at + block;
+        if (check.compared) {
+            const bool pending = recorder.PendingWriteOverlaps(from, static_cast<std::size_t>(to - from)) || recorder.PendingLeaseOverlaps(from, static_cast<std::size_t>(to - from));
+            check.modes.push_back(LabelCompare::ClassifyCompared(keptAtUnwatchHolds(from, 0), !unchangedSinceBaseline(from, to), pending));
+            continue;
+        }
         LabelCompare::BlockState state;
         state.kept = keptAtUnwatchHolds(from, 0);
         state.unknown = layerGeneration[0] == 0;
@@ -6363,7 +6369,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<std::uint8_t> cpuBlocks(drawn.drawn ? spanBlocks : 0);
     const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks, cpuBlocks);
     std::vector<bool> compared(trackedLayers, false);
-    if (!tracked) {
+    if (!tracked && labelCompareStore != nullptr) {
+        Require(labelCompareStore->compared && trackedLayers == 1, "a GPU-compared label store found a tracked classification over compared memory");
+        compared[0] = true;
+    } else if (!tracked) {
         awaitStoredSave(&layers);
         std::vector<bool> saved(trackedLayers, false);
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) saved[layer] = layers[layer] && layerOriginal[layer];
