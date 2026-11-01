@@ -2138,7 +2138,7 @@ std::uint64_t MultisampledDepthBytes_nid_no_patch(VkExtent2D extent, std::uint32
 }
 
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
-    if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;
+    if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire) || ResidentGuardsClear_nid_no_patch(address, bytes)) return;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth read range overflows");
     const auto overlaps = [&](const DepthGuard& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     if (htileClear.has_value() && htileClear->second <= std::numeric_limits<std::uint64_t>::max() - htileClear->first && htileClear->first <= address && bytes <= htileClear->second && address - htileClear->first <= htileClear->second - bytes) {
@@ -2186,6 +2186,11 @@ void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target) {
 
 bool HasResidentDepthGuards_nid_no_patch() {
     return anyDepthGuard().load(std::memory_order_acquire);
+}
+
+bool ResidentDepthGap_nid_no_patch(std::uint64_t address, std::uint64_t end, GuardGap& gap) {
+    std::shared_lock lock(depthGuardMutex());
+    return std::ranges::all_of(depthGuards(), [&](const auto& range) { return NarrowGuardGap(gap, address, end, range.address, range.bytes); });
 }
 
 void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
@@ -2291,6 +2296,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten});
+            NoteResidentGuardGrowth_nid_no_patch();
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;

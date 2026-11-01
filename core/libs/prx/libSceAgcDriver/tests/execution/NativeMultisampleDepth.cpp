@@ -1456,7 +1456,11 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     target.iterate256 = target.htilePipeAligned = target.htileDepthOnly = true;
     const auto words = DepthSampleWords(target);
     const auto resource = DecodeTextureResource(words);
+    Require(ResidentGuardsClear_nid_no_patch(target.address, 1u) && ResidentGuardsClear_nid_no_patch(target.htileAddress, 1u), "an unguarded depth range was not proven clear");
+    const auto growthBefore = ResidentGuardGrowth_nid_no_patch();
     const auto firstView = DepthSurfaceView(context, target);
+    Require(ResidentGuardGrowth_nid_no_patch() > growthBefore, "registering a native depth guard did not advance the guard growth");
+    Require(!ResidentGuardsClear_nid_no_patch(target.address, 1u) && !ResidentGuardsClear_nid_no_patch(target.htileAddress, 1u), "a certificate taken before a native depth registration was accepted after it");
     NoteDepthSurfaceWrite(context, target);
     auto firstTexture = DepthSurfaceTexture(context, words, resource, VkComponentMapping{});
     Require(firstTexture != nullptr, "retirement fixture has no native sampled view");
@@ -1506,6 +1510,8 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     }
     RequireNoResidentDepthRead_nid_no_patch(target.address, 1u);
     RequireNoResidentDepthRead_nid_no_patch(target.htileAddress, metadataBytes);
+    Require(ResidentGuardsClear_nid_no_patch(target.address, 1u), "a released native depth range was not proven clear");
+    const auto growthReleased = ResidentGuardGrowth_nid_no_patch();
     Require(!DepthSurfaceHolds(context, resource, firstTexture.get()) && !DepthSurfaceAt(target.address), "a fully released depth owner remains discoverable");
     if ((mode & 1u) != 0u) {
         ClearDepthSurfaces(context.device);
@@ -1519,6 +1525,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     const std::uint32_t one = 0xfffffff0u;
     for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(memory.Data() + depthBytes + offset, &one, 4u);
     const auto remappedView = DepthSurfaceView(context, target);
+    Require(ResidentGuardGrowth_nid_no_patch() > growthReleased && !ResidentGuardsClear_nid_no_patch(target.address, 1u), "a native depth guard over a reused address kept an old certificate");
     Require(remappedView != VK_NULL_HANDLE && ((mode & 1u) != 0u || remappedView != firstView), "a remapped allocation reused its old native depth attachment");
     auto fresh = DepthSurfaceTexture(context, words, resource, VkComponentMapping{});
     Require(fresh != nullptr && fresh->View() != firstTexture->View(), "a remapped allocation reused its old sampled view");

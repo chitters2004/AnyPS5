@@ -16,12 +16,14 @@
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -802,6 +804,35 @@ std::atomic<std::uint64_t>& guardedGeneration() {
     return generation;
 }
 
+std::atomic<std::uint64_t>& guardGrowth() {
+    static std::atomic<std::uint64_t> growth{1};
+    return growth;
+}
+
+struct GuardCertificate {
+    std::uint64_t growth = 0;
+    std::array<GuardGap, 4> gaps{};
+    std::size_t next = 0;
+};
+
+using GuardCertificateSlot = HostThreadSlot<GuardCertificate*, GuardCertificate>;
+
+void rememberGap(std::uint64_t growth, const GuardGap& gap) {
+    auto* certificate = GuardCertificateSlot::Get();
+    if (certificate == nullptr) {
+        thread_local GuardCertificate owned;
+        certificate = &owned;
+        GuardCertificateSlot::Set(certificate);
+    }
+    if (certificate->growth != growth) *certificate = GuardCertificate{growth};
+    certificate->gaps[certificate->next++ % certificate->gaps.size()] = gap;
+}
+
+bool colorGap(std::uint64_t address, std::uint64_t end, GuardGap& gap) {
+    std::shared_lock lock(guardedMutex());
+    return std::ranges::all_of(guarded(), [&](const auto& range) { return NarrowGuardGap(gap, address, end, range.address, range.bytes); });
+}
+
 void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
 }
@@ -894,6 +925,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
         if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) guarded().push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid, use});
     }
     guardedGeneration().fetch_add(1, std::memory_order_release);
+    guardGrowth().fetch_add(1, std::memory_order_release);
     anyGuarded().store(true, std::memory_order_release);
     InstallResidentImageReadGuard_nid_no_patch();
 }
@@ -1506,10 +1538,36 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     const auto bytes = std::max<std::uint64_t>((bits / 8u + 0xffffu) & ~0xffffull, 0x10000u);
     std::unique_lock lock(guardedMutex());
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
-    if (!known) guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
+    if (!known) {
+        guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
+        guardGrowth().fetch_add(1, std::memory_order_release);
+    }
     anyGuarded().store(true, std::memory_order_release);
     lock.unlock();
     InstallResidentImageReadGuard_nid_no_patch();
+}
+
+std::uint64_t ResidentGuardGrowth_nid_no_patch() {
+    return guardGrowth().load(std::memory_order_acquire);
+}
+
+void NoteResidentGuardGrowth_nid_no_patch() {
+    guardGrowth().fetch_add(1, std::memory_order_release);
+}
+
+bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto growth = guardGrowth().load(std::memory_order_acquire);
+    if (const auto* certificate = GuardCertificateSlot::Get(); certificate != nullptr && certificate->growth == growth) {
+        for (const auto& gap : certificate->gaps) {
+            if (gap.begin <= address && address < gap.end && bytes <= gap.end - address) return true;
+        }
+    }
+    GuardGap gap{0, std::numeric_limits<std::uint64_t>::max()};
+    const auto end = address + bytes;
+    if (!colorGap(address, end, gap) || !ResidentDepthGap_nid_no_patch(address, end, gap)) return false;
+    rememberGap(growth, gap);
+    return true;
 }
 
 std::uint64_t MultisampleTargetRangeGeneration() {
@@ -1578,12 +1636,14 @@ std::optional<std::vector<ShaderRecompiler::BdaAbi::Range>> ExcludeMultisampleTa
 }
 
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+    if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch()) || ResidentGuardsClear_nid_no_patch(address, bytes)) return;
     RequireNoResidentDepthRead_nid_no_patch(address, bytes);
     RequireNoMultisampleColorTarget(address, bytes, access);
 }
 
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
-    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return;
+    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || ResidentGuardsClear_nid_no_patch(address, bytes)) return;
+    Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "multisampled color read range overflows");
     const auto overlaps = [&](const GuardedRange& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     const auto refuse = [&](const GuardedRange& range) {
         char text[256];
