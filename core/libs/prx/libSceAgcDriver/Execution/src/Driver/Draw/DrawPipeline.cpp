@@ -548,7 +548,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return outstanding.load(std::memory_order_acquire) != 0 || (DrawFinisher::Busy() && DrawFinisher::Overlap() && finisherProducer);
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
