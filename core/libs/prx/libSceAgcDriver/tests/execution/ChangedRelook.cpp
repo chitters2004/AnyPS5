@@ -157,6 +157,10 @@ std::string Path(const ShaderResources::ProofReport& report) {
     }
 }
 
+std::size_t SampledEntries() {
+    return AgcDriver::Graphics::TextureCacheUsage().sampledEntries;
+}
+
 void RunTests(const AgcDriver::VulkanDevice& device) {
     GuestBlock block(BlockBytes, true);
     GuestBlock surfaces(SurfaceBlockBytes, false);
@@ -195,6 +199,15 @@ void RunTests(const AgcDriver::VulkanDevice& device) {
     Require(!current, "changed relook: a set whose texture " + std::to_string(Textures / 2u) + " changed was proved current on the " + Path(report));
     Require(report.path == ShaderResources::ProofPath::Relooked, "changed relook: a changed texture was failed by the " + Path(report) + ", not by its own lookup");
     std::puts("a changed texture fails the proof at its own lookup");
+    resources = std::make_shared<ShaderResources>(context, shader);
+    report = Prove(*resources, shader, current);
+    Require(current && report.path == ShaderResources::ProofPath::Fast, "changed relook: the rebuilt set took the " + Path(report));
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+    Require(SampledEntries() == 0, "changed relook: clearing the sampled cache left entries");
+    report = Prove(*resources, shader, current);
+    Require(!current, "changed relook: a set whose textures left the sampled cache was proved current on the " + Path(report));
+    Require(SampledEntries() == 0, "changed relook: a set whose textures left the sampled cache looked " + std::to_string(SampledEntries()) + " textures up again before failing");
+    std::puts("a set whose textures were released fails without looking them up");
 }
 
 }

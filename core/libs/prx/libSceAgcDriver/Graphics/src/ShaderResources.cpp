@@ -3049,6 +3049,11 @@ bool ChangedRelookEnabled() {
     return !disabled;
 }
 
+bool ReplacedWalks() {
+    static const bool enabled = std::getenv("APS5_WALK_REPLACED") != nullptr;
+    return enabled;
+}
+
 bool VerifyProofs() {
     static const bool enabled = std::getenv("APS5_VERIFY_PROOFS") != nullptr;
     return enabled;
@@ -3903,6 +3908,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         reason = FastFail::Audit;
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : relooked ? ProofPath::Relooked : ProofPath::Fast;
+    if (!fast && reason == FastFail::Replaced && !ReplacedWalks()) return finish(false, false, ProofFailure::Evicted);
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
