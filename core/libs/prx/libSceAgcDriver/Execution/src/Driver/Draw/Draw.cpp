@@ -1249,7 +1249,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         auto ahead = recipe == nullptr && Graphics::DrawPrepareAhead() ? std::make_shared<AheadDraw>() : nullptr;
         const std::span<const Graphics::CompiledShader> aheadStages(stages);
         auto aheadDecode = ahead != nullptr ? decode : nullptr;
-        auto aheadDevice = ahead != nullptr ? localDevice : nullptr;
+        if (ahead != nullptr) ahead->device = localDevice;
         auto commit = [this, contentKey = std::move(contentKey), ahead, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
@@ -1257,9 +1257,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         if (ahead != nullptr) {
-            const bool queued = DrawPreparer::Get().Enqueue([held, ahead, aheadDevice = std::move(aheadDevice), aheadDecode = std::move(aheadDecode), drawParameters, aheadStages] {
+            const bool queued = DrawPreparer::Get().Enqueue([held, ahead, aheadDecode = std::move(aheadDecode), drawParameters, aheadStages] {
                 try {
-                    ahead->prepared = aheadDevice->PrepareDrawAhead(aheadDecode->state, drawParameters, aheadStages);
+                    ahead->prepared = ahead->device->PrepareDrawAhead(aheadDecode->state, drawParameters, aheadStages);
                 } catch (...) {
                     ahead->prepared = nullptr;
                 }

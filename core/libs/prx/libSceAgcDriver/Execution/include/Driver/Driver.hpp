@@ -59,6 +59,7 @@ struct DrawTail;
 
 struct AheadDraw {
     enum State : std::uint8_t { Pending, Ready, Refused };
+    std::shared_ptr<VulkanDevice> device;
     std::atomic<std::uint8_t> state{Pending};
     std::shared_ptr<Graphics::PreparedAhead> prepared;
 };
