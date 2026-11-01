@@ -21,6 +21,7 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/ConditionalStore_spv.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1246,6 +1247,8 @@ Recorder::~Recorder() {
     }
     if (dispatchArgumentPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, dispatchArgumentPipeline, nullptr);
     if (dispatchArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, dispatchArgumentLayout, nullptr);
+    if (conditionalStorePipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, conditionalStorePipeline, nullptr);
+    if (conditionalStoreLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, conditionalStoreLayout, nullptr);
     for (const auto fence : spare) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     spare.clear();
     for (const auto pool : sparePools) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, pool, nullptr);
@@ -2133,6 +2136,64 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
     recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, readers, VK_ACCESS_SHADER_WRITE_BIT, reads);
     CountBarriers(CommandClass::DispatchLeading, 2);
     return true;
+}
+
+namespace {
+
+constexpr std::uint32_t ConditionalStorePushBytes = 48;
+constexpr std::uint32_t ConditionalStoreGroup = 64;
+
+}
+
+bool Recorder::ConditionalStoreReady() {
+    if (conditionalStoreState != 0) return conditionalStoreState > 0;
+    conditionalStoreState = -1;
+    VkShaderModule module = VK_NULL_HANDLE;
+    try {
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, ConditionalStorePushBytes};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &conditionalStoreLayout), "vkCreatePipelineLayout conditional store");
+        module = CreateShaderModule(context, CONDITIONAL_STORE_SPV, sizeof(CONDITIONAL_STORE_SPV), "vkCreateShaderModule conditional store");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = conditionalStoreLayout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &conditionalStorePipeline), "vkCreateComputePipelines conditional store");
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        conditionalStoreState = 1;
+    } catch (const std::exception& error) {
+        if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+        std::fprintf(stderr, "[gpu] label stores wait for their writers: %s\n", error.what());
+    }
+    return conditionalStoreState > 0;
+}
+
+void Recorder::RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag) {
+    Require(conditionalStoreState > 0, "a conditional store was recorded without its pipeline");
+    struct {
+        VkDeviceAddress target;
+        VkDeviceAddress source;
+        VkDeviceAddress baseline;
+        VkDeviceAddress flags;
+        std::uint32_t words;
+        std::uint32_t flag;
+        std::uint32_t phase;
+        std::uint32_t unused;
+    } parameters{target, source, baseline, flags, words, flag, 0, 0};
+    static_assert(sizeof(parameters) == ConditionalStorePushBytes);
+    const auto groups = (words + ConditionalStoreGroup - 1) / ConditionalStoreGroup;
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, conditionalStorePipeline);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, conditionalStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, ConditionalStorePushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
+    recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    parameters.phase = 1;
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, conditionalStoreLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, ConditionalStorePushBytes, &parameters);
+    function(cmdDispatch, "vkCmdDispatch")(commands, groups, 1, 1);
+    CountBarriers(CommandClass::StorageWriteBack, 1);
 }
 
 void Recorder::CountSamples() {

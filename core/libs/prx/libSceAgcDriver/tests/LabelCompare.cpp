@@ -42,7 +42,8 @@ std::vector<Outcome> Outcomes(const BlockState& state) {
 }
 
 bool Today(const BlockState& state, const Outcome& outcome) {
-    return state.kept || state.unknown || (outcome.stampedAfter && outcome.changedAfter);
+    if (state.unknown) return false;
+    return state.kept || (outcome.stampedAfter && outcome.changedAfter);
 }
 
 struct Tally {
@@ -71,14 +72,16 @@ Tally Check(const std::function<BlockMode(const BlockState&)>& classify) {
 }
 
 BlockMode WithoutLeaseGuard(const BlockState& block) {
-    if (block.kept || block.unknown) return BlockMode::Keep;
+    if (block.unknown) return BlockMode::Store;
+    if (block.kept) return BlockMode::Keep;
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
     if (block.stampedNow || block.leaseOver) return BlockMode::OnGpu;
     return BlockMode::Store;
 }
 
 BlockMode WithoutWriterInGuard(const BlockState& block) {
-    if (block.kept || block.unknown) return BlockMode::Keep;
+    if (block.unknown) return BlockMode::Store;
+    if (block.kept) return BlockMode::Keep;
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
     if (block.leaseOver && !block.stampedNow && block.changedNow) return BlockMode::Fallback;
     if (block.stampedNow || block.leaseOver) return BlockMode::OnGpu;
@@ -91,14 +94,20 @@ BlockMode KeepForgetsCpuWrites(const BlockState& block) {
 }
 
 BlockMode WriterAlwaysOnGpu(const BlockState& block) {
-    if (block.kept || block.unknown) return BlockMode::Keep;
+    if (block.unknown) return BlockMode::Store;
+    if (block.kept) return BlockMode::Keep;
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
     if (block.leaseOver && !block.stampedNow && (block.changedNow || block.writerOver)) return BlockMode::Fallback;
     return BlockMode::OnGpu;
 }
 
 BlockMode KeptOnGpu(const BlockState& block) {
-    if ((block.kept || block.unknown) && (block.writerOver || block.leaseOver)) return BlockMode::OnGpu;
+    if (!block.unknown && block.kept && (block.writerOver || block.leaseOver)) return BlockMode::OnGpu;
+    return Classify(block);
+}
+
+BlockMode UntrackedKept(const BlockState& block) {
+    if (block.unknown) return BlockMode::Keep;
     return Classify(block);
 }
 
@@ -120,7 +129,8 @@ int main() {
         {"without the writer in the lease guard", WithoutWriterInGuard},
         {"storing CPU-written blocks without writers", KeepForgetsCpuWrites},
         {"comparing unstamped explicit writes on the GPU", WriterAlwaysOnGpu},
-        {"comparing kept and untracked blocks on the GPU", KeptOnGpu},
+        {"comparing kept blocks on the GPU", KeptOnGpu},
+        {"keeping untracked units", UntrackedKept},
     };
     for (const auto& control : controls) {
         const auto tally = Check(control.classify);
@@ -129,7 +139,8 @@ int main() {
     }
 
     Expect(Classify({true, false, false, false, true, true}) == BlockMode::Keep, "a block kept at unwatch stays kept under pending writers");
-    Expect(Classify({false, true, false, false, true, false}) == BlockMode::Keep, "an untracked unit stays kept under pending writers");
+    Expect(Classify({false, true, false, false, true, false}) == BlockMode::Store, "an untracked unit is stored whole under pending writers");
+    Expect(Classify({true, true, true, true, true, true}) == BlockMode::Store, "an untracked unit is stored whole even where a block was kept at unwatch");
     Expect(Classify({false, false, true, true, false, false}) == BlockMode::Keep, "a CPU-written block without pending writers is kept on the CPU");
     Expect(Classify({false, false, true, false, false, false}) == BlockMode::Store, "a stamped block holding its baseline is stored");
     Expect(Classify({false, false, false, false, true, false}) == BlockMode::Store, "an unstamped block under an explicit writer is stored");

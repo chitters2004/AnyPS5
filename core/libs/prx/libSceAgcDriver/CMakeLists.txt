@@ -142,6 +142,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcConditionalStoreShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ConditionalStore.comp)
+set(agcConditionalStoreShaderSpv ${agcTextureDetileGeneratedDir}/ConditionalStore.spv)
+set(agcConditionalStoreShaderHeader ${agcTextureDetileGeneratedDir}/ConditionalStore_spv.h)
+add_custom_command(
+        OUTPUT "${agcConditionalStoreShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcConditionalStoreShaderSpv}" "${agcConditionalStoreShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcConditionalStoreShaderSpv} -DOUTPUT=${agcConditionalStoreShaderHeader}
+        -DSYMBOL=CONDITIONAL_STORE_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcConditionalStoreShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcSampleCounterShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/SampleCounter.comp)
 set(agcSampleCounterShaderSpv ${agcTextureDetileGeneratedDir}/SampleCounter.spv)
 set(agcSampleCounterShaderHeader ${agcTextureDetileGeneratedDir}/SampleCounter_spv.h)
@@ -373,6 +386,7 @@ set(agcDriverSources
         ${agcTextureDetileImageShaderHeader}
         ${agcTextureRepackShaderHeader}
         ${agcDispatchArgumentsShaderHeader}
+        ${agcConditionalStoreShaderHeader}
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcPresentationShaderHeaders}

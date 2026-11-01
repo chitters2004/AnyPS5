@@ -128,7 +128,7 @@ bool AddressBasedStorePending(std::uint64_t image, bool open) {
     return read.has_value() && read->kind == AgcDriver::Graphics::Recorder::ReadKind::AddressBased && read->open == open;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name) {
+void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, bool gpuCompare) {
     const auto* words = guest.Words() + offset / 4u;
     const auto image = guest.Address() + offset;
     const auto target = device.Target();
@@ -146,7 +146,8 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
     }
     const std::string what = std::string("storage flush ordering, ") + name + ": ";
     Require(AddressBasedStorePending(image, !submit), what + "the address-based store was not pending in the expected batch at the flush");
-    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, gpuCompare ? "readback before label" : "test"), what + "the image store left no results pending");
+    if (gpuCompare && !submit) Require(AddressBasedStorePending(image, true), what + "the label store waited for the address-based store instead of comparing on the GPU");
     device.WaitIdle();
     Require(words[FarDword] == Stored, what + "the pending image's texel away from the newer write was not stored");
     Require(words[OverwrittenDword] == Overwritten, what + "the pending image's store put its older texels over a newer address-based store");
@@ -154,16 +155,17 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        const bool gpuCompare = argc == 2 && std::string(argv[1]) == "--label-gpu-compare";
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock guest(watched);
         if (!watched) std::puts("guest memory has no write watch: the writer-in-flight case is skipped");
         else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
-        else Run(*device, guest, 0, true, "writer in flight");
-        Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch");
+        else Run(*device, guest, 0, true, "writer in flight", gpuCompare);
+        Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch", gpuCompare);
         std::puts("storage flush ordering tests passed");
         return 0;
     } catch (const std::exception& error) {

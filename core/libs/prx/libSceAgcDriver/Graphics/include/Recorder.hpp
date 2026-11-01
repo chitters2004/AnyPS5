@@ -210,6 +210,8 @@ public:
     std::uint64_t OpenBatchSerial();
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
     bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr);
+    bool ConditionalStoreReady();
+    void RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
@@ -749,6 +751,9 @@ private:
     int dispatchArgumentState = 0;
     VkPipelineLayout dispatchArgumentLayout = VK_NULL_HANDLE;
     VkPipeline dispatchArgumentPipeline = VK_NULL_HANDLE;
+    int conditionalStoreState = 0;
+    VkPipelineLayout conditionalStoreLayout = VK_NULL_HANDLE;
+    VkPipeline conditionalStorePipeline = VK_NULL_HANDLE;
     // BeginGpuTiming on the open batch without Commands() (RecordStore times its own run, which
     // Commands() would close).
     std::uint32_t beginTiming(std::uint64_t key);

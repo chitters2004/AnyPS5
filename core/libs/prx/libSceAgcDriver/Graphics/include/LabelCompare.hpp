@@ -17,7 +17,8 @@ struct BlockState {
 };
 
 inline BlockMode Classify(const BlockState& block) {
-    if (block.kept || block.unknown) return BlockMode::Keep;
+    if (block.unknown) return BlockMode::Store;
+    if (block.kept) return BlockMode::Keep;
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
     if (block.leaseOver && !block.stampedNow && (block.changedNow || block.writerOver)) return BlockMode::Fallback;
     if (block.stampedNow || block.leaseOver) return BlockMode::OnGpu;

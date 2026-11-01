@@ -1543,6 +1543,80 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
 }
 
+int conditionalStoreTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    std::unique_lock gpu(GpuMutex());
+    if (!recorder.ConditionalStoreReady()) {
+        std::cout << "skipped, the conditional store pipeline is unavailable\n";
+        return 77;
+    }
+    constexpr std::uint32_t Words = 4096;
+    constexpr std::size_t Bytes = Words * 4;
+    constexpr VkBufferUsageFlags Usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    Buffer target(context, 2 * Bytes, Usage);
+    Buffer source(context, 2 * Bytes, Usage);
+    Buffer baseline(context, 2 * Bytes, Usage);
+    Buffer flags(context, 16, Usage);
+    const auto words = [](Buffer& buffer) { return reinterpret_cast<std::uint32_t*>(buffer.Bytes().data()); };
+    enum class Fill { None, Before, After };
+    struct Case {
+        const char* name;
+        std::uint32_t differing[2];
+        Fill fill;
+        bool kept[2];
+    };
+    const Case cases[] = {
+        {"unchanged ranges are stored", {Words, Words}, Fill::None, {false, false}},
+        {"a word changed in the last group keeps its whole range", {Words - 1, Words}, Fill::None, {true, false}},
+        {"a word changed in the first group keeps its whole range", {Words, 0}, Fill::None, {false, true}},
+        {"both ranges changed are both kept", {17, 4000}, Fill::None, {true, true}},
+        {"a GPU write recorded before the store is compared", {Words, Words}, Fill::Before, {true, false}},
+        {"a GPU write recorded after the store is not compared", {Words, Words}, Fill::After, {false, false}},
+    };
+    for (const auto& test : cases) {
+        for (std::uint32_t index = 0; index < 2 * Words; ++index) {
+            words(baseline)[index] = 0x1000u + index;
+            words(target)[index] = 0x1000u + index;
+            words(source)[index] = 0xabc00000u + index;
+        }
+        for (std::uint32_t range = 0; range < 2; ++range) {
+            if (test.differing[range] < Words) words(target)[range * Words + test.differing[range]] ^= 0x5au;
+        }
+        std::memset(flags.Bytes().data(), 0, 16);
+        const std::vector<std::uint32_t> before(words(target), words(target) + 2 * Words);
+        constexpr std::uint32_t Filled = 0x77777777u;
+        const auto fill = [&](VkCommandBuffer commands) {
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, target.Handle(), 8, 4, Filled);
+        };
+        const auto commands = recorder.Commands();
+        if (test.fill == Fill::Before) fill(commands);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        for (std::uint32_t range = 0; range < 2; ++range) recorder.RecordConditionalStore(commands, target.DeviceAddress() + range * Bytes, source.DeviceAddress() + range * Bytes, baseline.DeviceAddress() + range * Bytes, flags.DeviceAddress(), Words, range);
+        if (test.fill == Fill::After) fill(commands);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        recorder.Sync();
+        for (std::uint32_t range = 0; range < 2; ++range) {
+            std::uint32_t flag = 0;
+            std::memcpy(&flag, flags.Bytes().data() + 4 * range, 4);
+            Require((flag != 0) == test.kept[range], test.name);
+            for (std::uint32_t index = 0; index < Words; ++index) {
+                const auto at = range * Words + index;
+                auto expected = test.kept[range] ? before[at] : 0xabc00000u + at;
+                if (at == 2 && test.fill != Fill::None && (test.fill == Fill::After || test.kept[range])) expected = Filled;
+                if (words(target)[at] != expected) {
+                    std::cerr << test.name << ": word " << at << " is 0x" << std::hex << words(target)[at] << " instead of 0x" << expected << std::dec << '\n';
+                    Require(false, test.name);
+                }
+            }
+        }
+        std::cout << "conditional store: " << test.name << '\n';
+    }
+    std::cout << "conditional store tests passed\n";
+    return 0;
+}
+
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     const auto& context = device.GetContext();
     if (!device.Timestamps()) {
@@ -12564,6 +12638,9 @@ int main(int argc, char** argv) {
             }
             splitWriteBackTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--conditional-store-only") {
+            return conditionalStoreTests(device, recorder);
         }
         if (argc == 2 && std::string_view(argv[1]) == "--storage-write-back-only") {
             if (device.GetContext().hostImportAlignment == 0) {
