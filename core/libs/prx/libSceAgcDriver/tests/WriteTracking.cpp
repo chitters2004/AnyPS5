@@ -538,6 +538,29 @@ void CheckStampedBlockCompare() {
     Require(EqualsCommittedSince(base, snapshot, current, &compared) && compared == 0, "a texture current at its generation compared bytes");
 }
 
+void CheckStoreAfterCollectFoundNextCollect() {
+    constexpr std::size_t Bytes = 8 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x5c, Bytes);
+    std::vector<std::byte> snapshot(Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
+    const auto taken = CollectWritesUncached(base, Bytes);
+    Require(taken != 0, "the late store fixture was not collected");
+    static_cast<volatile std::uint8_t*>(memory)[Block + 0x10] = 0x5d;
+    const auto lookup = CollectWritesUncached(base, Bytes);
+    static_cast<volatile std::uint8_t*>(memory)[5 * Block + 0x20] = 0x5e;
+    std::size_t compared = 0;
+    Require(!EqualsCommitted(base, snapshot), "the full compare missed a store made after the last collect");
+    Require(!EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "the stamped compare did not compare exactly the collected store's block");
+    static_cast<volatile std::uint8_t*>(memory)[Block + 0x10] = 0x5c;
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "a store made after the last collect was compared before a collect stamped it");
+    Require(NewestStamp(base + 5 * Block, Block) <= lookup, "a store made after the last collect was stamped without a collect");
+    CollectWritesUncached(base, Bytes);
+    Require(NewestStamp(base + 5 * Block, Block) > lookup, "the next collect did not stamp the late store newer than the lookup's generation");
+    Require(!EqualsCommittedSince(base, snapshot, lookup, &compared) && compared == 2 * Block, "the late store was missed once the next collect stamped it");
+}
+
 void CheckUntrackedStoreCompared() {
     constexpr std::size_t Bytes = 4 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
@@ -2238,6 +2261,7 @@ int main() {
         CheckUnwatch();
         CheckStampedBlockCompare();
         CheckUntrackedStoreCompared();
+        CheckStoreAfterCollectFoundNextCollect();
         CheckNewestStamp();
         CheckPartlyWatchedStore();
 #ifndef _WIN32
