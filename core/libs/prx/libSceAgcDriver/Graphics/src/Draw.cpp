@@ -1280,6 +1280,62 @@ void CountDrawSkip(DrawSkip kind, double us) {
 }
 
 
+std::uint32_t ExpandPatchIndices_nid_no_patch(bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<const std::byte> indices, std::uint32_t indexSize, std::span<std::uint32_t> out) {
+    const std::uint32_t corners = quadList ? 6u : 3u;
+    const auto needed = quadList ? static_cast<std::uint64_t>(primitives) * 4u : static_cast<std::uint64_t>(primitives) + 2u;
+    Require(static_cast<std::uint64_t>(primitives) * corners <= out.size(), "expanded index output is too small");
+    Require(indices.empty() || ((indexSize == 2u || indexSize == 4u) && needed * indexSize <= indices.size()), "expanded index source is too small");
+    const auto source = [&](std::uint32_t idx) -> std::uint32_t {
+        if (indices.empty()) return idx;
+        if (indexSize == 2u) {
+            std::uint16_t value = 0;
+            std::memcpy(&value, indices.data() + static_cast<std::size_t>(idx) * 2u, sizeof(value));
+            return value;
+        }
+        std::uint32_t value = 0;
+        std::memcpy(&value, indices.data() + static_cast<std::size_t>(idx) * 4u, sizeof(value));
+        return value;
+    };
+    std::uint32_t maxIdx = 0;
+    for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
+        auto* written = out.data() + static_cast<std::size_t>(primitive) * corners;
+        if (quadList) {
+            const auto i0 = source(primitive * 4u + 0u);
+            const auto i1 = source(primitive * 4u + 1u);
+            const auto i2 = source(primitive * 4u + 2u);
+            const auto i3 = source(primitive * 4u + 3u);
+            if (lastProvoking) {
+                written[0] = i0;
+                written[1] = i1;
+                written[2] = i3;
+                written[3] = i1;
+                written[4] = i2;
+                written[5] = i3;
+            } else {
+                written[0] = i0;
+                written[1] = i1;
+                written[2] = i2;
+                written[3] = i0;
+                written[4] = i2;
+                written[5] = i3;
+            }
+        } else {
+            const std::uint32_t odd = primitive & 1u;
+            if (lastProvoking) {
+                written[0] = source(primitive + odd);
+                written[1] = source(primitive + 1u - odd);
+                written[2] = source(primitive + 2u);
+            } else {
+                written[0] = source(primitive);
+                written[1] = source(primitive + 1u + odd);
+                written[2] = source(primitive + 2u - odd);
+            }
+        }
+        for (std::uint32_t corner = 0; corner < corners; ++corner) maxIdx = std::max(maxIdx, written[corner]);
+    }
+    return maxIdx;
+}
+
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
     return !noDrawRecipe;
@@ -1548,64 +1604,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         auto* outIndices = reinterpret_cast<std::uint32_t*>(indexCopy->Bytes().data());
         std::uint32_t maxIdx = 0;
         const bool lastProvoking = state.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
-        const auto expand = [&](const auto& source) {
-            for (std::uint32_t primitive = 0; primitive < primitives; ++primitive) {
-                auto* out = outIndices + static_cast<std::size_t>(primitive) * corners;
-                if (state.quadList) {
-                    const auto i0 = source(primitive * 4u + 0u);
-                    const auto i1 = source(primitive * 4u + 1u);
-                    const auto i2 = source(primitive * 4u + 2u);
-                    const auto i3 = source(primitive * 4u + 3u);
-                    if (lastProvoking) {
-                        out[0] = i0;
-                        out[1] = i1;
-                        out[2] = i3;
-                        out[3] = i1;
-                        out[4] = i2;
-                        out[5] = i3;
-                    } else {
-                        out[0] = i0;
-                        out[1] = i1;
-                        out[2] = i2;
-                        out[3] = i0;
-                        out[4] = i2;
-                        out[5] = i3;
-                    }
-                } else {
-                    const std::uint32_t odd = primitive & 1u;
-                    if (lastProvoking) {
-                        out[0] = source(primitive + odd);
-                        out[1] = source(primitive + 1u - odd);
-                        out[2] = source(primitive + 2u);
-                    } else {
-                        out[0] = source(primitive);
-                        out[1] = source(primitive + 1u + odd);
-                        out[2] = source(primitive + 2u - odd);
-                    }
-                }
-                for (std::uint32_t corner = 0; corner < corners; ++corner) maxIdx = std::max(maxIdx, out[corner]);
-            }
-        };
         if (draw.indexed) {
-            GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-            GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
-            const auto readIndex = [&](std::uint32_t idx) -> std::uint32_t {
-                if (draw.indexSize == 2) {
-                    std::uint16_t v = 0;
-                    GuestMemory::Read(draw.indexAddress + static_cast<std::uint64_t>(idx) * 2u, std::as_writable_bytes(std::span(&v, 1)), 2);
-                    return v;
-                } else {
-                    std::uint32_t v = 0;
-                    GuestMemory::Read(draw.indexAddress + static_cast<std::uint64_t>(idx) * 4u, std::as_writable_bytes(std::span(&v, 1)), 4);
-                    return v;
-                }
-            };
-            expand(readIndex);
+            std::vector<std::byte> indices(static_cast<std::size_t>(indexBytes));
+            GuestMemory::Read(draw.indexAddress, indices, draw.indexSize);
+            maxIdx = ExpandPatchIndices_nid_no_patch(state.quadList, lastProvoking, primitives, indices, draw.indexSize, std::span(outIndices, outputIndexCount));
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
         } else {
             const std::uint32_t lastVertex = state.quadList ? primitives * 4u - 1u : primitives + 1u;
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
-            expand([](std::uint32_t idx) { return idx; });
+            maxIdx = ExpandPatchIndices_nid_no_patch(state.quadList, lastProvoking, primitives, {}, 0u, std::span(outIndices, outputIndexCount));
         }
         inputs.maxIndex = maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");

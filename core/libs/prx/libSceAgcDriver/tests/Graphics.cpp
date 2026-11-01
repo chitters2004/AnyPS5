@@ -9210,6 +9210,39 @@ void quadListTests() {
         for (const auto count : {5u, 6u, 7u}) Require(drawOutcome(count, indexed) == complete, "a quad-list draw with partial trailing vertices was not drawn like complete quads");
     }
     Require(drawOutcome(0, true).empty(), "an indexed quad-list draw without indices was not skipped");
+    const auto expanded = [](bool quadList, bool lastProvoking, std::uint32_t primitives, std::span<const std::byte> source, std::uint32_t indexSize, std::vector<std::uint32_t> expected, std::uint32_t highest, const char* what) {
+        std::vector<std::uint32_t> out(expected.size(), 0xdeadbeefu);
+        const auto max = ExpandPatchIndices_nid_no_patch(quadList, lastProvoking, primitives, source, indexSize, out);
+        Require(out == expected && max == highest, std::string("expanded patch indices are wrong: ") + what);
+    };
+    const std::array<std::uint16_t, 8> quads16{0, 1, 2, 3, 2, 3, 4, 9};
+    const std::array<std::uint32_t, 8> quads32{0, 1, 2, 3, 2, 3, 4, 70000};
+    const std::array<std::uint16_t, 5> strip16{5, 6, 7, 8, 9};
+    const std::array<std::uint32_t, 5> strip32{5, 6, 7, 8, 70009};
+    expanded(true, false, 2, std::as_bytes(std::span(quads16)), 2, {0, 1, 2, 0, 2, 3, 2, 3, 4, 2, 4, 9}, 9, "16-bit quads, first vertex");
+    expanded(true, true, 2, std::as_bytes(std::span(quads16)), 2, {0, 1, 3, 1, 2, 3, 2, 3, 9, 3, 4, 9}, 9, "16-bit quads, last vertex");
+    expanded(true, false, 2, std::as_bytes(std::span(quads32)), 4, {0, 1, 2, 0, 2, 3, 2, 3, 4, 2, 4, 70000}, 70000, "32-bit quads, first vertex");
+    expanded(true, true, 2, std::as_bytes(std::span(quads32)), 4, {0, 1, 3, 1, 2, 3, 2, 3, 70000, 3, 4, 70000}, 70000, "32-bit quads, last vertex");
+    expanded(false, false, 3, std::as_bytes(std::span(strip16)), 2, {5, 6, 7, 6, 8, 7, 7, 8, 9}, 9, "16-bit strip, first vertex");
+    expanded(false, true, 3, std::as_bytes(std::span(strip16)), 2, {5, 6, 7, 7, 6, 8, 7, 8, 9}, 9, "16-bit strip, last vertex");
+    expanded(false, false, 3, std::as_bytes(std::span(strip32)), 4, {5, 6, 7, 6, 8, 7, 7, 8, 70009}, 70009, "32-bit strip, first vertex");
+    expanded(true, false, 1, {}, 0, {0, 1, 2, 0, 2, 3}, 3, "auto quads");
+    expanded(false, false, 2, {}, 0, {0, 1, 2, 1, 3, 2}, 3, "auto strip");
+    std::vector<std::uint32_t> small(12);
+    bool refusedSource = false;
+    try {
+        ExpandPatchIndices_nid_no_patch(true, false, 2, std::as_bytes(std::span(quads16).first(7)), 2, small);
+    } catch (const std::runtime_error&) {
+        refusedSource = true;
+    }
+    Require(refusedSource, "an index source shorter than its primitives was expanded");
+    bool refusedOutput = false;
+    try {
+        ExpandPatchIndices_nid_no_patch(true, false, 2, std::as_bytes(std::span(quads16)), 2, std::span(small).first(11));
+    } catch (const std::runtime_error&) {
+        refusedOutput = true;
+    }
+    Require(refusedOutput, "an expansion into a too small output was accepted");
     const AgcDriver::Pm4::DrawParameters noInstances{reinterpret_cast<std::uint64_t>(indices.data()), 4, 2, 0, 0, true};
     Draw(context, state, noInstances, {});
 }
