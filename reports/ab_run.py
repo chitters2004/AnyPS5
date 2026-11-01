@@ -121,13 +121,38 @@ def parse_profile(text):
             "full revalidations": r"([0-9]+) full revalidations",
             "revalidate us: pre-pass": r"pre-pass " + NUMBER + " us",
             "ranges per revalidation": r"over " + NUMBER + " ranges",
-            "pending-write checks per revalidation": r"\(" + NUMBER + " pending-write checks\)",
+            "pending-write checks per revalidation": r"\(" + NUMBER + r" pending-write checks\)",
             "revalidate us: images": r"images " + NUMBER + " us",
             "revalidate us: imports": r"imports " + NUMBER + " us",
             "revalidate us: rest": r"rest " + NUMBER + " us",
             "moved: collect epoch": r"collect epoch ([0-9]+)",
             "moved: proof serial": r"proof serial ([0-9]+)",
             "moved: pending serial": r"pending serial ([0-9]+)",
+        }
+        for name, pattern in fields.items():
+            match = re.search(pattern, line)
+            if match:
+                result[name] = float(match.group(1))
+    line = last_line(text, "[draw-bindings]")
+    if line:
+        fields = {
+            "ring draws per 10 s": r"\(10 s\): ([0-9]+) ring draws",
+            "ring bytes copied per draw": NUMBER + r" bytes copied each",
+            "ring draws up to 256 B": r"up to 256: ([0-9]+)",
+            "ring draws up to 1 KiB": r"1 KiB: ([0-9]+)",
+            "ring draws up to 4 KiB": r"4 KiB: ([0-9]+)",
+            "ring draws up to 16 KiB": r"16 KiB: ([0-9]+)",
+            "ring draws over 16 KiB": r"more: ([0-9]+)",
+            "ring sets found": r"ring sets ([0-9]+) found",
+            "ring sets written": r"/ ([0-9]+) written",
+            "ring sets evicted live": r"\(([0-9]+) live ones evicted\)",
+            "ring draws per template and batch": NUMBER + r" draws per template and batch",
+            "rewritten draws per 10 s": r"; ([0-9]+) rewritten draws",
+            "rewritten data bytes per draw": NUMBER + r" data bytes",
+            "guest snapshots per rewritten draw": NUMBER + r" guest snapshots each",
+            "template set pool hits": r"template set pool ([0-9]+) hits",
+            "template set pool misses": r"/ ([0-9]+) misses",
+            "templates drawing per 10 s": r"; ([0-9]+) templates drew",
         }
         for name, pattern in fields.items():
             match = re.search(pattern, line)
@@ -243,12 +268,15 @@ def self_test():
         "[lookup-split] (10 s): 1000 draw resource lookups, 990 hits; us per lookup: key 0.50 find 0.40 revalidate 9.00 moved buffers 1.20 alias checks 0.30",
         "[lookup-split] (10 s): 2000 draw resource lookups, 1980 hits; us per lookup: key 0.60 find 0.45 revalidate 8.00 moved buffers 1.10 alias checks 0.25",
         "[revalidate-split] (cumulative): 50 epoch proofs reused, 150 proved (no epoch 0, first proof 10; moved since the object's proof: collect epoch 120, proof serial 30, pending serial 5); 150 full revalidations, per call: pre-pass 2.50 us over 30.0 ranges (0.0 pending-write checks), images 5.00 us (12.0 textures, 1.0 storage images), imports 0.80 us, rest 0.20 us",
+        "[draw-bindings] (10 s): 2700 ring draws, 832 bytes copied each (up to 256: 100, 1 KiB: 2000, 4 KiB: 600, 16 KiB: 0, more: 0), ring sets 2650 found / 50 written (3 live ones evicted), 12.5 draws per template and batch; 300 rewritten draws, 512 data bytes and 1.5 guest snapshots each, template set pool 280 hits / 70 misses; 400 templates drew",
         "[rescache] draws: 10 hits, 1 misses, 0 invalidated, 0 uncacheable; validation memo 5 hits / 1 misses (which key words the misses differ in: the miss churn line); draw bindings (cumulative): 900 ring with dynamic offsets (40 ring sets written), 100 rewritten sets",
     ])
     parsed = parse_profile(profile_text)
     assert parsed["lookup us: revalidate"] == 8.0 and parsed["lookup us: moved buffers"] == 1.1 and parsed["lookups_per_10s"] == 2000, parsed
     assert parsed["revalidate us: pre-pass"] == 2.5 and parsed["pending-write checks per revalidation"] == 0.0 and parsed["moved: collect epoch"] == 120, parsed
     assert parsed["ring share %"] == 90.0 and parsed["ring sets written"] == 40, parsed
+    assert parsed["ring bytes copied per draw"] == 832 and parsed["ring draws up to 1 KiB"] == 2000 and parsed["ring sets evicted live"] == 3, parsed
+    assert parsed["ring draws per template and batch"] == 12.5 and parsed["guest snapshots per rewritten draw"] == 1.5 and parsed["template set pool misses"] == 70 and parsed["templates drawing per 10 s"] == 400, parsed
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         script = root / "fake_title.py"
