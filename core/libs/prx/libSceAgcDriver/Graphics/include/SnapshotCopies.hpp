@@ -44,6 +44,26 @@ struct SnapshotCopies {
         bytes += data.size();
     }
 
+    void Insert(const Key& key, const std::shared_ptr<Buffer>& buffer, std::vector<std::byte>&& data) {
+        recency.push_back(key);
+        std::map<Key, Entry>::iterator entry;
+        bool inserted = false;
+        try {
+            std::tie(entry, inserted) = entries.try_emplace(key);
+        } catch (...) {
+            recency.pop_back();
+            throw;
+        }
+        if (!inserted) {
+            recency.pop_back();
+            return;
+        }
+        bytes += data.size();
+        entry->second.buffer = buffer;
+        entry->second.bytes = std::move(data);
+        entry->second.recent = std::prev(recency.end());
+    }
+
     void Clear() {
         entries.clear();
         recency.clear();

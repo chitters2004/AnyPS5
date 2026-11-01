@@ -3,6 +3,7 @@
 #include <array>
 #include <cstdio>
 #include <new>
+#include <vector>
 
 namespace {
 using AgcDriver::Graphics::Detail::SnapshotCopies;
@@ -60,11 +61,45 @@ void CheckInsertionFailures() {
     }
     Require(failures == 3, "did not exercise every snapshot insertion allocation");
 }
+
+void CheckMovedInsertion() {
+    const SnapshotCopies::Key key{0x3000, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT};
+    auto owner = std::make_shared<int>(7);
+    const std::shared_ptr<AgcDriver::Graphics::Buffer> buffer(owner, nullptr);
+    unsigned failures = 0;
+    for (int point = 0; point < 3; ++point) {
+        SnapshotCopies copies;
+        std::vector<std::byte> data(4096, std::byte{0x5a});
+        const auto* storage = data.data();
+        bool failed = false;
+        SetAllocationFailureCountdown(point);
+        try {
+            copies.Insert(key, buffer, std::move(data));
+        } catch (const std::bad_alloc&) {
+            failed = true;
+            ++failures;
+        }
+        SetAllocationFailureCountdown(-1);
+        Require(Consistent(copies), "moved snapshot insertion left inconsistent eviction metadata");
+        if (failed) {
+            Require(copies.entries.empty() && copies.bytes == 0 && data.data() == storage && data.size() == 4096, "failed moved insertion lost the snapshot or changed accounting");
+            continue;
+        }
+        const auto& kept = copies.entries.at(key).bytes;
+        Require(kept.data() == storage, "a snapshot cache insert copied the bytes instead of taking them");
+        Require(kept.size() == 4096 && kept.front() == std::byte{0x5a} && copies.bytes == 4096, "moved snapshot insertion changed the bytes or the accounting");
+        Require(owner.use_count() == 3, "moved snapshot insertion leaked or lost a buffer reference");
+        copies.Insert(key, buffer, std::vector<std::byte>(16));
+        Require(Consistent(copies) && copies.entries.size() == 1 && copies.bytes == 4096, "a repeated key replaced or double counted a snapshot");
+    }
+    Require(failures == 2, "did not exercise every moved snapshot insertion allocation");
+}
 }
 
 int main() {
     try {
         CheckInsertionFailures();
+        CheckMovedInsertion();
         std::puts("Snapshot insertion allocation failures preserve eviction metadata and buffer ownership");
     } catch (const std::exception& error) {
         SetAllocationFailureCountdown(-1);

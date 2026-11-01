@@ -2524,7 +2524,7 @@ SnapshotCopies& SnapshotCopyCache() {
     return copies;
 }
 
-std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t address, std::span<const std::byte> bytes, VkBufferUsageFlags usage) {
+std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t address, std::vector<std::byte>& bytes, VkBufferUsageFlags usage) {
     auto& copies = SnapshotCopyCache();
     std::lock_guard lock(copies.mutex);
     if (copies.device != context.device) {
@@ -2550,7 +2550,7 @@ std::shared_ptr<Buffer> snapshotCopy(const Context& context, std::uint64_t addre
         copies.entries.erase(oldest);
         copies.recency.pop_front();
     }
-    copies.Insert(key, buffer, bytes);
+    copies.Insert(key, buffer, std::move(bytes));
     return buffer;
 }
 
@@ -5911,7 +5911,7 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
     else {
         if (!shared) std::memcpy(region.buffer->Bytes().data(), region.snapshot.data(), region.snapshot.size());
-        readBytes += region.snapshot.size();
+        readBytes += shared ? bytes : region.snapshot.size();
     }
     region.snapshot.clear();
     if (profile) readUs.fetch_add(microsecondsSince(readStart), std::memory_order_relaxed);
