@@ -492,6 +492,7 @@ struct PageStates {
     }
 
     std::atomic<std::uint64_t> accessSerial{0};
+    std::atomic<bool> observed{false};
 
     void record(std::uintptr_t base, std::uintptr_t regionEnd, bool readable, bool writable, std::uint64_t generation, std::uint64_t access) {
         for (PageSpan* span : {&arena, &image}) {
@@ -547,6 +548,7 @@ void ForgetPages(std::uintptr_t address, std::size_t bytes) {
 void ForgetInaccessiblePages(std::uintptr_t address, std::size_t bytes) {
     Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
     Pages().forgetInaccessible(address, bytes);
+    Pages().accessSerial.fetch_add(1, std::memory_order_acq_rel);
 }
 
 #ifdef __linux__
@@ -601,6 +603,7 @@ void PageStates::initialize() {
         if (arenaCached || imageCached) {
             GuestAllocations::GuestAllocationsSetInvalidator_nid_postfix(&ForgetPages);
             GuestArena::GuestArenaSetAccessObserver_nid_postfix(&ForgetInaccessiblePages);
+            observed.store(true, std::memory_order_release);
         }
     });
     ready.store(true, std::memory_order_release);
@@ -828,6 +831,30 @@ void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, b
         if (trace) std::fprintf(stderr, "[unreadable] %s from +0x%llx\n", reason.c_str(), ModuleOffset(__builtin_return_address(0)));
         require(false, reason.c_str());
     }
+}
+
+std::uint64_t MappingEpoch() {
+    auto& pages = Pages();
+    pages.initialize();
+    return GuestAllocations::GuestAllocationsGeneration_nid_postfix() + forgetSerial.load(std::memory_order_acquire) + pages.accessSerial.load(std::memory_order_acquire);
+}
+
+void CheckRangeProved(RangeProof* proof, const void* pointer, std::size_t bytes, std::size_t alignment) {
+    if (proof == nullptr) {
+        CheckRange(pointer, bytes, alignment);
+        return;
+    }
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    require(alignment != 0, "zero guest memory alignment");
+    require(address != 0 && address % alignment == 0, "null or misaligned address");
+    require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address, "address range overflow");
+    const auto epoch = MappingEpoch();
+    if (proof->Holds(address, bytes, epoch)) return;
+    CheckRange(pointer, bytes, alignment);
+    auto& pages = Pages();
+    const auto* span = pages.spanOf(address);
+    if (bytes == 0u || !pages.observed.load(std::memory_order_acquire) || span == nullptr || span != pages.spanOf(address + bytes - 1u) || onOwnLiveStack(address, bytes)) return;
+    proof->Record(address, bytes, epoch);
 }
 
 bool Accessible(const void* pointer, std::size_t bytes, bool writable) {

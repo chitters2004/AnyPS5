@@ -48,6 +48,8 @@ private:
 };
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+void CheckRangeProved(RangeProof* proof, const void* pointer, std::size_t bytes, std::size_t alignment);
+std::uint64_t MappingEpoch();
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while

@@ -1488,7 +1488,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto indexBytes = inputs.indexBytes;
     APS5_LOG_OUT_DEBUG("Index buffer bytes=%llu", static_cast<unsigned long long>(indexBytes));
     Require(indexBytes <= std::numeric_limits<std::size_t>::max(), "index buffer size overflow");
-    if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+    if (draw.indexed) GuestMemory::CheckRangeProved(recipe != nullptr ? &recipe->mappingProofs[0] : nullptr, reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
     Require(!draw.indexed || !state.hasColorTarget || draw.indexAddress + indexBytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= draw.indexAddress, "index buffer aliases the render target");
     if (draw.indexed) RequireNoMultisampleTargetProved(recipe != nullptr ? &recipe->guardProofs[0] : nullptr, draw.indexAddress, static_cast<std::size_t>(indexBytes), "an index buffer read");
@@ -1766,7 +1766,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
         const auto [begin, end] = plan.copies[range];
         const auto bytes = static_cast<std::size_t>(end - begin);
-        GuestMemory::CheckRange(reinterpret_cast<const void*>(begin), bytes, 1);
+        GuestMemory::CheckRangeProved(recipe != nullptr && range + 1u < recipe->mappingProofs.size() ? &recipe->mappingProofs[range + 1u] : nullptr, reinterpret_cast<const void*>(begin), bytes, 1);
         RequireNoMultisampleTargetProved(recipe != nullptr && range + 1u < recipe->guardProofs.size() ? &recipe->guardProofs[range + 1u] : nullptr, begin, bytes, "a vertex buffer read");
         if (const auto* import = InPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite)) {
             rangeHandles.push_back(import->buffer);

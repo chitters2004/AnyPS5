@@ -397,6 +397,49 @@ void CheckGuardLog() {
     std::puts("guard log: registrations elsewhere keep proofs, overlapping ones and an overflowing log do not");
 }
 
+#ifndef _WIN32
+alignas(0x10000) std::array<std::byte, 0x20000> imageBlock{};
+
+bool CheckMappingProof() {
+    using AgcDriver::GuestMemory::CheckRangeProved;
+    using AgcDriver::GuestMemory::MappingEpoch;
+    auto* data = imageBlock.data();
+    const auto address = reinterpret_cast<std::uint64_t>(data);
+    constexpr std::size_t Page = 0x10000;
+    GuestAllocations::Mutation().Add(data, imageBlock.size(), true, true, true);
+    AgcDriver::GuestMemory::RangeProof proof;
+    CheckRangeProved(&proof, data, 4096u, 4u);
+    if (proof.Stamp(address, 4096u) == 0u) {
+        GuestAllocations::Mutation().Remove(data);
+        return false;
+    }
+    Require(proof.Holds(address, 4096u, MappingEpoch()), "a checked range was not proven at the mapping epoch");
+    Refuses([&] { CheckRangeProved(&proof, data + 1, 4096u, 4u); }, "misaligned");
+    WithoutSharedWrites([&] {
+        for (int round = 0; round < 1000; ++round) CheckRangeProved(&proof, data, 4096u, 4u);
+    });
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(data, Page, false, false, false, [&] { Require(mprotect(data, Page, PROT_NONE) == 0, "cannot protect the image block"); });
+    }
+    Require(!proof.Holds(address, 4096u, MappingEpoch()), "a mapping proof held after its range became inaccessible");
+    Refuses([&] { CheckRangeProved(&proof, data, 4096u, 4u); }, "not readable");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Protect(data, Page, true, true, false, [&] { Require(mprotect(data, Page, PROT_READ | PROT_WRITE) == 0, "cannot unprotect the image block"); });
+    }
+    CheckRangeProved(&proof, data, 4096u, 4u);
+    Require(proof.Holds(address, 4096u, MappingEpoch()), "a readable range was not proven again");
+    std::byte* stack[1]{};
+    AgcDriver::GuestMemory::RangeProof stackProof;
+    CheckRangeProved(&stackProof, stack, sizeof(stack), 1u);
+    Require(stackProof.Stamp(reinterpret_cast<std::uint64_t>(stack), sizeof(stack)) == 0u, "a range outside the cached pages was proven");
+    GuestAllocations::Mutation().Remove(data);
+    Require(!proof.Holds(address, 4096u, MappingEpoch()), "a mapping proof held after its range was removed");
+    return true;
+}
+#endif
+
 struct TeardownReads {
     std::uint64_t guardAddress = 0;
     std::uint64_t clearAddress = 0;
@@ -577,6 +620,9 @@ int main() {
         CheckProof();
         CheckRangeProof();
         CheckGuardLog();
+#ifndef _WIN32
+        std::puts(CheckMappingProof() ? "mapping proof: a checked range holds until a protection change, misalignment is still refused, held proofs write nothing in the driver image" : "mapping proof: skipped, the executable image is not page-cached");
+#endif
         CheckOverflow();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;

@@ -86,6 +86,7 @@ struct DrawRecipe {
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
     mutable std::array<GuestMemory::RangeProof, 8> guardProofs{};
+    mutable std::array<GuestMemory::RangeProof, 8> mappingProofs{};
 };
 
 }
