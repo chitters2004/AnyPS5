@@ -1570,19 +1570,23 @@ void NoteResidentGuardGrowth_nid_no_patch() {
     guardGrowth().fetch_add(1, std::memory_order_release);
 }
 
-bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::uint64_t>::max() - address) return ColorGuardOverlap | DepthGuardOverlap;
     const auto growth = guardGrowth().load(std::memory_order_acquire);
     if (const auto* certificate = GuardCertificateSlot::Get(); certificate != nullptr && certificate->growth == growth) {
         for (const auto& gap : certificate->gaps) {
-            if (gap.begin <= address && address < gap.end && bytes <= gap.end - address) return true;
+            if (gap.begin <= address && address < gap.end && bytes <= gap.end - address) return 0u;
         }
     }
     GuardGap gap{0, std::numeric_limits<std::uint64_t>::max()};
     const auto end = address + bytes;
-    if (!colorGap(address, end, gap) || !ResidentDepthGap_nid_no_patch(address, end, gap)) return false;
-    rememberGap(growth, gap);
-    return true;
+    const auto overlaps = (colorGap(address, end, gap) ? 0u : ColorGuardOverlap) | (ResidentDepthGap_nid_no_patch(address, end, gap) ? 0u : DepthGuardOverlap);
+    if (overlaps == 0u) rememberGap(growth, gap);
+    return overlaps;
+}
+
+bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    return ResidentGuardOverlaps_nid_no_patch(address, bytes) == 0u;
 }
 
 std::uint64_t MultisampleTargetRangeGeneration() {
@@ -1650,14 +1654,7 @@ std::optional<std::vector<ShaderRecompiler::BdaAbi::Range>> ExcludeMultisampleTa
     return changed ? std::optional(std::move(filtered)) : std::nullopt;
 }
 
-void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
-    if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch()) || ResidentGuardsClear_nid_no_patch(address, bytes)) return;
-    RequireNoResidentDepthRead_nid_no_patch(address, bytes);
-    RequireNoMultisampleColorTarget(address, bytes, access);
-}
-
-void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
-    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || ResidentGuardsClear_nid_no_patch(address, bytes)) return;
+static void requireNoColorTargetExact(std::uint64_t address, std::size_t bytes, const char* access) {
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "multisampled color read range overflows");
     const auto overlaps = [&](const GuardedRange& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     const auto refuse = [&](const GuardedRange& range) {
@@ -1697,6 +1694,18 @@ void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, c
     for (const auto& active : retired) active->store(false, std::memory_order_release);
     std::erase_if(guarded(), [&](const auto& range) { return std::find(retired.begin(), retired.end(), range.active) != retired.end(); });
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
+}
+
+void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+    if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch())) return;
+    const auto overlaps = ResidentGuardOverlaps_nid_no_patch(address, bytes);
+    if ((overlaps & DepthGuardOverlap) != 0u && HasResidentDepthGuards_nid_no_patch()) RequireNoResidentDepthReadExact_nid_no_patch(address, bytes);
+    if ((overlaps & ColorGuardOverlap) != 0u && anyGuarded().load(std::memory_order_acquire)) requireNoColorTargetExact(address, bytes, access);
+}
+
+void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || (ResidentGuardOverlaps_nid_no_patch(address, bytes) & ColorGuardOverlap) == 0u) return;
+    requireNoColorTargetExact(address, bytes, access);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes) {

@@ -104,8 +104,12 @@ inline bool NarrowGuardGap(GuardGap& gap, std::uint64_t address, std::uint64_t e
     return true;
 }
 
+inline constexpr unsigned ColorGuardOverlap = 1u;
+inline constexpr unsigned DepthGuardOverlap = 2u;
+
 std::uint64_t ResidentGuardGrowth_nid_no_patch();
 void NoteResidentGuardGrowth_nid_no_patch();
+unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access);

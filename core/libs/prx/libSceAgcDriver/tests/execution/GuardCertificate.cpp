@@ -143,6 +143,9 @@ void CheckHeadless() {
     const auto registered = ResidentGuardGrowth_nid_no_patch();
     Require(registered > start, "registering a guard did not advance the guard growth");
     Require(!ResidentGuardsClear_nid_no_patch(guardAddress, 64u), "a certificate taken before a registration was accepted after it");
+    Require(ResidentGuardOverlaps_nid_no_patch(guardAddress, 64u) == ColorGuardOverlap, "a read of a color guard was not classified as a color overlap only");
+    Require(ResidentGuardOverlaps_nid_no_patch(distant, 64u) == 0u, "a distant read was classified as an overlap");
+    Require(ResidentGuardOverlaps_nid_no_patch(std::numeric_limits<std::uint64_t>::max() - 15u, 32u) == (ColorGuardOverlap | DepthGuardOverlap), "an overflowing read was not sent to both exact paths");
     Refuses([&] { RequireNoMultisampleColorTarget(guardAddress, 64u, "a CPU read"); }, "FMASK");
     Refuses([&] { RequireNoMultisampleTarget(guardAddress + FmaskBytes - 1u, 1u, "a CPU read"); }, "FMASK");
     Refuses([&] { RequireNoMultisampleTarget(guardAddress - 64u, 65u, "a CPU read"); }, "FMASK");
