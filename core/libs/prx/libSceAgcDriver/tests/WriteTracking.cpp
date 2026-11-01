@@ -502,6 +502,7 @@ void CheckUnwatch() {
 }
 
 void CheckStampedBlockCompare() {
+    constexpr std::size_t Page = 4096;
     constexpr std::size_t Bytes = 32 * Block;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -518,19 +519,19 @@ void CheckStampedBlockCompare() {
     const auto same = CollectWritesUncached(base, Bytes);
     Require(same > taken && !UnchangedSince(base, Bytes, taken), "the rewritten block was not stamped");
     Require(EqualsCommittedSince(base, snapshot, taken, &compared) == EqualsCommitted(base, snapshot), "the stamped compare disagrees with a full compare over a rewrite of the same bytes");
-    Require(compared == Block, "a rewrite of one block did not compare exactly that block");
+    Require(compared == Page, "a rewrite of one page did not compare exactly that page");
     Require(EqualsCommittedSince(base, snapshot, taken), "a rewrite of the same bytes reads as a change");
 
     static_cast<volatile std::uint8_t*>(memory)[Stamped] = static_cast<std::uint8_t>(memory[Stamped] ^ 0x5a);
     CollectWritesUncached(base, Bytes);
     Require(EqualsCommittedSince(base, snapshot, taken, &compared) == EqualsCommitted(base, snapshot), "the stamped compare disagrees with a full compare over a changed block");
-    Require(compared == Block, "a store into one block did not compare exactly that block");
+    Require(compared == Page, "a store into one page did not compare exactly that page");
     Require(!EqualsCommittedSince(base, snapshot, taken), "a store into a stamped block was missed");
 
     const auto inner = base + 0x900;
     const auto innerBytes = Bytes - 0x1100;
     const auto innerSnapshot = std::span<const std::byte>(snapshot).subspan(0x900, innerBytes);
-    Require(EqualsCommittedSince(inner, innerSnapshot, taken, &compared) == EqualsCommitted(inner, innerSnapshot) && compared == Block, "an unaligned surface over the stamped block disagrees with a full compare");
+    Require(EqualsCommittedSince(inner, innerSnapshot, taken, &compared) == EqualsCommitted(inner, innerSnapshot) && compared == Page, "an unaligned surface over the stamped page disagrees with a full compare");
     Require(!EqualsCommittedSince(base, snapshot, 0, &compared) && compared == Bytes, "a texture without a generation skipped bytes");
 
     const auto current = CollectWritesUncached(base, Bytes);
@@ -545,20 +546,60 @@ void CheckStoreAfterCollectFoundNextCollect() {
     std::memset(memory, 0x5c, Bytes);
     std::vector<std::byte> snapshot(Bytes);
     std::memcpy(snapshot.data(), memory, Bytes);
-    const auto taken = CollectWritesUncached(base, Bytes);
-    Require(taken != 0, "the late store fixture was not collected");
-    static_cast<volatile std::uint8_t*>(memory)[Block + 0x10] = 0x5d;
-    const auto lookup = CollectWritesUncached(base, Bytes);
-    static_cast<volatile std::uint8_t*>(memory)[5 * Block + 0x20] = 0x5e;
-    std::size_t compared = 0;
-    Require(!EqualsCommitted(base, snapshot), "the full compare missed a store made after the last collect");
-    Require(!EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "the stamped compare did not compare exactly the collected store's block");
+    auto entry = CollectWritesUncached(base, Bytes);
+    Require(entry != 0, "the late store fixture was not collected");
     static_cast<volatile std::uint8_t*>(memory)[Block + 0x10] = 0x5c;
-    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "a store made after the last collect was compared before a collect stamped it");
-    Require(NewestStamp(base + 5 * Block, Block) <= lookup, "a store made after the last collect was stamped without a collect");
+    const auto first = CollectWritesUncached(base, Bytes);
+    static_cast<volatile std::uint8_t*>(memory)[5 * Block + 0x20] = 0x5e;
+    const bool kept = UnchangedSince(base, Bytes, entry) || EqualsCommittedSince(base, snapshot, entry);
+    if (kept) entry = first;
+    const auto second = CollectWritesUncached(base, Bytes);
+    Require(second > first && NewestStamp(base + 5 * Block, Block) > first, "the next collect did not stamp a store made after the last collect newer than that collect");
+    Require(!UnchangedSince(base, Bytes, entry), "a store made after the last collect reads as unchanged at the next lookup");
+    Require(!EqualsCommittedSince(base, snapshot, entry), "the next lookup kept a snapshot that a store made after the last collect changed");
+}
+
+void CheckStampedPageEvidence() {
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x71, Bytes);
+    std::vector<std::byte> snapshot(Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stamped;
+    std::size_t compared = 0;
+
+    auto taken = CollectWritesUncached(base, Bytes);
+    Require(taken != 0, "the page evidence fixture was not collected");
+    static_cast<volatile std::uint8_t*>(memory)[3 * Page + 8] = 0x71;
+    static_cast<volatile std::uint8_t*>(memory)[4 * Page + 8] = 0x71;
     CollectWritesUncached(base, Bytes);
-    Require(NewestStamp(base + 5 * Block, Block) > lookup, "the next collect did not stamp the late store newer than the lookup's generation");
-    Require(!EqualsCommittedSince(base, snapshot, lookup, &compared) && compared == 2 * Block, "the late store was missed once the next collect stamped it");
+    Require(StampedPagesSince(base, Bytes, taken, stamped) && stamped.size() == 1 && stamped.front() == std::pair<std::uint64_t, std::uint64_t>{base + 3 * Page, base + 5 * Page}, "stores into two adjacent pages were not one coalesced range");
+    Require(StampedSince(base, Bytes, taken, stamped) && stamped.size() == 1 && stamped.front() == std::pair<std::uint64_t, std::uint64_t>{base, base + Block}, "the block evidence of two page stores is not their block");
+
+    taken = CollectWritesUncached(base, Bytes);
+    Require(MarkWritten(base + Block + 2 * Page + 16, Page) != 0, "a driver store across two pages was not stamped");
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == 2 * Page, "a driver store across two pages did not compare exactly those pages");
+
+    taken = CollectWritesUncached(base, Bytes);
+    for (std::size_t piece = 0; piece < 5; ++piece) MarkWritten(base + 2 * Block + piece * 2 * Page, 64);
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "driver stores past the piece table did not fall back to their block");
+
+    taken = CollectWritesUncached(base, Bytes);
+    MarkPossiblyWritten(base + 3 * Block, Block);
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == Block, "a possible whole-block driver store did not compare its block");
+
+    taken = CollectWritesUncached(base, Bytes);
+    static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x71;
+    CollectWritesUncached(base, Bytes);
+    const auto tail = base + Block + 2 * Page;
+    const auto tailSnapshot = std::span<const std::byte>(snapshot).subspan(Block + 2 * Page, Block - 2 * Page);
+    Require(EqualsCommittedSince(tail, tailSnapshot, taken, &compared) && compared == 0, "a store before the surface in its first block was compared");
+    static_cast<volatile std::uint8_t*>(memory)[Block + 2 * Page + 8] = 0x72;
+    CollectWritesUncached(base, Bytes);
+    Require(!EqualsCommittedSince(tail, tailSnapshot, taken, &compared) && compared == Page, "a store into the surface's first page was missed beside a store before the surface");
+    Require(EqualsCommittedSince(tail, tailSnapshot, taken) == EqualsCommitted(tail, tailSnapshot), "the page compare disagrees with a full compare");
 }
 
 void CheckUntrackedStoreCompared() {
@@ -2262,6 +2303,7 @@ int main() {
         CheckStampedBlockCompare();
         CheckUntrackedStoreCompared();
         CheckStoreAfterCollectFoundNextCollect();
+        CheckStampedPageEvidence();
         CheckNewestStamp();
         CheckPartlyWatchedStore();
 #ifndef _WIN32

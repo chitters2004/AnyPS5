@@ -2847,7 +2847,58 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
     return true;
 }
 
-bool StampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped) {
+static void appendRange(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t begin, std::uint64_t stop) {
+    if (!ranges.empty() && ranges.back().second == begin) ranges.back().second = stop;
+    else ranges.emplace_back(begin, stop);
+}
+
+static bool unstampedStoreSince(const WriteTracker& tracker, std::uint64_t begin, std::uint64_t stop, std::uint64_t generation) {
+    if (tracker.unstampedStores.empty()) return false;
+    for (auto slot = begin / WriteBlockBytes; slot <= (stop - 1) / WriteBlockBytes; ++slot) {
+        if (tracker.unstampedStores[slot % WriteTracker::UnstampedSlots] > generation) return true;
+    }
+    return false;
+}
+
+static void appendStampedPages(const WriteTracker& tracker, std::uint64_t block, std::uint64_t begin, std::uint64_t stop, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped) {
+    const auto whole = [&] { appendRange(stamped, begin, stop); };
+    if (tracker.refusedSince(begin, stop, generation) || unstampedStoreSince(tracker, begin, stop, generation)) return whole();
+    std::array<bool, WritePagesPerBlock> written{};
+    bool evidence = false;
+    const auto notePages = [&](const std::unordered_map<std::uint64_t, WriteTracker::CpuPages>& pages) {
+        const auto found = pages.find(block);
+        if (found == pages.end()) return false;
+        for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
+            if (found->second.pages[page] <= generation) continue;
+            written[page] = true;
+            evidence = true;
+        }
+        return true;
+    };
+    if (!notePages(tracker.cpuPages) && tracker.cpuStampOf(block) > generation) return whole();
+    notePages(tracker.walkPages);
+    if (const auto found = tracker.driverPieces.find(block); found != tracker.driverPieces.end()) {
+        const auto& entry = found->second;
+        if (entry.whole > generation || entry.dropped > generation || entry.possibleWhole > generation || entry.possibleDropped > generation) return whole();
+        const auto notePiece = [&](const WriteTracker::DriverPiece& piece) {
+            if (piece.generation <= generation || piece.end <= piece.begin) return;
+            for (auto page = piece.begin / WritePageBytes; page <= (piece.end - 1) / WritePageBytes && page < WritePagesPerBlock; ++page) written[page] = true;
+            evidence = true;
+        };
+        for (const auto& piece : entry.pieces) notePiece(piece);
+        for (const auto& piece : entry.possiblePieces) notePiece(piece);
+    }
+    if (!evidence) return whole();
+    const auto blockStart = tracker.blockBegin(block);
+    for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
+        if (!written[page]) continue;
+        const auto pageBegin = std::max<std::uint64_t>(begin, blockStart + page * WritePageBytes);
+        const auto pageEnd = std::min<std::uint64_t>(stop, blockStart + (page + 1) * WritePageBytes);
+        if (pageBegin < pageEnd) appendRange(stamped, pageBegin, pageEnd);
+    }
+}
+
+static bool stampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped, bool pages) {
     stamped.clear();
     if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
@@ -2859,10 +2910,18 @@ bool StampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
         const auto begin = std::max(address, tracker.blockBegin(block));
         const auto stop = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
         if (tracker.newestStamp(begin, stop) <= generation && !tracker.refusedSince(begin, stop, generation)) continue;
-        if (!stamped.empty() && stamped.back().second == begin) stamped.back().second = stop;
-        else stamped.emplace_back(begin, stop);
+        if (pages) appendStampedPages(tracker, block, begin, stop, generation, stamped);
+        else appendRange(stamped, begin, stop);
     }
     return true;
+}
+
+bool StampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped) {
+    return stampedSince(address, bytes, generation, stamped, false);
+}
+
+bool StampedPagesSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped) {
+    return stampedSince(address, bytes, generation, stamped, true);
 }
 
 bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation, std::size_t* compared) {
@@ -2870,7 +2929,7 @@ bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> byte
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> stamped;
-    if (!StampedSince(address, bytes.size(), generation, stamped)) {
+    if (!StampedPagesSince(address, bytes.size(), generation, stamped)) {
         if (compared != nullptr) *compared = bytes.size();
         return EqualsCommittedUnsynced(address, bytes);
     }
