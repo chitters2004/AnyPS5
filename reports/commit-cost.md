@@ -1,6 +1,27 @@
 # Committer per-draw cost: handover runbook (branch `draft/commit-cost`)
 
-This file and `reports/bench/` are here only so that local agents can continue the work without the original conversation. AGENTS.md, CONTRIBUTING.md and `tools/check_conventions.py` keep reports out of the repository (`[notes-file]` error). Drop every `docs:` commit that touches `reports/` before anything goes upstream.
+This file and `reports/` are here only so that local agents can continue the work without the original conversation. AGENTS.md, CONTRIBUTING.md and `tools/check_conventions.py` keep reports out of the repository (`[notes-file]` error). Drop every `docs:` commit that touches `reports/` before anything goes upstream.
+
+## Start here
+
+**Where things stand.** The branch is `upstream/main` `dc9dc7eaa` plus 13 `perf(agc)` commits and one `docs:` commit that adds an `ENVIRONMENT.md` row (`c42c773d8`, to squash into `eb2f5b50f`), all in section 6. The other `docs:` commits only keep `reports/`.
+- **Validation:** all 1,156 `agc_` ctests pass on lavapipe with validation, with per-test VUID counts identical to main (section 3).
+- **Waiting on the owner:** GTA runs (section 0), the calibration numbers (section 0.1) and ideally one profiled GTA log and a frame capture (section 0, step 5).
+- **When the numbers arrive:** follow section 8.
+
+**What is in `reports/`:**
+
+| Path | What it is |
+|---|---|
+| `commit-cost.md` | This runbook |
+| `ab_run.py` | Runs a title or a replay once per switch configuration and prints one comparison table (`--self-test` covers it) |
+| `tools/run_all_agc.sh`, `tools/compare_runs.sh` | Full `agc_` suite with validation; results and per-test VUID counts; diff of two runs |
+| `tools/mingw_objects.sh` | MinGW objects of libSceAgcDriver with the two header shims Ubuntu's MinGW needs |
+| `bench/windows_audit.py` | Windows-expensive operations per draw (MinGW objects plus uprobe call counts) |
+| `bench/calibration.cpp` | Per-machine costs of thread_local, locks, shared_ptr, clock, allocation, memcpy and Vulkan descriptor work |
+| `bench/draw-bindings.cpp` | Per-draw CPU of the binding paths against the mock Vulkan device |
+| `bench/snapshot.cpp`, `bench/descriptors.cpp` | Benchmarks of the snapshot copy cache and of vkUpdateDescriptorSets on lavapipe |
+| `windows-audit-raw.md` | The audit's raw output (an upper bound; section 11) |
 
 ## 0. Owner run sheet (GTA, Windows)
 
@@ -160,6 +181,18 @@ python3 tools/check_conventions.py --base upstream/main
 
 Expect exactly one error, the `[notes-file]` error for this file.
 
+Scripted version of the full-suite comparison:
+
+```bash
+reports/tools/run_all_agc.sh main /tmp/runs
+```
+
+Run that with main checked out and built, then the same with `head` as the label on the branch; then:
+
+```bash
+reports/tools/compare_runs.sh /tmp/runs main head
+```
+
 Test-fixture notes:
 - Recorder releases kept objects on a release thread. Tests call `recorder.Sync()` and `recorder.FlushDeferredReleases()`, then poll; see `settle` in `writtenSetReuseTests`.
 - Mock contexts have zero limits by default; set the samplers and dynamic storage buffer limits a test needs.
@@ -204,6 +237,10 @@ Each code commit was timed alone and validated as in section 3.
 | `4ae6f4bc8` | Fixed-size offsets; the batch keeps the ring set and chunk once (`Recorder::KeptOnce`) | dynamicDrawDataTests use_count check | Removes per-draw keeps and two per-draw allocations |
 | `4df6d3109` | Profile-only `[revalidate-split]` and `[lookup-split]` lines (APS5_PROFILE_DRAW) | `agc_revalidate_split` (new ctest; does not compile without the change) | Measurement for the next step; no behaviour change |
 | `78647781b` | The Revalidate pre-pass checks `AnyPendingCpuWrites` once and walks its ranges for pending CPU writes only when some are pending (re-checked after a depth-plane flush that did work) | `agc_revalidate_split`: a revalidation with nothing pending makes no checks (fails when the old always-check is forced); with copied writers pending it still checks | Per range and proof: drops a `DrawCopiedWriters()` shared_ptr copy, the per-thread `InCompletion` read (emutls on Windows) and an atomic load. The `[revalidate-split]` line prints checks per call |
+| `46dc94fb0` | Profile-only `[draw-bindings]` line: ring draws and bytes copied (with their size spread), ring sets found, written and evicted live, draws per template and batch, rewritten draws with data bytes and guest snapshots, set pool hits and misses, templates drawing | the profiled `agc_revalidate_split` checks the counts on a real device | Says whether the chunk size, the 4 ring sets and the 16 kept sets per template fit GTA |
+| `c5a6421b4` | `DrawPipeline::Busy()` reads the finisher's global state before the thread_local `finisherProducer` | none can fail: the result is unchanged; the draw-pipeline execution tests cover every state, and MinGW disassembly shows the idle path returns before `__emutls_get_address` | About 21 emutls calls per draw on Windows |
+| `8bc6e456b` | `PerformanceContext::Current()` returns null without reading thread_local while no context carries a frame | `performanceContextTests` in `agc_driver_graphics` pins the semantics (nesting, frameless contexts, other threads); MinGW disassembly shows the constructor skips emutls when the count is zero | At least 22 emutls calls per draw on Windows |
+| `fcac8f0d9` | `flushBetweenPackets` keeps its reap timestamp in a `HostThreadLocal` slot, fetched only where the reap is decided | none can fail: per-thread behaviour is unchanged; the object has no emutls call left | About 19 emutls calls per draw become one FLS lookup on the reap path |
 | `434d12353` | Switches for one-build A/B: `APS5_NO_DRAW_SET_REUSE`, `APS5_DRAW_UPLOAD_CHUNK_MIB` (default 16) and `APS5_NO_PENDING_WRITE_GATE` | `agc_draw_bindings_no_set_reuse`, `agc_draw_bindings_small_chunk` and `agc_revalidate_split_ungated` check that each switch restores the old behaviour | Lets the owner time each change in one build with `reports/ab_run.py` (section 0) |
 
 Section 0 lists the A/B switches; `reports/ab_run.py` runs them. Standalone benchmarks are in `reports/bench/` (build commands in section 9).
@@ -222,6 +259,7 @@ At realistic sizes the ring saves about 1 to 1.7 us per draw before the driver's
 
 Take `tools/trace_digest.py` summaries on main and on each code commit above, on the same machine and scene, with `APS5_PROFILE_DRAW=1`, and collect these lines:
 
+- **`[draw-bindings] (10 s): ...`.** Constants bytes per ring draw and their size spread, ring set hits, writes and live evictions, draws per template and batch, the set pool hit rate and templates drawing.
 - **`[rescache] draws: ... draw bindings (cumulative): R ring with dynamic offsets (S ring sets written), W rewritten sets`.** The share of draws that take the ring. If W dominates, the next step in this area is putting small guest-buffer snapshots in the same ring.
 - **`[lookup-split] (10 s): N lookups, H hits; us per lookup: key, find, revalidate, moved buffers, alias checks`.** Says where the 34.8 us lookup goes.
 - **`[revalidate-split] (cumulative): ... epoch proofs reused, ... proved (no epoch, first proof; moved: collect epoch, proof serial, pending serial); per call: pre-pass us over N ranges, images us (textures, storage images), imports us, rest us`.** Says why proofs are not reused and which phase of `revalidateFull` costs.
@@ -284,6 +322,7 @@ Results on 4-core x86-64 lavapipe:
 
 ## 10. Not verified
 
+- The three thread_local fixes have no test that fails without them, since the behaviour is unchanged by design; the evidence is the MinGW disassembly and the semantics tests.
 - GTA, Windows, and real GPU drivers.
 - Descriptor update cost on real drivers.
 - On lavapipe the ring path was observed in `agc_driver_recorder` (7 draws) and `agc_draw_descriptors` (1 draw), using a temporary probe that was not committed. The selected execution tests' draws use non-dynamic templates.
@@ -308,10 +347,9 @@ The raw table is `reports/windows-audit-raw.md`. Its totals are an upper bound: 
 | `std::_Sp_counted_base::_M_release` | 36 | shared_ptr releases, each one or two atomic RMW |
 | `ShaderRecompiler` `materializeResult` and `getSource` | about 0.5 each | std::shared_mutex (winpthreads rwlock) sites; whether these run on the committer is not established |
 
-**Fixes that keep behaviour identical** (not done; each is small and testable):
-- **`DrawPipeline::Busy()`:** test `DrawFinisher::Busy() && DrawFinisher::Overlap()` before `finisherProducer`. These are pure reads, so the result is the same.
-- **`PerformanceContext::Current()`:** gate it on a global count of live contexts, so that with no frame timing anywhere it returns nullptr without touching thread_local.
-- **`flushBetweenPackets`:** read `lastReapTry` only when `reapDue`.
+**Fixed** (`c5a6421b4`, `8bc6e456b` and `fcac8f0d9`; section 6). None of the three has an off-switch: time them as head against `434d12353` or main. Remaining candidates:
+- **shared_ptr releases (36 per draw):** find the owners released per draw before changing anything.
+- **The recompiler's rwlock sites:** first establish which thread runs `materializeResult` and `getSource`.
 
 Under Wine, emutls costs 18.9 ns against 2.2 ns natively, so about 62 thread_local reads per draw would be about 1.2 us of a 30 us draw. The owner's calibration run (section 0.1) gives the real Windows cost.
 
