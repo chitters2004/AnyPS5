@@ -1795,6 +1795,15 @@ bool RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const 
     return false;
 }
 
+bool RequireNoMultisampleTargetProved(ResidentGuardRangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access) {
+    if (proof == nullptr) return RequireNoMultisampleTarget(address, bytes, access);
+    const auto growth = ResidentGuardGrowth_nid_no_patch();
+    if (proof->Holds(address, bytes, growth)) return true;
+    if (!RequireNoMultisampleTarget(address, bytes, access)) return false;
+    proof->Record(address, bytes, growth);
+    return true;
+}
+
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || (ResidentGuardOverlaps_nid_no_patch(address, bytes) & ColorGuardOverlap) == 0u) return;
     requireNoColorTargetExact(address, bytes, access);

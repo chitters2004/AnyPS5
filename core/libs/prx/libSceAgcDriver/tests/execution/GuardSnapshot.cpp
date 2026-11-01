@@ -313,6 +313,52 @@ void CheckProof() {
     std::puts("proof: a recorded proof holds until a registration, survives removals, and checking it writes nothing in the driver image");
 }
 
+void CheckRangeProof() {
+    const auto context = FakeContext(0xb000u);
+    const auto guardAddress = Base + 0x58000000ull;
+    const auto clearAddress = Base + 0x5c000000ull;
+    ClearMultisampleTargets(context.device);
+    ResidentGuardRangeProof proof;
+    const auto start = ResidentGuardGrowth_nid_no_patch();
+    Require(!proof.Holds(clearAddress, 64u, start), "an empty range proof held");
+    Require(RequireNoMultisampleTargetProved(&proof, clearAddress, 64u, "a vertex buffer read"), "a clear range was not proven");
+    Require(proof.Holds(clearAddress, 64u, start), "a proven range did not hold");
+    Require(!proof.Holds(clearAddress, 65u, start) && !proof.Holds(clearAddress + 1u, 64u, start), "a range proof held for another range");
+    GuardOneFragmentFmask(context, Fmask(clearAddress));
+    Require(!proof.Holds(clearAddress, 64u, ResidentGuardGrowth_nid_no_patch()), "a range proof held after a registration over it");
+    Refuses([&] { RequireNoMultisampleTargetProved(&proof, clearAddress, 64u, "a vertex buffer read"); }, "FMASK");
+    GuardOneFragmentFmask(context, Fmask(guardAddress));
+    Refuses([&] { RequireNoMultisampleTargetProved(&proof, guardAddress, 64u, "an index buffer read"); }, "FMASK");
+    Require(!proof.Holds(guardAddress, 64u, ResidentGuardGrowth_nid_no_patch()), "a refused range was proven");
+    ClearMultisampleTargets(context.device);
+    Require(RequireNoMultisampleTargetProved(&proof, guardAddress, 64u, "an index buffer read"), "a removed range was not proven");
+    WithoutSharedWrites([&] {
+        for (int round = 0; round < 1000; ++round) Require(RequireNoMultisampleTargetProved(&proof, guardAddress, 64u, "an index buffer read"), "a held range proof did not hold");
+    });
+    std::atomic<bool> done{false};
+    std::atomic<unsigned> mixed{0};
+    std::vector<std::thread> threads;
+    const auto growth = ResidentGuardGrowth_nid_no_patch();
+    for (unsigned writer = 0; writer < 2; ++writer) {
+        threads.emplace_back([&, writer] {
+            for (unsigned round = 0; round < 2000000u; ++round) proof.Record(writer == 0 ? 0x1000u : 0x2000u, writer == 0 ? 0x10u : 0x20u, growth);
+        });
+    }
+    for (unsigned reader = 0; reader < 2; ++reader) {
+        threads.emplace_back([&] {
+            while (!done.load(std::memory_order_acquire)) {
+                if (proof.Holds(0x1000u, 0x20u, growth) || proof.Holds(0x2000u, 0x10u, growth)) mixed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    threads[0].join();
+    threads[1].join();
+    done.store(true, std::memory_order_release);
+    for (std::size_t index = 2; index < threads.size(); ++index) threads[index].join();
+    Require(mixed.load() == 0u, "a range proof held for a range assembled from two writers " + std::to_string(mixed.load()) + " times");
+    std::puts("range proof: an exact range holds until a registration, refused ranges are never proven, concurrent writers never mix a range");
+}
+
 struct TeardownReads {
     std::uint64_t guardAddress = 0;
     std::uint64_t clearAddress = 0;
@@ -491,6 +537,7 @@ int main() {
         CheckTeardown();
         CheckStaleRebuild();
         CheckProof();
+        CheckRangeProof();
         CheckOverflow();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;

@@ -85,6 +85,7 @@ struct DrawRecipe {
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    mutable std::array<Graphics::ResidentGuardRangeProof, 8> guardProofs{};
 };
 
 }

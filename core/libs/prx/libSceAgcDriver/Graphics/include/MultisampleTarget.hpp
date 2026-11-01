@@ -125,6 +125,37 @@ private:
     std::atomic<std::uint64_t> proved{0};
 };
 
+class ResidentGuardRangeProof {
+public:
+    bool Holds(std::uint64_t address, std::uint64_t bytes, std::uint64_t growth) const noexcept {
+        const auto version = sequence.load(std::memory_order_acquire);
+        if ((version & 1u) != 0u) return false;
+        const auto provedGrowth = this->growth.load(std::memory_order_relaxed);
+        const auto provedAddress = this->address.load(std::memory_order_relaxed);
+        const auto provedBytes = this->bytes.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        return sequence.load(std::memory_order_relaxed) == version && provedGrowth != 0u && provedGrowth == growth && provedAddress == address && provedBytes == bytes;
+    }
+
+    void Record(std::uint64_t address, std::uint64_t bytes, std::uint64_t growth) noexcept {
+        auto version = sequence.load(std::memory_order_relaxed);
+        if ((version & 1u) != 0u || !sequence.compare_exchange_strong(version, version + 1u, std::memory_order_relaxed)) return;
+        std::atomic_thread_fence(std::memory_order_release);
+        this->growth.store(growth, std::memory_order_relaxed);
+        this->address.store(address, std::memory_order_relaxed);
+        this->bytes.store(bytes, std::memory_order_relaxed);
+        sequence.store(version + 2u, std::memory_order_release);
+    }
+
+private:
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint64_t> growth{0};
+    std::atomic<std::uint64_t> address{0};
+    std::atomic<std::uint64_t> bytes{0};
+};
+
+bool RequireNoMultisampleTargetProved(ResidentGuardRangeProof* proof, std::uint64_t address, std::size_t bytes, const char* access);
+
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
