@@ -265,6 +265,22 @@ public:
         std::uint64_t ringSets = 0;
     };
     static DrawBindingPaths DrawBindingPathCounts();
+    struct DrawBindingDetail {
+        std::uint64_t ringDraws = 0;
+        std::uint64_t ringBytes = 0;
+        std::array<std::uint64_t, 5> ringBytesHistogram{};
+        std::uint64_t ringSetHits = 0;
+        std::uint64_t ringSetsWritten = 0;
+        std::uint64_t ringSetsEvictedLive = 0;
+        std::uint64_t ringBatchKeeps = 0;
+        std::uint64_t rewrittenDraws = 0;
+        std::uint64_t rewrittenDataBytes = 0;
+        std::uint64_t rewrittenGuestSnapshots = 0;
+        std::uint64_t writtenSetHits = 0;
+        std::uint64_t writtenSetMisses = 0;
+        std::uint64_t templates = 0;
+    };
+    static DrawBindingDetail TakeDrawBindingDetail();
     struct RevalidateSplit {
         std::uint64_t reused = 0;
         std::uint64_t proved = 0;

@@ -12676,6 +12676,16 @@ int main(int argc, char** argv) {
             Require(idle.walks > quiet.walks && idle.ranges > quiet.ranges, "the sparse run import tests made no full revalidation");
             if (std::getenv("APS5_NO_PENDING_WRITE_GATE") == nullptr) Require(idle.pendingChecks == quiet.pendingChecks, "a revalidation with no CPU writes pending checked its ranges for them");
             else Require(idle.pendingChecks > quiet.pendingChecks, "APS5_NO_PENDING_WRITE_GATE did not check every range for pending CPU writes");
+            static_cast<void>(AgcDriver::Graphics::ShaderResources::TakeDrawBindingDetail());
+            drawDescriptorWriteTests(device, recorder);
+            drawSnapshotTableSetTests(device, recorder);
+            const auto detail = AgcDriver::Graphics::ShaderResources::TakeDrawBindingDetail();
+            std::cout << "draw binding detail: ring " << detail.ringDraws << ", ring sets written " << detail.ringSetsWritten << ", rewritten " << detail.rewrittenDraws << ", pool " << detail.writtenSetHits << "/" << detail.writtenSetMisses << ", templates " << detail.templates << "\n";
+            std::uint64_t histogram = 0;
+            for (const auto count : detail.ringBytesHistogram) histogram += count;
+            Require(detail.ringDraws != 0 && histogram == detail.ringDraws && detail.ringBytes != 0, "the draw binding profile did not count the ring draws and their bytes");
+            Require(detail.ringSetHits + detail.ringSetsWritten == detail.ringDraws && detail.ringSetsWritten != 0 && detail.ringBatchKeeps != 0, "the draw binding profile miscounted the ring sets");
+            Require(detail.templates != 0 && detail.writtenSetHits + detail.writtenSetMisses >= detail.ringSetsWritten + detail.rewrittenDraws, "the draw binding profile miscounted the templates or the set pool");
             std::cout << "Revalidate split counters passed\n";
             return 0;
         }

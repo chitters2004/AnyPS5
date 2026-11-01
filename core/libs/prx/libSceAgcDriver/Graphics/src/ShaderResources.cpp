@@ -2096,6 +2096,59 @@ std::atomic<std::uint64_t> ringSetCount{0};
 
 }
 
+namespace {
+
+struct DrawBindingCounters {
+    std::atomic<std::uint64_t> ringDraws{0}, ringBytes{0}, ringSetHits{0}, ringSetsWritten{0}, ringSetsEvictedLive{0}, ringBatchKeeps{0};
+    std::array<std::atomic<std::uint64_t>, 5> ringBytesHistogram{};
+    std::atomic<std::uint64_t> rewrittenDraws{0}, rewrittenDataBytes{0}, rewrittenGuestSnapshots{0}, writtenSetHits{0}, writtenSetMisses{0};
+    AgcDriver::Mutex templatesMutex;
+    std::unordered_set<const void*> templates;
+};
+
+DrawBindingCounters& BindingCounters() {
+    static DrawBindingCounters counters;
+    return counters;
+}
+
+bool DrawBindingProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void noteBindingTemplate(const void* resources) {
+    auto& counters = BindingCounters();
+    std::lock_guard lock(counters.templatesMutex);
+    counters.templates.insert(resources);
+}
+
+std::size_t RingBytesBucket(std::uint64_t bytes) {
+    return bytes <= 256u ? 0u : bytes <= 1024u ? 1u : bytes <= 4096u ? 2u : bytes <= 16384u ? 3u : 4u;
+}
+
+}
+
+ShaderResources::DrawBindingDetail ShaderResources::TakeDrawBindingDetail() {
+    auto& counters = BindingCounters();
+    DrawBindingDetail detail;
+    detail.ringDraws = counters.ringDraws.exchange(0, std::memory_order_relaxed);
+    detail.ringBytes = counters.ringBytes.exchange(0, std::memory_order_relaxed);
+    for (std::size_t bucket = 0; bucket < detail.ringBytesHistogram.size(); ++bucket) detail.ringBytesHistogram[bucket] = counters.ringBytesHistogram[bucket].exchange(0, std::memory_order_relaxed);
+    detail.ringSetHits = counters.ringSetHits.exchange(0, std::memory_order_relaxed);
+    detail.ringSetsWritten = counters.ringSetsWritten.exchange(0, std::memory_order_relaxed);
+    detail.ringSetsEvictedLive = counters.ringSetsEvictedLive.exchange(0, std::memory_order_relaxed);
+    detail.ringBatchKeeps = counters.ringBatchKeeps.exchange(0, std::memory_order_relaxed);
+    detail.rewrittenDraws = counters.rewrittenDraws.exchange(0, std::memory_order_relaxed);
+    detail.rewrittenDataBytes = counters.rewrittenDataBytes.exchange(0, std::memory_order_relaxed);
+    detail.rewrittenGuestSnapshots = counters.rewrittenGuestSnapshots.exchange(0, std::memory_order_relaxed);
+    detail.writtenSetHits = counters.writtenSetHits.exchange(0, std::memory_order_relaxed);
+    detail.writtenSetMisses = counters.writtenSetMisses.exchange(0, std::memory_order_relaxed);
+    std::lock_guard lock(counters.templatesMutex);
+    detail.templates = counters.templates.size();
+    counters.templates.clear();
+    return detail;
+}
+
 ShaderResources::DrawBindingPaths ShaderResources::DrawBindingPathCounts() {
     return {ringDrawCount.load(std::memory_order_relaxed), rewrittenDrawCount.load(std::memory_order_relaxed), ringSetCount.load(std::memory_order_relaxed)};
 }
@@ -6018,7 +6071,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         result->snapshots.push_back(std::move(snapshot));
     };
+    std::size_t dataUploads = 0;
     const auto uploadData = [&](const MovedBuffer& data) {
+        ++dataUploads;
+        if (DrawBindingProfiled()) BindingCounters().rewrittenDataBytes.fetch_add(data.size, std::memory_order_relaxed);
         auto slice = recorder.DrawUpload(data.size);
         std::memcpy(slice.bytes, data.words.data(), data.size);
         for (const auto& patch : dataPatches) {
@@ -6113,6 +6169,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     rewrittenDrawCount.fetch_add(1, std::memory_order_relaxed);
+    if (DrawBindingProfiled()) {
+        auto& counters = BindingCounters();
+        counters.rewrittenDraws.fetch_add(1, std::memory_order_relaxed);
+        counters.rewrittenGuestSnapshots.fetch_add(selected.size() - dataUploads, std::memory_order_relaxed);
+        noteBindingTemplate(this);
+    }
     return result;
 }
 
@@ -6139,7 +6201,9 @@ void ShaderResources::allocateDrawSets(DrawBindings& result) const {
     result.owner = writtenSets;
     const bool mainSet = described[0] || splitSets;
     const bool fragmentSet = described[1] || splitSets;
-    if (auto written = DrawSetReuse() ? writtenSets->Take() : std::nullopt) {
+    auto written = DrawSetReuse() ? writtenSets->Take() : std::nullopt;
+    if (DrawBindingProfiled()) (written.has_value() ? BindingCounters().writtenSetHits : BindingCounters().writtenSetMisses).fetch_add(1, std::memory_order_relaxed);
+    if (written) {
         result.allocation = written->allocation;
         result.fragmentAllocation = written->fragmentAllocation;
         if (mainSet) result.layout = _layout;
@@ -6238,6 +6302,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::ringDrawBindings
             }
         }
     }
+    const bool profiled = DrawBindingProfiled();
+    if (profiled && ring != nullptr) BindingCounters().ringSetHits.fetch_add(1, std::memory_order_relaxed);
     if (ring == nullptr) {
         ring = std::make_shared<DrawBindings>();
         allocateDrawSets(*ring);
@@ -6262,13 +6328,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::ringDrawBindings
             }
         }
         if (slot == &ringSets[ringNext]) ringNext = (ringNext + 1) % ringSets.size();
+        if (profiled) {
+            BindingCounters().ringSetsWritten.fetch_add(1, std::memory_order_relaxed);
+            if (slot->bindings != nullptr && slot->mask != mask && !slot->chunk.expired()) BindingCounters().ringSetsEvictedLive.fetch_add(1, std::memory_order_relaxed);
+        }
         *slot = {mask, slice.buffer, ring};
     }
     result->allocation.set = ring->allocation.set;
     result->fragmentAllocation.set = ring->fragmentAllocation.set;
     result->shared = std::move(ring);
     result->snapshots.push_back({0, slice.buffer, slice.offset, static_cast<std::size_t>(total)});
-    if (recorder.KeptOnce(result->shared.get())) recorder.Keep(result->shared);
+    if (recorder.KeptOnce(result->shared.get())) {
+        recorder.Keep(result->shared);
+        if (profiled) BindingCounters().ringBatchKeeps.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (profiled) {
+        auto& counters = BindingCounters();
+        counters.ringDraws.fetch_add(1, std::memory_order_relaxed);
+        counters.ringBytes.fetch_add(total, std::memory_order_relaxed);
+        counters.ringBytesHistogram[RingBytesBucket(total)].fetch_add(1, std::memory_order_relaxed);
+        noteBindingTemplate(this);
+    }
     if (recorder.KeptOnce(slice.buffer.get())) {
         recorder.Keep(slice.buffer);
         recorder.KeepBytes(slice.buffer.get(), slice.buffer->Bytes().size());
