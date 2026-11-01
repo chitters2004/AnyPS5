@@ -229,6 +229,52 @@ void CheckStress() {
     std::printf("stress: %u rounds of %u readers, no stale certificate accepted after a registration\n", Rounds, Readers);
 }
 
+struct TeardownReads {
+    std::uint64_t guardAddress = 0;
+    std::uint64_t clearAddress = 0;
+    std::atomic<unsigned>* failures = nullptr;
+
+    ~TeardownReads() {
+        if (failures == nullptr) return;
+        try {
+            for (int round = 0; round < 3; ++round) {
+                if (!ResidentGuardsClear_nid_no_patch(clearAddress, 64u)) failures->fetch_add(1, std::memory_order_relaxed);
+                RequireNoMultisampleTarget(clearAddress, 64u, "a CPU read");
+                if (ResidentGuardsClear_nid_no_patch(guardAddress, 64u)) failures->fetch_add(1, std::memory_order_relaxed);
+                try {
+                    RequireNoMultisampleColorTarget(guardAddress, 64u, "a CPU read");
+                    failures->fetch_add(1, std::memory_order_relaxed);
+                } catch (const std::runtime_error&) {
+                }
+            }
+        } catch (...) {
+            failures->fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+};
+
+void CheckTeardown() {
+    const auto context = FakeContext(0x7000u);
+    const auto guardAddress = Base + 0x20000000ull;
+    const auto clearAddress = Base + 0x28000000ull;
+    ClearMultisampleTargets(context.device);
+    GuardOneFragmentFmask(context, Fmask(guardAddress));
+    std::atomic<unsigned> failures{0};
+    for (int thread = 0; thread < 8; ++thread) {
+        std::thread([&] {
+            thread_local TeardownReads reads;
+            reads.guardAddress = guardAddress;
+            reads.clearAddress = clearAddress;
+            reads.failures = &failures;
+            if (!ResidentGuardsClear_nid_no_patch(clearAddress, 64u)) failures.fetch_add(1, std::memory_order_relaxed);
+            if (!ResidentGuardsClear_nid_no_patch(clearAddress + 4096u, 64u)) failures.fetch_add(1, std::memory_order_relaxed);
+        }).join();
+    }
+    ClearMultisampleTargets(context.device);
+    Require(failures.load() == 0u, "a read during thread teardown failed " + std::to_string(failures.load()) + " times");
+    std::puts("teardown: reads after a thread released its certificate are still checked exactly");
+}
+
 constexpr std::size_t BlockBytes = 1u << 20u;
 constexpr std::uint32_t Side = 256;
 
@@ -358,6 +404,7 @@ int main() {
     try {
         CheckHeadless();
         CheckStress();
+        CheckTeardown();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;
     } catch (const std::exception& error) {

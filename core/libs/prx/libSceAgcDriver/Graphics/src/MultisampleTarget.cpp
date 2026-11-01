@@ -817,11 +817,26 @@ struct GuardCertificate {
 
 using GuardCertificateSlot = HostThreadSlot<GuardCertificate*, GuardCertificate>;
 
+constinit GuardCertificate retiredCertificate{};
+
+struct GuardCertificateRelease {
+    GuardCertificateRelease() = default;
+    GuardCertificateRelease(const GuardCertificateRelease&) = delete;
+    GuardCertificateRelease& operator=(const GuardCertificateRelease&) = delete;
+
+    ~GuardCertificateRelease() {
+        auto* certificate = GuardCertificateSlot::Get();
+        GuardCertificateSlot::Set(&retiredCertificate);
+        if (certificate != &retiredCertificate) delete certificate;
+    }
+};
+
 void rememberGap(std::uint64_t growth, const GuardGap& gap) {
     auto* certificate = GuardCertificateSlot::Get();
+    if (certificate == &retiredCertificate) return;
     if (certificate == nullptr) {
-        thread_local GuardCertificate owned;
-        certificate = &owned;
+        [[maybe_unused]] thread_local GuardCertificateRelease release;
+        certificate = new GuardCertificate{};
         GuardCertificateSlot::Set(certificate);
     }
     if (certificate->growth != growth) *certificate = GuardCertificate{growth};
