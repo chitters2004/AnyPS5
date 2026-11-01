@@ -4,9 +4,16 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+struct LastReapTryStorage {};
+
+}
 
 void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket) {
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
@@ -20,7 +27,7 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     bool submit = false, record = false, needsRecord = false, deferredDue = false, pendingDue = false;
     const auto pending = Graphics::Recorder::PendingLabelSince();
 
-    thread_local std::chrono::steady_clock::time_point lastReapTry{};
+    const auto lastReapTry = []() -> std::chrono::steady_clock::time_point& { return HostThreadLocal<std::chrono::steady_clock::time_point, LastReapTryStorage>(); };
     const bool completions = completionsPending();
     const bool reapDue = completions && (reapEachPacket() || queue == 0);
 
@@ -45,12 +52,12 @@ void Driver::flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool
     }
     const auto work = Graphics::Recorder::RecordedWorkSinceSubmit();
     const bool capped = !submit && !record && batchCap() != 0 && work >= batchCap();
-    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry >= ReapInterval);
+    const bool reap = !submit && !record && !capped && reapDue && (reapEachPacket() || now - lastReapTry() >= ReapInterval);
     if (!submit && !record && !capped && !reap) {
         if (recordAtLock) ++recordTriesSkipped;
         return;
     }
-    if (reap) lastReapTry = now;
+    if (reap) lastReapTry() = now;
     if (DrawPipeline::Active() && (submit || record || capped || recordAtLock)) {
         static const bool committerSubmits = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
         if (committerSubmits && !record && !recordAtLock && DrawPipeline::Queue0().Busy()) return;
