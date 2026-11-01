@@ -652,9 +652,14 @@ private:
     std::shared_ptr<WrittenSets> writtenSets = std::make_shared<WrittenSets>();
     bool dynamicData = false;
     std::array<std::vector<std::size_t>, 2> dynamicAllocations;
+    struct RingSet {
+        std::uint64_t mask = 0;
+        std::weak_ptr<Buffer> chunk;
+        std::shared_ptr<DrawBindings> bindings;
+    };
     mutable AgcDriver::Mutex ringMutex;
-    mutable std::shared_ptr<DrawBindings> ringBindings;
-    mutable std::weak_ptr<Buffer> ringChunk;
+    mutable std::array<RingSet, 4> ringSets;
+    mutable std::size_t ringNext = 0;
     void allocateDrawSets(DrawBindings& result) const;
     void writeDrawSets(DrawBindings& result, std::span<const std::optional<VkDescriptorBufferInfo>> overrides) const;
     std::shared_ptr<DrawBindings> ringDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;

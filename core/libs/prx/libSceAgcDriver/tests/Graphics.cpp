@@ -6626,6 +6626,7 @@ void dynamicDrawDataTests() {
         ShaderResources resources(context, stages, state.color, 0, 0, 0);
         Require(resources.DynamicData() && resources.DynamicCount(0) == 2 && resources.DynamicCount(1) == 0, "a draw's shader data bindings did not become dynamic");
         const auto ownData = findWrite(5).buffers;
+        const auto ownSrt = findWrite(6).buffers;
         Require(findWrite(5).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && findWrite(6).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && findWrite(0).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "the build wrote the wrong descriptor types");
         const auto& key = resources.LayoutKey();
         for (std::size_t at = 0; at + 4 <= key.size(); at += 4) {
@@ -6643,18 +6644,19 @@ void dynamicDrawDataTests() {
             ShaderResources dispatch(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &compute, 0});
             Require(!dispatch.DynamicData() && findWrite(1).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "a dispatch's shader data became dynamic");
         }
-        const auto draw = [&](std::uint32_t value) {
+        const auto draw = [&](std::uint32_t value, bool srt = true) {
             auto drawn = vertex;
             drawn.bindings[1].guestDescriptor = ShaderDataWords({value, value + 1, value + 2});
-            drawn.bindings[2].guestDescriptor = {value, value, value, value};
+            if (srt) drawn.bindings[2].guestDescriptor = {value, value, value, value};
             const std::array<CompiledShader, 2> drawnStages{{{ShaderRecompiler::ShaderStage::Vertex, &drawn, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
             const auto moved = resources.MovedReadOnlyBuffers(drawnStages, recorder, &state.color);
-            Require(moved.has_value() && moved->size() == 2, "dynamic shader data was not reported for every data binding");
+            Require(moved.has_value() && moved->size() == (srt ? 2u : 1u), "changed shader data was not reported, or unchanged data was");
             auto bindings = resources.PrepareDrawBindings(recorder, *moved);
             Require(bindings != nullptr && bindings->shared != nullptr && bindings->dynamicOffsets[0].size() == 2 && bindings->dynamicOffsets[1].empty(), "a draw whose only change is its shader data did not take the ring set");
             const auto chunk = bindings->snapshots.at(0).buffer;
             const auto bytes = bufferBytes(chunk->Handle());
-            for (std::size_t index = 0; index < 2; ++index) {
+            if (!srt) Require(bindings->dynamicOffsets[0][1] == 0u, "an unchanged shader data binding was given a ring offset");
+            for (std::size_t index = 0; index < (srt ? 2u : 1u); ++index) {
                 const auto offset = bindings->dynamicOffsets[0][index];
                 const auto& words = drawn.bindings[1 + index].guestDescriptor;
                 Require(offset % 256u == 0u && sameBytes(bytes.subspan(offset), words.data(), words.size() * sizeof(std::uint32_t)), "a ring offset is misaligned or does not hold the draw's words");
@@ -6671,6 +6673,19 @@ void dynamicDrawDataTests() {
         Require(mock.writes.empty(), "a draw on the same upload chunk wrote descriptors");
         Require(second.first->allocation.set == first.first->allocation.set && second.first->dynamicOffsets[0] != first.first->dynamicOffsets[0], "a draw on the same chunk did not share the ring set at new offsets");
         Require(sameBytes(bufferBytes(chunk).subspan(first.first->dynamicOffsets[0][0]), first.second.bindings[1].guestDescriptor.data(), first.second.bindings[1].guestDescriptor.size() * sizeof(std::uint32_t)), "a later draw overwrote an earlier draw's ring words");
+        mock.writes.clear();
+        auto partial = draw(0x300u, false);
+        Require(partial.first->allocation.set != first.first->allocation.set && !mock.writes.empty(), "a draw changing fewer bindings reused a ring set pointing the others at the chunk");
+        Require(findWrite(5).buffers.at(0).buffer == chunk && findWrite(6).buffers.at(0).buffer == ownSrt.at(0).buffer && findWrite(6).buffers.at(0).offset == ownSrt.at(0).offset, "an unchanged shader data binding left the template's own buffer");
+        mock.writes.clear();
+        auto partialAgain = draw(0x400u, false);
+        Require(mock.writes.empty() && partialAgain.first->allocation.set == partial.first->allocation.set, "a second draw with the same changed bindings did not reuse its ring set");
+        {
+            const auto moved = resources.MovedReadOnlyBuffers(stages, recorder, &state.color);
+            Require(moved.has_value() && moved->empty() && resources.PrepareDrawBindings(recorder, *moved) == nullptr, "a draw with unchanged shader data did not bind the template's own set");
+        }
+        partial.first.reset();
+        partialAgain.first.reset();
         first.first.reset();
         second.first.reset();
         recorder.Sync();

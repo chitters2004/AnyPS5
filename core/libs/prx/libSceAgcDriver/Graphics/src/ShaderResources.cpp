@@ -5782,11 +5782,6 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto& item = allocations[index];
                 if (item.guest || item.buffer == nullptr || item.size != binding.guestDescriptor.size() * sizeof(std::uint32_t)) return std::nullopt;
                 const bool patched = std::any_of(dataPatches.begin(), dataPatches.end(), [&](const DataPatch& patch) { return patch.allocation == index; });
-                if (dynamicData && (!item.dataWords.empty() || !patched)) {
-                    if (moved.empty()) moved.reserve(allocations.size());
-                    moved.push_back({index, 0, item.size, binding.guestDescriptor});
-                    continue;
-                }
                 const bool same = !item.dataWords.empty() ? item.dataWords == binding.guestDescriptor : !patched && std::memcmp(item.buffer->Bytes().data(), binding.guestDescriptor.data(), item.size) == 0;
                 if (same) continue;
                 if (item.dataWords.empty() && patched) return std::nullopt;
@@ -5993,7 +5988,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (deferredCount != 0) {
-        if (selected.empty() && deferredCount == dynamicAllocations[0].size() + dynamicAllocations[1].size()) return ringDrawBindings(recorder, moved);
+        if (selected.empty()) return ringDrawBindings(recorder, moved);
         for (std::size_t index = 0; index < deferredCount; ++index) uploadData(*deferred[index]);
     }
     if (selected.empty()) return {};
@@ -6085,38 +6080,55 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::o
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::ringDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
+    std::array<const MovedBuffer*, MaxDynamicData> data{};
     std::array<VkDeviceSize, MaxDynamicData> placed{};
+    std::uint64_t mask = 0;
     VkDeviceSize total = 0;
-    std::size_t count = 0;
+    std::size_t ordinal = 0;
     for (const auto& set : dynamicAllocations) {
         for (const auto index : set) {
-            total = (total + alignment - 1) & ~(alignment - 1);
-            placed[count++] = total;
-            total += allocations[index].size;
+            const auto found = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index && !entry.words.empty(); });
+            if (found != moved.end()) {
+                Require(found->size == allocations[index].size && found->words.size() * sizeof(std::uint32_t) >= found->size, "a dynamic shader data binding has no words for the draw");
+                data[ordinal] = &*found;
+                mask |= std::uint64_t{1} << ordinal;
+                total = (total + alignment - 1) & ~(alignment - 1);
+                placed[ordinal] = total;
+                total += found->size;
+            }
+            ++ordinal;
         }
     }
+    Require(mask != 0, "a ring draw has no shader data to place");
     auto slice = recorder.DrawUpload(static_cast<std::size_t>(total));
     Require(slice.offset + total <= std::numeric_limits<std::uint32_t>::max(), "a dynamic shader data offset exceeds 32 bits");
     auto result = std::make_shared<DrawBindings>();
-    count = 0;
+    ordinal = 0;
     for (std::size_t set = 0; set < dynamicAllocations.size(); ++set) {
         result->dynamicOffsets[set].reserve(dynamicAllocations[set].size());
         for (const auto index : dynamicAllocations[set]) {
-            const auto data = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-            Require(data != moved.end() && data->size == allocations[index].size && data->words.size() * sizeof(std::uint32_t) >= data->size, "a dynamic shader data binding has no words for the draw");
-            auto* bytes = slice.bytes + placed[count];
-            std::memcpy(bytes, data->words.data(), data->size);
-            for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < data->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+            std::uint32_t offset = 0;
+            if (const auto* entry = data[ordinal]) {
+                auto* bytes = slice.bytes + placed[ordinal];
+                std::memcpy(bytes, entry->words.data(), entry->size);
+                for (const auto& patch : dataPatches) {
+                    if (patch.allocation == index && patch.byte < entry->size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+                }
+                offset = static_cast<std::uint32_t>(slice.offset + placed[ordinal]);
             }
-            result->dynamicOffsets[set].push_back(static_cast<std::uint32_t>(slice.offset + placed[count]));
-            ++count;
+            result->dynamicOffsets[set].push_back(offset);
+            ++ordinal;
         }
     }
     std::shared_ptr<DrawBindings> ring;
     {
         std::lock_guard lock(ringMutex);
-        if (ringBindings != nullptr && ringChunk.lock() == slice.buffer) ring = ringBindings;
+        for (const auto& entry : ringSets) {
+            if (entry.bindings != nullptr && entry.mask == mask && entry.chunk.lock() == slice.buffer) {
+                ring = entry.bindings;
+                break;
+            }
+        }
     }
     if (ring == nullptr) {
         ring = std::make_shared<DrawBindings>();
@@ -6124,14 +6136,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::ringDrawBindings
         thread_local std::vector<std::optional<VkDescriptorBufferInfo>>* overridesSlot = nullptr;
         auto& overrides = ShaderRecompiler::ThreadOwned(overridesSlot);
         overrides.assign(allocations.size(), std::nullopt);
+        ordinal = 0;
         for (const auto& set : dynamicAllocations) {
-            for (const auto index : set) overrides[index] = VkDescriptorBufferInfo{slice.buffer->Handle(), 0, allocations[index].size};
+            for (const auto index : set) {
+                if ((mask >> ordinal & 1u) != 0) overrides[index] = VkDescriptorBufferInfo{slice.buffer->Handle(), 0, allocations[index].size};
+                ++ordinal;
+            }
         }
         writeDrawSets(*ring, overrides);
         ringSetCount.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(ringMutex);
-        ringBindings = ring;
-        ringChunk = slice.buffer;
+        auto* slot = &ringSets[ringNext];
+        for (auto& entry : ringSets) {
+            if (entry.bindings == nullptr || entry.mask == mask || entry.chunk.expired()) {
+                slot = &entry;
+                break;
+            }
+        }
+        if (slot == &ringSets[ringNext]) ringNext = (ringNext + 1) % ringSets.size();
+        *slot = {mask, slice.buffer, ring};
     }
     result->allocation.set = ring->allocation.set;
     result->fragmentAllocation.set = ring->fragmentAllocation.set;
