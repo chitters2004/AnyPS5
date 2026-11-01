@@ -885,11 +885,14 @@ void CheckRewatchKeepsDriverStores(LostDriverStore kind) {
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     Require(Watched(base, Bytes), "the rewatched driver store fixture is not watched");
     std::memset(memory, 0x11, Bytes);
+    std::vector<std::byte> snapshot(Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
     BumpCollectEpoch();
     const auto taken = CollectWritesUncached(base, Bytes);
     Require(taken != 0, "the rewatched driver store fixture was not collected");
     const auto stored = base + 2 * Page;
     const auto rewatched = base + 9 * Page;
+    snapshot[2 * Page + 8] = std::byte{0x22};
     switch (kind) {
         case LostDriverStore::Piece: Require(MarkWritten(stored + 8, 16) != 0, "the driver store was not stamped"); break;
         case LostDriverStore::PossiblePiece: Require(MarkPossiblyWritten(stored + 8, 16) != 0, "the possible driver store was not stamped"); break;
@@ -904,6 +907,9 @@ void CheckRewatchKeepsDriverStores(LostDriverStore kind) {
     Require(Watched(base, Bytes), "the page did not return to the write watch");
     Require(!UnchangedSince(stored, Page, taken), "rewatching another page of the block made a driver store read as unchanged");
     Require(StoredOver(stored, Page, taken), "rewatching another page of the block made a driver store read as not stored over");
+    std::size_t compared = 0;
+    Require(!EqualsCommittedSince(base, snapshot, taken, &compared), "rewatching another page of the block hid a driver store from the stamped compare");
+    Require(compared >= Block, "the stamped compare after a rewatch that dropped driver stores did not compare their whole block");
     GuestArena::GuestArenaReset_nid_postfix(memory, Bytes);
     GuestArena::GuestArenaRelease_nid_postfix(memory, Bytes);
 }
