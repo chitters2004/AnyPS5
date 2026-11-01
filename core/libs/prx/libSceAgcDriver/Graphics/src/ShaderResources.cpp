@@ -50,6 +50,50 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+struct BlockCompareCount {
+    std::atomic<std::uint64_t> compares{0};
+    std::atomic<std::uint64_t> surfaceBytes{0};
+    std::atomic<std::uint64_t> comparedBytes{0};
+    std::atomic<std::uint64_t> blockCompares{0};
+    std::atomic<std::uint64_t> blockSurfaceBytes{0};
+    std::atomic<std::uint64_t> blockComparedBytes{0};
+    std::atomic<std::uint64_t> fullPending{0};
+    std::atomic<std::uint64_t> fullNoGeneration{0};
+    std::atomic<std::uint64_t> fullCommitted{0};
+    std::atomic<std::uint64_t> equal{0};
+    const bool enabled = std::getenv("APS5_BLOCK_COMPARE_COUNT") != nullptr;
+    void Print() const {
+        const auto surface = surfaceBytes.load(std::memory_order_relaxed);
+        const auto compared = comparedBytes.load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[blockcompare] site=texture-compare compares=%llu equal=%llu surface=%llu compared=%llu saved=%llu block-compares=%llu block-surface=%llu block-compared=%llu full-pending=%llu full-no-generation=%llu full-committed=%llu\n",
+            static_cast<unsigned long long>(compares.load(std::memory_order_relaxed)), static_cast<unsigned long long>(equal.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(surface), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(surface - compared),
+            static_cast<unsigned long long>(blockCompares.load(std::memory_order_relaxed)), static_cast<unsigned long long>(blockSurfaceBytes.load(std::memory_order_relaxed)), static_cast<unsigned long long>(blockComparedBytes.load(std::memory_order_relaxed)),
+            static_cast<unsigned long long>(fullPending.load(std::memory_order_relaxed)), static_cast<unsigned long long>(fullNoGeneration.load(std::memory_order_relaxed)), static_cast<unsigned long long>(fullCommitted.load(std::memory_order_relaxed)));
+    }
+    void Add(std::size_t surface, std::size_t compared, bool block, bool same) {
+        if (!enabled) return;
+        surfaceBytes.fetch_add(surface, std::memory_order_relaxed);
+        comparedBytes.fetch_add(compared, std::memory_order_relaxed);
+        if (block) {
+            blockCompares.fetch_add(1, std::memory_order_relaxed);
+            blockSurfaceBytes.fetch_add(surface, std::memory_order_relaxed);
+            blockComparedBytes.fetch_add(compared, std::memory_order_relaxed);
+        }
+        if (same) equal.fetch_add(1, std::memory_order_relaxed);
+        if ((compares.fetch_add(1, std::memory_order_relaxed) + 1) % 2048 == 0) Print();
+    }
+    ~BlockCompareCount() {
+        if (enabled) Print();
+    }
+};
+
+BlockCompareCount& BlockCompareCounter() {
+    static BlockCompareCount counter;
+    return counter;
+}
+
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -984,8 +1028,17 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 const bool pending = Recorder::SnapshotWriteOverlaps(address, bytes);
                 if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                if (pending || snapshotGeneration == 0 || it->committed != committed) return GuestMemory::EqualsCommitted(address, it->bytes);
-                return GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation);
+                auto& count = BlockCompareCounter();
+                if (pending || snapshotGeneration == 0 || it->committed != committed) {
+                    if (count.enabled) (pending ? count.fullPending : snapshotGeneration == 0 ? count.fullNoGeneration : count.fullCommitted).fetch_add(1, std::memory_order_relaxed);
+                    const bool same = GuestMemory::EqualsCommitted(address, it->bytes);
+                    count.Add(it->bytes.size(), it->bytes.size(), false, same);
+                    return same;
+                }
+                std::size_t compared = 0;
+                const bool same = GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation, &compared);
+                count.Add(it->bytes.size(), compared, true, same);
+                return same;
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
