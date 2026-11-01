@@ -427,6 +427,8 @@ private:
         std::vector<LabelCompare::BlockMode> modes;
         std::vector<std::int8_t> written;
         std::vector<std::int8_t> changedAfter;
+        std::vector<VkBuffer> leaseTables;
+        bool noBaseline = false;
         double waitedMs = 0;
     };
     LabelCompareCheck labelCompareClassify(const Recorder& recorder);

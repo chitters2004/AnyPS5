@@ -4307,14 +4307,14 @@ struct LabelCompareTotals {
     std::mutex mutex;
     std::uint64_t checks = 0;
     std::uint64_t eligible = 0;
-    std::uint64_t blocks[4] = {};
+    std::uint64_t blocks[5] = {};
     std::uint64_t compared = 0;
     std::uint64_t mismatches = 0;
     double eligibleWaitMs = 0;
     double refusedWaitMs = 0;
     std::map<std::string, std::uint64_t> refusals;
     std::uint64_t waitsSkipped = 0;
-    std::uint64_t skippedBlocks[4] = {};
+    std::uint64_t skippedBlocks[5] = {};
     std::map<std::string, std::uint64_t> gpuRefusals;
 };
 
@@ -4334,9 +4334,9 @@ std::string LabelCompareReport() {
     std::string gpuRefusals;
     for (const auto& [why, count] : totals.gpuRefusals) gpuRefusals += " " + why + " " + std::to_string(count);
     char gpu[512];
-    std::snprintf(gpu, sizeof(gpu), "[label-compare] GPU compare: waits skipped %llu, blocks store %llu keep %llu gpu %llu; GPU-compared blocks stored %llu kept %llu; images in sync at completion %llu, left stale %llu; waits kept:%s\n", static_cast<unsigned long long>(totals.waitsSkipped), static_cast<unsigned long long>(totals.skippedBlocks[0]), static_cast<unsigned long long>(totals.skippedBlocks[1]), static_cast<unsigned long long>(totals.skippedBlocks[2]), static_cast<unsigned long long>(conditionalStored.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalKept.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalSettled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalLeftStale.exchange(0, std::memory_order_relaxed)), gpuRefusals.c_str());
+    std::snprintf(gpu, sizeof(gpu), "[label-compare] GPU compare: waits skipped %llu, blocks store %llu keep %llu gpu %llu gpu-lease %llu; GPU-compared blocks stored %llu kept %llu; images in sync at completion %llu, left stale %llu; waits kept:%s\n", static_cast<unsigned long long>(totals.waitsSkipped), static_cast<unsigned long long>(totals.skippedBlocks[0]), static_cast<unsigned long long>(totals.skippedBlocks[1]), static_cast<unsigned long long>(totals.skippedBlocks[2]), static_cast<unsigned long long>(totals.skippedBlocks[4]), static_cast<unsigned long long>(conditionalStored.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalKept.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalSettled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalLeftStale.exchange(0, std::memory_order_relaxed)), gpuRefusals.c_str());
     char text[512];
-    std::snprintf(text, sizeof(text), "[label-compare] waits checked %llu, eligible %llu (%.1f ms waited), refused %llu (%.1f ms waited:%s); blocks store %llu keep %llu gpu %llu fallback %llu; decisions compared %llu, mismatches %llu\n", static_cast<unsigned long long>(totals.checks), static_cast<unsigned long long>(totals.eligible), totals.eligibleWaitMs, static_cast<unsigned long long>(totals.checks - totals.eligible), totals.refusedWaitMs, refusals.c_str(), static_cast<unsigned long long>(totals.blocks[0]), static_cast<unsigned long long>(totals.blocks[1]), static_cast<unsigned long long>(totals.blocks[2]), static_cast<unsigned long long>(totals.blocks[3]), static_cast<unsigned long long>(totals.compared), static_cast<unsigned long long>(totals.mismatches));
+    std::snprintf(text, sizeof(text), "[label-compare] waits checked %llu, eligible %llu (%.1f ms waited), refused %llu (%.1f ms waited:%s); blocks store %llu keep %llu gpu %llu gpu-lease %llu fallback %llu; decisions compared %llu, mismatches %llu\n", static_cast<unsigned long long>(totals.checks), static_cast<unsigned long long>(totals.eligible), totals.eligibleWaitMs, static_cast<unsigned long long>(totals.checks - totals.eligible), totals.refusedWaitMs, refusals.c_str(), static_cast<unsigned long long>(totals.blocks[0]), static_cast<unsigned long long>(totals.blocks[1]), static_cast<unsigned long long>(totals.blocks[2]), static_cast<unsigned long long>(totals.blocks[4]), static_cast<unsigned long long>(totals.blocks[3]), static_cast<unsigned long long>(totals.compared), static_cast<unsigned long long>(totals.mismatches));
     totals.checks = 0;
     totals.eligible = 0;
     for (auto& count : totals.blocks) count = 0;
@@ -4557,6 +4557,8 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     if (check.compared && savedTicket.size() == trackedLayers && savedTicket[0] != 0) return refuse("save-pending");
     check.written.assign(blocks, -1);
     check.changedAfter.assign(blocks, -1);
+    const bool leaseTabled = !check.compared && recorder.OpenLeaseTables(base, size, check.leaseTables);
+    check.noBaseline = !check.compared && !originalHolds(base, size) && generationBaseline.size() != guestBytes;
     bool fallback = false;
     for (std::size_t k = 0; k < blocks; ++k) {
         const auto at = check.spanBegin + k * block;
@@ -4575,14 +4577,20 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
         state.changedNow = !unchangedSinceBaseline(from, to);
         state.writerOver = recorder.PendingWriteOverlaps(from, static_cast<std::size_t>(to - from));
         state.leaseOver = recorder.PendingLeaseOverlaps(from, static_cast<std::size_t>(to - from));
-        const auto mode = LabelCompare::Classify(state);
+        state.edge = edge;
+        state.leaseTabled = leaseTabled;
+        auto mode = LabelCompare::Classify(state);
+        if (check.noBaseline && mode == LabelCompare::BlockMode::OnGpu) {
+            Require(state.stampedNow, "a block without a baseline was left to the GPU unstamped");
+            mode = LabelCompare::BlockMode::Keep;
+        }
         fallback = fallback || mode == LabelCompare::BlockMode::Fallback;
         check.modes.push_back(mode);
     }
     check.classified = true;
     if (fallback) return refuse("fallback-block");
-    const bool onGpu = std::any_of(check.modes.begin(), check.modes.end(), [](LabelCompare::BlockMode mode) { return mode == LabelCompare::BlockMode::OnGpu; });
-    if (onGpu && !originalHolds(base, size) && generationBaseline.size() != guestBytes) return refuse("no-baseline");
+    const bool onGpu = std::any_of(check.modes.begin(), check.modes.end(), [](LabelCompare::BlockMode mode) { return mode == LabelCompare::BlockMode::OnGpu || mode == LabelCompare::BlockMode::OnGpuLease; });
+    if (onGpu && check.noBaseline && blockUnits) return refuse("no-baseline");
     if (guestBytes > LabelCompareMaxBytes) return refuse("large");
     check.eligible = true;
     return check;
@@ -4604,7 +4612,7 @@ void StorageTexture::tallyLabelCompare(const LabelCompareCheck& check, std::uint
     std::string modes;
     for (std::size_t k = 0; k < check.modes.size(); ++k) {
         modes += std::string(" ") + LabelCompare::ModeName(check.modes[k]);
-        if (!check.classified || check.modes[k] == LabelCompare::BlockMode::Fallback || check.written[k] < 0) continue;
+        if (!check.classified || check.modes[k] == LabelCompare::BlockMode::Fallback || check.modes[k] == LabelCompare::BlockMode::OnGpuLease || check.written[k] < 0) continue;
         ++compared;
         const bool predicted = LabelCompare::Written(check.modes[k], check.changedAfter[k] == 1);
         if (predicted == (check.written[k] == 1)) continue;
@@ -6289,17 +6297,31 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditiona
         Require(from % 4 == 0 && to % 4 == 0 && to > from, "a GPU-compared label store range is not whole words");
         bytes += static_cast<std::size_t>(to - from);
     }
+    namespace Abi = ShaderRecompiler::BdaAbi;
     const auto flagsOffset = 2 * bytes;
-    auto staging = std::make_shared<Buffer>(context, flagsOffset + 4 * ranges.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    const auto tablesOffset = flagsOffset + 12 * ranges.size();
+    const std::uint32_t tableWords = Abi::SrtGuardWord - Abi::WrittenOverflowWord;
+    const auto leaseMode = [&](std::uint64_t from) {
+        if (labelCompareStore == nullptr || from < labelCompareStore->spanBegin) return false;
+        const auto k = static_cast<std::size_t>((from - labelCompareStore->spanBegin) / 65536);
+        return k < labelCompareStore->modes.size() && labelCompareStore->modes[k] == LabelCompare::BlockMode::OnGpuLease;
+    };
+    const bool anyLease = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return leaseMode(range.first); });
+    const std::span<const VkBuffer> tables = anyLease ? std::span<const VkBuffer>(labelCompareStore->leaseTables) : std::span<const VkBuffer>();
+    Require(!anyLease || !tables.empty(), "a lease-table label store has no lease table");
+    const auto stagingBytes = tablesOffset + std::size_t{4} * tableWords * tables.size();
+    auto staging = std::make_shared<Buffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     auto memory = staging->Bytes();
     std::vector<VkBufferCopy> copies;
     std::size_t at = 0;
     for (const auto& [from, to] : ranges) {
         const auto length = static_cast<std::size_t>(to - from);
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
+        const bool presetChanged = labelCompareStore != nullptr && labelCompareStore->noBaseline;
         const auto& baseline = originalHolds(from, length) ? original : generationBaseline;
-        Require(baseline.size() == guestBytes, "a GPU-compared label store has no baseline");
-        std::memcpy(memory.data() + bytes + at, baseline.data() + offset, length);
+        Require(presetChanged ? sources.empty() && leaseMode(from) : baseline.size() == guestBytes, "a GPU-compared label store has no baseline");
+        if (presetChanged) std::memset(memory.data() + bytes + at, 0, length);
+        else std::memcpy(memory.data() + bytes + at, baseline.data() + offset, length);
         if (sources.empty()) {
             copies.push_back({offset, at, length});
         } else {
@@ -6312,7 +6334,18 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditiona
         }
         at += length;
     }
-    std::memset(memory.data() + flagsOffset, 0, 4 * ranges.size());
+    std::memset(memory.data() + flagsOffset, 0, 12 * ranges.size());
+    if (labelCompareStore != nullptr && labelCompareStore->noBaseline) {
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const std::uint32_t changed = 1;
+            std::memcpy(memory.data() + flagsOffset + 12 * index, &changed, sizeof(changed));
+        }
+    }
+    if (!tables.empty()) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (std::size_t index = 0; index < tables.size(); ++index) {
+        const VkBufferCopy table{std::size_t{4} * Abi::WrittenOverflowWord, tablesOffset + std::size_t{4} * tableWords * index, std::size_t{4} * tableWords};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tables[index], staging->Handle(), 1, &table);
+    }
     if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, results, staging->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     const auto address = staging->DeviceAddress();
@@ -6320,15 +6353,27 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditiona
     for (std::size_t index = 0; index < ranges.size(); ++index) {
         const auto& [from, to] = ranges[index];
         const auto length = static_cast<std::size_t>(to - from);
-        recorder.RecordConditionalStore(commands, import.address + HostImportOffset(import, from), address + at, address + bytes + at, address + flagsOffset, static_cast<std::uint32_t>(length / 4), static_cast<std::uint32_t>(index));
+        Recorder::ConditionalLease lease;
+        if (leaseMode(from)) {
+            Require(from % 65536 == 0 && length == 65536, "a lease-table label store range is not a whole 64 KiB block");
+            lease.tables = address + tablesOffset;
+            lease.count = static_cast<std::uint32_t>(tables.size());
+            lease.stride = tableWords;
+            lease.key = static_cast<std::uint32_t>(from >> Abi::WrittenChunkShift) + 1u;
+            lease.mask = 0xffffu << static_cast<std::uint32_t>((from >> Abi::WrittenPageShift) & (Abi::WrittenChunkPages - 1u));
+            lease.countWord = Abi::WrittenCountWord - Abi::WrittenOverflowWord;
+            lease.slotsWord = Abi::WrittenSlotsWord - Abi::WrittenOverflowWord;
+            lease.listWord = Abi::WrittenListWord - Abi::WrittenOverflowWord;
+        }
+        recorder.RecordConditionalStore(commands, import.address + HostImportOffset(import, from), address + at, address + bytes + at, address + flagsOffset, static_cast<std::uint32_t>(length / 4), static_cast<std::uint32_t>(index), lease.count != 0 ? &lease : nullptr);
         at += length;
     }
-    recorder.Keep(staging, flagsOffset + 4 * ranges.size());
+    recorder.Keep(staging, stagingBytes);
     recorder.OnComplete([staging, flagsOffset, count = ranges.size()] {
         const auto flags = staging->Bytes();
         for (std::size_t index = 0; index < count; ++index) {
             std::uint32_t kept = 0;
-            std::memcpy(&kept, flags.data() + flagsOffset + 4 * index, sizeof(kept));
+            std::memcpy(&kept, flags.data() + flagsOffset + 12 * index + 8, sizeof(kept));
             (kept != 0 ? conditionalKept : conditionalStored).fetch_add(1, std::memory_order_relaxed);
         }
     });
@@ -6353,7 +6398,7 @@ void StorageTexture::settleConditionalAtCompletion(Recorder& recorder, const std
         const auto bytes = staging->Bytes();
         for (std::size_t index = 0; index < count; ++index) {
             std::uint32_t kept = 0;
-            std::memcpy(&kept, bytes.data() + offset + 4 * index, sizeof(kept));
+            std::memcpy(&kept, bytes.data() + offset + 12 * index + 8, sizeof(kept));
             stored = stored && kept == 0;
         }
         const bool current = alive->conditionalTicket == ticket && alive->layerGeneration[0] == stale;
@@ -6488,7 +6533,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                     ++skipped;
                     continue;
                 }
-                if (mode == LabelCompare::BlockMode::OnGpu) {
+                if (mode == LabelCompare::BlockMode::OnGpu || mode == LabelCompare::BlockMode::OnGpuLease) {
                     conditional.emplace_back(from, to);
                     skippedLayer[layer] = true;
                 }

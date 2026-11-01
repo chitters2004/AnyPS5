@@ -5985,10 +5985,23 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
     if (auto split = guestMemory.SplitInPlaceReads()) {
+        if (kind == Recorder::ReadKind::AddressBased) {
+            if (bda != nullptr && faultChecks) {
+                recorder.NoteLeaseTable(bda->Fault().buffer, split->space);
+                recorder.NoteLeaseTable(bda->Fault().buffer, std::make_shared<const Recorder::ReadList>(split->own.begin(), split->own.end()));
+            } else {
+                recorder.NoteUntabledLease();
+            }
+        }
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        const auto reads = guestMemory.InPlaceReads();
+        if (kind == Recorder::ReadKind::AddressBased) {
+            if (bda != nullptr && faultChecks) recorder.NoteLeaseTable(bda->Fault().buffer, std::make_shared<const Recorder::ReadList>(reads.begin(), reads.end()));
+            else recorder.NoteUntabledLease();
+        }
+        recorder.NotePendingReads(reads, kind);
     }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

@@ -187,6 +187,9 @@ public:
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
     bool PendingLeaseOverlaps(std::uint64_t address, std::size_t bytes) const;
+    void NoteLeaseTable(VkBuffer table, std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges);
+    void NoteUntabledLease();
+    bool OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -211,7 +214,17 @@ public:
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
     bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr);
     bool ConditionalStoreReady();
-    void RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag);
+    struct ConditionalLease {
+        VkDeviceAddress tables = 0;
+        std::uint32_t count = 0;
+        std::uint32_t stride = 0;
+        std::uint32_t key = 0;
+        std::uint32_t mask = 0;
+        std::uint32_t countWord = 0;
+        std::uint32_t slotsWord = 0;
+        std::uint32_t listWord = 0;
+    };
+    void RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag, const ConditionalLease* lease = nullptr);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
     // it touches only the immutable timeline semaphore (the caller keeps the device alive). Requires
     // HasTimeline(); the debug switch APS5_NO_TIMELINE makes the device create the recorder without one.
@@ -589,6 +602,12 @@ private:
             ReadKind kind;
         };
         std::vector<ReadListNote> readLists;
+        struct LeaseTable {
+            VkBuffer table;
+            std::shared_ptr<const ReadList> ranges;
+        };
+        std::vector<LeaseTable> leaseTables;
+        bool untabledLease = false;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;

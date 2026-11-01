@@ -176,6 +176,32 @@ void RunTiled(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::siz
     else Require(!synced, what + "the image whose block the GPU kept was put back in sync at completion");
 }
 
+std::vector<std::uint32_t> RunLeaseTable(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool label, bool inside) {
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = guest.Address() + offset;
+    const auto target = device.Target();
+    const std::array<std::uint32_t, 4> pattern{0x33333333u, 0x33333333u, 0x33333333u, 0x33333333u};
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(device.FillBuffer(image, 4096u, pattern), "storage flush ordering, lease table: the GPU fill was not recorded");
+    }
+    std::uint64_t serial = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        serial = device.SubmitAndEpoch();
+    }
+    device.WaitRecorded(serial);
+    const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
+    const auto storeGlobal = Compile(StoreGlobalCode, GlobalUserData(inside ? image : image + ImageBytes), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreGlobalCode.data()));
+    const std::string what = std::string("storage flush ordering, lease table ") + (inside ? "inside" : "outside") + (label ? ", label: " : ", waited: ");
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, label ? "readback before label" : "test"), what + "the image store left no results pending");
+    if (label) Require(AddressBasedStorePending(image, true), what + "the label store waited for the address-based store instead of reading its table on the GPU");
+    device.WaitIdle();
+    return {words, words + (ImageBytes + 0x200u) / 4u};
+}
+
 void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, bool gpuCompare, bool baseline = false) {
     const auto* words = guest.Words() + offset / 4u;
     const auto image = guest.Address() + offset;
@@ -237,6 +263,19 @@ int main(int argc, char** argv) {
             Run(*device, guest, BlockBytes / 4u, false, "writer of the baseline bytes in the open batch", gpuCompare, true);
             RunTiled(*device, guest, BlockBytes / 8u, "writer in the open batch", false);
             RunTiled(*device, guest, 3u * BlockBytes / 4u, "writer of the baseline bytes in the open batch", true);
+            for (const bool inside : {true, false}) {
+                GuestBlock waitedBlock(watched);
+                GuestBlock labelBlock(watched);
+                const auto waited = RunLeaseTable(*device, waitedBlock, 0, false, inside);
+                const auto stored = RunLeaseTable(*device, labelBlock, 0, true, inside);
+                for (std::size_t index = 0; index < waited.size(); ++index) {
+                    if (waited[index] != stored[index]) {
+                        std::fprintf(stderr, "lease table %s: word 0x%zx waited 0x%08x label 0x%08x\n", inside ? "inside" : "outside", index, waited[index], stored[index]);
+                        break;
+                    }
+                }
+                Require(waited == stored, std::string("storage flush ordering, lease table ") + (inside ? "inside" : "outside") + ": the GPU decision differs from the decision after the wait");
+            }
         }
         std::puts("storage flush ordering tests passed");
         return 0;

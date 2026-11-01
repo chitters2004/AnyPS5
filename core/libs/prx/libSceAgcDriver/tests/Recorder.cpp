@@ -1556,7 +1556,7 @@ int conditionalStoreTests(const Device& device, Recorder& recorder) {
     Buffer target(context, 2 * Bytes, Usage);
     Buffer source(context, 2 * Bytes, Usage);
     Buffer baseline(context, 2 * Bytes, Usage);
-    Buffer flags(context, 16, Usage);
+    Buffer flags(context, 64, Usage);
     const auto words = [](Buffer& buffer) { return reinterpret_cast<std::uint32_t*>(buffer.Bytes().data()); };
     enum class Fill { None, Before, After };
     struct Case {
@@ -1582,7 +1582,7 @@ int conditionalStoreTests(const Device& device, Recorder& recorder) {
         for (std::uint32_t range = 0; range < 2; ++range) {
             if (test.differing[range] < Words) words(target)[range * Words + test.differing[range]] ^= 0x5au;
         }
-        std::memset(flags.Bytes().data(), 0, 16);
+        std::memset(flags.Bytes().data(), 0, 64);
         const std::vector<std::uint32_t> before(words(target), words(target) + 2 * Words);
         constexpr std::uint32_t Filled = 0x77777777u;
         const auto fill = [&](VkCommandBuffer commands) {
@@ -1599,7 +1599,7 @@ int conditionalStoreTests(const Device& device, Recorder& recorder) {
         recorder.Sync();
         for (std::uint32_t range = 0; range < 2; ++range) {
             std::uint32_t flag = 0;
-            std::memcpy(&flag, flags.Bytes().data() + 4 * range, 4);
+            std::memcpy(&flag, flags.Bytes().data() + 12 * range + 8, 4);
             Require((flag != 0) == test.kept[range], test.name);
             for (std::uint32_t index = 0; index < Words; ++index) {
                 const auto at = range * Words + index;
@@ -1609,6 +1609,68 @@ int conditionalStoreTests(const Device& device, Recorder& recorder) {
                     std::cerr << test.name << ": word " << at << " is 0x" << std::hex << words(target)[at] << " instead of 0x" << expected << std::dec << '\n';
                     Require(false, test.name);
                 }
+            }
+        }
+        std::cout << "conditional store: " << test.name << '\n';
+    }
+    Buffer table(context, 64 * 4, Usage);
+    struct LeaseCase {
+        const char* name;
+        std::uint32_t key;
+        std::uint32_t mask;
+        bool overflow;
+        bool changed;
+        bool preset;
+        bool kept;
+    };
+    constexpr std::uint32_t Key = 7, Mask = 0xffff0000u;
+    const LeaseCase leaseCases[] = {
+        {"a lease that stored in the block and changed it keeps it", Key, 0x00010000u, false, true, false, true},
+        {"a lease that stored only outside the block's pages stores it", Key, 0x00008000u, false, true, false, false},
+        {"a lease that stored in another chunk stores it", Key + 1, 0x00010000u, false, true, false, false},
+        {"a lease that stored in the block without changing it stores it", Key, 0x00010000u, false, false, false, false},
+        {"an overflowed lease table keeps a changed block", Key + 1, 0x00010000u, true, true, false, true},
+        {"without a baseline a lease that stored in the block keeps it", Key, 0x80000000u, false, false, true, true},
+        {"without a baseline a lease that stored elsewhere stores it", Key, 0x0000ffffu, false, false, true, false},
+    };
+    for (const auto& test : leaseCases) {
+        for (std::uint32_t index = 0; index < Words; ++index) {
+            words(baseline)[index] = 0x1000u + index;
+            words(target)[index] = 0x1000u + index;
+            words(source)[index] = 0xabc00000u + index;
+        }
+        if (test.changed) words(target)[5] ^= 0x5au;
+        std::memset(flags.Bytes().data(), 0, 64);
+        if (test.preset) words(flags)[0] = 1u;
+        std::memset(table.Bytes().data(), 0, 64 * 4);
+        auto* tableWords = words(table);
+        tableWords[0] = test.overflow ? 1u : 0u;
+        tableWords[1] = 1u;
+        tableWords[2 + 2 * 3] = test.key;
+        tableWords[2 + 2 * 3 + 1] = test.mask;
+        tableWords[10] = 3u;
+        const std::vector<std::uint32_t> before(words(target), words(target) + Words);
+        Recorder::ConditionalLease lease;
+        lease.tables = table.DeviceAddress();
+        lease.count = 1;
+        lease.stride = 14;
+        lease.key = Key;
+        lease.mask = Mask;
+        lease.countWord = 1;
+        lease.slotsWord = 2;
+        lease.listWord = 10;
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        recorder.RecordConditionalStore(commands, target.DeviceAddress(), source.DeviceAddress(), baseline.DeviceAddress(), flags.DeviceAddress(), Words, 0, &lease);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Submit();
+        recorder.Sync();
+        Require((words(flags)[2] != 0) == test.kept, test.name);
+        for (std::uint32_t index = 0; index < Words; ++index) {
+            const auto expected = test.kept ? before[index] : 0xabc00000u + index;
+            if (words(target)[index] != expected) {
+                std::cerr << test.name << ": word " << index << " is 0x" << std::hex << words(target)[index] << " instead of 0x" << expected << std::dec << '\n';
+                Require(false, test.name);
             }
         }
         std::cout << "conditional store: " << test.name << '\n';

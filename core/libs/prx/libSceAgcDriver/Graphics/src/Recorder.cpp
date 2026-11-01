@@ -2140,7 +2140,7 @@ bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress
 
 namespace {
 
-constexpr std::uint32_t ConditionalStorePushBytes = 48;
+constexpr std::uint32_t ConditionalStorePushBytes = 88;
 constexpr std::uint32_t ConditionalStoreGroup = 64;
 
 }
@@ -2172,18 +2172,30 @@ bool Recorder::ConditionalStoreReady() {
     return conditionalStoreState > 0;
 }
 
-void Recorder::RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag) {
+void Recorder::RecordConditionalStore(VkCommandBuffer commands, VkDeviceAddress target, VkDeviceAddress source, VkDeviceAddress baseline, VkDeviceAddress flags, std::uint32_t words, std::uint32_t flag, const ConditionalLease* lease) {
     Require(conditionalStoreState > 0, "a conditional store was recorded without its pipeline");
+    Require(lease == nullptr || (lease->count != 0 && lease->tables != 0 && lease->listWord > lease->slotsWord), "a conditional store's lease tables are incomplete");
+    const ConditionalLease none{};
+    const auto& tables = lease != nullptr ? *lease : none;
     struct {
         VkDeviceAddress target;
         VkDeviceAddress source;
         VkDeviceAddress baseline;
         VkDeviceAddress flags;
+        VkDeviceAddress tables;
         std::uint32_t words;
         std::uint32_t flag;
         std::uint32_t phase;
+        std::uint32_t lease;
+        std::uint32_t key;
+        std::uint32_t mask;
+        std::uint32_t count;
+        std::uint32_t stride;
+        std::uint32_t countWord;
+        std::uint32_t slotsWord;
+        std::uint32_t listWord;
         std::uint32_t unused;
-    } parameters{target, source, baseline, flags, words, flag, 0, 0};
+    } parameters{target, source, baseline, flags, tables.tables, words, flag, 0, lease != nullptr ? 1u : 0u, tables.key, tables.mask, tables.count, tables.stride, tables.countWord, tables.slotsWord, tables.listWord, 0};
     static_assert(sizeof(parameters) == ConditionalStorePushBytes);
     const auto groups = (words + ConditionalStoreGroup - 1) / ConditionalStoreGroup;
     function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, conditionalStorePipeline);
@@ -3256,6 +3268,35 @@ bool Recorder::PendingLeaseOverlaps(std::uint64_t address, std::size_t bytes) co
         if (readOverlap(*batch, address, end, ReadKind::AddressBased).has_value()) return true;
     }
     return false;
+}
+
+void Recorder::NoteLeaseTable(VkBuffer table, std::shared_ptr<const ReadList> ranges) {
+    ensureOpen();
+    open->leaseTables.push_back({table, std::move(ranges)});
+}
+
+void Recorder::NoteUntabledLease() {
+    ensureOpen();
+    open->untabledLease = true;
+}
+
+bool Recorder::OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables) const {
+    tables.clear();
+    if (bytes == 0) return true;
+    const auto end = address + bytes;
+    for (const auto& batch : inFlight) {
+        if (readOverlap(*batch, address, end, ReadKind::AddressBased).has_value()) return false;
+    }
+    if (open == nullptr || !readOverlap(*open, address, end, ReadKind::AddressBased).has_value()) return true;
+    if (open->untabledLease) return false;
+    for (const auto& lease : open->leaseTables) {
+        if (std::none_of(lease.ranges->begin(), lease.ranges->end(), [&](const auto& range) { return address < range.second && range.first < end; })) continue;
+        for (const auto& batch : inFlight) {
+            if (std::any_of(batch->leaseTables.begin(), batch->leaseTables.end(), [&](const Batch::LeaseTable& other) { return other.table == lease.table; })) return false;
+        }
+        if (std::find(tables.begin(), tables.end(), lease.table) == tables.end()) tables.push_back(lease.table);
+    }
+    return !tables.empty();
 }
 
 bool Recorder::signaled(const Batch& batch) const {

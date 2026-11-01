@@ -5,7 +5,7 @@
 
 namespace AgcDriver::Graphics::LabelCompare {
 
-enum class BlockMode : std::uint8_t { Store, Keep, OnGpu, Fallback };
+enum class BlockMode : std::uint8_t { Store, Keep, OnGpu, Fallback, OnGpuLease };
 
 struct BlockState {
     bool kept = false;
@@ -14,13 +14,15 @@ struct BlockState {
     bool changedNow = false;
     bool writerOver = false;
     bool leaseOver = false;
+    bool edge = false;
+    bool leaseTabled = false;
 };
 
 inline BlockMode Classify(const BlockState& block) {
     if (block.unknown) return BlockMode::Store;
     if (block.kept) return BlockMode::Keep;
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
-    if (block.leaseOver && !block.stampedNow && (block.changedNow || block.writerOver)) return BlockMode::Fallback;
+    if (block.leaseOver && !block.stampedNow && (block.changedNow || block.writerOver)) return block.leaseTabled && !block.edge ? BlockMode::OnGpuLease : BlockMode::Fallback;
     if (block.stampedNow || block.leaseOver) return BlockMode::OnGpu;
     return BlockMode::Store;
 }
@@ -31,8 +33,8 @@ inline BlockMode ClassifyCompared(bool kept, bool changedNow, bool pending) {
     return BlockMode::OnGpu;
 }
 
-inline bool Written(BlockMode mode, bool changedOnGpu) {
-    return mode == BlockMode::Keep || (mode == BlockMode::OnGpu && changedOnGpu);
+inline bool Written(BlockMode mode, bool changedOnGpu, bool leaseStoredOnGpu = false) {
+    return mode == BlockMode::Keep || (mode == BlockMode::OnGpu && changedOnGpu) || (mode == BlockMode::OnGpuLease && leaseStoredOnGpu && changedOnGpu);
 }
 
 inline const char* ModeName(BlockMode mode) {
@@ -41,6 +43,7 @@ inline const char* ModeName(BlockMode mode) {
         case BlockMode::Keep: return "keep";
         case BlockMode::OnGpu: return "gpu";
         case BlockMode::Fallback: return "fallback";
+        case BlockMode::OnGpuLease: return "gpu-lease";
     }
     return "?";
 }

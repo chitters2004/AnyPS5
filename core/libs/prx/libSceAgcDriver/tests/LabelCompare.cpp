@@ -20,6 +20,7 @@ enum class Lease { None, Same, Different };
 struct Outcome {
     bool changedAfter;
     bool stampedAfter;
+    bool leaseStored;
 };
 
 std::vector<Outcome> Outcomes(const BlockState& state) {
@@ -35,7 +36,7 @@ std::vector<Outcome> Outcomes(const BlockState& state) {
             if (lease != Lease::Different) changed = {beforeLease};
             else if (beforeLease) changed = {false, true};
             else changed = {true};
-            for (const bool after : changed) outcomes.push_back({after, state.stampedNow || lease != Lease::None});
+            for (const bool after : changed) outcomes.push_back({after, state.stampedNow || lease != Lease::None, lease != Lease::None});
         }
     }
     return outcomes;
@@ -50,22 +51,24 @@ struct Tally {
     int checked = 0;
     int mismatches = 0;
     int onGpu = 0;
+    int onGpuLease = 0;
     int fallback = 0;
 };
 
 Tally Check(const std::function<BlockMode(const BlockState&)>& classify) {
     Tally tally;
-    for (unsigned bits = 0; bits < 64; ++bits) {
-        const BlockState state{(bits & 1u) != 0, (bits & 2u) != 0, (bits & 4u) != 0, (bits & 8u) != 0, (bits & 16u) != 0, (bits & 32u) != 0};
+    for (unsigned bits = 0; bits < 256; ++bits) {
+        const BlockState state{(bits & 1u) != 0, (bits & 2u) != 0, (bits & 4u) != 0, (bits & 8u) != 0, (bits & 16u) != 0, (bits & 32u) != 0, (bits & 64u) != 0, (bits & 128u) != 0};
         const auto mode = classify(state);
         if (mode == BlockMode::Fallback) {
             ++tally.fallback;
             continue;
         }
-        if (mode == BlockMode::OnGpu) ++tally.onGpu;
+        if (mode == BlockMode::OnGpu || mode == BlockMode::OnGpuLease) ++tally.onGpu;
+        if (mode == BlockMode::OnGpuLease) ++tally.onGpuLease;
         for (const auto& outcome : Outcomes(state)) {
             ++tally.checked;
-            if (Written(mode, outcome.changedAfter) != Today(state, outcome)) ++tally.mismatches;
+            if (Written(mode, outcome.changedAfter, outcome.leaseStored) != Today(state, outcome)) ++tally.mismatches;
         }
     }
     return tally;
@@ -99,6 +102,16 @@ BlockMode WriterAlwaysOnGpu(const BlockState& block) {
     if (!block.writerOver && !block.leaseOver) return block.stampedNow && block.changedNow ? BlockMode::Keep : BlockMode::Store;
     if (block.leaseOver && !block.stampedNow && (block.changedNow || block.writerOver)) return BlockMode::Fallback;
     return BlockMode::OnGpu;
+}
+
+BlockMode LeaseTableIgnored(const BlockState& block) {
+    const auto mode = Classify(block);
+    return mode == BlockMode::OnGpuLease ? BlockMode::OnGpu : mode;
+}
+
+BlockMode LeaseTableAlwaysStored(const BlockState& block) {
+    const auto mode = Classify(block);
+    return mode == BlockMode::OnGpuLease ? BlockMode::Keep : mode;
 }
 
 BlockMode KeptOnGpu(const BlockState& block) {
@@ -148,7 +161,8 @@ int main() {
     const auto rule = Check(Classify);
     Expect(rule.mismatches == 0, "the rule decides every block as the flush does after its wait");
     Expect(rule.onGpu > 0, "the rule leaves some blocks to the GPU");
-    Expect(rule.fallback > 0 && rule.fallback < 16, "the rule falls back for few states");
+    Expect(rule.onGpuLease > 0, "the rule reads lease tables for some states");
+    Expect(rule.fallback > 0 && rule.fallback < 48, "the rule falls back for few states");
     std::printf("label compare rule: %d outcomes checked, %d mismatches, %d states on the GPU, %d fall back\n", rule.checked, rule.mismatches, rule.onGpu, rule.fallback);
 
     struct Control {
@@ -162,6 +176,8 @@ int main() {
         {"comparing unstamped explicit writes on the GPU", WriterAlwaysOnGpu},
         {"comparing kept blocks on the GPU", KeptOnGpu},
         {"keeping untracked units", UntrackedKept},
+        {"comparing former fallback blocks without the lease table", LeaseTableIgnored},
+        {"keeping former fallback blocks without the lease table", LeaseTableAlwaysStored},
     };
     for (const auto& control : controls) {
         const auto tally = Check(control.classify);
@@ -177,8 +193,12 @@ int main() {
     Expect(Classify({false, false, false, false, true, false}) == BlockMode::Store, "an unstamped block under an explicit writer is stored");
     Expect(Classify({false, false, true, false, true, false}) == BlockMode::OnGpu, "a stamped block under an explicit writer is compared on the GPU");
     Expect(Classify({false, false, false, false, false, true}) == BlockMode::OnGpu, "an unstamped block holding its baseline under a lease is compared on the GPU");
-    Expect(Classify({false, false, false, true, false, true}) == BlockMode::Fallback, "an unstamped changed block under a lease falls back");
-    Expect(Classify({false, false, false, false, true, true}) == BlockMode::Fallback, "an unstamped block under a lease and an explicit writer falls back");
+    Expect(Classify({false, false, false, true, false, true}) == BlockMode::Fallback, "an unstamped changed block under a lease falls back without its table");
+    Expect(Classify({false, false, false, false, true, true}) == BlockMode::Fallback, "an unstamped block under a lease and an explicit writer falls back without its table");
+    Expect(Classify({false, false, false, true, false, true, false, true}) == BlockMode::OnGpuLease, "an unstamped changed block under a tabled lease reads the table");
+    Expect(Classify({false, false, false, false, true, true, false, true}) == BlockMode::OnGpuLease, "an unstamped block under a tabled lease and an explicit writer reads the table");
+    Expect(Classify({false, false, false, true, false, true, true, true}) == BlockMode::Fallback, "an edge block under a tabled lease falls back");
+    Expect(Written(BlockMode::OnGpuLease, true, true) && !Written(BlockMode::OnGpuLease, true, false) && !Written(BlockMode::OnGpuLease, false, true), "a lease-table block is kept only when the lease stored there and its bytes changed");
     Expect(Written(BlockMode::OnGpu, true) && !Written(BlockMode::OnGpu, false), "a GPU-compared block is kept only when its bytes changed");
     Expect(!Written(BlockMode::Fallback, true), "a fallback block decides nothing");
 

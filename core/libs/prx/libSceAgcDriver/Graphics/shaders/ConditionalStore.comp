@@ -8,18 +8,48 @@ layout(push_constant) uniform Parameters {
     Words source;
     Words baseline;
     Words flags;
+    Words tables;
     uint words;
     uint flag;
     uint phase;
+    uint lease;
+    uint key;
+    uint mask;
+    uint count;
+    uint stride;
+    uint countWord;
+    uint slotsWord;
+    uint listWord;
     uint unused;
 } parameters;
 
+bool leaseStored() {
+    uint slots = (parameters.listWord - parameters.slotsWord) / 2u;
+    for (uint table = 0u; table < parameters.count; ++table) {
+        uint at = table * parameters.stride;
+        if (parameters.tables.words[at] != 0u) return true;
+        uint claims = parameters.tables.words[at + parameters.countWord];
+        if (claims > slots) return true;
+        for (uint claim = 0u; claim < claims; ++claim) {
+            uint slot = parameters.tables.words[at + parameters.listWord + claim];
+            if (slot >= slots) return true;
+            uint entry = at + parameters.slotsWord + 2u * slot;
+            if (parameters.tables.words[entry] == parameters.key && (parameters.tables.words[entry + 1u] & parameters.mask) != 0u) return true;
+        }
+    }
+    return false;
+}
+
 void main() {
     uint index = gl_GlobalInvocationID.x;
-    if (index >= parameters.words) return;
+    uint base = 3u * parameters.flag;
     if (parameters.phase == 0u) {
-        if (parameters.target.words[index] != parameters.baseline.words[index]) atomicOr(parameters.flags.words[parameters.flag], 1u);
+        if (index == 0u && parameters.lease != 0u && leaseStored()) parameters.flags.words[base + 1u] = 1u;
+        if (index < parameters.words && parameters.target.words[index] != parameters.baseline.words[index]) atomicOr(parameters.flags.words[base], 1u);
         return;
     }
-    if (parameters.flags.words[parameters.flag] == 0u) parameters.target.words[index] = parameters.source.words[index];
+    bool changed = parameters.flags.words[base] != 0u;
+    bool keep = parameters.lease != 0u ? changed && parameters.flags.words[base + 1u] != 0u : changed;
+    if (index == 0u) parameters.flags.words[base + 2u] = keep ? 1u : 0u;
+    if (index < parameters.words && !keep) parameters.target.words[index] = parameters.source.words[index];
 }
