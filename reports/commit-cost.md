@@ -56,6 +56,24 @@ Switch reference:
 | `no-pending-gate` | `APS5_NO_PENDING_WRITE_GATE=1` | `78647781b` |
 | `all-off` | all four | all of the above |
 
+### 0.1 Also send: calibration numbers from the GTA machine (one minute)
+
+Build the benchmark with the same MSYS2 toolchain as the driver, from the repository root, then run it:
+
+```bash
+g++ -std=c++20 -O2 -Icore/libs -Icore -I3rdparty/Vulkan-Headers/include reports/bench/calibration.cpp -o calibration.exe -static
+```
+
+```bash
+./calibration.exe
+```
+
+Send the printed table. `CALIBRATION_GPU=<index>` picks another device from the list it prints. It measures, on that machine:
+- `thread_local` (emutls), `ThreadOwned`, `HostThreadLocal`, `AgcDriver::Mutex`, `std::mutex`, `std::shared_mutex`, a `shared_ptr` copy, `steady_clock::now`, `new`/`delete` and `memcpy`;
+- `vkUpdateDescriptorSets` by descriptor type, a whole set against buffers only, set allocation, a bind with dynamic offsets, and creating an exact-size buffer.
+
+These turn the audit's counts (section 10) and the descriptor savings into microseconds on the owner's hardware.
+
 ## 1. Goal and rules
 
 - **Goal:** GTA V (PPSA04263) at PS5 Pro frame rate or better, with no fidelity loss. Fixes must be general; never per-title logic.
@@ -270,3 +288,34 @@ Results on 4-core x86-64 lavapipe:
 - Descriptor update cost on real drivers.
 - On lavapipe the ring path was observed in `agc_driver_recorder` (7 draws) and `agc_draw_descriptors` (1 draw), using a temporary probe that was not committed. The selected execution tests' draws use non-dynamic templates.
 - The first `[revalidate-split]` sample on lavapipe (`agc_revalidate_split`) showed no collect epoch and a pre-pass of about 0.8 ms over one range. A toy case, not representative.
+
+## 11. Windows hot-path audit (static sites times calls per draw)
+
+**Method** (`reports/bench/windows_audit.py`):
+- Compile every libSceAgcDriver source with MinGW GCC 13 at -O3. 6 shim sources with Windows SEH assembler stubs and the Linux-only libc and libkernel files fail; none is on the draw path.
+- Count per function the calls to `__emutls_get_address` (thread_local), winpthreads rwlock and mutex calls, FLS/TLS slot calls and lock-prefixed atomics.
+- Count calls per draw of the same functions (same mangled names) with uprobes on the Linux build, over the draw execution tests (64 draws).
+
+The raw table is `reports/windows-audit-raw.md`. Its totals are an upper bound: they count call sites, and most sites sit in profiling, tracing or failure branches. The top entries were checked by hand.
+
+**Real on the default path:**
+
+| Site | Per draw | Cost |
+|---|---|---|
+| `PerformanceTimer` constructor (`Execution/include/PerformanceTimer.hpp`) | at least 22 (more where inlined) | `PerformanceContext::Current()`, a thread_local read |
+| `DrawPipeline::Busy()` (`DrawPipeline.cpp`) | about 21 | reads thread_local `finisherProducer` whenever the pipeline is idle |
+| `Driver::flushBetweenPackets` (`PacketFlush.cpp`) | about 19, once per packet | thread_local `lastReapTry`, plus `deferredLabels()` through `HostThreadLocal` (FLS) |
+| `std::_Sp_counted_base::_M_release` | 36 | shared_ptr releases, each one or two atomic RMW |
+| `ShaderRecompiler` `materializeResult` and `getSource` | about 0.5 each | std::shared_mutex (winpthreads rwlock) sites; whether these run on the committer is not established |
+
+**Fixes that keep behaviour identical** (not done; each is small and testable):
+- **`DrawPipeline::Busy()`:** test `DrawFinisher::Busy() && DrawFinisher::Overlap()` before `finisherProducer`. These are pure reads, so the result is the same.
+- **`PerformanceContext::Current()`:** gate it on a global count of live contexts, so that with no frame timing anywhere it returns nullptr without touching thread_local.
+- **`flushBetweenPackets`:** read `lastReapTry` only when `reapDue`.
+
+Under Wine, emutls costs 18.9 ns against 2.2 ns natively, so about 62 thread_local reads per draw would be about 1.2 us of a 30 us draw. The owner's calibration run (section 0.1) gives the real Windows cost.
+
+**Not on GTA's recorded path:** `vkGetDeviceProcAddr` runs about 14 times per draw in the tests, all from `CommandBatch` and `RenderTarget`, which the synchronous test readbacks use; recorded draws open batches through `Recorder`. The `[vk]` profile line counts GTA's real lookups.
+
+**Upper bound from the raw table:** 1,220 emutls, 2,717 mutex, 7.6 rwlock and 6,770 atomic sites times calls per draw, mostly branches that do not run (for example `PerformanceTimer::Finish` returns before its frame and trace paths when neither is active).
+
