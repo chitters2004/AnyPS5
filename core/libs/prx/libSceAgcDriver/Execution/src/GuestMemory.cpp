@@ -2847,6 +2847,41 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
     return true;
 }
 
+bool StampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped) {
+    stamped.clear();
+    if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || !tracker.covers(address, bytes)) return false;
+    const auto end = address + bytes;
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) {
+        const auto begin = std::max(address, tracker.blockBegin(block));
+        const auto stop = std::min<std::uint64_t>(end, tracker.blockBegin(block) + WriteBlockBytes);
+        if (tracker.newestStamp(begin, stop) <= generation && !tracker.refusedSince(begin, stop, generation)) continue;
+        if (!stamped.empty() && stamped.back().second == begin) stamped.back().second = stop;
+        else stamped.emplace_back(begin, stop);
+    }
+    return true;
+}
+
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation, std::size_t* compared) {
+    if (compared != nullptr) *compared = 0;
+    if (bytes.empty()) return true;
+    FlushGpuWrites(address, bytes.size());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stamped;
+    if (!StampedSince(address, bytes.size(), generation, stamped)) {
+        if (compared != nullptr) *compared = bytes.size();
+        return EqualsCommittedUnsynced(address, bytes);
+    }
+    for (const auto& [begin, end] : stamped) {
+        const auto length = static_cast<std::size_t>(end - begin);
+        if (compared != nullptr) *compared += length;
+        if (!EqualsCommittedUnsynced(begin, bytes.subspan(static_cast<std::size_t>(begin - address), length))) return false;
+    }
+    return true;
+}
+
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;

@@ -37,6 +37,8 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+bool StampedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& stamped);
+bool EqualsCommittedSince(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t generation, std::size_t* compared = nullptr);
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address

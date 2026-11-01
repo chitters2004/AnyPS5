@@ -981,9 +981,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
                 if (it->bytes.empty()) return false;
-                if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
+                const bool pending = Recorder::SnapshotWriteOverlaps(address, bytes);
+                if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                if (pending || snapshotGeneration == 0 || it->committed != committed) return GuestMemory::EqualsCommitted(address, it->bytes);
+                return GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation);
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;

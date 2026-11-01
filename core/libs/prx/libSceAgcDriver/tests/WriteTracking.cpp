@@ -501,6 +501,64 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+void CheckStampedBlockCompare() {
+    constexpr std::size_t Bytes = 32 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    for (std::size_t i = 0; i < Bytes; ++i) memory[i] = static_cast<std::uint8_t>(i * 7 + 3);
+    std::vector<std::byte> snapshot(Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
+    const auto taken = CollectWritesUncached(base, Bytes);
+    Require(taken != 0, "the stamped compare texture was not collected");
+    std::size_t compared = 0;
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) && compared == 0, "an unstamped tracked texture compared bytes");
+
+    constexpr std::size_t Stamped = 7 * Block + 0x1234;
+    static_cast<volatile std::uint8_t*>(memory)[Stamped] = memory[Stamped];
+    const auto same = CollectWritesUncached(base, Bytes);
+    Require(same > taken && !UnchangedSince(base, Bytes, taken), "the rewritten block was not stamped");
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) == EqualsCommitted(base, snapshot), "the stamped compare disagrees with a full compare over a rewrite of the same bytes");
+    Require(compared == Block, "a rewrite of one block did not compare exactly that block");
+    Require(EqualsCommittedSince(base, snapshot, taken), "a rewrite of the same bytes reads as a change");
+
+    static_cast<volatile std::uint8_t*>(memory)[Stamped] = static_cast<std::uint8_t>(memory[Stamped] ^ 0x5a);
+    CollectWritesUncached(base, Bytes);
+    Require(EqualsCommittedSince(base, snapshot, taken, &compared) == EqualsCommitted(base, snapshot), "the stamped compare disagrees with a full compare over a changed block");
+    Require(compared == Block, "a store into one block did not compare exactly that block");
+    Require(!EqualsCommittedSince(base, snapshot, taken), "a store into a stamped block was missed");
+
+    const auto inner = base + 0x900;
+    const auto innerBytes = Bytes - 0x1100;
+    const auto innerSnapshot = std::span<const std::byte>(snapshot).subspan(0x900, innerBytes);
+    Require(EqualsCommittedSince(inner, innerSnapshot, taken, &compared) == EqualsCommitted(inner, innerSnapshot) && compared == Block, "an unaligned surface over the stamped block disagrees with a full compare");
+    Require(!EqualsCommittedSince(base, snapshot, 0, &compared) && compared == Bytes, "a texture without a generation skipped bytes");
+
+    const auto current = CollectWritesUncached(base, Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
+    Require(EqualsCommittedSince(base, snapshot, current, &compared) && compared == 0, "a texture current at its generation compared bytes");
+}
+
+void CheckUntrackedStoreCompared() {
+    constexpr std::size_t Bytes = 4 * Block;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x3c, Bytes);
+    std::vector<std::byte> snapshot(Bytes);
+    std::memcpy(snapshot.data(), memory, Bytes);
+    const auto taken = CollectWritesUncached(base, Bytes);
+    Require(taken != 0, "the untracked compare fixture was not collected");
+    const auto host = base + 2 * Block;
+    Unwatch(host, Block);
+    Require(!Watched(host, Block), "the untracked range is still watched");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stamped;
+    Require(!StampedSince(base, Bytes, taken, stamped), "a texture over an untracked range uses block stamps");
+    static_cast<volatile std::uint8_t*>(memory)[2 * Block + 0x40] = 0x99;
+    std::size_t compared = 0;
+    Require(!EqualsCommittedSince(base, snapshot, taken, &compared), "a store into an untracked range was missed");
+    Require(compared == Bytes, "a texture over an untracked range did not compare in full");
+    Require(!EqualsCommittedSince(host, std::span<const std::byte>(snapshot).subspan(2 * Block, Block), taken, &compared) && compared == Block, "a store into an untracked texture was missed");
+}
+
 void CheckNewestStamp() {
     void* memory = AllocateWatched(4 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -2178,6 +2236,8 @@ int main() {
         CheckRepeatedPossibleStores();
         CheckOwnStore();
         CheckUnwatch();
+        CheckStampedBlockCompare();
+        CheckUntrackedStoreCompared();
         CheckNewestStamp();
         CheckPartlyWatchedStore();
 #ifndef _WIN32
