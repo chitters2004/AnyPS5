@@ -48,14 +48,24 @@ perf(agc): bind draw shader data through dynamic offsets into the upload ring.
 - **Validation.** On lavapipe all 23 focused tests pass with the validation layer, and the VUID set is identical to main. A temporary, uncommitted probe confirmed that real-device draws took the ring path: 7 in agc_driver_recorder and 1 in agc_draw_descriptors. The execution tests' draws used non-dynamic templates.
 - **Limit.** The ring path applies only when no read-only guest buffer is snapshotted for the draw. The profile line's ring/rewritten split on GTA decides whether the next step below is needed.
 
+## Commits 4 to 6: follow-ups to the ring
+
+The key finding: ShaderRecompiler::RuntimeAbi::ShaderData is a fixed 16,064 bytes per stage. Only about 640 of those bytes (userData and bufferOffsets) normally change between draws; the rest is image and sampler metadata. Main already copies the whole 16 KiB of each changed binding into DrawUpload on every draw, about 32 KiB a draw for two stages.
+
+4. `f8eedb639` perf(agc): copy only changed shader data into the draw ring. Commit 3 copied every dynamic binding on every draw, where main copied only the changed ones, so it was a likely regression. The compare from main is back. Unchanged bindings stay on the template's own buffer at dynamic offset 0. A template keeps up to four ring sets, keyed by (chunk, mask of the bindings taken from the ring). A draw with no changes binds the template's own set. The test fails on commit 3's code.
+5. `d2b0314fb` perf(agc): raise the draw upload chunk to 16 MiB. At 16 to 32 KiB a draw, a 1 MiB chunk filled every 32 to 64 draws. Each fill took a new buffer and made every template write a new ring set. The test (200 full draws, at most one new ring set) fails at 1 MiB. Cost: one live 16 MiB chunk per recorder.
+6. `4ae6f4bc8` perf(agc): keep a ring draw's set and chunk once per batch. Offsets are now a fixed array (no per-draw vectors), and Recorder::KeptOnce keeps the ring set and the chunk once per batch instead of keeping a bindings object per draw. The test checks that the per-draw object is not kept and the ring set is; it fails with the per-draw keep.
+
+Validation after commit 6: 23 of 23 focused tests pass on lavapipe with the validation layer, the VUID set is identical to main, and APS5_VERIFY_SET_LAYOUTS=1 passes.
+
 ## Further options, ranked
 
-1. **Revalidate (lookup is 34.8 of 68 us; 9.6% busy, always revalidateFull).** This is the largest remaining item. Epoch proofs are reused only while the global collect epoch, proof serial and pending serial all stay unchanged, and a busy frame moves them constantly. A per-template proof keyed on the write generations of the template's own ranges would make the proof O(ranges) compares instead of repeating cachedTexture lookups. First collect the [rescache] revalidate FastFail reasons on GTA.
-2. **Guest buffer snapshots into the same ring.** Small read-only guest snapshots (up to DrawUploadLimit, 4 KiB) already come from DrawUpload. Making those bindings dynamic as well would let draws with snapshots take the ring path. Do this only if the new counter shows that rewritten sets dominate.
-3. **ShaderResources constructor (23.8%) with 98.6% draw template hits.** This is probably dispatch builds. Measure the draw/dispatch split before acting.
-4. **Register draw cache (15% entries).** The key includes user-data words. Check the [draw-cache] data-only hit count; widening data hits would cut decode work, not the committer's lookup.
-5. **Descriptor heap / descriptor buffer (upstream #9508).** It supersedes sets entirely and would subsume commits 2 and 3 if it lands.
-6. **Push descriptors.** Not better: they rewrite every descriptor per draw (what commit 2 removes) and cap at maxPushDescriptors.
+1. **Shrink the per-draw constants copy (needs a recompiler change).** Moving userData and bufferOffsets out of the 16 KiB ShaderData, into push constants or their own small binding, would cut the per-draw copy from about 32 KiB to under 1 KiB. Costs: it invalidates every shader cache (a one-time recompile for all players, and main/change timings can't share a warm cache), and it changes every title's shaders, so it needs broad testing. Decide after timing commits 1 to 6 and measuring the time spent copying constants on GTA.
+2. **Revalidate (lookup is 34.8 of 68 us; 9.6% busy, always revalidateFull).** This is a separate lookup step, not part of the constants path. Epoch proofs are reused only while the global collect epoch, proof serial and pending serial all stay unchanged. A per-template proof keyed on its own ranges' write generations would be O(ranges) compares. First collect the [rescache] revalidate FastFail reasons.
+3. **Guest buffer snapshots into the same ring.** Do this only if the [rescache] counter shows that rewritten sets dominate.
+4. **ShaderResources constructor (23.8%) with 98.6% draw template hits.** This is probably dispatch builds. Measure the split first.
+5. **Descriptor heap / descriptor buffer (upstream #9508).** It supersedes sets and would subsume commits 2 to 6.
+6. **Push descriptors.** Not better: they rewrite every descriptor per draw and cap at maxPushDescriptors.
 
 ## What the owner should measure on GTA
 
