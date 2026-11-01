@@ -2807,6 +2807,15 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+std::size_t Recorder::DrawUploadChunkBytes() {
+    static const std::size_t bytes = [] {
+        const char* text = std::getenv("APS5_DRAW_UPLOAD_CHUNK_MIB");
+        const auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return mib != 0 && mib <= 1024 ? static_cast<std::size_t>(mib) << 20u : DrawUploadChunk;
+    }();
+    return bytes;
+}
+
 bool Recorder::KeptOnce(const void* owner) {
     ensureOpen();
     return owner != nullptr && open->keptOnce.insert(owner).second;
@@ -2816,7 +2825,7 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunkBytes(), bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         offset = 0;
     }
     drawUploadUsed = offset + bytes;

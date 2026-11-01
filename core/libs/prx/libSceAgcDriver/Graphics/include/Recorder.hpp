@@ -113,6 +113,7 @@ public:
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
     static constexpr std::size_t DrawUploadChunk = std::size_t{16} << 20u;
+    static std::size_t DrawUploadChunkBytes();
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
         VkDeviceSize offset = 0;

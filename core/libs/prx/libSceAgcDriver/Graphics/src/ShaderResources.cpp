@@ -2066,6 +2066,16 @@ bool DynamicDrawData() {
     return enabled;
 }
 
+bool DrawSetReuse() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_SET_REUSE") == nullptr;
+    return enabled;
+}
+
+bool PendingWriteGate() {
+    static const bool enabled = std::getenv("APS5_NO_PENDING_WRITE_GATE") == nullptr;
+    return enabled;
+}
+
 bool BufferDescriptor(VkDescriptorType type) {
     return type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;
 }
@@ -3777,9 +3787,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         ++pendingChecks;
         CompletePendingCpuWrites(context, address, bytes);
     };
-    bool pendingCpu = AnyPendingCpuWrites(context);
+    bool pendingCpu = !PendingWriteGate() || AnyPendingCpuWrites(context);
     for (const auto& region : directRegions) {
-        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) pendingCpu = AnyPendingCpuWrites(context);
+        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) pendingCpu = !PendingWriteGate() || AnyPendingCpuWrites(context);
         if (pendingCpu) completePending(region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
     for (const auto& range : describedRanges) {
@@ -5857,7 +5867,7 @@ ShaderResources::WrittenSets::~WrittenSets() {
 
 ShaderResources::DrawBindings::~DrawBindings() {
     if (cache == nullptr) return;
-    if (owner != nullptr && owner->Give(cache, layout, fragmentLayout, {allocation, fragmentAllocation})) return;
+    if (owner != nullptr && DrawSetReuse() && owner->Give(cache, layout, fragmentLayout, {allocation, fragmentAllocation})) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
         if (setLayout != VK_NULL_HANDLE) cache->Recycle(setLayout, set);
@@ -6129,7 +6139,7 @@ void ShaderResources::allocateDrawSets(DrawBindings& result) const {
     result.owner = writtenSets;
     const bool mainSet = described[0] || splitSets;
     const bool fragmentSet = described[1] || splitSets;
-    if (auto written = writtenSets->Take()) {
+    if (auto written = DrawSetReuse() ? writtenSets->Take() : std::nullopt) {
         result.allocation = written->allocation;
         result.fragmentAllocation = written->fragmentAllocation;
         if (mainSet) result.layout = _layout;

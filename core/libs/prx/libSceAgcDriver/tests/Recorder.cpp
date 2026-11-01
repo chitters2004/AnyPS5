@@ -5246,7 +5246,7 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         const auto first = snapshotRecorder.DrawUpload(16);
         const auto second = snapshotRecorder.DrawUpload(16);
         Require(second.buffer == first.buffer && second.offset >= first.offset + 16 && second.offset % alignment == 0, "upload slices overlap or are not aligned");
-        const auto whole = snapshotRecorder.DrawUpload(Recorder::DrawUploadChunk);
+        const auto whole = snapshotRecorder.DrawUpload(Recorder::DrawUploadChunkBytes());
         Require(whole.buffer != second.buffer && whole.offset == 0, "a full upload chunk was not replaced");
         snapshotRecorder.Sync();
     }
@@ -12674,7 +12674,8 @@ int main(int argc, char** argv) {
             Require(sparseRunImportTests(device, false), "the sparse run import tests failed");
             const Split idle = AgcDriver::Graphics::ShaderResources::RevalidateSplitCounts();
             Require(idle.walks > quiet.walks && idle.ranges > quiet.ranges, "the sparse run import tests made no full revalidation");
-            Require(idle.pendingChecks == quiet.pendingChecks, "a revalidation with no CPU writes pending checked its ranges for them");
+            if (std::getenv("APS5_NO_PENDING_WRITE_GATE") == nullptr) Require(idle.pendingChecks == quiet.pendingChecks, "a revalidation with no CPU writes pending checked its ranges for them");
+            else Require(idle.pendingChecks > quiet.pendingChecks, "APS5_NO_PENDING_WRITE_GATE did not check every range for pending CPU writes");
             std::cout << "Revalidate split counters passed\n";
             return 0;
         }

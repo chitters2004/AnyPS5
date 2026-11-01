@@ -6519,6 +6519,7 @@ void writtenSetReuseTests() {
     using AgcDriver::Graphics::DescriptorCache;
     using AgcDriver::Graphics::Recorder;
     using AgcDriver::Graphics::ShaderResources;
+    const bool reuse = std::getenv("APS5_NO_DRAW_SET_REUSE") == nullptr;
     mock = MockVulkan{};
     mock.allowCopies = true;
     auto context = mockContext();
@@ -6554,6 +6555,11 @@ void writtenSetReuseTests() {
             recorder.Sync();
             recorder.FlushDeferredReleases();
             const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            if (!reuse) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                Require(from.IdleDrawSets() == 0, "APS5_NO_DRAW_SET_REUSE kept a finished draw's sets for its template");
+                return;
+            }
             while (from.IdleDrawSets() < idle && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             Require(from.IdleDrawSets() == idle, "a finished template draw did not return its descriptor sets to the template");
         };
@@ -6582,18 +6588,26 @@ void writtenSetReuseTests() {
         first.reset();
         settle(resources, 1);
         auto second = draw(resources, 1, 0x22222222u);
-        Require(second->allocation.set == firstSet && second->fragmentAllocation.set == firstFragment, "a template draw did not reuse the set an earlier draw of it finished with");
-        Require(samplerWrites() == 0 && mock.writes.size() == 2, "a reused draw descriptor set rewrote more than its buffer descriptors");
-        auto overlapping = draw(resources, 0, 0x33333333u);
-        Require(overlapping->allocation.set != firstSet && samplerWrites() == 1, "a set still in use was handed to another draw, or a fresh set lacked the sampler");
-        second.reset();
-        overlapping.reset();
-        settle(resources, 2);
-        auto foreign = draw(other, 1, 0x44444444u);
-        Require(foreign->allocation.set != firstSet && samplerWrites() == 1, "another template got a set holding this template's descriptors");
-        foreign.reset();
-        settle(other, 1);
-        Require(resources.IdleDrawSets() == 2, "another template's draw changed this template's idle sets");
+        if (!reuse) {
+            Require(samplerWrites() == 1, "APS5_NO_DRAW_SET_REUSE wrote a draw set without the template's sampler");
+            second.reset();
+            recorder.Sync();
+            recorder.FlushDeferredReleases();
+        }
+        if (reuse) {
+            Require(second->allocation.set == firstSet && second->fragmentAllocation.set == firstFragment, "a template draw did not reuse the set an earlier draw of it finished with");
+            Require(samplerWrites() == 0 && mock.writes.size() == 2, "a reused draw descriptor set rewrote more than its buffer descriptors");
+            auto overlapping = draw(resources, 0, 0x33333333u);
+            Require(overlapping->allocation.set != firstSet && samplerWrites() == 1, "a set still in use was handed to another draw, or a fresh set lacked the sampler");
+            second.reset();
+            overlapping.reset();
+            settle(resources, 2);
+            auto foreign = draw(other, 1, 0x44444444u);
+            Require(foreign->allocation.set != firstSet && samplerWrites() == 1, "another template got a set holding this template's descriptors");
+            foreign.reset();
+            settle(other, 1);
+            Require(resources.IdleDrawSets() == 2, "another template's draw changed this template's idle sets");
+        }
     }
     Require(mock.live == 0, "reused draw descriptor sets leaked Vulkan objects");
 }
@@ -6689,7 +6703,8 @@ void dynamicDrawDataTests() {
         partialAgain.first.reset();
         const auto setsBefore = ShaderResources::DrawBindingPathCounts().ringSets;
         for (std::uint32_t round = 0; round < 200; ++round) static_cast<void>(draw(0x1000u + round));
-        Require(ShaderResources::DrawBindingPathCounts().ringSets - setsBefore <= 1u, "200 draws of one template's full shader data needed more than one upload chunk");
+        if (Recorder::DrawUploadChunkBytes() == Recorder::DrawUploadChunk) Require(ShaderResources::DrawBindingPathCounts().ringSets - setsBefore <= 1u, "200 draws of one template's full shader data needed more than one upload chunk");
+        else Require(Recorder::DrawUploadChunkBytes() == (std::size_t{1} << 20u) && ShaderResources::DrawBindingPathCounts().ringSets - setsBefore >= 3u, "APS5_DRAW_UPLOAD_CHUNK_MIB=1 did not give 1 MiB upload chunks");
         first.first.reset();
         second.first.reset();
         recorder.Sync();
@@ -12917,6 +12932,13 @@ int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--linear-volume-nonresident") {
             LinearVolumeNonResidentTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-bindings-only") {
+            descriptorSnapshotTests();
+            writtenSetReuseTests();
+            dynamicDrawDataTests();
+            std::puts("Draw binding tests passed");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {
