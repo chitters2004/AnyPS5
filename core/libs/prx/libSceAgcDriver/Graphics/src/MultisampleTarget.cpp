@@ -918,6 +918,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
     const auto bytes = guardedColorBytes(target);
     stampUse(*use, target.address, bytes);
     std::unique_lock lock(guardedMutex());
+    guardGrowth().fetch_add(1, std::memory_order_release);
     guarded().push_back({context.device, target.address, bytes, target.samples, active, nullptr, use});
     if (target.dccAddress != 0) {
         guarded().push_back({context.device, target.dccAddress, MultisampledDccBytes(target), target.samples, active, metadataValid, use});
@@ -925,7 +926,6 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
         if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) guarded().push_back({context.device, target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes, target.samples, active, metadataValid, use});
     }
     guardedGeneration().fetch_add(1, std::memory_order_release);
-    guardGrowth().fetch_add(1, std::memory_order_release);
     anyGuarded().store(true, std::memory_order_release);
     InstallResidentImageReadGuard_nid_no_patch();
 }
@@ -1539,8 +1539,8 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     std::unique_lock lock(guardedMutex());
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
     if (!known) {
-        guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
         guardGrowth().fetch_add(1, std::memory_order_release);
+        guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
     }
     anyGuarded().store(true, std::memory_order_release);
     lock.unlock();
