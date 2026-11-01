@@ -801,6 +801,35 @@ struct DrawProfile {
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
 
+struct LookupSplit {
+    std::atomic<std::uint64_t> lookups{0};
+    std::atomic<std::uint64_t> hits{0};
+    std::array<std::atomic<std::uint64_t>, 5> nanoseconds{};
+};
+
+constexpr std::array<const char*, 5> LookupSplitNames{"key", "find", "revalidate", "moved buffers", "alias checks"};
+
+LookupSplit& LookupSplits() {
+    static LookupSplit split;
+    return split;
+}
+
+bool LookupSplitProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+struct LookupClock {
+    bool on = LookupSplitProfiled();
+    std::chrono::steady_clock::time_point last = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    void mark(std::size_t step) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        LookupSplits().nanoseconds[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()), std::memory_order_relaxed);
+        last = now;
+    }
+};
+
 DrawProfile& Profile() {
     static DrawProfile profile;
     return profile;
@@ -915,6 +944,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    {
+        auto& split = LookupSplits();
+        const auto lookups = split.lookups.exchange(0, std::memory_order_relaxed);
+        std::string steps;
+        for (std::size_t step = 0; step < LookupSplitNames.size(); ++step) {
+            char text[64];
+            std::snprintf(text, sizeof(text), " %s %.2f", LookupSplitNames[step], lookups != 0 ? static_cast<double>(split.nanoseconds[step].exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(lookups) : 0.0);
+            steps += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[lookup-split] (10 s): %llu draw resource lookups, %llu hits; us per lookup:%s\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(split.hits.exchange(0, std::memory_order_relaxed)), steps.c_str());
+    }
     const auto paths = ShaderResources::DrawBindingPathCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line); draw bindings (cumulative): %llu ring with dynamic offsets (%llu ring sets written), %llu rewritten sets\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses), static_cast<unsigned long long>(paths.ring), static_cast<unsigned long long>(paths.ringSets), static_cast<unsigned long long>(paths.rewritten));
     profile.totalsUs.fill(0);
@@ -1869,14 +1909,23 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
     if (resolved.cacheable) {
+        LookupClock clock;
+        if (clock.on) LookupSplits().lookups.fetch_add(1, std::memory_order_relaxed);
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        clock.mark(0);
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        clock.mark(1);
+        if (cached != nullptr) {
             const bool valid = cached->Revalidate(shaders);
+            clock.mark(2);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+            clock.mark(3);
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                clock.mark(4);
+                if (clock.on) LookupSplits().hits.fetch_add(1, std::memory_order_relaxed);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;

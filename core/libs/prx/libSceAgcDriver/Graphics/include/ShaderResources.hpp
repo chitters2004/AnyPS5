@@ -265,6 +265,21 @@ public:
         std::uint64_t ringSets = 0;
     };
     static DrawBindingPaths DrawBindingPathCounts();
+    struct RevalidateSplit {
+        std::uint64_t reused = 0;
+        std::uint64_t proved = 0;
+        std::uint64_t noEpoch = 0;
+        std::uint64_t firstProof = 0;
+        std::uint64_t epochMoved = 0;
+        std::uint64_t proofMoved = 0;
+        std::uint64_t pendingMoved = 0;
+        std::uint64_t walks = 0;
+        std::uint64_t ranges = 0;
+        std::uint64_t images = 0;
+        std::uint64_t storageImages = 0;
+        std::array<std::uint64_t, 4> nanoseconds{};
+    };
+    static RevalidateSplit RevalidateSplitCounts();
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);

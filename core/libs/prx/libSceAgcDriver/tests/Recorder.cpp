@@ -12658,6 +12658,20 @@ int main(int argc, char** argv) {
             fmaskDecompressMsaaTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--revalidate-split-only") {
+            using Split = AgcDriver::Graphics::ShaderResources::RevalidateSplit;
+            const Split before = AgcDriver::Graphics::ShaderResources::RevalidateSplitCounts();
+            copiedDirectOrderingTests(device, recorder);
+            const Split after = AgcDriver::Graphics::ShaderResources::RevalidateSplitCounts();
+            const auto delta = [&](std::uint64_t Split::*field) { return after.*field - before.*field; };
+            Require(delta(&Split::reused) + delta(&Split::proved) >= 3, "the revalidate split did not count the epoch proofs");
+            Require(delta(&Split::proved) - delta(&Split::noEpoch) - delta(&Split::firstProof) <= delta(&Split::epochMoved) + delta(&Split::proofMoved) + delta(&Split::pendingMoved), "a proof that was not reused named no serial that moved");
+            std::uint64_t nanoseconds = 0;
+            for (std::size_t phase = 0; phase < after.nanoseconds.size(); ++phase) nanoseconds += after.nanoseconds[phase] - before.nanoseconds[phase];
+            Require(delta(&Split::walks) >= delta(&Split::proved) && delta(&Split::walks) != 0 && delta(&Split::ranges) != 0 && nanoseconds != 0, "full revalidations were not timed by phase");
+            std::cout << "Revalidate split counters passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             drawSnapshotTableSetTests(device, recorder);

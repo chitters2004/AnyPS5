@@ -3651,12 +3651,95 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+namespace {
+
+struct ProofSplit {
+    std::atomic<std::uint64_t> reused{0}, proved{0}, noEpoch{0}, firstProof{0}, epochMoved{0}, proofMoved{0}, pendingMoved{0};
+    std::atomic<std::uint64_t> walks{0}, ranges{0}, images{0}, storageImages{0};
+    std::array<std::atomic<std::uint64_t>, 4> nanoseconds{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+ProofSplit& ProofSplits() {
+    static ProofSplit split;
+    return split;
+}
+
+bool ProofSplitProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void reportProofSplit() {
+    auto& split = ProofSplits();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = split.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !split.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto counts = ShaderResources::RevalidateSplitCounts();
+    const auto walks = static_cast<double>(std::max<std::uint64_t>(counts.walks, 1));
+    AgcDriver::ProfilePrint_nid_no_patch("[revalidate-split] (cumulative): %llu epoch proofs reused, %llu proved (no epoch %llu, first proof %llu; moved since the object's proof: collect epoch %llu, proof serial %llu, pending serial %llu); %llu full revalidations, per call: pre-pass %.2f us over %.1f ranges, images %.2f us (%.1f textures, %.1f storage images), imports %.2f us, rest %.2f us\n", static_cast<unsigned long long>(counts.reused), static_cast<unsigned long long>(counts.proved), static_cast<unsigned long long>(counts.noEpoch), static_cast<unsigned long long>(counts.firstProof), static_cast<unsigned long long>(counts.epochMoved), static_cast<unsigned long long>(counts.proofMoved), static_cast<unsigned long long>(counts.pendingMoved), static_cast<unsigned long long>(counts.walks), static_cast<double>(counts.nanoseconds[0]) / 1000.0 / walks, static_cast<double>(counts.ranges) / walks, static_cast<double>(counts.nanoseconds[1]) / 1000.0 / walks, static_cast<double>(counts.images) / walks, static_cast<double>(counts.storageImages) / walks, static_cast<double>(counts.nanoseconds[2]) / 1000.0 / walks, static_cast<double>(counts.nanoseconds[3]) / 1000.0 / walks);
+}
+
+void noteProofPhases(std::chrono::steady_clock::time_point start, std::span<const std::chrono::steady_clock::time_point, 3> marks, std::size_t ranges, std::size_t images, std::size_t storageImages) {
+    auto& split = ProofSplits();
+    const auto end = std::chrono::steady_clock::now();
+    auto previous = start;
+    for (std::size_t phase = 0; phase < marks.size(); ++phase) {
+        const auto reached = marks[phase] != std::chrono::steady_clock::time_point{} ? marks[phase] : end;
+        split.nanoseconds[phase].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(reached - previous).count()), std::memory_order_relaxed);
+        previous = reached;
+    }
+    split.nanoseconds[3].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - previous).count()), std::memory_order_relaxed);
+    split.walks.fetch_add(1, std::memory_order_relaxed);
+    split.ranges.fetch_add(ranges, std::memory_order_relaxed);
+    split.images.fetch_add(images, std::memory_order_relaxed);
+    split.storageImages.fetch_add(storageImages, std::memory_order_relaxed);
+    reportProofSplit();
+}
+
+}
+
+ShaderResources::RevalidateSplit ShaderResources::RevalidateSplitCounts() {
+    auto& split = ProofSplits();
+    RevalidateSplit counts;
+    counts.reused = split.reused.load(std::memory_order_relaxed);
+    counts.proved = split.proved.load(std::memory_order_relaxed);
+    counts.noEpoch = split.noEpoch.load(std::memory_order_relaxed);
+    counts.firstProof = split.firstProof.load(std::memory_order_relaxed);
+    counts.epochMoved = split.epochMoved.load(std::memory_order_relaxed);
+    counts.proofMoved = split.proofMoved.load(std::memory_order_relaxed);
+    counts.pendingMoved = split.pendingMoved.load(std::memory_order_relaxed);
+    counts.walks = split.walks.load(std::memory_order_relaxed);
+    counts.ranges = split.ranges.load(std::memory_order_relaxed);
+    counts.images = split.images.load(std::memory_order_relaxed);
+    counts.storageImages = split.storageImages.load(std::memory_order_relaxed);
+    for (std::size_t phase = 0; phase < counts.nanoseconds.size(); ++phase) counts.nanoseconds[phase] = split.nanoseconds[phase].load(std::memory_order_relaxed);
+    return counts;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+        const bool reuse = epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending;
+        if (ProofSplitProfiled()) {
+            auto& split = ProofSplits();
+            if (reuse) {
+                split.reused.fetch_add(1, std::memory_order_relaxed);
+                reportProofSplit();
+            } else {
+                split.proved.fetch_add(1, std::memory_order_relaxed);
+                if (epoch == 0) split.noEpoch.fetch_add(1, std::memory_order_relaxed);
+                else if (provedEpoch == 0) split.firstProof.fetch_add(1, std::memory_order_relaxed);
+                else {
+                    if (provedEpoch != epoch) split.epochMoved.fetch_add(1, std::memory_order_relaxed);
+                    if (provedProof != proof) split.proofMoved.fetch_add(1, std::memory_order_relaxed);
+                    if (provedPending != pending) split.pendingMoved.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+        if (reuse) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
@@ -3700,9 +3783,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    std::array<std::chrono::steady_clock::time_point, 3> phaseMarks{};
+    if (profile) phaseMarks[0] = std::chrono::steady_clock::now();
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (profile) noteProofPhases(start, phaseMarks, directRegions.size() + describedRanges.size() + storageTextures.size(), textures.size(), storageTextures.size());
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
@@ -3867,6 +3953,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    if (profile) phaseMarks[1] = std::chrono::steady_clock::now();
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -3911,6 +3998,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
     }
+    if (profile) phaseMarks[2] = std::chrono::steady_clock::now();
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
