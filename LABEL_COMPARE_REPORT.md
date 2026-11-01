@@ -15,9 +15,11 @@ Commits, oldest first:
 5. `cc8593c56` docs: report update
 6. `d3eadc01c` feat(agc): put a GPU-compared image back in sync when its batch completes
 7. `08811bbd3` feat(agc): compare small block-unit label stores on the GPU and allow images up to 1 MiB
-8. this report update
+8. `43de569b4` docs: report update
+9. `0beed21ce` feat(agc): read pending leases' written-page tables in the label store GPU compare
+10. this report update
 
-Line references below are at commit 7. Paths are under `core/libs/prx/libSceAgcDriver/`.
+Line references below are at commit 7 unless noted; search by function name if they moved. Paths are under `core/libs/prx/libSceAgcDriver/`.
 
 ## Goal and starting point
 
@@ -100,7 +102,19 @@ Watched memory, per block, from its state at the wait (`kept` at unwatch, `unkno
 
 Explicit writers stamp when recorded, so their stamps are in `stampedNow`; a lease's change
 implies its completion stamp; an unstamped block under a lease that already differs, or that an
-explicit writer also changes, cannot attribute a change to the lease, so it falls back.
+explicit writer also changes, cannot attribute a change to the lease from bytes alone.
+
+Since commit 9 that state reads the lease's own record instead (`OnGpuLease`): when every lease
+over the image is in the open batch with a written-page table and the block is a whole 64 KiB
+tracker block, the GPU keeps it iff a lease stored in its pages and its bytes changed, which is
+`stampedAfter && changedAfter` exactly. Otherwise it still falls back (edge blocks, untabled
+leases, leases in batches in flight).
+
+Without a baseline `unchangedSinceBaseline` is always false, so the decision after the wait is the
+stamp alone: a stamped block left to the GPU is kept on the CPU, and a lease-mode block has its
+"changed" flag preset. Without the lease tables this case mostly could not run at all: the
+fallback states are, in practice, images whose bytes were not settled when their baseline was
+captured, so they have no baseline.
 
 Compared memory (`ClassifyCompared`): kept at unwatch → keep; no writer or lease → keep iff
 changed now; otherwise GPU against `original`. No stamps, so no fallback. Needs a complete
@@ -143,6 +157,15 @@ Opt-in: `APS5_LABEL_GPU_COMPARE=1`.
   become `original`. Otherwise it stays stale and the save is cancelled.
 - Eligible: one tracked unit, at most 1 MiB, whole words, host import over the image; small block
   units included.
+- Lease tables (commit 9): `ShaderResources::MarkGpuWrites` registers each lease's fault buffer
+  with its read ranges (`Recorder::NoteLeaseTable`; a lease without fault checks marks the batch
+  `untabledLease`). `Recorder::OpenLeaseTables` returns the tables over the image only when every
+  lease there is in the open batch (a reap clears a table at completion, so an in-flight lease's
+  table may be gone before the compare runs) and no table is shared with a batch in flight.
+  `recordConditionalStores` copies each table (overflow word to the end of the list) into its
+  staging buffer behind a barrier from every earlier command; pass 0 (invocation 0) looks up the
+  block's chunk key and 16-page mask; an overflowed or invalid table counts as stored. Flags are
+  three words per range: changed, lease stored, decision.
 
 ## Safety, condition by condition
 
@@ -155,10 +178,11 @@ Opt-in: `APS5_LABEL_GPU_COMPARE=1`.
 | Import lifetime | Same import, offset and lifetime as today's copy | code only |
 | Conservative generation bookkeeping | Stale when recorded; back in sync at completion only if fully stored and untouched since | driver: baseline-bytes writer → in sync; changing writer → stale; never settling, and settling when kept, each fail in both modes. Not tested: the ticket and generation guards against a write-back or upload in between |
 | Fallback intact | Every refusal waits; switch off by default | `--label-gpu-compare` fails with the switch off |
+| Lease-table decisions | Table = the stamps the lease will make; only open-batch leases, so no reap clears a table first | `agc_label_compare` 810 outcomes, 0 mismatches; `agc_conditional_store` seven table cases; driver: fill, image and lease (inside or outside the image) run waiting and on the GPU give identical bytes with no wait; treating every lease as stored, or falling back, each fail |
 
 Driver-level negative controls run and seen failing: compare off; GPU blocks stored
 unconditionally; leases ignored; pending compared blocks stored; never settling; settling when a
-range was kept; block units refused; tiled pieces copied unconditionally. One control did not
+range was kept; block units refused; tiled pieces copied unconditionally. Since commit 9 also: lease mode falling back; every lease counted as stored. One control did not
 fail: keeping the `compareUntracked` call; its flush hook did not sync here, so skipping it is
 defensive.
 
@@ -173,7 +197,7 @@ completion stores or labels, listed copied writers, watched fallback blocks, a m
 `'agc_driver_(storage_flush_ordering|linear_readback_label|alias_copy_label|storage_write_back_overhang$|storage_write_back_no_window|storage_one_slice_alias|storage_read_during_idle_store|copied_writer_label_order)|agc_label_compare|agc_conditional_store'`:
 
 - `main`: 10/10 passed.
-- Head: 15/15 passed, and 15/15 with `APS5_LABEL_GPU_COMPARE=1` forced on every test.
+- Head (commit 9): 15/15 passed, and 15/15 with `APS5_LABEL_GPU_COMPARE=1` forced on every test.
 - No `was not found but was requested by env var VK_INSTANCE_LAYERS`; the layer loads. Only VUID:
   `VUID-VkDeviceCreateInfo-pNext-pNext` (old layer); per-test counts identical to `main`, plus
   one per new registration.
@@ -184,6 +208,20 @@ New registrations: `agc_label_compare`, `agc_conditional_store`,
 `agc_driver_storage_flush_ordering_gpu_compare_compared` (`unwatch`). The `--label-gpu-compare`
 mode runs a 128 KiB linear image (writer of other bytes, writer of the baseline bytes) and a
 64 KiB S64KB tiled image (both writers).
+
+## Test environment caveat: forced watch on lavapipe
+
+`APS5_WRITE_WATCH_IMPORTS=watch` on lavapipe makes the driver tests use watched memory, but
+lavapipe executes GPU writes as CPU stores, so a GPU write that runs while a flush waits leaves a
+CPU-collected stamp (seen with a temporary diagnostic: `changed 1 cpu 1` on the filled block). That
+violates the premise the import probe checks (watched imports need 0 pages "written after a GPU
+write"), so on a correctly probed GPU it cannot happen. The lease-table test therefore lets its
+GPU fill execute before the classification (submitted and waited, not reaped), so both paths see
+the same stamp. Any new watched-mode test on lavapipe needs the same care.
+
+The validation layer also caught a real bug during commit 9: `vkCmdCopyBuffer` from the fault
+buffer without transfer-source usage (`VUID-vkCmdCopyBuffer-srcBuffer-00118`, while `ctest`
+passed). Fixed in the same commit.
 
 ## The size limit
 
@@ -208,10 +246,9 @@ block-unit plumbing all stay. What 5 replaces is the watched-memory classificati
 fallback states and the `leaseOver` reasoning. On compared memory (Windows by default) there are
 no stamps at all, so 5 changes nothing there.
 
-The useful part of 5 is cheap because the GPU already has the data: each address-based dispatch's
-written-page table is in its fault buffer before completion. Letting pass 0 of the compare also
-read the pending leases' tables for its block would turn "lease overlaps" into "lease stored
-here" on the GPU and remove the fallback. A full GPU-resident generation table stamped by every
+The useful part of 5 was cheap because the GPU already has the data: each address-based dispatch's
+written-page table is in its fault buffer before completion. Commit 9 does this (see the rules
+above); the fallback remains only for edge blocks and leases outside the open batch. A full GPU-resident generation table stamped by every
 GPU writer (fills, copies, draws and dispatches through descriptors, labels) would also let other
 flushes stop waiting, but it means instrumenting every write path, keeping two trackers coherent,
 and it still falls back when a fault table overflows. Do the cheap part when the shadow
@@ -247,7 +284,9 @@ flush waits dominate after this.
 ## Next steps, ranked
 
 1. Measure (above); the refusal histogram decides the rest.
-2. Read pending leases' written-page tables in pass 0 (the cheap part of 5) if `fallback-block` costs time.
+2. If `fallback-block` still costs time, extend lease tables to in-flight leases (pin a table
+   against its completion's clear until the compare's batch completes) and to edge blocks
+   (verify `StoredOver`'s granularity against the 4 KiB page bits).
 3. Block units above 64 KiB (gate the unit-shadow publish the same way) if `units` costs time.
 4. Device-side baseline and in-place scratch reads if `large` costs time.
 5. DCC images with a test if `keys` costs time.
