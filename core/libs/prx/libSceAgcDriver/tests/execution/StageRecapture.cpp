@@ -4,6 +4,7 @@
 #include "Recompiler.hpp"
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
+#include "CompiledVariant.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -168,6 +169,19 @@ void CheckInterfaceKey() {
     Require(full.size() == again.size() + 1u && full[2] == stage.request.shader.code.size() && full[3] == RecompileCacheKey::HashCode(stage.request.shader.code) && std::equal(again.begin() + 2, again.end() - 1, full.begin() + 4), "the cache key is not the interface key with the code hash after the stage");
 }
 
+void CheckSubstituteSlots() {
+    BufferSubstituteTable table(std::vector<BufferSubstitute>(2u));
+    const auto before = table.Slots();
+    table.Learn(1u, {0x11u, 0x22u, 4u, false});
+    const auto after = table.Slots();
+    Require(before->size() == 2u && !(*before)[1].known, "learning a substitute changed the slots an earlier materialization holds");
+    Require((*after)[1].known && (*after)[1].word1 == 0x11u && (*after)[1].word3 == 0x22u && (*after)[1].misalignment == 4u && !(*after)[0].known, "a learned substitute is missing from the slots read after it");
+    table.Learn(1u, {0x33u, 0x44u, 0u, false});
+    Require((*table.Slots())[1].word1 == 0x11u, "a known substitute was learned again");
+    table.Learn(2u, {0x55u, 0x66u, 0u, false});
+    Require(table.Slots()->size() == 2u, "a substitute outside the slots was learned");
+}
+
 struct Spread {
     double median;
     double low;
@@ -229,6 +243,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         CheckInterfaceKey();
+        CheckSubstituteSlots();
         CheckInvocation();
         CheckResultMemo();
         std::cout << "stage recapture tests passed\n";
