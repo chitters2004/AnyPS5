@@ -3044,6 +3044,11 @@ bool OwnImageRefreshEnabled() {
 
 // APS5_VERIFY_PROOFS=1: after every own-object refresh the full walk runs beside the proof and the
 // process aborts when it would return another object or upload again (a different decision).
+bool ChangedRelookEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_CHANGED_RELOOK") != nullptr;
+    return !disabled;
+}
+
 bool VerifyProofs() {
     static const bool enabled = std::getenv("APS5_VERIFY_PROOFS") != nullptr;
     return enabled;
@@ -3193,6 +3198,15 @@ std::array<std::uint64_t, static_cast<std::size_t>(ShaderResources::FastFail::Co
     return result;
 }
 
+std::atomic<std::uint64_t>& relookedLookups() {
+    static std::atomic<std::uint64_t> lookups{0};
+    return lookups;
+}
+
+std::uint64_t ShaderResources::RelookedLookups() {
+    return relookedLookups().load(std::memory_order_relaxed);
+}
+
 std::size_t ShaderResources::LookupLogCapacity() {
     return lookupLog().capacity();
 }
@@ -3212,9 +3226,10 @@ std::size_t ShaderResources::LookupLogCapacity() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
-bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, std::vector<PendingOverlap>& changed) {
     reason = FastFail::Count;
     overlapping.clear();
+    changed.clear();
     accepted = false;
     if (!EpochRevalidate()) return fastRevalidateEach();
     const auto fail = [&reason](FastFail why) {
@@ -3236,7 +3251,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
     thread_local std::vector<DccKeys>* scannedKeysSlot = nullptr;
     auto& scannedKeys = ShaderRecompiler::ThreadOwned(scannedKeysSlot);
+    thread_local std::vector<PendingOverlap>* queryOwnersSlot = nullptr;
+    auto& queryOwners = ShaderRecompiler::ThreadOwned(queryOwnersSlot);
     queries.clear();
+    queryOwners.clear();
     pending.clear();
     owners.clear();
     images.clear();
@@ -3303,6 +3321,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         } else {
             queries.push_back({address, bytes, surface.generation});
         }
+        queryOwners.push_back({i, false, false});
     }
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
@@ -3330,6 +3349,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
         queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
+        queryOwners.push_back({i, true, false});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -3372,7 +3392,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    if (!GuestMemory::UnchangedSinceAll(queries)) {
+        for (std::size_t k = 0; k < queries.size(); ++k) {
+            if (!GuestMemory::UnchangedSince(queries[k].address, queries[k].bytes, queries[k].generation)) changed.push_back(queryOwners[k]);
+        }
+        return fail(FastFail::Changed);
+    }
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
@@ -3538,6 +3563,103 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
         }
     }
     return OwnRefreshFallback::Count;
+}
+
+ShaderResources::RelookOutcome ShaderResources::relookChanged(std::span<const CompiledShader> shaders, std::span<const PendingOverlap> changed) {
+    const auto listed = [&](std::size_t element, bool storage) {
+        return std::any_of(changed.begin(), changed.end(), [&](const PendingOverlap& entry) { return entry.element == element && entry.storage == storage; });
+    };
+    const auto leave = [](RelookOutcome outcome) {
+        lookupLog().clear();
+        return outcome;
+    };
+    if (changed.empty()) return RelookOutcome::Fallback;
+    lookupLog().clear();
+    std::size_t textureIndex = 0;
+    std::size_t storageIndex = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) return leave(RelookOutcome::Fallback);
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
+            if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
+                const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto raw = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
+                    std::array<std::uint32_t, 8> narrowed{};
+                    const auto words = firstLayerWords(raw, binding.imageShape, narrowed, false);
+                    if (IsNullTextureResource(words)) continue;
+                    if (textureIndex >= textures.size()) return leave(RelookOutcome::Fallback);
+                    const auto index = textureIndex++;
+                    if (!listed(index, false)) continue;
+                    relookedLookups().fetch_add(1, std::memory_order_relaxed);
+                    const auto resource = DecodeTextureResource(words);
+                    const VkImageViewType multisampleViewType = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+                    if (cachedTexture(context, words, resource, ViewComponents(resource), 0, !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element), multisampleViewType) != textures[index]) return leave(RelookOutcome::Differs);
+                }
+            } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
+                for (std::uint32_t element = 0; element < binding.count; ++element) {
+                    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                    if (IsNullTextureResource(words)) continue;
+                    if (storageIndex >= storageTextures.size()) return leave(RelookOutcome::Fallback);
+                    const auto index = storageIndex++;
+                    if (!listed(index, true)) continue;
+                    relookedLookups().fetch_add(1, std::memory_order_relaxed);
+                    std::shared_ptr<StorageTexture> expected;
+                    if (index != 0 && SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled()) expected = storageTextures[index - 1];
+                    else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[index], 0, storageWritten[index]);
+                    if (expected != storageTextures[index]) return leave(RelookOutcome::Differs);
+                }
+            }
+        }
+    }
+    for (const auto& table : tableStages) {
+        if (table.elementTextures.empty()) continue;
+        const auto* images = tableImages(shaders, table.stage);
+        if (images == nullptr || images->count != table.elementTextures.size()) return leave(RelookOutcome::Fallback);
+        for (std::uint32_t element = 0; element < images->count; ++element) {
+            if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
+            if (textureIndex >= textures.size() || table.elementTextures[element] != textureIndex) return leave(RelookOutcome::Fallback);
+            const auto index = textureIndex++;
+            if (!listed(index, false)) continue;
+            relookedLookups().fetch_add(1, std::memory_order_relaxed);
+            const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+            std::array<std::uint32_t, 8> narrowed{};
+            const auto words = firstLayerWords(raw, images->imageShapes.at(element), narrowed, false);
+            const auto resource = DecodeTextureResource(words);
+            const VkImageViewType multisampleViewType = images->imageShapes.at(element) == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+            if (cachedTexture(context, words, resource, ViewComponents(resource), 0, images->imageDepthCompare.at(element), multisampleViewType) != textures[index]) return leave(RelookOutcome::Differs);
+        }
+    }
+    if (textureIndex != textures.size() || storageIndex != storageTextures.size()) return leave(RelookOutcome::Fallback);
+    return captureValidationOf(changed) ? RelookOutcome::Same : RelookOutcome::Fallback;
+}
+
+bool ShaderResources::captureValidationOf(std::span<const PendingOverlap> changed) {
+    const auto& log = lookupLog();
+    thread_local std::vector<const void*>* loggedSlot = nullptr;
+    auto& logged = ShaderRecompiler::ThreadOwned(loggedSlot);
+    thread_local std::vector<const void*>* objectsSlot = nullptr;
+    auto& objects = ShaderRecompiler::ThreadOwned(objectsSlot);
+    thread_local std::vector<std::size_t>* indicesSlot = nullptr;
+    auto& indices = ShaderRecompiler::ThreadOwned(indicesSlot);
+    logged.clear();
+    for (const auto& entry : log) logged.push_back(entry.object);
+    objects.clear();
+    for (const auto& entry : changed) {
+        if (!entry.storage) objects.push_back(textures[entry.element].get());
+    }
+    LastRecordIndices(logged, objects, indices);
+    bool complete = validatedTextures.size() == textures.size() && std::none_of(indices.begin(), indices.end(), [&](std::size_t at) { return at == log.size(); });
+    if (complete) {
+        std::size_t k = 0;
+        for (const auto& entry : changed) {
+            if (entry.storage) continue;
+            const auto& found = log[indices[k++]];
+            validatedTextures[entry.element] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true};
+        }
+    }
+    lookupLog().clear();
+    return complete;
 }
 
 bool AnyPendingCpuWrites(const Context& context) {
@@ -3739,7 +3861,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    thread_local std::vector<PendingOverlap>* changedSlot = nullptr;
+    auto& changed = ShaderRecompiler::ThreadOwned(changedSlot);
+    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, changed);
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -3754,18 +3878,31 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             fallback = refreshOwnObjects(shaders, refreshed);
         }
         if (fallback == OwnRefreshFallback::Count) {
-            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, changed);
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
+    bool relooked = false;
+    if (!fast && reason == FastFail::Changed && ChangedRelookEnabled()) {
+        const auto outcome = relookChanged(shaders, changed);
+        if (outcome == RelookOutcome::Differs) {
+            if (report != nullptr) report->path = ProofPath::Relooked;
+            return finish(false, false, ProofFailure::Changed);
+        }
+        if (outcome == RelookOutcome::Same) {
+            fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, changed);
+            relooked = fast;
+        }
+    }
     if (fast && TemplateAuditDue(lastFullWalk)) {
         fast = false;
         ownRefreshed = false;
+        relooked = false;
         reason = FastFail::Audit;
     }
-    if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
+    if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : relooked ? ProofPath::Relooked : ProofPath::Fast;
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3783,7 +3920,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             }();
             return finish(false, false, failure);
         }
-    } else if (ownRefreshed || accepted) {
+    } else if (ownRefreshed || accepted || relooked) {
         if (profile && ownRefreshed) Revalidations().ownRefreshed.fetch_add(1, std::memory_order_relaxed);
         if (VerifyProofs()) {
             // The walk after the refresh, or beside a proof that accepted a foreign overlap, must

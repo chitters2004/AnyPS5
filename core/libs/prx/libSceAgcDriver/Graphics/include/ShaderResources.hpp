@@ -291,13 +291,14 @@ public:
     static std::uint64_t DepthGuardRefusals();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
+    static std::uint64_t RelookedLookups();
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults() const;
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
     // and, on a refusal, what failed.
-    enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, Count };
+    enum class ProofPath : std::size_t { Fast, OwnRefreshed, Full, Relooked, Count };
     enum class ProofFailure : std::size_t { None, Imports, Evicted, Pending, Changed, Keys, Other, Count };
     struct ProofReport {
         ProofPath path = ProofPath::Fast;
@@ -559,7 +560,10 @@ private:
     // holds; `reason` receives why the proof failed (Count: it passed), `overlapping` the surfaces
     // of a Pending failure in element order (empty otherwise), `accepted` whether a foreign overlap
     // was accepted by either rule (the verify switch then runs the full walk beside the proof).
-    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted);
+    bool fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted, std::vector<PendingOverlap>& changed);
+    enum class RelookOutcome { Same, Differs, Fallback };
+    RelookOutcome relookChanged(std::span<const CompiledShader> shaders, std::span<const PendingOverlap> changed);
+    bool captureValidationOf(std::span<const PendingOverlap> changed);
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's
