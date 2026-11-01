@@ -160,3 +160,54 @@ for m in 0 1 5; do ./model_$m c 3000; echo "certificate mutant $m rc=$?"; done; 
 ```
 
 Expected: certificate mutants 1 and 5 and snapshot mutants 2, 3, 4 and 5 fail; both clean runs pass.
+
+## Summary of results
+
+The snapshot is the better design. It is never slower than the certificate in a regime that matters, and it is much faster once a thread reads more than four separate gaps.
+
+| 4 threads, 12 guards, 1,000 reg/s (ns/check) | main | cert draft | cert fixed | snapshot |
+|---|---|---|---|---|
+| Disjoint, one area per thread | 1065 | 17 | 10 | 17 |
+| Disjoint, spread over all gaps | 1018 | 829 | 805 | 46 |
+| Cycling over 5 gaps | 973 | 1108 | 852 | 19 |
+| Overlapping a guard | 944 | 3392 | 1756 | 427 |
+
+- **Ties:** with one area per thread, both designs cut a check from about 1 µs to under 20 ns.
+- **Certificate weakness:** it caches 4 gaps per thread, so a thread that touches more misses on every read and costs as much as main or more. The snapshot stays at 8–58 ns at every guard count up to 256.
+- **Overlaps:** fix 3 halves the certificate's cost; the snapshot halves it again.
+- **Writer cost:** the snapshot spends 8–35 µs of CPU per registration, against 6–9 µs for the certificate. It is included in the totals and only matters at thousands of registrations per second.
+- **Deciding GTA measurement:** per-thread, per-frame certificate hits, misses and snapshot stale reads, plus registrations per second, captured with `tools/trace_digest.py` in the same scene on main and on each design. If threads touch at most 4 gaps between registrations, the two designs are equal; otherwise the snapshot wins.
+
+## Raw data (`data/`)
+
+| File | Contents |
+|---|---|
+| `bench_table.csv` | Run used for the tables above: idle machine, 200 ms per cell, `table` mode, includes the `null` overhead design. |
+| `bench_full.csv` | First full run: 250 ms per cell, every rate from 0 to 5000 for every guard count, no `null` design. Its 4-thread rows are noisier (main about 1.1–1.3 µs gross); use it for the rate sweeps. |
+| `model_c_<m>.log`, `model_s_<m>.log` | TSan model runs, 3000 rounds each, for the certificate (`c`) and the snapshot (`s`), mutant `m`; `model_s_4.log` holds the TSan race reports. |
+| `ctest_main_validation.log` | Guard tests on main `cf79276fe` (10 tests; no guard test exists there) under `VK_LAYER_KHRONOS_validation`. |
+| `ctest_cert_validation.log` | The same tests plus `guard_certificate`, on `2a4339321`. |
+| `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
+| `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
+| `build2.log` … `build5.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
+
+Validation-error counts in the ctest logs: `VUID-VkDeviceCreateInfo-pNext-pNext` appears 27 times on main and 30 times on each change (3 per test, device creation only). No other VUIDs, and no `was not found but was requested by env var VK_INSTANCE_LAYERS` line.
+
+A first quick run, made while a build used all 4 CPUs, is not in `data/`. At 4 threads and 12 guards, ns/check (harness overhead included) was:
+
+| Pattern, reg/s | main | cert draft | cert fixed | snapshot |
+|---|---|---|---|---|
+| disjoint-local, 0 | 542 | 145 | 135 | 168 |
+| disjoint-spread, 0 | 542 | 531 | 564 | 186 |
+| cyclic-5, 0 | 590 | 792 | 795 | 141 |
+| overlap, 0 | 663 | 1327 | 736 | 388 |
+
+This run matched the published main figure (557–694 ns) but is CPU-contended, so it is not used for conclusions.
+
+## Environment
+
+- Linux 6.18 cloud container, 4 vCPU, Intel Xeon @ 2.10 GHz.
+- g++ 13.3 (`-O2`); clang 18 present but without the TSan runtime.
+- Mesa lavapipe (llvmpipe, LLVM 20.1.2) and Ubuntu 24.04 `vulkan-validationlayers`.
+- Release build configured with `-DBUILD_TESTING=ON -DANYPS5_AGC_EXECUTION_TESTS=<the guard tests>`.
+- No `/dev/udmabuf`, so `native_depth_bda_clear` skips.
