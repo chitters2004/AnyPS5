@@ -1088,35 +1088,35 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
     auto linked = LinkUserDataCallees(request);
     if (linked.code.empty()) linked.code = LinkGraphicsUserDataTail(request, snapshot);
-    auto source = request;
+    auto invocationRequest = request;
     if (!linked.code.empty()) {
-        source.shader.code = linked.code;
-        source.context.linkedCallFallbacks = linked.fallbacks;
+        invocationRequest.shader.code = linked.code;
+        invocationRequest.context.linkedCallFallbacks = linked.fallbacks;
     }
+    const auto sourceCode = invocationRequest.shader.code;
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) source.context.convertedSamples = true;
-    auto invocationRequest = source;
+    if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) invocationRequest.context.convertedSamples = true;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
-    ShaderRecompiler::BuildPreparedShaderKey(source, key);
+    ShaderRecompiler::BuildPreparedShaderKey(invocationRequest, key);
     PreparedAtUse preparedAtUse;
     if (!snapshot.prepared->deferredAbis.empty() || snapshot.prepared->deferredPreparing) preparedAtUse = PrepareDeferredAbis(snapshot, lock);
     for (auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
         invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (!linked.code.empty() && !std::ranges::equal(invocationRequest.shader.code, linked.code)) continue;
-        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) {
+        if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(std::move(invocationRequest), entry.handle, key)) {
             NoteMatchedEntry(entry, preparedAtUse);
             return std::move(*invocation);
         }
     }
+    invocationRequest.shader.code = sourceCode;
     NoteOwnPreparation(preparedAtUse);
-    ReportPreparedAtUse(snapshot, source);
-    auto handle = PrepareShaderWithDiagnostics(source);
-    invocationRequest = source;
+    ReportPreparedAtUse(snapshot, invocationRequest);
+    auto handle = PrepareShaderWithDiagnostics(invocationRequest);
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
-    auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
+    auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(std::move(invocationRequest), handle, key);
     if (!invocation.has_value()) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
     snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
     return std::move(*invocation);
