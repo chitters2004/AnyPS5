@@ -6686,6 +6686,9 @@ void dynamicDrawDataTests() {
         }
         partial.first.reset();
         partialAgain.first.reset();
+        const auto setsBefore = ShaderResources::DrawBindingPathCounts().ringSets;
+        for (std::uint32_t round = 0; round < 200; ++round) static_cast<void>(draw(0x1000u + round));
+        Require(ShaderResources::DrawBindingPathCounts().ringSets - setsBefore <= 1u, "200 draws of one template's full shader data needed more than one upload chunk");
         first.first.reset();
         second.first.reset();
         recorder.Sync();
