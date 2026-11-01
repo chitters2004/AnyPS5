@@ -227,6 +227,8 @@ public:
         std::vector<Snapshot> snapshots;
         std::shared_ptr<WrittenSets> owner;
         bool rewroteBuffersOnly = false;
+        std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
+        std::shared_ptr<DrawBindings> shared;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -236,6 +238,14 @@ public:
         std::span<const std::uint32_t> words;
     };
     std::size_t IdleDrawSets() const { return writtenSets->Size(); }
+    bool DynamicData() const { return dynamicData; }
+    std::uint32_t DynamicCount(std::size_t set) const { return static_cast<std::uint32_t>(dynamicAllocations.at(set).size()); }
+    struct DrawBindingPaths {
+        std::uint64_t ring = 0;
+        std::uint64_t rewritten = 0;
+        std::uint64_t ringSets = 0;
+    };
+    static DrawBindingPaths DrawBindingPathCounts();
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
@@ -429,6 +439,7 @@ private:
         std::vector<std::size_t> imageAllocations;
         VkDescriptorBindingFlags flags = 0;
         std::int32_t set = -1;
+        bool data = false;
     };
 
     struct TableStage {
@@ -639,6 +650,14 @@ private:
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;
     std::shared_ptr<WrittenSets> writtenSets = std::make_shared<WrittenSets>();
+    bool dynamicData = false;
+    std::array<std::vector<std::size_t>, 2> dynamicAllocations;
+    mutable AgcDriver::Mutex ringMutex;
+    mutable std::shared_ptr<DrawBindings> ringBindings;
+    mutable std::weak_ptr<Buffer> ringChunk;
+    void allocateDrawSets(DrawBindings& result) const;
+    void writeDrawSets(DrawBindings& result, std::span<const std::optional<VkDescriptorBufferInfo>> overrides) const;
+    std::shared_ptr<DrawBindings> ringDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).

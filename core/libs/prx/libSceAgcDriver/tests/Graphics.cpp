@@ -5426,6 +5426,7 @@ struct MockVulkan {
     std::vector<VkCopyDescriptorSet> copies;
     bool allowCopies = false;
     std::uint32_t boundSets = 0;
+    std::vector<std::uint32_t> boundOffsets;
     std::uint32_t boundFirst = 0;
     VkPipelineBindPoint boundPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
     std::map<VkPipelineLayout, VkDeviceSize> pipelineLayoutPushConstantSize;
@@ -5627,10 +5628,11 @@ VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t coun
     }
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) {
+VKAPI_ATTR void VKAPI_CALL mockCmdBindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet*, std::uint32_t offsetCount, const std::uint32_t* offsets) {
     mock.boundPoint = point;
     mock.boundFirst = first;
     mock.boundSets = count;
+    mock.boundOffsets.assign(offsets, offsets + offsetCount);
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockGetMemoryHostPointerProperties(VkDevice, VkExternalMemoryHandleTypeFlagBits type, const void* pointer, VkMemoryHostPointerPropertiesEXT* properties) {
@@ -6594,6 +6596,87 @@ void writtenSetReuseTests() {
         Require(resources.IdleDrawSets() == 2, "another template's draw changed this template's idle sets");
     }
     Require(mock.live == 0, "reused draw descriptor sets leaked Vulkan objects");
+}
+
+void dynamicDrawDataTests() {
+    using AgcDriver::Graphics::CompiledShader;
+    using AgcDriver::Graphics::DescriptorCache;
+    using AgcDriver::Graphics::Recorder;
+    using AgcDriver::Graphics::ShaderResources;
+    mock = MockVulkan{};
+    mock.allowCopies = true;
+    auto context = mockContext();
+    context.limits.maxDescriptorSetStorageBuffersDynamic = 8;
+    context.limits.minStorageBufferOffsetAlignment = 256;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.shaderDataDwords = ShaderRecompiler::RuntimeAbi::ShaderDataDwords;
+        auto buffers = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16));
+        buffers.bufferWritten = {false};
+        vertex.bindings.push_back(buffers);
+        vertex.bindings.push_back(makeBinding(Role::ShaderData, 5, 1, ShaderDataWords({7, 8, 9})));
+        vertex.bindings.push_back(makeBinding(Role::FlattenedSrt, 6, 1, {1, 2, 3, 4}));
+        const auto state = AgcDriver::Graphics::DecodeState(makeState());
+        const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+        mock.writes.clear();
+        ShaderResources resources(context, stages, state.color, 0, 0, 0);
+        Require(resources.DynamicData() && resources.DynamicCount(0) == 2 && resources.DynamicCount(1) == 0, "a draw's shader data bindings did not become dynamic");
+        const auto ownData = findWrite(5).buffers;
+        Require(findWrite(5).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && findWrite(6).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC && findWrite(0).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "the build wrote the wrong descriptor types");
+        const auto& key = resources.LayoutKey();
+        for (std::size_t at = 0; at + 4 <= key.size(); at += 4) {
+            if (key[at] == 5 || key[at] == 6) Require(key[at + 1] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, "the layout key lacks the dynamic type");
+            if (key[at] == 0) Require(key[at + 1] == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "a guest buffer binding became dynamic");
+        }
+        const auto described = AgcDriver::Graphics::DescribeSetLayouts(context, stages);
+        Require(std::ranges::equal(described.mainKey, key) && described.layouts.main == resources.SetLayouts().main, "described layouts disagree with the built dynamic layout");
+        resources.Bind(VK_NULL_HANDLE, VK_PIPELINE_BIND_POINT_GRAPHICS, VK_NULL_HANDLE);
+        Require(mock.boundOffsets == std::vector<std::uint32_t>{0u, 0u}, "the template's own set was bound without zero dynamic offsets");
+        {
+            ShaderRecompiler::RecompileResult compute;
+            compute.shaderDataDwords = ShaderRecompiler::RuntimeAbi::ShaderDataDwords;
+            compute.bindings.push_back(makeBinding(Role::ShaderData, 1, 1, ShaderDataWords({0x11, 0x22})));
+            ShaderResources dispatch(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &compute, 0});
+            Require(!dispatch.DynamicData() && findWrite(1).type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, "a dispatch's shader data became dynamic");
+        }
+        const auto draw = [&](std::uint32_t value) {
+            auto drawn = vertex;
+            drawn.bindings[1].guestDescriptor = ShaderDataWords({value, value + 1, value + 2});
+            drawn.bindings[2].guestDescriptor = {value, value, value, value};
+            const std::array<CompiledShader, 2> drawnStages{{{ShaderRecompiler::ShaderStage::Vertex, &drawn, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+            const auto moved = resources.MovedReadOnlyBuffers(drawnStages, recorder, &state.color);
+            Require(moved.has_value() && moved->size() == 2, "dynamic shader data was not reported for every data binding");
+            auto bindings = resources.PrepareDrawBindings(recorder, *moved);
+            Require(bindings != nullptr && bindings->shared != nullptr && bindings->dynamicOffsets[0].size() == 2 && bindings->dynamicOffsets[1].empty(), "a draw whose only change is its shader data did not take the ring set");
+            const auto chunk = bindings->snapshots.at(0).buffer;
+            const auto bytes = bufferBytes(chunk->Handle());
+            for (std::size_t index = 0; index < 2; ++index) {
+                const auto offset = bindings->dynamicOffsets[0][index];
+                const auto& words = drawn.bindings[1 + index].guestDescriptor;
+                Require(offset % 256u == 0u && sameBytes(bytes.subspan(offset), words.data(), words.size() * sizeof(std::uint32_t)), "a ring offset is misaligned or does not hold the draw's words");
+            }
+            return std::make_pair(bindings, drawn);
+        };
+        mock.writes.clear();
+        auto first = draw(0x100u);
+        const auto chunk = first.first->snapshots.at(0).buffer->Handle();
+        Require(mock.writes.size() == 3, "the ring set was not written whole once");
+        Require(findWrite(5).buffers.at(0).buffer == chunk && findWrite(5).buffers.at(0).offset == 0 && findWrite(5).buffers.at(0).range == ownData.at(0).range && findWrite(6).buffers.at(0).buffer == chunk, "the ring set does not point its data bindings at the upload chunk");
+        mock.writes.clear();
+        auto second = draw(0x200u);
+        Require(mock.writes.empty(), "a draw on the same upload chunk wrote descriptors");
+        Require(second.first->allocation.set == first.first->allocation.set && second.first->dynamicOffsets[0] != first.first->dynamicOffsets[0], "a draw on the same chunk did not share the ring set at new offsets");
+        Require(sameBytes(bufferBytes(chunk).subspan(first.first->dynamicOffsets[0][0]), first.second.bindings[1].guestDescriptor.data(), first.second.bindings[1].guestDescriptor.size() * sizeof(std::uint32_t)), "a later draw overwrote an earlier draw's ring words");
+        first.first.reset();
+        second.first.reset();
+        recorder.Sync();
+        recorder.FlushDeferredReleases();
+    }
+    Require(mock.live == 0, "ring draw descriptor sets leaked Vulkan objects");
 }
 
 alignas(16) std::array<std::uint32_t, 8> guestMovedFirst{0x51515151, 0x52525252, 0x53535353, 0x54545454, 0x55555555, 0x56565656, 0x57575757, 0x58585858};
@@ -13213,6 +13296,7 @@ int main(int argc, char** argv) {
         guestBufferViewBytesTests();
         descriptorSnapshotTests();
         writtenSetReuseTests();
+        dynamicDrawDataTests();
         dispatchMoveTests();
         descriptorCacheTests();
         bufferBudgetPlacementTests();
