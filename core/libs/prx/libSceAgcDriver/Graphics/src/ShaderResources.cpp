@@ -3044,6 +3044,48 @@ bool OwnImageRefreshEnabled() {
 
 // APS5_VERIFY_PROOFS=1: after every own-object refresh the full walk runs beside the proof and the
 // process aborts when it would return another object or upload again (a different decision).
+struct WalkCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count) + 1> walks{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count) + 1> current{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count) + 1> nanoseconds{};
+    std::atomic<std::uint64_t> relookSame{0};
+    std::atomic<std::uint64_t> relookDiffers{0};
+    std::atomic<std::uint64_t> relookFallback{0};
+    std::atomic<std::uint64_t> relookRerunFailed{0};
+    std::atomic<std::uint64_t> relookElements{0};
+    std::atomic<std::uint64_t> replacedSkipped{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+WalkCounters& walkCounters() {
+    static WalkCounters counters;
+    return counters;
+}
+
+bool WalksCounted() {
+    static const bool enabled = std::getenv("APS5_COUNT_WALKS") != nullptr;
+    return enabled;
+}
+
+void reportWalks() {
+    auto& counters = walkCounters();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::string text = "[walks] full walks by reason (walks/found current/ms):";
+    for (std::size_t i = 0; i <= static_cast<std::size_t>(FastFail::Count); ++i) {
+        const auto walks = counters.walks[i].load(std::memory_order_relaxed);
+        if (walks == 0) continue;
+        char entry[160];
+        std::snprintf(entry, sizeof(entry), " %s %llu/%llu/%.1f;", i == static_cast<std::size_t>(FastFail::Count) ? "fast proof off" : FastFailNames[i], static_cast<unsigned long long>(walks), static_cast<unsigned long long>(counters.current[i].load(std::memory_order_relaxed)), counters.nanoseconds[i].load(std::memory_order_relaxed) / 1e6);
+        text += entry;
+    }
+    char tail[320];
+    std::snprintf(tail, sizeof(tail), " relook: %llu same, %llu differing, %llu fell back, %llu reruns failed, %llu elements looked up; replaced: %llu walks skipped\n", static_cast<unsigned long long>(counters.relookSame.load()), static_cast<unsigned long long>(counters.relookDiffers.load()), static_cast<unsigned long long>(counters.relookFallback.load()), static_cast<unsigned long long>(counters.relookRerunFailed.load()), static_cast<unsigned long long>(counters.relookElements.load()), static_cast<unsigned long long>(counters.replacedSkipped.load()));
+    text += tail;
+    std::fputs(text.c_str(), stderr);
+}
+
 bool ChangedRelookEnabled() {
     static const bool disabled = std::getenv("APS5_NO_CHANGED_RELOOK") != nullptr;
     return !disabled;
@@ -3891,7 +3933,13 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     bool relooked = false;
     if (!fast && reason == FastFail::Changed && ChangedRelookEnabled()) {
+        const auto relookStart = ShaderResources::RelookedLookups();
         const auto outcome = relookChanged(shaders, changed);
+        if (WalksCounted()) {
+            auto& counters = walkCounters();
+            counters.relookElements.fetch_add(ShaderResources::RelookedLookups() - relookStart, std::memory_order_relaxed);
+            (outcome == RelookOutcome::Same ? counters.relookSame : outcome == RelookOutcome::Differs ? counters.relookDiffers : counters.relookFallback).fetch_add(1, std::memory_order_relaxed);
+        }
         if (outcome == RelookOutcome::Differs) {
             if (report != nullptr) report->path = ProofPath::Relooked;
             return finish(false, false, ProofFailure::Changed);
@@ -3899,6 +3947,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (outcome == RelookOutcome::Same) {
             fast = fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted, changed);
             relooked = fast;
+            if (!fast && WalksCounted()) walkCounters().relookRerunFailed.fetch_add(1, std::memory_order_relaxed);
         }
     }
     if (fast && TemplateAuditDue(lastFullWalk)) {
@@ -3908,12 +3957,27 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         reason = FastFail::Audit;
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : relooked ? ProofPath::Relooked : ProofPath::Fast;
-    if (!fast && reason == FastFail::Replaced && !ReplacedWalks()) return finish(false, false, ProofFailure::Evicted);
+    if (!fast && reason == FastFail::Replaced && !ReplacedWalks()) {
+        if (WalksCounted()) {
+            walkCounters().replacedSkipped.fetch_add(1, std::memory_order_relaxed);
+            reportWalks();
+        }
+        return finish(false, false, ProofFailure::Evicted);
+    }
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto countedStart = WalksCounted() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool walked = fullWalk();
         countFullWalkTime(reason, walkStart);
+        if (WalksCounted()) {
+            auto& counters = walkCounters();
+            const auto slot = static_cast<std::size_t>(reason);
+            counters.walks[slot].fetch_add(1, std::memory_order_relaxed);
+            if (walked) counters.current[slot].fetch_add(1, std::memory_order_relaxed);
+            counters.nanoseconds[slot].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - countedStart).count()), std::memory_order_relaxed);
+            reportWalks();
+        }
         if (!walked) {
             const auto failure = [&] {
                 switch (reason) {
