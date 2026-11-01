@@ -1714,15 +1714,11 @@ void reportResultMemo() {
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
-std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, bool masked, std::span<const BufferSubstitute> substitutes = {}) {
+std::uint64_t snapshotCommonHash(const RecompileRequest& request, const ResourceSnapshot& snapshot) {
     std::uint64_t hash = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         hash ^= value;
         hash *= 0x100000001b3ull;
-    };
-    const auto mixWords = [&](std::span<const std::uint32_t> words) {
-        mix(words.size());
-        for (const auto word : words) mix(word);
     };
     const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
         mix(values.size());
@@ -1732,36 +1728,8 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
             for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
         }
     };
-    if (masked) {
-        mix(snapshot.buffers.size());
-        for (std::size_t index = 0; index < snapshot.buffers.size(); ++index) {
-            const auto& value = snapshot.buffers[index];
-            mix(value.dwordCount);
-            mix(value.availableDwordMask);
-            const auto fields = BufferSpecializationFields(value, substitutes, index);
-            mix(fields.known ? 4u | fields.misalignment : 0u);
-            mix(fields.word1);
-            if (value.dwordCount > 3u) mix(fields.word3);
-            for (std::uint32_t i = 4; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
-        }
-    } else {
-        mixDescriptors(snapshot.buffers);
-        for (std::size_t index = 0; index < substitutes.size() && index < snapshot.buffers.size(); ++index) {
-            const auto fields = BufferSpecializationFields(snapshot.buffers[index], substitutes, index);
-            mix(fields.word1);
-            mix(fields.word3);
-            mix(fields.known ? 4u | fields.misalignment : 0u);
-        }
-    }
     mixDescriptors(snapshot.images);
     mixDescriptors(snapshot.samplers);
-    if (masked) {
-        mix(snapshot.flattenedSrt.size());
-        mix(snapshot.userData.size());
-    } else {
-        mixWords(snapshot.flattenedSrt);
-        mixWords(snapshot.userData);
-    }
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
     for (const auto stride : snapshot.uniformFill.groupStride) mix(stride);
@@ -1827,6 +1795,55 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     return hash;
 }
 
+std::uint64_t snapshotHash(std::uint64_t common, const ResourceSnapshot& snapshot, bool masked, std::span<const BufferSubstitute> substitutes) {
+    std::uint64_t hash = common;
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 0x100000001b3ull;
+    };
+    const auto mixWords = [&](std::span<const std::uint32_t> words) {
+        mix(words.size());
+        for (const auto word : words) mix(word);
+    };
+    const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
+        mix(values.size());
+        for (const auto& value : values) {
+            mix(value.dwordCount);
+            mix(value.availableDwordMask);
+            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+        }
+    };
+    if (masked) {
+        mix(snapshot.buffers.size());
+        for (std::size_t index = 0; index < snapshot.buffers.size(); ++index) {
+            const auto& value = snapshot.buffers[index];
+            mix(value.dwordCount);
+            mix(value.availableDwordMask);
+            const auto fields = BufferSpecializationFields(value, substitutes, index);
+            mix(fields.known ? 4u | fields.misalignment : 0u);
+            mix(fields.word1);
+            if (value.dwordCount > 3u) mix(fields.word3);
+            for (std::uint32_t i = 4; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+        }
+    } else {
+        mixDescriptors(snapshot.buffers);
+        for (std::size_t index = 0; index < substitutes.size() && index < snapshot.buffers.size(); ++index) {
+            const auto fields = BufferSpecializationFields(snapshot.buffers[index], substitutes, index);
+            mix(fields.word1);
+            mix(fields.word3);
+            mix(fields.known ? 4u | fields.misalignment : 0u);
+        }
+    }
+    if (masked) {
+        mix(snapshot.flattenedSrt.size());
+        mix(snapshot.userData.size());
+    } else {
+        mixWords(snapshot.flattenedSrt);
+        mixWords(snapshot.userData);
+    }
+    return hash;
+}
+
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
@@ -1836,7 +1853,8 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     static const std::vector<BufferSubstitute> noSubstitutes;
     const auto slots = bufferSubstitutesEnabled() && variant->substitutes != nullptr ? variant->substitutes->Slots() : nullptr;
     const auto& substitutes = slots != nullptr ? *slots : noSubstitutes;
-    const auto hash = snapshotHash(request, snapshot, false, substitutes);
+    const auto common = snapshotCommonHash(request, snapshot);
+    const auto hash = snapshotHash(common, snapshot, false, substitutes);
     const auto index = (variantId * 0x9e3779b97f4a7c15ull) ^ hash;
     auto& counters = resultMemoCounters();
     {
@@ -1854,7 +1872,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
     }
     const bool masking = MaskedResultMemo();
-    const auto maskedHash = masking ? snapshotHash(request, snapshot, true, substitutes) : 0u;
+    const auto maskedHash = masking ? snapshotHash(common, snapshot, true, substitutes) : 0u;
     const auto maskedIndex = (variantId * 0x9e3779b97f4a7c15ull) ^ maskedHash;
     std::shared_ptr<const RecompileResult> donor;
     std::shared_ptr<const MemoPatch> donorPatch;
