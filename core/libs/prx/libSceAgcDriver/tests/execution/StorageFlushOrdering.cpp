@@ -44,6 +44,7 @@ constexpr std::size_t FarDword = 100u * Width;
 
 alignas(256) constexpr std::array<std::uint32_t, 11> StoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Stored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 7> StoreGlobalCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Overwritten, 0xdc708100u, 0x007d0200u, 0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 7> StoreBaselineCode{0x7e000208u, 0x7e020209u, 0x7e0402ffu, Initial, 0xdc708100u, 0x007d0200u, 0xbf810000u};
 
 class GuestBlock {
 public:
@@ -128,14 +129,15 @@ bool AddressBasedStorePending(std::uint64_t image, bool open) {
     return read.has_value() && read->kind == AgcDriver::Graphics::Recorder::ReadKind::AddressBased && read->open == open;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, bool gpuCompare) {
+void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, bool gpuCompare, bool baseline = false) {
     const auto* words = guest.Words() + offset / 4u;
     const auto image = guest.Address() + offset;
     const auto target = device.Target();
     const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
-    const auto storeGlobal = Compile(StoreGlobalCode, GlobalUserData(image), target);
+    const auto& globalCode = baseline ? StoreBaselineCode : StoreGlobalCode;
+    const auto storeGlobal = Compile(globalCode, GlobalUserData(image), target);
     device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
-    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreGlobalCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(globalCode.data()));
     if (submit) {
         std::uint64_t serial = 0;
         {
@@ -146,11 +148,29 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
     }
     const std::string what = std::string("storage flush ordering, ") + name + ": ";
     Require(AddressBasedStorePending(image, !submit), what + "the address-based store was not pending in the expected batch at the flush");
+    std::shared_ptr<AgcDriver::Graphics::StorageTexture> texture;
+    std::uint64_t before = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        texture = AgcDriver::Graphics::StorageTexture::FindLive(image, ImageBytes);
+        if (texture != nullptr) before = texture->Generation();
+    }
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, gpuCompare ? "readback before label" : "test"), what + "the image store left no results pending");
     if (gpuCompare && !submit) Require(AddressBasedStorePending(image, true), what + "the label store waited for the address-based store instead of comparing on the GPU");
     device.WaitIdle();
     Require(words[FarDword] == Stored, what + "the pending image's texel away from the newer write was not stored");
-    Require(words[OverwrittenDword] == Overwritten, what + "the pending image's store put its older texels over a newer address-based store");
+    if (baseline) {
+        Require(words[0] == Stored && words[OverwrittenDword] == Initial, what + "the pending image's results were not stored over a write of the same bytes");
+    } else {
+        Require(words[OverwrittenDword] == Overwritten, what + "the pending image's store put its older texels over a newer address-based store");
+    }
+    if (!gpuCompare || submit) return;
+    Require(texture != nullptr, what + "the stored image is no longer live");
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const bool watched = AgcDriver::GuestMemory::Watched(image, ImageBytes);
+    const bool synced = watched ? texture->Generation() > before : texture->GuestSnapshotValid();
+    if (baseline) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
+    else Require(!synced, what + "the image whose block the GPU kept was put back in sync at completion");
 }
 
 }
@@ -166,6 +186,7 @@ int main(int argc, char** argv) {
         else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
         else Run(*device, guest, 0, true, "writer in flight", gpuCompare);
         Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch", gpuCompare);
+        if (gpuCompare) Run(*device, guest, BlockBytes / 4u, false, "writer of the baseline bytes in the open batch", gpuCompare, true);
         std::puts("storage flush ordering tests passed");
         return 0;
     } catch (const std::exception& error) {

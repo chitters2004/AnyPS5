@@ -4300,7 +4300,7 @@ struct LabelCompareTotals {
     std::map<std::string, std::uint64_t> gpuRefusals;
 };
 
-std::atomic<std::uint64_t> conditionalStored{0}, conditionalKept{0};
+std::atomic<std::uint64_t> conditionalStored{0}, conditionalKept{0}, conditionalSettled{0}, conditionalLeftStale{0};
 
 LabelCompareTotals& LabelCompareCounts() {
     static LabelCompareTotals totals;
@@ -4316,7 +4316,7 @@ std::string LabelCompareReport() {
     std::string gpuRefusals;
     for (const auto& [why, count] : totals.gpuRefusals) gpuRefusals += " " + why + " " + std::to_string(count);
     char gpu[512];
-    std::snprintf(gpu, sizeof(gpu), "[label-compare] GPU compare: waits skipped %llu, blocks store %llu keep %llu gpu %llu; GPU-compared blocks stored %llu kept %llu; waits kept:%s\n", static_cast<unsigned long long>(totals.waitsSkipped), static_cast<unsigned long long>(totals.skippedBlocks[0]), static_cast<unsigned long long>(totals.skippedBlocks[1]), static_cast<unsigned long long>(totals.skippedBlocks[2]), static_cast<unsigned long long>(conditionalStored.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalKept.exchange(0, std::memory_order_relaxed)), gpuRefusals.c_str());
+    std::snprintf(gpu, sizeof(gpu), "[label-compare] GPU compare: waits skipped %llu, blocks store %llu keep %llu gpu %llu; GPU-compared blocks stored %llu kept %llu; images in sync at completion %llu, left stale %llu; waits kept:%s\n", static_cast<unsigned long long>(totals.waitsSkipped), static_cast<unsigned long long>(totals.skippedBlocks[0]), static_cast<unsigned long long>(totals.skippedBlocks[1]), static_cast<unsigned long long>(totals.skippedBlocks[2]), static_cast<unsigned long long>(conditionalStored.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalKept.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalSettled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(conditionalLeftStale.exchange(0, std::memory_order_relaxed)), gpuRefusals.c_str());
     char text[512];
     std::snprintf(text, sizeof(text), "[label-compare] waits checked %llu, eligible %llu (%.1f ms waited), refused %llu (%.1f ms waited:%s); blocks store %llu keep %llu gpu %llu fallback %llu; decisions compared %llu, mismatches %llu\n", static_cast<unsigned long long>(totals.checks), static_cast<unsigned long long>(totals.eligible), totals.eligibleWaitMs, static_cast<unsigned long long>(totals.checks - totals.eligible), totals.refusedWaitMs, refusals.c_str(), static_cast<unsigned long long>(totals.blocks[0]), static_cast<unsigned long long>(totals.blocks[1]), static_cast<unsigned long long>(totals.blocks[2]), static_cast<unsigned long long>(totals.blocks[3]), static_cast<unsigned long long>(totals.compared), static_cast<unsigned long long>(totals.mismatches));
     totals.checks = 0;
@@ -6263,7 +6263,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::withoutRang
     return left;
 }
 
-void StorageTexture::recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
     std::size_t bytes = 0;
     for (const auto& [from, to] : ranges) {
         Require(from % 4 == 0 && to % 4 == 0 && to > from, "a GPU-compared label store range is not whole words");
@@ -6303,6 +6303,42 @@ void StorageTexture::recordConditionalStores(Recorder& recorder, VkCommandBuffer
             (kept != 0 ? conditionalKept : conditionalStored).fetch_add(1, std::memory_order_relaxed);
         }
     });
+    return {staging, flagsOffset};
+}
+
+void StorageTexture::settleConditionalAtCompletion(Recorder& recorder, const std::pair<std::shared_ptr<Buffer>, std::size_t>& flags, std::size_t count, bool save, std::uint64_t firstStored, std::uint64_t lastStored) {
+    Require(trackedLayers == 1 && flags.first != nullptr, "a GPU-compared label store settles a layer it did not store");
+    const auto target = collectedLayerGeneration(0, GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
+    const auto stale = layerGeneration[0];
+    const auto ticket = ++lastConditionalTicket;
+    conditionalTicket = ticket;
+    std::uint64_t saveTicket = 0;
+    if (save) {
+        saveTicket = ++lastSaveTicket;
+        savedTicket[0] = saveTicket;
+    }
+    recorder.OnComplete([texture = weak_from_this(), staging = flags.first, offset = flags.second, count, ticket, stale, target, saveTicket] {
+        const auto alive = texture.lock();
+        if (alive == nullptr) return;
+        bool stored = true;
+        const auto bytes = staging->Bytes();
+        for (std::size_t index = 0; index < count; ++index) {
+            std::uint32_t kept = 0;
+            std::memcpy(&kept, bytes.data() + offset + 4 * index, sizeof(kept));
+            stored = stored && kept == 0;
+        }
+        const bool current = alive->conditionalTicket == ticket && alive->layerGeneration[0] == stale;
+        if (alive->conditionalTicket == ticket) alive->conditionalTicket = 0;
+        if (stored && current) {
+            alive->layerGeneration[0] = target;
+            alive->refreshGeneration();
+            if (saveTicket != 0) alive->applyStoredSave(saveTicket, {0});
+            conditionalSettled.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        if (saveTicket != 0 && alive->savedTicket[0] == saveTicket) alive->savedTicket[0] = 0;
+        conditionalLeftStale.fetch_add(1, std::memory_order_relaxed);
+    });
 }
 
 bool StorageTexture::guestBytesSettled() const {
@@ -6334,6 +6370,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         StorageTexture& texture;
         ~Reconcile() { texture.reconcilePending(); }
     } reconcile{*this};
+    conditionalTicket = 0;
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
     // may have reused the memory for something else entirely (see layerGeneration). A generation of
@@ -6567,6 +6604,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             for (const auto& [begin, end] : coveredBytes(runs)) importStores.emplace_back(descriptor.baseAddress + begin, descriptor.baseAddress + end);
             padding = {};
         }
+        const bool conditionalSave = !conditional.empty() && skipped == 0 && !GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+        if (conditionalSave && !savedBytes) savedBytes = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        std::pair<std::shared_ptr<Buffer>, std::size_t> conditionalFlags;
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
@@ -6645,8 +6685,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 }
                 if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), segment.import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
             }
-            if (!conditional.empty()) recordConditionalStores(*recorder, commands, *segments.front().import, tiledScratch->Handle(), conditional);
-            if (!saveUnits.empty()) {
+            if (!conditional.empty()) conditionalFlags = recordConditionalStores(*recorder, commands, *segments.front().import, tiledScratch->Handle(), conditional);
+            if (!saveUnits.empty() || conditionalSave) {
                 std::vector<VkBufferCopy> saves;
                 for (const auto& [from, to] : keep) saves.push_back({from - descriptor.baseAddress, from - descriptor.baseAddress, to - from});
                 context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), savedBytes->Handle(), static_cast<std::uint32_t>(saves.size()), saves.data());
@@ -6683,6 +6723,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // (MarkWritten made the only stamps), so the memoized collect is exact.
         settle(true);
         commitStoredSave(saveUnits);
+        if (!conditional.empty() && skipped == 0) settleConditionalAtCompletion(*recorder, conditionalFlags, conditional.size(), conditionalSave, firstStored, lastStored);
         ++Profile().storageDirectWriteBacks;
         return;
     }

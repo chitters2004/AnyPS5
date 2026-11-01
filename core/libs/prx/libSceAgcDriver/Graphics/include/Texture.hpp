@@ -433,7 +433,8 @@ private:
     void noteLabelCompareBlock(std::uint64_t at, bool written, std::uint64_t from, std::uint64_t to);
     static void tallyLabelCompare(const LabelCompareCheck& check, std::uint64_t image, const char* reason);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> withoutRanges(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& removed);
-    void recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+    std::pair<std::shared_ptr<Buffer>, std::size_t> recordConditionalStores(Recorder& recorder, VkCommandBuffer commands, const HostImport& import, VkBuffer results, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
+    void settleConditionalAtCompletion(Recorder& recorder, const std::pair<std::shared_ptr<Buffer>, std::size_t>& flags, std::size_t count, bool save, std::uint64_t firstStored, std::uint64_t lastStored);
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
     bool keptAtUnwatchHolds(std::uint64_t from, std::uint32_t unit) const;
@@ -702,6 +703,8 @@ private:
     std::vector<std::uint64_t> storeNotes;
     LabelCompareCheck* labelCompareCheck = nullptr;
     const LabelCompareCheck* labelCompareStore = nullptr;
+    std::uint64_t conditionalTicket = 0;
+    std::uint64_t lastConditionalTicket = 0;
     std::uint64_t version = 0;
     std::uint64_t writes = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
