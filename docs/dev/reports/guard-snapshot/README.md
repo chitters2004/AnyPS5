@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,8 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `cff455dfe` | perf: `GuestMemory::CheckRangeProved` and mapping proofs on draw recipes, so a draw-cache hit skips re-querying its index and vertex mappings until guest memory changes (see "Mapping proofs"). |
+| `fb7ca46f3` | perf: a 64-entry log of recent registrations, so a stale guard proof is revalidated against the registrations since it rather than fully re-checked (see "Registration log"). The range proof moves to `GuestMemory::RangeProof`. |
 | `876e52aca` | perf: exact range proofs on draw recipes, so a draw-cache hit skips its index and vertex range checks while nothing has registered (see "Draw proofs"). |
 | `9a7128ddb` | perf: growth-stamped proofs (see "Skipping repeated checks"). `requireGuestBuffers` skips its whole loop while nothing has registered, and every registration now advances the growth when it starts and again when it finishes. |
 
@@ -144,7 +146,7 @@ Ship the snapshot.
 
 ## Reproducing
 
-The sources are in this folder: `guard_bench.cpp` (the benchmark), `guard_model.cpp` (the concurrency model) and `probe_bench.cpp` (the proof-owner benchmark, which includes `guard_bench.cpp`; build it from this folder with `g++ -O2 -std=c++20 -pthread probe_bench.cpp -o probe_bench`). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
+The sources are in this folder: `guard_bench.cpp` (the benchmark), `guard_model.cpp` (the concurrency model) `probe_bench.cpp` (the proof-owner benchmark) and `log_bench.cpp` (the registration-log benchmark). The last two include `guard_bench.cpp`; build them from this folder with `g++ -O2 -std=c++20 -pthread probe_bench.cpp -o probe_bench` (likewise `log_bench`). Neither is part of the CMake build. The benchmark's `cert-fixed` design models commit `2a4339321`, and its `snapshot` design models `7133b7d37`, including the growth-checked rebuild.
 
 Benchmark. The first argument is milliseconds per cell. The second is `table` (the grid above), `full` (every rate for every guard count) or `quick` (4 threads, 12 guards). Run it on an idle machine; a concurrent build roughly halves main's measured contention. Output is CSV, one row per design × threads × guards × pattern × rate. Subtract the `null` design's `total_ns_per_op` to remove harness overhead.
 
@@ -199,11 +201,43 @@ A proof only pays when an object that persists between draws holds it; a per-thr
 - **Tests:** `CheckRangeProof` covers exact-match, other ranges, invalidation by a registration over the range, refused ranges never being proven, removal, held proofs writing nothing in the driver image, and the concurrent-writer check. 16 tests pass under validation, including `recorder` and `sample_order`, which replay recipes; `sample_order_grid_reference` and `sample_order_recipe_depth_locations` skip on lavapipe. The only validation error is still the device-creation `VUID-VkDeviceCreateInfo-pNext-pNext`, 3 per test (`data/ctest_drawproof_validation.log`).
 - **Not measured:** the saving in a real frame, which depends on the draw-cache hit rate (the GTA trace).
 
+## Registration log (`fb7ca46f3`)
+
+- **What:** each registration's ranges go into a 64-entry ring, stamped with the growth value its finish produces. Both growth advances of a registration are now taken under the snapshot writer mutex, so growth changes are serialized and the stamp is exact. The ring is written under its own sequence counter and read lock-free.
+- **Revalidation (`ResidentGuardsUnchangedSince_nid_no_patch`):** a proof stamped `p` is still valid at growth `g` if every log entry stamped in `(p, g]` misses the proven range, and the ring still reaches back to `p` (an entry stamped `<= p` is retained, or nothing was ever evicted). Entries stamped after `g` belong to registrations finishing concurrently; the proof is re-stamped at `g`, so they are caught next time. A proof older than the ring, a log write that failed (lock exception, which marks the log lost for good) or 4 torn reads fall back to the full check.
+- **Users:** `RequireNoMultisampleTargetProved` (draw recipes) and `ShaderResources::requireGuestBuffers` (every guest buffer is revalidated against the log; any overlap means the full loop). `ResidentGuardProof` and `GuestMemory::RangeProof` gained `Stamp()` for this.
+- **Measured** (`log_bench.cpp`, `data/log_bench.csv`; 12 guards, 1000 draws of 3 ranges, a busy-waiting writer registering at the given rate; ns per draw, then full checks per draw):
+
+| Rate/s | Threads | 3 lookups | proof, full recheck | proof + log |
+|---|---|---|---|---|
+| 0 | 1 | 41.1 | 0.9 | 1.1 |
+| 10,000 | 1 | 35.2 | 1.6 (0.016) | 0.9 (0.0000) |
+| 50,000 | 1 | 129.4 | 42.0 (0.288) | 6.8 (0.0002) |
+| 10,000 | 4 | 116.2 | 1.8 (0.008) | 1.4 (0.0001) |
+| 50,000 | 4 | 112.8 | 1.7 (0.012) | 1.8 (0.0001) |
+
+  The log only matters at tens of thousands of registrations per second: at 50,000/s on one thread it cuts a draw from 42 to 7 ns. At realistic rates both proof variants are about 1 ns. With 4 readers the busy-waiting writer shares 4 CPUs, so its real rate is lower than nominal.
+- **Tests:** `CheckGuardLog` covers a registration elsewhere keeping a proof, one over the range invalidating it, a proof newer than the growth, revalidation advancing the proof, removals, and a log flooded with 80 registrations falling back to the full check. The stress readers also keep a range proof on each round's guard and fail if it is accepted after the guard is published. Mutants: not logging the ranges, and stamping entries one growth too early, each fail 3/3 runs (about 4,500 stale acceptances).
+
+## Mapping proofs (`cff455dfe`)
+
+- **What:** `GuestMemory::CheckRangeProved(proof, pointer, bytes, alignment)` always checks the null, alignment and overflow rules, then skips the mapping query if the proof holds for that exact range at the mapping epoch. Draw recipes keep `mappingProofs` (8 slots, same layout as `guardProofs`) for the index range and vertex copy ranges, used on draw-cache hits only.
+- **Epoch:** `MappingEpoch()` = allocation generation + page-cache forget serial + page access serial. All three only grow, so equal sums mean all three are unchanged. This is the same set of counters the page-state cache already trusts: a registry mutation advances the generation when it ends and then forgets the changed pages (two forget-serial advances around the forget), and the guest arena's access observer advances the access serial.
+- **Fix to that cache:** `ForgetInaccessiblePages` advanced the access serial only before forgetting. A check reading the serial in between could keep a proof of the stale pages, so it now advances it again afterwards (as `ForgetPages` already did).
+- **When nothing is recorded** (the range is checked every time):
+  - writable checks (the API is read-only);
+  - ranges not inside one page-cached span (the guest arena or the main image);
+  - processes where the cache's invalidation observers were never installed;
+  - the caller's own stack, which `verify` accepts per thread.
+- **Tests:** `CheckMappingProof` uses a 128 KiB block in the test executable's image, which is page-cached on Linux (the check is compiled out on Windows, and reports a skip if the image is not cached). It covers: a proof at the epoch; misalignment still refused; held proofs writing nothing in the driver image; a protection change to no access invalidating the proof and the next check refusing the range; a readable range proven again; a stack range never proven; and removal invalidating the proof. Mutants: a constant epoch and recording outside the cached spans each fail.
+- **Other tests:** 16 tests pass under validation, with the same 39 device-creation VUIDs (3 per test; `data/ctest_log_mapping_validation.log`). `agc_write_tracking` and `agc_write_watch_coverage` pass (`data/ctest_guestmemory.log`). The page-state tests are Windows-only and were not run.
+- **Not measured:** the cost of the skipped query in the driver. On Linux a small uncached range is read with `process_vm_readv` (a system call); a cached range is a page-table scan.
+
 ## Further improvements (not done)
 
-1. **Invalidate only overlapping proofs.** Every registration currently voids every proof. Keeping a small ring of the last N registered ranges would let a proof stale by at most N registrations be revalidated by checking those N ranges instead of running the full check. This helps the regime with thousands of registrations per second.
+1. Done in `fb7ca46f3` (registration log).
 2. **Owners for the remaining sites.** Non-recipe draws, DMA and the generic `GuestMemory::Read` → `GuardRead` path have none. If decoded command buffers or descriptor fetches are cached anywhere, proofs could live there.
-3. **The same proof idea for `GuestMemory::CheckRange`,** which re-validates the same index and vertex ranges on every draw, with the unmap epoch in place of the guard growth.
+3. Done in `cff455dfe` (mapping proofs), for draw-cache hits.
 4. **Formal check of the seqlocks** (snapshot and range proof) with a C11 model checker such as GenMC: x86 and TSan cannot catch a misplaced fence.
 5. **Range proof in the TSan model,** so the no-claim variant fails every run, not 1 in 5.
 6. **Windows and the GTA trace:** still the deciding gaps (see "Not verified").
@@ -237,9 +271,12 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
 | `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
 | `ctest_proof_validation.log` | The same tests on `9a7128ddb` (proofs). |
+| `ctest_log_mapping_validation.log` | 16 tests on `cff455dfe` (registration log and mapping proofs). |
+| `ctest_guestmemory.log` | `agc_write_tracking` and `agc_write_watch_coverage` on `cff455dfe`. |
+| `log_bench.csv` | `log_bench.cpp` output: draw proofs with and without the registration log under registration load. |
 | `ctest_drawproof_validation.log` | 16 tests, including `recorder` and `sample_order`, on `876e52aca`. |
 | `probe.csv` | `probe_bench.cpp` output: snapshot lookups against owner-held proofs against a per-thread range cache. |
-| `build2.log` … `build8.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
+| `build2.log` … `build11.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
 
 Validation-error counts in the ctest logs: `VUID-VkDeviceCreateInfo-pNext-pNext` appears 27 times on main and 30 times on each change (3 per test, device creation only). No other VUIDs, and no `was not found but was requested by env var VK_INSTANCE_LAYERS` line.
 
