@@ -32,6 +32,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <atomic>
+#include <thread>
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1419,6 +1421,111 @@ void CheckEligibility(Context context) {
     std::puts("Native depth eligibility, guest writes, queued writes, metadata transitions and held views checked");
 }
 
+void CheckRegistrationRace(Context context, VkFormat format, std::uint32_t samples) {
+    constexpr VkExtent2D extent{5u, 3u};
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, samples));
+    const auto metadataBytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    const auto allocationBytes = depthBytes + 65536u;
+    TargetMemory memory(allocationBytes);
+    const auto release = [](const void*, std::size_t, const void*, bool) {};
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(memory.Data(), allocationBytes, true, true, true);
+    }
+    Recorder recorder(context);
+    recorder.Activate();
+    const auto clear = [&] {
+        recorder.Sync();
+        ClearCachedTextures(context.device);
+        ClearDepthSurfaces(context.device);
+        ClearMultisampleTargets(context.device);
+    };
+    const auto cleanup = [&] {
+        clear();
+        GuestAllocations::Mutation mutation;
+        if (mutation.Overlaps(memory.Data(), allocationBytes)) mutation.Unmap(memory.Data(), allocationBytes, release);
+    };
+    struct Cleanup {
+        decltype(cleanup)& action;
+        ~Cleanup() { action(); }
+    } cleanupScope{cleanup};
+    std::memset(memory.Data() + depthBytes, 0, metadataBytes);
+    DepthTarget target{memory.Address(), 0u, extent, format, 0.0f, 0u, memory.Address() + depthBytes, false, samples};
+    target.depthSwizzle = 24u;
+    target.iterate256 = target.htilePipeAligned = target.htileDepthOnly = true;
+    constexpr unsigned Readers = 3;
+    constexpr unsigned Rounds = 400;
+    std::atomic<unsigned> round{0}, published{0}, ready{0}, finished{0}, stale{0};
+    std::atomic<std::uint64_t> unflagged{0};
+    std::atomic<bool> done{false};
+    std::vector<std::thread> readers;
+    for (unsigned reader = 0; reader < Readers; ++reader) {
+        readers.emplace_back([&] {
+            ResidentGuardProof proof;
+            unsigned seen = 0;
+            while (!done.load(std::memory_order_acquire)) {
+                const auto current = round.load(std::memory_order_acquire);
+                if (current == seen) continue;
+                seen = current;
+                ready.fetch_add(1, std::memory_order_acq_rel);
+                std::uint64_t latestUnflagged = 0;
+                for (bool after = false; !after;) {
+                    after = published.load(std::memory_order_acquire) >= current;
+                    const auto growth = ResidentGuardGrowth_nid_no_patch();
+                    if (!HasResidentDepthGuards_nid_no_patch()) latestUnflagged = std::max(latestUnflagged, growth);
+                    const bool proved = proof.Holds(growth, current) || (ResidentGuardsClear_nid_no_patch(target.address, 1u) && ResidentGuardsClear_nid_no_patch(target.htileAddress, 1u) && (proof.Record(growth, current), true));
+                    if (after && proved) stale.fetch_add(1, std::memory_order_relaxed);
+                }
+                auto expected = unflagged.load(std::memory_order_relaxed);
+                while (expected < latestUnflagged && !unflagged.compare_exchange_weak(expected, latestUnflagged, std::memory_order_relaxed)) {}
+                finished.fetch_add(1, std::memory_order_acq_rel);
+            }
+        });
+    }
+    std::uint64_t violations = 0;
+    for (unsigned current = 1; current <= Rounds; ++current) {
+        clear();
+        Require(!HasResidentDepthGuards_nid_no_patch(), "a depth guard stayed resident across a race round");
+        unflagged.store(0, std::memory_order_relaxed);
+        ready.store(0, std::memory_order_release);
+        finished.store(0, std::memory_order_release);
+        round.store(current, std::memory_order_release);
+        while (ready.load(std::memory_order_acquire) != Readers) std::this_thread::yield();
+        const auto before = ResidentGuardGrowth_nid_no_patch();
+        Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "a race round has no native depth view");
+        const auto registered = ResidentGuardGrowth_nid_no_patch();
+        Require(registered > before, "a race round did not register the native depth guard");
+        published.store(current, std::memory_order_release);
+        while (finished.load(std::memory_order_acquire) != Readers) std::this_thread::yield();
+        if (unflagged.load(std::memory_order_relaxed) >= registered) ++violations;
+    }
+    done.store(true, std::memory_order_release);
+    for (auto& thread : readers) thread.join();
+    Require(HasResidentDepthGuards_nid_no_patch(), "the last race round left no depth guard for the spanning reads");
+    Context colorContext{};
+    colorContext.device = reinterpret_cast<VkDevice>(std::uintptr_t{0x7700u});
+    const auto fmask = [&](std::uint64_t address) {
+        ColorTarget color{};
+        color.extent = {256u, 256u};
+        color.coverageSamples = 4u;
+        color.samples = 8u;
+        color.fmaskAddress = address;
+        GuardOneFragmentFmask(colorContext, color);
+    };
+    const auto before = target.address - 0x200000u;
+    const auto after = target.htileAddress + metadataBytes + 0x200000u;
+    fmask(before);
+    fmask(after);
+    const auto both = ColorGuardOverlap | DepthGuardOverlap;
+    Require(ResidentGuardOverlaps_nid_no_patch(before, static_cast<std::size_t>(target.address + 1u - before)) == both, "a read from a color guard across a gap into a depth guard lost a registry");
+    Require(ResidentGuardOverlaps_nid_no_patch(target.address, static_cast<std::size_t>(after + 1u - target.address)) == both, "a read from a depth guard across a gap into a color guard lost a registry");
+    Require(ResidentGuardOverlaps_nid_no_patch(before + 0x100000u, static_cast<std::size_t>(target.address - before - 0x100000u)) == 0u, "the gap between a color and a depth guard was not proven clear");
+    ClearMultisampleTargets(colorContext.device);
+    Require(violations == 0u, "a check that loaded a depth registration's final growth saw no resident depth guard in " + std::to_string(violations) + " rounds");
+    Require(stale.load() == 0u, "a proof taken during a native depth registration was accepted after it " + std::to_string(stale.load()) + " times");
+    std::printf("Native depth registration race: %u registrations with nothing resident, the resident flag and proofs never lag the growth, reads across a color and a depth guard see both\n", Rounds);
+}
+
 void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, std::uint32_t mode) {
     constexpr VkExtent2D extent{5u, 3u};
     const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(extent, format == VK_FORMAT_D16_UNORM ? 2u : 4u, samples));
@@ -1611,6 +1718,7 @@ int main(int argc, char** argv) {
             return 0;
         }
         Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--retirement"), "invalid native depth fixture arguments");
+        if (argc == 1) CheckRegistrationRace(context, VK_FORMAT_D32_SFLOAT, 4u);
         if (argc == 2) {
             std::uint32_t checked = 0u, unavailable = 0u;
             for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT}) {

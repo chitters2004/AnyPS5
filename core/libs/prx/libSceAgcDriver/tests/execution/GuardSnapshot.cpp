@@ -607,6 +607,73 @@ bool CheckTargets() {
         ClearMultisampleTargets(context.device);
     }
     settle();
+    {
+        GuestBlock block;
+        const auto target = Target(block);
+        const auto address = block.Address();
+        constexpr unsigned Readers = 3;
+        constexpr unsigned Rounds = 8000;
+        std::atomic<unsigned> round{0}, published{0}, ready{0}, finished{0}, stale{0}, failures{0};
+        std::atomic<bool> done{false};
+        std::vector<std::thread> readers;
+        for (unsigned reader = 0; reader < Readers; ++reader) {
+            readers.emplace_back([&, reader] {
+                AgcDriver::GuestMemory::RangeProof rangeProof;
+                ResidentGuardProof proof;
+                unsigned seen = 0;
+                while (!done.load(std::memory_order_acquire)) {
+                    const auto current = round.load(std::memory_order_acquire);
+                    if (current == seen) continue;
+                    seen = current;
+                    ready.fetch_add(1, std::memory_order_acq_rel);
+                    bool after = false;
+                    for (unsigned spin = 0; !after; ++spin) {
+                        after = published.load(std::memory_order_acquire) >= current;
+                        const auto read = address + 64u * reader;
+                        try {
+                            if (RequireNoMultisampleTargetProved(&rangeProof, read, 64u, "a vertex buffer read") && after) stale.fetch_add(1, std::memory_order_relaxed);
+                        } catch (const std::runtime_error&) {
+                        }
+                        const auto growth = ResidentGuardGrowth_nid_no_patch();
+                        const bool proved = proof.Holds(growth, current) || (ResidentGuardsClear_nid_no_patch(read, 64u) && (proof.Record(growth, current), true));
+                        if (after && proved) stale.fetch_add(1, std::memory_order_relaxed);
+                        if (spin > 50000000u) {
+                            failures.fetch_add(1, std::memory_order_relaxed);
+                            break;
+                        }
+                    }
+                    finished.fetch_add(1, std::memory_order_acq_rel);
+                }
+            });
+        }
+        for (unsigned current = 1; current <= Rounds; ++current) {
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                ClearMultisampleTargets(context.device);
+            }
+            settle();
+            ready.store(0, std::memory_order_release);
+            finished.store(0, std::memory_order_release);
+            round.store(current, std::memory_order_release);
+            while (ready.load(std::memory_order_acquire) != Readers) std::this_thread::yield();
+            const auto before = ResidentGuardGrowth_nid_no_patch();
+            acquire(target);
+            Require(ResidentGuardGrowth_nid_no_patch() > before, "a race round did not register the color target");
+            published.store(current, std::memory_order_release);
+            while (finished.load(std::memory_order_acquire) != Readers) std::this_thread::yield();
+        }
+        done.store(true, std::memory_order_release);
+        for (auto& thread : readers) thread.join();
+        settle();
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            ClearMultisampleTargets(context.device);
+        }
+        settle();
+        Require(failures.load() == 0u, "a target registration reader did not finish");
+        Require(stale.load() == 0u, "a proof or snapshot taken during a color target registration was accepted after it " + std::to_string(stale.load()) + " times");
+        std::printf("target race: %u registrations of a color target with nothing resident, no proof or snapshot accepted after one\n", Rounds);
+    }
     std::puts("targets: creation and address reuse are seen, repeated host-only acquires do not grow, retired and unmapped ranges are proven clear, claimed targets still retire");
     return true;
 }
