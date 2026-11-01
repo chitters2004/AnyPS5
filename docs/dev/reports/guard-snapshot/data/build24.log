@@ -1,0 +1,30 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/34] cd /home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver && /usr/bin/cmake -DGIT=/usr/bin/git -DSOURCE=/home/user/AnyPS5 -DOUTPUT=/home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver/generated/prx/libSceAgcDriver/TraceRevision.hpp -P /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/trace_revision.cmake
+[2/28] Linking CXX shared library core/libs/libs/unpatched/libSceAgc.prx
+[3/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_storage_tests.dir/tests/execution/DepthStorage.cpp.o
+[4/28] Linking CXX executable tests/agc_driver_depth_storage_tests
+[5/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_plane_guest_layers_tests.dir/tests/execution/DepthPlaneGuestLayers.cpp.o
+[6/28] Linking CXX executable tests/agc_driver_depth_plane_guest_layers_tests
+[7/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_fast_clear_submit_tests.dir/tests/execution/DepthFastClearSubmit.cpp.o
+[8/28] Linking CXX executable tests/agc_driver_depth_fast_clear_submit_tests
+[9/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_surface_last_writer_tests.dir/tests/execution/DepthSurfaceLastWriter.cpp.o
+[10/28] Linking CXX executable tests/agc_driver_depth_surface_last_writer_tests
+[11/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_guard_snapshot_tests.dir/tests/execution/GuardSnapshot.cpp.o
+[12/28] Linking CXX executable tests/agc_driver_guard_snapshot_tests
+[13/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_multisample_retirement_tests.dir/tests/execution/MultisampleRetirement.cpp.o
+[14/28] Linking CXX executable tests/agc_driver_multisample_retirement_tests
+[15/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_alpha_to_coverage_tests.dir/tests/execution/AlphaToCoverage.cpp.o
+[16/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_depth_bda_clear_tests.dir/tests/execution/NativeDepthBdaClear.cpp.o
+[17/28] Linking CXX executable tests/agc_driver_alpha_to_coverage_tests
+[18/28] Linking CXX executable tests/agc_driver_native_depth_bda_clear_tests
+[19/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_quad_list_index_overflow_tests.dir/tests/execution/QuadListIndexOverflow.cpp.o
+[20/28] Linking CXX executable tests/agc_driver_quad_list_index_overflow_tests
+[21/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_order_tests.dir/tests/execution/SampleOrder.cpp.o
+[22/28] Linking CXX executable tests/agc_driver_sample_order_tests
+[23/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_multisample_target_tests.dir/tests/execution/SampleMultisampleTarget.cpp.o
+[24/28] Linking CXX executable tests/agc_driver_sample_multisample_target_tests
+[25/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_multisample_depth_tests.dir/tests/execution/NativeMultisampleDepth.cpp.o
+[26/28] Linking CXX executable tests/agc_driver_native_multisample_depth_tests
+[27/28] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_recorder_tests.dir/tests/Recorder.cpp.o
+[28/28] Linking CXX executable tests/agc_driver_recorder_tests

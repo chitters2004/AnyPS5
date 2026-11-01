@@ -1,0 +1,6 @@
+cost,quad-list expansion, 10000 quads, one GuestMemory::Read per index (old),1,2708157.4
+cost,quad-list expansion, 10000 quads, one batched read and ExpandPatchIndices (new),1,47387.8
+cost,quad-list expansion, 10000 quads, one GuestMemory::Read per index (old),1,2902056.1
+cost,quad-list expansion, 10000 quads, one batched read and ExpandPatchIndices (new),1,45303.6
+cost,quad-list expansion, 10000 quads, one GuestMemory::Read per index (old),1,4066231.5
+cost,quad-list expansion, 10000 quads, one batched read and ExpandPatchIndices (new),1,45582.6

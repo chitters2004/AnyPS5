@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <sys/mman.h>
@@ -109,6 +110,41 @@ int main() {
         Report(("GuestMemory::Read, page-cached image" + suffix).c_str(), 1, Time(1, 500000, [&](unsigned, std::uint64_t) { GuestMemory::Read(imageAddress, destination); }));
         Report(("GuestMemory::Read, uncached mapping" + suffix).c_str(), 1, Time(1, 200000, [&](unsigned, std::uint64_t) { GuestMemory::Read(mappedAddress, destination); }));
         Report(("memcpy" + suffix).c_str(), 1, Time(1, 2000000, [&](unsigned, std::uint64_t) { std::memcpy(destination.data(), image, bytes); sinks[0].value = static_cast<std::uint64_t>(destination[0]); }));
+    }
+    {
+        constexpr std::uint32_t Quads = 10000;
+        auto* indices = reinterpret_cast<std::uint16_t*>(image);
+        for (std::uint32_t index = 0; index < Quads * 4u; ++index) indices[index] = static_cast<std::uint16_t>((index * 7u) & 0xffffu);
+        std::vector<std::uint32_t> out(static_cast<std::size_t>(Quads) * 6u);
+        const auto perIndex = Time(1, 20, [&](unsigned thread, std::uint64_t) {
+            GuestMemory::FlushGpuWrites(imageAddress, Quads * 8u);
+            GuestMemory::CheckRange(image, Quads * 8u, 2);
+            std::uint32_t highest = 0;
+            for (std::uint32_t quad = 0; quad < Quads; ++quad) {
+                std::uint32_t corner[4];
+                for (std::uint32_t at = 0; at < 4u; ++at) {
+                    std::uint16_t value = 0;
+                    GuestMemory::Read(imageAddress + (static_cast<std::uint64_t>(quad) * 4u + at) * 2u, std::as_writable_bytes(std::span(&value, 1)), 2);
+                    corner[at] = value;
+                    highest = std::max(highest, corner[at]);
+                }
+                auto* written = out.data() + static_cast<std::size_t>(quad) * 6u;
+                written[0] = corner[0];
+                written[1] = corner[1];
+                written[2] = corner[2];
+                written[3] = corner[0];
+                written[4] = corner[2];
+                written[5] = corner[3];
+            }
+            sinks[thread].value = highest;
+        });
+        const auto batched = Time(1, 20, [&](unsigned thread, std::uint64_t) {
+            std::vector<std::byte> bytes(Quads * 8u);
+            GuestMemory::Read(imageAddress, bytes, 2);
+            sinks[thread].value = ExpandPatchIndices_nid_no_patch(true, false, Quads, bytes, 2u, out);
+        });
+        Report("quad-list expansion, 10000 quads, one GuestMemory::Read per index (old)", 1, perIndex);
+        Report("quad-list expansion, 10000 quads, one batched read and ExpandPatchIndices (new)", 1, batched);
     }
     ClearMultisampleTargets(context.device);
     GuestAllocations::Mutation().Remove(mapped);

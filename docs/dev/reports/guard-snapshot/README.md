@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03`, `26c7b2105`, the three docs commits after `5293a5cc7` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03`, `26c7b2105`, the three docs commits after `5293a5cc7`, the docs commit after `88142952c` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,7 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `88142952c` | perf: CPU index expansion reads the index range once instead of once per index (see "Index expansion batching"). |
 | `5293a5cc7` | test: race the full color target and native depth registrations against checks, and reads spanning a color and a depth guard (see "Registration races"). |
 | `b7a439237` | fix: a snapshot lookup ORs the tags of every interval the read covers (see "Independent review"). |
 | `7d96fe73e` | fix: `GuardOneFragmentFmask` marks the color guard resident before its registration finishes (see "Bug found by the range proofs"). |
@@ -390,11 +391,35 @@ From the source, by grepping direct calls (`data/read_callers.txt`): 76 direct c
 - **The strongest finding is batching, not proofs.** `Draw.cpp` (about line 1590) expands quad lists and strip patches on the CPU by calling `GuestMemory::Read` once per index (2 or 4 bytes). The index range was already flushed and `CheckRange`d just above.
   - At about 60–80 ns per call, a 10,000-quad draw (40,000 index reads) costs about 3 ms in read overhead (estimate from the measured per-read cost).
   - One guarded read of the whole index range into a local buffer would cut this to roughly the cost of a copy.
-  - Not implemented here.
+  - Implemented in `88142952c` (see "Index expansion batching").
 - **Others to look at:**
   - `ShaderMemory.cpp` reads shader memory one word at a time in its pending-write and verification policies, a path that mainly runs during captures.
   - `ShaderInputState.cpp` already reads in one batch and only falls back per entry when the whole range is not accessible.
 - **Conclusion:** proofs at `GuestMemory::Read` callers are not worth it. The guard is about 13 ns of a read, and the large-read and per-packet callers have no owner. Batching the per-element loops, starting with index expansion, is the useful change. A GTA trace (`CountReadCaller`) would confirm which of these paths run per frame.
+
+## Index expansion batching (`88142952c`)
+
+- **What changed:** quad lists and triangle strips drawn through emulated barycentric patches expand their indices on the CPU in `prepareDrawInputs` (`Draw.cpp`). Each index was fetched with its own `GuestMemory::Read` of 2 or 4 bytes, which repeats the guard check, the GPU-write flush, the mapping check and the read counters each time. The index range is now read once into a host vector by one `GuestMemory::Read`, which performs the same flush, guard and mapping checks over the whole range. The expansion loop moved unchanged into `ExpandPatchIndices_nid_no_patch` (declared in `Draw.hpp`), which also refuses a source or output too small for the primitives.
+- **Behaviour:**
+  - The indices read are the same: every index used is below `indexCount`, and the range is `indexCount × indexSize`.
+  - Index size is already restricted to 2 or 4 earlier in the function.
+  - The only difference is that all indices now come from one copy taken at one moment, instead of being read one at a time.
+- **Measured** in the driver (`driver_guard_cost.cpp`, `data/index_expansion_cost.csv`; 10,000 quads of 16-bit indices on page-cached memory, single thread):
+
+| | per draw |
+|---|---|
+| Old: one `GuestMemory::Read` per index (40,000 reads) | 2.7–4.1 ms |
+| New: one read and `ExpandPatchIndices_nid_no_patch` | 45–55 µs |
+
+  About 60× faster, matching the earlier estimate of about 3 ms. How often GTA draws quad lists or strips through this path is unknown without a trace.
+- **Tests:**
+  - **There was no coverage before.** The existing `quadListTests` in `tests/Graphics.cpp` fails with "incorrect graphics stage count" before reaching the expansion, so nothing covered it.
+  - **New unit test:** it tests `ExpandPatchIndices_nid_no_patch` directly against hand-derived expected outputs: quads and strips, first and last provoking vertex, 16- and 32-bit indices (including 70000 and 70009, which do not fit 16 bits), automatic indices, and refusal of a short source and of a short output.
+  - **First attempt, dropped:** a test of the draw's index limit, which never reached the expansion for the same reason.
+  - **Results:** 19 tests pass under validation, adding `agc_driver_quad_list_index_overflow`, with only the device-creation VUID, 3 per device creation (`data/ctest_expansion_validation.log`).
+- **Mistakes along the way:**
+  - The first placement of the new function was inside an anonymous namespace, so it was not exported to the test; it now sits next to `DrawRecipes()`.
+  - One edit script matched an earlier occurrence of its end marker and duplicated part of `Graphics.cpp`; it was restored from a copy before anything was committed.
 
 ## Summary of results
 
@@ -433,6 +458,8 @@ The repository's `.gitignore` excludes `*.log`, so the `.log` files here were mi
 | `mingw_syntax_check.log` | MinGW compile check of the changed sources. |
 | `read_callers.txt` | The direct `GuestMemory` read calls found by the census. |
 | `independent_review.md` | The independent review's findings. |
+| `ctest_expansion_validation.log` | 19 tests on `88142952c` (index expansion batching). |
+| `index_expansion_cost.csv` | Old and new index expansion cost, 3 runs. |
 | `ctest_head_validation.log` | 18 tests on `5293a5cc7` code (after the review fix and with both race tests). |
 | `ctest_final_validation.log` | 18 tests on `7d96fe73e` (after the fix). |
 | `ctest_log_mapping_validation.log` | 16 tests on `cff455dfe` (registration log and mapping proofs). |
