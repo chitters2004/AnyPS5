@@ -2,6 +2,60 @@
 
 This file and `reports/bench/` are here only so that local agents can continue the work without the original conversation. AGENTS.md, CONTRIBUTING.md and `tools/check_conventions.py` keep reports out of the repository (`[notes-file]` error). Drop every `docs:` commit that touches `reports/` before anything goes upstream.
 
+## 0. Owner run sheet (GTA, Windows)
+
+One build of head covers every change: each draw-path change has an off-switch, so a single binary times them all. All commands run from the repository root.
+
+**What it costs:** 6 configurations, 3 rounds, a timing pass and a profile pass, at 150 s per run plus a pause, is about 95 minutes unattended. The quick version below is about 20 minutes.
+
+**Step 1. Build head** (`draft/commit-cost`) the way you normally build for GTA. Note the commit and your GPU, driver and OS.
+
+**Step 2. Pick a repeatable scene.** Use the same save, place and camera every launch, and the same resolution and settings. Lock GPU clocks if you can (`nvidia-smi -lgc <clock>`). The script launches GTA once per run and stops it after `--seconds`. If GTA needs input after launch to reach the scene, the runs are not comparable; use step 5 instead.
+
+**Step 3. Full run:**
+
+```bash
+python reports/ab_run.py run --out ab-gta --rounds 3 --seconds 150 --warmup 30 -- <the command that starts GTA>
+```
+
+**Quick run** (head, ring off, all switches off):
+
+```bash
+python reports/ab_run.py run --out ab-gta-quick --configs head,no-ring,all-off --rounds 2 --seconds 120 --warmup 30 -- <the command that starts GTA>
+```
+
+**Optional epoch-proof pass:** `APS5_DRAW_PIPELINE=1` makes Revalidate reuse proofs; the profile lines differ with it.
+
+```bash
+python reports/ab_run.py run --out ab-gta-pipeline --mode profile --pipeline --configs head --rounds 2 --seconds 120 --warmup 30 -- <the command that starts GTA>
+```
+
+**Step 4. Send back:**
+- the markdown the script prints at the end (`python reports/ab_run.py report ab-gta` prints it again);
+- the commit, GPU, driver and OS;
+- for a speed claim in a PR, the `tools/trace_digest.py` summary of `ab-gta/timing/head/round-1/aps5-summary.jsonl` and the same on main.
+
+**Reading the table:**
+- A `no-X` row slower than `head` is what change X saves. `all-off` approximates main for the switchable changes; commit `331932b6f` and the once-per-batch keep (`4ae6f4bc8`) have no switch.
+- The profile table gives the lookup split, the Revalidate split and the ring share that choose the next step (section 8).
+
+**Step 5. If launches are not repeatable,** capture once and replay instead:
+- Set `APS5_FRAME_CAPTURE=<dir>` and play to the scene. It records 10 frames at the next flip by default; `APS5_FRAME_CAPTURE_TRIGGER` lets you pick the moment (see `docs/dev/BUILD.md`, Frame capture and replay).
+- Give the script `build/core/libs/prx/libSceAgcDriver/agc_frame_replay.exe <dir>` as the command, with `build/core/libs/libs/unpatched` prepended to `PATH`. A replay exits on its own, so `--seconds` only bounds it.
+- Unverified: whether a replay writes `aps5-summary.jsonl` intervals as a title does. If the timing table is empty, use the replay's own JSON line in each run's `stdout.log`.
+- A capture also lets agents reproduce GTA frames on Linux. It holds the game's memory, so share it privately only.
+
+Switch reference:
+
+| Configuration | Switches set | Turns off |
+|---|---|---|
+| `head` | none | nothing |
+| `no-ring` | `APS5_NO_DYNAMIC_DRAW_DATA=1` | `eb2f5b50f` and its follow-ups `f8eedb639` and `4ae6f4bc8` |
+| `no-set-reuse` | `APS5_NO_DRAW_SET_REUSE=1` | `30ef0bf7a` |
+| `no-chunk` | `APS5_DRAW_UPLOAD_CHUNK_MIB=1` | `d2b0314fb` |
+| `no-pending-gate` | `APS5_NO_PENDING_WRITE_GATE=1` | `78647781b` |
+| `all-off` | all four | all of the above |
+
 ## 1. Goal and rules
 
 - **Goal:** GTA V (PPSA04263) at PS5 Pro frame rate or better, with no fidelity loss. Fixes must be general; never per-title logic.
@@ -132,8 +186,9 @@ Each code commit was timed alone and validated as in section 3.
 | `4ae6f4bc8` | Fixed-size offsets; the batch keeps the ring set and chunk once (`Recorder::KeptOnce`) | dynamicDrawDataTests use_count check | Removes per-draw keeps and two per-draw allocations |
 | `4df6d3109` | Profile-only `[revalidate-split]` and `[lookup-split]` lines (APS5_PROFILE_DRAW) | `agc_revalidate_split` (new ctest; does not compile without the change) | Measurement for the next step; no behaviour change |
 | `78647781b` | The Revalidate pre-pass checks `AnyPendingCpuWrites` once and walks its ranges for pending CPU writes only when some are pending (re-checked after a depth-plane flush that did work) | `agc_revalidate_split`: a revalidation with nothing pending makes no checks (fails when the old always-check is forced); with copied writers pending it still checks | Per range and proof: drops a `DrawCopiedWriters()` shared_ptr copy, the per-thread `InCompletion` read (emutls on Windows) and an atomic load. The `[revalidate-split]` line prints checks per call |
+| `434d12353` | Switches for one-build A/B: `APS5_NO_DRAW_SET_REUSE`, `APS5_DRAW_UPLOAD_CHUNK_MIB` (default 16) and `APS5_NO_PENDING_WRITE_GATE` | `agc_draw_bindings_no_set_reuse`, `agc_draw_bindings_small_chunk` and `agc_revalidate_split_ungated` check that each switch restores the old behaviour | Lets the owner time each change in one build with `reports/ab_run.py` (section 0) |
 
-The A/B switch for the ring is `APS5_NO_DYNAMIC_DRAW_DATA=1`, which restores the old layouts and bindings. Standalone benchmarks are in `reports/bench/` (build commands in section 9).
+Section 0 lists the A/B switches; `reports/ab_run.py` runs them. Standalone benchmarks are in `reports/bench/` (build commands in section 9).
 
 **Per-draw CPU benchmark** (`reports/bench/draw-bindings.cpp`, standalone; mock Vulkan with descriptor updates stubbed, so the Vulkan driver's own cost is excluded). It measures MovedReadOnlyBuffers plus PrepareDrawBindings for a template whose ShaderData and SRT both change, in us per draw, ring on versus off:
 
