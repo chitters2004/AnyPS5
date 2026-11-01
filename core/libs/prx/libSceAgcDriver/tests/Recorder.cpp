@@ -12669,6 +12669,12 @@ int main(int argc, char** argv) {
             std::uint64_t nanoseconds = 0;
             for (std::size_t phase = 0; phase < after.nanoseconds.size(); ++phase) nanoseconds += after.nanoseconds[phase] - before.nanoseconds[phase];
             Require(delta(&Split::walks) >= delta(&Split::proved) && delta(&Split::walks) != 0 && delta(&Split::ranges) != 0 && nanoseconds != 0, "full revalidations were not timed by phase");
+            Require(delta(&Split::pendingChecks) != 0, "a revalidation with copied writers pending did not check its ranges for them");
+            const Split quiet = AgcDriver::Graphics::ShaderResources::RevalidateSplitCounts();
+            Require(sparseRunImportTests(device, false), "the sparse run import tests failed");
+            const Split idle = AgcDriver::Graphics::ShaderResources::RevalidateSplitCounts();
+            Require(idle.walks > quiet.walks && idle.ranges > quiet.ranges, "the sparse run import tests made no full revalidation");
+            Require(idle.pendingChecks == quiet.pendingChecks, "a revalidation with no CPU writes pending checked its ranges for them");
             std::cout << "Revalidate split counters passed\n";
             return 0;
         }

@@ -3655,7 +3655,7 @@ namespace {
 
 struct ProofSplit {
     std::atomic<std::uint64_t> reused{0}, proved{0}, noEpoch{0}, firstProof{0}, epochMoved{0}, proofMoved{0}, pendingMoved{0};
-    std::atomic<std::uint64_t> walks{0}, ranges{0}, images{0}, storageImages{0};
+    std::atomic<std::uint64_t> walks{0}, ranges{0}, images{0}, storageImages{0}, pendingChecks{0};
     std::array<std::atomic<std::uint64_t>, 4> nanoseconds{};
     std::atomic<std::int64_t> lastReport{0};
 };
@@ -3677,10 +3677,10 @@ void reportProofSplit() {
     if (nowMs - last < 10000 || !split.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto counts = ShaderResources::RevalidateSplitCounts();
     const auto walks = static_cast<double>(std::max<std::uint64_t>(counts.walks, 1));
-    AgcDriver::ProfilePrint_nid_no_patch("[revalidate-split] (cumulative): %llu epoch proofs reused, %llu proved (no epoch %llu, first proof %llu; moved since the object's proof: collect epoch %llu, proof serial %llu, pending serial %llu); %llu full revalidations, per call: pre-pass %.2f us over %.1f ranges, images %.2f us (%.1f textures, %.1f storage images), imports %.2f us, rest %.2f us\n", static_cast<unsigned long long>(counts.reused), static_cast<unsigned long long>(counts.proved), static_cast<unsigned long long>(counts.noEpoch), static_cast<unsigned long long>(counts.firstProof), static_cast<unsigned long long>(counts.epochMoved), static_cast<unsigned long long>(counts.proofMoved), static_cast<unsigned long long>(counts.pendingMoved), static_cast<unsigned long long>(counts.walks), static_cast<double>(counts.nanoseconds[0]) / 1000.0 / walks, static_cast<double>(counts.ranges) / walks, static_cast<double>(counts.nanoseconds[1]) / 1000.0 / walks, static_cast<double>(counts.images) / walks, static_cast<double>(counts.storageImages) / walks, static_cast<double>(counts.nanoseconds[2]) / 1000.0 / walks, static_cast<double>(counts.nanoseconds[3]) / 1000.0 / walks);
+    AgcDriver::ProfilePrint_nid_no_patch("[revalidate-split] (cumulative): %llu epoch proofs reused, %llu proved (no epoch %llu, first proof %llu; moved since the object's proof: collect epoch %llu, proof serial %llu, pending serial %llu); %llu full revalidations, per call: pre-pass %.2f us over %.1f ranges (%.1f pending-write checks), images %.2f us (%.1f textures, %.1f storage images), imports %.2f us, rest %.2f us\n", static_cast<unsigned long long>(counts.reused), static_cast<unsigned long long>(counts.proved), static_cast<unsigned long long>(counts.noEpoch), static_cast<unsigned long long>(counts.firstProof), static_cast<unsigned long long>(counts.epochMoved), static_cast<unsigned long long>(counts.proofMoved), static_cast<unsigned long long>(counts.pendingMoved), static_cast<unsigned long long>(counts.walks), static_cast<double>(counts.nanoseconds[0]) / 1000.0 / walks, static_cast<double>(counts.ranges) / walks, static_cast<double>(counts.pendingChecks) / walks, static_cast<double>(counts.nanoseconds[1]) / 1000.0 / walks, static_cast<double>(counts.images) / walks, static_cast<double>(counts.storageImages) / walks, static_cast<double>(counts.nanoseconds[2]) / 1000.0 / walks, static_cast<double>(counts.nanoseconds[3]) / 1000.0 / walks);
 }
 
-void noteProofPhases(std::chrono::steady_clock::time_point start, std::span<const std::chrono::steady_clock::time_point, 3> marks, std::size_t ranges, std::size_t images, std::size_t storageImages) {
+void noteProofPhases(std::chrono::steady_clock::time_point start, std::span<const std::chrono::steady_clock::time_point, 3> marks, std::size_t ranges, std::size_t images, std::size_t storageImages, std::size_t pendingChecks) {
     auto& split = ProofSplits();
     const auto end = std::chrono::steady_clock::now();
     auto previous = start;
@@ -3694,6 +3694,7 @@ void noteProofPhases(std::chrono::steady_clock::time_point start, std::span<cons
     split.ranges.fetch_add(ranges, std::memory_order_relaxed);
     split.images.fetch_add(images, std::memory_order_relaxed);
     split.storageImages.fetch_add(storageImages, std::memory_order_relaxed);
+    split.pendingChecks.fetch_add(pendingChecks, std::memory_order_relaxed);
     reportProofSplit();
 }
 
@@ -3713,6 +3714,7 @@ ShaderResources::RevalidateSplit ShaderResources::RevalidateSplitCounts() {
     counts.ranges = split.ranges.load(std::memory_order_relaxed);
     counts.images = split.images.load(std::memory_order_relaxed);
     counts.storageImages = split.storageImages.load(std::memory_order_relaxed);
+    counts.pendingChecks = split.pendingChecks.load(std::memory_order_relaxed);
     for (std::size_t phase = 0; phase < counts.nanoseconds.size(); ++phase) counts.nanoseconds[phase] = split.nanoseconds[phase].load(std::memory_order_relaxed);
     return counts;
 }
@@ -3770,25 +3772,33 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    std::size_t pendingChecks = 0;
+    const auto completePending = [&](std::uint64_t address, std::size_t bytes) {
+        ++pendingChecks;
+        CompletePendingCpuWrites(context, address, bytes);
+    };
+    bool pendingCpu = AnyPendingCpuWrites(context);
     for (const auto& region : directRegions) {
-        static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
-        CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) pendingCpu = AnyPendingCpuWrites(context);
+        if (pendingCpu) completePending(region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
     for (const auto& range : describedRanges) {
         if (!range.imageTable) RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        if (!pendingCpu) continue;
+        completePending(range.address, static_cast<std::size_t>(range.bytes));
+        if (range.dccAddress != 0) completePending(range.dccAddress, DccKeyBytes(range.bytes));
     }
     for (const auto& image : storageTextures) {
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        if (!pendingCpu) break;
+        completePending(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        if (image->Descriptor().dccAddress != 0) completePending(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     std::array<std::chrono::steady_clock::time_point, 3> phaseMarks{};
     if (profile) phaseMarks[0] = std::chrono::steady_clock::now();
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
-        if (profile) noteProofPhases(start, phaseMarks, directRegions.size() + describedRanges.size() + storageTextures.size(), textures.size(), storageTextures.size());
+        if (profile) noteProofPhases(start, phaseMarks, directRegions.size() + describedRanges.size() + storageTextures.size(), textures.size(), storageTextures.size(), pendingChecks);
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;

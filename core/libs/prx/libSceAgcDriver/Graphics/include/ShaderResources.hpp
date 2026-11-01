@@ -277,6 +277,7 @@ public:
         std::uint64_t ranges = 0;
         std::uint64_t images = 0;
         std::uint64_t storageImages = 0;
+        std::uint64_t pendingChecks = 0;
         std::array<std::uint64_t, 4> nanoseconds{};
     };
     static RevalidateSplit RevalidateSplitCounts();
