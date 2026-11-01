@@ -398,15 +398,17 @@ void CheckGuardLog() {
 }
 
 #ifndef _WIN32
-alignas(0x10000) std::array<std::byte, 0x20000> imageBlock{};
+std::array<std::byte, 0x30000> imageStorage{};
 
 bool CheckMappingProof() {
     using AgcDriver::GuestMemory::CheckRangeProved;
     using AgcDriver::GuestMemory::MappingEpoch;
-    auto* data = imageBlock.data();
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const auto aligned = (reinterpret_cast<std::uintptr_t>(imageStorage.data()) + 0xffffu) & ~std::uintptr_t{0xffff};
+    auto* data = reinterpret_cast<std::byte*>(aligned);
     const auto address = reinterpret_cast<std::uint64_t>(data);
-    constexpr std::size_t Page = 0x10000;
-    GuestAllocations::Mutation().Add(data, imageBlock.size(), true, true, true);
+    constexpr std::size_t BlockSize = 0x20000;
+    GuestAllocations::Mutation().Add(data, BlockSize, true, true, true);
     AgcDriver::GuestMemory::RangeProof proof;
     CheckRangeProved(&proof, data, 4096u, 4u);
     if (proof.Stamp(address, 4096u) == 0u) {
@@ -420,13 +422,13 @@ bool CheckMappingProof() {
     });
     {
         GuestAllocations::Mutation mutation;
-        mutation.Protect(data, Page, false, false, false, [&] { Require(mprotect(data, Page, PROT_NONE) == 0, "cannot protect the image block"); });
+        mutation.Protect(data, page, false, false, false, [&] { Require(mprotect(data, page, PROT_NONE) == 0, "cannot protect the image block"); });
     }
     Require(!proof.Holds(address, 4096u, MappingEpoch()), "a mapping proof held after its range became inaccessible");
     Refuses([&] { CheckRangeProved(&proof, data, 4096u, 4u); }, "not readable");
     {
         GuestAllocations::Mutation mutation;
-        mutation.Protect(data, Page, true, true, false, [&] { Require(mprotect(data, Page, PROT_READ | PROT_WRITE) == 0, "cannot unprotect the image block"); });
+        mutation.Protect(data, page, true, true, false, [&] { Require(mprotect(data, page, PROT_READ | PROT_WRITE) == 0, "cannot unprotect the image block"); });
     }
     CheckRangeProved(&proof, data, 4096u, 4u);
     Require(proof.Holds(address, 4096u, MappingEpoch()), "a readable range was not proven again");
