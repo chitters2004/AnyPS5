@@ -1664,6 +1664,7 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> noted{{{target.fmaskAddress, bytes}}};
         const ResidentGuardRegistration registration(noted, ColorGuardOverlap);
         guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
+        anyGuarded().store(true, std::memory_order_release);
     }
     anyGuarded().store(true, std::memory_order_release);
     lock.unlock();
