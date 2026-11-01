@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -11,6 +11,8 @@ Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for ag
 | `2a4339321` | perf: classify a miss once (`ResidentGuardOverlaps_nid_no_patch` returns color/depth bits) and run only the overlapping registries' exact paths. An overlapping read drops from 6 scans and 2 exact passes to 2 scans and 1 exact pass. **Pick this commit for the certificate design.** |
 | `7133b7d37` | perf: replace the certificate with a process-wide snapshot. |
 | `edaacd785` | perf: `ShaderResources::requireGuestBuffers` makes one combined check (`RequireNoMultisampleTarget` gained an optional `htileClear`), not separate depth and color checks. |
+| `7d96fe73e` | fix: `GuardOneFragmentFmask` marks the color guard resident before its registration finishes (see "Bug found by the range proofs"). |
+| `ac35a7e35` | test: the mapping proof test aligns its block at run time (MinGW rejects static objects aligned above 8192 bytes; the convention checker flagged it). |
 | `cff455dfe` | perf: `GuestMemory::CheckRangeProved` and mapping proofs on draw recipes, so a draw-cache hit skips re-querying its index and vertex mappings until guest memory changes (see "Mapping proofs"). |
 | `fb7ca46f3` | perf: a 64-entry log of recent registrations, so a stale guard proof is revalidated against the registrations since it rather than fully re-checked (see "Registration log"). The range proof moves to `GuestMemory::RangeProof`. |
 | `876e52aca` | perf: exact range proofs on draw recipes, so a draw-cache hit skips its index and vertex range checks while nothing has registered (see "Draw proofs"). |
@@ -233,6 +235,17 @@ A proof only pays when an object that persists between draws holds it; a per-thr
 - **Other tests:** 16 tests pass under validation, with the same 39 device-creation VUIDs (3 per test; `data/ctest_log_mapping_validation.log`). `agc_write_tracking` and `agc_write_watch_coverage` pass (`data/ctest_guestmemory.log`). The page-state tests are Windows-only and were not run.
 - **Not measured:** the cost of the skipped query in the driver. On Linux a small uncached range is read with `process_vm_readv` (a system call); a cached range is a page-table scan.
 
+## Bug found by the range proofs (`7d96fe73e`)
+
+The stress readers' new range-proof check (added with the registration log) accepted a stale proof after a registration in 4 of 25 runs. Splitting the stale counter showed it was always that check. The cause was older than the log:
+- `GuardOneFragmentFmask` set `anyGuarded` only after its `ResidentGuardRegistration` was destroyed, which is the finishing growth advance.
+- With no other guard resident (the stress test clears every 7 rounds), a check could load the final growth, still read `anyGuarded == false`, take `RequireNoMultisampleTarget`'s early return for an unguarded process, and record a proof stamped at the final growth that outlived the registration.
+- This affected `requireGuestBuffers` proofs since `9a7128ddb` and recipe range proofs since `876e52aca`.
+
+The fix sets the flag before the registration finishes, as `guard()` and `DepthSurfaceView` already did. The general rule for the proofs: every state a check reads must be published before the registration's finishing growth advance.
+
+After the fix the guard test passed 0-fail in 40, 20 and 30 consecutive runs. The 18-test validation suite (the 16 above plus `agc_write_tracking` and `agc_write_watch_coverage`) passes on `7d96fe73e` with the same 39 device-creation VUIDs (`data/ctest_final_validation.log`). The earlier test logs for `9a7128ddb`, `876e52aca` and `cff455dfe` passed because their stress tests did not include the check that exposes this.
+
 ## Further improvements (not done)
 
 1. Done in `fb7ca46f3` (registration log).
@@ -271,12 +284,13 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `ctest_snapshot_validation.log` | The same tests plus `guard_snapshot`, on `7133b7d37`. |
 | `ctest_combined.log` | The same tests on `edaacd785` (combined shader-buffer check). |
 | `ctest_proof_validation.log` | The same tests on `9a7128ddb` (proofs). |
+| `ctest_final_validation.log` | 18 tests on `7d96fe73e` (after the fix). |
 | `ctest_log_mapping_validation.log` | 16 tests on `cff455dfe` (registration log and mapping proofs). |
 | `ctest_guestmemory.log` | `agc_write_tracking` and `agc_write_watch_coverage` on `cff455dfe`. |
 | `log_bench.csv` | `log_bench.cpp` output: draw proofs with and without the registration log under registration load. |
 | `ctest_drawproof_validation.log` | 16 tests, including `recorder` and `sample_order`, on `876e52aca`. |
 | `probe.csv` | `probe_bench.cpp` output: snapshot lookups against owner-held proofs against a per-thread range cache. |
-| `build2.log` … `build11.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
+| `build2.log` … `build12.log`, `cfg2.log` | Incremental builds for the snapshot, the certificate, main and the combined check, and the reconfigure log. |
 
 Validation-error counts in the ctest logs: `VUID-VkDeviceCreateInfo-pNext-pNext` appears 27 times on main and 30 times on each change (3 per test, device creation only). No other VUIDs, and no `was not found but was requested by env var VK_INSTANCE_LAYERS` line.
 
