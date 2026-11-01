@@ -22,7 +22,10 @@ Commits, oldest first:
 12. `67a758ec0` docs: report update
 13. `98a77161f` fix(agc): keep GPU-compared label stores exact against completion-time stamps
 14. `8ece574c0` docs: report update
-15. this report update (wide regression)
+15. `f0224b231` docs: report update (wide regression)
+16. `820bdb6a8` test(agc): cover the late-stamping writer refusal of the label store GPU compare
+17. `42eef5b02` perf(agc): keep the label compare's bookkeeping off unless asked and report it without the draw profile
+18. this commit: `label-compare-kit/` and this report update
 
 Line references below are at commit 7 unless noted; search by function name if they moved. Paths are under `core/libs/prx/libSceAgcDriver/`.
 
@@ -314,6 +317,30 @@ readback, import, depth plane, alias, copied writer, unit or resident: 181 on `m
   `-01551`; head with the compare on equals head with it off. The new tests add only the known
   `VUID-VkDeviceCreateInfo-pNext-pNext`.
 
+## Late-stamping writer test and lean defaults (commits 16, 17)
+
+- Test: a non-reusable dispatch (it binds the BDA page table) stores both through BDA into block 0
+  and through a buffer descriptor into block 1, recorded before the image's dispatch. On watched
+  memory the label store must wait (`late-stamping-writer`); the same scenario without the
+  descriptor store must take the GPU path; waited and label bytes must match in both. Removing the
+  refusal makes the bytes differ. The refusal now applies to watched memory only (compared
+  memory decides by bytes).
+- With neither switch set, `ShaderResources::MarkGpuWrites` no longer registers lease tables or
+  late stamps, so an `off` run measures the same work as `main`.
+- The `[label-compare]` lines print on stderr every 10 s from `FlushPending` whenever it counted
+  something, without `APS5_PROFILE_DRAW`; the waits a GPU-compare store still took are timed per
+  reason. Checked with the interval set to 0 in a local build (66 lines in one test run).
+
+## Windows and GTA kit
+
+`label-compare-kit/` (not for upstream): `README.md` (step by step), `run-tests.ps1` (focused or
+wide tests on `main`, branch, branch with the compare on, then a by-name comparison),
+`run-gta.ps1` (deploys one build's libraries into the converted title and runs one mode with a
+trace window), `summarize.py` (`tests`: ctest logs by name; `gta`: `[label-compare]` totals,
+mismatches, refusal reasons ranked by wait time with the next step each points to, frame-time
+table from `aps5-summary.jsonl`; `self-test`). The Python tool was checked against the Linux logs
+of this report; the PowerShell scripts were not run (no Windows or PowerShell here).
+
 ## Extensions: what the code says (no title needed)
 
 - Edge blocks: a lease's completion stamps go in as byte-range `possiblePieces`, checked exactly
@@ -331,7 +358,9 @@ readback, import, depth plane, alias, copied writer, unit or resident: 181 on `m
 - Any title; no frame-time number. Hardware GPUs; Windows.
 - Import lifetime at runtime. The completion's generation and ticket guards and the positive settle
   on watched memory (tests exist but skip on this machine, see above).
-- The late-stamping-writer refusal (no test builds a non-reusable direct writer).
+- The late-stamping writer test (commit 16) cannot separate the completion re-stamp from the
+  lavapipe artefact: on lavapipe the waited path also sees the descriptor store's execution as a
+  CPU store. Either way the refusal is what keeps the bytes identical.
 - Concurrent CPU stores during the window (same race class as today's decision after the wait),
   including the baseline-filled bytes a stored block-unit range rewrites.
 - `captureGuestBytes` reads unsynced (`Texture.cpp:2628`): an image that becomes pending again
@@ -359,7 +388,7 @@ readback, import, depth plane, alias, copied writer, unit or resident: 181 on `m
 
 ## Next steps, ranked
 
-1. Measure (above); the refusal histogram decides the rest.
+1. Measure with `label-compare-kit/` (above); the refusal histogram decides the rest.
 2. Run the branch's tests on a GPU whose import probe keeps imports watched (the settle and guard
    cases run there instead of skipping).
 3. If `fallback-lease-in-flight` costs time, per-use lease tables; if `fallback-edge` does, an
