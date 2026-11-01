@@ -2059,7 +2059,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 
 namespace {
 
-constexpr std::uint32_t MaxDynamicData = 64;
+constexpr std::uint32_t MaxDynamicData = static_cast<std::uint32_t>(ShaderResources::DynamicOffsets::Capacity);
 
 bool DynamicDrawData() {
     static const bool enabled = std::getenv("APS5_NO_DYNAMIC_DRAW_DATA") == nullptr;
@@ -6160,8 +6160,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::ringDrawBindings
     result->fragmentAllocation.set = ring->fragmentAllocation.set;
     result->shared = std::move(ring);
     result->snapshots.push_back({0, slice.buffer, slice.offset, static_cast<std::size_t>(total)});
-    recorder.Keep(result);
-    recorder.KeepBytes(slice.buffer.get(), slice.buffer->Bytes().size());
+    if (recorder.KeptOnce(result->shared.get())) recorder.Keep(result->shared);
+    if (recorder.KeptOnce(slice.buffer.get())) {
+        recorder.Keep(slice.buffer);
+        recorder.KeepBytes(slice.buffer.get(), slice.buffer->Bytes().size());
+    }
     ringDrawCount.fetch_add(1, std::memory_order_relaxed);
     return result;
 }

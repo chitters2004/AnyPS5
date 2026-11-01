@@ -119,6 +119,7 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    bool KeptOnce(const void* owner);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -568,6 +569,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
+        std::unordered_set<const void*> keptOnce;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;

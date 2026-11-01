@@ -6653,6 +6653,7 @@ void dynamicDrawDataTests() {
             Require(moved.has_value() && moved->size() == (srt ? 2u : 1u), "changed shader data was not reported, or unchanged data was");
             auto bindings = resources.PrepareDrawBindings(recorder, *moved);
             Require(bindings != nullptr && bindings->shared != nullptr && bindings->dynamicOffsets[0].size() == 2 && bindings->dynamicOffsets[1].empty(), "a draw whose only change is its shader data did not take the ring set");
+            Require(bindings.use_count() == 1 && bindings->shared.use_count() >= 3, "a ring draw was kept by the batch per draw, or its ring set was not kept by the batch");
             const auto chunk = bindings->snapshots.at(0).buffer;
             const auto bytes = bufferBytes(chunk->Handle());
             if (!srt) Require(bindings->dynamicOffsets[0][1] == 0u, "an unchanged shader data binding was given a ring offset");

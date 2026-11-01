@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <limits>
@@ -17,6 +18,7 @@
 #include <optional>
 #include <span>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -208,6 +210,23 @@ public:
         VkDescriptorSetLayout fragmentLayout = VK_NULL_HANDLE;
         std::vector<Pair> sets;
     };
+    struct DynamicOffsets {
+        static constexpr std::size_t Capacity = 64;
+        std::array<std::uint32_t, Capacity> values{};
+        std::uint32_t count = 0;
+        void push_back(std::uint32_t value) { values.at(count++) = value; }
+        void assign(std::size_t size, std::uint32_t value) {
+            if (size > Capacity) throw std::out_of_range("too many dynamic offsets");
+            count = static_cast<std::uint32_t>(size);
+            std::fill_n(values.begin(), size, value);
+        }
+        void reserve(std::size_t) {}
+        std::size_t size() const { return count; }
+        bool empty() const { return count == 0; }
+        const std::uint32_t* data() const { return values.data(); }
+        std::uint32_t operator[](std::size_t index) const { return values[index]; }
+        bool operator==(const DynamicOffsets& other) const { return count == other.count && std::equal(values.begin(), values.begin() + count, other.values.begin()); }
+    };
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -227,7 +246,7 @@ public:
         std::vector<Snapshot> snapshots;
         std::shared_ptr<WrittenSets> owner;
         bool rewroteBuffersOnly = false;
-        std::array<std::vector<std::uint32_t>, 2> dynamicOffsets;
+        std::array<DynamicOffsets, 2> dynamicOffsets;
         std::shared_ptr<DrawBindings> shared;
         ~DrawBindings();
     };
