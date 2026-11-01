@@ -21,7 +21,8 @@ Commits, oldest first:
 11. `8a7ab13ae` feat(agc): split the label store fallback refusals by cause in shadow mode
 12. `67a758ec0` docs: report update
 13. `98a77161f` fix(agc): keep GPU-compared label stores exact against completion-time stamps
-14. this report update
+14. `8ece574c0` docs: report update
+15. this report update (wide regression)
 
 Line references below are at commit 7 unless noted; search by function name if they moved. Paths are under `core/libs/prx/libSceAgcDriver/`.
 
@@ -297,6 +298,21 @@ the in-flight and shared-table refusals, and found four issues. I verified each 
   stores, so a completion can never settle; on compared memory the second use's CPU refresh syncs
   the batch first. Removing either guard therefore changes nothing on this machine. Both tests are
   written to run on a GPU whose import probe keeps imports watched; run them there.
+
+## Wide regression (after commit 13)
+
+Every registered test whose name matches storage, label, flush, write-back, shadow, BDA, lease,
+readback, import, depth plane, alias, copied writer, unit or resident: 181 on `main`
+`dc9dc7eaa`, 185 on head (the 4 new ones), 70 executables, lavapipe,
+`ANYPS5_REQUIRE_VULKAN=1 ANYPS5_NO_SHADER_CACHE=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation ctest -V -j2`.
+
+- Outcomes per test are identical on `main`, head, and head with `APS5_LABEL_GPU_COMPARE=1`:
+  148 pass, 18 skip, 15 fail on all three (relinker import tests and two guest-net tests the name
+  pattern caught; unrelated). The 4 new tests pass.
+- No `was not found but was requested by env var VK_INSTANCE_LAYERS` in any log. VUIDs per test
+  name are identical to `main`, including the existing `VUID-vkCmdCopyImage-srcImage-01548` and
+  `-01551`; head with the compare on equals head with it off. The new tests add only the known
+  `VUID-VkDeviceCreateInfo-pNext-pNext`.
 
 ## Extensions: what the code says (no title needed)
 
