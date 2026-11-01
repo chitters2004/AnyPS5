@@ -19,7 +19,7 @@ Base: upstream/main `dc9dc7eaaeaf99b1c491d426e68bb999def3da16`.
 - **copyRegion / snapshotCopy** (GuestBufferMemory.cpp). A snapshot-backed region uploads a snapshot taken before the device lock. The snapshot copy cache shares one buffer between identical snapshots (by address, size and usage, then memcmp).
 - **CopyDrawInput.** Vertex and index bytes are copied into a pooled Buffer unless a reusable recorder snapshot exists. The Buffer is created exactly to size (BindExactBuffer) because robust vertex fetch bounds use the buffer size.
 
-## Commits on the branch
+## Commits on the branch (drop every docs: commit before going upstream)
 
 1. `331932b6f` perf(agc): move a snapshot into the copy cache instead of copying it. On a cache miss, the entry takes the region's vector instead of copying it, which removes one memcpy and one allocation per miss. Test: agc_snapshot_copy_failure (CheckMovedInsertion; fails without the change). Standalone benchmark (insert only): 0 B saves 19 ns, 4 KiB saves 172 ns, 1 MiB saves 145 us; 64 KiB was even.
 2. `30ef0bf7a` perf(agc): reuse a template's draw sets and rewrite only their buffers. A finished draw returns its sets to the build that wrote them (up to 16 per build). The next draw of that build rewrites only its storage-buffer descriptors. Test: agc_driver_graphics writtenSetReuseTests (fails without the change). Standalone benchmark on lavapipe, vkUpdateDescriptorSets with 3 buffers: 0 other descriptors saves 0 ns, 16 samplers save 25 ns, 64 save 84 ns.
@@ -36,27 +36,26 @@ Not verified: GTA, Windows, descriptor write cost on real drivers, and whether t
 4. CopyDrawInput's exactly sized buffers: exact size matters for robust vertex fetch, so it stays.
 5. DrawResourceKey vector build and hash: under 1 us of 34.8, dropped.
 
-## Ring and dynamic-offset constants: design (in progress)
+## Commit 3: ring and dynamic-offset constants (`eb2f5b50f`)
 
-Goal: a template hit whose data words changed binds one long-lived set with dynamic offsets into the recorder's DrawUpload chunk, instead of allocating and writing a set per draw.
+perf(agc): bind draw shader data through dynamic offsets into the upload ring.
 
-- **Scope.** Graphics builds only (drawBuild), not BDA, not update-after-bind (a dynamic type is invalid in an UPDATE_AFTER_BIND_POOL layout), and dynamic bindings per set within maxDescriptorSetStorageBuffersDynamic. A switch disables it. Compute keeps STORAGE_BUFFER and RefreshData.
-- **Layout.** ShaderData and FlattenedSrt bindings (DataRole, count 1) become VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC. The layout key carries the type, so pipelines and layouts separate by themselves. Places that assume STORAGE_BUFFER:
-  - the image count in buildComplete;
-  - the write switch;
-  - the non-split pool sizes;
-  - DescriptorCache chain pool sizes (they need a dynamic entry);
-  - the descriptor limit switch (maxDescriptorSetStorageBuffersDynamic);
-  - the update-after-bind flags;
-  - commit 2's buffers-only filter.
-- **Bind sites.** ShaderResources::Bind (zero offsets for the template's own set), Draw.cpp recordDraw (the DrawBindings offsets) and recordPreparedDraw (via Bind). VulkanDevice compute binds stay non-dynamic. Dynamic offsets are ordered by binding number within each set.
-- **Per draw.** In dynamic mode, MovedReadOnlyBuffers reports every data binding with its words (no compare). PrepareDrawBindings takes the ring path when only data words are selected:
-  - reserve one DrawUpload slice for all data bindings, with sub-offsets aligned to minStorageBufferOffsetAlignment, and copy the words with dataPatches applied;
-  - take the template's ring set for that chunk, or write one (from WrittenSets with buffer writes only, else AllocateRewritten with every write);
-  - return a small per-draw DrawBindings that shares the ring set (no recycling of its own), carries the dynamic offsets, and keeps the slice for capture.
-  When guest buffers are selected, the existing rewrite path runs and binds with zero offsets.
-- **Lifetime.** The ring set is a DrawBindings held by the template and by each draw that uses it (the recorder keeps the draw). When the chunk changes, the template drops it, and it returns to WrittenSets once its batches finish. It holds the chunk only weakly for identity.
-- **Expected saving.** Most template hits stop allocating a set, stop issuing vkUpdateDescriptorSets and stop taking DescriptorCache's mutex. The left-over per-draw cost is one small memcpy, one make_shared and the bind.
+- **Layout.** Graphics builds without update-after-bind give their ShaderData and FlattenedSrt bindings VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC. This applies only when the dynamic bindings fit maxDescriptorSetStorageBuffersDynamic and 64. buildPrepare and DescribeSetLayouts share one rule (DynamicDataLayout), so the pipelined and journal paths still get identical layouts; APS5_VERIFY_SET_LAYOUTS=1 passes on lavapipe. Dispatches keep STORAGE_BUFFER. The chain pools hold 2048 dynamic descriptors, and SetDescriptorLimit knows the type.
+- **Per draw.** In dynamic mode, MovedReadOnlyBuffers reports every data binding with its words, with no compare. When nothing else needs a snapshot, PrepareDrawBindings reserves one DrawUpload slice for all data bindings, with sub-offsets aligned to minStorageBufferOffsetAlignment, and copies the words with dataPatches applied. It then returns a small DrawBindings that shares the template's ring set for that upload chunk and carries the dynamic offsets. A ring set is written once per (template, chunk) and never updated while in use. When the chunk changes, it goes back to WrittenSets once its batches finish.
+- **Other paths.** A draw that also snapshots a read-only guest buffer keeps the rewritten-set path and binds with zero offsets. ShaderResources::Bind binds the template's own set with zero offsets.
+- **Switches and counters.** APS5_NO_DYNAMIC_DRAW_DATA=1 restores the previous layouts. The [rescache] draw line (APS5_PROFILE_DRAW) now prints the cumulative counts of ring draws, ring sets written and rewritten sets.
+- **Tests.** agc_driver_graphics dynamicDrawDataTests is a mock test, and it fails with APS5_NO_DYNAMIC_DRAW_DATA=1. It covers layout types, agreement with DescribeSetLayouts, zero offsets on Bind, compute staying non-dynamic, one ring set write per chunk, no writes on the second draw, aligned and distinct offsets, and earlier draws' bytes left intact. The Recorder.cpp capture hook now reads dynamic writes as buffers.
+- **Validation.** On lavapipe all 23 focused tests pass with the validation layer, and the VUID set is identical to main. A temporary, uncommitted probe confirmed that real-device draws took the ring path: 7 in agc_driver_recorder and 1 in agc_draw_descriptors. The execution tests' draws used non-dynamic templates.
+- **Limit.** The ring path applies only when no read-only guest buffer is snapshotted for the draw. The profile line's ring/rewritten split on GTA decides whether the next step below is needed.
+
+## Further options, ranked
+
+1. **Revalidate (lookup is 34.8 of 68 us; 9.6% busy, always revalidateFull).** This is the largest remaining item. Epoch proofs are reused only while the global collect epoch, proof serial and pending serial all stay unchanged, and a busy frame moves them constantly. A per-template proof keyed on the write generations of the template's own ranges would make the proof O(ranges) compares instead of repeating cachedTexture lookups. First collect the [rescache] revalidate FastFail reasons on GTA.
+2. **Guest buffer snapshots into the same ring.** Small read-only guest snapshots (up to DrawUploadLimit, 4 KiB) already come from DrawUpload. Making those bindings dynamic as well would let draws with snapshots take the ring path. Do this only if the new counter shows that rewritten sets dominate.
+3. **ShaderResources constructor (23.8%) with 98.6% draw template hits.** This is probably dispatch builds. Measure the draw/dispatch split before acting.
+4. **Register draw cache (15% entries).** The key includes user-data words. Check the [draw-cache] data-only hit count; widening data hits would cut decode work, not the committer's lookup.
+5. **Descriptor heap / descriptor buffer (upstream #9508).** It supersedes sets entirely and would subsume commits 2 and 3 if it lands.
+6. **Push descriptors.** Not better: they rewrite every descriptor per draw (what commit 2 removes) and cap at maxPushDescriptors.
 
 ## What the owner should measure on GTA
 
