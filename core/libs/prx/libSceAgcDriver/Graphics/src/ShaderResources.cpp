@@ -50,6 +50,73 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+struct BlockCompareCount {
+    static constexpr std::size_t Buckets = 5;
+    static constexpr std::array<std::size_t, Buckets - 1> Limits{16u << 10u, 64u << 10u, 128u << 10u, 256u << 10u};
+    static constexpr std::array<const char*, Buckets> Names{"le16k", "le64k", "le128k", "le256k", "gt256k"};
+    struct Bucket {
+        std::atomic<std::uint64_t> compares{0};
+        std::atomic<std::uint64_t> equal{0};
+        std::atomic<std::uint64_t> selective{0};
+        std::atomic<std::uint64_t> selectiveEqual{0};
+        std::atomic<std::uint64_t> surface{0};
+        std::atomic<std::uint64_t> compared{0};
+    };
+    std::array<Bucket, Buckets> buckets{};
+    std::atomic<std::uint64_t> compares{0};
+    std::atomic<std::uint64_t> fullPending{0};
+    std::atomic<std::uint64_t> fullNoGeneration{0};
+    std::atomic<std::uint64_t> fullCommitted{0};
+    std::atomic<std::uint64_t> trackedNoSnapshotOver{0};
+    std::atomic<std::uint64_t> otherNoSnapshot{0};
+    std::atomic<std::uint64_t> parkedOver{0};
+    const bool enabled = std::getenv("APS5_BLOCK_COMPARE_COUNT") != nullptr;
+    static std::size_t BucketOf(std::size_t bytes) {
+        std::size_t index = 0;
+        while (index < Limits.size() && bytes > Limits[index]) ++index;
+        return index;
+    }
+    static unsigned long long Load(const std::atomic<std::uint64_t>& value) {
+        return static_cast<unsigned long long>(value.load(std::memory_order_relaxed));
+    }
+    void Print() const {
+        std::uint64_t surface = 0, compared = 0, equal = 0;
+        for (const auto& bucket : buckets) {
+            surface += bucket.surface.load(std::memory_order_relaxed);
+            compared += bucket.compared.load(std::memory_order_relaxed);
+            equal += bucket.equal.load(std::memory_order_relaxed);
+        }
+        std::fprintf(stderr, "[blockcompare] site=texture-compare compares=%llu equal=%llu surface=%llu compared=%llu saved=%llu full-pending=%llu full-no-generation=%llu full-committed=%llu tracked-no-snapshot-over-256k=%llu other-no-snapshot=%llu parked-over-256k=%llu\n",
+            Load(compares), static_cast<unsigned long long>(equal), static_cast<unsigned long long>(surface), static_cast<unsigned long long>(compared), static_cast<unsigned long long>(surface - compared),
+            Load(fullPending), Load(fullNoGeneration), Load(fullCommitted), Load(trackedNoSnapshotOver), Load(otherNoSnapshot), Load(parkedOver));
+        for (std::size_t index = 0; index < Buckets; ++index) {
+            const auto& bucket = buckets[index];
+            if (bucket.compares.load(std::memory_order_relaxed) == 0) continue;
+            std::fprintf(stderr, "[blockcompare]   size=%s compares=%llu equal=%llu selective=%llu selective-equal=%llu surface=%llu compared=%llu\n", Names[index], Load(bucket.compares), Load(bucket.equal), Load(bucket.selective), Load(bucket.selectiveEqual), Load(bucket.surface), Load(bucket.compared));
+        }
+    }
+    void Add(std::size_t surface, std::size_t compared, bool selective, bool same) {
+        if (!enabled) return;
+        auto& bucket = buckets[BucketOf(surface)];
+        bucket.compares.fetch_add(1, std::memory_order_relaxed);
+        bucket.surface.fetch_add(surface, std::memory_order_relaxed);
+        bucket.compared.fetch_add(compared, std::memory_order_relaxed);
+        if (same) bucket.equal.fetch_add(1, std::memory_order_relaxed);
+        if (selective) bucket.selective.fetch_add(1, std::memory_order_relaxed);
+        if (selective && same) bucket.selectiveEqual.fetch_add(1, std::memory_order_relaxed);
+        if ((compares.fetch_add(1, std::memory_order_relaxed) + 1) % 2048 == 0) Print();
+    }
+    ~BlockCompareCount() {
+        if (enabled) Print();
+    }
+};
+
+BlockCompareCount& BlockCompareCounter() {
+    static BlockCompareCount counter;
+    return counter;
+}
+
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -980,12 +1047,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
             const auto equalsCommitted = [&] {
-                if (it->bytes.empty()) return false;
+                if (it->bytes.empty()) {
+                    auto& count = BlockCompareCounter();
+                    if (count.enabled) (snapshotGeneration != 0 && it->surfaceBytes > (256u << 10u) ? count.trackedNoSnapshotOver : count.otherNoSnapshot).fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
                 const bool pending = Recorder::SnapshotWriteOverlaps(address, bytes);
                 if (pending) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                if (pending || snapshotGeneration == 0 || it->committed != committed) return GuestMemory::EqualsCommitted(address, it->bytes);
-                return GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation);
+                auto& count = BlockCompareCounter();
+                if (pending || snapshotGeneration == 0 || it->committed != committed) {
+                    if (count.enabled) (pending ? count.fullPending : snapshotGeneration == 0 ? count.fullNoGeneration : count.fullCommitted).fetch_add(1, std::memory_order_relaxed);
+                    const bool same = GuestMemory::EqualsCommitted(address, it->bytes);
+                    count.Add(it->bytes.size(), it->bytes.size(), false, same);
+                    return same;
+                }
+                std::size_t compared = 0;
+                const bool same = GuestMemory::EqualsCommittedSince(address, it->bytes, it->generation, &compared);
+                count.Add(it->bytes.size(), compared, true, same);
+                return same;
             };
             const auto unchanged = [&] {
                 if (it->committed != committed) return false;
@@ -1063,7 +1143,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare);
         entry.accounted = entry.texture->AllocationBytes();
         constexpr std::size_t SnapshotCompareBytes = 256u << 10u;
-        if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
+        if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) {
+            if (auto& count = BlockCompareCounter(); count.enabled && entry.generation != 0) count.parkedOver.fetch_add(1, std::memory_order_relaxed);
+            parkSnapshot(cache, entry.bytes);
+        }
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
     const auto budget = sampledBudget(context, cache);
