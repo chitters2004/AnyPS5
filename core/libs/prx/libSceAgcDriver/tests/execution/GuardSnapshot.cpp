@@ -152,6 +152,8 @@ void CheckHeadless() {
     Require(ResidentGuardsClear_nid_no_patch(guardAddress - 64u, 64u), "the range ending at a guard was not proven clear");
     Refuses([&] { RequireNoMultisampleTarget(guardAddress - 64u, 128u, "a CPU read"); }, "FMASK");
     Require(ResidentGuardsClear_nid_no_patch(guardAddress + FmaskBytes, 1u), "the range starting at a guard end was not proven clear");
+    Refuses([&] { RequireNoMultisampleTarget(guardAddress, 64u, "a shader buffer access", std::pair<std::uint64_t, std::size_t>{guardAddress, FmaskBytes}); }, "FMASK");
+    RequireNoMultisampleTarget(distant, 64u, "a shader buffer access", std::pair<std::uint64_t, std::size_t>{distant, 64u});
     Require(!ResidentGuardsClear_nid_no_patch(std::numeric_limits<std::uint64_t>::max() - 15u, 32u), "an overflowing range was proven clear");
     Refuses([&] { RequireNoMultisampleColorTarget(std::numeric_limits<std::uint64_t>::max() - 15u, 32u, "a CPU read"); }, "overflows");
     Require(ResidentGuardsClear_nid_no_patch(distant, 4096u), "a distant range was not proven clear after a registration");

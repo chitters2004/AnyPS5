@@ -96,7 +96,7 @@ std::uint64_t ResidentGuardGrowth_nid_no_patch();
 void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap);
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);
-void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);
+void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes);
 

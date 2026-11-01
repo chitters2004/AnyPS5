@@ -1782,10 +1782,10 @@ static void requireNoColorTargetExact(std::uint64_t address, std::size_t bytes, 
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
 }
 
-void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access) {
+void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
     if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch())) return;
     const auto overlaps = ResidentGuardOverlaps_nid_no_patch(address, bytes);
-    if ((overlaps & DepthGuardOverlap) != 0u && HasResidentDepthGuards_nid_no_patch()) RequireNoResidentDepthReadExact_nid_no_patch(address, bytes);
+    if ((overlaps & DepthGuardOverlap) != 0u && HasResidentDepthGuards_nid_no_patch()) RequireNoResidentDepthReadExact_nid_no_patch(address, bytes, htileClear);
     if ((overlaps & ColorGuardOverlap) != 0u && anyGuarded().load(std::memory_order_acquire)) requireNoColorTargetExact(address, bytes, access);
 }
 
