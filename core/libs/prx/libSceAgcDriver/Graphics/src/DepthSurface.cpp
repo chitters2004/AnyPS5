@@ -2307,7 +2307,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
             std::unique_lock guardLock(depthGuardMutex());
             std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
             for (const auto& range : fresh.sampling.initial) noted.emplace_back(range.address, range.bytes);
-            NoteResidentGuardRanges_nid_no_patch(noted, DepthGuardOverlap);
+            const ResidentGuardRegistration registration(noted, DepthGuardOverlap);
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten});
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();

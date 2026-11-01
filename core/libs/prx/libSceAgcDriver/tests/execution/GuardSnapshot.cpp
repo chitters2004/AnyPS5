@@ -184,6 +184,7 @@ void CheckStress() {
     std::vector<std::thread> readers;
     for (unsigned reader = 0; reader < Readers; ++reader) {
         readers.emplace_back([&, reader] {
+            ResidentGuardProof proof;
             unsigned seen = 0;
             while (!done.load(std::memory_order_acquire)) {
                 const auto current = round.load(std::memory_order_acquire);
@@ -207,6 +208,9 @@ void CheckStress() {
                     } catch (const std::runtime_error&) {
                     }
                     RequireNoMultisampleTarget(warm, 64u, "a CPU read");
+                    const auto growth = ResidentGuardGrowth_nid_no_patch();
+                    const bool proved = proof.Holds(growth, current) || (ResidentGuardsClear_nid_no_patch(address + 128u, 64u) && (proof.Record(growth, current), true));
+                    if (after && proved) stale.fetch_add(1, std::memory_order_relaxed);
                     if (current > 8u) {
                         try {
                             RequireNoMultisampleColorTarget(Base + 0x10000000ull + static_cast<std::uint64_t>(current - 8u) * 0x40000u, 64u, "a CPU read");
@@ -237,7 +241,7 @@ void CheckStress() {
     ClearMultisampleTargets(context.device);
     Require(failures.load() == 0u, "a stress reader failed " + std::to_string(failures.load()) + " times");
     Require(stale.load() == 0u, "a stale snapshot was accepted " + std::to_string(stale.load()) + " times after a registration");
-    std::printf("stress: %u rounds of %u readers with concurrent rebuilds, no stale snapshot accepted after a registration\n", Rounds, Readers);
+    std::printf("stress: %u rounds of %u readers with concurrent rebuilds and proofs, no stale snapshot or proof accepted after a registration\n", Rounds, Readers);
 }
 
 void CheckStaleRebuild() {
@@ -280,6 +284,33 @@ void CheckOverflow() {
         for (int round = 0; round < 1000; ++round) Require(ResidentGuardsClear_nid_no_patch(distant + round, 64u), "a distant range was not proven clear after the snapshot recovered");
     });
     std::puts("overflow: an overflowing snapshot sends reads to the exact path and recovers after removals");
+}
+
+void CheckProof() {
+    const auto context = FakeContext(0xa000u);
+    const auto guardAddress = Base + 0x50000000ull;
+    ClearMultisampleTargets(context.device);
+    ResidentGuardProof proof;
+    const auto start = ResidentGuardGrowth_nid_no_patch();
+    Require(!proof.Holds(start, 1u), "an empty proof held");
+    Require(RequireNoMultisampleTarget(guardAddress, 64u, "a CPU read"), "an unguarded read was not reported clear");
+    proof.Record(start, 1u);
+    Require(proof.Holds(start, 1u), "a recorded proof did not hold");
+    Require(!proof.Holds(start, 2u), "a proof held for another key");
+    Require(!proof.Holds(start, std::uint64_t{1} << ResidentGuardProof::KeyBits), "a proof held for a key wider than its bits");
+    Require(!proof.Holds(std::uint64_t{1} << (64u - ResidentGuardProof::KeyBits), 1u), "a proof held for a growth wider than its bits");
+    GuardOneFragmentFmask(context, Fmask(guardAddress));
+    const auto registered = ResidentGuardGrowth_nid_no_patch();
+    Require(registered >= start + 2u, "a registration did not advance the growth when it started and when it finished");
+    Require(!proof.Holds(registered, 1u), "a proof held after a registration");
+    Refuses([&] { RequireNoMultisampleTarget(guardAddress + FmaskBytes - 64u, 64u, "a CPU read"); }, "FMASK");
+    proof.Record(registered, 1u);
+    ClearMultisampleTargets(context.device);
+    Require(proof.Holds(ResidentGuardGrowth_nid_no_patch(), 1u), "removing guards invalidated a proof");
+    WithoutSharedWrites([&] {
+        for (int round = 0; round < 1000; ++round) Require(proof.Holds(ResidentGuardGrowth_nid_no_patch(), 1u), "a held proof stopped holding");
+    });
+    std::puts("proof: a recorded proof holds until a registration, survives removals, and checking it writes nothing in the driver image");
 }
 
 struct TeardownReads {
@@ -459,6 +490,7 @@ int main() {
         CheckStress();
         CheckTeardown();
         CheckStaleRebuild();
+        CheckProof();
         CheckOverflow();
         if (!CheckTargets()) std::puts("targets: skipped, no Vulkan device with 4x color targets");
         return 0;

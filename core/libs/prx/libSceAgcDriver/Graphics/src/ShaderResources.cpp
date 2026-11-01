@@ -5938,14 +5938,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    const auto growth = ResidentGuardGrowth_nid_no_patch();
+    const auto key = static_cast<std::uint64_t>(allocations.size());
+    if (moved.empty() && guestBuffersProof.Holds(growth, key)) return;
+    bool clear = true;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoMultisampleTarget(address, bytes, "a shader buffer access", htileClear);
+        if (!RequireNoMultisampleTarget(address, bytes, "a shader buffer access", htileClear)) clear = false;
     }
+    if (moved.empty() && clear) guestBuffersProof.Record(growth, key);
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

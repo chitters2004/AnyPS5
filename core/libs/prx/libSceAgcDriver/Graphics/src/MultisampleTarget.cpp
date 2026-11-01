@@ -1015,7 +1015,7 @@ void guard(const Context& context, const ColorTarget& target, const std::shared_
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
     for (const auto& range : ranges) noted.emplace_back(range.address, range.bytes);
-    NoteResidentGuardRanges_nid_no_patch(noted, ColorGuardOverlap);
+    const ResidentGuardRegistration registration(noted, ColorGuardOverlap);
     guarded().insert(guarded().end(), ranges.begin(), ranges.end());
     guardedGeneration().fetch_add(1, std::memory_order_release);
     anyGuarded().store(true, std::memory_order_release);
@@ -1632,7 +1632,7 @@ void GuardOneFragmentFmask(const Context& context, const ColorTarget& target) {
     const bool known = std::ranges::any_of(guarded(), [&](const auto& range) { return range.fmask && range.device == context.device && range.address == target.fmaskAddress && range.bytes == bytes; });
     if (!known) {
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> noted{{{target.fmaskAddress, bytes}}};
-        NoteResidentGuardRanges_nid_no_patch(noted, ColorGuardOverlap);
+        const ResidentGuardRegistration registration(noted, ColorGuardOverlap);
         guarded().push_back({context.device, target.fmaskAddress, bytes, target.coverageSamples, std::make_shared<std::atomic<bool>>(true), nullptr, std::make_shared<TargetUse>(), true});
     }
     anyGuarded().store(true, std::memory_order_release);
@@ -1657,6 +1657,10 @@ void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_
     }
     for (const auto& [address, bytes] : ranges) intervals.push_back(guardInterval(address, bytes, overlap & GuardSnapshotTags));
     publishGuardSnapshot(mergedGuardIntervals(std::move(intervals)));
+}
+
+void FinishResidentGuardRegistration_nid_no_patch() {
+    guardGrowth().fetch_add(1, std::memory_order_release);
 }
 
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes) {
@@ -1782,11 +1786,13 @@ static void requireNoColorTargetExact(std::uint64_t address, std::size_t bytes, 
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
 }
 
-void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
-    if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch())) return;
+bool RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
+    if (bytes == 0 || (!anyGuarded().load(std::memory_order_acquire) && !HasResidentDepthGuards_nid_no_patch())) return true;
     const auto overlaps = ResidentGuardOverlaps_nid_no_patch(address, bytes);
+    if (overlaps == 0u) return true;
     if ((overlaps & DepthGuardOverlap) != 0u && HasResidentDepthGuards_nid_no_patch()) RequireNoResidentDepthReadExact_nid_no_patch(address, bytes, htileClear);
     if ((overlaps & ColorGuardOverlap) != 0u && anyGuarded().load(std::memory_order_acquire)) requireNoColorTargetExact(address, bytes, access);
+    return false;
 }
 
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {

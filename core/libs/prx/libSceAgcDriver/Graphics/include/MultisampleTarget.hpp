@@ -7,6 +7,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -94,9 +95,39 @@ inline constexpr unsigned DepthGuardOverlap = 2u;
 
 std::uint64_t ResidentGuardGrowth_nid_no_patch();
 void NoteResidentGuardRanges_nid_no_patch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap);
+void FinishResidentGuardRegistration_nid_no_patch();
+
+class ResidentGuardRegistration {
+public:
+    ResidentGuardRegistration(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, unsigned overlap) { NoteResidentGuardRanges_nid_no_patch(ranges, overlap); }
+    ~ResidentGuardRegistration() { FinishResidentGuardRegistration_nid_no_patch(); }
+    ResidentGuardRegistration(const ResidentGuardRegistration&) = delete;
+    ResidentGuardRegistration& operator=(const ResidentGuardRegistration&) = delete;
+};
+
+class ResidentGuardProof {
+public:
+    static constexpr unsigned KeyBits = 16;
+
+    bool Holds(std::uint64_t growth, std::uint64_t key) const noexcept {
+        const auto packed = pack(growth, key);
+        return packed != 0u && proved.load(std::memory_order_acquire) == packed;
+    }
+
+    void Record(std::uint64_t growth, std::uint64_t key) noexcept { proved.store(pack(growth, key), std::memory_order_release); }
+
+private:
+    static std::uint64_t pack(std::uint64_t growth, std::uint64_t key) noexcept {
+        if (growth == 0u || key >> KeyBits != 0u || growth >> (64u - KeyBits) != 0u) return 0u;
+        return growth << KeyBits | key;
+    }
+
+    std::atomic<std::uint64_t> proved{0};
+};
+
 unsigned ResidentGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes);
 bool ResidentGuardsClear_nid_no_patch(std::uint64_t address, std::size_t bytes);
-void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+bool RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes);
 

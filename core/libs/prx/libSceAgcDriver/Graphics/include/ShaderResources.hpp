@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include <array>
 #include <chrono>
 #include <limits>
@@ -659,6 +660,7 @@ private:
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
     std::uint64_t provedGuards = 0;
+    mutable ResidentGuardProof guestBuffersProof;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
