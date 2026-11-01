@@ -1,6 +1,6 @@
 # AGC guard check: certificate vs snapshot
 
-Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03`, `26c7b2105` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
+Branch `draft/guard-snapshot`, based on `draft/agc-guard`. This folder is for agents and reviewers reading the branch. `tools/check_conventions.py` allows Markdown and logs under `docs/dev/`, so it passes, but `AGENTS.md` says reports belong in the pull request and no other files may be added. Before opening a pull request, drop every `docs(agc)` commit (`88079274b`, `af5a4f28e`, `aabfd6e43`, `8adf95f64`, `126fff126`, `e4d71ebe2`, `850f87fe2`, `da5182b03`, `26c7b2105`, the three docs commits after `5293a5cc7` and the one that adds this sentence) and move the text into the PR body. They are interleaved with code commits, so rebuild the branch from the `fix`/`perf` commits in order.
 
 ## Commits
 
@@ -415,7 +415,7 @@ The snapshot is the better design. It is never slower than the certificate in a 
 
 ## Raw data (`data/`)
 
-The repository's `.gitignore` excludes `*.log`, so the `.log` files here were missing from the branch until `docs(agc)` commit `{LOGCOMMIT}` force-added them; earlier versions of this README listed them before they were committed. A local agent adding more logs needs `git add -f`.
+The repository's `.gitignore` excludes `*.log`, so the `.log` files here were missing from the branch until `docs(agc)` commit `13b8a28d2` force-added them; earlier versions of this README listed them before they were committed. A local agent adding more logs needs `git add -f`.
 
 | File | Contents |
 |---|---|
