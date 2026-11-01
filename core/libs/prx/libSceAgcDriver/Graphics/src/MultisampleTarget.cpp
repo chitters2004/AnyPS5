@@ -887,9 +887,10 @@ unsigned guardSnapshotOverlaps(std::uint64_t address, std::uint64_t end) {
                 else high = middle;
             }
             overlaps = 0u;
-            if (low < limit) {
-                const auto begin = guardSnapshot.begin[low].load(std::memory_order_relaxed);
-                if ((begin & ~GuardSnapshotTags) < end) overlaps = static_cast<unsigned>(begin & GuardSnapshotTags);
+            for (auto index = low; index < limit && overlaps != GuardSnapshotTags; ++index) {
+                const auto begin = guardSnapshot.begin[index].load(std::memory_order_relaxed);
+                if ((begin & ~GuardSnapshotTags) >= end) break;
+                overlaps |= static_cast<unsigned>(begin & GuardSnapshotTags);
             }
         }
         std::atomic_thread_fence(std::memory_order_acquire);
