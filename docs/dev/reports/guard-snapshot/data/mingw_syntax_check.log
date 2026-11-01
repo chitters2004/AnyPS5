@@ -1,0 +1,8 @@
+x86_64-w64-mingw32-g++-posix (GCC) 13-posix
+Graphics/src/MultisampleTarget.cpp: compiles
+Graphics/src/DepthSurface.cpp: compiles
+Execution/src/GuestMemory.cpp: compiles
+Graphics/src/ShaderResources.cpp: compiles
+Graphics/src/Draw.cpp: compiles
+tests/execution/GuardSnapshot.cpp: compiles
+tests/execution/NativeMultisampleDepth.cpp: compiles

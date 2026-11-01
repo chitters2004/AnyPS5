@@ -1,0 +1,2 @@
+original: teardown reads of a dead certificate=64, of the retired sentinel=0, of a live one=0
+fixed: teardown reads of a dead certificate=0, of the retired sentinel=64, of a live one=0

@@ -1,0 +1,255 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/186] cd /home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver && /usr/bin/cmake -DGIT=/usr/bin/git -DSOURCE=/home/user/AnyPS5 -DOUTPUT=/home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver/generated/prx/libSceAgcDriver/TraceRevision.hpp -P /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/trace_revision.cmake
+[2/186] Hashing the shader recompiler sources for the shader disk cache
+[3/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Unimplemented.cpp.o
+[4/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Export.cpp.o
+[5/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Acb/src/Control.cpp.o
+[6/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Acb/src/Dispatch.cpp.o
+[7/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Acb/src/Sync.cpp.o
+[8/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Acb/src/Memory.cpp.o
+[9/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Cb/src/Dispatch.cpp.o
+[10/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Cb/src/Branch.cpp.o
+[11/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Command/src/Control.cpp.o
+[12/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Command/src/Draw.cpp.o
+[13/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Command/src/Memory.cpp.o
+[14/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Command/src/RegisterDefaults.cpp.o
+[15/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Cb/src/Registers.cpp.o
+[16/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Cb/src/Sync.cpp.o
+[17/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Command/src/Packet.cpp.o
+[18/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbDraw/src/DrawIndexed.cpp.o
+[19/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbDraw/src/DrawNonIndexed.cpp.o
+[20/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbDraw/src/IndexBuffer.cpp.o
+[21/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbDraw/src/Instancing.cpp.o
+[22/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbFlow/src/Dispatch.cpp.o
+[23/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbDraw/src/Stats.cpp.o
+[24/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbFlow/src/Control.cpp.o
+[25/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbFlow/src/Memory.cpp.o
+[26/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbFlow/src/Sync.cpp.o
+[27/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/ContextState.cpp.o
+[28/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Display.cpp.o
+[29/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Init.cpp.o
+[30/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Marker.cpp.o
+[31/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Predication.cpp.o
+[32/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Workload.cpp.o
+[33/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/DcbState/src/Registers.cpp.o
+[34/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/PacketInfo.cpp.o
+[35/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/Platform.cpp.o
+[36/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/Debug.cpp.o
+[37/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/StaticBuffer.cpp.o
+[38/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/RegisterDefaults.cpp.o
+[39/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/Semaphore.cpp.o
+[40/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/Suspend.cpp.o
+[41/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/CondExec.cpp.o
+[42/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Misc/src/ShaderFusion.cpp.o
+In file included from /usr/include/c++/13/algorithm:60,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgc/Misc/src/ShaderFusion.cpp:3:
+In function 'constexpr decltype (__comp((* __first1), (* __first2))) std::lexicographical_compare_three_way(_InputIter1, _InputIter1, _InputIter2, _InputIter2, _Comp) [with _InputIter1 = __gnu_cxx::__normal_iterator<const unsigned char*, vector<unsigned char> >; _InputIter2 = __gnu_cxx::__normal_iterator<const unsigned char*, vector<unsigned char> >; _Comp = __detail::_Synth3way]',
+    inlined from 'constexpr std::__detail::__synth3way_t<_T1> std::operator<=>(const vector<_Tp, _Alloc>&, const vector<_Tp, _Alloc>&) [with _Tp = unsigned char; _Alloc = allocator<unsigned char>]' at /usr/include/c++/13/bits/stl_vector.h:2061:52,
+    inlined from 'constexpr bool std::less<_Tp>::operator()(const _Tp&, const _Tp&) const [with _Tp = std::vector<unsigned char>]' at /usr/include/c++/13/bits/stl_function.h:408:20,
+    inlined from 'std::pair<std::_Rb_tree_node_base*, std::_Rb_tree_node_base*> std::_Rb_tree<_Key, _Val, _KeyOfValue, _Compare, _Alloc>::_M_get_insert_unique_pos(const key_type&) [with _Key = std::vector<unsigned char>; _Val = std::pair<const std::vector<unsigned char>, {anonymous}::FusedProgram>; _KeyOfValue = std::_Select1st<std::pair<const std::vector<unsigned char>, {anonymous}::FusedProgram> >; _Compare = std::less<std::vector<unsigned char> >; _Alloc = std::allocator<std::pair<const std::vector<unsigned char>, {anonymous}::FusedProgram> >]' at /usr/include/c++/13/bits/stl_tree.h:2118:35:
+/usr/include/c++/13/bits/stl_algobase.h:1848:39: warning: 'int __builtin_memcmp(const void*, const void*, long unsigned int)' specified bound [9223372036854775808, 18446744073709551615] exceeds maximum object size 9223372036854775807 [-Wstringop-overread]
+ 1848 |                     = __builtin_memcmp(&*__first1, &*__first2, __blen) <=> 0;
+      |                       ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[43/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/Dma.cpp.o
+[44/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/IndirectRegisters.cpp.o
+[45/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/Jump.cpp.o
+[46/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/Nop.cpp.o
+[47/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/QueueEndOfPipeAction.cpp.o
+[48/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/Rewind.cpp.o
+[49/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/WaitRegMem.cpp.o
+[50/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Patch/src/Branch.cpp.o
+[51/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Predication/src/Predication.cpp.o
+[52/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/CreateShader.cpp.o
+[53/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/LinkShaders.cpp.o
+[54/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/GsPrimPayload.cpp.o
+[55/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/GsOversubscription.cpp.o
+[56/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/ShaderUtils.cpp.o
+[57/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/InterpolantMapping.cpp.o
+[58/184] Building CXX object core/libs/prx/libSceAgc/CMakeFiles/libSceAgc.dir/Shader/src/PrimState.cpp.o
+[59/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/DeviceAccess.cpp.o
+[60/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Diagnostics.cpp.o
+[61/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DataHitVerification.cpp.o
+[62/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchCache.cpp.o
+[63/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchAhead.cpp.o
+[64/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/Dispatch.cpp.o
+[65/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchCacheStatistics.cpp.o
+[66/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchInsert.cpp.o
+[67/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchTiming.cpp.o
+[68/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/DispatchLookup.cpp.o
+[69/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/IndirectDispatch.cpp.o
+[70/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/VariantValidation.cpp.o
+[71/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawCacheStatistics.cpp.o
+[72/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawCache.cpp.o
+[73/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawDecode.cpp.o
+[74/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawLookup.cpp.o
+[75/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawCapture.cpp.o
+[76/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/Draw.cpp.o
+[77/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawPrecheck.cpp.o
+[78/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawRegisterKey.cpp.o
+[79/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawPipeline.cpp.o
+[80/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawTiming.cpp.o
+[81/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/IndirectDraw.cpp.o
+[82/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawRelocate.cpp.o
+[83/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/EntryPoints.cpp.o
+[84/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/BufferCopy.cpp.o
+[85/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Lifecycle.cpp.o
+[86/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/BufferFill.cpp.o
+[87/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/CaptureDiagnostics.cpp.o
+[88/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/CaptureValidation.cpp.o
+[89/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/WriteEvidence.cpp.o
+[90/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/CommandValidation.cpp.o
+[91/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/WrittenBuffers.cpp.o
+[92/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketFlush.cpp.o
+[93/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketHistory.cpp.o
+[94/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketExecution.cpp.o
+[95/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketMemory.cpp.o
+[96/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketTiming.cpp.o
+[97/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Presentation.cpp.o
+[98/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Queues/QueueWorker.cpp.o
+[99/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Queues/WorkerAffinity.cpp.o
+[100/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Queues/Submission.cpp.o
+[101/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Shaders/ShaderDiagnostics.cpp.o
+[102/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Synchronization/DeferredLabels.cpp.o
+[103/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Synchronization/LabelHistory.cpp.o
+[104/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp.o
+[105/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Synchronization/WaitMemory.cpp.o
+[106/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Synchronization/WaitStatistics.cpp.o
+[107/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/HostReportSources.cpp.o
+[108/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/PerformanceTrace.cpp.o
+[109/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Shaders/ShaderRegistry.cpp.o
+[110/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/FrameRecorder.cpp.o
+[111/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/FloatFlushProbe.cpp.o
+[112/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/PerformanceOverlay.cpp.o
+[113/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/DepthSurface.cpp.o
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp: In member function 'std::shared_ptr<AgcDriver::Graphics::Texture> AgcDriver::Graphics::{anonymous}::DepthPlaneCopy::Refresh(std::span<const AgcDriver::Graphics::{anonymous}::DepthPlaneSlice>, const AgcDriver::Graphics::GuestTextureResource&, VkComponentMapping, VkImageViewType, uint32_t)':
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp:1385:214: warning: format '%u' expects argument of type 'unsigned int', but argument 12 has type 'const AgcDriver::Graphics::TextureTileMode' [-Wformat=]
+ 1385 |             std::snprintf(text, sizeof(text), "AGC graphics: depth plane copy geometry does not match its layers (copy %ux%u, %u layers, %llu bytes a slice; texture %ux%u guest format %u, dimension %d, tile mode %u, %u layers, %llu bytes a slice, %zu mips)", extent.width, extent.height, layers, static_cast<unsigned long long>(sliceBytes()), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.tileMode, geometry.layers, static_cast<unsigned long long>(geometry.sliceLinearBytes), geometry.mips.size());
+      |                                                                                                                                                                                                                     ~^                                                                                                                                                                                                                         ~~~~~~~~~~~~~~~~~
+      |                                                                                                                                                                                                                      |                                                                                                                                                                                                                                  |
+      |                                                                                                                                                                                                                      unsigned int                                                                                                                                                                                                                       const AgcDriver::Graphics::TextureTileMode
+[114/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/MultisampleTarget.cpp.o
+[115/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/VulkanDevice.cpp.o
+[116/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Draw.cpp.o
+[117/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/PipelineLibrary.cpp.o
+In file included from /usr/include/c++/13/array:43,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/include/Context.hpp:9,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp:4,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/PipelineLibrary.cpp:1:
+In function 'constexpr decltype (__comp((* __first1), (* __first2))) std::lexicographical_compare_three_way(_InputIter1, _InputIter1, _InputIter2, _InputIter2, _Comp) [with _InputIter1 = __gnu_cxx::__normal_iterator<const byte*, vector<byte> >; _InputIter2 = __gnu_cxx::__normal_iterator<const byte*, vector<byte> >; _Comp = __detail::_Synth3way]',
+    inlined from 'constexpr std::__detail::__synth3way_t<_T1> std::operator<=>(const vector<_Tp, _Alloc>&, const vector<_Tp, _Alloc>&) [with _Tp = byte; _Alloc = allocator<byte>]' at /usr/include/c++/13/bits/stl_vector.h:2061:52,
+    inlined from 'constexpr bool std::less<_Tp>::operator()(const _Tp&, const _Tp&) const [with _Tp = std::vector<std::byte>]' at /usr/include/c++/13/bits/stl_function.h:408:20,
+    inlined from 'std::pair<std::_Rb_tree_node_base*, std::_Rb_tree_node_base*> std::_Rb_tree<_Key, _Val, _KeyOfValue, _Compare, _Alloc>::_M_get_insert_unique_pos(const key_type&) [with _Key = std::vector<std::byte>; _Val = std::pair<const std::vector<std::byte>, VkPipelineLayout_T*>; _KeyOfValue = std::_Select1st<std::pair<const std::vector<std::byte>, VkPipelineLayout_T*> >; _Compare = std::less<std::vector<std::byte> >; _Alloc = std::allocator<std::pair<const std::vector<std::byte>, VkPipelineLayout_T*> >]' at /usr/include/c++/13/bits/stl_tree.h:2118:35:
+/usr/include/c++/13/bits/stl_algobase.h:1848:39: warning: 'int __builtin_memcmp(const void*, const void*, long unsigned int)' specified bound [9223372036854775808, 18446744073709551615] exceeds maximum object size 9223372036854775807 [-Wstringop-overread]
+ 1848 |                     = __builtin_memcmp(&*__first1, &*__first2, __blen) <=> 0;
+      |                       ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In function 'constexpr decltype (__comp((* __first1), (* __first2))) std::lexicographical_compare_three_way(_InputIter1, _InputIter1, _InputIter2, _InputIter2, _Comp) [with _InputIter1 = __gnu_cxx::__normal_iterator<const byte*, vector<byte> >; _InputIter2 = __gnu_cxx::__normal_iterator<const byte*, vector<byte> >; _Comp = __detail::_Synth3way]',
+    inlined from 'constexpr std::__detail::__synth3way_t<_T1> std::operator<=>(const vector<_Tp, _Alloc>&, const vector<_Tp, _Alloc>&) [with _Tp = byte; _Alloc = allocator<byte>]' at /usr/include/c++/13/bits/stl_vector.h:2061:52,
+    inlined from 'constexpr bool std::less<_Tp>::operator()(const _Tp&, const _Tp&) const [with _Tp = std::vector<std::byte>]' at /usr/include/c++/13/bits/stl_function.h:408:20,
+    inlined from 'std::pair<std::_Rb_tree_node_base*, std::_Rb_tree_node_base*> std::_Rb_tree<_Key, _Val, _KeyOfValue, _Compare, _Alloc>::_M_get_insert_unique_pos(const key_type&) [with _Key = std::vector<std::byte>; _Val = std::pair<const std::vector<std::byte>, VkPipeline_T*>; _KeyOfValue = std::_Select1st<std::pair<const std::vector<std::byte>, VkPipeline_T*> >; _Compare = std::less<std::vector<std::byte> >; _Alloc = std::allocator<std::pair<const std::vector<std::byte>, VkPipeline_T*> >]' at /usr/include/c++/13/bits/stl_tree.h:2118:35:
+/usr/include/c++/13/bits/stl_algobase.h:1848:39: warning: 'int __builtin_memcmp(const void*, const void*, long unsigned int)' specified bound [9223372036854775808, 18446744073709551615] exceeds maximum object size 9223372036854775807 [-Wstringop-overread]
+ 1848 |                     = __builtin_memcmp(&*__first1, &*__first2, __blen) <=> 0;
+      |                       ~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+[118/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Pipeline.cpp.o
+[119/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/MemoryAccounting.cpp.o
+[120/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/ShaderAddressResources.cpp.o
+[121/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/PipelineJournal.cpp.o
+[122/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/BdaResources.cpp.o
+[123/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/ShaderValidation.cpp.o
+[124/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/State.cpp.o
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp: In lambda function:
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:347:86: warning: ' with a pixel shader that ex...' directive output may be truncated writing 76 bytes into a region of size between 70 and 79 [-Wformat-truncation=]
+  347 |             std::snprintf(detail, sizeof(detail), "AGC graphics: stencil operation %u with a pixel shader that exports the stencil operation value is unsupported", op);
+      |                                                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:980,
+                 from /usr/include/c++/13/cstdio:42,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:1:
+In function 'int snprintf(char*, size_t, const char*, ...)',
+    inlined from 'AgcDriver::Graphics::{anonymous}::stencilFace(uint32_t, uint32_t, uint32_t, bool, bool, bool, bool)::<lambda(uint32_t, bool)>' at /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:347:26:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:35: note: '__builtin___snprintf_chk' output between 110 and 119 bytes into a destination of size 112
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+[125/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/SampleOrder.cpp.o
+[126/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/GuestBufferMemory.cpp.o
+[127/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/ShaderResources.cpp.o
+[128/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_address_passes_tests.dir/cmake_pch.hxx.gch
+[129/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_address_passes_tests.dir/tests/ExecutionTestNotBuilt.cpp.o
+[130/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/GuestTextureResource.cpp.o
+[131/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Texture.cpp.o
+[132/184] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx
+[133/184] Linking CXX shared library core/libs/libs/unpatched/libSceAgc.prx
+[134/184] Linking CXX executable tests/agc_driver_address_passes_tests
+[135/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/BdaResources.cpp.o
+[136/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/LastRecordIndices.cpp.o
+[137/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_fast_clear_submit_tests.dir/tests/execution/DepthFastClearSubmit.cpp.o
+[138/184] Linking CXX executable tests/agc_driver_depth_fast_clear_submit_tests
+[139/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_plane_guest_layers_tests.dir/tests/execution/DepthPlaneGuestLayers.cpp.o
+[140/184] Linking CXX executable tests/agc_driver_depth_plane_guest_layers_tests
+[141/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_storage_tests.dir/tests/execution/DepthStorage.cpp.o
+[142/184] Linking CXX executable tests/agc_driver_depth_storage_tests
+[143/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_alpha_to_coverage_tests.dir/tests/execution/AlphaToCoverage.cpp.o
+[144/184] Linking CXX executable tests/agc_driver_alpha_to_coverage_tests
+[145/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_surface_last_writer_tests.dir/tests/execution/DepthSurfaceLastWriter.cpp.o
+[146/184] Linking CXX executable tests/agc_driver_depth_surface_last_writer_tests
+[147/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_guard_snapshot_tests.dir/tests/execution/GuardSnapshot.cpp.o
+[148/184] Linking CXX executable tests/agc_driver_guard_snapshot_tests
+[149/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_depth_bda_clear_tests.dir/tests/execution/NativeDepthBdaClear.cpp.o
+[150/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_multisample_retirement_tests.dir/tests/execution/MultisampleRetirement.cpp.o
+[151/184] Linking CXX executable tests/agc_driver_native_depth_bda_clear_tests
+[152/184] Linking CXX executable tests/agc_driver_multisample_retirement_tests
+[153/184] Generating generated-tests/SampleOrderTestR8_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderTexels.comp
+[154/184] Generating generated-tests/SampleOrderTestR16_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderTexels.comp
+[155/184] Generating generated-tests/SampleOrderTestR32_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderTexels.comp
+[156/184] Generating generated-tests/SampleOrderTestRG32_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderTexels.comp
+[157/184] Generating generated-tests/SampleOrderTestRGBA32_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderTexels.comp
+[158/184] Generating generated-tests/SampleOrderTestFillVertex_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderFill.vert
+[159/184] Generating generated-tests/SampleOrderTestFillDepth_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderFill.frag
+[160/184] Generating generated-tests/SampleOrderTestFillStencil_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderFill.frag
+[161/184] Generating generated-tests/SampleOrderTestReadDepth_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderRead.comp
+[162/184] Generating generated-tests/SampleOrderTestReadStencil_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderRead.comp
+[163/184] Generating generated-tests/SampleOrderTestReadColor_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleOrderRead.comp
+[164/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_multisample_target_tests.dir/tests/execution/SampleMultisampleTarget.cpp.o
+[165/184] Linking CXX executable tests/agc_driver_sample_multisample_target_tests
+[166/184] Generating generated-tests/Cover_vert_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/Cover.vert
+[167/184] Generating generated-tests/Cover_frag_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/Cover.frag
+[168/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_multisample_depth_tests.dir/tests/execution/NativeMultisampleDepth.cpp.o
+[169/184] Linking CXX executable tests/agc_driver_native_multisample_depth_tests
+[170/184] Generating generated-tests/Triangle_vert_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/Triangle.vert
+[171/184] Generating generated-tests/SampleLod_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleLod.comp
+[172/184] Generating generated-tests/Triangle_frag_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/Triangle.frag
+[173/184] Generating generated-tests/SampleArray_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/SampleArray.comp
+[174/184] Generating generated-tests/BufferUpdate_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/BufferUpdate.comp
+[175/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_order_tests.dir/tests/execution/SampleOrder.cpp.o
+[176/184] Generating generated-tests/VertexRange_vert_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/VertexRange.vert
+[177/184] Generating generated-tests/VertexRangeProducer_frag_spv.h
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/tests/shaders/VertexRangeProducer.frag
+[178/184] Linking CXX executable tests/agc_driver_sample_order_tests
+[179/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_recorder_tests.dir/tests/ResidentPresent.cpp.o
+[180/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_recorder_tests.dir/tests/HostImportLifetime.cpp.o
+[181/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_recorder_tests.dir/tests/Recorder.cpp.o
+[182/184] Linking CXX executable tests/agc_driver_recorder_tests
+[183/184] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/Graphics.cpp.o
+[184/184] Linking CXX executable tests/agc_driver_graphics_tests

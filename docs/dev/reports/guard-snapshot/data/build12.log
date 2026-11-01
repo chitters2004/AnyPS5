@@ -1,0 +1,22 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/20] cd /home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver && /usr/bin/cmake -DGIT=/usr/bin/git -DSOURCE=/home/user/AnyPS5 -DOUTPUT=/home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver/generated/prx/libSceAgcDriver/TraceRevision.hpp -P /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/trace_revision.cmake
+[2/20] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/HostReportSources.cpp.o
+[3/20] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/FrameRecorder.cpp.o
+[4/20] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/PerformanceTrace.cpp.o
+[5/20] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx
+[6/20] Linking CXX executable tests/agc_driver_address_passes_tests
+[7/20] Linking CXX shared library core/libs/libs/unpatched/libSceAgc.prx
+[8/20] Linking CXX executable tests/agc_driver_graphics_tests
+[9/20] Linking CXX executable tests/agc_driver_depth_plane_guest_layers_tests
+[10/20] Linking CXX executable tests/agc_driver_alpha_to_coverage_tests
+[11/20] Linking CXX executable tests/agc_driver_depth_fast_clear_submit_tests
+[12/20] Linking CXX executable tests/agc_driver_depth_surface_last_writer_tests
+[13/20] Linking CXX executable tests/agc_driver_depth_storage_tests
+[14/20] Linking CXX executable tests/agc_driver_guard_snapshot_tests
+[15/20] Linking CXX executable tests/agc_driver_multisample_retirement_tests
+[16/20] Linking CXX executable tests/agc_driver_native_depth_bda_clear_tests
+[17/20] Linking CXX executable tests/agc_driver_native_multisample_depth_tests
+[18/20] Linking CXX executable tests/agc_driver_sample_multisample_target_tests
+[19/20] Linking CXX executable tests/agc_driver_recorder_tests
+[20/20] Linking CXX executable tests/agc_driver_sample_order_tests

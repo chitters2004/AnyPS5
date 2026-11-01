@@ -1,0 +1,9 @@
+Test project /home/user/AnyPS5/build
+    Start 1868: agc_write_tracking
+1/2 Test #1868: agc_write_tracking ...............   Passed    0.11 sec
+    Start 1869: agc_write_watch_coverage
+2/2 Test #1869: agc_write_watch_coverage .........   Passed    0.01 sec
+
+100% tests passed, 0 tests failed out of 2
+
+Total Test time (real) =   0.19 sec

@@ -1,0 +1,37 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/35] cd /home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver && /usr/bin/cmake -DGIT=/usr/bin/git -DSOURCE=/home/user/AnyPS5 -DOUTPUT=/home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver/generated/prx/libSceAgcDriver/TraceRevision.hpp -P /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/trace_revision.cmake
+[2/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/HostReportSources.cpp.o
+[3/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/FrameRecorder.cpp.o
+[4/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/PerformanceTrace.cpp.o
+[5/35] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx
+[6/35] Linking CXX shared library core/libs/libs/unpatched/libSceAgc.prx
+[7/35] Linking CXX executable tests/agc_driver_address_passes_tests
+[8/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/GuestTextureResource.cpp.o
+[9/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/BdaResources.cpp.o
+[10/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_fast_clear_submit_tests.dir/tests/execution/DepthFastClearSubmit.cpp.o
+[11/35] Linking CXX executable tests/agc_driver_depth_fast_clear_submit_tests
+[12/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_alpha_to_coverage_tests.dir/tests/execution/AlphaToCoverage.cpp.o
+[13/35] Linking CXX executable tests/agc_driver_alpha_to_coverage_tests
+[14/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_plane_guest_layers_tests.dir/tests/execution/DepthPlaneGuestLayers.cpp.o
+[15/35] Linking CXX executable tests/agc_driver_depth_plane_guest_layers_tests
+[16/35] Linking CXX executable tests/agc_driver_guard_snapshot_tests
+[17/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_storage_tests.dir/tests/execution/DepthStorage.cpp.o
+[18/35] Linking CXX executable tests/agc_driver_depth_storage_tests
+[19/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_surface_last_writer_tests.dir/tests/execution/DepthSurfaceLastWriter.cpp.o
+[20/35] Linking CXX executable tests/agc_driver_depth_surface_last_writer_tests
+[21/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_depth_bda_clear_tests.dir/tests/execution/NativeDepthBdaClear.cpp.o
+[22/35] Linking CXX executable tests/agc_driver_native_depth_bda_clear_tests
+[23/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_multisample_retirement_tests.dir/tests/execution/MultisampleRetirement.cpp.o
+[24/35] Linking CXX executable tests/agc_driver_multisample_retirement_tests
+[25/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_order_tests.dir/tests/execution/SampleOrder.cpp.o
+[26/35] Linking CXX executable tests/agc_driver_sample_order_tests
+[27/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_multisample_target_tests.dir/tests/execution/SampleMultisampleTarget.cpp.o
+[28/35] Linking CXX executable tests/agc_driver_sample_multisample_target_tests
+[29/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_multisample_depth_tests.dir/tests/execution/NativeMultisampleDepth.cpp.o
+[30/35] Linking CXX executable tests/agc_driver_native_multisample_depth_tests
+[31/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/LastRecordIndices.cpp.o
+[32/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_recorder_tests.dir/tests/Recorder.cpp.o
+[33/35] Linking CXX executable tests/agc_driver_recorder_tests
+[34/35] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/Graphics.cpp.o
+[35/35] Linking CXX executable tests/agc_driver_graphics_tests

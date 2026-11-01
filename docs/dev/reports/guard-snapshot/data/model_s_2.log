@@ -1,0 +1,2 @@
+snapshot mutant=2 rounds=3000 checks=216104 violations=216104 rebuilds=0
+rc=1

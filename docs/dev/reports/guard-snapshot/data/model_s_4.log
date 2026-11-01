@@ -1,0 +1,858 @@
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00090 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 (model_4+0x36f7) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb00090 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:172 (model_4+0x4b82) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9090)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00290 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb00290 by thread T2:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9290)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00298 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb00298 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:259 (model_4+0x4f68) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4f68)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4f68)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4f68)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4f68)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4f68)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9298)
+
+  Mutex M0 (0x55f7afb004c0) created at:
+    #0 pthread_rwlock_rdlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1476 (libtsan.so.2+0x57473) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_rdlock /usr/include/c++/13/shared_mutex:81 (model_4+0x31dd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock_shared() /usr/include/c++/13/shared_mutex:232 (model_4+0x31dd)
+    #3 std::shared_mutex::lock_shared() /usr/include/c++/13/shared_mutex:429 (model_4+0x31dd)
+    #4 std::shared_lock<std::shared_mutex>::shared_lock(std::shared_mutex&) /usr/include/c++/13/shared_mutex:741 (model_4+0x31dd)
+    #5 exact(Registry&, unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:43 (model_4+0x31dd)
+    #6 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:181 (model_4+0x4c74) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #7 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #8 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #9 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #10 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #11 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #12 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #13 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #14 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #15 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb000a8 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 (model_4+0x36f7) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb000a8 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:172 (model_4+0x4b82) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x90a8)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002a8 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb002a8 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92a8)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002e0 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb002e0 by thread T2:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:260 (model_4+0x4ea1) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ea1)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ea1)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ea1)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ea1)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ea1)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92e0)
+
+  Mutex M0 (0x55f7afb004c0) created at:
+    #0 pthread_rwlock_rdlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1476 (libtsan.so.2+0x57473) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_rdlock /usr/include/c++/13/shared_mutex:81 (model_4+0x31dd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock_shared() /usr/include/c++/13/shared_mutex:232 (model_4+0x31dd)
+    #3 std::shared_mutex::lock_shared() /usr/include/c++/13/shared_mutex:429 (model_4+0x31dd)
+    #4 std::shared_lock<std::shared_mutex>::shared_lock(std::shared_mutex&) /usr/include/c++/13/shared_mutex:741 (model_4+0x31dd)
+    #5 exact(Registry&, unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:43 (model_4+0x31dd)
+    #6 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:181 (model_4+0x4c74) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #7 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #8 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #9 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #10 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #11 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #12 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #13 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #14 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #15 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002f8 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb002f8 by thread T2:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:259 (model_4+0x4f68) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4f68)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4f68)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4f68)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4f68)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4f68)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92f8)
+
+  Mutex M0 (0x55f7afb004c0) created at:
+    #0 pthread_rwlock_rdlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1476 (libtsan.so.2+0x57473) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_rdlock /usr/include/c++/13/shared_mutex:81 (model_4+0x31dd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock_shared() /usr/include/c++/13/shared_mutex:232 (model_4+0x31dd)
+    #3 std::shared_mutex::lock_shared() /usr/include/c++/13/shared_mutex:429 (model_4+0x31dd)
+    #4 std::shared_lock<std::shared_mutex>::shared_lock(std::shared_mutex&) /usr/include/c++/13/shared_mutex:741 (model_4+0x31dd)
+    #5 exact(Registry&, unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:43 (model_4+0x31dd)
+    #6 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:181 (model_4+0x4c74) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #7 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #8 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #9 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #10 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #11 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #12 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #13 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #14 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #15 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00098 by thread T1 (mutexes: write M0):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 (model_4+0x36f7) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 rebuild() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:152 (model_4+0x4a62) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:182 (model_4+0x4cb4) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #5 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #7 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #8 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #9 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #10 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #11 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 8 at 0x55f7afb00098 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:172 (model_4+0x4b82) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9098)
+
+  Mutex M0 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T1 (tid=1946, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00298 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb00298 by thread T1:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9298)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T1 (tid=1946, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002b8 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb002b8 by thread T2:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92b8)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb000b8 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 (model_4+0x36f7) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb000b8 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:172 (model_4+0x4b82) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x90b8)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002e8 by thread T2 (mutexes: write M0):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 rebuild() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:152 (model_4+0x4a62) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:182 (model_4+0x4cb4) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #5 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #7 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #8 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #9 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #10 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #11 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 8 at 0x55f7afb002e8 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:262 (model_4+0x4edb) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4edb)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4edb)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4edb)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4edb)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4edb)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92e8)
+
+  Mutex M0 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002a8 by thread T1 (mutexes: write M0):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 rebuild() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:152 (model_4+0x4a62) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:182 (model_4+0x4cb4) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #5 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #7 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #8 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #9 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #10 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #11 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 8 at 0x55f7afb002a8 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92a8)
+
+  Mutex M0 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T1 (tid=1946, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb00090 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 (model_4+0x36f7) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb00090 by thread T1:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:172 (model_4+0x4b82) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x9090)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T1 (tid=1946, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:99 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002e0 by main thread (mutexes: write M0, write M1):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:128 (model_4+0x453b) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:282 (model_4+0x5c6c) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Previous read of size 8 at 0x55f7afb002e0 by thread T3:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:260 (model_4+0x4ea1) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ea1)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ea1)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ea1)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ea1)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ea1)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92e0)
+
+  Mutex M0 (0x55f7afb00520) created at:
+    #0 pthread_rwlock_wrlock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1506 (libtsan.so.2+0x576a3) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __glibcxx_rwlock_wrlock /usr/include/c++/13/shared_mutex:83 (model_4+0x4ffd) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::__shared_mutex_pthread::lock() /usr/include/c++/13/shared_mutex:196 (model_4+0x4ffd)
+    #3 std::shared_mutex::lock() /usr/include/c++/13/shared_mutex:423 (model_4+0x4ffd)
+    #4 std::unique_lock<std::shared_mutex>::lock() /usr/include/c++/13/bits/unique_lock.h:141 (model_4+0x4ffd)
+    #5 std::unique_lock<std::shared_mutex>::unique_lock(std::shared_mutex&) /usr/include/c++/13/bits/unique_lock.h:71 (model_4+0x4ffd)
+    #6 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:192 (model_4+0x4ffd)
+    #7 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Mutex M1 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002f0 by thread T3 (mutexes: write M0):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 rebuild() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:152 (model_4+0x4a62) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:182 (model_4+0x4cb4) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #5 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #7 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #8 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #9 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #10 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #11 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 8 at 0x55f7afb002f0 by thread T2:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:260 (model_4+0x4ea1) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ea1)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ea1)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ea1)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ea1)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ea1)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92f0)
+
+  Mutex M0 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+  Thread T2 (tid=1947, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+==================
+WARNING: ThreadSanitizer: data race (pid=1944)
+  Write of size 8 at 0x55f7afb002f0 by thread T3 (mutexes: write M0):
+    #0 publish(std::vector<Entry, std::allocator<Entry> > const&) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 (model_4+0x3721) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 rebuild() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:152 (model_4+0x4a62) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:182 (model_4+0x4cb4) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #5 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:261 (model_4+0x4ec9) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4ec9)
+    #7 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4ec9)
+    #8 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4ec9)
+    #9 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4ec9)
+    #10 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4ec9)
+    #11 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Previous read of size 8 at 0x55f7afb002f0 by thread T1:
+    #0 checkSnapshot(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:169 (model_4+0x4c33) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #1 checkOnce(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:229 (model_4+0x4d04) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 check(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:239 (model_4+0x4de3) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #3 operator() /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:259 (model_4+0x4f68) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #4 __invoke_impl<void, main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:61 (model_4+0x4f68)
+    #5 __invoke<main(int, char**)::<lambda()> > /usr/include/c++/13/bits/invoke.h:96 (model_4+0x4f68)
+    #6 _M_invoke<0> /usr/include/c++/13/bits/std_thread.h:292 (model_4+0x4f68)
+    #7 operator() /usr/include/c++/13/bits/std_thread.h:299 (model_4+0x4f68)
+    #8 _M_run /usr/include/c++/13/bits/std_thread.h:244 (model_4+0x4f68)
+    #9 <null> <null> (libstdc++.so.6+0xecdb3) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+
+  Location is global 'snapshot' of size 1088 at 0x55f7afb00080 (model_4+0x92f0)
+
+  Mutex M0 (0x55f7afb00490) created at:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341 (libtsan.so.2+0x59a13) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 __gthread_mutex_lock /usr/include/x86_64-linux-gnu/c++/13/bits/gthr-default.h:749 (model_4+0x4046) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #2 std::mutex::lock() /usr/include/c++/13/bits/std_mutex.h:113 (model_4+0x4046)
+    #3 std::lock_guard<std::mutex>::lock_guard(std::mutex&) /usr/include/c++/13/bits/std_mutex.h:249 (model_4+0x4046)
+    #4 snapshotInsert(unsigned long, unsigned long) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:121 (model_4+0x4046)
+    #5 insert(Registry&, std::initializer_list<Range>) /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:197 (model_4+0x50a2) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+    #6 main /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:287 (model_4+0x59ac) (BuildId: 217b4ff67fc880ff1d04d53f4a6ab89380e086e5)
+
+  Thread T3 (tid=1948, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+  Thread T1 (tid=1946, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022 (libtsan.so.2+0x5ac1a) (BuildId: 2a13a7710e361d06f7babbea53065ca2be93f738)
+    #1 std::thread::_M_start_thread(std::unique_ptr<std::thread::_State, std::default_delete<std::thread::_State> >, void (*)()) <null> (libstdc++.so.6+0xeceb0) (BuildId: 753c6c8608b61d4e67be8f0c890e03e0aa046b8b)
+    #2 __libc_start_call_main ../sysdeps/nptl/libc_start_call_main.h:58 (libc.so.6+0x2a1c9) (BuildId: a4a7992a8e66555c8141ab2a08a8465ff6e0ea65)
+
+SUMMARY: ThreadSanitizer: data race /tmp/claude-0/-home-user-AnyPS5/aa610458-c3f5-59bb-ac83-a0d5b1d7edc3/scratchpad/bench/guard_model.cpp:100 in publish(std::vector<Entry, std::allocator<Entry> > const&)
+==================
+snapshot mutant=4 rounds=3000 checks=159056 violations=0 rebuilds=660
+ThreadSanitizer: reported 17 warnings
+rc=66

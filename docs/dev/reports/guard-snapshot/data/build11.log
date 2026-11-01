@@ -1,0 +1,8 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/6] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_write_watch_coverage_tests.dir/tests/WriteWatchCoverage.cpp.o
+[2/6] Linking CXX executable tests/agc_write_watch_coverage_tests
+[3/6] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_write_tracking_tests.dir/Execution/src/PerformanceTraceThread.cpp.o
+[4/6] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_write_tracking_tests.dir/tests/WriteTracking.cpp.o
+[5/6] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_write_tracking_tests.dir/Execution/src/GuestMemory.cpp.o
+[6/6] Linking CXX executable tests/agc_write_tracking_tests

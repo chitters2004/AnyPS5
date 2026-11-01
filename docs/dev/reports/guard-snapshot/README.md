@@ -415,6 +415,8 @@ The snapshot is the better design. It is never slower than the certificate in a 
 
 ## Raw data (`data/`)
 
+The repository's `.gitignore` excludes `*.log`, so the `.log` files here were missing from the branch until `docs(agc)` commit `{LOGCOMMIT}` force-added them; earlier versions of this README listed them before they were committed. A local agent adding more logs needs `git add -f`.
+
 | File | Contents |
 |---|---|
 | `bench_table.csv` | Run used for the tables above: idle machine, 200 ms per cell, `table` mode, includes the `null` overhead design. |
@@ -431,6 +433,7 @@ The snapshot is the better design. It is never slower than the certificate in a 
 | `mingw_syntax_check.log` | MinGW compile check of the changed sources. |
 | `read_callers.txt` | The direct `GuestMemory` read calls found by the census. |
 | `independent_review.md` | The independent review's findings. |
+| `ctest_head_validation.log` | 18 tests on `5293a5cc7` code (after the review fix and with both race tests). |
 | `ctest_final_validation.log` | 18 tests on `7d96fe73e` (after the fix). |
 | `ctest_log_mapping_validation.log` | 16 tests on `cff455dfe` (registration log and mapping proofs). |
 | `ctest_guestmemory.log` | `agc_write_tracking` and `agc_write_watch_coverage` on `cff455dfe`. |

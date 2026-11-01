@@ -1,0 +1,71 @@
+ninja: Entering directory `build'
+[0/2] Re-checking globbed directories...
+[1/49] cd /home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver && /usr/bin/cmake -DGIT=/usr/bin/git -DSOURCE=/home/user/AnyPS5 -DOUTPUT=/home/user/AnyPS5/build/core/libs/prx/libSceAgcDriver/generated/prx/libSceAgcDriver/TraceRevision.hpp -P /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/trace_revision.cmake
+[2/49] Hashing the shader recompiler sources for the shader disk cache
+[3/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Draw/DrawPrecheck.cpp.o
+[4/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/WrittenBuffers.cpp.o
+[5/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Memory/BufferFill.cpp.o
+[6/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/HostReportSources.cpp.o
+[7/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Dispatch/Dispatch.cpp.o
+[8/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/Driver/Packets/PacketMemory.cpp.o
+[9/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/PerformanceTrace.cpp.o
+[10/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/FrameRecorder.cpp.o
+[11/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/MultisampleTarget.cpp.o
+[12/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/DepthSurface.cpp.o
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp: In member function 'std::shared_ptr<AgcDriver::Graphics::Texture> AgcDriver::Graphics::{anonymous}::DepthPlaneCopy::Refresh(std::span<const AgcDriver::Graphics::{anonymous}::DepthPlaneSlice>, const AgcDriver::Graphics::GuestTextureResource&, VkComponentMapping, VkImageViewType, uint32_t)':
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp:1385:214: warning: format '%u' expects argument of type 'unsigned int', but argument 12 has type 'const AgcDriver::Graphics::TextureTileMode' [-Wformat=]
+ 1385 |             std::snprintf(text, sizeof(text), "AGC graphics: depth plane copy geometry does not match its layers (copy %ux%u, %u layers, %llu bytes a slice; texture %ux%u guest format %u, dimension %d, tile mode %u, %u layers, %llu bytes a slice, %zu mips)", extent.width, extent.height, layers, static_cast<unsigned long long>(sliceBytes()), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.tileMode, geometry.layers, static_cast<unsigned long long>(geometry.sliceLinearBytes), geometry.mips.size());
+      |                                                                                                                                                                                                                     ~^                                                                                                                                                                                                                         ~~~~~~~~~~~~~~~~~
+      |                                                                                                                                                                                                                      |                                                                                                                                                                                                                                  |
+      |                                                                                                                                                                                                                      unsigned int                                                                                                                                                                                                                       const AgcDriver::Graphics::TextureTileMode
+[13/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Draw.cpp.o
+[14/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Execution/src/VulkanDevice.cpp.o
+[15/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Pipeline.cpp.o
+[16/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/BdaResources.cpp.o
+[17/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Recorder.cpp.o
+[18/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/State.cpp.o
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp: In lambda function:
+/home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:347:86: warning: ' with a pixel shader that ex...' directive output may be truncated writing 76 bytes into a region of size between 70 and 79 [-Wformat-truncation=]
+  347 |             std::snprintf(detail, sizeof(detail), "AGC graphics: stencil operation %u with a pixel shader that exports the stencil operation value is unsupported", op);
+      |                                                                                      ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+In file included from /usr/include/stdio.h:980,
+                 from /usr/include/c++/13/cstdio:42,
+                 from /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:1:
+In function 'int snprintf(char*, size_t, const char*, ...)',
+    inlined from 'AgcDriver::Graphics::{anonymous}::stencilFace(uint32_t, uint32_t, uint32_t, bool, bool, bool, bool)::<lambda(uint32_t, bool)>' at /home/user/AnyPS5/core/libs/prx/libSceAgcDriver/Graphics/src/State.cpp:347:26:
+/usr/include/x86_64-linux-gnu/bits/stdio2.h:54:35: note: '__builtin___snprintf_chk' output between 110 and 119 bytes into a destination of size 112
+   54 |   return __builtin___snprintf_chk (__s, __n, __USE_FORTIFY_LEVEL - 1,
+      |          ~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   55 |                                    __glibc_objsize (__s), __fmt,
+      |                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   56 |                                    __va_arg_pack ());
+      |                                    ~~~~~~~~~~~~~~~~~
+[19/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/SampleOrder.cpp.o
+[20/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/GuestBufferMemory.cpp.o
+[21/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/ShaderResources.cpp.o
+[22/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/DepthSurfaceReuse.cpp.o
+[23/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/libSceAgcDriver.dir/Graphics/src/Texture.cpp.o
+[24/47] Linking CXX shared library core/libs/libs/unpatched/libSceAgcDriver.prx
+[25/47] Linking CXX executable tests/agc_driver_address_passes_tests
+[26/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_fast_clear_submit_tests.dir/tests/execution/DepthFastClearSubmit.cpp.o
+[27/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_plane_guest_layers_tests.dir/tests/execution/DepthPlaneGuestLayers.cpp.o
+[28/47] Linking CXX executable tests/agc_driver_depth_fast_clear_submit_tests
+[29/47] Linking CXX executable tests/agc_driver_depth_plane_guest_layers_tests
+[30/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_surface_last_writer_tests.dir/tests/execution/DepthSurfaceLastWriter.cpp.o
+[31/47] Linking CXX executable tests/agc_driver_depth_surface_last_writer_tests
+[32/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_depth_storage_tests.dir/tests/execution/DepthStorage.cpp.o
+[33/47] Linking CXX executable tests/agc_driver_depth_storage_tests
+[34/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_alpha_to_coverage_tests.dir/tests/execution/AlphaToCoverage.cpp.o
+[35/47] Linking CXX executable tests/agc_driver_alpha_to_coverage_tests
+[36/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_guard_certificate_tests.dir/tests/execution/GuardCertificate.cpp.o
+[37/47] Linking CXX executable tests/agc_driver_guard_certificate_tests
+[38/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_depth_bda_clear_tests.dir/tests/execution/NativeDepthBdaClear.cpp.o
+[39/47] Linking CXX executable tests/agc_driver_native_depth_bda_clear_tests
+[40/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_multisample_retirement_tests.dir/tests/execution/MultisampleRetirement.cpp.o
+[41/47] Linking CXX executable tests/agc_driver_multisample_retirement_tests
+[42/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_native_multisample_depth_tests.dir/tests/execution/NativeMultisampleDepth.cpp.o
+[43/47] Linking CXX executable tests/agc_driver_native_multisample_depth_tests
+[44/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_sample_multisample_target_tests.dir/tests/execution/SampleMultisampleTarget.cpp.o
+[45/47] Linking CXX executable tests/agc_driver_sample_multisample_target_tests
+[46/47] Building CXX object core/libs/prx/libSceAgcDriver/CMakeFiles/agc_driver_graphics_tests.dir/tests/Graphics.cpp.o
+[47/47] Linking CXX executable tests/agc_driver_graphics_tests
