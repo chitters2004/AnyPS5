@@ -171,9 +171,151 @@ void RunTiled(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::siz
         Require(stored == 0 && words[OverwrittenDword] == Overwritten, what + "the image's store put its older texels over a newer address-based store");
     }
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-    const bool synced = AgcDriver::GuestMemory::Watched(image, TiledBytes) ? texture->Generation() > before : texture->GuestSnapshotValid();
-    if (baseline) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
-    else Require(!synced, what + "the image whose block the GPU kept was put back in sync at completion");
+    const bool watched = AgcDriver::GuestMemory::Watched(image, TiledBytes);
+    const bool synced = watched ? texture->Generation() > before : texture->GuestSnapshotValid();
+    if (baseline && !watched) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
+    else Require(!synced, what + "the image was put back in sync at completion although its block was kept or a lease stamped it then");
+}
+
+enum class LeaseTarget { Inside, InsideSame, Outside };
+
+struct DifferentialCase {
+    bool tiled;
+    bool fill;
+    LeaseTarget lease;
+    bool cpuWrite;
+};
+
+struct DifferentialRun {
+    std::vector<std::uint32_t> words;
+    bool waited;
+};
+
+DifferentialRun RunDifferential(AgcDriver::VulkanDevice& device, const GuestBlock& guest, const DifferentialCase& test, bool label) {
+    const auto bytes = test.tiled ? TiledBytes : ImageBytes;
+    const auto* words = guest.Words();
+    const auto image = guest.Address();
+    const auto target = device.Target();
+    if (test.fill) {
+        const std::array<std::uint32_t, 4> pattern{0x33333333u, 0x33333333u, 0x33333333u, 0x33333333u};
+        std::uint64_t serial = 0;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Require(device.FillBuffer(image, 4096u, pattern), "storage flush ordering, differential: the GPU fill was not recorded");
+            serial = device.SubmitAndEpoch();
+        }
+        device.WaitRecorded(serial);
+    }
+    const auto& globalCode = test.lease == LeaseTarget::InsideSame ? StoreBaselineCode : StoreGlobalCode;
+    const auto storeImage = Compile(StoreImageCode, test.tiled ? TiledUserData(image) : ImageUserData(image), target);
+    const auto storeGlobal = Compile(globalCode, GlobalUserData(test.lease == LeaseTarget::Outside ? image + bytes : image), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(globalCode.data()));
+    if (test.cpuWrite) guest.Words()[bytes / 4u - 16u] = 0x44444444u;
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, bytes, nullptr, label ? "readback before label" : "test"), "storage flush ordering, differential: the image store left no results pending");
+    const bool waited = !AddressBasedStorePending(image, true, bytes);
+    device.WaitIdle();
+    return {{words, words + (bytes + 0x200u) / 4u}, waited};
+}
+
+void RunDifferentials(AgcDriver::VulkanDevice& device, bool watched) {
+    std::size_t compared = 0, onGpu = 0;
+    for (const bool tiled : {false, true}) {
+        for (const bool fill : {false, true}) {
+            for (const auto lease : {LeaseTarget::Inside, LeaseTarget::InsideSame, LeaseTarget::Outside}) {
+                for (const bool cpuWrite : {false, true}) {
+                    const DifferentialCase test{tiled, fill, lease, cpuWrite};
+                    GuestBlock waitedBlock(watched);
+                    GuestBlock labelBlock(watched);
+                    const auto waited = RunDifferential(device, waitedBlock, test, false);
+                    const auto stored = RunDifferential(device, labelBlock, test, true);
+                    Require(waited.waited, "storage flush ordering, differential: the waited flush did not wait");
+                    for (std::size_t index = 0; index < waited.words.size(); ++index) {
+                        if (waited.words[index] == stored.words[index]) continue;
+                        std::fprintf(stderr, "differential tiled=%d fill=%d lease=%d cpu=%d: word 0x%zx waited 0x%08x label 0x%08x\n", tiled, fill, static_cast<int>(lease), cpuWrite, index, waited.words[index], stored.words[index]);
+                        Require(false, "storage flush ordering, differential: the label store's bytes differ from the waited store's");
+                    }
+                    ++compared;
+                    if (!stored.waited) ++onGpu;
+                }
+            }
+        }
+    }
+    std::printf("storage flush ordering differential: %zu cases identical, %zu decided on the GPU\n", compared, onGpu);
+    Require(onGpu * 2 >= compared, "storage flush ordering, differential: fewer than half the cases were decided on the GPU");
+}
+
+void RunSettled(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const auto image = guest.Address() + offset;
+    const auto target = device.Target();
+    const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
+    const auto storeGlobal = Compile(StoreGlobalCode, GlobalUserData(image + ImageBytes), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreGlobalCode.data()));
+    const std::string what = "storage flush ordering, settled at completion: ";
+    std::shared_ptr<AgcDriver::Graphics::StorageTexture> texture;
+    std::uint64_t stale = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        texture = AgcDriver::Graphics::StorageTexture::FindLive(image, ImageBytes);
+        Require(texture != nullptr, what + "the image has no storage texture");
+        stale = texture->Generation();
+    }
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "readback before label"), what + "the image store left no results pending");
+    Require(AddressBasedStorePending(image, true), what + "the label store waited instead of comparing on the GPU");
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(texture->Generation() == stale, what + "the image was put in sync before the GPU decided");
+    }
+    device.WaitIdle();
+    const auto* words = guest.Words() + offset / 4u;
+    Require(words[FarDword] == Stored && words[0] == Stored, what + "the image's texels were not stored");
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    if (!AgcDriver::GuestMemory::UnchangedSinceCollected(image, ImageBytes, stale)) {
+        std::puts("storage flush ordering, settled at completion: the device's GPU writes show as CPU stores to the write watch (as on lavapipe), so the image stays stale; check skipped");
+        return;
+    }
+    Require(texture->Generation() > stale, what + "the image stored whole with no later stamp was left stale at completion");
+}
+
+void RunUploadBeforeCompletion(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const auto image = guest.Address() + offset;
+    const auto target = device.Target();
+    const auto storeImage = Compile(StoreImageCode, ImageUserData(image), target);
+    const auto storeGlobal = Compile(StoreGlobalCode, GlobalUserData(image + ImageBytes), target);
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    device.Dispatch(storeGlobal, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreGlobalCode.data()));
+    const std::string what = "storage flush ordering, upload before completion: ";
+    std::shared_ptr<AgcDriver::Graphics::StorageTexture> texture;
+    std::uint64_t stale = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        texture = AgcDriver::Graphics::StorageTexture::FindLive(image, ImageBytes);
+        Require(texture != nullptr, what + "the image has no storage texture");
+        stale = texture->Generation();
+    }
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "readback before label"), what + "the image store left no results pending");
+    Require(AddressBasedStorePending(image, true), what + "the label store waited instead of comparing on the GPU");
+    device.Dispatch(storeImage, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    std::uint64_t uploaded = 0;
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Require(AgcDriver::Graphics::StorageTexture::FindLive(image, ImageBytes) == texture, what + "the image was replaced instead of uploaded");
+        uploaded = texture->Generation();
+    }
+    if (!AddressBasedStorePending(image, true)) {
+        std::puts("storage flush ordering, upload before completion: the second use synced the label store's batch (compared memory refreshes on the CPU); check skipped");
+        device.WaitIdle();
+        return;
+    }
+    Require(uploaded != stale, what + "the second use did not upload the image");
+    device.WaitIdle();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    if (!AgcDriver::GuestMemory::UnchangedSinceCollected(image, ImageBytes, stale)) {
+        std::puts("storage flush ordering, upload before completion: the device's GPU writes show as CPU stores to the write watch (as on lavapipe), so the completion cannot settle; check skipped");
+        return;
+    }
+    Require(texture->Generation() == uploaded, what + "the label store's completion overwrote the upload's generation");
 }
 
 std::vector<std::uint32_t> RunLeaseTable(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool label, bool inside) {
@@ -242,8 +384,8 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     const bool watched = AgcDriver::GuestMemory::Watched(image, ImageBytes);
     const bool synced = watched ? texture->Generation() > before : texture->GuestSnapshotValid();
-    if (baseline) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
-    else Require(!synced, what + "the image whose block the GPU kept was put back in sync at completion");
+    if (baseline && !watched) Require(synced, what + "the image stored whole on the GPU was left stale at completion");
+    else Require(!synced, what + "the image was put back in sync at completion although its block was kept or a lease stamped it then");
 }
 
 }
@@ -263,6 +405,13 @@ int main(int argc, char** argv) {
             Run(*device, guest, BlockBytes / 4u, false, "writer of the baseline bytes in the open batch", gpuCompare, true);
             RunTiled(*device, guest, BlockBytes / 8u, "writer in the open batch", false);
             RunTiled(*device, guest, 3u * BlockBytes / 4u, "writer of the baseline bytes in the open batch", true);
+            RunDifferentials(*device, watched);
+            if (AgcDriver::GuestMemory::Watched(guest.Address(), BlockBytes)) {
+                GuestBlock settledBlock(watched);
+                RunSettled(*device, settledBlock, 0);
+            }
+            GuestBlock uploadBlock(watched);
+            RunUploadBeforeCompletion(*device, uploadBlock, 0);
             for (const bool inside : {true, false}) {
                 GuestBlock waitedBlock(watched);
                 GuestBlock labelBlock(watched);

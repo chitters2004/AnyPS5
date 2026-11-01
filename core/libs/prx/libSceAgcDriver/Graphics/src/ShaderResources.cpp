@@ -6016,6 +6016,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
     recorder.NotePendingWrites(guestMemory.Writes());
+    if (!reusable && NeedsCompletion()) recorder.NoteLateStamps(guestMemory.Writes());
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

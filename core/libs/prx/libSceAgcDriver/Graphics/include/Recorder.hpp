@@ -189,6 +189,8 @@ public:
     bool PendingLeaseOverlaps(std::uint64_t address, std::size_t bytes) const;
     void NoteLeaseTable(VkBuffer table, std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> ranges);
     void NoteUntabledLease();
+    void NoteLateStamps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    bool PendingLateStampOverlaps(std::uint64_t address, std::size_t bytes) const;
     bool OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables, const char** refusal = nullptr) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
@@ -608,6 +610,7 @@ private:
         };
         std::vector<LeaseTable> leaseTables;
         bool untabledLease = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> lateStamps;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
         std::uint64_t traceId = 0;

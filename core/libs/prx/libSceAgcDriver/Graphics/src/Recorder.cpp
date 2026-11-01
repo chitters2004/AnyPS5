@@ -3280,6 +3280,20 @@ void Recorder::NoteUntabledLease() {
     open->untabledLease = true;
 }
 
+void Recorder::NoteLateStamps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.empty()) return;
+    ensureOpen();
+    open->lateStamps.insert(open->lateStamps.end(), ranges.begin(), ranges.end());
+}
+
+bool Recorder::PendingLateStampOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const auto overlaps = [&](const Batch& batch) { return std::any_of(batch.lateStamps.begin(), batch.lateStamps.end(), [&](const auto& range) { return address < range.second && range.first < end; }); };
+    if (open != nullptr && overlaps(*open)) return true;
+    return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return overlaps(*batch); });
+}
+
 bool Recorder::OpenLeaseTables(std::uint64_t address, std::size_t bytes, std::vector<VkBuffer>& tables, const char** refusal) const {
     tables.clear();
     const auto refuse = [&](const char* why) {

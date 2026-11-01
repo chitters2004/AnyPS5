@@ -4562,6 +4562,7 @@ StorageTexture::LabelCompareCheck StorageTexture::labelCompareClassify(const Rec
     if (AnyShadowedOverlaps(base, size)) return refuse("shadowed");
     if (Recorder::PendingCompletionStores() != 0 || Recorder::PendingCompletionLabels() != 0) return refuse("completion-stores");
     if ((context.copiedWriters != nullptr && !context.copiedWriters->empty()) || !DrawCopiedWriters()->empty()) return refuse("copied-writers");
+    if (recorder.PendingLateStampOverlaps(base, size)) return refuse("late-stamping-writer");
     constexpr std::uint64_t block = 65536;
     const auto end = base + guestBytes;
     check.spanBegin = base & ~(block - 1);
@@ -6409,6 +6410,7 @@ std::pair<std::shared_ptr<Buffer>, std::size_t> StorageTexture::recordConditiona
 void StorageTexture::settleConditionalAtCompletion(Recorder& recorder, const std::pair<std::shared_ptr<Buffer>, std::size_t>& flags, std::size_t count, bool save, std::uint64_t firstStored, std::uint64_t lastStored) {
     Require(trackedLayers == 1 && flags.first != nullptr, "a GPU-compared label store settles a layer it did not store");
     const auto target = collectedLayerGeneration(0, GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
+    const bool watched = GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored));
     const auto stale = layerGeneration[0];
     const auto ticket = ++lastConditionalTicket;
     conditionalTicket = ticket;
@@ -6417,7 +6419,7 @@ void StorageTexture::settleConditionalAtCompletion(Recorder& recorder, const std
         saveTicket = ++lastSaveTicket;
         savedTicket[0] = saveTicket;
     }
-    recorder.OnComplete([texture = weak_from_this(), staging = flags.first, offset = flags.second, count, ticket, stale, target, saveTicket] {
+    recorder.OnComplete([texture = weak_from_this(), staging = flags.first, offset = flags.second, count, ticket, stale, target, saveTicket, watched, firstStored, lastStored] {
         const auto alive = texture.lock();
         if (alive == nullptr) return;
         bool stored = true;
@@ -6427,16 +6429,20 @@ void StorageTexture::settleConditionalAtCompletion(Recorder& recorder, const std
             std::memcpy(&kept, bytes.data() + offset + 12 * index + 8, sizeof(kept));
             stored = stored && kept == 0;
         }
+        if (saveTicket != 0) {
+            if (stored) alive->applyStoredSave(saveTicket, {0});
+            else if (alive->savedTicket[0] == saveTicket) alive->savedTicket[0] = 0;
+        }
         const bool current = alive->conditionalTicket == ticket && alive->layerGeneration[0] == stale;
         if (alive->conditionalTicket == ticket) alive->conditionalTicket = 0;
-        if (stored && current) {
+        const auto length = static_cast<std::size_t>(lastStored - firstStored);
+        const bool unstampedSince = !watched || (GuestMemory::CollectWritesUncached(firstStored, length), GuestMemory::UnchangedSince(firstStored, length, target));
+        if (stored && current && unstampedSince) {
             alive->layerGeneration[0] = target;
             alive->refreshGeneration();
-            if (saveTicket != 0) alive->applyStoredSave(saveTicket, {0});
             conditionalSettled.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (saveTicket != 0 && alive->savedTicket[0] == saveTicket) alive->savedTicket[0] = 0;
         conditionalLeftStale.fetch_add(1, std::memory_order_relaxed);
     });
 }
