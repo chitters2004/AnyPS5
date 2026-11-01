@@ -3,6 +3,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
 #include "BdaAbi.hpp"
+#include "CacheKey.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -140,6 +141,33 @@ void CheckResultMemo() {
     Require(stage.Draw(0x11u) == first, "returning to the first push offset did not reuse the first result");
 }
 
+void CheckInterfaceKey() {
+    PixelStage stage;
+    std::vector<std::uint64_t> key;
+    BuildPreparedShaderKey(stage.request, key);
+    Require(key.size() > 128u, "the pixel interface key is too short to cross the key writer's staging boundary twice");
+    Require(key[0] == RuntimeAbi::Version && key[1] == static_cast<std::uint64_t>(ShaderStage::Fragment), "the interface key does not start with the ABI version and the stage");
+    std::vector<std::uint64_t> again{1u, 2u, 3u};
+    BuildPreparedShaderKey(stage.request, again);
+    Require(again == key, "an interface key built into a used vector differs from one built into an empty vector");
+    stage.request.target.meshWindowBuffer = !stage.request.target.meshWindowBuffer;
+    BuildPreparedShaderKey(stage.request, again);
+    Require(again.size() == key.size(), "the last target field changed the length of the interface key");
+    std::vector<std::size_t> changed;
+    for (std::size_t index = 0; index < key.size(); ++index) {
+        if (key[index] != again[index]) changed.push_back(index);
+    }
+    Require(changed.size() == 1u && changed.front() == key.size() - 5u, "the last target field did not change exactly its own word, before the probe, ray tracing and subgroup words");
+    stage.request.target.meshWindowBuffer = !stage.request.target.meshWindowBuffer;
+    stage.request.context.pixel->interpolatorCount = 2u;
+    stage.request.context.pixel->interpolatorSettings[1] = 0x405u;
+    BuildPreparedShaderKey(stage.request, again);
+    Require(again.size() == key.size() + 2u && again.back() == key.back(), "two interpolators did not add exactly two words to the interface key");
+    std::vector<std::uint64_t> full;
+    RecompileCacheKey::Build(stage.request, full);
+    Require(full.size() == again.size() + 1u && full[2] == stage.request.shader.code.size() && full[3] == RecompileCacheKey::HashCode(stage.request.shader.code) && std::equal(again.begin() + 2, again.end() - 1, full.begin() + 4), "the cache key is not the interface key with the code hash after the stage");
+}
+
 struct Spread {
     double median;
     double low;
@@ -200,6 +228,7 @@ int main(int argc, char** argv) {
             Bench();
             return 0;
         }
+        CheckInterfaceKey();
         CheckInvocation();
         CheckResultMemo();
         std::cout << "stage recapture tests passed\n";

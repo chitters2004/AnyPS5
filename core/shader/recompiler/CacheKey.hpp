@@ -5,18 +5,43 @@
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace ShaderRecompiler {
 
 class RecompileCacheKey {
+    class KeyWriter {
+    public:
+        explicit KeyWriter(std::vector<std::uint64_t>& key) : key(key) {
+            key.clear();
+        }
+
+        void push_back(std::uint64_t value) {
+            if (used == staged.size()) Flush();
+            staged[used++] = value;
+        }
+
+        void Flush() {
+            key.insert(key.end(), staged.begin(), staged.begin() + static_cast<std::ptrdiff_t>(used));
+            used = 0;
+        }
+
+    private:
+        std::vector<std::uint64_t>& key;
+        std::array<std::uint64_t, 64> staged;
+        std::size_t used = 0;
+    };
+
 public:
-    static void Build(const RecompileRequest& request, std::vector<std::uint64_t>& key) {
-        key.clear();
+    static void Build(const RecompileRequest& request, std::vector<std::uint64_t>& built) {
+        KeyWriter key(built);
         append(key, RuntimeAbi::Version);
         append(key, request.shader.stage);
         // The code enters as a hash rather than word by word: the key is built, hashed and compared
@@ -30,13 +55,15 @@ public:
             append(key, request.shader.code);
         }
         appendInterface(key, request);
+        key.Flush();
     }
 
-    static void BuildInterface(const RecompileRequest& request, std::vector<std::uint64_t>& key) {
-        key.clear();
+    static void BuildInterface(const RecompileRequest& request, std::vector<std::uint64_t>& built) {
+        KeyWriter key(built);
         append(key, RuntimeAbi::Version);
         append(key, request.shader.stage);
         appendInterface(key, request);
+        key.Flush();
     }
 
     // A hash over every field Build appends except the code, the target and the probe flag: the
@@ -44,8 +71,8 @@ public:
     // device itself, and which is bypassed while the probe is active.
     static std::uint64_t ContextHash(const RecompileRequest& request) {
         struct ContextKeyStorage {};
-        auto& key = HostThreadLocal<std::vector<std::uint64_t>, ContextKeyStorage>();
-        key.clear();
+        auto& built = HostThreadLocal<std::vector<std::uint64_t>, ContextKeyStorage>();
+        KeyWriter key(built);
         append(key, RuntimeAbi::Version);
         append(key, request.shader.stage);
         append(key, request.context.waveSize);
@@ -59,8 +86,9 @@ public:
         appendFallbacks(key, request);
         appendMesh(key, request);
         appendTessellation(key, request);
+        key.Flush();
         std::uint64_t hash = 0xcbf29ce484222325ull;
-        for (const auto value : key) {
+        for (const auto value : built) {
             hash ^= value;
             hash *= 0x100000001b3ull;
         }
@@ -81,7 +109,7 @@ public:
     }
 
 private:
-    static void appendInterface(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+    static void appendInterface(KeyWriter& key, const RecompileRequest& request) {
         append(key, request.context.waveSize);
         append(key, request.context.userDataBaseRegister);
         append(key, request.context.userData.size());
@@ -99,12 +127,12 @@ private:
         append(key, RayTracingMiss());
     }
 
-    static void appendFallbacks(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+    static void appendFallbacks(KeyWriter& key, const RecompileRequest& request) {
         append(key, request.context.linkedCallFallbacks.size());
         for (const auto programCounter : request.context.linkedCallFallbacks) append(key, programCounter);
     }
 
-    static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+    static void appendMesh(KeyWriter& key, const RecompileRequest& request) {
         if (request.shader.stage == ShaderStage::Fragment) {
             append(key, request.graphics && request.graphics->mesh);
             return;
@@ -133,7 +161,7 @@ private:
         }
     }
 
-    static void appendTessellation(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
+    static void appendTessellation(KeyWriter& key, const RecompileRequest& request) {
         if (request.shader.stage != ShaderStage::Local && request.shader.stage != ShaderStage::TessellationControl && request.shader.stage != ShaderStage::TessellationEvaluation) return;
         const auto* tessellation = request.graphics && request.graphics->tessellation ? &*request.graphics->tessellation : nullptr;
         append(key, tessellation != nullptr);
@@ -147,40 +175,40 @@ private:
     }
 
     template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
+    static void append(KeyWriter& key, TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
         key.push_back(static_cast<std::uint64_t>(value));
     }
 
     template<typename TValue, std::size_t TSize>
-    static void append(std::vector<std::uint64_t>& key, const std::array<TValue, TSize>& values) {
+    static void append(KeyWriter& key, const std::array<TValue, TSize>& values) {
         for (const auto value : values) append(key, value);
     }
 
     template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, std::span<TValue> values) {
+    static void append(KeyWriter& key, std::span<TValue> values) {
         append(key, values.size());
         for (const auto value : values) append(key, value);
     }
 
     template<typename TValue>
-    static void append(std::vector<std::uint64_t>& key, const std::optional<TValue>& value) {
+    static void append(KeyWriter& key, const std::optional<TValue>& value) {
         append(key, value.has_value());
         if (value) append(key, *value);
     }
 
-    static void append(std::vector<std::uint64_t>& key, std::string_view value) {
+    static void append(KeyWriter& key, std::string_view value) {
         append(key, value.size());
         for (const unsigned char byte : value) append(key, byte);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderFloatMode& value) {
+    static void append(KeyWriter& key, const ShaderFloatMode& value) {
         append(key, value.floatMode);
         append(key, value.dx10Clamp);
         append(key, value.ieeeMode);
         append(key, value.fp16Overflow);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderComputeStageInfo& value) {
+    static void append(KeyWriter& key, const ShaderComputeStageInfo& value) {
         append(key, value.numThreads);
         append(key, value.ldsSizeDwords);
         append(key, value.groupIdEnable);
@@ -190,7 +218,7 @@ private:
         append(key, value.scratchDwords);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderPixelStageInfo& value) {
+    static void append(KeyWriter& key, const ShaderPixelStageInfo& value) {
         append(key, value.interpolatorCount);
         if (value.interpolatorCount > value.interpolatorSettings.size()) throw std::runtime_error("Shader cache: invalid interpolator count");
         for (std::uint32_t i = 0; i < value.interpolatorCount; ++i) append(key, value.interpolatorSettings[i]);
@@ -252,14 +280,14 @@ private:
         append(key, value.sampleOrder);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderVertexResourceDestination& value) {
+    static void append(KeyWriter& key, const ShaderVertexResourceDestination& value) {
         append(key, value.registerStart);
         append(key, value.registersNum);
         append(key, value.attrId);
         append(key, value.fetchIndex);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const ShaderVertexStageInfo& value) {
+    static void append(KeyWriter& key, const ShaderVertexStageInfo& value) {
         append(key, value.fetchAttribReg);
         append(key, value.fetchBufferReg);
         append(key, value.fetchEmbedded);
@@ -279,7 +307,7 @@ private:
         }
     }
 
-    static void append(std::vector<std::uint64_t>& key, const MeshTargetLimits& value) {
+    static void append(KeyWriter& key, const MeshTargetLimits& value) {
         append(key, value.maxWorkgroupSize);
         append(key, value.maxWorkgroupInvocations);
         append(key, value.maxSharedMemoryBytes);
@@ -291,7 +319,7 @@ private:
         append(key, value.outputPerPrimitiveGranularity);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const TessellationTargetLimits& value) {
+    static void append(KeyWriter& key, const TessellationTargetLimits& value) {
         append(key, value.maxPatchSize);
         append(key, value.maxControlPerVertexInputComponents);
         append(key, value.maxControlPerVertexOutputComponents);
@@ -301,7 +329,7 @@ private:
         append(key, value.maxEvaluationOutputComponents);
     }
 
-    static void appendFeatureDigest(std::vector<std::uint64_t>& key, std::span<const std::uint32_t> capabilities, std::span<const std::string_view> extensions) {
+    static void appendFeatureDigest(KeyWriter& key, std::span<const std::uint32_t> capabilities, std::span<const std::string_view> extensions) {
         std::uint64_t low = 0xcbf29ce484222325ull;
         std::uint64_t high = 0x6a09e667f3bcc909ull;
         const auto mix = [&](std::uint64_t value) {
@@ -324,7 +352,7 @@ private:
         key.push_back(high);
     }
 
-    static void append(std::vector<std::uint64_t>& key, const SpirvTarget& value) {
+    static void append(KeyWriter& key, const SpirvTarget& value) {
         append(key, value.vulkanVersion);
         append(key, value.spirvVersion);
         append(key, value.subgroupSize);
