@@ -3397,10 +3397,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) {
-        for (std::size_t k = 0; k < queries.size(); ++k) {
-            if (!GuestMemory::UnchangedSince(queries[k].address, queries[k].bytes, queries[k].generation)) changed.push_back(queryOwners[k]);
-        }
+    thread_local std::vector<std::size_t>* changedQueriesSlot = nullptr;
+    auto& changedQueries = ShaderRecompiler::ThreadOwned(changedQueriesSlot);
+    if (!GuestMemory::ChangedSince(queries, changedQueries)) return fail(FastFail::Changed);
+    if (!changedQueries.empty()) {
+        for (const auto k : changedQueries) changed.push_back(queryOwners[k]);
         return fail(FastFail::Changed);
     }
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
