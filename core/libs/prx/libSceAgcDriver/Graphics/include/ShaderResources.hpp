@@ -565,15 +565,12 @@ private:
     RelookOutcome relookChanged(std::span<const CompiledShader> shaders, std::span<const PendingOverlap> changed);
     bool captureValidationOf(std::span<const PendingOverlap> changed);
     struct LookupRecipe {
-        std::array<std::uint32_t, 8> words{};
-        std::uint32_t wordCount = 0;
-        std::optional<ShaderRecompiler::DescriptorImageShape> shape;
-        bool depthCompare = false;
-        std::uint32_t mip = 0;
-        bool written = false;
-        bool dedupe = false;
-        std::size_t order = 0;
+        std::uint32_t shader = 0;
+        std::uint32_t binding = 0;
+        std::uint32_t element = 0;
+        std::uint32_t order = 0;
     };
+    static constexpr std::uint32_t TableRecipe = std::numeric_limits<std::uint32_t>::max();
     bool captureRecipes(std::span<const CompiledShader> shaders);
     std::vector<LookupRecipe> sampledRecipes;
     std::vector<LookupRecipe> storageRecipes;

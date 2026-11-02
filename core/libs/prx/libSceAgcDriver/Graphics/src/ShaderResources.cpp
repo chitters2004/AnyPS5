@@ -3572,18 +3572,22 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 }
 
 bool ShaderResources::captureRecipes(std::span<const CompiledShader> shaders) {
-    sampledRecipes.clear();
-    storageRecipes.clear();
     const auto refuse = [&] {
-        sampledRecipes.clear();
-        storageRecipes.clear();
+        std::vector<LookupRecipe>().swap(sampledRecipes);
+        std::vector<LookupRecipe>().swap(storageRecipes);
         recipeState = RecipeState::Refused;
         return false;
     };
-    std::size_t order = 0;
-    for (const auto& shader : shaders) {
-        if (shader.program == nullptr) return refuse();
-        for (const auto& binding : shader.program->bindings) {
+    sampledRecipes.clear();
+    storageRecipes.clear();
+    sampledRecipes.reserve(textures.size());
+    storageRecipes.reserve(storageTextures.size());
+    std::uint32_t order = 0;
+    for (std::size_t stage = 0; stage < shaders.size(); ++stage) {
+        const auto* program = shaders[stage].program;
+        if (program == nullptr) return refuse();
+        for (std::size_t index = 0; index < program->bindings.size(); ++index) {
+            const auto& binding = program->bindings[index];
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages) continue;
             if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
                 const auto elementWords = binding.count != 0 ? binding.guestDescriptor.size() / binding.count : 0;
@@ -3592,51 +3596,33 @@ bool ShaderResources::captureRecipes(std::span<const CompiledShader> shaders) {
                     const auto raw = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * elementWords, elementWords);
                     std::array<std::uint32_t, 8> narrowed{};
                     if (IsNullTextureResource(firstLayerWords(raw, binding.imageShape, narrowed, false))) continue;
-                    LookupRecipe recipe;
-                    std::copy(raw.begin(), raw.end(), recipe.words.begin());
-                    recipe.wordCount = static_cast<std::uint32_t>(raw.size());
-                    recipe.shape = binding.imageShape;
-                    recipe.depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
-                    recipe.order = order++;
-                    sampledRecipes.push_back(recipe);
+                    if (sampledRecipes.size() >= textures.size()) return refuse();
+                    sampledRecipes.push_back({static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(index), element, order++});
                 }
             } else if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
                 if (binding.guestDescriptor.size() < static_cast<std::size_t>(binding.count) * 8u) return refuse();
                 for (std::uint32_t element = 0; element < binding.count; ++element) {
-                    const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
-                    if (IsNullTextureResource(words)) continue;
-                    const auto index = storageRecipes.size();
-                    if (index >= storageTextures.size() || index >= storageMips.size() || index >= storageWritten.size()) return refuse();
-                    LookupRecipe recipe;
-                    std::copy(words.begin(), words.end(), recipe.words.begin());
-                    recipe.wordCount = 8;
-                    recipe.mip = storageMips[index];
-                    recipe.written = storageWritten[index];
-                    recipe.dedupe = index != 0 && SameAsPreviousStorageElement(binding, element) && StorageDedupeEnabled();
-                    recipe.order = order++;
-                    storageRecipes.push_back(recipe);
+                    if (IsNullTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u))) continue;
+                    if (storageRecipes.size() >= storageTextures.size() || storageRecipes.size() >= storageMips.size() || storageRecipes.size() >= storageWritten.size()) return refuse();
+                    storageRecipes.push_back({static_cast<std::uint32_t>(stage), static_cast<std::uint32_t>(index), element, order++});
                 }
             }
         }
     }
-    for (const auto& table : tableStages) {
+    for (std::size_t stage = 0; stage < tableStages.size(); ++stage) {
+        const auto& table = tableStages[stage];
         if (table.elementTextures.empty()) continue;
         const auto* images = tableImages(shaders, table.stage);
         if (images == nullptr || images->count != table.elementTextures.size() || images->guestDescriptor.size() < static_cast<std::size_t>(images->count) * 8u) return refuse();
         for (std::uint32_t element = 0; element < images->count; ++element) {
             if (table.elementTextures[element] == std::numeric_limits<std::size_t>::max()) continue;
             if (table.elementTextures[element] != sampledRecipes.size()) return refuse();
-            const auto raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
-            LookupRecipe recipe;
-            std::copy(raw.begin(), raw.end(), recipe.words.begin());
-            recipe.wordCount = 8;
-            recipe.shape = images->imageShapes.at(element);
-            recipe.depthCompare = images->imageDepthCompare.at(element);
-            recipe.order = order++;
-            sampledRecipes.push_back(recipe);
+            sampledRecipes.push_back({static_cast<std::uint32_t>(stage), TableRecipe, element, order++});
         }
     }
     if (sampledRecipes.size() != textures.size() || storageRecipes.size() != storageTextures.size()) return refuse();
+    sampledRecipes.shrink_to_fit();
+    storageRecipes.shrink_to_fit();
     recipeState = RecipeState::Captured;
     return true;
 }
@@ -3648,7 +3634,7 @@ ShaderResources::RelookOutcome ShaderResources::relookChanged(std::span<const Co
     };
     if (changed.empty() || recipeState == RecipeState::Refused) return RelookOutcome::Fallback;
     if (recipeState == RecipeState::Missing && !captureRecipes(shaders)) return RelookOutcome::Fallback;
-    thread_local std::vector<std::pair<std::size_t, PendingOverlap>>* orderedSlot = nullptr;
+    thread_local std::vector<std::pair<std::uint32_t, PendingOverlap>>* orderedSlot = nullptr;
     auto& ordered = ShaderRecompiler::ThreadOwned(orderedSlot);
     ordered.clear();
     for (const auto& entry : changed) {
@@ -3657,24 +3643,55 @@ ShaderResources::RelookOutcome ShaderResources::relookChanged(std::span<const Co
         ordered.emplace_back(recipes[entry.element].order, entry);
     }
     std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
+    const auto bindingOf = [&](const LookupRecipe& recipe, ShaderRecompiler::DescriptorKind kind) -> const ShaderRecompiler::DescriptorBinding* {
+        if (recipe.shader >= shaders.size() || shaders[recipe.shader].program == nullptr) return nullptr;
+        const auto& bindings = shaders[recipe.shader].program->bindings;
+        if (recipe.binding >= bindings.size()) return nullptr;
+        const auto& binding = bindings[recipe.binding];
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != kind || recipe.element >= binding.count) return nullptr;
+        return &binding;
+    };
     lookupLog().clear();
     for (const auto& [order, entry] : ordered) {
         relookedLookups().fetch_add(1, std::memory_order_relaxed);
-        if (!entry.storage) {
-            const auto& recipe = sampledRecipes[entry.element];
-            std::array<std::uint32_t, 8> narrowed{};
-            const auto words = firstLayerWords(std::span<const std::uint32_t>(recipe.words.data(), recipe.wordCount), recipe.shape, narrowed, false);
-            const auto resource = DecodeTextureResource(words);
-            const VkImageViewType multisampleViewType = recipe.shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-            if (cachedTexture(context, words, resource, ViewComponents(resource), 0, recipe.depthCompare, multisampleViewType) != textures[entry.element]) return leave(RelookOutcome::Differs);
+        if (entry.storage) {
+            const auto& recipe = storageRecipes[entry.element];
+            const auto* binding = bindingOf(recipe, ShaderRecompiler::DescriptorKind::StorageImage);
+            if (binding == nullptr || binding->guestDescriptor.size() < static_cast<std::size_t>(binding->count) * 8u) return leave(RelookOutcome::Fallback);
+            const auto words = std::span<const std::uint32_t>(binding->guestDescriptor).subspan(static_cast<std::size_t>(recipe.element) * 8u, 8u);
+            if (IsNullTextureResource(words)) return leave(RelookOutcome::Fallback);
+            std::shared_ptr<StorageTexture> expected;
+            if (entry.element != 0 && SameAsPreviousStorageElement(*binding, recipe.element) && StorageDedupeEnabled()) expected = storageTextures[entry.element - 1];
+            else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), storageMips[entry.element], 0, storageWritten[entry.element]);
+            if (expected != storageTextures[entry.element]) return leave(RelookOutcome::Differs);
             continue;
         }
-        const auto& recipe = storageRecipes[entry.element];
-        const auto words = std::span<const std::uint32_t>(recipe.words.data(), 8);
-        std::shared_ptr<StorageTexture> expected;
-        if (recipe.dedupe) expected = storageTextures[entry.element - 1];
-        else expected = cachedStorageTexture(context, words, DecodeTextureResource(words), recipe.mip, 0, recipe.written);
-        if (expected != storageTextures[entry.element]) return leave(RelookOutcome::Differs);
+        const auto& recipe = sampledRecipes[entry.element];
+        std::span<const std::uint32_t> raw;
+        std::optional<ShaderRecompiler::DescriptorImageShape> shape;
+        bool depthCompare = false;
+        if (recipe.binding == TableRecipe) {
+            if (recipe.shader >= tableStages.size()) return leave(RelookOutcome::Fallback);
+            const auto* images = tableImages(shaders, tableStages[recipe.shader].stage);
+            if (images == nullptr || recipe.element >= images->count || images->guestDescriptor.size() < static_cast<std::size_t>(images->count) * 8u) return leave(RelookOutcome::Fallback);
+            raw = std::span<const std::uint32_t>(images->guestDescriptor).subspan(static_cast<std::size_t>(recipe.element) * 8u, 8u);
+            shape = images->imageShapes.at(recipe.element);
+            depthCompare = images->imageDepthCompare.at(recipe.element);
+        } else {
+            const auto* binding = bindingOf(recipe, ShaderRecompiler::DescriptorKind::SampledImage);
+            if (binding == nullptr) return leave(RelookOutcome::Fallback);
+            const auto elementWords = binding->guestDescriptor.size() / binding->count;
+            if (elementWords > 8) return leave(RelookOutcome::Fallback);
+            raw = std::span<const std::uint32_t>(binding->guestDescriptor).subspan(static_cast<std::size_t>(recipe.element) * elementWords, elementWords);
+            shape = binding->imageShape;
+            depthCompare = !binding->imageDepthCompare.empty() && binding->imageDepthCompare.at(recipe.element);
+        }
+        std::array<std::uint32_t, 8> narrowed{};
+        const auto words = firstLayerWords(raw, shape, narrowed, false);
+        if (IsNullTextureResource(words)) return leave(RelookOutcome::Fallback);
+        const auto resource = DecodeTextureResource(words);
+        const VkImageViewType multisampleViewType = shape == ShaderRecompiler::DescriptorImageShape::Image2DMultisampleArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+        if (cachedTexture(context, words, resource, ViewComponents(resource), 0, depthCompare, multisampleViewType) != textures[entry.element]) return leave(RelookOutcome::Differs);
     }
     return captureValidationOf(changed) ? RelookOutcome::Same : RelookOutcome::Fallback;
 }
