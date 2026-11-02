@@ -1696,14 +1696,17 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
         else written.emplace_back(begin, stop);
     };
     for (auto block = first; block <= last; ++block) {
-        if (tracker.cpuStampOf(block) <= since) continue;
-        const auto [begin, stop] = clip(block);
         const auto pages = tracker.cpuPages.find(block);
+        const bool stamped = tracker.cpuStampOf(block) > since;
+        if (!stamped && pages == tracker.cpuPages.end()) continue;
+        const auto [begin, stop] = clip(block);
+        const auto walked = tracker.walkPages.find(block);
         bool any = false;
         if (pages != tracker.cpuPages.end()) {
             const auto blockStart = tracker.blockBegin(block);
             for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {
-                if (pages->second.pages[page] <= since) continue;
+                const auto cpu = pages->second.pages[page];
+                if (cpu <= since && (cpu == 0 || walked == tracker.walkPages.end() || walked->second.pages[page] <= since)) continue;
                 const auto pageBegin = std::max<std::uint64_t>(begin, blockStart + page * WritePageBytes);
                 const auto pageEnd = std::min<std::uint64_t>(stop, blockStart + (page + 1) * WritePageBytes);
                 if (pageBegin >= pageEnd) continue;
@@ -1711,7 +1714,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
                 any = true;
             }
         }
-        if (!any) append(begin, stop);
+        if (!any && stamped) append(begin, stop);
     }
     return tracker.generation.load(std::memory_order_relaxed);
 }
