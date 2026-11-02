@@ -1339,10 +1339,82 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 }
 
+namespace {
+
+enum class FlushSite : std::size_t { IndexInput, CopiedInput, InPlaceInput, ZeroPaddedInput, EmulatedIndices, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(FlushSite::Count)> FlushSiteNames{"indexed input", "copied input", "in-place input", "zero-padded vertex input", "emulated primitive indices"};
+
+struct FlushSiteCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FlushSite::Count)> calls{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FlushSite::Count)> nanoseconds{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FlushSite::Count)> slowest{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FlushSite::Count)> secondNanoseconds{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FlushSite::Count)> secondSlowest{};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+FlushSiteCounters& flushSites() {
+    static FlushSiteCounters counters;
+    return counters;
+}
+
+bool FlushesCounted() {
+    static const bool enabled = std::getenv("APS5_COUNT_INPUT_FLUSHES") != nullptr;
+    return enabled;
+}
+
+bool SecondFlushProbed() {
+    static const bool enabled = std::getenv("APS5_PROBE_SECOND_INPUT_FLUSH") != nullptr;
+    return enabled;
+}
+
+void raise(std::atomic<std::uint64_t>& slot, std::uint64_t value) {
+    auto held = slot.load(std::memory_order_relaxed);
+    while (value > held && !slot.compare_exchange_weak(held, value, std::memory_order_relaxed)) {
+    }
+}
+
+void countedFlush(FlushSite site, std::uint64_t address, std::size_t bytes) {
+    if (!FlushesCounted()) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+        return;
+    }
+    auto& counters = flushSites();
+    const auto index = static_cast<std::size_t>(site);
+    const auto start = std::chrono::steady_clock::now();
+    GuestMemory::FlushGpuWrites(address, bytes);
+    const auto first = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    counters.calls[index].fetch_add(1, std::memory_order_relaxed);
+    counters.nanoseconds[index].fetch_add(first, std::memory_order_relaxed);
+    raise(counters.slowest[index], first);
+    if (SecondFlushProbed()) {
+        const auto again = std::chrono::steady_clock::now();
+        GuestMemory::FlushGpuWrites(address, bytes);
+        const auto second = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - again).count());
+        counters.secondNanoseconds[index].fetch_add(second, std::memory_order_relaxed);
+        raise(counters.secondSlowest[index], second);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::string text = "[input-flushes] by site (calls/total ms/slowest us; repeated flush total ms/slowest us):";
+    for (std::size_t i = 0; i < static_cast<std::size_t>(FlushSite::Count); ++i) {
+        const auto calls = counters.calls[i].load(std::memory_order_relaxed);
+        if (calls == 0) continue;
+        char entry[200];
+        std::snprintf(entry, sizeof(entry), " %s %llu/%.2f/%.1f; %.2f/%.1f;", FlushSiteNames[i], static_cast<unsigned long long>(calls), counters.nanoseconds[i].load(std::memory_order_relaxed) / 1e6, counters.slowest[i].load(std::memory_order_relaxed) / 1e3, counters.secondNanoseconds[i].load(std::memory_order_relaxed) / 1e6, counters.secondSlowest[i].load(std::memory_order_relaxed) / 1e3);
+        text += entry;
+    }
+    text += "\n";
+    std::fputs(text.c_str(), stderr);
+}
+
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, bool synced) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
-    if (bytes != 0 && !synced) GuestMemory::FlushGpuWrites(address, bytes);
+    if (bytes != 0 && !synced) countedFlush(FlushSite::CopiedInput, address, bytes);
     if (recorder != nullptr && bytes != 0) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
@@ -1359,7 +1431,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride) {
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
-    GuestMemory::FlushGpuWrites(address, bytes);
+    countedFlush(FlushSite::ZeroPaddedInput, address, bytes);
     DrawInputCopy copy;
     copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     const auto span = copy.buffer->Bytes();
@@ -1384,7 +1456,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (recorder == nullptr || bytes == 0 || !context.drawInputsInPlace || context.hostImportAlignment == 0) return nullptr;
     bool behind = false;
     if (behindGpuWrite == nullptr) {
-        if (!synced) GuestMemory::FlushGpuWrites(address, bytes);
+        if (!synced) countedFlush(FlushSite::InPlaceInput, address, bytes);
         if (recorder->PendingWriteOverlaps(address, bytes)) return nullptr;
     } else {
         StorageTexture::FlushPending(address, bytes, nullptr, "in-place vertex input");
@@ -1603,7 +1675,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             }
         };
         if (draw.indexed) {
-            GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+            countedFlush(FlushSite::EmulatedIndices, draw.indexAddress, static_cast<std::size_t>(indexBytes));
             GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
             const auto readIndex = [&](std::uint32_t idx) -> std::uint32_t {
                 if (draw.indexSize == 2) {
@@ -1664,7 +1736,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool fanGeometry = state.stages.mesh && state.stages.mesh->inputPrimitive == 5;
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart) && !fanGeometry;
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-        if (indexBytes != 0) GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+        if (indexBytes != 0) countedFlush(FlushSite::IndexInput, draw.indexAddress, static_cast<std::size_t>(indexBytes));
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, nullptr, true);
         DrawInputCopy copy;
         if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use, true);
