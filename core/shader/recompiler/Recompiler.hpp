@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -656,6 +657,41 @@ inline std::uint64_t HashSpirvWords(std::span<const std::uint32_t> words, std::u
     hash ^= hash >> 33u;
     return hash;
 }
+
+class SnapshotHasher {
+public:
+    void Mix(std::uint64_t value) {
+        first = Round(first, value);
+        std::swap(first, second);
+    }
+    void Words(std::span<const std::uint32_t> words) {
+        Mix(words.size());
+        Pairs(words);
+    }
+    void Pairs(std::span<const std::uint32_t> words) {
+        std::size_t index = 0;
+        for (; index + 2 <= words.size(); index += 2) Mix(words[index] | (static_cast<std::uint64_t>(words[index + 1]) << 32u));
+        if (index < words.size()) Mix(words[index]);
+    }
+    [[nodiscard]] std::uint64_t Finish() const {
+        auto hash = std::rotl(first, 1) + std::rotl(second, 7);
+        hash ^= hash >> 33u;
+        hash *= 0xc2b2ae3d27d4eb4full;
+        hash ^= hash >> 29u;
+        hash *= 0x165667b19e3779f9ull;
+        hash ^= hash >> 32u;
+        return hash;
+    }
+
+private:
+    static std::uint64_t Round(std::uint64_t lane, std::uint64_t value) {
+        lane += value * 0xc2b2ae3d27d4eb4full;
+        lane = std::rotl(lane, 31);
+        return lane * 0x9e3779b185ebca87ull;
+    }
+    std::uint64_t first = 0x60ea27eeadc0b5d6ull;
+    std::uint64_t second = 0x8c1fe1d3b1b8b1a7ull;
+};
 
 // Compiled SPIR-V shared between a cached variant and every result materialized from it: results
 // are copied per dispatch and draw, so the words are reference counted and only duplicated when a

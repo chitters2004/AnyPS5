@@ -1720,41 +1720,32 @@ void reportResultMemo() {
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
 // attributes are resolved from.
 std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapshot& snapshot, bool masked, std::span<const BufferSubstitute> substitutes = {}) {
-    std::uint64_t hash = 0xcbf29ce484222325ull;
-    const auto mix = [&](std::uint64_t value) {
-        hash ^= value;
-        hash *= 0x100000001b3ull;
-    };
-    const auto mixWords = [&](std::span<const std::uint32_t> words) {
-        mix(words.size());
-        for (const auto word : words) mix(word);
-    };
+    SnapshotHasher hasher;
+    const auto mix = [&](std::uint64_t value) { hasher.Mix(value); };
+    const auto mixWords = [&](std::span<const std::uint32_t> words) { hasher.Words(words); };
+    const auto shape = [](const DescriptorValue& value) { return value.dwordCount | (static_cast<std::uint64_t>(value.availableDwordMask) << 32u); };
     const auto mixDescriptors = [&](const std::vector<DescriptorValue>& values) {
         mix(values.size());
         for (const auto& value : values) {
-            mix(value.dwordCount);
-            mix(value.availableDwordMask);
-            for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+            mix(shape(value));
+            hasher.Pairs(std::span<const std::uint32_t>(value.dwords.data(), std::min<std::size_t>(value.dwordCount, value.dwords.size())));
         }
     };
     if (masked) {
         mix(snapshot.buffers.size());
         for (std::size_t index = 0; index < snapshot.buffers.size(); ++index) {
             const auto& value = snapshot.buffers[index];
-            mix(value.dwordCount);
-            mix(value.availableDwordMask);
+            mix(shape(value));
             const auto fields = BufferSpecializationFields(value, substitutes, index);
-            mix(fields.known ? 4u | fields.misalignment : 0u);
-            mix(fields.word1);
+            mix((fields.known ? 4u | fields.misalignment : 0u) | (static_cast<std::uint64_t>(fields.word1) << 32u));
             if (value.dwordCount > 3u) mix(fields.word3);
-            for (std::uint32_t i = 4; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+            if (value.dwordCount > 4u) hasher.Pairs(std::span<const std::uint32_t>(value.dwords.data() + 4, std::min<std::size_t>(value.dwordCount, value.dwords.size()) - 4u));
         }
     } else {
         mixDescriptors(snapshot.buffers);
         for (std::size_t index = 0; index < substitutes.size() && index < snapshot.buffers.size(); ++index) {
             const auto fields = BufferSpecializationFields(snapshot.buffers[index], substitutes, index);
-            mix(fields.word1);
-            mix(fields.word3);
+            mix(fields.word1 | (static_cast<std::uint64_t>(fields.word3) << 32u));
             mix(fields.known ? 4u | fields.misalignment : 0u);
         }
     }
@@ -1829,7 +1820,7 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
     } else {
         mix(1ull << 32u);
     }
-    return hash;
+    return hasher.Finish();
 }
 
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
