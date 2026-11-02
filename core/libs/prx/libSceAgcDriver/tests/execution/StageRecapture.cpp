@@ -12,6 +12,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -631,6 +632,8 @@ void CheckMemoHashInputs() {
     RequireSeen(stage, fetched, "a moved vertex buffer", [&] { stage.request.context.vertex->resources[0].fields[0] = 0x20000400u; }, [&] { stage.request.context.vertex->resources[0].fields[0] = 0x20000000u; });
 }
 
+void CheckDescriptorFixture();
+
 struct Spread {
     double median;
     double low;
@@ -654,7 +657,127 @@ Spread Measure(std::size_t batches, std::size_t iterations, auto&& body) {
 }
 
 void Print(const char* name, const Spread& spread) {
-    std::printf("%-28s median %8.1f ns  p10 %8.1f  p90 %8.1f  min %8.1f  max %8.1f\n", name, spread.median, spread.low, spread.high, spread.min, spread.max);
+    std::printf("%-44s median %8.1f ns  p10 %8.1f  p90 %8.1f  min %8.1f  max %8.1f\n", name, spread.median, spread.low, spread.high, spread.min, spread.max);
+}
+
+struct DescriptorTable {
+    static constexpr std::uint32_t Buffers = 8;
+    alignas(256) std::array<std::uint32_t, Buffers * 4u + 8u> words{};
+    std::vector<std::uint8_t> texels = std::vector<std::uint8_t>(std::size_t{1} << 21u);
+
+    DescriptorTable() {
+        for (std::uint32_t buffer = 0; buffer < Buffers; ++buffer) MoveBuffer(buffer, 0x10000000u + buffer * 0x1000u);
+        MoveImage(0u);
+    }
+
+    void MoveBuffer(std::uint32_t buffer, std::uint32_t base) {
+        words[buffer * 4u] = base;
+        words[buffer * 4u + 1u] = 0u;
+        words[buffer * 4u + 2u] = 0x100u;
+        words[buffer * 4u + 3u] = 0x00027facu;
+    }
+
+    static constexpr std::uint32_t Format8888UNorm = 56;
+    static constexpr std::uint32_t Format8888Srgb = 57;
+
+    void MoveImage(std::uint32_t offset) {
+        PlaceImage((static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data())) + 255u) / 256u * 256u + offset % 8000u * 256u);
+    }
+
+    void PlaceImage(std::uint64_t base, std::uint32_t format = Format8888UNorm, std::uint32_t height = 7u) {
+        constexpr std::uint32_t Type2D = 9;
+        constexpr std::uint32_t width = 7u;
+        const std::array<std::uint32_t, 8> image{static_cast<std::uint32_t>(base >> 8u), static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (format << 20u) | (width << 30u), height << 14u, 0xfacu | (Type2D << 28u), 0u, 0u, 0u, 0u};
+        std::copy(image.begin(), image.end(), words.begin() + Buffers * 4u);
+    }
+
+    std::uint64_t ImageBase(std::uint32_t offset) const {
+        return (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data())) + 255u) / 256u * 256u + offset * 256u;
+    }
+};
+
+std::vector<std::uint32_t> DescriptorPixelCode() {
+    std::vector<std::uint32_t> code{0xf4100100u, 0xfa000000u, 0xf4100500u, 0xfa000040u, 0xf40c0900u, 0xfa000080u, 0xbf8cc07fu};
+    for (std::uint32_t buffer = 0; buffer < DescriptorTable::Buffers; ++buffer) code.insert(code.end(), {0xf4200000u | ((44u + buffer) << 6u) | (2u + buffer * 2u), 0xfa000000u});
+    code.insert(code.end(), {0xbf8cc07fu, 0x7e00022cu, 0x7e02022du, 0x7e04022eu, 0x7e06022fu, 0x4a000030u, 0x4a020231u, 0x4a040432u, 0x4a060633u, 0x7e100280u, 0x7e120280u,
+        0xf0001f08u, 0x00090408u, 0xbf8c3f70u, 0x4a000104u, 0x4a020305u, 0x4a040506u, 0x4a060707u, 0xf800180fu, 0x03020100u, 0xbf810000u});
+    return code;
+}
+
+void CheckDescriptorFixture() {
+    static DescriptorTable table;
+    const auto code = DescriptorPixelCode();
+    PixelStage stage(code, PointerWords(table.words.data()), 0x250000u);
+    const auto first = stage.Current();
+    RequireSameResult(*first, *stage.CurrentUncached(), "the descriptor fixture");
+    std::size_t buffers = 0;
+    std::size_t images = 0;
+    std::size_t flattened = 0;
+    for (const auto& binding : first->bindings) {
+        if (binding.role == DescriptorRole::GuestBuffers) buffers += binding.guestDescriptor.size() / 4u;
+        if (binding.role == DescriptorRole::GuestImages) images += binding.guestDescriptor.size() / 8u;
+        if (binding.role == DescriptorRole::FlattenedSrt) flattened += binding.guestDescriptor.size();
+    }
+    std::printf("descriptor fixture: %zu buffers, %zu images, %zu flattened SRT words, %zu push bytes\n", buffers, images, flattened, first->pushConstants.size());
+    Require(buffers == DescriptorTable::Buffers && images == 1u, "the descriptor fixture does not bind its eight buffers and one image");
+    Require(stage.Current() == first, "the descriptor fixture did not reuse its memoized result");
+    for (std::uint32_t round = 1; round < 4u; ++round) {
+        table.MoveBuffer(round % DescriptorTable::Buffers, 0x20000000u + round * 0x100u);
+        const auto moved = stage.Current();
+        Require(moved != first, "a moved buffer of the descriptor fixture reused the old result");
+        RequireSameResult(*moved, *stage.CurrentUncached(), "a moved buffer of the descriptor fixture");
+        table.MoveImage(round);
+        const auto image = stage.Current();
+        Require(image != moved, "a moved image of the descriptor fixture reused the old result");
+        RequireSameResult(*image, *stage.CurrentUncached(), "a moved image of the descriptor fixture");
+    }
+}
+
+void BenchDescriptors(bool churnOnly) {
+    constexpr std::size_t batches = 21;
+    constexpr std::size_t iterations = 2000;
+    static DescriptorTable table;
+    const auto code = DescriptorPixelCode();
+    PixelStage stage(code, PointerWords(table.words.data()), 0x260000u);
+    static_cast<void>(stage.Current());
+    const auto phases = [&](const char* name, auto&& change) {
+        std::array<std::vector<double>, 3> samples;
+        std::uint64_t sequence = 0;
+        for (std::size_t batch = 0; batch <= batches; ++batch) {
+            std::array<double, 3> spent{};
+            for (std::size_t iteration = 0; iteration < iterations; ++iteration) {
+                change(++sequence);
+                AgcDriver::ShaderMemory draw({});
+                const auto started = std::chrono::steady_clock::now();
+                auto invocation = AgcDriver::DriverDetail::InvocationFor(stage.snapshot, 0, stage.request);
+                const auto invoked = std::chrono::steady_clock::now();
+                const auto capture = AgcDriver::DriverDetail::CaptureInvocation(draw, stage.snapshot, 0, stage.request, invocation);
+                const auto captured = std::chrono::steady_clock::now();
+                static_cast<void>(invocation.Materialize(*capture));
+                const auto materialized = std::chrono::steady_clock::now();
+                spent[0] += std::chrono::duration<double, std::nano>(invoked - started).count();
+                spent[1] += std::chrono::duration<double, std::nano>(captured - invoked).count();
+                spent[2] += std::chrono::duration<double, std::nano>(materialized - captured).count();
+            }
+            if (batch == 0) continue;
+            for (std::size_t phase = 0; phase < 3; ++phase) samples[phase].push_back(spent[phase] / static_cast<double>(iterations));
+        }
+        const std::array<const char*, 3> names{"invocation", "capture", "materialize"};
+        for (std::size_t phase = 0; phase < 3; ++phase) {
+            auto& values = samples[phase];
+            std::ranges::sort(values);
+            const auto at = [&](double fraction) { return values[static_cast<std::size_t>(fraction * static_cast<double>(values.size() - 1u))]; };
+            const auto label = std::string(name) + ", " + names[phase];
+            Print(label.c_str(), {at(0.5), at(0.1), at(0.9), values.front(), values.back()});
+        }
+    };
+    if (churnOnly) {
+        for (int repeat = 0; repeat < 10; ++repeat) phases("descriptors, moved buffer", [&](std::uint64_t sequence) { table.MoveBuffer(static_cast<std::uint32_t>(sequence % DescriptorTable::Buffers), 0x20000000u + static_cast<std::uint32_t>(sequence + repeat * 100000u) * 0x100u); });
+        return;
+    }
+    phases("descriptors, memo hit", [](std::uint64_t) {});
+    phases("descriptors, moved buffer", [&](std::uint64_t sequence) { table.MoveBuffer(static_cast<std::uint32_t>(sequence % DescriptorTable::Buffers), 0x20000000u + static_cast<std::uint32_t>(sequence) * 0x100u); });
+    phases("descriptors, moved image (miss)", [&](std::uint64_t sequence) { table.MoveImage(static_cast<std::uint32_t>(sequence)); });
 }
 
 void Bench() {
@@ -676,6 +799,7 @@ void Bench() {
     Print("TryCreate", Measure(batches, iterations, [&](std::size_t) { static_cast<void>(PreparedShaderInvocation::TryCreate(prepared, handle, key)); }));
     Print("stage, memo hit", Measure(batches, iterations, [&](std::size_t) { static_cast<void>(stage.Draw(1u)); }));
     Print("stage, new user data", Measure(batches, iterations, [&](std::size_t index) { static_cast<void>(stage.Draw(static_cast<std::uint32_t>(index) + 2u)); }));
+    BenchDescriptors(false);
     auto invocation = stage.Invocation(1u);
     const auto capture = AgcDriver::DriverDetail::CaptureInvocation(stage.memory, stage.snapshot, 0, stage.request, invocation);
     Print("Materialize, memo hit", Measure(batches, iterations, [&](std::size_t) { static_cast<void>(invocation.Materialize(*capture)); }));
@@ -687,6 +811,10 @@ int main(int argc, char** argv) {
     try {
         Require(argc <= 2, "invalid test arguments");
         if (argc == 2) {
+            if (std::string_view(argv[1]) == "--bench-churn") {
+                BenchDescriptors(true);
+                return 0;
+            }
             Require(std::string_view(argv[1]) == "--bench", "invalid test arguments");
             Bench();
             return 0;
@@ -697,6 +825,7 @@ int main(int argc, char** argv) {
         CheckDifferingCandidateRestoresSource();
         CheckConcurrentSubstitutes();
         CheckMemoHashInputs();
+        CheckDescriptorFixture();
         CheckSubstituteSlots();
         CheckInvocation();
         CheckResultMemo();
