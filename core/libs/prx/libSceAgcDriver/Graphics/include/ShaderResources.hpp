@@ -564,6 +564,21 @@ private:
     enum class RelookOutcome { Same, Differs, Fallback };
     RelookOutcome relookChanged(std::span<const CompiledShader> shaders, std::span<const PendingOverlap> changed);
     bool captureValidationOf(std::span<const PendingOverlap> changed);
+    struct LookupRecipe {
+        std::array<std::uint32_t, 8> words{};
+        std::uint32_t wordCount = 0;
+        std::optional<ShaderRecompiler::DescriptorImageShape> shape;
+        bool depthCompare = false;
+        std::uint32_t mip = 0;
+        bool written = false;
+        bool dedupe = false;
+        std::size_t order = 0;
+    };
+    bool captureRecipes(std::span<const CompiledShader> shaders);
+    std::vector<LookupRecipe> sampledRecipes;
+    std::vector<LookupRecipe> storageRecipes;
+    enum class RecipeState : std::uint8_t { Missing, Captured, Refused };
+    RecipeState recipeState = RecipeState::Missing;
     // T1 (design_cpu_final M3): brings the overlapping surfaces' own objects up to date exactly as
     // the full walk's lookups would, in the walk's binding order, without the lookups: a storage
     // image's Refresh (which stores the foreign images over its surface first), a view's source's

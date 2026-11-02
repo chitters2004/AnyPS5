@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -210,6 +211,126 @@ void RunTests(const AgcDriver::VulkanDevice& device) {
     std::puts("a set whose textures were released fails without looking them up");
 }
 
+
+
+constexpr std::size_t Slot = 262144;
+constexpr std::uint32_t Linear = 0;
+constexpr std::uint32_t Tiled64KB = 0x1b;
+constexpr std::uint32_t Type2DArray = 13;
+
+std::array<std::uint32_t, 8> SurfaceWords(std::uint64_t address, std::uint32_t side, std::uint32_t tile, std::uint32_t type, std::uint32_t lastSlice, std::uint64_t keys) {
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format8888UNorm << 20u) | (((side - 1u) & 3u) << 30u), ((side - 1u) >> 2u) | ((side - 1u) << 14u), 0xfacu | (tile << 20u) | (type << 28u), lastSlice, 0u, keys != 0 ? (1u << 21u) | (static_cast<std::uint32_t>((keys >> 8u) & 0xffu) << 24u) : 0u, static_cast<std::uint32_t>(keys >> 16u)};
+}
+
+ShaderRecompiler::DescriptorBinding ImageBinding(ShaderRecompiler::DescriptorKind kind, std::uint32_t slot, const std::array<std::uint32_t, 8>& words) {
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = kind;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = (kind == ShaderRecompiler::DescriptorKind::StorageImage ? ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding : ShaderRecompiler::RuntimeAbi::FirstImageBinding) + slot;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    if (kind == ShaderRecompiler::DescriptorKind::SampledImage) binding.imageSamplers = {0};
+    else binding.imageWritten = {false};
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    return binding;
+}
+
+struct Synthetic {
+    ShaderRecompiler::RecompileResult program;
+    CompiledShader shader{ShaderStage::Compute, nullptr, 0};
+    std::shared_ptr<ShaderResources> resources;
+};
+
+void Build(Synthetic& set, const AgcDriver::Graphics::Context& context, std::vector<ShaderRecompiler::DescriptorBinding> bindings, const std::string& name) {
+    set.program = {};
+    set.program.bindings = std::move(bindings);
+    set.shader = CompiledShader{ShaderStage::Compute, &set.program, 0};
+    set.resources = std::make_shared<ShaderResources>(context, set.shader);
+    Require(set.resources->Reusable(), "changed relook: the " + name + " set is not reusable");
+    bool current = false;
+    auto report = Prove(*set.resources, set.shader, current);
+    if (report.path != ShaderResources::ProofPath::Fast) {
+        std::printf("%s: the first proof after the build took the %s (failure %d, current %d)\n", name.c_str(), Path(report).c_str(), static_cast<int>(report.failure), current);
+        report = Prove(*set.resources, set.shader, current);
+    }
+    Require(current && report.path == ShaderResources::ProofPath::Fast, "changed relook: the " + name + " set took the " + Path(report) + " with its memory unchanged after the build");
+}
+
+ShaderResources::ProofReport ProveCounted(Synthetic& set, bool& current, std::uint64_t& relooked) {
+    const auto before = ShaderResources::RelookedLookups();
+    const auto report = Prove(*set.resources, set.shader, current);
+    relooked = ShaderResources::RelookedLookups() - before;
+    return report;
+}
+
+void Touch(const GuestBlock& block, std::size_t offset, bool change) {
+    auto* first = reinterpret_cast<volatile std::uint8_t*>(block.Bytes(offset));
+    const std::uint8_t saved = *first;
+    *first = change ? static_cast<std::uint8_t>(saved ^ 0xffu) : saved;
+}
+
+void SyntheticTests(const AgcDriver::VulkanDevice& device) {
+    using Kind = ShaderRecompiler::DescriptorKind;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    GuestBlock block(8 * Slot, true);
+    for (std::size_t i = 0; i < 8 * Slot; ++i) *block.Bytes(i) = static_cast<std::uint8_t>(i * 7u + 3u);
+    AgcDriver::GuestMemory::CollectWritesUncached(block.At(0), 8 * Slot);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    bool current = false;
+    std::uint64_t relooked = 0;
+
+    const auto expect = [&](const ShaderResources::ProofReport& report, bool wantCurrent, ShaderResources::ProofPath wantPath, std::uint64_t wantRelooked, const std::string& what) {
+        Require(current == wantCurrent && report.path == wantPath && relooked == wantRelooked, "changed relook: " + what + " took the " + Path(report) + (current ? ", current," : ", not current,") + " after " + std::to_string(relooked) + " relooked lookups");
+    };
+    using ShaderResources::ProofPath::Relooked;
+    using ShaderResources::ProofPath::Full;
+    if (std::getenv("APS5_NO_HOST_IMPORT") != nullptr) {
+        Synthetic alias;
+        const auto aliased = SurfaceWords(block.At(0), 64, Linear, Type2D, 0, 0);
+        Build(alias, context, {ImageBinding(Kind::StorageImage, 0, aliased), ImageBinding(Kind::SampledImage, 0, aliased)}, "storage and sampled alias");
+        Touch(block, 0, false);
+        expect(ProveCounted(alias, current, relooked), true, Relooked, 2, "a same-byte store under a storage image and its sampled view");
+        Touch(block, 0, true);
+        expect(ProveCounted(alias, current, relooked), false, Relooked, 2, "a changed byte under a storage image and its sampled view");
+        std::puts("a storage image and its sampled view relook together");
+    } else {
+        std::puts("imported memory is compared, not write-watched, on this device: the storage alias case runs with APS5_NO_HOST_IMPORT=1");
+    }
+
+    Synthetic layered;
+    Build(layered, context, {ImageBinding(Kind::SampledImage, 0, SurfaceWords(block.At(Slot), 64, Linear, Type2DArray, 3, 0))}, "first layer of a 2D array");
+    Touch(block, Slot, false);
+    expect(ProveCounted(layered, current, relooked), true, Relooked, 1, "a same-byte store in the sampled first layer of a 2D array");
+    Touch(block, Slot, true);
+    expect(ProveCounted(layered, current, relooked), false, Relooked, 1, "a changed first layer of a 2D array");
+    std::puts("the first layer of a 2D array relooks through its narrowed descriptor");
+
+    const auto keys = block.At(3 * Slot);
+    const auto keyBytes = AgcDriver::Graphics::DccKeyBytes(65536);
+    std::memset(block.Bytes(3 * Slot), 0xff, keyBytes);
+    AgcDriver::GuestMemory::MarkWritten(keys, keyBytes);
+    Synthetic compressed;
+    Build(compressed, context, {ImageBinding(Kind::SampledImage, 0, SurfaceWords(block.At(2 * Slot), 64, Tiled64KB, Type2D, 0, keys))}, "DCC surface");
+    Touch(block, 2 * Slot, false);
+    expect(ProveCounted(compressed, current, relooked), true, Relooked, 1, "a same-byte store under uncompressed DCC keys");
+    std::memset(block.Bytes(3 * Slot), 0x00, keyBytes);
+    AgcDriver::GuestMemory::MarkWritten(keys, keyBytes);
+    expect(ProveCounted(compressed, current, relooked), false, Full, 0, "a fast clear of the DCC keys");
+    std::puts("a DCC key change leaves the relook for the full walk");
+
+    Synthetic pair;
+    Build(pair, context, {ImageBinding(Kind::SampledImage, 0, SurfaceWords(block.At(4 * Slot), 8, Linear, Type2D, 0, 0)), ImageBinding(Kind::SampledImage, 1, SurfaceWords(block.At(5 * Slot), 8, Linear, Type2D, 0, 0))}, "two textures");
+    const auto kept = pair.resources->SampledTextures()[1];
+    AgcDriver::Graphics::OverrideCacheBudgetForTest(1);
+    Touch(block, 4 * Slot, true);
+    const auto evicting = ProveCounted(pair, current, relooked);
+    AgcDriver::Graphics::OverrideCacheBudgetForTest(0);
+    expect(evicting, false, Relooked, 1, "a changed texture whose new copy evicts the other bound texture");
+    Require(kept->Released(), "changed relook: the changed texture's new copy did not evict the other bound texture, so eviction was not exercised");
+    std::puts("a relook whose lookup evicts another bound texture fails at that lookup");
+}
+
 }
 
 int main() {
@@ -221,7 +342,8 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        RunTests(*device);
+        if (std::getenv("APS5_NO_HOST_IMPORT") == nullptr) RunTests(*device);
+        SyntheticTests(*device);
         std::puts("changed relook tests passed");
         return 0;
     } catch (const std::exception& error) {
