@@ -478,7 +478,7 @@ struct VulkanDevice::State {
     bool logicOp = false;
     bool occlusionQueryPrecise = false;
     VkDeviceSize hostImportAlignment = 0;
-    bool drawInputsInPlace = true;
+    bool drawInputsInPlace = false;
     bool dmaBufImport = false;
     bool sparseBinding = false;
     bool sparseResidencyBuffer = false;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -23,6 +24,7 @@
 #include <cstring>
 #include <algorithm>
 #include <mutex>
+#include <optional>
 #include <initializer_list>
 #include <iostream>
 #include <new>
@@ -31,6 +33,14 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -141,6 +151,7 @@ std::vector<Variant> Variants() {
     const auto bits = [](float value) { return std::bit_cast<std::uint32_t>(value); };
     return {
         {"32-bit triangle-list indices", TriangleList, Index32, 3, Consumer::Indices, {0, 0, 0, 0}, {0, 1, 2, 0}, triangle},
+        {"16-bit triangle-list indices", TriangleList, Index16, 3, Consumer::Indices, {0, 0, 0, 0}, {0x00010000u, 0x00000002u, 0, 0}, triangle},
         {"16-bit quad-list indices expanded on the CPU", QuadList, Index16, 4, Consumer::Indices, {0, 0, 0, 0}, {0x00010000u, 0x00030002u, 0, 0}, quad},
         {"32-bit quad-list indices expanded on the CPU", QuadList, Index32, 4, Consumer::Indices, {0, 0, 0, 3}, {0, 1, 2, 3}, quad},
         {"vertex positions behind intact 32-bit indices", TriangleList, Index32, 3, Consumer::Vertices, {0, 0, 0, 0}, {bits(1.0f), bits(3.0f), bits(0.5f), bits(1.0f)}, collapsed},
@@ -304,9 +315,15 @@ void Prepare(const Variant& variant, Slot& slot) {
 struct Access {
     bool flush;
     std::thread::id thread;
+    std::uint64_t address;
+    std::size_t bytes;
     bool producedBefore;
     bool producedAfter;
 };
+
+bool Imported = false;
+bool InPlace = false;
+std::optional<std::thread::id> ConsumerThread;
 
 std::mutex AccessMutex;
 std::vector<Access> Accesses;
@@ -331,14 +348,14 @@ void TracingFlush(std::uint64_t address, std::size_t bytes) {
     PreviousFlush(address, bytes);
     if (!watched) return;
     std::lock_guard lock(AccessMutex);
-    Accesses.push_back({true, std::this_thread::get_id(), before, Produced()});
+    Accesses.push_back({true, std::this_thread::get_id(), address, bytes, before, Produced()});
 }
 
 void TracingGuard(std::uint64_t address, std::size_t bytes) {
     if (!Watched(address, bytes)) return;
     const bool produced = Produced();
     std::lock_guard lock(AccessMutex);
-    Accesses.push_back({false, std::this_thread::get_id(), produced, produced});
+    Accesses.push_back({false, std::this_thread::get_id(), address, bytes, produced, produced});
 }
 
 void Trace(const Variant& variant) {
@@ -361,7 +378,48 @@ std::vector<Access> Untrace() {
 }
 
 bool CopiedWriters() {
-    return std::getenv("APS5_NO_HOST_IMPORT") != nullptr;
+    return !Imported;
+}
+
+void RequireAccesses(const Variant& variant, const std::vector<Access>& accesses) {
+    const std::string name = variant.name;
+    const auto begin = reinterpret_cast<std::uintptr_t>(ProducedTarget(variant));
+    const auto end = variant.consumer == Consumer::Indices ? begin + static_cast<std::uint64_t>(variant.indexCount) * (variant.indexType == Index16 ? 2u : 4u) : begin + sizeof(variant.produced);
+    const auto inside = [&](const Access& access) { return access.address < end && begin < access.address + access.bytes; };
+    std::vector<std::size_t> reads;
+    for (std::size_t i = 0; i < accesses.size(); ++i) {
+        if (!accesses[i].flush && inside(accesses[i]) && ConsumerThread && accesses[i].thread == *ConsumerThread) reads.push_back(i);
+    }
+    for (const auto i : reads) Require(accesses[i].producedAfter, name + ": a read of the input at 0x" + std::to_string(accesses[i].address) + "+" + std::to_string(accesses[i].bytes) + " saw the stale bytes");
+    if (variant.consumer == Consumer::Vertices) {
+        if (reads.empty()) {
+            Require(Imported, name + ": with copied writes the vertices must be read on the CPU, and no read of them was seen");
+            std::printf("%s: no CPU read of the vertices; the GPU reads them through their import\n", variant.name);
+        } else {
+            std::printf("%s: %zu CPU reads of the vertices, all of the produced bytes\n", variant.name, reads.size());
+        }
+        return;
+    }
+    Require(!reads.empty(), name + ": the draw did not read its indices from guest memory");
+    const auto consumer = accesses[reads.front()].thread;
+    std::vector<std::size_t> covering;
+    for (std::size_t i = 0; i < accesses.size(); ++i) {
+        const auto& access = accesses[i];
+        if (!access.flush || access.thread != consumer || !inside(access)) continue;
+        Require(access.address <= begin && access.address + access.bytes >= end, name + ": the consumer flushed only part of its index range (0x" + std::to_string(access.address) + "+" + std::to_string(access.bytes) + ")");
+        covering.push_back(i);
+    }
+    Require(covering.size() == 1, name + ": the consumer flushed its index range " + std::to_string(covering.size()) + " times, expected once");
+    const auto& flush = accesses[covering.front()];
+    Require(covering.front() < reads.front(), name + ": the consumer read its indices before flushing them");
+    Require(flush.producedAfter, name + ": the consumer's flush ended before the producer's store landed");
+    if (Imported) {
+        Require(!flush.producedBefore, name + ": the consumer's flush began after the producer's store had landed, so the case does not test that the flush orders the copy");
+        std::printf("%s: one flush, begun with the producer outstanding, landed the store before %zu reads\n", variant.name, reads.size());
+    } else {
+        Require(flush.producedBefore, name + ": with copied writes the label should hold the consumer until the write-back landed");
+        std::printf("%s: one flush, after the write-back the label waited for, before %zu reads\n", variant.name, reads.size());
+    }
 }
 
 void DrawStale(const Variant& variant, const char* what) {
@@ -374,7 +432,13 @@ void DrawStale(const Variant& variant, const char* what) {
 
 void RequireStaleDegenerate(const Variant& variant, Slot& slot) {
     Prepare(variant, slot);
+    Trace(variant);
     DrawStale(variant, "the draw over the stale input");
+    const auto first = Untrace();
+    if (const auto read = std::find_if(first.begin(), first.end(), [](const Access& access) { return !access.flush; }); read != first.end()) {
+        Require(!ConsumerThread || *ConsumerThread == read->thread, std::string(variant.name) + ": the stale draw read its input on another thread than the earlier draws");
+        ConsumerThread = read->thread;
+    }
     if (!variant.reuse) return;
     Trace(variant);
     DrawStale(variant, "the second draw over the stale input");
@@ -418,12 +482,7 @@ void Run(const Variant& variant, Slot& slot) {
     Require(std::memcmp(ProducedTarget(variant), variant.produced.data(), sizeof(variant.produced)) == 0, std::string(variant.name) + ": the producer's store did not reach guest memory");
     const auto written = WrittenPixels(variant.name);
     Require(written == Width * Height, std::string(variant.name) + ": the draw behind the label covered " + std::to_string(written) + " of " + std::to_string(Width * Height) + " pixels: it read its input before the producer the label follows wrote it");
-    if (variant.consumer == Consumer::Vertices) return;
-    const auto read = std::find_if(accesses.rbegin(), accesses.rend(), [](const Access& access) { return !access.flush; });
-    Require(read != accesses.rend() && read->producedAfter, std::string(variant.name) + ": the draw did not read its input from guest memory after the producer's store landed");
-    const auto outstanding = std::any_of(accesses.begin(), accesses.end(), [&](const Access& access) { return access.flush && access.thread == read->thread && !access.producedBefore && access.producedAfter; });
-    std::printf("%s: the consumer's flush %s\n", variant.name, outstanding ? "began with the producer outstanding and landed its store" : "began after the producer's store had landed");
-    if (!CopiedWriters()) Require(outstanding, std::string(variant.name) + ": the draw's own flush never began with the producer outstanding, so the case does not test that the flush orders the copy");
+    RequireAccesses(variant, accesses);
 }
 
 }
@@ -438,6 +497,10 @@ int main(int argc, char** argv) {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            Imported = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).hostImportAlignment != 0;
+            InPlace = device->DrawInputsInPlace();
+            Require(!InPlace, "producer label draw input: draw inputs are read in place although APS5_NO_DRAW_INPUTS_IN_PLACE is set");
+            std::printf("memory mode: %s, draw inputs in place: %s\n", Imported ? "imported" : "copied", InPlace ? "yes" : "no");
         }
         ColorMemory = AllocateWatched(2 * Block);
         Pool = AllocateWatched(PoolBytes);
