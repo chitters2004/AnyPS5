@@ -2006,6 +2006,7 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
 
 bool ChangedSince(std::span<const UnchangedQuery> queries, std::vector<std::size_t>& changed) {
     changed.clear();
+    if (changed.capacity() < queries.size()) changed.reserve(queries.size());
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
