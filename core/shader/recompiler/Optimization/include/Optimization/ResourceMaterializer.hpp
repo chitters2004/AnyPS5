@@ -66,6 +66,36 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+struct SrtCaptureRecipe {
+    bool valid = false;
+    const IrResourcePlan* plan = nullptr;
+    std::uint64_t shaderBase = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<DescriptorValue> values;
+    std::vector<std::uint8_t> activeSources;
+    std::vector<std::uint32_t> flattened;
+    SrtSlotReads reads;
+};
+
+enum class SrtReplayRefusal : std::uint8_t {
+    None,
+    NoRecipe,
+    UserData,
+    Unmapped,
+    ReadFailed,
+    Address,
+    Selector,
+    Fill,
+    Computed,
+    Fixed,
+    Inactive,
+    Invalidated,
+    Rejected,
+    Count
+};
+
+const char* SrtReplayRefusalName(SrtReplayRefusal refusal);
+
 class ResourceMaterializer {
 public:
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
@@ -81,6 +111,8 @@ public:
     [[nodiscard]] IrResourcePlan ExtractPlan(const IrProgram& program) const;
     static void CompactPlan(IrResourcePlan& plan);
     void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const;
+    void Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, SrtCaptureRecipe* record) const;
+    SrtReplayRefusal Replay(const IrResourcePlan& program, const SrtRuntime& runtime, const SrtCaptureRecipe& recipe, ResourceSnapshot& snapshot, SrtCaptureRecipe& next) const;
     static std::uint64_t SpecializationNanoseconds();
     static ImageTableReuseCounts TableReuse();
     static std::uint64_t EvaluateNanoseconds();

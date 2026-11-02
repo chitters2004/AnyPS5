@@ -4,6 +4,8 @@
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
+#include <array>
 #include <cstdint>
 #include <memory>
 
@@ -39,6 +41,7 @@ struct ResourceCapture {
     // and every other read sorted and deduplicated); empty otherwise.
     SrtReadTrace readTrace;
     SrtUserDataUse userDataUse;
+    std::shared_ptr<const SrtCaptureRecipe> recipe;
     // APS5_PROFILE_DRAW: what CaptureResources spent resolving the source (the stage inputs, the
     // key over the code, the plan) before the walk.
     std::uint64_t sourceNanoseconds = 0;
@@ -73,6 +76,8 @@ private:
     RecompileRequest request;
     std::shared_ptr<const SourceHandle> handle;
 };
+[[nodiscard]] std::uint64_t CaptureReplays(SrtReplayRefusal outcome);
+[[nodiscard]] std::uint64_t CaptureReplayShadowMismatches();
 [[nodiscard]] std::span<const std::uint32_t> GetPreparedCode(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request);
 [[nodiscard]] std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation);

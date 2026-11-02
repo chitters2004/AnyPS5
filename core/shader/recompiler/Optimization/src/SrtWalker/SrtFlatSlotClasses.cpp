@@ -62,6 +62,71 @@ std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan) {
     return pure;
 }
 
+void ComputeSlotRoles(IrResourcePlan& plan) {
+    auto& roles = plan.slotRoles;
+    auto& identities = plan.sourceDwordSlots;
+    roles.assign(plan.srtReads.size(), 0u);
+    identities.assign(plan.descriptorSources.size() * 8u, SrtSlotRole::NoSlot);
+    bool disqualified = !plan.srtPlanComplete || plan.requiresSpecializationMemory || plan.uniformFill.fill.kind != UniformFillKind::None
+        || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() || source.dwordCount > 8u; });
+    std::unordered_map<const IrValue*, std::uint32_t> readSlots;
+    for (std::uint32_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+        if (plan.srtReads[slot].flatOffset != slot || plan.srtReads[slot].value == nullptr) disqualified = true;
+        else readSlots.emplace(plan.srtReads[slot].value->Resolve(), slot);
+    }
+    if (disqualified) {
+        std::fill(roles.begin(), roles.end(), SrtSlotRole::Fixed);
+        return;
+    }
+    const auto constSlot = [&](const IrValue* value) -> std::uint32_t {
+        if (value->Opcode() != IrOpcode::ReadConst || value->ArgumentCount() < 2 || value->Argument(1) == nullptr) return SrtSlotRole::NoSlot;
+        const IrValue* slot = value->Argument(1)->Resolve();
+        return slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < roles.size() ? slot->ImmediateU32() : SrtSlotRole::NoSlot;
+    };
+    std::vector<IrValue*> pending;
+    const auto mark = [&](IrValue* root, std::uint8_t role) {
+        if (root == nullptr) return;
+        std::unordered_set<const IrValue*> visited;
+        pending.assign(1, root);
+        while (!pending.empty()) {
+            IrValue* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!visited.insert(value).second) continue;
+            if (const auto slot = constSlot(value); slot != SrtSlotRole::NoSlot) {
+                roles[slot] |= role;
+                pending.push_back(plan.srtReads[slot].value);
+            }
+            if (const auto found = readSlots.find(value); found != readSlots.end()) roles[found->second] |= role;
+            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+            }
+        }
+    };
+    for (std::size_t index = 0; index < plan.descriptorSources.size(); ++index) {
+        const auto& source = plan.descriptorSources[index];
+        for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
+            IrValue* root = source.dwords[dword];
+            if (root == nullptr) continue;
+            const IrValue* value = root->Resolve();
+            auto slot = constSlot(value);
+            if (slot == SrtSlotRole::NoSlot) {
+                if (const auto found = readSlots.find(value); found != readSlots.end()) slot = found->second;
+            }
+            if (slot == SrtSlotRole::NoSlot) {
+                mark(root, SrtSlotRole::Computed);
+                continue;
+            }
+            roles[slot] |= SrtSlotRole::Descriptor;
+            identities[index * 8u + dword] = slot;
+        }
+    }
+    for (const auto& block : plan.controlFlow) mark(block.condition, SrtSlotRole::Selector);
+    for (const auto& read : plan.srtReads) {
+        IrValue* raw = read.value->Resolve();
+        for (std::size_t i = 0; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i), SrtSlotRole::Address);
+    }
+}
+
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan) {
     std::unordered_map<const IrValue*, std::vector<const IrValue*>> users;
     std::unordered_set<const IrValue*> seen;

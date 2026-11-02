@@ -221,6 +221,16 @@ struct SrtTapeSlot {
     std::shared_ptr<const void> tape;
 };
 
+namespace SrtSlotRole {
+inline constexpr std::uint8_t Descriptor = 1u;
+inline constexpr std::uint8_t Address = 2u;
+inline constexpr std::uint8_t Selector = 4u;
+inline constexpr std::uint8_t Fill = 8u;
+inline constexpr std::uint8_t Computed = 16u;
+inline constexpr std::uint8_t Fixed = 32u;
+inline constexpr std::uint32_t NoSlot = 0xffffffffu;
+}
+
 struct IrResourcePlan {
     IrShaderStage stage = IrShaderStage::Unknown;
     std::uint64_t shaderHash = 0;
@@ -240,6 +250,8 @@ struct IrResourcePlan {
     // One byte per srtReads slot, 1 when the CPU walk never consumes the slot's value (see
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
+    std::vector<std::uint8_t> slotRoles;
+    std::vector<std::uint32_t> sourceDwordSlots;
     bool denseValueIds = false;
     CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;

@@ -17,6 +17,7 @@ namespace ShaderRecompiler::Detail {
 // unknown opcode only makes more slots impure.
 std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan);
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan);
+void ComputeSlotRoles(IrResourcePlan& plan);
 
 }
 

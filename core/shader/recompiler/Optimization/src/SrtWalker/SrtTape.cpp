@@ -326,6 +326,7 @@ struct SrtTape::Frame {
     bool nullRoot = false;
     std::uint32_t addressDepth = 0;
     std::size_t descriptorBytes = 0;
+    std::uint64_t* addresses = nullptr;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -444,6 +445,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
                 if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
                 else trace->otherReads.push_back(address);
             }
+            if (frame.addresses != nullptr) frame.addresses[static_cast<std::size_t>(&node - nodes.data())] = address;
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
             std::uint32_t word = 0;
             if (reader != nullptr) {
@@ -585,6 +587,12 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states};
+    std::vector<std::uint64_t> nodeAddresses;
+    if (runtime.slotReads != nullptr) {
+        runtime.slotReads->addresses.clear();
+        nodeAddresses.assign(nodes.size(), SrtNoAddress);
+        frame.addresses = nodeAddresses.data();
+    }
 
     struct Scratch {
         std::uint32_t attempt = 0;
@@ -689,6 +697,19 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     if (runtime.descriptorScope != nullptr && runtime.descriptorScope(runtime.userContext, 0u) != invalidationsBefore) {
         refuse();
         return attempt + 1u < 3u && Run(plan, runtime, results, flat, activeSources);
+    }
+    if (runtime.slotReads != nullptr && runtime.slotReads->addresses.empty()) {
+        auto& reads = *runtime.slotReads;
+        reads.addresses.assign(plan.srtReads.size(), SrtNoAddress);
+        reads.words.assign(plan.srtReads.size(), 0u);
+        reads.active.assign(plan.srtReads.size(), 0u);
+        for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+            reads.active[slot] = activeFlat[plan.srtReads[slot].flatOffset];
+            const auto root = flatRoots[slot];
+            if (root == NoNode || states[root] != 1u) continue;
+            reads.addresses[slot] = nodeAddresses[root];
+            reads.words[slot] = static_cast<std::uint32_t>(values[root]);
+        }
     }
     results.swap(evaluated);
     activeSources.swap(active);

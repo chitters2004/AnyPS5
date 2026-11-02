@@ -1394,7 +1394,9 @@ private:
     std::vector<std::uint32_t> keyWords;
 };
 
-void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<std::uint8_t>& activeSources) {
+void finishSnapshot(const IrResourcePlan& plan, const std::vector<DescriptorValue>& values, const std::vector<std::uint8_t>& activeSources, ResourceSnapshot& snapshot);
+
+void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, SrtWalker& walker, ResourceSnapshot& snapshot, std::vector<std::uint8_t>& activeSources, SrtCaptureRecipe* record) {
     snapshot = ResourceSnapshot{};
     if (plan.uniformFill.fill.kind != UniformFillKind::None) {
         const auto words = plan.uniformFill.fill.words;
@@ -1422,7 +1424,16 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
     const auto evaluateStarted = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     walker.EvaluateRuntimeSources(plan, plan.materializationSources, runtime, values, snapshot.flattenedSrt, plan.cleanFlatSlots, activeSources, &snapshot.srtPoison, &snapshot.nullRootReads);
     if (MaterializeProfiled()) evaluateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - evaluateStarted).count()), std::memory_order_relaxed);
+    if (record != nullptr) {
+        record->values = values;
+        record->activeSources = activeSources;
+        record->flattened = snapshot.flattenedSrt;
+        record->userData = snapshot.userData;
+    }
+    finishSnapshot(plan, values, activeSources, snapshot);
+}
 
+void finishSnapshot(const IrResourcePlan& plan, const std::vector<DescriptorValue>& values, const std::vector<std::uint8_t>& activeSources, ResourceSnapshot& snapshot) {
     std::size_t cursor = 0;
     if (values.size() < plan.info.buffers.size()) {
         throw std::runtime_error("materialization sources are missing buffer descriptors");
@@ -2611,6 +2622,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
         }
     }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
+    Detail::ComputeSlotRoles(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);
     buildCompactPlan(plan);
@@ -2623,7 +2635,89 @@ void ResourceMaterializer::CompactPlan(IrResourcePlan& plan) {
 }
 
 void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot) const {
+    Materialize(program, runtime, snapshot, nullptr);
+}
+
+const char* SrtReplayRefusalName(SrtReplayRefusal refusal) {
+    switch (refusal) {
+    case SrtReplayRefusal::None: return "replayed";
+    case SrtReplayRefusal::NoRecipe: return "no recipe";
+    case SrtReplayRefusal::UserData: return "user data";
+    case SrtReplayRefusal::Unmapped: return "unmapped";
+    case SrtReplayRefusal::ReadFailed: return "read failed";
+    case SrtReplayRefusal::Address: return "address word";
+    case SrtReplayRefusal::Selector: return "selector word";
+    case SrtReplayRefusal::Fill: return "fill word";
+    case SrtReplayRefusal::Computed: return "computed descriptor word";
+    case SrtReplayRefusal::Fixed: return "fixed word";
+    case SrtReplayRefusal::Inactive: return "inactive descriptor slot";
+    case SrtReplayRefusal::Invalidated: return "invalidated";
+    case SrtReplayRefusal::Rejected: return "rejected descriptor";
+    case SrtReplayRefusal::Count: break;
+    }
+    return "unknown";
+}
+
+SrtReplayRefusal ResourceMaterializer::Replay(const IrResourcePlan& plan, const SrtRuntime& runtime, const SrtCaptureRecipe& recipe, ResourceSnapshot& snapshot, SrtCaptureRecipe& next) const {
+    const auto slots = plan.srtReads.size();
+    if (!recipe.valid || recipe.plan != &plan || recipe.shaderBase != runtime.shaderBase || plan.slotRoles.size() != slots || recipe.reads.addresses.size() != slots || recipe.flattened.size() != slots) return SrtReplayRefusal::NoRecipe;
+    if (runtime.userData.size() < plan.userDataCount || !std::equal(recipe.userData.begin(), recipe.userData.end(), runtime.userData.begin())) return SrtReplayRefusal::UserData;
+    if (runtime.readMemory == nullptr) return SrtReplayRefusal::NoRecipe;
+    const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
+    next = recipe;
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        const auto address = recipe.reads.addresses[slot];
+        if (address == SrtNoAddress) continue;
+        if (runtime.accessible != nullptr && !runtime.accessible(runtime.userContext, address, sizeof(std::uint32_t))) return SrtReplayRefusal::Unmapped;
+        const bool clean = slot < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[slot] != 0u;
+        const auto reader = clean && runtime.readSpecializationMemory != nullptr ? runtime.readSpecializationMemory : runtime.readMemory;
+        std::uint32_t word = 0;
+        if (!reader(runtime.userContext, address, &word)) return SrtReplayRefusal::ReadFailed;
+        if (word != recipe.reads.words[slot]) {
+            const auto roles = plan.slotRoles[slot];
+            if ((roles & SrtSlotRole::Fixed) != 0u) return SrtReplayRefusal::Fixed;
+            if ((roles & SrtSlotRole::Address) != 0u) return SrtReplayRefusal::Address;
+            if ((roles & SrtSlotRole::Selector) != 0u) return SrtReplayRefusal::Selector;
+            if ((roles & SrtSlotRole::Fill) != 0u) return SrtReplayRefusal::Fill;
+            if ((roles & SrtSlotRole::Computed) != 0u) return SrtReplayRefusal::Computed;
+        }
+        next.reads.words[slot] = word;
+        if (recipe.reads.active[slot] != 0u) next.flattened[slot] = word;
+    }
+    for (std::size_t position = 0; position < plan.materializationSources.size() && position < next.values.size(); ++position) {
+        const auto source = plan.materializationSources[position];
+        if (source >= recipe.activeSources.size() || recipe.activeSources[source] == 0u) continue;
+        auto& value = next.values[position];
+        for (std::uint32_t dword = 0; dword < value.dwordCount && dword < 8u; ++dword) {
+            const auto slot = plan.sourceDwordSlots.at(source * 8u + dword);
+            if (slot == SrtSlotRole::NoSlot) continue;
+            if (recipe.reads.addresses[slot] == SrtNoAddress) return SrtReplayRefusal::Inactive;
+            value.dwords[dword] = next.reads.words[slot];
+        }
+    }
+    try {
+        ResourceSnapshot replayed;
+        replayed.userData = next.userData;
+        replayed.flattenedSrt = next.flattened;
+        finishSnapshot(plan, next.values, next.activeSources, replayed);
+        materializeForcedDegamma(plan, replayed);
+        materializeTables(plan, replayed);
+        materializeSrtGuards(plan, replayed);
+        snapshot = std::move(replayed);
+    } catch (const std::exception&) {
+        return SrtReplayRefusal::Rejected;
+    }
+    if (runtime.descriptorScope != nullptr && runtime.descriptorScope(runtime.userContext, 0u) != invalidationsBefore) return SrtReplayRefusal::Invalidated;
+    return SrtReplayRefusal::None;
+}
+
+void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtRuntime& runtime, ResourceSnapshot& snapshot, SrtCaptureRecipe* record) const {
     const IrResourcePlan& plan = program;
+    SrtRuntime recording = runtime;
+    if (record != nullptr) {
+        *record = SrtCaptureRecipe{};
+        recording.slotReads = &record->reads;
+    }
     if (!plan.resourceTrackingComplete) {
         throw std::runtime_error("ResourceMaterializer::Materialize requires a completed resource plan");
     }
@@ -2643,7 +2737,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
             const auto beforeSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
             activeSources.clear();
             try {
-                materializeSnapshot(plan, runtime, walker, nextSnapshot, activeSources);
+                materializeSnapshot(plan, recording, walker, nextSnapshot, activeSources, record);
                 const auto afterSnapshot = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
                 TableSnapshotter(plan, runtime, walker, activeSources, nextSnapshot.tables).Run();
                 const auto afterTables = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
@@ -2670,6 +2764,16 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
         throw;
     }
     snapshot = std::move(nextSnapshot);
+    if (record != nullptr) {
+        const auto slots = plan.srtReads.size();
+        const auto& reads = record->reads;
+        bool readable = reads.addresses.size() == slots && reads.words.size() == slots && reads.active.size() == slots;
+        for (std::size_t slot = 0; readable && slot < slots; ++slot) readable = reads.active[slot] == 0u || reads.addresses[slot] != SrtNoAddress;
+        record->plan = &plan;
+        record->shaderBase = runtime.shaderBase;
+        record->valid = readable && plan.slotRoles.size() == slots && record->flattened.size() == slots && !plan.requiresSpecializationMemory && plan.uniformFill.fill.kind == UniformFillKind::None
+            && snapshot.srtPoison.empty() && snapshot.nullRootReads == 0u && snapshot.tables.tables.empty();
+    }
     reportTables();
     if (MaterializeProfiled()) materializeNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - materializeStarted).count()), std::memory_order_relaxed);
 }

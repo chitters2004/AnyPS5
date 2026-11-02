@@ -634,6 +634,9 @@ void CheckMemoHashInputs() {
 
 void CheckDescriptorFixture();
 void CheckImageMasking(bool registration, std::uint64_t address);
+void CheckCaptureReplay();
+void CheckReplayPointerSwap();
+void CheckReplayComputedDescriptor();
 
 struct Spread {
     double median;
@@ -817,6 +820,98 @@ void CheckImageMasking(bool registration, std::uint64_t address) {
     expect("an image back at a base after a null one", true, [&] { table.PlaceImage(table.ImageBase(6u)); });
 }
 
+std::vector<std::uint32_t> BufferWords(const RecompileResult& result) {
+    std::vector<std::uint32_t> words;
+    for (const auto& binding : result.bindings) {
+        if (binding.role == DescriptorRole::GuestBuffers) words.insert(words.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+    }
+    return words;
+}
+
+struct ReplayCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(SrtReplayRefusal::Count)> outcomes{};
+
+    static ReplayCounts Now() {
+        ReplayCounts counts;
+        for (std::size_t outcome = 0; outcome < counts.outcomes.size(); ++outcome) counts.outcomes[outcome] = CaptureReplays(static_cast<SrtReplayRefusal>(outcome));
+        return counts;
+    }
+
+    std::uint64_t Since(const ReplayCounts& before, SrtReplayRefusal outcome) const {
+        const auto index = static_cast<std::size_t>(outcome);
+        return outcomes[index] - before.outcomes[index];
+    }
+};
+
+void CheckCaptureReplay() {
+    const char* mode = std::getenv("APS5_CAPTURE_REPLAY");
+    const bool replaying = mode != nullptr && *mode != '\0' && std::string_view(mode) != "0";
+    static DescriptorTable table;
+    const auto code = DescriptorPixelCode();
+    PixelStage stage(code, PointerWords(table.words.data()), 0x290000u);
+    const auto draw = [&](const std::string& what, SrtReplayRefusal expected) {
+        const auto before = ReplayCounts::Now();
+        const auto result = stage.Current();
+        const auto after = ReplayCounts::Now();
+        RequireSameResult(*result, *stage.CurrentUncached(), what);
+        Require(ImageWords(*result) == ImageWords(*stage.CurrentUncached()) && BufferWords(*result) == BufferWords(*stage.CurrentUncached()), what + ": the descriptors differ from a capture without replay");
+        if (replaying) Require(after.Since(before, expected) == 1u, what + ": the capture was not " + SrtReplayRefusalName(expected));
+        return result;
+    };
+    static_cast<void>(draw("the first capture of the replay fixture", SrtReplayRefusal::NoRecipe));
+    static_cast<void>(draw("an unchanged replay fixture", SrtReplayRefusal::None));
+    table.MoveBuffer(3u, 0x40000000u);
+    const auto moved = draw("a moved buffer of the replay fixture", SrtReplayRefusal::None);
+    Require(BufferWords(*moved).at(12) == 0x40000000u, "a replayed capture did not read the moved buffer");
+    table.MoveImage(9u);
+    static_cast<void>(draw("a moved image of the replay fixture", SrtReplayRefusal::None));
+    static DescriptorTable other;
+    stage.users = PointerWords(other.words.data());
+    stage.request.context.userData = stage.users;
+    static_cast<void>(draw("a replay fixture pointed at another table", SrtReplayRefusal::UserData));
+}
+
+void CheckReplayPointerSwap() {
+    const char* mode = std::getenv("APS5_CAPTURE_REPLAY");
+    const bool replaying = mode != nullptr && *mode != '\0' && std::string_view(mode) != "0";
+    alignas(64) static std::array<std::uint32_t, 4> first{0x11000000u, 0u, 0x40u, 0x00027facu};
+    alignas(64) static std::array<std::uint32_t, 4> second{0x22000000u, 0u, 0x40u, 0x00027facu};
+    alignas(64) static std::array<std::uint32_t, 2> root{};
+    const auto point = [&](const std::array<std::uint32_t, 4>& table) {
+        const auto words = PointerWords(table.data());
+        root = {words[0], words[1]};
+    };
+    point(first);
+    const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
+    PixelStage stage(code, PointerWords(root.data()), 0x2a0000u);
+    static_cast<void>(stage.Current());
+    const auto before = ReplayCounts::Now();
+    const auto same = stage.Current();
+    Require(BufferWords(*same).size() == 4u && BufferWords(*same)[0] == first[0], "the pointer fixture does not bind the first table's buffer");
+    if (replaying) Require(ReplayCounts::Now().Since(before, SrtReplayRefusal::None) == 1u, "an unchanged pointer fixture was not replayed");
+    point(second);
+    const auto swapped = ReplayCounts::Now();
+    const auto result = stage.Current();
+    Require(BufferWords(*result).size() == 4u && BufferWords(*result)[0] == second[0], "after its pointer moved to a table of the same layout, the stage still binds the old table's buffer");
+    RequireSameResult(*result, *stage.CurrentUncached(), "a stage whose table pointer moved");
+    if (replaying) Require(ReplayCounts::Now().Since(swapped, SrtReplayRefusal::Address) == 1u, "a moved table pointer was not refused as an address word");
+}
+
+void CheckReplayComputedDescriptor() {
+    const char* mode = std::getenv("APS5_CAPTURE_REPLAY");
+    const bool replaying = mode != nullptr && *mode != '\0' && std::string_view(mode) != "0";
+    alignas(64) static std::array<std::uint32_t, 4> table{0x13000000u, 0x00000012u, 0x40u, 0x00027facu};
+    const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0x8705ff05u, 0x000000ffu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
+    PixelStage stage(code, PointerWords(table.data()), 0x2b0000u);
+    static_cast<void>(stage.Current());
+    const auto before = ReplayCounts::Now();
+    table[1] = 0x00000034u;
+    const auto result = stage.Current();
+    const auto after = ReplayCounts::Now();
+    Require(BufferWords(*result).size() == 4u && BufferWords(*result)[1] == 0x00000034u, "a stage whose masked buffer word changed binds the old word");
+    if (replaying) Require(after.Since(before, SrtReplayRefusal::Computed) == 1u, "a changed word that a descriptor computes from was not refused as computed");
+}
+
 void Bench() {
     constexpr std::size_t batches = 31;
     constexpr std::size_t iterations = 4000;
@@ -865,6 +960,9 @@ int main(int argc, char** argv) {
         CheckDescriptorFixture();
         CheckImageMasking(false, 0x270000u);
         CheckImageMasking(true, 0x280000u);
+        CheckCaptureReplay();
+        CheckReplayPointerSwap();
+        CheckReplayComputedDescriptor();
         CheckSubstituteSlots();
         CheckInvocation();
         CheckResultMemo();

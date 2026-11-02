@@ -418,6 +418,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<std::uint32_t> code;
     std::vector<std::uint32_t> linkedCallFallbacks;
     std::shared_ptr<const IrResourcePlan> plan;
+    std::shared_ptr<const ResourceCapture> replayFrom;
     bool runtimeCaptured = false;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
@@ -2063,16 +2064,16 @@ namespace {
 
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
-void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
+void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime, SrtCaptureRecipe* record = nullptr) {
     const auto& plan = *capture.plan;
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
-        ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+        ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, record);
         return;
     }
     traced.readTrace = &capture.readTrace;
-    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
+    ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot, record);
     auto& other = capture.readTrace.otherReads;
     if (other.size() > 1) {
         std::sort(other.begin(), other.end());
@@ -2181,12 +2182,133 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(Reco
     return PreparedShaderInvocation(std::move(request), handle);
 }
 
+enum class CaptureReplayMode { Off, On, Shadow };
+
+CaptureReplayMode captureReplayMode() {
+    static const CaptureReplayMode mode = [] {
+        const char* value = std::getenv("APS5_CAPTURE_REPLAY");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "0") == 0) return CaptureReplayMode::Off;
+        return std::strcmp(value, "shadow") == 0 ? CaptureReplayMode::Shadow : CaptureReplayMode::On;
+    }();
+    return mode;
+}
+
+struct CaptureReplayCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(SrtReplayRefusal::Count)> outcomes{};
+    std::atomic<std::uint64_t> shadowMismatches{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+CaptureReplayCounters& captureReplayCounters() {
+    static CaptureReplayCounters counters;
+    return counters;
+}
+
+void reportCaptureReplay() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counters = captureReplayCounters();
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::string line = "[recompile] capture replay (10 s):";
+    for (std::size_t outcome = 0; outcome < counters.outcomes.size(); ++outcome) {
+        line += " " + std::to_string(counters.outcomes[outcome].exchange(0, std::memory_order_relaxed)) + " " + SrtReplayRefusalName(static_cast<SrtReplayRefusal>(outcome)) + (outcome + 1u < counters.outcomes.size() ? "," : "");
+    }
+    line += "; " + std::to_string(counters.shadowMismatches.load(std::memory_order_relaxed)) + " shadow mismatches in total\n";
+    std::fputs(line.c_str(), stderr);
+}
+
+const char* replayDifference(const ResourceCapture& replayed, const ResourceCapture& full) {
+    const auto sameValues = [](const std::vector<DescriptorValue>& left, const std::vector<DescriptorValue>& right) {
+        if (left.size() != right.size()) return false;
+        for (std::size_t index = 0; index < left.size(); ++index) {
+            if (left[index].dwordCount != right[index].dwordCount || left[index].availableDwordMask != right[index].availableDwordMask) return false;
+            if (!std::equal(left[index].dwords.begin(), left[index].dwords.begin() + std::min<std::size_t>(left[index].dwordCount, left[index].dwords.size()), right[index].dwords.begin())) return false;
+        }
+        return true;
+    };
+    const auto& a = replayed.snapshot;
+    const auto& b = full.snapshot;
+    if (!sameValues(a.buffers, b.buffers)) return "buffers";
+    if (!sameValues(a.images, b.images)) return "images";
+    if (!sameValues(a.samplers, b.samplers)) return "samplers";
+    if (a.flattenedSrt != b.flattenedSrt) return "flattened SRT";
+    if (a.userData != b.userData) return "user data";
+    if (a.uniformFill.kind != b.uniformFill.kind || a.uniformFill.value != b.uniformFill.value || a.uniformFill.words != b.uniformFill.words) return "uniform fill";
+    if (a.srtPoison.size() != b.srtPoison.size() || a.nullRootReads != b.nullRootReads) return "poison";
+    if (a.tables.tables.size() != b.tables.tables.size() || a.tables.ranges != b.tables.ranges) return "tables";
+    if (replayed.userDataUse.asBase != full.userDataUse.asBase || replayed.userDataUse.asValue != full.userDataUse.asValue || replayed.userDataUse.reads != full.userDataUse.reads) return "user data use";
+    if (replayed.readTrace.leaves != full.readTrace.leaves || replayed.readTrace.otherReads != full.readTrace.otherReads) return "read trace";
+    return nullptr;
+}
+
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = acquirePlan(request, handle->source, true, handle.get());
-    materializeCapture(*capture, runtime);
+    const auto mode = captureReplayMode();
+    if (mode == CaptureReplayMode::Off) {
+        materializeCapture(*capture, runtime);
+        return capture;
+    }
+    auto& counters = captureReplayCounters();
+    const auto count = [&](SrtReplayRefusal outcome) {
+        counters.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
+        reportCaptureReplay();
+    };
+    std::shared_ptr<const ResourceCapture> previous;
+    {
+        std::lock_guard lock(handle->source->mutex);
+        previous = handle->source->replayFrom;
+    }
+    if (previous != nullptr && previous->plan == capture->plan && previous->recipe != nullptr) {
+        auto next = std::make_shared<SrtCaptureRecipe>();
+        const auto outcome = ResourceMaterializer{}.Replay(*capture->plan, runtime, *previous->recipe, capture->snapshot, *next);
+        count(outcome);
+        if (outcome == SrtReplayRefusal::None) {
+            capture->userDataUse = previous->userDataUse;
+            capture->readTrace = previous->readTrace;
+            capture->recipe = std::move(next);
+            if (mode == CaptureReplayMode::Shadow) {
+                ResourceCapture full;
+                full.source = capture->source;
+                full.plan = capture->plan;
+                materializeCapture(full, runtime);
+                if (const char* difference = replayDifference(*capture, full)) {
+                    counters.shadowMismatches.fetch_add(1, std::memory_order_relaxed);
+                    throw std::runtime_error(std::string("ShaderRecompiler: a replayed capture differs from a full capture in its ") + difference);
+                }
+            }
+            std::lock_guard lock(handle->source->mutex);
+            handle->source->replayFrom = capture;
+            return capture;
+        }
+        capture->snapshot = ResourceSnapshot{};
+    } else {
+        count(SrtReplayRefusal::NoRecipe);
+    }
+    auto recipe = std::make_shared<SrtCaptureRecipe>();
+    materializeCapture(*capture, runtime, recipe.get());
+    if (recipe->valid) {
+        capture->recipe = std::move(recipe);
+        std::lock_guard lock(handle->source->mutex);
+        handle->source->replayFrom = capture;
+    }
     return capture;
+}
+
+std::uint64_t CaptureReplays(SrtReplayRefusal outcome) {
+    const auto index = static_cast<std::size_t>(outcome);
+    return index < captureReplayCounters().outcomes.size() ? captureReplayCounters().outcomes[index].load(std::memory_order_relaxed) : 0u;
+}
+
+std::uint64_t CaptureReplayShadowMismatches() {
+    return captureReplayCounters().shadowMismatches.load(std::memory_order_relaxed);
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {

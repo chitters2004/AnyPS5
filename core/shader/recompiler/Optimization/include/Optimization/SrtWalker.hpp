@@ -77,6 +77,14 @@ struct SrtReadTrace {
     std::vector<std::uint64_t> otherReads;
 };
 
+inline constexpr std::uint64_t SrtNoAddress = ~std::uint64_t{0};
+
+struct SrtSlotReads {
+    std::vector<std::uint64_t> addresses;
+    std::vector<std::uint32_t> words;
+    std::vector<std::uint8_t> active;
+};
+
 struct SrtRuntime {
     std::span<const std::uint32_t> userData;
     std::uint64_t shaderBase = 0;
@@ -92,6 +100,7 @@ struct SrtRuntime {
     SrtMemorySupplier supplyWords = nullptr;
     SrtUserDataUse* userDataUse = nullptr;
     SrtDescriptorScope descriptorScope = nullptr;
+    SrtSlotReads* slotReads = nullptr;
 };
 
 struct SrtForceSyncScope {
