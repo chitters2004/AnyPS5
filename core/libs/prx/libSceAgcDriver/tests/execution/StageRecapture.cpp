@@ -633,6 +633,7 @@ void CheckMemoHashInputs() {
 }
 
 void CheckDescriptorFixture();
+void CheckImageMasking(bool registration, std::uint64_t address);
 
 struct Spread {
     double median;
@@ -780,6 +781,42 @@ void BenchDescriptors(bool churnOnly) {
     phases("descriptors, moved image (miss)", [&](std::uint64_t sequence) { table.MoveImage(static_cast<std::uint32_t>(sequence)); });
 }
 
+std::vector<std::uint32_t> ImageWords(const RecompileResult& result) {
+    std::vector<std::uint32_t> words;
+    for (const auto& binding : result.bindings) {
+        if (binding.role == DescriptorRole::GuestImages) words.insert(words.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+    }
+    return words;
+}
+
+void CheckImageMasking(bool registration, std::uint64_t address) {
+    const bool masked = std::getenv("APS5_NO_MASKED_RESULT_MEMO") == nullptr;
+    static DescriptorTable tables[2];
+    auto& table = tables[registration ? 1 : 0];
+    const auto code = DescriptorPixelCode();
+    PixelStage stage(code, PointerWords(table.words.data()), address);
+    stage.request.target.registrationModules = registration;
+    const std::string what = registration ? "with registration modules" : "without registration modules";
+    table.PlaceImage(table.ImageBase(1u));
+    const auto first = stage.Current();
+    RequireSameResult(*first, *stage.CurrentUncached(), "the image fixture " + what);
+    const auto expect = [&](const std::string& change, bool patched, auto&& apply) {
+        apply();
+        const auto before = ResultMemoPatches();
+        const auto result = stage.Current();
+        const auto patches = ResultMemoPatches() - before;
+        RequireSameResult(*result, *stage.CurrentUncached(), change + " " + what);
+        Require(ImageWords(*result) == ImageWords(*stage.CurrentUncached()), change + " " + what + ": the image words differ from a materialization without the memo");
+        Require(patches == (patched && masked ? 1u : 0u), change + " " + what + (patched ? " was not patched from a result for another image base" : " was patched from a result for an image that differs in more than its base"));
+    };
+    expect("a moved image", true, [&] { table.PlaceImage(table.ImageBase(2u)); });
+    expect("an image moved by its high base byte", true, [&] { table.PlaceImage(table.ImageBase(3u) + (std::uint64_t{1} << 40u)); });
+    expect("an image of another format", false, [&] { table.PlaceImage(table.ImageBase(4u), DescriptorTable::Format8888Srgb); });
+    expect("an image of another height", false, [&] { table.PlaceImage(table.ImageBase(5u), DescriptorTable::Format8888UNorm, 5u); });
+    expect("an image with a null base", false, [&] { table.PlaceImage(0u); });
+    expect("an image back at a base after a null one", true, [&] { table.PlaceImage(table.ImageBase(6u)); });
+}
+
 void Bench() {
     constexpr std::size_t batches = 31;
     constexpr std::size_t iterations = 4000;
@@ -826,6 +863,8 @@ int main(int argc, char** argv) {
         CheckConcurrentSubstitutes();
         CheckMemoHashInputs();
         CheckDescriptorFixture();
+        CheckImageMasking(false, 0x270000u);
+        CheckImageMasking(true, 0x280000u);
         CheckSubstituteSlots();
         CheckInvocation();
         CheckResultMemo();

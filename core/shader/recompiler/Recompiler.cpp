@@ -14,6 +14,7 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include <cstddef>
 #include <list>
 #include <functional>
 #include <map>
@@ -372,9 +373,17 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 // A materialized result of one variant over one snapshot (Recompile(request, capture)): the
 // shared immutable object every later capture that reproduces the snapshot receives, so Populate
 // and the per-request copy run once per distinct snapshot.
+struct MemoImagePatch {
+    std::uint32_t binding;
+    std::uint32_t word;
+    std::uint32_t resource;
+};
+
 struct MemoPatch {
     static constexpr std::uint32_t NoBinding = ~0u;
     std::vector<std::pair<std::uint32_t, std::vector<std::uint32_t>>> buffers;
+    std::vector<MemoImagePatch> images;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> imageMetadata;
     std::vector<std::uint32_t> userWords;
     std::uint32_t shaderData = NoBinding;
     std::uint32_t flattenedSrt = NoBinding;
@@ -1105,6 +1114,11 @@ void recordMemoPatch(MemoPatch& patch, const DescriptorBindingPlan& plan, const 
         const auto position = static_cast<std::uint32_t>(index);
         if (binding.descriptor.role == DescriptorRole::GuestBuffers) {
             patch.buffers.push_back({position, binding.resources});
+        } else if (binding.descriptor.role == DescriptorRole::GuestImages) {
+            for (std::size_t element = 0; element < binding.resources.size(); ++element) {
+                if (!binding.inactive.empty() && binding.inactive[element]) continue;
+                patch.images.push_back({position, static_cast<std::uint32_t>(element * 8u), binding.resources[element]});
+            }
         } else if (binding.descriptor.role == DescriptorRole::FlattenedSrt) {
             patch.flattenedSrt = position;
         } else if (binding.descriptor.role == DescriptorRole::ShaderData) {
@@ -1115,7 +1129,10 @@ void recordMemoPatch(MemoPatch& patch, const DescriptorBindingPlan& plan, const 
     if (patch.pushData || plan.storageData) {
         for (const auto reg : layout.userDataRegisters) patch.userWords.push_back(reg - variant.info.userDataBase);
     }
-    patch.valid = layout.userDataRegisters.size() <= layout.DispatchThreadLimitDword() && (patch.userWords.empty() || patch.pushData || patch.shaderData != MemoPatch::NoBinding);
+    constexpr auto descriptorWord = static_cast<std::uint32_t>(offsetof(RuntimeAbi::ResourceMetadata, descriptor) / sizeof(std::uint32_t));
+    for (const auto& metadata : plan.imageMetadata) patch.imageMetadata.push_back({metadata.offset + descriptorWord, metadata.resource});
+    const bool dataReachable = patch.pushData || patch.shaderData != MemoPatch::NoBinding;
+    patch.valid = layout.userDataRegisters.size() <= layout.DispatchThreadLimitDword() && (patch.userWords.empty() || dataReachable) && (patch.imageMetadata.empty() || dataReachable);
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, MemoPatch* patch = nullptr, const std::vector<BufferSubstitute>* substituteSnapshot = nullptr) {
@@ -1535,6 +1552,30 @@ void applyMemoPatch(RecompileResult& result, const MemoPatch& patch, const Resou
             for (std::size_t word = 0; word < patch.userWords.size(); ++word) words[word] = snapshot.userData.at(patch.userWords[word]);
         }
     }
+    for (const auto& image : patch.images) {
+        if (image.resource >= snapshot.images.size()) continue;
+        const auto& descriptor = snapshot.images[image.resource];
+        if (descriptor.dwordCount != 8u) throw std::runtime_error("a patched image descriptor changed its width");
+        auto& words = result.bindings.at(image.binding).guestDescriptor;
+        if (image.word + 2u > words.size()) throw std::runtime_error("a patched image lies outside its binding");
+        words[image.word] = descriptor.dwords[0];
+        words[image.word + 1u] = descriptor.dwords[1];
+    }
+    for (const auto& [word, resource] : patch.imageMetadata) {
+        if (resource >= snapshot.images.size()) continue;
+        const auto& descriptor = snapshot.images[resource];
+        if (descriptor.dwordCount != 8u) throw std::runtime_error("a patched image descriptor changed its width");
+        for (std::uint32_t dword = 0; dword < 2u; ++dword) {
+            if (patch.pushData) {
+                if ((word + dword + 1u) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("patched image metadata lies outside the push data");
+                std::memcpy(result.pushConstants.data() + (word + dword) * sizeof(std::uint32_t), &descriptor.dwords[dword], sizeof(std::uint32_t));
+            } else {
+                auto& words = result.bindings.at(patch.shaderData).guestDescriptor;
+                if (word + dword >= words.size()) throw std::runtime_error("patched image metadata lies outside the shader data");
+                words[word + dword] = descriptor.dwords[dword];
+            }
+        }
+    }
     if (patch.flattenedSrt != MemoPatch::NoBinding) result.bindings.at(patch.flattenedSrt).guestDescriptor = snapshot.flattenedSrt;
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
 }
@@ -1563,6 +1604,11 @@ ResultMemoCounters& resultMemoCounters() {
     return counters;
 }
 
+std::atomic<std::uint64_t>& resultMemoPatches() {
+    static std::atomic<std::uint64_t> patches{0};
+    return patches;
+}
+
 std::uint64_t nextMemoUse() {
     return resultMemoCounters().clock.fetch_add(1, std::memory_order_relaxed) + 1u;
 }
@@ -1589,7 +1635,7 @@ std::uint64_t resultBytes(const RecompileResult& result) {
 }
 
 std::uint64_t patchBytes(const MemoPatch& patch) {
-    auto total = static_cast<std::uint64_t>(sizeof(MemoPatch)) + vectorBytes(patch.buffers) + vectorBytes(patch.userWords);
+    auto total = static_cast<std::uint64_t>(sizeof(MemoPatch)) + vectorBytes(patch.buffers) + vectorBytes(patch.userWords) + vectorBytes(patch.images) + vectorBytes(patch.imageMetadata);
     for (const auto& buffer : patch.buffers) total += vectorBytes(buffer.second);
     return total;
 }
@@ -1728,7 +1774,6 @@ std::uint64_t snapshotCommonHash(const RecompileRequest& request, const Resource
             for (std::uint32_t i = 0; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
         }
     };
-    mixDescriptors(snapshot.images);
     mixDescriptors(snapshot.samplers);
     mix(static_cast<std::uint64_t>(snapshot.uniformFill.kind));
     mix(snapshot.uniformFill.resource);
@@ -1835,6 +1880,22 @@ std::uint64_t snapshotHash(std::uint64_t common, const ResourceSnapshot& snapsho
         }
     }
     if (masked) {
+        mix(snapshot.images.size());
+        for (const auto& value : snapshot.images) {
+            mix(value.dwordCount);
+            mix(value.availableDwordMask);
+            if (value.dwordCount < 2u) {
+                for (std::uint32_t i = 0; i < value.dwordCount; ++i) mix(value.dwords[i]);
+                continue;
+            }
+            mix(value.dwords[0] != 0u || (value.dwords[1] & 0xffu) != 0u);
+            mix(value.dwords[1] & ~0xffu);
+            for (std::uint32_t i = 2; i < value.dwordCount && i < value.dwords.size(); ++i) mix(value.dwords[i]);
+        }
+    } else {
+        mixDescriptors(snapshot.images);
+    }
+    if (masked) {
         mix(snapshot.flattenedSrt.size());
         mix(snapshot.userData.size());
     } else {
@@ -1898,6 +1959,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
         if (profile) counters.patchNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.patched.fetch_add(1, std::memory_order_relaxed);
+        resultMemoPatches().fetch_add(1, std::memory_order_relaxed);
     } else {
         if (masking) patch = std::make_shared<MemoPatch>();
         result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, patch.get(), &substitutes));
@@ -2195,6 +2257,10 @@ void SetResultMemoBudget(std::uint64_t bytes) {
 void SetResultMemoTrimHook(std::function<void()> hook) {
     std::lock_guard lock(resultMemoTrimMutex());
     resultMemoTrimHook() = std::move(hook);
+}
+
+std::uint64_t ResultMemoPatches() {
+    return resultMemoPatches().load(std::memory_order_relaxed);
 }
 
 std::uint64_t ResultMemoBytes() {
