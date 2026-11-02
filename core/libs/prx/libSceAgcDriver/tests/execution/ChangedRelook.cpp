@@ -25,7 +25,9 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <atomic>
 #include <memory>
+#include <thread>
 #include <mutex>
 #include <span>
 #include <string>
@@ -280,7 +282,12 @@ void SyntheticTests(const AgcDriver::VulkanDevice& device) {
     bool current = false;
     std::uint64_t relooked = 0;
 
+    const bool walkOnly = std::getenv("APS5_NO_CHANGED_RELOOK") != nullptr;
     const auto expect = [&](const ShaderResources::ProofReport& report, bool wantCurrent, ShaderResources::ProofPath wantPath, std::uint64_t wantRelooked, const std::string& what) {
+        if (walkOnly && wantPath == ShaderResources::ProofPath::Relooked) {
+            wantPath = ShaderResources::ProofPath::Full;
+            wantRelooked = 0;
+        }
         Require(current == wantCurrent && report.path == wantPath && relooked == wantRelooked, "changed relook: " + what + " took the " + Path(report) + (current ? ", current," : ", not current,") + " after " + std::to_string(relooked) + " relooked lookups");
     };
     using ShaderResources::ProofPath::Relooked;
@@ -329,6 +336,72 @@ void SyntheticTests(const AgcDriver::VulkanDevice& device) {
     expect(evicting, false, Relooked, 1, "a changed texture whose new copy evicts the other bound texture");
     Require(kept->Released(), "changed relook: the changed texture's new copy did not evict the other bound texture, so eviction was not exercised");
     std::puts("a relook whose lookup evicts another bound texture fails at that lookup");
+
+    const auto nullWords = std::array<std::uint32_t, 8>{};
+    Synthetic withNull;
+    auto nullFirst = ImageBinding(Kind::SampledImage, 0, nullWords);
+    const auto sixth = SurfaceWords(block.At(6 * Slot), 8, Linear, Type2D, 0, 0);
+    nullFirst.count = 2;
+    nullFirst.imageSamplers = {0, 0};
+    nullFirst.guestDescriptor.insert(nullFirst.guestDescriptor.end(), sixth.begin(), sixth.end());
+    Build(withNull, context, {nullFirst}, "null element before a texture");
+    Touch(block, 6 * Slot, false);
+    expect(ProveCounted(withNull, current, relooked), true, Relooked, 1, "a same-byte store behind a null element");
+    std::puts("a null element does not shift the relooked element");
+
+    Synthetic duplicated;
+    const auto seventh = SurfaceWords(block.At(7 * Slot), 8, Linear, Type2D, 0, 0);
+    Build(duplicated, context, {ImageBinding(Kind::SampledImage, 0, seventh), ImageBinding(Kind::SampledImage, 1, seventh)}, "duplicate sampled aliases");
+    Require(duplicated.resources->SampledTextures()[0] == duplicated.resources->SampledTextures()[1], "changed relook: duplicate sampled descriptors did not share a texture");
+    Touch(block, 7 * Slot, false);
+    expect(ProveCounted(duplicated, current, relooked), true, Relooked, 2, "a same-byte store under two bindings of one texture");
+    std::puts("duplicate sampled aliases relook both bindings to the one texture");
+
+    {
+        auto program = std::make_unique<ShaderRecompiler::RecompileResult>();
+        program->bindings = {ImageBinding(Kind::SampledImage, 0, sixth)};
+        auto other = std::make_unique<ShaderRecompiler::RecompileResult>(*program);
+        const CompiledShader one{ShaderStage::Compute, program.get(), 0};
+        const CompiledShader same{ShaderStage::Compute, other.get(), 0};
+        Require(ShaderResources::ContentKey(one, true, false) == ShaderResources::ContentKey(same, true, false), "changed relook: equal image descriptors keyed different templates");
+        other->bindings[0].guestDescriptor[0] ^= 1u;
+        Require(ShaderResources::ContentKey(one, true, false) != ShaderResources::ContentKey(same, true, false), "changed relook: image descriptors differing in one word keyed one template, so a relook could look up another template's descriptors");
+        std::puts("a template's key separates image descriptors that differ in one word");
+    }
+
+    {
+        using AgcDriver::GuestMemory::ChangedSince;
+        using AgcDriver::GuestMemory::CollectWrites;
+        const auto a = block.At(4 * Slot);
+        const auto b = block.At(5 * Slot);
+        std::vector<AgcDriver::GuestMemory::UnchangedQuery> queries{{a, 256, CollectWrites(a, 256)}, {b, 256, CollectWrites(b, 256)}, {a, 65536, CollectWrites(a, 65536)}};
+        std::vector<std::size_t> changed{7, 8, 9};
+        Require(ChangedSince(queries, changed) && changed.empty(), "changed relook: ChangedSince reported unchanged ranges or kept its old output");
+        Touch(block, 4 * Slot + 16, false);
+        static_cast<void>(CollectWrites(a, 256));
+        Require(ChangedSince(queries, changed) && changed == std::vector<std::size_t>{0, 2}, "changed relook: ChangedSince did not name exactly the two queries over the stored byte");
+        auto invalid = queries;
+        invalid.push_back({b, 256, 0});
+        changed = {7};
+        Require(!ChangedSince(invalid, changed) && changed.empty(), "changed relook: ChangedSince accepted a query without a generation after valid ones, or left output behind");
+        alignas(64) static std::array<std::byte, 256> unwatched{};
+        std::vector<AgcDriver::GuestMemory::UnchangedQuery> outside{{reinterpret_cast<std::uint64_t>(unwatched.data()), unwatched.size(), 1}};
+        Require(!ChangedSince(outside, changed) && changed.empty(), "changed relook: ChangedSince accepted a range the tracker does not cover");
+        const std::vector<AgcDriver::GuestMemory::UnchangedQuery> steady{{b, 256, CollectWrites(b, 256)}};
+        std::atomic<bool> stop{false};
+        std::thread writer([&] {
+            while (!stop.load(std::memory_order_relaxed)) {
+                Touch(block, 4 * Slot, false);
+                static_cast<void>(CollectWrites(a, 256));
+            }
+        });
+        bool steadyHeld = true;
+        for (int i = 0; i < 2000 && steadyHeld; ++i) steadyHeld = ChangedSince(steady, changed) && changed.empty();
+        stop = true;
+        writer.join();
+        Require(steadyHeld, "changed relook: ChangedSince reported an unwritten range changed while another thread wrote and collected a different one");
+        std::puts("ChangedSince names exactly the moved queries, refuses invalid ones and clears its output");
+    }
 }
 
 }
