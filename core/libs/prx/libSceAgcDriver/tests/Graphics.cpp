@@ -12127,7 +12127,7 @@ void ResourceContentKeyTests(bool benchmark) {
         images.count = count;
         images.guestDescriptor.resize(static_cast<std::size_t>(count) * 8u);
         for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
-        for (auto* bits : {&images.traits->imageWritten, &images.traits->samplerDepthCompare, &images.traits->imageDepthCompare, &images.traits->imageAtomic, &images.traits->samplerUnnormalized, &images.traits->samplerIntegerBorder, &images.traits->imageUnnormalized, &images.traits->imageUnnormalizedBaseLevel, &images.traits->bufferWritten}) {
+        for (auto* bits : {&images.traits.Mutable().imageWritten, &images.traits.Mutable().samplerDepthCompare, &images.traits.Mutable().imageDepthCompare, &images.traits.Mutable().imageAtomic, &images.traits.Mutable().samplerUnnormalized, &images.traits.Mutable().samplerIntegerBorder, &images.traits.Mutable().imageUnnormalized, &images.traits.Mutable().imageUnnormalizedBaseLevel, &images.traits.Mutable().bufferWritten}) {
             bits->resize(count);
             for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
         }
@@ -12160,17 +12160,17 @@ void ResourceContentKeyTests(bool benchmark) {
             Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
             program.bindings[2].traits.Mutable().bufferWritten[0] = false;
             if (count != 0) {
-                for (auto* bits : {&program.bindings[0].traits->imageWritten, &program.bindings[0].traits->samplerDepthCompare, &program.bindings[0].traits->imageDepthCompare, &program.bindings[0].traits->imageAtomic, &program.bindings[0].traits->samplerUnnormalized, &program.bindings[0].traits->samplerIntegerBorder, &program.bindings[0].traits->imageUnnormalized, &program.bindings[0].traits->imageUnnormalizedBaseLevel}) {
+                for (auto* bits : {&program.bindings[0].traits.Mutable().imageWritten, &program.bindings[0].traits.Mutable().samplerDepthCompare, &program.bindings[0].traits.Mutable().imageDepthCompare, &program.bindings[0].traits.Mutable().imageAtomic, &program.bindings[0].traits.Mutable().samplerUnnormalized, &program.bindings[0].traits.Mutable().samplerIntegerBorder, &program.bindings[0].traits.Mutable().imageUnnormalized, &program.bindings[0].traits.Mutable().imageUnnormalizedBaseLevel}) {
                     bits->back().flip();
                     Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last packed flag");
                     bits->back().flip();
                 }
-                ++program.bindings[0].traits->imageSamplers.back();
+                ++program.bindings[0].traits.Mutable().imageSamplers.back();
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last sampler association");
-                --program.bindings[0].traits->imageSamplers.back();
-                program.bindings[0].traits->imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image3D;
+                --program.bindings[0].traits.Mutable().imageSamplers.back();
+                program.bindings[0].traits.Mutable().imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image3D;
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last image shape");
-                program.bindings[0].traits->imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
+                program.bindings[0].traits.Mutable().imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
             }
             Require(original.capacity() == original.size(), "content key reserved a different word count than it serialized");
             std::uint64_t hash = 14695981039346656037ull;
