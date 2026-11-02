@@ -6,6 +6,7 @@
 #include "BdaAbi.hpp"
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
+#include "ShaderDiskCache.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <thread>
@@ -119,6 +120,13 @@ struct PixelStage {
         const auto capture = AgcDriver::DriverDetail::CaptureInvocation(draw, snapshot, 0, request, invocation);
         auto result = invocation.Materialize(*capture);
         return {std::move(result), Copied(draw)};
+    }
+
+    std::shared_ptr<const IrResourcePlan> Plan() {
+        const auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+        AgcDriver::ShaderMemory independent({});
+        auto copy = invocation;
+        return AgcDriver::DriverDetail::CaptureInvocation(independent, snapshot, 0, request, copy)->plan;
     }
 
     Drawn Oracle() {
@@ -1008,12 +1016,23 @@ void CheckReplaySpanQueries() {
     }
 }
 
+void RequireSameRolesAfterDiskCache(PixelStage& stage, const std::string& what) {
+    const auto plan = stage.Plan();
+    std::vector<std::byte> bytes;
+    Require(ShaderDiskCache::EncodePlan(*plan, bytes), what + ": the plan could not be encoded for the disk cache");
+    IrResourcePlan decoded;
+    Require(ShaderDiskCache::DecodePlan(bytes, decoded), what + ": the plan could not be decoded from the disk cache");
+    Require(!plan->slotRoles.empty() || plan->srtReads.empty(), what + ": the built plan has no slot roles");
+    Require(decoded.slotRoles == plan->slotRoles && decoded.sourceDwordSlots == plan->sourceDwordSlots && decoded.replayEligible == plan->replayEligible, what + ": the roles derived after a disk cache load differ from the roles of the built plan");
+}
+
 void CheckReplayOracle() {
     {
         static DescriptorTable table;
         const auto code = DescriptorPixelCode();
         PixelStage stage(code, PointerWords(table.words.data()), 0x2c0000u);
         ExpectOracle(stage, "the first oracle draw", SrtReplayRefusal::NoRecipe);
+        RequireSameRolesAfterDiskCache(stage, "the descriptor fixture");
         table.MoveBuffer(5u, 0x50000000u);
         ExpectOracle(stage, "a moved buffer against the oracle", SrtReplayRefusal::None);
         table.MoveImage(11u);
@@ -1031,6 +1050,7 @@ void CheckReplayOracle() {
         const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
         PixelStage stage(code, PointerWords(root.data()), 0x2d0000u);
         ExpectOracle(stage, "the first pointer draw", SrtReplayRefusal::NoRecipe);
+        RequireSameRolesAfterDiskCache(stage, "the pointer fixture");
         first[0] = 0x11000400u;
         ExpectOracle(stage, "a pointee whose buffer moved", SrtReplayRefusal::None);
         point(second);
@@ -1056,6 +1076,7 @@ void CheckReplayOracle() {
         users.push_back(16u);
         PixelStage stage(code, users, 0x320000u);
         ExpectOracle(stage, "the first draw with a static and a runtime-offset descriptor", SrtReplayRefusal::Ineligible);
+        RequireSameRolesAfterDiskCache(stage, "the runtime-offset fixture");
         table[0] = 0x66000400u;
         ExpectOracle(stage, "a static descriptor moved beside a runtime-offset one", SrtReplayRefusal::Ineligible);
         table[4] = 0x77000400u;
@@ -1066,6 +1087,7 @@ void CheckReplayOracle() {
         const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080100u, 0xfa000010u, 0xbf8cc07fu, 0x7e000280u, 0xbf068002u, 0xbf850004u, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
         PixelStage stage(code, PointerWords(table.data()), 0x2f0000u);
         ExpectOracle(stage, "the first selector draw", SrtReplayRefusal::NoRecipe);
+        RequireSameRolesAfterDiskCache(stage, "the selector fixture");
         table[4] = 0x44000400u;
         ExpectOracle(stage, "a buffer moved under a branch", SrtReplayRefusal::None);
         table[0] = 0u;
@@ -1084,6 +1106,7 @@ void CheckReplayOracle() {
             0xe0300000u, 0x80010100u, 0xbf8c3f70u, 0x7e00020cu, 0x4a000101u, 0xf800180fu, 0u, 0xbf810000u};
         PixelStage stage(code, PointerWords(table.data()), 0x300000u);
         ExpectOracle(stage, "the first draw whose buffer also locates a descriptor", SrtReplayRefusal::NoRecipe);
+        RequireSameRolesAfterDiskCache(stage, "the multi-role fixture");
         inner[0] = 0x55000400u;
         ExpectOracle(stage, "a descriptor moved inside a bound buffer", SrtReplayRefusal::None);
         table[2] = 0x200u;
