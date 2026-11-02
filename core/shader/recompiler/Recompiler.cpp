@@ -1576,8 +1576,13 @@ std::uint64_t vectorBytes(const std::vector<bool>& values) {
     return static_cast<std::uint64_t>(values.capacity() + 7u) / 8u;
 }
 
+std::uint64_t elementTraitsBytes(const DescriptorElementTraits& traits) {
+    return static_cast<std::uint64_t>(sizeof(DescriptorElementTraits)) + vectorBytes(traits.imageShapes) + vectorBytes(traits.imageSamplers) + vectorBytes(traits.bufferExtent) + vectorBytes(traits.samplerDepthCompare) + vectorBytes(traits.imageWritten) + vectorBytes(traits.imageDepthCompare) + vectorBytes(traits.imageAtomic) + vectorBytes(traits.imageAtomic64) + vectorBytes(traits.bufferAtomic) + vectorBytes(traits.bufferWritten) + vectorBytes(traits.samplerUnnormalized) + vectorBytes(traits.samplerIntegerBorder) + vectorBytes(traits.samplerCoordinatesIgnored) + vectorBytes(traits.imageUnnormalized) + vectorBytes(traits.imageUnnormalizedBaseLevel) + vectorBytes(traits.bufferRead);
+}
+
 std::uint64_t descriptorBindingBytes(const DescriptorBinding& binding) {
-    return vectorBytes(binding.guestDescriptor) + vectorBytes(binding.imageShapes) + vectorBytes(binding.imageSamplers) + vectorBytes(binding.bufferExtent) + vectorBytes(binding.samplerDepthCompare) + vectorBytes(binding.imageWritten) + vectorBytes(binding.imageDepthCompare) + vectorBytes(binding.imageAtomic) + vectorBytes(binding.imageAtomic64) + vectorBytes(binding.bufferAtomic) + vectorBytes(binding.bufferWritten) + vectorBytes(binding.samplerUnnormalized) + vectorBytes(binding.samplerIntegerBorder) + vectorBytes(binding.samplerCoordinatesIgnored) + vectorBytes(binding.imageUnnormalized) + vectorBytes(binding.imageUnnormalizedBaseLevel) + vectorBytes(binding.bufferRead);
+    const bool perResult = binding.role == DescriptorRole::ImageTable || binding.role == DescriptorRole::ImageStorageTable || binding.role == DescriptorRole::SamplerTable;
+    return vectorBytes(binding.guestDescriptor) + (perResult && binding.traits.Identity() != nullptr ? elementTraitsBytes(*binding.traits) : 0u);
 }
 
 std::uint64_t resultBytes(const RecompileResult& result) {

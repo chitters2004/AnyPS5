@@ -770,7 +770,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, 1024, 0x31000000u};
-    binding.bufferWritten = {true};
+    binding.traits.Mutable().bufferWritten = {true};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto direct = std::make_shared<ShaderResources>(context, compute);
@@ -868,7 +868,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         auto& mixedBinding = mixedProgram.bindings[0];
         mixedBinding.count = 2;
         mixedBinding.guestDescriptor.insert(mixedBinding.guestDescriptor.end(), {static_cast<std::uint32_t>(copiedAddress), static_cast<std::uint32_t>(copiedAddress >> 32u) & 0xffffu, 1024, 0x31000000u});
-        mixedBinding.bufferWritten = {true, true};
+        mixedBinding.traits.Mutable().bufferWritten = {true, true};
         const CompiledShader mixedCompute{ShaderRecompiler::ShaderStage::Compute, &mixedProgram, 0};
         for (const bool draw : {false, true}) {
             auto mixed = std::make_shared<ShaderResources>(context, mixedCompute);
@@ -909,7 +909,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         imageBinding.descriptorSet = 0;
         imageBinding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
         imageBinding.count = 1;
-        imageBinding.imageSamplers = {0};
+        imageBinding.traits.Mutable().imageSamplers = {0};
         imageBinding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
         imageBinding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8), static_cast<std::uint32_t>(address >> 40) | (56u << 20) | (3u << 30), 15u | (63u << 14), 0x91b00fac, 0, 0, 0, 0};
         imageProgram.bindings.push_back(imageBinding);
@@ -3916,7 +3916,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
@@ -4140,9 +4140,9 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         binding.binding = 0;
         binding.count = 1;
         binding.guestDescriptor = {static_cast<std::uint32_t>(element), (static_cast<std::uint32_t>(element >> 32u) & 0xffffu) | (stride << 16u), records, 0x31000000u};
-        binding.bufferWritten = {true};
-        binding.bufferRead = {read};
-        binding.bufferExtent = {extent};
+        binding.traits.Mutable().bufferWritten = {true};
+        binding.traits.Mutable().bufferRead = {read};
+        binding.traits.Mutable().bufferExtent = {extent};
         program.bindings.push_back(binding);
         const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         ShaderResources resources(context, compute, {}, false, dispatchThreads);
@@ -4314,7 +4314,7 @@ bool sparseRunImportTests(const Device& device, bool copied) {
         binding.binding = 0;
         binding.count = 1;
         binding.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, static_cast<std::uint32_t>(heap), 0x31000000u};
-        binding.bufferWritten = {false};
+        binding.traits.Mutable().bufferWritten = {false};
         program.bindings.push_back(binding);
         program.pushConstants.resize(16);
         program.memoryOffsetDword = 0;
@@ -4397,7 +4397,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(view), static_cast<std::uint32_t>(view >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.traits.Mutable().bufferWritten = {false};
     vertex.bindings.push_back(binding);
     vertex.pushConstants.resize(16);
     vertex.memoryOffsetDword = 0;
@@ -4487,7 +4487,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     binding.count = 2;
     for (const auto word : words(address + outer, outerBytes)) binding.guestDescriptor.push_back(word);
     for (const auto word : words(address + offset, elementBytes)) binding.guestDescriptor.push_back(word);
-    binding.bufferWritten = {false, false};
+    binding.traits.Mutable().bufferWritten = {false, false};
     program.bindings.push_back(binding);
     program.pushConstants.resize(16);
     program.memoryOffsetDword = 0;
@@ -4581,7 +4581,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
         sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
         sampler.count = 2;
         sampler.guestDescriptor.resize(8);
-        sampler.samplerDepthCompare = {false, false};
+        sampler.traits.Mutable().samplerDepthCompare = {false, false};
         program.bindings.push_back(sampler);
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         ShaderResources resources(context, shader);
@@ -4653,9 +4653,9 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         images.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
         images.count = elements;
         for (std::uint32_t element = 0; element < elements; ++element) images.guestDescriptor.insert(images.guestDescriptor.end(), texture.begin(), texture.end());
-        images.imageShapes.assign(elements, ShaderRecompiler::DescriptorImageShape::Image2D);
-        images.imageDepthCompare.assign(elements, false);
-        images.imageSamplers.assign(elements, 0u);
+        images.traits.Mutable().imageShapes.assign(elements, ShaderRecompiler::DescriptorImageShape::Image2D);
+        images.traits.Mutable().imageDepthCompare.assign(elements, false);
+        images.traits.Mutable().imageSamplers.assign(elements, 0u);
         program.bindings.push_back(std::move(images));
     };
     DescriptorUpdates updates(context);
@@ -4734,9 +4734,9 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
     images.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
     images.count = 1;
     images.guestDescriptor.assign(texture.begin(), texture.end());
-    images.imageShapes.assign(1, ShaderRecompiler::DescriptorImageShape::Image2D);
-    images.imageDepthCompare.assign(1, false);
-    images.imageSamplers.assign(1, 0u);
+    images.traits.Mutable().imageShapes.assign(1, ShaderRecompiler::DescriptorImageShape::Image2D);
+    images.traits.Mutable().imageDepthCompare.assign(1, false);
+    images.traits.Mutable().imageSamplers.assign(1, 0u);
     program.bindings.push_back(std::move(images));
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
@@ -4800,7 +4800,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, elementBytes, 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
@@ -4895,7 +4895,7 @@ void drawSnapshotPatchTests(const Device& device) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto snapshotContext = context;
@@ -4998,7 +4998,7 @@ void drawSnapshotEpochTests(const Device& device) {
     binding.binding = 0;
     binding.count = 1;
     binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
-    binding.bufferWritten = {false};
+    binding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(binding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto snapshotContext = context;
@@ -5097,7 +5097,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     smallBinding.binding = 0;
     smallBinding.count = 1;
     smallBinding.guestDescriptor = {static_cast<std::uint32_t>(smallAddress), static_cast<std::uint32_t>(smallAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(smallBytes), 0x31000000u};
-    smallBinding.bufferWritten = {false};
+    smallBinding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(smallBinding);
     ShaderRecompiler::DescriptorBinding largeBinding;
     largeBinding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
@@ -5106,7 +5106,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     largeBinding.binding = 1;
     largeBinding.count = 1;
     largeBinding.guestDescriptor = {static_cast<std::uint32_t>(largeAddress), static_cast<std::uint32_t>(largeAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(largeBytes), 0x31000000u};
-    largeBinding.bufferWritten = {false};
+    largeBinding.traits.Mutable().bufferWritten = {false};
     program.bindings.push_back(largeBinding);
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     {
@@ -5159,7 +5159,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     firstBinding.binding = 0;
     firstBinding.count = 1;
     firstBinding.guestDescriptor = {static_cast<std::uint32_t>(firstAddress), static_cast<std::uint32_t>(firstAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(firstBytes), 0x31000000u};
-    firstBinding.bufferWritten = {false};
+    firstBinding.traits.Mutable().bufferWritten = {false};
     cumulativeProgram.bindings.push_back(firstBinding);
     ShaderRecompiler::DescriptorBinding secondBinding;
     secondBinding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
@@ -5168,7 +5168,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     secondBinding.binding = 1;
     secondBinding.count = 1;
     secondBinding.guestDescriptor = {static_cast<std::uint32_t>(secondAddress), static_cast<std::uint32_t>(secondAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(secondBytes), 0x31000000u};
-    secondBinding.bufferWritten = {false};
+    secondBinding.traits.Mutable().bufferWritten = {false};
     cumulativeProgram.bindings.push_back(secondBinding);
     const CompiledShader cumulativeCompute{ShaderRecompiler::ShaderStage::Compute, &cumulativeProgram, 0};
     {
@@ -5336,7 +5336,7 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         binding.binding = index;
         binding.count = 1;
         binding.guestDescriptor = {static_cast<std::uint32_t>(elements[index]), static_cast<std::uint32_t>(elements[index] >> 32u) & 0xffffu, static_cast<std::uint32_t>(sizes[index]), 0x31000000u};
-        binding.bufferWritten = {false};
+        binding.traits.Mutable().bufferWritten = {false};
         program.bindings.push_back(binding);
     }
     const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -9545,7 +9545,7 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     binding.binding = 1;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageSamplers = {0u};
+    binding.traits.Mutable().imageSamplers = {0u};
     program.bindings.push_back(binding);
     const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     std::vector<std::shared_ptr<Texture>> kept;
@@ -9573,8 +9573,8 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
         program.bindings[0].count = static_cast<std::uint32_t>(elements.size());
         program.bindings[0].guestDescriptor.clear();
         for (const auto& words : elements) program.bindings[0].guestDescriptor.insert(program.bindings[0].guestDescriptor.end(), words.begin(), words.end());
-        program.bindings[0].imageDepthCompare = std::move(depthCompare);
-        program.bindings[0].imageSamplers.assign(elements.size(), 0u);
+        program.bindings[0].traits.Mutable().imageDepthCompare = std::move(depthCompare);
+        program.bindings[0].traits.Mutable().imageSamplers.assign(elements.size(), 0u);
         ShaderResources resources(context, compiled);
         Require(resources.SampledTextures().size() == elements.size(), "the build has the wrong number of sampled textures");
         kept.insert(kept.end(), resources.SampledTextures().begin(), resources.SampledTextures().end());
@@ -9583,8 +9583,8 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto repeated = bindElements({firstWords, firstWords, secondWords, firstWords}, {});
     Require(repeated[0] == remade && repeated[1] == remade && repeated[2] == replaced && repeated[3] == remade, "repeated elements of one build do not bind the cache's textures");
     program.bindings[0].count = 1;
-    program.bindings[0].imageDepthCompare.clear();
-    program.bindings[0].imageSamplers.assign(1, 0u);
+    program.bindings[0].traits.Mutable().imageDepthCompare.clear();
+    program.bindings[0].traits.Mutable().imageSamplers.assign(1, 0u);
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();
@@ -9755,7 +9755,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageSamplers = {0};
+    binding.traits.Mutable().imageSamplers = {0};
     binding.guestDescriptor = {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
@@ -10123,7 +10123,7 @@ void oneFragmentFmaskGuardTests(const Device& device) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageSamplers = {0};
+    binding.traits.Mutable().imageSamplers = {0};
     binding.guestDescriptor = {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((side - 1u) & 3u) << 30u),
@@ -10402,7 +10402,7 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageSamplers = {0};
+    binding.traits.Mutable().imageSamplers = {0};
     binding.guestDescriptor = {
         static_cast<std::uint32_t>(address >> 8u),
         static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((side - 1u) & 3u) << 30u),

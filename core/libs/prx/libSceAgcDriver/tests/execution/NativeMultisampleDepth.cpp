@@ -761,7 +761,7 @@ void CheckDrawFeedback() {
     image.count = 1u;
     image.guestDescriptor.assign(words.begin(), words.end());
     image.imageShape = ShaderRecompiler::DescriptorImageShape::Image2DMultisample;
-    image.imageSamplers = {0u};
+    image.traits.Mutable().imageSamplers = {0u};
     reader.bindings.push_back(std::move(image));
     const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0u}, {ShaderRecompiler::ShaderStage::Fragment, &reader, pixelOffset}}};
     TargetRefuses([&] { device->Draw(state, draw, shaders); }, "sampling a native multisampled depth target the draw attaches");

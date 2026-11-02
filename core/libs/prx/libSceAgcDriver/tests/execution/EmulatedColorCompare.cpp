@@ -228,7 +228,7 @@ std::uint64_t Run(AgcDriver::VulkanDevice& device, const Sampler& sampler, const
     if (expectedVariant != 0) Require(result.cacheHit && result.variantId == expectedVariant, std::string(name) + " did not reuse the compiled comparison artifact");
     for (const auto& binding : result.bindings) {
         Require(binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers, "emulated comparison retained a sampler binding");
-        Require(std::all_of(binding.imageSamplers.begin(), binding.imageSamplers.end(), [](auto mask) { return mask == 0u; }), "emulated comparison retained an unused sampler association");
+        Require(std::all_of(binding.traits->imageSamplers.begin(), binding.traits->imageSamplers.end(), [](auto mask) { return mask == 0u; }), "emulated comparison retained an unused sampler association");
     }
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
@@ -310,7 +310,7 @@ void RunCube(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char
     const auto result = Compile(device, Format1616UNorm, sampler, CubeCode, false, true, true);
     for (const auto& binding : result.bindings) {
         Require(binding.role != ShaderRecompiler::DescriptorRole::GuestSamplers, "cube emulated comparison retained a sampler binding");
-        Require(std::all_of(binding.imageSamplers.begin(), binding.imageSamplers.end(), [](auto mask) { return mask == 0u; }), "cube emulated comparison retained an unused sampler association");
+        Require(std::all_of(binding.traits->imageSamplers.begin(), binding.traits->imageSamplers.end(), [](auto mask) { return mask == 0u; }), "cube emulated comparison retained an unused sampler association");
     }
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(CubeCode.data()));
     device.WaitIdle();
@@ -321,7 +321,7 @@ void RunCube(AgcDriver::VulkanDevice& device, const Sampler& sampler, const char
 
 bool BindsDepthCompare(const ShaderRecompiler::RecompileResult& result) {
     return std::any_of(result.bindings.begin(), result.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) {
-        return std::any_of(binding.imageDepthCompare.begin(), binding.imageDepthCompare.end(), [](bool compare) { return compare; });
+        return std::any_of(binding.traits->imageDepthCompare.begin(), binding.traits->imageDepthCompare.end(), [](bool compare) { return compare; });
     });
 }
 

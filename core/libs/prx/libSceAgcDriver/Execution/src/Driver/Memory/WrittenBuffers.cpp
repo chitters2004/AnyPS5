@@ -21,14 +21,14 @@ void visitWrittenBuffers(const ShaderRecompiler::RecompileResult& compiled, TVis
     for (const auto& binding : compiled.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
-            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            const bool written = element >= binding.traits->bufferWritten.size() || binding.traits->bufferWritten[element];
             if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 4) continue;
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4);
             const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
             const auto base = descriptor.Base48();
             const auto size = descriptor.GetSize();
             if (base == 0 || size == 0) continue;
-            visit(element, base, base + size, element < binding.bufferAtomic.size() && binding.bufferAtomic[element]);
+            visit(element, base, base + size, element < binding.traits->bufferAtomic.size() && binding.traits->bufferAtomic[element]);
         }
     }
 }
@@ -60,7 +60,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const S
         if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
-            const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+            const bool written = element >= binding.traits->imageWritten.size() || binding.traits->imageWritten[element];
             if (!written) continue;
             if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) {
                 bounded = false;
@@ -108,7 +108,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
         for (const auto& binding : stage.program->bindings) {
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+                const bool written = element >= binding.traits->imageWritten.size() || binding.traits->imageWritten[element];
                 if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
                 if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;

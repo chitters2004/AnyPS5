@@ -2063,8 +2063,8 @@ void ShadersWriteMemoryTests() {
         result.kind = kind;
         result.role = role;
         result.count = 1;
-        if (role == ShaderRecompiler::DescriptorRole::GuestImages) result.imageWritten = std::move(written);
-        else result.bufferWritten = std::move(written);
+        if (role == ShaderRecompiler::DescriptorRole::GuestImages) result.traits.Mutable().imageWritten = std::move(written);
+        else result.traits.Mutable().bufferWritten = std::move(written);
         return result;
     };
     ShaderRecompiler::RecompileResult reads;
@@ -4863,7 +4863,7 @@ void quadPixelMaskTests() {
     written.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
     written.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
     written.count = 1;
-    written.bufferWritten = {true};
+    written.traits.Mutable().bufferWritten = {true};
     stores.bindings.push_back(written);
     const std::array<AgcDriver::Graphics::CompiledShader, 2> storing{{{Stage::Vertex, &late, 0}, {Stage::Fragment, &stores, 0}}};
     const std::array<AgcDriver::Graphics::CompiledShader, 2> vertexStoring{{{Stage::Vertex, &stores, 0}, {Stage::Fragment, &late, 0}}};
@@ -6471,7 +6471,7 @@ void descriptorSnapshotTests() {
             Recorder recorder(context);
             ShaderRecompiler::RecompileResult vertex, fragment;
             auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
-            binding.bufferWritten = {false, false};
+            binding.traits.Mutable().bufferWritten = {false, false};
             vertex.bindings.push_back(binding);
             fragment.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
             const auto state = AgcDriver::Graphics::DecodeState(makeState());
@@ -6532,10 +6532,10 @@ void dispatchMoveTests() {
         Recorder recorder(context);
         ShaderRecompiler::RecompileResult built;
         auto inputs = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
-        inputs.bufferWritten = {false, false};
+        inputs.traits.Mutable().bufferWritten = {false, false};
         built.bindings.push_back(inputs);
         auto output = makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8));
-        output.bufferWritten = {true};
+        output.traits.Mutable().bufferWritten = {true};
         built.bindings.push_back(output);
         const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &built, 0};
         ShaderResources resources(context, shader);
@@ -6578,7 +6578,7 @@ void dispatchMoveTests() {
         refuses(both, 30, Refusal::Limit, "moved buffers past the byte budget together were served");
 
         auto written = relocated;
-        written.bindings[0].bufferWritten[1] = true;
+        written.bindings[0].traits.Mutable().bufferWritten[1] = true;
         refuses(written, 0, Refusal::Written, "a moved buffer the dispatch writes was served");
         refuses(moveTo(1, guestMovedSecond.data(), 20000), 0, Refusal::Written, "a moved buffer over the storage buffer range that no registered allocation holds was served");
         refuses(relocated, 16, Refusal::Limit, "a moved buffer over the byte budget was served");
@@ -6618,7 +6618,7 @@ void dispatchMoveTests() {
         const auto readOnly = [&](const std::vector<std::uint32_t>& words) {
             ShaderRecompiler::RecompileResult built;
             auto binding = makeBinding(Role::GuestBuffers, 0, 1, words);
-            binding.bufferWritten = {false};
+            binding.traits.Mutable().bufferWritten = {false};
             built.bindings.push_back(binding);
             return built;
         };
@@ -6812,8 +6812,8 @@ void resourceTests() {
         descriptor[1] |= stride << 16u;
         return descriptor;
     };
-    expectSingleAccepted(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {false}; }), "a read-only strided V# whose last record runs 8 bytes into the render target");
-    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.bufferWritten = {true}; }), "aliases the render target");
+    expectSingleAccepted(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.traits.Mutable().bufferWritten = {false}; }), "a read-only strided V# whose last record runs 8 bytes into the render target");
+    expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); binding.traits.Mutable().bufferWritten = {true}; }), "aliases the render target");
     expectSingleFailure(changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(60); }), "aliases the render target");
     {
         mock = MockVulkan{};
@@ -6822,7 +6822,7 @@ void resourceTests() {
         ShaderRecompiler::RecompileResult vertex;
         ShaderRecompiler::RecompileResult fragment;
         auto strided = changed([&](auto& binding) { binding.guestDescriptor = stridedBefore(8); });
-        strided.bufferWritten = {false};
+        strided.traits.Mutable().bufferWritten = {false};
         vertex.bindings.push_back(strided);
         AgcDriver::Graphics::ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
         const auto movedFor = [&](std::uint32_t past) {
@@ -7089,9 +7089,9 @@ void imageTableAllocationTests() {
                 program.bindings.push_back(map);
                 auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
                 images.kind = Kind::SampledImage;
-                images.imageShapes.resize(count);
-                images.imageDepthCompare.resize(count);
-                images.imageSamplers.resize(count);
+                images.traits.Mutable().imageShapes.resize(count);
+                images.traits.Mutable().imageDepthCompare.resize(count);
+                images.traits.Mutable().imageSamplers.resize(count);
                 program.bindings.push_back(std::move(images));
                 const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
                 {
@@ -7129,7 +7129,7 @@ void imageTableSnapshotAllocationTests() {
         Recorder recorder(context);
         ShaderRecompiler::RecompileResult vertex, fragment;
         auto buffer = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16));
-        buffer.bufferWritten = {false};
+        buffer.traits.Mutable().bufferWritten = {false};
         vertex.bindings.push_back(buffer);
         auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords));
         map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
@@ -7187,7 +7187,7 @@ void samplerTableNonSeamlessCubeTests() {
                 const std::array<std::uint32_t, 4> words{0x92u | (entry == flaggedEntry ? 1u << 28u : 0u), (4u * 256u) << 12u, 0u, 0u};
                 for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
                     samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
-                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                    samplers.traits.Mutable().samplerDepthCompare.push_back(variant >= 2u);
                 }
             }
             const auto samplerBinding = samplers.binding;
@@ -7254,7 +7254,7 @@ void samplerTableDeviceLimitTests(std::optional<std::uint32_t> selected = std::n
                 const auto& words = entry == badEntry ? invalid[kind] : valid;
                 for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
                     samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
-                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                    samplers.traits.Mutable().samplerDepthCompare.push_back(variant >= 2u);
                 }
             }
             const auto samplerBinding = samplers.binding;
@@ -7379,9 +7379,9 @@ void tableUpdateAfterBindTests() {
             program.bindings.push_back(map);
             auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 2u, std::vector<std::uint32_t>(16u));
             images.kind = Kind::SampledImage;
-            images.imageShapes.resize(2u);
-            images.imageDepthCompare.resize(2u);
-            images.imageSamplers.resize(2u);
+            images.traits.Mutable().imageShapes.resize(2u);
+            images.traits.Mutable().imageDepthCompare.resize(2u);
+            images.traits.Mutable().imageSamplers.resize(2u);
             program.bindings.push_back(std::move(images));
             const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
             {
@@ -7418,7 +7418,7 @@ void tableUpdateAfterBindTests() {
             const std::array<std::uint32_t, 4> valid{0x92u, (4u * 256u) << 12u, 0u, 0u};
             for (std::uint32_t element = 0; element < count; ++element) {
                 samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), valid.begin(), valid.end());
-                samplers.samplerDepthCompare.push_back(false);
+                samplers.traits.Mutable().samplerDepthCompare.push_back(false);
             }
             program.bindings.push_back(std::move(samplers));
             const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -8397,7 +8397,7 @@ void sampleOrderTests() {
         written.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
         written.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
         written.count = 1;
-        written.bufferWritten = {true};
+        written.traits.Mutable().bufferWritten = {true};
         memoryWriter.bindings.push_back(written);
         const std::array<CompiledShader, 1> writing{{{ShaderRecompiler::ShaderStage::Fragment, &memoryWriter, 0}}};
         const std::array<CompiledShader, 1> notWriting{{{ShaderRecompiler::ShaderStage::Fragment, &memoryKeeper, 0}}};
@@ -8990,9 +8990,9 @@ void copiedWriterIndirectOverlapTests() {
         RecompileResult shader;
         shader.runtimeAbiVersion = RuntimeAbi::Version;
         auto copiedBinding = makeBinding(Role::GuestBuffers, 0, 1, vsharp(copiedBlock, 1024));
-        copiedBinding.bufferWritten = {true};
+        copiedBinding.traits.Mutable().bufferWritten = {true};
         auto directBinding = makeBinding(Role::GuestBuffers, 1, 1, vsharp(directBlock, 1024));
-        directBinding.bufferWritten = {true};
+        directBinding.traits.Mutable().bufferWritten = {true};
         shader.bindings = {copiedBinding, directBinding};
         CompiledShader compiled{ShaderStage::Compute, &shader, 0};
         auto writer = std::make_shared<ShaderResources>(context, compiled);
@@ -12127,12 +12127,12 @@ void ResourceContentKeyTests(bool benchmark) {
         images.count = count;
         images.guestDescriptor.resize(static_cast<std::size_t>(count) * 8u);
         for (std::size_t i = 0; i < images.guestDescriptor.size(); ++i) images.guestDescriptor[i] = static_cast<std::uint32_t>(i * 1664525u + 1013904223u);
-        for (auto* bits : {&images.imageWritten, &images.samplerDepthCompare, &images.imageDepthCompare, &images.imageAtomic, &images.samplerUnnormalized, &images.samplerIntegerBorder, &images.imageUnnormalized, &images.imageUnnormalizedBaseLevel, &images.bufferWritten}) {
+        for (auto* bits : {&images.traits->imageWritten, &images.traits->samplerDepthCompare, &images.traits->imageDepthCompare, &images.traits->imageAtomic, &images.traits->samplerUnnormalized, &images.traits->samplerIntegerBorder, &images.traits->imageUnnormalized, &images.traits->imageUnnormalizedBaseLevel, &images.traits->bufferWritten}) {
             bits->resize(count);
             for (std::size_t i = 0; i < bits->size(); ++i) (*bits)[i] = i % 3u == 0;
         }
-        images.imageSamplers.resize(count, 7u);
-        images.imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
+        images.traits.Mutable().imageSamplers.resize(count, 7u);
+        images.traits.Mutable().imageShapes.resize(count, ShaderRecompiler::DescriptorImageShape::Image2D);
         program.bindings.push_back(std::move(images));
         ShaderRecompiler::DescriptorBinding data{};
         data.kind = DescriptorKind::StorageBuffer;
@@ -12145,7 +12145,7 @@ void ResourceContentKeyTests(bool benchmark) {
         buffers.role = DescriptorRole::GuestBuffers;
         buffers.count = 1;
         buffers.guestDescriptor = {0x1000u, 0x10000u, 4u, 0x1234u};
-        buffers.bufferWritten = {false};
+        buffers.traits.Mutable().bufferWritten = {false};
         program.bindings.push_back(std::move(buffers));
         const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         for (const bool dataWords : {false, true}) for (const bool movable : {false, true}) {
@@ -12156,21 +12156,21 @@ void ResourceContentKeyTests(bool benchmark) {
             program.bindings[2].guestDescriptor[0] += 0x1000u;
             Require((ShaderResources::ContentKey(shader, dataWords, movable) != original) == !movable, "content key changed its movable-buffer policy");
             program.bindings[2].guestDescriptor[0] -= 0x1000u;
-            program.bindings[2].bufferWritten[0] = true;
+            program.bindings[2].traits.Mutable().bufferWritten[0] = true;
             Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the written-buffer mask");
-            program.bindings[2].bufferWritten[0] = false;
+            program.bindings[2].traits.Mutable().bufferWritten[0] = false;
             if (count != 0) {
-                for (auto* bits : {&program.bindings[0].imageWritten, &program.bindings[0].samplerDepthCompare, &program.bindings[0].imageDepthCompare, &program.bindings[0].imageAtomic, &program.bindings[0].samplerUnnormalized, &program.bindings[0].samplerIntegerBorder, &program.bindings[0].imageUnnormalized, &program.bindings[0].imageUnnormalizedBaseLevel}) {
+                for (auto* bits : {&program.bindings[0].traits->imageWritten, &program.bindings[0].traits->samplerDepthCompare, &program.bindings[0].traits->imageDepthCompare, &program.bindings[0].traits->imageAtomic, &program.bindings[0].traits->samplerUnnormalized, &program.bindings[0].traits->samplerIntegerBorder, &program.bindings[0].traits->imageUnnormalized, &program.bindings[0].traits->imageUnnormalizedBaseLevel}) {
                     bits->back().flip();
                     Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last packed flag");
                     bits->back().flip();
                 }
-                ++program.bindings[0].imageSamplers.back();
+                ++program.bindings[0].traits->imageSamplers.back();
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last sampler association");
-                --program.bindings[0].imageSamplers.back();
-                program.bindings[0].imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image3D;
+                --program.bindings[0].traits->imageSamplers.back();
+                program.bindings[0].traits->imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image3D;
                 Require(ShaderResources::ContentKey(shader, dataWords, movable) != original, "content key ignored the last image shape");
-                program.bindings[0].imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
+                program.bindings[0].traits->imageShapes.back() = ShaderRecompiler::DescriptorImageShape::Image2D;
             }
             Require(original.capacity() == original.size(), "content key reserved a different word count than it serialized");
             std::uint64_t hash = 14695981039346656037ull;

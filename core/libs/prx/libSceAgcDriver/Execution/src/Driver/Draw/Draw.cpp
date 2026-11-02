@@ -226,12 +226,12 @@ std::optional<HeldReason> writesBeyondTargets(const ShaderRecompiler::RecompileR
         if (binding.role == Role::BdaPagetable && Graphics::ShaderStoresThroughAddresses(compiled.spirv)) return HeldReason::Bda;
         if (binding.role == Role::GuestBuffers) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
-                if (element >= binding.bufferWritten.size() || binding.bufferWritten[element]) return HeldReason::Buffer;
+                if (element >= binding.traits->bufferWritten.size() || binding.traits->bufferWritten[element]) return HeldReason::Buffer;
             }
         }
         if (binding.role == Role::GuestImages && binding.kind == ShaderRecompiler::DescriptorKind::StorageImage) {
             for (std::uint32_t element = 0; element < binding.count; ++element) {
-                if (element >= binding.imageWritten.size() || binding.imageWritten[element]) return HeldReason::Storage;
+                if (element >= binding.traits->imageWritten.size() || binding.traits->imageWritten[element]) return HeldReason::Storage;
             }
         }
     }

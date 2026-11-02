@@ -64,9 +64,9 @@ std::shared_ptr<DispatchVariant> Variant(std::shared_ptr<const RecompileResult> 
 
 ShaderRecompiler::DescriptorBinding GuestBuffer(std::vector<std::uint32_t> descriptor, bool written) {
     ShaderRecompiler::DescriptorBinding binding{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::GuestBuffers, 0, 0, 1, std::move(descriptor)};
-    binding.bufferWritten = {written};
-    binding.bufferAtomic = {false};
-    binding.bufferRead = {true};
+    binding.traits.Mutable().bufferWritten = {written};
+    binding.traits.Mutable().bufferAtomic = {false};
+    binding.traits.Mutable().bufferRead = {true};
     return binding;
 }
 

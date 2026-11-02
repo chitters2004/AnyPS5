@@ -521,15 +521,7 @@ enum class DescriptorRole {
     ImageStorageTable
 };
 
-struct DescriptorBinding {
-    DescriptorKind kind;
-    DescriptorRole role;
-    std::uint32_t descriptorSet;
-    std::uint32_t binding;
-    std::uint32_t count;
-    std::vector<std::uint32_t> guestDescriptor;
-    bool readOnly = false;
-    std::optional<DescriptorImageShape> imageShape;
+struct DescriptorElementTraits {
     std::vector<bool> samplerDepthCompare;
     // Guest image elements the shader stores to (or updates atomically); the others are only read.
     std::vector<bool> imageWritten;
@@ -555,6 +547,43 @@ struct DescriptorBinding {
     std::vector<std::uint32_t> imageSamplers;
     std::vector<bool> bufferRead;
     std::vector<std::uint32_t> bufferExtent;
+    bool operator==(const DescriptorElementTraits&) const = default;
+};
+
+class SharedElementTraits {
+public:
+    SharedElementTraits() = default;
+    SharedElementTraits(DescriptorElementTraits traits) : holder(std::make_shared<DescriptorElementTraits>(std::move(traits))) {}
+
+    [[nodiscard]] const DescriptorElementTraits& operator*() const { return holder != nullptr ? *holder : Empty(); }
+    [[nodiscard]] const DescriptorElementTraits* operator->() const { return &**this; }
+    [[nodiscard]] DescriptorElementTraits& Mutable() {
+        if (holder == nullptr) holder = std::make_shared<DescriptorElementTraits>();
+        else if (holder.use_count() != 1) holder = std::make_shared<DescriptorElementTraits>(*holder);
+        return *holder;
+    }
+    [[nodiscard]] bool Shares(const SharedElementTraits& other) const { return holder != nullptr && holder == other.holder; }
+    [[nodiscard]] const void* Identity() const { return holder.get(); }
+    friend bool operator==(const SharedElementTraits& left, const SharedElementTraits& right) { return left.holder == right.holder || *left == *right; }
+
+private:
+    static const DescriptorElementTraits& Empty() {
+        static const DescriptorElementTraits empty;
+        return empty;
+    }
+    std::shared_ptr<DescriptorElementTraits> holder;
+};
+
+struct DescriptorBinding {
+    DescriptorKind kind;
+    DescriptorRole role;
+    std::uint32_t descriptorSet;
+    std::uint32_t binding;
+    std::uint32_t count;
+    std::vector<std::uint32_t> guestDescriptor;
+    bool readOnly = false;
+    std::optional<DescriptorImageShape> imageShape;
+    SharedElementTraits traits;
 };
 
 struct ImageTableEntryPoison {

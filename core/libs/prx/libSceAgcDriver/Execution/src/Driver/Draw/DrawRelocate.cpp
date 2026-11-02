@@ -123,7 +123,7 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
         }
         const auto& target = compiled.bindings[binding];
         const auto element = word / 4u;
-        const bool readOnly = target.role == ShaderRecompiler::DescriptorRole::GuestBuffers && target.guestDescriptor.size() == static_cast<std::size_t>(target.count) * 4u && word % 4u == 0 && element < target.bufferWritten.size() && !target.bufferWritten[element] && (element >= target.bufferAtomic.size() || !target.bufferAtomic[element]);
+        const bool readOnly = target.role == ShaderRecompiler::DescriptorRole::GuestBuffers && target.guestDescriptor.size() == static_cast<std::size_t>(target.count) * 4u && word % 4u == 0 && element < target.traits->bufferWritten.size() && !target.traits->bufferWritten[element] && (element >= target.traits->bufferAtomic.size() || !target.traits->bufferAtomic[element]);
         if (!readOnly || target.guestDescriptor[word + 1] != program.userData[index + 1] || target.guestDescriptor[word + 2] != program.userData[index + 2] || readThrough(target.guestDescriptor.data() + word)) continue;
         variant.valueWords |= std::uint64_t {1} << index;
         variant.valueSlots.push_back({index, binding, word});

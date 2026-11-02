@@ -145,7 +145,7 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.traits->samplerDepthCompare == right.traits->samplerDepthCompare && left.traits->imageWritten == right.traits->imageWritten && left.traits->imageDepthCompare == right.traits->imageDepthCompare && left.traits->imageAtomic == right.traits->imageAtomic && left.traits->imageShapes == right.traits->imageShapes && left.traits->bufferAtomic == right.traits->bufferAtomic && left.traits->bufferWritten == right.traits->bufferWritten && left.traits->bufferRead == right.traits->bufferRead && left.traits->bufferExtent == right.traits->bufferExtent && left.traits->samplerUnnormalized == right.traits->samplerUnnormalized && left.traits->samplerIntegerBorder == right.traits->samplerIntegerBorder && left.traits->samplerCoordinatesIgnored == right.traits->samplerCoordinatesIgnored && left.traits->imageUnnormalized == right.traits->imageUnnormalized && left.traits->imageUnnormalizedBaseLevel == right.traits->imageUnnormalizedBaseLevel && left.traits->imageSamplers == right.traits->imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -233,21 +233,21 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.guestDescriptor = {0x11111111u * seed, 0xdeadbeefu, 0x80000000u, 7u, 0u, 0xffffffffu, 42u, seed};
     binding.readOnly = seed % 2 == 0;
     binding.imageShape = DescriptorImageShape::Image2DArray;
-    binding.samplerDepthCompare = {true, false, true};
-    binding.imageDepthCompare = {false, true, false};
-    binding.imageWritten = {false, true, true};
-    binding.imageAtomic = {false, true, false};
-    binding.imageShapes = {DescriptorImageShape::Image2D, DescriptorImageShape::Image3D};
-    binding.bufferAtomic = {true};
-    binding.bufferWritten = {false, false, true, true, false};
-    binding.samplerUnnormalized = {false, true, true};
-    binding.samplerIntegerBorder = {true, false, seed % 2 == 1};
-    binding.samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
-    binding.imageUnnormalized = {true, false, seed % 2 == 0};
-    binding.imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
-    binding.imageSamplers = {0x5u, 0u, 0x80000000u};
-    binding.bufferRead = {true, false, false, true, true, false};
-    binding.bufferExtent = {32, 0, 16, 4096, 8, 0};
+    binding.traits.Mutable().samplerDepthCompare = {true, false, true};
+    binding.traits.Mutable().imageDepthCompare = {false, true, false};
+    binding.traits.Mutable().imageWritten = {false, true, true};
+    binding.traits.Mutable().imageAtomic = {false, true, false};
+    binding.traits.Mutable().imageShapes = {DescriptorImageShape::Image2D, DescriptorImageShape::Image3D};
+    binding.traits.Mutable().bufferAtomic = {true};
+    binding.traits.Mutable().bufferWritten = {false, false, true, true, false};
+    binding.traits.Mutable().samplerUnnormalized = {false, true, true};
+    binding.traits.Mutable().samplerIntegerBorder = {true, false, seed % 2 == 1};
+    binding.traits.Mutable().samplerCoordinatesIgnored = {false, seed % 2 == 0, true};
+    binding.traits.Mutable().imageUnnormalized = {true, false, seed % 2 == 0};
+    binding.traits.Mutable().imageUnnormalizedBaseLevel = {false, true, seed % 3 == 0};
+    binding.traits.Mutable().imageSamplers = {0x5u, 0u, 0x80000000u};
+    binding.traits.Mutable().bufferRead = {true, false, false, true, true, false};
+    binding.traits.Mutable().bufferExtent = {32, 0, 16, 4096, 8, 0};
     return binding;
 }
 
@@ -1474,7 +1474,7 @@ void verifyBindingPlanSelection() {
     BindingAllocationResult full;
     builder.Populate(full, compiled, plan, 0u, snapshot, {});
     require(full.bindings.size() == 4u, "binding plan lost a descriptor before module selection");
-    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false} && full.bindings[0].bufferRead == std::vector<bool>{false, true}, "binding plan lost buffer access metadata");
+    require(full.bindings[0].traits->bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].traits->bufferWritten == std::vector<bool>{true, false} && full.bindings[0].traits->bufferRead == std::vector<bool>{false, true}, "binding plan lost buffer access metadata");
     const std::array liveBindings{full.bindings[0].binding, full.bindings[0].binding, full.bindings[3].binding};
     const auto selected = builder.Select(plan, liveBindings);
     snapshot.userData.clear();

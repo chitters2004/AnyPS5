@@ -58,7 +58,7 @@ int main() {
             const auto words = ImageWords(base, 256, 128);
             images.guestDescriptor.insert(images.guestDescriptor.end(), words.begin(), words.end());
         }
-        images.imageWritten = {true, false};
+        images.traits.Mutable().imageWritten = {true, false};
         program.bindings.push_back(images);
         const std::array<AgcDriver::Graphics::CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::Fragment, &program, 0}}};
         AgcDriver::Graphics::State state{};
@@ -70,13 +70,13 @@ int main() {
             Require(Contains(ranges, written, written + surfaceBytes), "a storage image the draw stores to is not a write range");
             Require(!Touches(ranges, readOnly, readOnly + surfaceBytes), "a storage image the draw only reads is a write range");
         }
-        program.bindings[0].imageWritten.clear();
+        program.bindings[0].traits.Mutable().imageWritten.clear();
         Require(Contains(DrawWriteRanges(state, stages, true), readOnly, readOnly + surfaceBytes), "an image without written flags is not a write range");
         auto nullImage = ImageWords(0, 256, 128);
         nullImage[0] = 0;
         nullImage[1] &= ~0xffu;
         std::copy(nullImage.begin(), nullImage.end(), program.bindings[0].guestDescriptor.begin() + 8);
-        program.bindings[0].imageWritten = {true, true};
+        program.bindings[0].traits.Mutable().imageWritten = {true, true};
         for (const bool exact : {false, true}) {
             const auto ranges = DrawWriteRanges(state, stages, exact);
             Require(Contains(ranges, written, written + surfaceBytes), "a written image next to a null one is not a write range");

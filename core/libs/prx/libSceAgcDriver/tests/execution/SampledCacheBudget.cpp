@@ -410,8 +410,8 @@ std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Bl
     binding.binding = (sampled ? ShaderRecompiler::RuntimeAbi::FirstImageBinding : ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding) + PlaceholderDimensionsPerClass + 2u;
     binding.count = count;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(count, false);
-    binding.imageSamplers.assign(count, 0u);
+    binding.traits.Mutable().imageWritten.assign(count, false);
+    binding.traits.Mutable().imageSamplers.assign(count, 0u);
     for (std::uint32_t element = 0; element < count; ++element) {
         const auto words = Descriptor(block.Surface(first + element));
         binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
@@ -592,8 +592,8 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstImageBinding + PlaceholderDimensionsPerClass + 2u;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(1, false);
-    binding.imageSamplers.assign(1, 0u);
+    binding.traits.Mutable().imageWritten.assign(1, false);
+    binding.traits.Mutable().imageSamplers.assign(1, 0u);
     const auto words = Descriptor(address);
     binding.guestDescriptor.assign(words.begin(), words.end());
     ShaderRecompiler::RecompileResult program;
@@ -1231,8 +1231,8 @@ ShaderRecompiler::RecompileResult StorageProgram(std::uint64_t address) {
     binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten.assign(1, false);
-    binding.imageSamplers.assign(1, 0u);
+    binding.traits.Mutable().imageWritten.assign(1, false);
+    binding.traits.Mutable().imageSamplers.assign(1, 0u);
     const auto words = Descriptor(address);
     binding.guestDescriptor.assign(words.begin(), words.end());
     ShaderRecompiler::RecompileResult program;

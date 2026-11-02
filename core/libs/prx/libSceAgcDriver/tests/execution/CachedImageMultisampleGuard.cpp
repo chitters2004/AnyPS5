@@ -115,8 +115,8 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     binding.binding = (sampled ? ShaderRecompiler::RuntimeAbi::FirstImageBinding : ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding) + PlaceholderDimensionsPerClass + 2u;
     binding.count = 1;
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
-    binding.imageWritten = {false};
-    binding.imageSamplers = {0u};
+    binding.traits.Mutable().imageWritten = {false};
+    binding.traits.Mutable().imageSamplers = {0u};
     binding.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (20u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
     ShaderRecompiler::RecompileResult vertex;
     ShaderRecompiler::RecompileResult program;
@@ -205,10 +205,10 @@ void CheckMultisampleTable(AgcDriver::VulkanDevice& device) {
     image.role = ShaderRecompiler::DescriptorRole::ImageTable;
     image.binding = ShaderRecompiler::RuntimeAbi::ImageTableBinding;
     image.count = 1;
-    image.imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2DMultisample};
-    image.imageDepthCompare = {false};
-    image.imageWritten = {false};
-    image.imageSamplers = {0u};
+    image.traits.Mutable().imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2DMultisample};
+    image.traits.Mutable().imageDepthCompare = {false};
+    image.traits.Mutable().imageWritten = {false};
+    image.traits.Mutable().imageSamplers = {0u};
     const auto address = block.Address();
     image.guestDescriptor = {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((Side - 1u) & 3u) << 30u), ((Side - 1u) >> 2u) | ((Side - 1u) << 14u), 0xfacu | (2u << 16u) | (0x1bu << 20u) | (14u << 28u), 0u, 2u << 4u, 0u, 0u};
     program.bindings.push_back(image);
