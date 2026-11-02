@@ -400,6 +400,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         if (page.wordwise && (policy == PendingWrite::Raw || policy == PendingWrite::KnownValue || (forcedRaw && !waited))) page.raw.Set(index);
         else page.raw.Clear(index);
     }
+    if (self.journaling) {
+        const auto fresh = (page.read.Test(index) ? 0u : 1u << 31u) | (page.recent.Test(index) ? 0u : 1u << 30u);
+        if (fresh != 0u) self.journalWords.emplace_back(&page, static_cast<std::uint32_t>(index) | fresh);
+    }
     page.read.Set(index);
     page.recent.Set(index);
     *value = page.words[index];
@@ -750,6 +754,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
     runtime.descriptorScope = &descriptorScope;
+    runtime.readJournal = &journal;
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
@@ -847,6 +852,20 @@ std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnl
     }
     emitBefore(std::numeric_limits<std::uint64_t>::max());
     return result;
+}
+
+void ShaderMemory::journal(void* context, ShaderRecompiler::SrtReadJournalOp op) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    using Op = ShaderRecompiler::SrtReadJournalOp;
+    if (op == Op::Rollback) {
+        for (const auto& [page, entry] : self.journalWords) {
+            const auto index = static_cast<std::size_t>(entry & 0x3fffffffu);
+            if ((entry & (1u << 31u)) != 0u) page->read.Clear(index);
+            if ((entry & (1u << 30u)) != 0u) page->recent.Clear(index);
+        }
+    }
+    self.journalWords.clear();
+    self.journaling = op == Op::Begin;
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::Regions() const {

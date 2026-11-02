@@ -252,6 +252,7 @@ struct IrResourcePlan {
     std::vector<std::uint8_t> pureFlatSlots;
     std::vector<std::uint8_t> slotRoles;
     std::vector<std::uint32_t> sourceDwordSlots;
+    bool replayEligible = false;
     bool denseValueIds = false;
     CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;

@@ -418,7 +418,7 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::vector<std::uint32_t> code;
     std::vector<std::uint32_t> linkedCallFallbacks;
     std::shared_ptr<const IrResourcePlan> plan;
-    std::shared_ptr<const ResourceCapture> replayFrom;
+    std::shared_ptr<const struct CaptureReplayBase> replayFrom;
     bool runtimeCaptured = false;
     // A plan build that threw (an unsupported resource chain or control flow) is remembered and
     // rethrown: the front end ran every pass before failing, ~13 ms per dispatch of a shader the
@@ -2182,6 +2182,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(Reco
     return PreparedShaderInvocation(std::move(request), handle);
 }
 
+struct CaptureReplayBase {
+    std::shared_ptr<const IrResourcePlan> plan;
+    std::shared_ptr<const SrtCaptureRecipe> recipe;
+    SrtUserDataUse userDataUse;
+    SrtReadTrace readTrace;
+};
+
 enum class CaptureReplayMode { Off, On, Shadow };
 
 CaptureReplayMode captureReplayMode() {
@@ -2261,7 +2268,21 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
         counters.outcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
         reportCaptureReplay();
     };
-    std::shared_ptr<const ResourceCapture> previous;
+    if (!capture->plan->replayEligible) {
+        count(SrtReplayRefusal::Ineligible);
+        materializeCapture(*capture, runtime);
+        return capture;
+    }
+    const auto remember = [&] {
+        auto base = std::make_shared<CaptureReplayBase>();
+        base->plan = capture->plan;
+        base->recipe = capture->recipe;
+        base->userDataUse = capture->userDataUse;
+        base->readTrace = capture->readTrace;
+        std::lock_guard lock(handle->source->mutex);
+        handle->source->replayFrom = std::move(base);
+    };
+    std::shared_ptr<const CaptureReplayBase> previous;
     {
         std::lock_guard lock(handle->source->mutex);
         previous = handle->source->replayFrom;
@@ -2284,8 +2305,7 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
                     throw std::runtime_error(std::string("ShaderRecompiler: a replayed capture differs from a full capture in its ") + difference);
                 }
             }
-            std::lock_guard lock(handle->source->mutex);
-            handle->source->replayFrom = capture;
+            remember();
             return capture;
         }
         capture->snapshot = ResourceSnapshot{};
@@ -2296,8 +2316,7 @@ std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const S
     materializeCapture(*capture, runtime, recipe.get());
     if (recipe->valid) {
         capture->recipe = std::move(recipe);
-        std::lock_guard lock(handle->source->mutex);
-        handle->source->replayFrom = capture;
+        remember();
     }
     return capture;
 }

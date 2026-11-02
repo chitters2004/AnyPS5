@@ -79,6 +79,9 @@ struct SrtReadTrace {
 
 inline constexpr std::uint64_t SrtNoAddress = ~std::uint64_t{0};
 
+enum class SrtReadJournalOp { Begin, Commit, Rollback };
+using SrtReadJournal = void (*)(void* userData, SrtReadJournalOp op);
+
 struct SrtSlotReads {
     std::vector<std::uint64_t> addresses;
     std::vector<std::uint32_t> words;
@@ -101,6 +104,7 @@ struct SrtRuntime {
     SrtUserDataUse* userDataUse = nullptr;
     SrtDescriptorScope descriptorScope = nullptr;
     SrtSlotReads* slotReads = nullptr;
+    SrtReadJournal readJournal = nullptr;
 };
 
 struct SrtForceSyncScope {

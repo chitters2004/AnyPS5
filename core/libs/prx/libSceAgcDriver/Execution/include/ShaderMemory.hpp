@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_SHADERMEMORY_HPP
 
 #include "Recompiler.hpp"
+#include "Optimization/SrtWalker.hpp"
 #include <algorithm>
 #include <array>
 #include <bitset>
@@ -138,6 +139,7 @@ private:
     };
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
+    static void journal(void* context, ShaderRecompiler::SrtReadJournalOp op);
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
@@ -167,6 +169,8 @@ private:
     HookWaitCounter hookWaits = nullptr;
     PendingWriteQuery pendingSpan = nullptr;
     std::size_t descriptorSpanBytes = 0;
+    bool journaling = false;
+    std::vector<std::pair<Page*, std::uint32_t>> journalWords;
     std::uint64_t rawInvalidations = 0;
     std::uint32_t forceSync = 0;
 };

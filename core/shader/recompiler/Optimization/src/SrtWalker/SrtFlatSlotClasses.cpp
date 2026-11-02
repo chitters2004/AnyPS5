@@ -65,6 +65,7 @@ std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan) {
 void ComputeSlotRoles(IrResourcePlan& plan) {
     auto& roles = plan.slotRoles;
     auto& identities = plan.sourceDwordSlots;
+    plan.replayEligible = false;
     roles.assign(plan.srtReads.size(), 0u);
     identities.assign(plan.descriptorSources.size() * 8u, SrtSlotRole::NoSlot);
     bool disqualified = !plan.srtPlanComplete || plan.requiresSpecializationMemory || plan.uniformFill.fill.kind != UniformFillKind::None
@@ -83,6 +84,8 @@ void ComputeSlotRoles(IrResourcePlan& plan) {
         const IrValue* slot = value->Argument(1)->Resolve();
         return slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < roles.size() ? slot->ImmediateU32() : SrtSlotRole::NoSlot;
     };
+    bool unrecorded = false;
+    const auto memoryRead = [](const IrValue* value) { return value->Opcode() == IrOpcode::LoadAddressU32 || value->Opcode() == IrOpcode::ReadConstBuffer; };
     std::vector<IrValue*> pending;
     const auto mark = [&](IrValue* root, std::uint8_t role) {
         if (root == nullptr) return;
@@ -97,6 +100,7 @@ void ComputeSlotRoles(IrResourcePlan& plan) {
                 pending.push_back(plan.srtReads[slot].value);
             }
             if (const auto found = readSlots.find(value); found != readSlots.end()) roles[found->second] |= role;
+            else if (memoryRead(value)) unrecorded = true;
             for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
                 if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
             }
@@ -123,8 +127,14 @@ void ComputeSlotRoles(IrResourcePlan& plan) {
     for (const auto& block : plan.controlFlow) mark(block.condition, SrtSlotRole::Selector);
     for (const auto& read : plan.srtReads) {
         IrValue* raw = read.value->Resolve();
+        if (!memoryRead(raw)) unrecorded = true;
         for (std::size_t i = 0; i < raw->ArgumentCount(); ++i) mark(raw->Argument(i), SrtSlotRole::Address);
     }
+    if (unrecorded) {
+        std::fill(roles.begin(), roles.end(), SrtSlotRole::Fixed);
+        return;
+    }
+    plan.replayEligible = !roles.empty() && std::any_of(roles.begin(), roles.end(), [](std::uint8_t role) { return (role & ~SrtSlotRole::Descriptor) == 0u; });
 }
 
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan) {

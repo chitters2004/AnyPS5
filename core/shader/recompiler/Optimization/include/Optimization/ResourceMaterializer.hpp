@@ -80,6 +80,7 @@ struct SrtCaptureRecipe {
 enum class SrtReplayRefusal : std::uint8_t {
     None,
     NoRecipe,
+    Ineligible,
     UserData,
     Unmapped,
     ReadFailed,

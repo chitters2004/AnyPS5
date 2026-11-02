@@ -2642,6 +2642,7 @@ const char* SrtReplayRefusalName(SrtReplayRefusal refusal) {
     switch (refusal) {
     case SrtReplayRefusal::None: return "replayed";
     case SrtReplayRefusal::NoRecipe: return "no recipe";
+    case SrtReplayRefusal::Ineligible: return "ineligible plan";
     case SrtReplayRefusal::UserData: return "user data";
     case SrtReplayRefusal::Unmapped: return "unmapped";
     case SrtReplayRefusal::ReadFailed: return "read failed";
@@ -2660,19 +2661,36 @@ const char* SrtReplayRefusalName(SrtReplayRefusal refusal) {
 
 SrtReplayRefusal ResourceMaterializer::Replay(const IrResourcePlan& plan, const SrtRuntime& runtime, const SrtCaptureRecipe& recipe, ResourceSnapshot& snapshot, SrtCaptureRecipe& next) const {
     const auto slots = plan.srtReads.size();
+    if (!plan.replayEligible) return SrtReplayRefusal::Ineligible;
     if (!recipe.valid || recipe.plan != &plan || recipe.shaderBase != runtime.shaderBase || plan.slotRoles.size() != slots || recipe.reads.addresses.size() != slots || recipe.flattened.size() != slots) return SrtReplayRefusal::NoRecipe;
     if (runtime.userData.size() < plan.userDataCount || !std::equal(recipe.userData.begin(), recipe.userData.end(), runtime.userData.begin())) return SrtReplayRefusal::UserData;
     if (runtime.readMemory == nullptr) return SrtReplayRefusal::NoRecipe;
     const auto invalidationsBefore = runtime.descriptorScope != nullptr ? runtime.descriptorScope(runtime.userContext, 0u) : 0u;
+    struct Journal {
+        const SrtRuntime& runtime;
+        bool committed = false;
+        explicit Journal(const SrtRuntime& runtime) : runtime(runtime) {
+            if (runtime.readJournal != nullptr) runtime.readJournal(runtime.userContext, SrtReadJournalOp::Begin);
+        }
+        ~Journal() {
+            if (runtime.readJournal != nullptr) runtime.readJournal(runtime.userContext, committed ? SrtReadJournalOp::Commit : SrtReadJournalOp::Rollback);
+        }
+    } journal(runtime);
     next = recipe;
-    for (std::size_t slot = 0; slot < slots; ++slot) {
+    struct ReadStorage {};
+    auto& read = HostThreadLocal<std::vector<std::uint8_t>, ReadStorage>();
+    read.assign(slots, 0u);
+    const auto load = [&](std::size_t slot, std::size_t span) {
         const auto address = recipe.reads.addresses[slot];
-        if (address == SrtNoAddress) continue;
         if (runtime.accessible != nullptr && !runtime.accessible(runtime.userContext, address, sizeof(std::uint32_t))) return SrtReplayRefusal::Unmapped;
         const bool clean = slot < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[slot] != 0u;
         const auto reader = clean && runtime.readSpecializationMemory != nullptr ? runtime.readSpecializationMemory : runtime.readMemory;
+        const bool scoped = span != 0u && runtime.descriptorScope != nullptr;
+        if (scoped) static_cast<void>(runtime.descriptorScope(runtime.userContext, span));
         std::uint32_t word = 0;
-        if (!reader(runtime.userContext, address, &word)) return SrtReplayRefusal::ReadFailed;
+        const bool ok = reader(runtime.userContext, address, &word);
+        if (scoped) static_cast<void>(runtime.descriptorScope(runtime.userContext, 0u));
+        if (!ok) return SrtReplayRefusal::ReadFailed;
         if (word != recipe.reads.words[slot]) {
             const auto roles = plan.slotRoles[slot];
             if ((roles & SrtSlotRole::Fixed) != 0u) return SrtReplayRefusal::Fixed;
@@ -2683,7 +2701,9 @@ SrtReplayRefusal ResourceMaterializer::Replay(const IrResourcePlan& plan, const 
         }
         next.reads.words[slot] = word;
         if (recipe.reads.active[slot] != 0u) next.flattened[slot] = word;
-    }
+        read[slot] = 1u;
+        return SrtReplayRefusal::None;
+    };
     for (std::size_t position = 0; position < plan.materializationSources.size() && position < next.values.size(); ++position) {
         const auto source = plan.materializationSources[position];
         if (source >= recipe.activeSources.size() || recipe.activeSources[source] == 0u) continue;
@@ -2692,8 +2712,16 @@ SrtReplayRefusal ResourceMaterializer::Replay(const IrResourcePlan& plan, const 
             const auto slot = plan.sourceDwordSlots.at(source * 8u + dword);
             if (slot == SrtSlotRole::NoSlot) continue;
             if (recipe.reads.addresses[slot] == SrtNoAddress) return SrtReplayRefusal::Inactive;
+            if (read[slot] == 0u) {
+                const auto span = value.dwordCount > 1u ? static_cast<std::size_t>(value.dwordCount - dword) * sizeof(std::uint32_t) : 0u;
+                if (const auto refusal = load(slot, span); refusal != SrtReplayRefusal::None) return refusal;
+            }
             value.dwords[dword] = next.reads.words[slot];
         }
+    }
+    for (std::size_t slot = 0; slot < slots; ++slot) {
+        if (recipe.reads.addresses[slot] == SrtNoAddress || read[slot] != 0u) continue;
+        if (const auto refusal = load(slot, 0u); refusal != SrtReplayRefusal::None) return refusal;
     }
     try {
         ResourceSnapshot replayed;
@@ -2708,6 +2736,7 @@ SrtReplayRefusal ResourceMaterializer::Replay(const IrResourcePlan& plan, const 
         return SrtReplayRefusal::Rejected;
     }
     if (runtime.descriptorScope != nullptr && runtime.descriptorScope(runtime.userContext, 0u) != invalidationsBefore) return SrtReplayRefusal::Invalidated;
+    journal.committed = true;
     return SrtReplayRefusal::None;
 }
 

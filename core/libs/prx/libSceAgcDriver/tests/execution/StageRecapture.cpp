@@ -17,6 +17,7 @@
 #include <cstdio>
 #include <iostream>
 #include <memory>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -54,6 +55,23 @@ SpirvTarget Target() {
     return target;
 }
 
+std::vector<std::pair<std::uint64_t, std::size_t>>& RecordedQueries() {
+    static std::vector<std::pair<std::uint64_t, std::size_t>> queries;
+    return queries;
+}
+
+AgcDriver::ShaderMemory::PendingWrite RecordQuery(std::uint64_t address, std::size_t bytes, std::span<std::byte>) {
+    if (bytes >= 4096u) return AgcDriver::ShaderMemory::PendingWrite::Sync;
+    RecordedQueries().emplace_back(address, bytes);
+    return AgcDriver::ShaderMemory::PendingWrite::Raw;
+}
+
+std::set<std::pair<std::uint64_t, std::size_t>> TakeQueries() {
+    std::set<std::pair<std::uint64_t, std::size_t>> queries(RecordedQueries().begin(), RecordedQueries().end());
+    RecordedQueries().clear();
+    return queries;
+}
+
 struct PixelStage {
     ShaderSnapshot snapshot;
     std::vector<std::uint32_t> users;
@@ -79,6 +97,42 @@ struct PixelStage {
         auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
         const auto capture = AgcDriver::DriverDetail::CaptureInvocation(draw, snapshot, 0, request, invocation);
         return invocation.Materialize(*capture);
+    }
+
+    struct Drawn {
+        std::shared_ptr<const RecompileResult> result;
+        std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
+    };
+
+    static std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> Copied(const AgcDriver::ShaderMemory& memory) {
+        std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> copied;
+        for (const auto& region : memory.Regions()) copied.emplace_back(region.guestAddress, std::vector<std::byte>(region.bytes.begin(), region.bytes.end()));
+        std::ranges::sort(copied);
+        return copied;
+    }
+
+    bool queried = false;
+
+    Drawn Traced() {
+        AgcDriver::ShaderMemory draw({}, queried ? &RecordQuery : nullptr);
+        auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+        const auto capture = AgcDriver::DriverDetail::CaptureInvocation(draw, snapshot, 0, request, invocation);
+        auto result = invocation.Materialize(*capture);
+        return {std::move(result), Copied(draw)};
+    }
+
+    Drawn Oracle() {
+        const auto invocation = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+        std::shared_ptr<const SourceHandle> handle;
+        for (const auto& entry : snapshot.prepared->entries) {
+            if (GetPreparedCode(*entry.handle).data() == invocation.Request().shader.code.data()) handle = entry.handle;
+        }
+        Require(handle != nullptr, "the oracle found no prepared artifact for the invocation");
+        auto full = invocation.Request();
+        full.useCache = false;
+        AgcDriver::ShaderMemory independent({}, queried ? &RecordQuery : nullptr);
+        const auto capture = independent.Capture(full, handle.get());
+        return {MaterializeShader(full, *capture, *handle), Copied(independent)};
     }
 
     std::shared_ptr<const RecompileResult> CurrentUncached() {
@@ -637,6 +691,8 @@ void CheckImageMasking(bool registration, std::uint64_t address);
 void CheckCaptureReplay();
 void CheckReplayPointerSwap();
 void CheckReplayComputedDescriptor();
+void CheckReplayOracle();
+void CheckReplaySpanQueries();
 
 struct Spread {
     double median;
@@ -912,6 +968,129 @@ void CheckReplayComputedDescriptor() {
     if (replaying) Require(after.Since(before, SrtReplayRefusal::Computed) == 1u, "a changed word that a descriptor computes from was not refused as computed");
 }
 
+bool ReplayMode() {
+    const char* mode = std::getenv("APS5_CAPTURE_REPLAY");
+    return mode != nullptr && *mode != '\0' && std::string_view(mode) != "0";
+}
+
+void ExpectOracle(PixelStage& stage, const std::string& what, SrtReplayRefusal expected) {
+    const auto before = ReplayCounts::Now();
+    const auto drawn = stage.Traced();
+    const auto after = ReplayCounts::Now();
+    const auto oracle = stage.Oracle();
+    RequireSameResult(*drawn.result, *oracle.result, what);
+    Require(BufferWords(*drawn.result) == BufferWords(*oracle.result) && ImageWords(*drawn.result) == ImageWords(*oracle.result), what + ": the descriptors differ from an independent full capture");
+    Require(drawn.regions == oracle.regions, what + ": the draw read other memory than an independent full capture");
+    if (ReplayMode()) Require(after.Since(before, expected) == 1u, what + ": the capture was not " + SrtReplayRefusalName(expected));
+}
+
+void CheckReplaySpanQueries() {
+    static DescriptorTable table;
+    const auto code = DescriptorPixelCode();
+    PixelStage stage(code, PointerWords(table.words.data()), 0x310000u);
+    stage.queried = true;
+    for (std::uint32_t round = 0; round < 3u; ++round) {
+        table.MoveBuffer(round % DescriptorTable::Buffers, 0x60000000u + round * 0x100u);
+        table.MoveImage(round + 20u);
+        static_cast<void>(TakeQueries());
+        const auto before = ReplayCounts::Now();
+        const auto drawn = stage.Traced();
+        const auto replayed = ReplayCounts::Now().Since(before, SrtReplayRefusal::None);
+        const auto drawnQueries = TakeQueries();
+        const auto oracle = stage.Oracle();
+        const auto oracleQueries = TakeQueries();
+        const auto what = "pending-write queries of draw " + std::to_string(round);
+        RequireSameResult(*drawn.result, *oracle.result, what);
+        Require(drawn.regions == oracle.regions, what + ": the draw read other memory than an independent full capture");
+        Require(!oracleQueries.empty() && std::ranges::any_of(oracleQueries, [](const auto& query) { return query.second > 4u; }), what + ": the full capture made no descriptor span query, so the fixture does not test span sync");
+        Require(drawnQueries == oracleQueries, what + ": the draw asked for other pending-write spans than an independent full capture");
+        if (ReplayMode() && round > 0u) Require(replayed == 1u, what + ": the draw was not replayed");
+    }
+}
+
+void CheckReplayOracle() {
+    {
+        static DescriptorTable table;
+        const auto code = DescriptorPixelCode();
+        PixelStage stage(code, PointerWords(table.words.data()), 0x2c0000u);
+        ExpectOracle(stage, "the first oracle draw", SrtReplayRefusal::NoRecipe);
+        table.MoveBuffer(5u, 0x50000000u);
+        ExpectOracle(stage, "a moved buffer against the oracle", SrtReplayRefusal::None);
+        table.MoveImage(11u);
+        ExpectOracle(stage, "a moved image against the oracle", SrtReplayRefusal::None);
+    }
+    {
+        alignas(64) static std::array<std::uint32_t, 4> first{0x11000000u, 0u, 0x40u, 0x00027facu};
+        alignas(64) static std::array<std::uint32_t, 4> second{0x22000000u, 0u, 0x40u, 0x00027facu};
+        alignas(64) static std::array<std::uint32_t, 2> root{};
+        const auto point = [&](const std::array<std::uint32_t, 4>& table) {
+            const auto words = PointerWords(table.data());
+            root = {words[0], words[1]};
+        };
+        point(first);
+        const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xbf8cc07fu, 0xf4080101u, 0xfa000000u, 0xbf8cc07fu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
+        PixelStage stage(code, PointerWords(root.data()), 0x2d0000u);
+        ExpectOracle(stage, "the first pointer draw", SrtReplayRefusal::NoRecipe);
+        first[0] = 0x11000400u;
+        ExpectOracle(stage, "a pointee whose buffer moved", SrtReplayRefusal::None);
+        point(second);
+        ExpectOracle(stage, "a pointer moved to a table of the same layout", SrtReplayRefusal::Address);
+        second[0] = 0x22000400u;
+        ExpectOracle(stage, "the new pointee's buffer moved", SrtReplayRefusal::None);
+    }
+    {
+        alignas(64) static std::array<std::uint32_t, 8> table{0u, 0u, 0u, 0u, 0x33000000u, 0u, 0x40u, 0x00027facu};
+        const std::vector<std::uint32_t> code{0xf4080100u, 0x04000000u, 0xbf8cc07fu, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
+        auto users = PointerWords(table.data());
+        users.push_back(16u);
+        PixelStage stage(code, users, 0x2e0000u);
+        ExpectOracle(stage, "the first runtime-offset draw", SrtReplayRefusal::Ineligible);
+        table[4] = 0x33000400u;
+        ExpectOracle(stage, "a buffer moved behind a runtime offset", SrtReplayRefusal::Ineligible);
+    }
+    {
+        alignas(64) static std::array<std::uint32_t, 8> table{0x66000000u, 0u, 0x40u, 0x00027facu, 0x77000000u, 0u, 0x40u, 0x00027facu};
+        const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xf4080200u, 0x04000000u, 0xbf8cc07fu, 0xf4200302u, 0xfa000000u, 0xf4200344u, 0xfa000000u, 0xbf8cc07fu,
+            0x7e00020cu, 0x7e02020du, 0xf800180fu, 0x01010100u, 0xbf810000u};
+        auto users = PointerWords(table.data());
+        users.push_back(16u);
+        PixelStage stage(code, users, 0x320000u);
+        ExpectOracle(stage, "the first draw with a static and a runtime-offset descriptor", SrtReplayRefusal::Ineligible);
+        table[0] = 0x66000400u;
+        ExpectOracle(stage, "a static descriptor moved beside a runtime-offset one", SrtReplayRefusal::Ineligible);
+        table[4] = 0x77000400u;
+        ExpectOracle(stage, "a descriptor moved behind a runtime offset beside a static one", SrtReplayRefusal::Ineligible);
+    }
+    {
+        alignas(64) static std::array<std::uint32_t, 8> table{1u, 0u, 0u, 0u, 0x44000000u, 0u, 0x40u, 0x00027facu};
+        const std::vector<std::uint32_t> code{0xf4040080u, 0xfa000000u, 0xf4080100u, 0xfa000010u, 0xbf8cc07fu, 0x7e000280u, 0xbf068002u, 0xbf850004u, 0xf4200202u, 0xfa000000u, 0xbf8cc07fu, 0x7e000208u, 0xf800180fu, 0u, 0xbf810000u};
+        PixelStage stage(code, PointerWords(table.data()), 0x2f0000u);
+        ExpectOracle(stage, "the first selector draw", SrtReplayRefusal::NoRecipe);
+        table[4] = 0x44000400u;
+        ExpectOracle(stage, "a buffer moved under a branch", SrtReplayRefusal::None);
+        table[0] = 0u;
+        ExpectOracle(stage, "a branch word that turns the buffer off", SrtReplayRefusal::Selector);
+        table[4] = 0x44000800u;
+        ExpectOracle(stage, "a buffer moved while its branch is off", SrtReplayRefusal::None);
+        table[0] = 1u;
+        ExpectOracle(stage, "a branch word that turns the buffer back on", SrtReplayRefusal::Selector);
+    }
+    {
+        alignas(64) static std::array<std::uint32_t, 64> inner{0x55000000u, 0u, 0x40u, 0x00027facu};
+        alignas(64) static std::array<std::uint32_t, 4> table{};
+        const auto address = reinterpret_cast<std::uintptr_t>(inner.data());
+        table = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), 0x100u, 0x00027facu};
+        const std::vector<std::uint32_t> code{0xf4080100u, 0xfa000000u, 0xbf8cc07fu, 0xf4280202u, 0xfa000000u, 0xbf8cc07fu, 0xf4200304u, 0xfa000000u, 0xbf8cc07fu,
+            0xe0300000u, 0x80010100u, 0xbf8c3f70u, 0x7e00020cu, 0x4a000101u, 0xf800180fu, 0u, 0xbf810000u};
+        PixelStage stage(code, PointerWords(table.data()), 0x300000u);
+        ExpectOracle(stage, "the first draw whose buffer also locates a descriptor", SrtReplayRefusal::NoRecipe);
+        inner[0] = 0x55000400u;
+        ExpectOracle(stage, "a descriptor moved inside a bound buffer", SrtReplayRefusal::None);
+        table[2] = 0x200u;
+        ExpectOracle(stage, "a bound buffer that also bounds a descriptor read grew", SrtReplayRefusal::Address);
+    }
+}
+
 void Bench() {
     constexpr std::size_t batches = 31;
     constexpr std::size_t iterations = 4000;
@@ -963,6 +1142,8 @@ int main(int argc, char** argv) {
         CheckCaptureReplay();
         CheckReplayPointerSwap();
         CheckReplayComputedDescriptor();
+        CheckReplayOracle();
+        CheckReplaySpanQueries();
         CheckSubstituteSlots();
         CheckInvocation();
         CheckResultMemo();
