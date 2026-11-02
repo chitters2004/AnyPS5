@@ -21,6 +21,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
+#include <mutex>
 #include <initializer_list>
 #include <iostream>
 #include <new>
@@ -124,6 +126,7 @@ struct Variant {
     std::array<std::uint32_t, 4> stale;
     std::array<std::uint32_t, 4> produced;
     std::vector<Vertex> vertices;
+    bool reuse = false;
 };
 
 Vertex At(float x, float y) {
@@ -141,6 +144,7 @@ std::vector<Variant> Variants() {
         {"16-bit quad-list indices expanded on the CPU", QuadList, Index16, 4, Consumer::Indices, {0, 0, 0, 0}, {0x00010000u, 0x00030002u, 0, 0}, quad},
         {"32-bit quad-list indices expanded on the CPU", QuadList, Index32, 4, Consumer::Indices, {0, 0, 0, 3}, {0, 1, 2, 3}, quad},
         {"vertex positions behind intact 32-bit indices", TriangleList, Index32, 3, Consumer::Vertices, {0, 0, 0, 0}, {bits(1.0f), bits(3.0f), bits(0.5f), bits(1.0f)}, collapsed},
+        {"32-bit triangle-list indices behind their kept stale copy", TriangleList, Index32, 3, Consumer::Indices, {0, 0, 0, 0}, {0, 1, 2, 0}, triangle, true},
     };
 }
 
@@ -297,18 +301,103 @@ void Prepare(const Variant& variant, Slot& slot) {
     slot.gate = 0;
 }
 
-void RequireStaleDegenerate(const Variant& variant, Slot& slot) {
-    Prepare(variant, slot);
+struct Access {
+    bool flush;
+    std::thread::id thread;
+    bool producedBefore;
+    bool producedAfter;
+};
+
+std::mutex AccessMutex;
+std::vector<Access> Accesses;
+std::uint64_t WatchBegin = 0;
+std::uint64_t WatchEnd = 0;
+std::array<std::uint32_t, 4> WatchProduced{};
+void (*PreviousFlush)(std::uint64_t, std::size_t) = nullptr;
+
+bool Watched(std::uint64_t address, std::size_t bytes) {
+    return address < WatchEnd && WatchBegin < address + bytes;
+}
+
+bool Produced() {
+    std::array<std::uint32_t, 4> held{};
+    std::memcpy(held.data(), reinterpret_cast<const void*>(WatchBegin), sizeof(held));
+    return held == WatchProduced;
+}
+
+void TracingFlush(std::uint64_t address, std::size_t bytes) {
+    const bool watched = Watched(address, bytes);
+    const bool before = watched && Produced();
+    PreviousFlush(address, bytes);
+    if (!watched) return;
+    std::lock_guard lock(AccessMutex);
+    Accesses.push_back({true, std::this_thread::get_id(), before, Produced()});
+}
+
+void TracingGuard(std::uint64_t address, std::size_t bytes) {
+    if (!Watched(address, bytes)) return;
+    const bool produced = Produced();
+    std::lock_guard lock(AccessMutex);
+    Accesses.push_back({false, std::this_thread::get_id(), produced, produced});
+}
+
+void Trace(const Variant& variant) {
+    std::lock_guard lock(AccessMutex);
+    Accesses.clear();
+    WatchBegin = reinterpret_cast<std::uintptr_t>(ProducedTarget(variant));
+    WatchEnd = WatchBegin + sizeof(variant.produced);
+    WatchProduced = variant.produced;
+    PreviousFlush = AgcDriver::GuestMemory::CurrentFlushHook();
+    Require(PreviousFlush != nullptr, std::string(variant.name) + ": no flush hook is installed to trace");
+    AgcDriver::GuestMemory::SetFlushHook(&TracingFlush);
+    AgcDriver::GuestMemory::SetReadGuard(&TracingGuard);
+}
+
+std::vector<Access> Untrace() {
+    AgcDriver::GuestMemory::SetReadGuard(nullptr);
+    AgcDriver::GuestMemory::SetFlushHook(PreviousFlush);
+    std::lock_guard lock(AccessMutex);
+    return std::exchange(Accesses, {});
+}
+
+bool CopiedWriters() {
+    return std::getenv("APS5_NO_HOST_IMPORT") != nullptr;
+}
+
+void DrawStale(const Variant& variant, const char* what) {
     std::vector<std::uint32_t> draw;
     Draw(draw, variant);
-    Submit(Graphics, draw, "the draw over the stale input");
+    Submit(Graphics, draw, what);
     AgcDriverWaitIdle_nid_postfix();
-    Require(WrittenPixels(variant.name) == 0, std::string(variant.name) + ": the draw over the stale input covered pixels, so a draw that copied early would not be told apart");
+    Require(WrittenPixels(variant.name) == 0, std::string(variant.name) + ": " + what + " covered pixels, so a draw that copied early would not be told apart");
+}
+
+void RequireStaleDegenerate(const Variant& variant, Slot& slot) {
+    Prepare(variant, slot);
+    DrawStale(variant, "the draw over the stale input");
+    if (!variant.reuse) return;
+    Trace(variant);
+    DrawStale(variant, "the second draw over the stale input");
+    const auto accesses = Untrace();
+    const bool reused = std::none_of(accesses.begin(), accesses.end(), [](const Access& access) { return !access.flush; });
+    if (!CopiedWriters() && !reused) {
+        std::printf("%s: imported memory is compared, not write-watched, on this device, so no copy is kept to reuse\n", variant.name);
+        return;
+    }
+    Require(reused, std::string(variant.name) + ": the second draw over the unchanged stale input read it again instead of reusing its kept copy, so the case below would not test reuse");
+    std::printf("%s: the second stale draw reused its kept copy\n", variant.name);
 }
 
 void Run(const Variant& variant, Slot& slot) {
     RequireStaleDegenerate(variant, slot);
-    Prepare(variant, slot);
+    if (variant.reuse) {
+        std::memset(ColorMemory, 0, ColorBytes);
+        AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(ColorMemory), ColorBytes);
+        slot.label = 0;
+        slot.gate = 0;
+    } else {
+        Prepare(variant, slot);
+    }
     std::vector<std::uint32_t> producer;
     WaitEqual(producer, &slot.gate, GateOpen);
     Spin(producer, slot);
@@ -317,16 +406,24 @@ void Run(const Variant& variant, Slot& slot) {
     std::vector<std::uint32_t> consumer;
     WaitEqual(consumer, &slot.label, LabelValue);
     Draw(consumer, variant);
+    Trace(variant);
     Submit(Compute, producer, "the gated producer and its label");
     Submit(Graphics, consumer, "the label wait and the draw");
     std::this_thread::sleep_for(ProducerStall);
     Require(slot.label == 0, std::string(variant.name) + ": the label landed while its producer was still gated");
     reinterpret_cast<volatile std::uint32_t&>(slot.gate) = GateOpen;
     AgcDriverWaitIdle_nid_postfix();
+    const auto accesses = Untrace();
     Require(slot.label == 1, std::string(variant.name) + ": the producer's label never landed");
     Require(std::memcmp(ProducedTarget(variant), variant.produced.data(), sizeof(variant.produced)) == 0, std::string(variant.name) + ": the producer's store did not reach guest memory");
     const auto written = WrittenPixels(variant.name);
     Require(written == Width * Height, std::string(variant.name) + ": the draw behind the label covered " + std::to_string(written) + " of " + std::to_string(Width * Height) + " pixels: it read its input before the producer the label follows wrote it");
+    if (variant.consumer == Consumer::Vertices) return;
+    const auto read = std::find_if(accesses.rbegin(), accesses.rend(), [](const Access& access) { return !access.flush; });
+    Require(read != accesses.rend() && read->producedAfter, std::string(variant.name) + ": the draw did not read its input from guest memory after the producer's store landed");
+    const auto outstanding = std::any_of(accesses.begin(), accesses.end(), [&](const Access& access) { return access.flush && access.thread == read->thread && !access.producedBefore && access.producedAfter; });
+    std::printf("%s: the consumer's flush %s\n", variant.name, outstanding ? "began with the producer outstanding and landed its store" : "began after the producer's store had landed");
+    if (!CopiedWriters()) Require(outstanding, std::string(variant.name) + ": the draw's own flush never began with the producer outstanding, so the case does not test that the flush orders the copy");
 }
 
 }
