@@ -2913,7 +2913,7 @@ void Recorder::EndPassSamples() {
     if (open != nullptr && open->segmentActive) endSegment(*open);
 }
 
-void Recorder::RecordUncounted(const std::function<void(VkCommandBuffer)>& record) {
+void Recorder::RecordUncounted(const std::function<void(CommandState&)>& record) {
     Commands();
     if (open->segmentActive) endSegment(*open);
     const bool counted = open->sampleActive;
@@ -2923,8 +2923,7 @@ void Recorder::RecordUncounted(const std::function<void(VkCommandBuffer)>& recor
         open->endedSamples.push_back(open->samples);
         open->samples = VK_NULL_HANDLE;
     }
-    const CommandState::Untracked untracked(open->graphicsState);
-    record(untracked.Commands());
+    record(open->graphicsState);
     if (counted) beginSamples(*open);
 }
 
