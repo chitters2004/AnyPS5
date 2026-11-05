@@ -929,7 +929,8 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
-void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, CommandState* tracker, const State* masked) const {
+void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked) const {
+    const auto commands = recording.Commands();
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
         Require(views.size() == attachments, "render targets do not match the pipeline's attachments");
@@ -957,7 +958,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED && HasStencil(depthFormat)) rendering.pStencilAttachment = &depth;
         context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
-        Continue(commands, state, tracker, masked);
+        Continue(recording, state, masked);
         return;
     }
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -976,42 +977,42 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pPostSubpassSampleLocations = &post;
     if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
-    Continue(commands, state, tracker, masked);
+    Continue(recording, state, masked);
 }
 
-void Pipeline::Continue(VkCommandBuffer commands, const State& state, CommandState* tracker, const State* masked) const {
+void Pipeline::Continue(CommandState& recording, const State& state, const State* masked) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
-    CommandState::BindPipeline(tracker, context, commands, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
-    CommandState::SetViewport(tracker, context, commands, state.viewport);
-    CommandState::SetScissor(tracker, context, commands, state.scissor);
-    setColorWriteMasks(commands, state, tracker, masked, false);
-    if (state.stencilReplayReference) CommandState::SetStencilReference(tracker, context, commands, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
+    recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
+    recording.SetViewport(context, state.viewport);
+    recording.SetScissor(context, state.scissor);
+    setColorWriteMasks(recording, state, masked, false);
+    if (state.stencilReplayReference) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
-        setLibraryState(commands, state, tracker);
+        setLibraryState(recording, state);
         return;
     }
-    if (depthBias) CommandState::SetDepthBias(tracker, context, commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
+    if (depthBias) recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
-    CommandState::SetDepthBounds(tracker, context, commands, state.minDepthBounds, state.maxDepthBounds);
+    recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
 
-void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, CommandState* tracker) const {
+void Pipeline::setLibraryState(CommandState& recording, const State& state) const {
     const bool depth = state.depth.has_value();
-    CommandState::SetCullMode(tracker, context, commands, state.cullMode);
-    CommandState::SetFrontFace(tracker, context, commands, state.frontFace);
-    CommandState::SetDepthBias(tracker, context, commands, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    CommandState::SetDepthBounds(tracker, context, commands, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
-    CommandState::SetDepthTestEnable(tracker, context, commands, depth && state.depthTest);
-    CommandState::SetDepthWriteEnable(tracker, context, commands, depth && state.depthWrite);
-    CommandState::SetDepthCompareOp(tracker, context, commands, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
-    CommandState::SetDepthBoundsTestEnable(tracker, context, commands, depthBounds);
-    CommandState::SetStencilTestEnable(tracker, context, commands, depth && state.stencilTest);
+    recording.SetCullMode(context, state.cullMode);
+    recording.SetFrontFace(context, state.frontFace);
+    recording.SetDepthBias(context, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
+    recording.SetDepthBounds(context, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
+    recording.SetDepthTestEnable(context, depth && state.depthTest);
+    recording.SetDepthWriteEnable(context, depth && state.depthWrite);
+    recording.SetDepthCompareOp(context, depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS);
+    recording.SetDepthBoundsTestEnable(context, depthBounds);
+    recording.SetStencilTestEnable(context, depth && state.stencilTest);
     const auto stencil = [&](VkStencilFaceFlags face, const VkStencilOpState& op) {
-        CommandState::SetStencilOp(tracker, context, commands, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
-        CommandState::SetStencilCompareMask(tracker, context, commands, face, op.compareMask);
-        CommandState::SetStencilWriteMask(tracker, context, commands, face, op.writeMask);
-        CommandState::SetStencilReference(tracker, context, commands, face, op.reference);
+        recording.SetStencilOp(context, face, op.failOp, op.passOp, op.depthFailOp, op.compareOp);
+        recording.SetStencilCompareMask(context, face, op.compareMask);
+        recording.SetStencilWriteMask(context, face, op.writeMask);
+        recording.SetStencilReference(context, face, op.reference);
     };
     const auto front = depth ? state.stencilFront : VkStencilOpState{};
     const auto back = depth ? state.stencilBack : VkStencilOpState{};
@@ -1023,26 +1024,26 @@ void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state, Com
     stencil(VK_STENCIL_FACE_BACK_BIT, back);
 }
 
-void Pipeline::ContinueSecondChannel(VkCommandBuffer commands, const State& state, CommandState* tracker, const State* masked) const {
+void Pipeline::ContinueSecondChannel(CommandState& recording, const State& state, const State* masked) const {
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
-    CommandState::BindPipeline(tracker, context, commands, secondChannel, dynamicSlots);
-    setColorWriteMasks(commands, state, tracker, masked, true);
+    recording.BindPipeline(context, secondChannel, dynamicSlots);
+    setColorWriteMasks(recording, state, masked, true);
 }
 
-void Pipeline::setColorWriteMasks(VkCommandBuffer commands, const State& state, CommandState* tracker, const State* masked, bool secondChannel) const {
+void Pipeline::setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const {
     if (!context.dynamicColorWriteMask || state.blends.empty()) return;
     const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), secondChannel);
-    CommandState::SetColorWriteMasks(tracker, context, commands, std::span(masks).first(state.blends.size()));
+    recording.SetColorWriteMasks(context, std::span(masks).first(state.blends.size()));
 }
 
-void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, CommandState* tracker, const State* masked) const {
+void Pipeline::ContinueBackFaces(CommandState& recording, const State& state, const State* masked) const {
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
-    CommandState::BindPipeline(tracker, context, commands, backFaces, dynamicSlots);
-    setColorWriteMasks(commands, state, tracker, masked, false);
-    CommandState::SetViewport(tracker, context, commands, state.viewport);
-    CommandState::SetScissor(tracker, context, commands, state.scissor);
-    CommandState::SetDepthBias(tracker, context, commands, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
-    if (depthBounds) CommandState::SetDepthBounds(tracker, context, commands, state.minDepthBounds, state.maxDepthBounds);
+    recording.BindPipeline(context, backFaces, dynamicSlots);
+    setColorWriteMasks(recording, state, masked, false);
+    recording.SetViewport(context, state.viewport);
+    recording.SetScissor(context, state.scissor);
+    recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
+    if (depthBounds) recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
