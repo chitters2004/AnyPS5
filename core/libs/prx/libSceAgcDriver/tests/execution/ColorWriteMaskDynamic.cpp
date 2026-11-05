@@ -197,8 +197,8 @@ struct MaskTrace {
     AgcDriver::Graphics::DeviceFunctions* functions;
     explicit MaskTrace(const AgcDriver::Graphics::Context& context) {
         functions = const_cast<AgcDriver::Graphics::DeviceFunctions*>(context.functions);
-        Require(functions != nullptr && functions->cmdSetColorWriteMask != nullptr, "vkCmdSetColorWriteMaskEXT is unavailable");
-        NativeSetMasks = functions->cmdSetColorWriteMask;
+        NativeSetMasks = context.dynamicColorWriteMask ? reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(context.deviceProc(context.device, "vkCmdSetColorWriteMaskEXT")) : nullptr;
+        Require(functions != nullptr && NativeSetMasks != nullptr, "vkCmdSetColorWriteMaskEXT is unavailable");
         functions->cmdSetColorWriteMask = CountMasks;
     }
     ~MaskTrace() { functions->cmdSetColorWriteMask = NativeSetMasks; }
