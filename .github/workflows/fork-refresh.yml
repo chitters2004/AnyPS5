@@ -1,0 +1,225 @@
+name: Fork refresh
+
+on:
+  workflow_dispatch:
+    inputs:
+      branches:
+        description: Comma list of fork branch names to refresh (for example draft/src/perf/some-branch)
+        required: true
+        type: string
+      tests:
+        description: ctest -R regular expression for every branch, or auto to use .github/fork-refresh-tests.json
+        required: false
+        default: auto
+        type: string
+      onto:
+        description: Ref or SHA to rebase onto (empty means the head of upstream main)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/boykopovar/AnyPS5.git
+
+jobs:
+  rebase:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    outputs:
+      onto: ${{ steps.rebase.outputs.onto }}
+      rows: ${{ steps.rebase.outputs.rows }}
+      gate_matrix: ${{ steps.rebase.outputs.gate_matrix }}
+      has_clean: ${{ steps.rebase.outputs.has_clean }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/fork-refresh-tests.json
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          path: repo
+          fetch-depth: 0
+          persist-credentials: true
+      - id: rebase
+        working-directory: repo
+        env:
+          BRANCHES: ${{ inputs.branches }}
+          TESTS: ${{ inputs.tests }}
+          ONTO: ${{ inputs.onto }}
+        run: |
+          set -euo pipefail
+          git config user.name fork-refresh
+          git config user.email fork-refresh@localhost
+          if [ -n "$ONTO" ]; then
+            onto=$(git rev-parse --verify "$ONTO^{commit}" 2>/dev/null || git rev-parse --verify "refs/remotes/origin/$ONTO^{commit}" 2>/dev/null || true)
+            if [ -z "$onto" ]; then git fetch --no-tags "$UPSTREAM" "$ONTO"; onto=$(git rev-parse FETCH_HEAD); fi
+          else
+            git fetch --no-tags "$UPSTREAM" main
+            onto=$(git rev-parse FETCH_HEAD)
+          fi
+          echo "onto $onto"
+          export onto
+          python3 - <<'PY'
+          import json, os, re, subprocess
+          def git(*args, check=True):
+              r = subprocess.run(["git", *args], capture_output=True, text=True)
+              if check and r.returncode:
+                  raise SystemExit(f"git {' '.join(args)} failed: {r.stderr}")
+              return r
+          onto = os.environ["onto"]
+          mapping = json.load(open("../ci/.github/fork-refresh-tests.json")) if os.path.exists("../ci/.github/fork-refresh-tests.json") else {}
+          rows = []
+          for name in [b.strip() for b in os.environ["BRANCHES"].split(",") if b.strip()]:
+              display = re.sub(r"^draft/src/", "", name)
+              tag = re.sub(r"[^A-Za-z0-9]+", "-", display).strip("-")[:40] + "-"
+              row = {"name": name, "display": display, "tag": tag, "label": tag.rstrip("-"), "onto": onto}
+              rows.append(row)
+              src = git("rev-parse", "--verify", f"refs/remotes/origin/{name}^{{commit}}", check=False)
+              if src.returncode:
+                  row.update(result="missing", detail="the branch does not exist on the fork")
+                  continue
+              src = src.stdout.strip()
+              row["src"] = src
+              row["old_base"] = git("merge-base", src, onto, check=False).stdout.strip()
+              tests = mapping.get(display) if os.environ["TESTS"] == "auto" else os.environ["TESTS"]
+              if not tests:
+                  row.update(result="no-tests", detail=f"no entry for {display} in .github/fork-refresh-tests.json")
+                  continue
+              row["tests"] = tests
+              git("checkout", "-q", "--detach", src)
+              rebase = git("rebase", onto, check=False)
+              if rebase.returncode:
+                  files = git("diff", "--name-only", "--diff-filter=U", check=False).stdout.split()
+                  failing = git("rev-parse", "REBASE_HEAD", check=False).stdout.strip()
+                  subject = git("log", "-1", "--format=%h %s", failing, check=False).stdout.strip() if failing else "?"
+                  git("rebase", "--abort", check=False)
+                  row.update(result="conflict", detail=f"commit {subject}; files: {', '.join(files) or '?'}")
+                  continue
+              tip = git("rev-parse", "HEAD").stdout.strip()
+              pushed = git("push", "--force", "origin", f"HEAD:refs/heads/draft/rebased/{display}", check=False)
+              if pushed.returncode:
+                  row.update(result="push-failed", detail=pushed.stderr.strip().splitlines()[-2] if pushed.stderr.strip() else "push failed")
+                  continue
+              row.update(result="clean", new_tip=tip, commits=int(git("rev-list", "--count", f"{onto}..{tip}").stdout.strip()),
+                         detail=f"{tip[:10]} pushed as draft/rebased/{display}")
+          clean = [r for r in rows if r["result"] == "clean"]
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("onto=" + onto + "\n")
+              out.write("rows=" + json.dumps(rows) + "\n")
+              out.write("gate_matrix=" + json.dumps({"include": clean}) + "\n")
+              out.write("has_clean=" + ("true" if clean else "false") + "\n")
+          for r in rows:
+              print(r)
+          PY
+
+  gate:
+    needs: rebase
+    if: ${{ needs.rebase.outputs.has_clean == 'true' }}
+    name: ${{ matrix.label }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.rebase.outputs.gate_matrix) }}
+    uses: ./.github/workflows/fork-ci.yml
+    with:
+      ref: ${{ matrix.new_tip }}
+      base: ${{ needs.rebase.outputs.onto }}
+      tests: ${{ matrix.tests }}
+      jobs: linux-gate,windows
+      tag: ${{ matrix.tag }}
+
+  conventions:
+    needs: rebase
+    if: ${{ needs.rebase.outputs.has_clean == 'true' }}
+    name: conventions ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.rebase.outputs.gate_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.rebase.outputs.onto }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the conventions of the rebased tip against the new base, with the script of the new base
+        env:
+          ONTO: ${{ needs.rebase.outputs.onto }}
+          TIP: ${{ matrix.new_tip }}
+          TAG: ${{ matrix.tag }}
+        run: |
+          git fetch --no-tags origin "$TIP" 2>/dev/null || true
+          set +e
+          python3 -I tools/check_conventions.py --base "$ONTO" --head "$TIP" 2>&1 | tee conventions.log
+          rc=${PIPESTATUS[0]}
+          mkdir -p out
+          python3 - "$rc" <<'PY'
+          import json, os, sys
+          log = open("conventions.log", errors="replace").read().strip().splitlines()
+          json.dump({"tag": os.environ["TAG"], "rc": int(sys.argv[1]), "tail": log[-12:]}, open("out/conventions.json", "w"))
+          PY
+          exit 0
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: conv-${{ matrix.tag }}
+          path: out/conventions.json
+
+  summary:
+    needs: [rebase, gate, conventions]
+    if: ${{ !cancelled() && needs.rebase.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      ROWS: ${{ needs.rebase.outputs.rows }}
+      ONTO: ${{ needs.rebase.outputs.onto }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: '{summary,conv}-*'
+          path: parts
+      - name: Write the summary table
+        run: |
+          python3 - <<'PY'
+          import glob, json, os
+          rows = json.loads(os.environ["ROWS"])
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          def w(text=""):
+              print(text)
+              out.write(text + "\n")
+          def load(pattern):
+              found = glob.glob(pattern)
+              return json.load(open(found[0])) if found else None
+          red = False
+          w(f"## Fork refresh onto `{os.environ['ONTO'][:10]}`")
+          w("| branch | old base | new tip | rebase | Linux | Windows | conventions | new failures / VUIDs |")
+          w("| - | - | - | - | - | - | - | - |")
+          for r in rows:
+              base = (r.get("old_base") or "?")[:10]
+              if r["result"] != "clean":
+                  red = True
+                  w(f"| {r['display']} | {base} | - | {r['result']}: {r['detail']} | - | - | - | - |")
+                  continue
+              s = load(f"parts/summary-{r['tag']}/summary.json")
+              c = load(f"parts/conv-{r['tag']}/conventions.json")
+              def cell(k):
+                  if not s or k not in s:
+                      return "no result"
+                  d = s[k]
+                  return f"{d.get('passed', 0)}/{d['ran']} passed, {d.get('failed', 0)} failed, {d.get('skipped', 0)} skipped; VUID lines {d['vuid_lines']} (base {d['base_vuid_lines']})"
+              conv = "no result" if not c else ("ok" if c["rc"] == 0 else f"{c['rc']}: " + " / ".join(c["tail"][-3:]))
+              bad = "no result" if not s else ("none" if not s["bad"] else "; ".join(s["bad"]))
+              if not s or s["verdict"] != "GREEN" or not c or c["rc"] != 0:
+                  red = True
+              w(f"| {r['display']} | {base} | {r['new_tip'][:10]} ({r['commits']} commits) | clean | {cell('linux')} | {cell('windows')} | {conv} | {bad} |")
+          raise SystemExit(1 if red else 0)
+          PY

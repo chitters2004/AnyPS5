@@ -1,0 +1,107 @@
+name: Fork warm
+
+on:
+  schedule:
+    - cron: '30 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Warm even when this head of upstream main was warmed before
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/boykopovar/AnyPS5.git
+  UPSTREAM_SLUG: boykopovar/AnyPS5
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      stale: ${{ steps.verdict.outputs.stale }}
+    steps:
+      - id: head
+        run: echo "sha=$(git ls-remote "$UPSTREAM" refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+      - id: marker
+        uses: actions/cache/restore@v6
+        with:
+          path: marker
+          key: warm-done-${{ steps.head.outputs.sha }}
+          lookup-only: true
+      - id: verdict
+        env:
+          HIT: ${{ steps.marker.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          if [ "$HIT" = true ] && [ "$FORCE" != true ]; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "upstream main $SHA was warmed before; nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "warming upstream main $SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  warm:
+    needs: check
+    if: ${{ needs.check.outputs.stale == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    uses: ./.github/workflows/fork-ci.yml
+    with:
+      repository: boykopovar/AnyPS5
+      ref: ${{ needs.check.outputs.sha }}
+      base: ${{ needs.check.outputs.sha }}
+      tests: none
+      jobs: warm
+
+  mark:
+    needs: [check, warm]
+    if: ${{ needs.warm.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          mkdir marker
+          echo "${{ needs.check.outputs.sha }}" > marker/head
+      - uses: actions/cache/save@v6
+        with:
+          path: marker
+          key: warm-done-${{ needs.check.outputs.sha }}
+
+  prune:
+    needs: [check, warm, mark]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Keep the newest two compiler caches of each key and delete the rest
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
+          python3 - <<'PY' > delete.txt
+          import re
+          rows = [line.split() for line in open("caches.tsv")]
+          groups = {}
+          for cid, key, created, size in rows:
+              m = re.match(r"(ccache-[a-z]+(?:-[a-z]+)?)-\d{4}-", key)
+              if m:
+                  groups.setdefault(m[1], []).append((created, cid))
+          for name, items in groups.items():
+              for created, cid in sorted(items, reverse=True)[2:]:
+                  print(cid)
+          PY
+          echo "deleting $(wc -l < delete.txt) old compiler caches"
+          while read -r id; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent || true; done < delete.txt
+          gh api "repos/$GITHUB_REPOSITORY/actions/cache/usage" -q '"cache usage now \(.active_caches_size_in_bytes / 1048576 | floor) MB"'

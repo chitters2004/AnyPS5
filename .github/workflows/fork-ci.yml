@@ -1,0 +1,1026 @@
+name: Fork CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to test
+        required: true
+        type: string
+      base:
+        description: Main-side ref or SHA to compare against (empty means the merge-base of ref with upstream main)
+        required: false
+        default: ''
+        type: string
+      tests:
+        description: ctest -R regular expression
+        required: true
+        type: string
+      jobs:
+        description: Comma list from linux-gate, windows, asan, tsan, census, mutants, warm
+        required: false
+        default: linux-gate,windows
+        type: string
+      mutants:
+        description: Path inside ref to a directory of .patch files (jobs must include mutants)
+        required: false
+        default: ''
+        type: string
+      reduced:
+        description: Build only the selected test executables and the libs target (set false for the whole tree)
+        required: false
+        default: true
+        type: boolean
+      repository:
+        description: Repository to check out (empty means this fork)
+        required: false
+        default: ''
+        type: string
+  workflow_call:
+    inputs:
+      ref:
+        required: true
+        type: string
+      base:
+        required: false
+        default: ''
+        type: string
+      tests:
+        required: true
+        type: string
+      jobs:
+        required: false
+        default: linux-gate,windows
+        type: string
+      mutants:
+        required: false
+        default: ''
+        type: string
+      reduced:
+        required: false
+        default: true
+        type: boolean
+      repository:
+        required: false
+        default: ''
+        type: string
+      tag:
+        description: Prefix for artifact names and for the job names of a caller, such as memo-
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CONFIGURE: >-
+    -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+    -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
+    -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  UPSTREAM: https://github.com/boykopovar/AnyPS5.git
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      has_linux: ${{ steps.plan.outputs.has_linux }}
+      windows: ${{ steps.plan.outputs.windows }}
+      warm: ${{ steps.plan.outputs.warm }}
+      win_matrix: ${{ steps.plan.outputs.win_matrix }}
+      ref_sha: ${{ steps.plan.outputs.ref_sha }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        env:
+          BASE: ${{ inputs.base }}
+          JOBS: ${{ inputs.jobs }}
+          REF: ${{ inputs.ref }}
+          MUTANTS: ${{ inputs.mutants }}
+        run: |
+          set -euo pipefail
+          ref_sha=$(git rev-parse HEAD)
+          if [ -n "$BASE" ]; then
+            base_sha=$(git rev-parse --verify "$BASE^{commit}" 2>/dev/null || git rev-parse --verify "refs/remotes/origin/$BASE^{commit}")
+          else
+            git fetch --no-tags --filter=blob:none "$UPSTREAM" main
+            base_sha=$(git merge-base "$ref_sha" FETCH_HEAD)
+          fi
+          echo "ref $REF = $ref_sha; base = $base_sha"
+          git cat-file -e "$base_sha^{commit}"
+          patches=""
+          if [ -n "$MUTANTS" ]; then
+            patches=$(git ls-tree -r --name-only "$ref_sha" -- "${MUTANTS%/}/" | grep '\.patch$' || true)
+          fi
+          export ref_sha base_sha patches
+          python3 - <<'PY'
+          import json, os, re
+          jobs = {j.strip() for j in os.environ["JOBS"].split(",") if j.strip()}
+          unknown = jobs - {"linux-gate", "windows", "asan", "tsan", "census", "mutants", "warm"}
+          if unknown:
+              raise SystemExit(f"unknown jobs: {sorted(unknown)}")
+          ref_sha, base_sha = os.environ["ref_sha"], os.environ["base_sha"]
+          plain_restore = "plain-base\nplain-ref"
+          include = []
+          if "linux-gate" in jobs:
+              include.append(dict(id="gate-ref", kind="gate", side="ref", sha=ref_sha, group="plain",
+                                  cache_key="plain-ref", cache_restore="plain-base\nplain-ref", cache_max="4G", cache_save="true"))
+              include.append(dict(id="gate-base", kind="gate", side="base", sha=base_sha, group="plain",
+                                  cache_key="plain-base", cache_restore="plain-base\nplain-ref", cache_max="4G", cache_save="true"))
+          for san in ("asan", "tsan"):
+              if san in jobs:
+                  include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
+                                      cache_key=san, cache_restore=san, cache_max="2G", cache_save="true"))
+          if "warm" in jobs:
+              include.append(dict(id="warm-linux", kind="warm", side="base", sha=ref_sha, group="plain",
+                                  cache_key="plain-base", cache_restore="plain-base\nplain-ref", cache_max="4G", cache_save="true"))
+          if "census" in jobs:
+              include.append(dict(id="census", kind="census", side="ref", sha=ref_sha, group="plain",
+                                  cache_key="plain-census", cache_restore=plain_restore, cache_max="4G", cache_save="false"))
+          if "mutants" in jobs:
+              for path in os.environ["patches"].split():
+                  name = re.sub(r"[^A-Za-z0-9]+", "-", os.path.basename(path)[:-6]).strip("-")
+                  include.append(dict(id=f"mutant-{name}", kind="mutant", side="ref", sha=ref_sha, group="plain", patch=path,
+                                      cache_key="plain-mutant", cache_restore=plain_restore, cache_max="4G", cache_save="false"))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write("matrix=" + json.dumps({"include": include}) + "\n")
+              out.write("has_linux=" + ("true" if include else "false") + "\n")
+              out.write("windows=" + ("true" if jobs & {"windows", "warm"} else "false") + "\n")
+              out.write("warm=" + ("true" if "warm" in jobs else "false") + "\n")
+              win = []
+              if "windows" in jobs:
+                  win += [dict(id="windows-ref", kind="gate", side="ref", sha=ref_sha), dict(id="windows-base", kind="gate", side="base", sha=base_sha)]
+              if "warm" in jobs:
+                  win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha))
+              out.write("win_matrix=" + json.dumps({"include": win}) + "\n")
+              out.write("ref_sha=" + ref_sha + "\nbase_sha=" + base_sha + "\n")
+          print(json.dumps(include, indent=1))
+          PY
+
+  linux:
+    needs: plan
+    if: ${{ needs.plan.outputs.has_linux == 'true' }}
+    name: linux ${{ matrix.id }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      KIND: ${{ matrix.kind }}
+      TESTS: ${{ inputs.tests }}
+      REDUCED: ${{ inputs.reduced }}
+      CCACHE_COMPILERCHECK: content
+      VVL_VERSION: 1.4.363.1
+      VVL_SHA256: b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8
+      VVL_DIR: /home/runner/vvl
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Apply the mutant
+        if: ${{ matrix.kind == 'mutant' }}
+        env:
+          PATCH: ${{ matrix.patch }}
+        run: |
+          git apply --check --whitespace=nowarn "$PATCH"
+          git apply --whitespace=nowarn "$PATCH"
+          git diff --stat
+      - name: Install the build and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build libx11-dev libxext-dev libxrandr-dev libasound2-dev libpulse-dev mesa-vulkan-drivers libvulkan1 vulkan-tools xz-utils
+          dpkg-query -W mesa-vulkan-drivers vulkan-tools
+          grep -m1 '^model name' /proc/cpuinfo
+          nproc
+          free -m
+      - id: vvl-cache
+        if: ${{ matrix.kind == 'gate' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: /home/runner/vvl
+          key: vvl-linux-${{ env.VVL_VERSION }}
+      - name: Install the pinned Khronos validation layer and Vulkan loader from the LunarG SDK
+        if: ${{ matrix.kind == 'gate' && steps.vvl-cache.outputs.cache-hit != 'true' }}
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/vulkan_sdk.tar.xz" "https://sdk.lunarg.com/sdk/download/$VVL_VERSION/linux/vulkan_sdk.tar.xz"
+          echo "$VVL_SHA256  $RUNNER_TEMP/vulkan_sdk.tar.xz" | sha256sum -c -
+          mkdir -p "$VVL_DIR/lib" "$VVL_DIR/layers" "$RUNNER_TEMP/sdk"
+          tar -xJf "$RUNNER_TEMP/vulkan_sdk.tar.xz" -C "$RUNNER_TEMP/sdk" --strip-components=2 --wildcards "*/x86_64/lib/libVkLayer_khronos_validation.so" "*/x86_64/lib/VulkanLoader/lib/libvulkan.so*" "*/x86_64/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json"
+          cp -a "$RUNNER_TEMP"/sdk/lib/libVkLayer_khronos_validation.so "$RUNNER_TEMP"/sdk/lib/VulkanLoader/lib/libvulkan.so* "$VVL_DIR/lib/"
+          sed "s|\"library_path\": *\"[^\"]*\"|\"library_path\": \"$VVL_DIR/lib/libVkLayer_khronos_validation.so\"|" "$RUNNER_TEMP/sdk/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json" > "$VVL_DIR/layers/VkLayer_khronos_validation.json"
+          cat "$VVL_DIR/layers/VkLayer_khronos_validation.json"
+          ls -l "$VVL_DIR/lib"
+      - if: ${{ matrix.kind == 'gate' && steps.vvl-cache.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: /home/runner/vvl
+          key: ${{ steps.vvl-cache.outputs.cache-primary-key }}
+      - name: Free disk space for the build
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+      - name: Let ThreadSanitizer map its shadow memory
+        if: ${{ matrix.kind == 'tsan' }}
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Install the wild linker
+        if: ${{ matrix.group == 'plain' }}
+        env:
+          WILD_VERSION: 0.10.0
+          WILD_SHA256: 641265506a7c06cfb03181b8916ab663ec8407855db6d4db7f8450667d105283
+        run: |
+          tools=$RUNNER_TOOL_CACHE/wild
+          mkdir -p "$tools" 2>/dev/null && test -w "$tools" || { tools=$RUNNER_TEMP/wild; mkdir -p "$tools"; }
+          dir=$tools/$WILD_VERSION
+          tmp=
+          probe=$(mktemp -d "$RUNNER_TEMP/wild-probe.XXXXXX")
+          trap 'rm -rf "$tmp" "$probe"' EXIT
+          if [ ! -x "$dir/bin/ld" ]; then
+            tmp=$(mktemp -d "$tools/.wild.XXXXXX")
+            name=wild-linker-$WILD_VERSION-x86_64-unknown-linux-gnu
+            curl -fsSL --retry 3 -o "$tmp/$name.tar.gz" "https://github.com/davidlattimore/wild/releases/download/$WILD_VERSION/$name.tar.gz"
+            echo "$WILD_SHA256  $tmp/$name.tar.gz" | sha256sum -c -
+            tar -xzf "$tmp/$name.tar.gz" -C "$tmp"
+            mkdir -p "$tmp/out/bin"
+            mv "$tmp/$name/wild" "$tmp/out/bin/wild"
+            ln -s wild "$tmp/out/bin/ld"
+            mv -T "$tmp/out" "$dir" 2>/dev/null || test -x "$dir/bin/ld"
+          fi
+          echo 'int main(void) { return 0; }' > "$probe/main.c"
+          gcc "-B$dir/bin" "$probe/main.c" -o "$probe/main"
+          readelf -p .comment "$probe/main" | grep -F "Linker: Wild $WILD_VERSION"
+          echo "LINKER_FLAGS=-B$dir/bin" >> "$GITHUB_ENV"
+      - name: Size parallelism
+        run: |
+          cpus=$(nproc)
+          mem_mb=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo)
+          slots=$(( (mem_mb - 2048) / 1024 ))
+          slots=$(( slots < 1 ? 1 : slots ))
+          slots=$(( slots > cpus ? cpus : slots ))
+          echo "cpus=$cpus mem_total_mb=$mem_mb -> build jobs $cpus, cold compiles $slots"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$cpus" >> "$GITHUB_ENV"
+          if [ -x tools/compile_slot.sh ]; then
+            slot_dir=$RUNNER_TEMP/compile-slots
+            mkdir -p "$slot_dir"
+            echo "CCACHE_PREFIX=$GITHUB_WORKSPACE/tools/compile_slot.sh" >> "$GITHUB_ENV"
+            echo "ANYPS5_COMPILE_SLOT_DIR=$slot_dir" >> "$GITHUB_ENV"
+            echo "ANYPS5_COMPILE_SLOTS=$slots" >> "$GITHUB_ENV"
+          fi
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: ${{ matrix.cache_key }}
+          restore-keys: ${{ matrix.cache_restore }}
+          max-size: ${{ matrix.cache_max }}
+          save: ${{ matrix.cache_save }}
+          evict-old-files: 7d
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-forkci-${{ runner.os }}-${{ matrix.group }}-${{ steps.submodules.outputs.ffmpeg }}
+      - name: Configure
+        env:
+          GROUP: ${{ matrix.group }}
+        run: |
+          start=$(date +%s)
+          case "$GROUP" in
+            plain) extra=(-DANYPS5_ENABLE_SPIRV_TOOLS=ON "-DCMAKE_EXE_LINKER_FLAGS=${LINKER_FLAGS:-}" "-DCMAKE_SHARED_LINKER_FLAGS=${LINKER_FLAGS:-}" "-DCMAKE_MODULE_LINKER_FLAGS=${LINKER_FLAGS:-}") ;;
+            asan) extra=(-DANYPS5_ENABLE_ASAN=ON "-DCMAKE_C_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DCMAKE_CXX_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown") ;;
+            tsan) extra=(-DANYPS5_ENABLE_TSAN=ON "-DCMAKE_C_FLAGS=-g1" "-DCMAKE_CXX_FLAGS=-g1" "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown") ;;
+          esac
+          cmake -S . -B build $CONFIGURE "${extra[@]}"
+          echo "CONFIGURE_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Build
+        id: build
+        run: |
+          ccache --zero-stats
+          start=$(date +%s)
+          rc=0
+          select_targets() {
+            ctest --test-dir build -N -R "$TESTS" | tee build/selected.txt
+            python3 - <<'PY' > build/targets.txt
+          import glob, os, re, subprocess
+          selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
+          known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
+          names = set()
+          for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in selected:
+                      for word in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)):
+                          name = os.path.basename(word.replace("\\", "/"))
+                          for candidate in (name, name[:-4] if name.endswith(".exe") else name):
+                              if candidate in known:
+                                  names.add(candidate)
+          print(" ".join(sorted(names)))
+          PY
+            echo "targets: $(cat build/targets.txt)"
+            grep -q "[^[:space:]]" build/targets.txt || { echo "::error::none of the selected tests names a built executable"; return 1; }
+          }
+          case "$KIND" in
+            gate|warm)
+              if [ "$REDUCED" = true ] && [ "$KIND" = gate ]; then
+                select_targets
+                cmake --build build --target $(cat build/targets.txt) libs || rc=$?
+              else
+                cmake --build build || rc=$?
+                if [ $rc -eq 0 ]; then cmake --build build --target libs || rc=$?; fi
+              fi ;;
+            asan|tsan)
+              cmake --build build -- -k 0 || rc=$?
+              cmake --build build --target libs -- -k 0 || rc=$? ;;
+            census)
+              cmake --build build --target agc_driver_draw_allocations_tests libs || rc=$? ;;
+            mutant)
+              select_targets
+              cmake --build build --target $(cat build/targets.txt) libs || rc=$? ;;
+          esac
+          echo "BUILD_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          echo "BUILD_RC=$rc" >> "$GITHUB_ENV"
+          ccache --show-stats | tee ccache-stats.txt
+          exit $rc
+      - name: Prove the Vulkan validation layer loads
+        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          VK_LAYER_PATH: /home/runner/vvl/layers
+          LD_LIBRARY_PATH: /home/runner/vvl/lib
+        run: |
+          mkdir -p result
+          {
+            echo "== packages"
+            echo "== layer: LunarG SDK $VVL_VERSION"
+            grep -E 'implementation_version|api_version|library_path' "$VVL_DIR/layers/VkLayer_khronos_validation.json"
+            dpkg-query -W mesa-vulkan-drivers libvulkan1 vulkan-tools
+            ls -l /usr/share/vulkan/icd.d/
+            echo "== vulkaninfo with the layer requested"
+            VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LOADER_DEBUG=layer GALLIUM_OVERRIDE_CPU_CAPS=avx vulkaninfo --summary
+            echo "== layer as enumerated by the loader"
+            GALLIUM_OVERRIDE_CPU_CAPS=avx vulkaninfo | grep -E "VK_LAYER_KHRONOS_validation|Vulkan Instance Version"
+          } > result/layer-proof.txt 2>&1 || true
+          grep -E 'deviceName|driverName|Insert instance layer|VK_LAYER_KHRONOS_validation|was not found' result/layer-proof.txt | sort -u | head -30
+          grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' result/layer-proof.txt
+          if grep -q 'was not found but was requested' result/layer-proof.txt; then exit 1; fi
+          grep -E 'VK_LAYER_KHRONOS_validation' result/layer-proof.txt | head -3
+          echo "LAYER_PROOF=1" >> "$GITHUB_ENV"
+      - name: Run the tests with the validation layer
+        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          ANYPS5_NO_SHADER_CACHE: 1
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          VK_LAYER_PATH: /home/runner/vvl/layers
+          LD_LIBRARY_PATH: /home/runner/vvl/lib
+          VK_LOADER_DEBUG: layer
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          mkdir -p result
+          start=$(date +%s)
+          set +e
+          ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 -j "$(nproc)" --test-load "$(nproc)" --output-junit ctest.xml 2>&1 | tee ctest.log
+          echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          echo "TEST_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          exit 0
+      - name: Run the allocation census
+        if: ${{ matrix.kind == 'census' && !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          APS5_DRAW_ALLOCATIONS_NO_LIMIT: 1
+          ANYPS5_REQUIRE_VULKAN: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          set +e
+          ctest --test-dir build -R 'agc_driver_draw_allocations' -V --no-tests=error --timeout 600 --output-junit ctest.xml 2>&1 | tee ctest.log
+          echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          exit 0
+      - name: Run the tests under the sanitizer
+        if: ${{ (matrix.kind == 'asan' || matrix.kind == 'tsan') && !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          APS5_SKIP_TIMING_TESTS: 1
+        run: |
+          if [ "$KIND" = tsan ]; then export TSAN_OPTIONS="suppressions=$PWD/tools/tsan-suppressions.txt"; fi
+          start=$(date +%s)
+          set +e
+          ctest --test-dir build -R "$TESTS" --no-tests=error --output-on-failure --timeout 300 --parallel 4 --output-log ctest.log --output-junit ctest.xml
+          echo "TEST_RC=$?" >> "$GITHUB_ENV"
+          echo "TEST_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          exit 0
+      - name: Run the tests of the mutant
+        if: ${{ matrix.kind == 'mutant' && !cancelled() && steps.build.outcome == 'success' }}
+        env:
+          ANYPS5_REQUIRE_VULKAN: 1
+          ANYPS5_NO_SHADER_CACHE: 1
+          GALLIUM_OVERRIDE_CPU_CAPS: avx
+        run: |
+          start=$(date +%s)
+          set +e
+          ctest --test-dir build -R "$TESTS" --no-tests=error --output-on-failure --timeout 120 --output-junit ctest.xml 2>&1 | tee ctest.log
+          echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          echo "TEST_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+          exit 0
+      - name: Collect the result
+        if: ${{ !cancelled() }}
+        env:
+          ID: ${{ matrix.id }}
+          SIDE: ${{ matrix.side }}
+          SHA: ${{ matrix.sha }}
+          PATCH: ${{ matrix.patch }}
+        run: |
+          mkdir -p result
+          for f in ctest.log; do
+            if [ -f "$f" ]; then gzip -c "$f" > "result/$f.gz"; fi
+          done
+          for f in ctest.xml; do
+            for g in "$f" "build/$f"; do if [ -f "$g" ]; then cp "$g" "result/$f"; fi; done
+          done
+          cp ccache-stats.txt result/ 2>/dev/null || true
+          if [ -d build ]; then
+            find build -name '*.log' ! -name ctest.log ! -path '*/CMakeFiles/*' -size +0 -print0 | while IFS= read -r -d '' f; do
+              if grep -q 'VUID-' "$f"; then gzip -c "$f" > "result/replay-$(echo "$f" | tr '/' '_').gz"; fi
+            done
+          fi
+          python3 - <<'PY'
+          import json, os
+          e = os.environ.get
+          def num(k):
+              return int(e(k)) if e(k, "") != "" else None
+          json.dump({"id": e("ID"), "kind": e("KIND"), "side": e("SIDE"), "sha": e("SHA"), "patch": e("PATCH"), "os": "linux",
+                     "build_rc": num("BUILD_RC"), "test_rc": num("TEST_RC"), "layer_proof": e("LAYER_PROOF") == "1"},
+                    open("result/result.json", "w"), indent=1)
+          PY
+          {
+            echo "### $ID ($KIND, $SIDE) sha \`$SHA\`; build rc ${BUILD_RC:-?}, test rc ${TEST_RC:-?}"
+            echo '```'
+            head -14 ccache-stats.txt 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Summarize the sanitizer findings
+        if: ${{ (matrix.kind == 'asan' || matrix.kind == 'tsan') && !cancelled() && hashFiles('build/ctest.xml') != '' }}
+        env:
+          SANITIZERS: ${{ matrix.kind == 'asan' && '--sanitizer address --sanitizer undefined' || '--sanitizer thread' }}
+        run: python3 tools/sanitizer_report.py build/ctest.xml --title "$KIND" --known .github/sanitizer-known-failures.txt $SANITIZERS --summary "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: result-${{ inputs.tag }}${{ matrix.id }}
+          path: result/
+          if-no-files-found: ignore
+      - name: Verdict
+        if: ${{ !cancelled() }}
+        run: |
+          fail=0
+          if [ "${BUILD_RC:-1}" != 0 ] && [ "$KIND" != mutant ]; then echo "::error::the build failed"; fail=1; fi
+          case "$KIND" in
+            gate)
+              [ "${LAYER_PROOF:-0}" = 1 ] || { echo "::error::the Vulkan validation layer did not load"; fail=1; }
+              [ "${TEST_RC:-1}" = 0 ] || echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base" ;;
+            census) [ "${TEST_RC:-1}" = 0 ] || { echo "::error::census failed"; fail=1; } ;;
+            mutant)
+              if [ "${BUILD_RC:-1}" != 0 ]; then echo "::error::mutant did not build"; fail=1;
+              elif [ "${TEST_RC:-1}" = 0 ]; then echo "::error::mutant SURVIVED: all selected tests passed"; fail=1;
+              else echo "mutant killed"; fi ;;
+          esac
+          exit $fail
+
+  windows:
+    needs: plan
+    if: ${{ needs.plan.outputs.windows == 'true' }}
+    name: windows ${{ matrix.id }}
+    runs-on: windows-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.win_matrix) }}
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      TESTS: ${{ inputs.tests }}
+      REDUCED: ${{ inputs.reduced }}
+      CCACHE_COMPILERCHECK: content
+      VVL_VERSION: 1.4.363.1
+      VVL_SDK_SHA256: c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a
+      MESA_VERSION: 26.2.6
+      MESA_SHA256: b2e00615feaba45942343c265cc8c5f576142ca682c1ac6661922d4b72492877
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar --force-local -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar --force-local -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Point the WinLibs CMake at the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: C:\winlibs
+          key: ${{ env.WINLIBS_ZIP }}
+      - if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+      - run: echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+      - id: vk-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: C:\vk
+          key: vk-windows-${{ env.VVL_VERSION }}-mesa${{ env.MESA_VERSION }}
+      - name: Fetch Mesa lavapipe and the pinned LunarG loader and validation layer
+        id: vk-install
+        if: ${{ steps.vk-cache.outputs.cache-hit != 'true' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force C:\vk | Out-Null
+          curl.exe -sSfL --retry 3 -o "$env:RUNNER_TEMP\mesa.7z" "https://github.com/pal1000/mesa-dist-win/releases/download/$env:MESA_VERSION/mesa3d-$env:MESA_VERSION-release-msvc.7z"
+          if ((Get-FileHash "$env:RUNNER_TEMP\mesa.7z" -Algorithm SHA256).Hash.ToLower() -ne $env:MESA_SHA256) { throw 'mesa sha256 mismatch' }
+          7z e "-oC:\vk" "$env:RUNNER_TEMP\mesa.7z" x64/vulkan_lvp.dll x64/lvp_icd.x86_64.json -y
+          curl.exe -sSfL --retry 3 -o "$env:RUNNER_TEMP\vulkansdk.exe" "https://sdk.lunarg.com/sdk/download/$env:VVL_VERSION/windows/vulkansdk-windows-X64-$env:VVL_VERSION.exe"
+          if ((Get-FileHash "$env:RUNNER_TEMP\vulkansdk.exe" -Algorithm SHA256).Hash.ToLower() -ne $env:VVL_SDK_SHA256) { throw 'sdk sha256 mismatch' }
+          $p = Start-Process -PassThru -Wait -NoNewWindow -FilePath "$env:RUNNER_TEMP\vulkansdk.exe" -ArgumentList '--root', 'C:\VulkanSDK', '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if ($p.ExitCode -ne 0) { throw "sdk installer exit code $($p.ExitCode)" }
+          Copy-Item C:\Windows\System32\vulkan-1.dll C:\vk\
+          foreach ($name in 'VkLayer_khronos_validation.dll', 'VkLayer_khronos_validation.json', 'vulkaninfoSDK.exe') { Copy-Item "C:\VulkanSDK\Bin\$name" C:\vk\ }
+          Get-ChildItem C:\vk
+      - if: ${{ steps.vk-cache.outputs.cache-hit != 'true' && steps.vk-install.outcome == 'success' }}
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: C:\vk
+          key: ${{ steps.vk-cache.outputs.cache-primary-key }}
+      - uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: windows-${{ matrix.side }}
+          restore-keys: |
+            windows-base
+            windows-${{ matrix.side }}
+            windows
+          max-size: 4G
+          evict-old-files: 7d
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}
+      - id: seed-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: configure-seed.cmake
+          key: configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', 'tools/configure_seed.py', '.github/workflows/build.yml') }}
+      - name: Configure
+        shell: cmd
+        run: |
+          if exist configure-seed.cmake (cmake -C configure-seed.cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=) else (cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=)
+      - if: steps.seed-cache.outputs.cache-hit != 'true'
+        shell: cmd
+        run: python tools/configure_seed.py build/CMakeCache.txt configure-seed.cmake
+      - if: steps.seed-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: configure-seed.cmake
+          key: ${{ steps.seed-cache.outputs.cache-primary-key }}
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - id: build
+        name: Build
+        env:
+          KIND: ${{ matrix.kind }}
+        run: |
+          ccache --zero-stats
+          if [ "$REDUCED" = true ] && [ "$KIND" = gate ]; then
+            ctest --test-dir build -N -R "$TESTS" | tee build/selected.txt
+            python - <<'PY' > build/targets.txt
+          import glob, os, re, subprocess
+          selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
+          known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
+          names = set()
+          for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in selected:
+                      for word in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)):
+                          name = os.path.basename(word.replace("\\", "/"))
+                          for candidate in (name, name[:-4] if name.endswith(".exe") else name):
+                              if candidate in known:
+                                  names.add(candidate)
+          print(" ".join(sorted(names)))
+          PY
+            echo "targets: $(cat build/targets.txt)"
+            grep -q "[^[:space:]]" build/targets.txt || { echo "::error::none of the selected tests names a built executable"; exit 1; }
+            cmake --build build --target $(cat build/targets.txt) libs
+          else
+            cmake --build build
+          fi
+      - name: Build the libraries
+        id: libs
+        run: cmake --build build --target libs
+      - name: Report compiler cache statistics
+        if: ${{ !cancelled() }}
+        run: ccache --show-stats | tee ccache-stats.txt
+      - name: Register lavapipe and the validation layer with the loader
+        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          reg add HKLM\SOFTWARE\Khronos\Vulkan\Drivers /v C:\vk\lvp_icd.x86_64.json /t REG_DWORD /d 0 /f
+          reg add HKLM\SOFTWARE\Khronos\Vulkan\ExplicitLayers /v C:\vk\VkLayer_khronos_validation.json /t REG_DWORD /d 0 /f
+          reg query HKLM\SOFTWARE\Khronos\Vulkan /s
+      - name: Prove whether lavapipe and the validation layer load on Windows
+        id: proof
+        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          VK_LOADER_DEBUG: layer,driver
+        run: |
+          mkdir -p result
+          export PATH="/c/vk:$PATH"
+          {
+            echo "== layer: LunarG SDK $VVL_VERSION, lavapipe from mesa-dist-win $MESA_VERSION"
+            ls -l /c/vk
+            grep -E 'implementation_version|api_version|library_path' /c/vk/VkLayer_khronos_validation.json || true
+            /c/vk/vulkaninfoSDK.exe --summary
+            /c/vk/vulkaninfoSDK.exe | grep -E "VK_LAYER_KHRONOS_validation|Vulkan Instance Version" || true
+          } > result/layer-proof.txt 2>&1 || true
+          grep -E 'deviceName|driverName|Insert instance layer|was not found|Vulkan Instance Version|VK_LAYER_KHRONOS_validation' result/layer-proof.txt | sort -u | head -20 || true
+          if grep -q 'deviceName.*llvmpipe' result/layer-proof.txt; then echo "VK_DEVICE=1" >> "$GITHUB_ENV"; fi
+          if grep -q 'Insert instance layer "VK_LAYER_KHRONOS_validation"' result/layer-proof.txt && ! grep -q 'was not found but was requested' result/layer-proof.txt; then echo "LAYER_PROOF=1" >> "$GITHUB_ENV"; fi
+          exit 0
+      - name: Run the tests
+        id: test
+        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          VK_LOADER_DEBUG: layer
+          ANYPS5_NO_SHADER_CACHE: 1
+        run: |
+          export PATH="/c/vk:$PATH"
+          if [ "${VK_DEVICE:-0}" = 1 ]; then export ANYPS5_REQUIRE_VULKAN=1; fi
+          set +e
+          ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
+          echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
+          exit 0
+      - name: Collect the result
+        if: ${{ !cancelled() }}
+        env:
+          ID: ${{ matrix.id }}
+          SIDE: ${{ matrix.side }}
+          SHA: ${{ matrix.sha }}
+        run: |
+          mkdir -p result
+          if [ -f ctest.log ]; then gzip -c ctest.log > result/ctest.log.gz; fi
+          cp build/ctest.xml result/ctest.xml 2>/dev/null || true
+          cp ccache-stats.txt result/ 2>/dev/null || true
+          python tools/check_skips.py build/ctest.xml --job windows --list > result/skips.txt 2>&1 || true
+          python - <<'PY'
+          import json, os
+          e = os.environ.get
+          def num(k):
+              return int(e(k)) if e(k, "") != "" else None
+          json.dump({"id": e("ID"), "kind": "windows", "side": e("SIDE"), "sha": e("SHA"), "os": "windows",
+                     "build_rc": 0 if "${{ steps.libs.outcome }}" == "success" else 1, "test_rc": num("TEST_RC"),
+                     "layer_proof": e("LAYER_PROOF") == "1", "vk_device": e("VK_DEVICE") == "1"},
+                    open("result/result.json", "w"), indent=1)
+          PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: result-${{ inputs.tag }}${{ matrix.id }}
+          path: result/
+          if-no-files-found: ignore
+      - name: Verdict
+        if: ${{ !cancelled() }}
+        env:
+          LIBS_OUTCOME: ${{ steps.libs.outcome }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          if [ "$LIBS_OUTCOME" != success ]; then echo "::error::the build failed"; exit 1; fi
+          if [ "$KIND" = warm ]; then exit 0; fi
+          if [ "${TEST_RC:-1}" != 0 ]; then echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base"; fi
+
+  report:
+    needs: [plan, linux, windows]
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.warm != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: result-${{ inputs.tag }}*
+          path: results
+      - name: Parse the logs, compare ref with base, fail on a vacuous or regressed gate
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs" --paginate > jobs.json
+          python3 - <<'PY'
+          import collections, glob, gzip, json, os, re
+          out = open(os.environ["GITHUB_STEP_SUMMARY"], "a")
+          bad = []
+          def w(text=""):
+              print(text)
+              out.write(text + "\n")
+          def fail(msg):
+              bad.append(msg)
+              w(f"- FAIL: {msg}")
+          def read(path):
+              if path.endswith(".gz"):
+                  return gzip.open(path, "rt", errors="replace").read()
+              return open(path, errors="replace").read() if os.path.exists(path) else ""
+          LINE = re.compile(r"Test\s+#(\d+):\s+(\S+)\s+\.+\s*(.*?)\s+([\d.]+) sec")
+          SUMMARY = re.compile(r"(\d+)% tests passed, (\d+) tests? failed out of (\d+)")
+          VUID = re.compile(r"VUID-[A-Za-z0-9_-]+")
+          def status(text):
+              text = text.strip()
+              if text.startswith("Passed"):
+                  return "passed"
+              if "Skipped" in text:
+                  return "skipped"
+              if "Not Run" in text:
+                  return "notrun"
+              return "failed"
+          def parse(text):
+              text = text.replace("\r", "")
+              tests, ids = {}, {}
+              for m in LINE.finditer(text):
+                  tests[m[2]] = status(m[3])
+                  ids[m[1]] = m[2]
+              total = None
+              for m in SUMMARY.finditer(text):
+                  total = int(m[3])
+              per_test, global_ids = collections.defaultdict(collections.Counter), collections.Counter()
+              vuid_lines = 0
+              for line in text.splitlines():
+                  if "VUID-" in line:
+                      vuid_lines += 1
+                      global_ids.update(VUID.findall(line))
+                      m = re.match(r"(\d+): ", line)
+                      if m and m[1] in ids:
+                          per_test[ids[m[1]]].update(VUID.findall(line))
+              return dict(tests=tests, total=total, per_test=per_test, vuid_ids=global_ids, vuid_lines=vuid_lines,
+                          missing=text.count("was not found but was requested"),
+                          inserts=text.count('Insert instance layer "VK_LAYER_KHRONOS_validation"'),
+                          pnext=text.count("VUID-VkDeviceCreateInfo-pNext-pNext"))
+          results = {}
+          for path in glob.glob("results/**/result.json", recursive=True):
+              folder = os.path.dirname(path)
+              data = json.load(open(path))
+              data["_dir"] = folder
+              data.update(parse(read(os.path.join(folder, "ctest.log.gz"))))
+              data["proof"] = read(os.path.join(folder, "layer-proof.txt"))
+              data["stats"] = read(os.path.join(folder, "ccache-stats.txt"))
+              data["skips"] = read(os.path.join(folder, "skips.txt"))
+              replay = {}
+              for rp in glob.glob(os.path.join(folder, "replay-*.gz")):
+                  replay[os.path.basename(rp)] = collections.Counter(VUID.findall(read(rp)))
+              data["replay"] = replay
+              results[data["id"]] = data
+          jobs = json.load(open("jobs.json"))["jobs"]
+          from datetime import datetime
+          def dur(a, b):
+              if not a or not b:
+                  return "n/a"
+              s = int((datetime.fromisoformat(b.replace("Z", "+00:00")) - datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds())
+              return f"{s // 60}m{s % 60:02d}s"
+          KEEP = ("Configure", "Build", "Build the libraries", "Run the tests", "Run the tests with the validation layer",
+                  "Run the allocation census", "Run the tests under the sanitizer", "Run the tests of the mutant",
+                  "Install the pinned Khronos validation layer and Vulkan loader from the LunarG SDK",
+                  "Fetch Mesa lavapipe and the pinned LunarG loader and validation layer")
+          w("## Fork CI report")
+          w("| job | total | steps | ccache hits / misses | build rc | test rc |")
+          w("| - | - | - | - | - | - |")
+          prefix = os.environ.get("TAG", "").rstrip("-")
+          for job in sorted(jobs, key=lambda j: j["name"]):
+              if prefix and not job["name"].startswith(prefix + " / "):
+                  continue
+              job["name"] = job["name"].split(" / ", 1)[1] if prefix else job["name"]
+              if job["name"] in ("plan", "report") or job["status"] != "completed" or job["conclusion"] == "skipped":
+                  continue
+              steps = "; ".join(f"{s['name'].split(' ')[0] if len(s['name']) > 24 else s['name']} {dur(s['started_at'], s['completed_at'])}"
+                                for s in job["steps"] if s["name"] in KEEP)
+              key = job["name"].split(" ", 1)[-1]
+              r = results.get(key, {})
+              st = r.get("stats", "")
+              hits = re.search(r"Hits:\s+(\d+) / (\d+)", st)
+              miss = re.search(r"Misses:\s+(\d+)", st)
+              rate = f"{hits[1]} / {miss[1]}" if hits and miss else "n/a"
+              w(f"| {job['name']} | {dur(job['started_at'], job['completed_at'])} | {steps} | {rate} | {r.get('build_rc')} | {r.get('test_rc')} |")
+
+          def side(r, label):
+              c = collections.Counter(r["tests"].values())
+              w(f"- {label} `{r['sha'][:10]}`: ran {len(r['tests'])} tests (ctest reports {r['total']}): {dict(c)}; "
+                f"VUID lines {r['vuid_lines']} (VkDeviceCreateInfo-pNext-pNext lines {r['pnext']}); layer inserts in test logs {r['inserts']}; "
+                f"missing-layer lines {r['missing']}; VUIDs in replay logs {sum(sum(v.values()) for v in r['replay'].values())}")
+              if not r["tests"]:
+                  fail(f"{label} ran 0 tests: the gate is vacuous")
+              elif r["total"] is not None and r["total"] != len(r["tests"]):
+                  fail(f"{label} parsed {len(r['tests'])} tests but ctest reports {r['total']}")
+              if r["missing"]:
+                  fail(f"{label}: the validation layer was requested but not found")
+              if c["notrun"]:
+                  fail(f"{label}: {c['notrun']} test(s) did not run: {sorted(n for n, st in r['tests'].items() if st == 'notrun')}")
+
+          def compare(ref, base, what):
+              only_ref = sorted(set(ref["tests"]) - set(base["tests"]))
+              only_base = sorted(set(base["tests"]) - set(ref["tests"]))
+              if only_base:
+                  fail(f"{what}: tests the base runs and the ref does not: {only_base} (only on ref: {only_ref})")
+              elif only_ref:
+                  w(f"- {what}: the change adds tests {only_ref}; they must pass")
+                  notok = [n for n in only_ref if ref["tests"][n] != "passed"]
+                  if notok:
+                      fail(f"{what}: tests added by the change did not pass: {notok}")
+              else:
+                  w(f"- {what}: test sets equal ({len(ref['tests'])} tests)")
+              both = sorted(n for n, s in ref["tests"].items() if s == "failed" and base["tests"].get(n) == "failed")
+              if both:
+                  w(f"- {what}: failing on both sides (not caused by the change): {both}")
+              newfail = sorted(n for n, s in ref["tests"].items() if s == "failed" and base["tests"].get(n) != "failed")
+              w(f"- {what}: failing on ref but not on base: {newfail or 'none'}")
+              if newfail:
+                  fail(f"{what}: {len(newfail)} test(s) fail on ref only: {newfail}")
+              new = {}
+              for n, ids in ref["per_test"].items():
+                  for vid in ids:
+                      if vid not in base["per_test"].get(n, {}):
+                          new.setdefault(n, []).append(vid)
+              for vid in ref["vuid_ids"]:
+                  if vid not in base["vuid_ids"]:
+                      new.setdefault("(any test)", []).append(vid)
+              for rp, ids in ref["replay"].items():
+                  for vid in ids:
+                      if not any(vid in b for b in base["replay"].values()):
+                          new.setdefault("(replay log)", []).append(vid)
+              w(f"- {what}: VUIDs new on ref: {new or 'none'}")
+              if new:
+                  fail(f"{what}: new VUIDs on ref: {new}")
+
+          ref, base = results.get("gate-ref"), results.get("gate-base")
+          if ref or base:
+              w("\n## Linux gate (lavapipe, Khronos validation layer)")
+              for label, r in (("ref", ref), ("base", base)):
+                  if r is None:
+                      fail(f"linux gate {label}: no result"); continue
+                  proof = [l for l in r["proof"].splitlines() if re.search(r"implementation_version|api_version|VK_LAYER_KHRONOS_validation.*(version|layer)|deviceName|Vulkan Instance Version", l)]
+                  w(f"- layer proof {label}: {r['layer_proof']}; " + " | ".join(x.strip() for x in proof[:6]))
+                  if not r["layer_proof"]:
+                      fail(f"linux gate {label}: the validation layer did not load")
+                  side(r, f"linux {label}")
+                  if r["tests"] and all(s == "skipped" for s in r["tests"].values()):
+                      fail(f"linux gate {label}: every test was skipped")
+              if ref and base:
+                  compare(ref, base, "linux gate")
+
+          wref, wbase = results.get("windows-ref"), results.get("windows-base")
+          if wref or wbase:
+              w("\n## Windows (MinGW build, Mesa lavapipe from mesa-dist-win, Khronos layer from the LunarG SDK)")
+              for label, r in (("ref", wref), ("base", wbase)):
+                  if r is None:
+                      fail(f"windows {label}: no result"); continue
+                  side(r, f"windows {label}")
+                  c = collections.Counter(r["tests"].values())
+                  w(f"  - lavapipe device found: {r['vk_device']}; layer loaded: {r['layer_proof']}; skipped {c['skipped']} of {len(r['tests'])}")
+                  if r["build_rc"] != 0:
+                      fail(f"windows {label}: the build failed")
+                  if r["tests"] and c["skipped"] == len(r["tests"]):
+                      w(f"  - build + non-GPU tests only: every test skipped. Skips:")
+                      for line in r["skips"].splitlines()[:30]:
+                          w(f"    - {line}")
+                  elif c["skipped"]:
+                      w(f"  - skipped: {sorted(n for n, s in r['tests'].items() if s == 'skipped')}")
+                  if r["vk_device"] and c["skipped"] != len(r["tests"]) and not r["layer_proof"]:
+                      fail(f"windows {label}: GPU tests ran without the validation layer")
+              if wref and wbase:
+                  compare(wref, wbase, "windows")
+
+          for san in ("asan", "tsan"):
+              if san in results:
+                  r = results[san]
+                  w(f"\n## {san}: tests {dict(collections.Counter(r['tests'].values()))} (ctest reports {r['total']})")
+                  if not r["tests"]:
+                      fail(f"{san} ran 0 tests")
+          if "census" in results:
+              w("\n## Host allocations per draw, by test")
+              w("| test | shape | allocations per draw (bytes) |")
+              w("| - | - | - |")
+              text = read(os.path.join(results["census"]["_dir"], "ctest.log.gz")).replace("\r", "")
+              names = {m[1]: m[2] for m in LINE.finditer(text)}
+              rows = []
+              for line in text.splitlines():
+                  pm = re.match(r"(\d+): draw allocations \[([^\]]+)\] per draw: ([0-9.]+) \(([0-9.]+) bytes\)", line)
+                  if pm and pm[1] in names:
+                      rows.append((names[pm[1]], pm[2], f"{float(pm[3]):.3f} ({float(pm[4]):.0f} B)"))
+              for row in sorted(set(rows)):
+                  w("| " + " | ".join(row) + " |")
+              if not rows:
+                  fail("census printed no allocation table")
+          mutants = {k: v for k, v in results.items() if v["kind"] == "mutant"}
+          if mutants:
+              w("\n## Mutants")
+              for k, r in sorted(mutants.items()):
+                  ran = bool(r["tests"])
+                  if r["build_rc"] != 0:
+                      verdict = "build error"; fail(f"mutant {r['patch']} did not build")
+                  elif r["test_rc"] not in (None, 0) and "failed" in r["tests"].values():
+                      verdict = "killed"
+                  else:
+                      verdict = "SURVIVED"; fail(f"mutant {r['patch']} survived")
+                  w(f"- `{r['patch']}`: {verdict} ({collections.Counter(r['tests'].values())})")
+          w("\n## Verdict")
+          w("RED: " + "; ".join(bad) if bad else "GREEN")
+          summary = {"tag": prefix, "verdict": "RED" if bad else "GREEN", "bad": bad}
+          for label, pair in (("linux", (ref, base)), ("windows", (wref, wbase))):
+              if pair[0]:
+                  summary[label] = dict(collections.Counter(pair[0]["tests"].values()), ran=len(pair[0]["tests"]),
+                                        vuid_lines=pair[0]["vuid_lines"], base_vuid_lines=pair[1]["vuid_lines"] if pair[1] else None,
+                                        sha=pair[0]["sha"], base=pair[1]["sha"] if pair[1] else None)
+          json.dump(summary, open("summary.json", "w"), indent=1)
+          raise SystemExit(1 if bad else 0)
+          PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: summary-${{ inputs.tag || 'run' }}
+          path: summary.json
+          if-no-files-found: ignore
