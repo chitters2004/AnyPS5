@@ -313,6 +313,9 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
 void resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
     AgcDriverWaitIdle_nid_postfix();
     for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) AgcDriverReplaceGuestMemory_nid_no_patch(chunk.address, static_cast<std::size_t>(chunk.bytes));
+    }
+    for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
     }
     restoreSnapshot(reader, skipped);

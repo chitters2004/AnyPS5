@@ -3053,7 +3053,10 @@ void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes)
         range.live = std::move(remaining);
     }
     for (const auto& range : depthGuards()) {
-        if (std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); })) range.active->store(false, std::memory_order_release);
+        if (std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); })) {
+            range.active->store(false, std::memory_order_release);
+            range.hostWritten->store(false, std::memory_order_release);
+        }
     }
     std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
