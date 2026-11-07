@@ -790,7 +790,10 @@ jobs:
               for line in open(path, encoding="utf-8", errors="replace"):
                   tm = re.match(r"\s*(?:add_test|set_tests_properties)\(\[=\[(.*?)\]=\]", line)
                   if tm and tm.group(1) in chosen:
-                      for ref in re.findall(re.escape(build_ci) + r"[^\s;\"\)\]]*", line):
+                      for ref in re.findall(re.escape(build_ci) + r"[^\s;\"\)\]]*", line, re.I):
+                          if os.path.isfile(ref):
+                              exes.add(ref)
+                              continue
                           for cand in (ref, os.path.dirname(ref)):
                               if os.path.isdir(cand):
                                   dirs.add(os.path.relpath(cand, build).replace("\\", "/"))
