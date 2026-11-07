@@ -976,15 +976,21 @@ void forgetSingleClears(std::uintptr_t address, std::size_t bytes) {
     anySingleClears().store(!singleClears().empty(), std::memory_order_release);
 }
 
-void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
+void retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
     forgetSingleClears(address, bytes);
-    RetireUnmappedDepth_nid_no_patch(address, bytes);
+    if (replaced) RetireReplacedDepth_nid_no_patch(address, bytes);
+    else RetireUnmappedDepth_nid_no_patch(address, bytes);
     std::unique_lock lock(guardedMutex());
     bool metadataChanged = false;
     const auto invalidated = std::erase_if(guarded(), [&](const auto& range) {
-        if (range.metadataValid && address < range.address + range.bytes && range.address < address + bytes) {
+        const bool overlaps = address < range.address + range.bytes && range.address < address + bytes;
+        if (range.metadataValid && overlaps) {
             range.metadataValid->store(false, std::memory_order_release);
             metadataChanged = true;
+        }
+        if (replaced && !range.metadataValid && overlaps) {
+            range.active->store(false, std::memory_order_release);
+            return true;
         }
         if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
         if (!range.metadataValid) range.active->store(false, std::memory_order_release);
@@ -993,6 +999,10 @@ void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
     const auto stale = std::erase_if(guarded(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
     if (metadataChanged || invalidated != 0 || stale != 0) guardedGeneration().fetch_add(1, std::memory_order_release);
     anyGuarded().store(!guarded().empty(), std::memory_order_release);
+}
+
+void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
+    retireGuarded(address, bytes, false);
 }
 
 void claimOverlapping(std::uint64_t address, std::uint64_t bytes, const TargetUse* claimant) {
@@ -1205,6 +1215,11 @@ void UpdateResidentImageUnmapObserver_nid_no_patch() {
     static std::mutex mutex;
     std::lock_guard lock(mutex);
     GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || anySingleClears().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() || DepthPlanesStale() ? &retireUnmapped : nullptr);
+}
+
+void RetireResidentImagesOver_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireGuarded(address, bytes, true);
+    UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
 std::optional<DccKeys> MultisampledCmaskKeys(std::uint8_t code) {
