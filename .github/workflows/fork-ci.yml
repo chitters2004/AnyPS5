@@ -818,6 +818,15 @@ jobs:
               keep(exe)
               for dll in glob.glob(os.path.join(os.path.dirname(exe), "*.dll")):
                   keep(dll)
+          baked = re.compile(re.escape(build_ci.encode()) + rb"[^\x00\"\r\n]*", re.I)
+          for rel in list(copied):
+              if rel.lower().endswith((".exe", ".dll")):
+                  for hit in set(baked.findall(open(os.path.join(build, rel), "rb").read())):
+                      ref = hit.decode("utf-8", "replace")
+                      if os.path.isfile(ref):
+                          keep(ref)
+                      elif os.path.isdir(ref):
+                          dirs.add(os.path.relpath(ref, build).replace("\\", "/"))
           by_name = {}
           keep(os.path.join(build, "CMakeCache.txt"))
           for path in glob.glob(build + "/**/*.dll", recursive=True):
