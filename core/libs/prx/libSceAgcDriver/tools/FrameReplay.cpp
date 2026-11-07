@@ -31,6 +31,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -314,15 +315,84 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     return skipped;
 }
 
-void resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
+std::uint64_t resetRange(const FrameCaptureReader& reader, const FrameMemoryChunk& range, std::span<const FrameMemoryChunk* const> snapshot, std::vector<std::byte>& desired, std::vector<std::byte>& staged, std::mutex& driverMutex) {
+    constexpr std::uint64_t Page = 4096;
+    const auto rangeEnd = range.address + range.bytes;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> hostOnly;
+    {
+        std::lock_guard lock(driverMutex);
+        AgcDriverFlushGuestMemory_nid_no_patch(range.address, static_cast<std::size_t>(range.bytes));
+        AgcDriverHostOnlySampleRanges_nid_no_patch(range.address, static_cast<std::size_t>(range.bytes), hostOnly);
+    }
+    desired.assign(static_cast<std::size_t>(range.bytes), std::byte{0});
+    auto chunk = std::partition_point(snapshot.begin(), snapshot.end(), [&](const auto* piece) { return piece->address + piece->bytes <= range.address; });
+    for (; chunk != snapshot.end() && (*chunk)->address < rangeEnd; ++chunk) {
+        const auto& piece = **chunk;
+        if (piece.address >= range.address && piece.address + piece.bytes <= rangeEnd) {
+            reader.Read(piece, std::span(desired.data() + (piece.address - range.address), static_cast<std::size_t>(piece.bytes)));
+            continue;
+        }
+        const auto begin = std::max(piece.address, range.address);
+        const auto end = std::min(piece.address + piece.bytes, rangeEnd);
+        staged.resize(static_cast<std::size_t>(piece.bytes));
+        reader.Read(piece, staged);
+        std::memcpy(desired.data() + (begin - range.address), staged.data() + (begin - piece.address), static_cast<std::size_t>(end - begin));
+    }
+    const auto* const current = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(range.address));
+    const auto next = [&](std::uint64_t address) { return std::min((address & ~(Page - 1)) + Page, rangeEnd); };
+    const auto differs = [&](std::uint64_t address) {
+        const auto end = next(address);
+        if (std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) return true;
+        return std::memcmp(current + (address - range.address), desired.data() + (address - range.address), static_cast<std::size_t>(end - address)) != 0;
+    };
+    std::uint64_t rewritten = 0;
+    for (auto address = range.address; address < rangeEnd;) {
+        if (!differs(address)) {
+            address = next(address);
+            continue;
+        }
+        auto end = next(address);
+        while (end < rangeEnd && differs(end)) end = next(end);
+        const auto bytes = static_cast<std::size_t>(end - address);
+        {
+            std::lock_guard lock(driverMutex);
+            AgcDriverReplaceGuestMemory_nid_no_patch(address, bytes);
+        }
+        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - range.address), bytes);
+        rewritten += bytes;
+        address = end;
+    }
+    return rewritten;
+}
+
+std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
     AgcDriverWaitIdle_nid_postfix();
+    std::vector<const FrameMemoryChunk*> ranges;
+    std::vector<const FrameMemoryChunk*> snapshot;
+    std::uint64_t rangeBytes = 0;
     for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) AgcDriverReplaceGuestMemory_nid_no_patch(chunk.address, static_cast<std::size_t>(chunk.bytes));
+        if (skipped.Overlaps(chunk)) continue;
+        if (chunk.kind == FrameMemoryKind::Range) {
+            ranges.push_back(&chunk);
+            rangeBytes += chunk.bytes;
+        } else if (chunk.kind == FrameMemoryKind::Snapshot) {
+            snapshot.push_back(&chunk);
+        }
     }
-    for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
+    std::mutex driverMutex;
+    std::atomic<std::size_t> claimed{0};
+    std::atomic<std::uint64_t> rewritten{0};
+    std::vector<std::future<void>> workers;
+    for (std::size_t worker = 0; worker < std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, std::max<std::size_t>(1, ranges.size())); ++worker) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            std::vector<std::byte> desired;
+            std::vector<std::byte> staged;
+            for (auto index = claimed++; index < ranges.size(); index = claimed++) rewritten += resetRange(reader, *ranges[index], snapshot, desired, staged, driverMutex);
+        }));
     }
-    restoreSnapshot(reader, skipped);
+    for (auto& worker : workers) worker.get();
+    return {rewritten.load(), rangeBytes};
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
@@ -1121,6 +1191,8 @@ struct Pass {
     double seconds = 0.0;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
+    std::uint64_t rewrittenBytes = 0;
+    std::uint64_t rangeBytes = 0;
 };
 
 double percentile(std::vector<double> values, double fraction) {
@@ -1153,8 +1225,9 @@ int run(const Options& options) {
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
+        std::pair<std::uint64_t, std::uint64_t> reset{0, 0};
         if (pass > 0) {
-            resetMemory(reader, replay.skipped);
+            reset = resetMemory(reader, replay.skipped);
             replay.pass = pass;
             replay.recording = false;
             for (auto output = replay.outputs.begin(); output != replay.outputs.end();) {
@@ -1175,7 +1248,7 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
-        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load(), reset.first, reset.second};
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
@@ -1206,9 +1279,9 @@ int run(const Options& options) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames; ++frame) passMs.push_back(std::chrono::duration<double, std::milli>(ready[frame] - ready[frame - 1]).count());
-        char entry[192];
-        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
-                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized));
+        char entry[256];
+        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"rewritten_bytes\":%llu,\"range_bytes\":%llu}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
+                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), static_cast<unsigned long long>(measured.rewrittenBytes), static_cast<unsigned long long>(measured.rangeBytes));
         passList += entry;
         if (index < firstMeasured) continue;
         for (const auto value : passMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));

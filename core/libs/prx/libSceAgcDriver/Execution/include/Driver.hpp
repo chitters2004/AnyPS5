@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <span>
 #include <cstddef>
+#include <utility>
+#include <vector>
 #include "SceTypes.hpp"
 #include "SceShaders.hpp"
 
@@ -23,6 +25,8 @@ struct AwaitedWait {
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes);
+extern "C" void AgcDriverFlushGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes);
+extern "C" void AgcDriverHostOnlySampleRanges_nid_no_patch(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes);
 extern "C" void AgcDriverWaitIdle_nid_postfix();
 extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords);
