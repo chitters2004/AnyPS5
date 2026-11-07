@@ -24,7 +24,7 @@ class Unsupported(Exception):
 
 def bash_exe():
     if os.name == "nt":
-        for candidate in (r"C:\Program Files\Gitinash.exe", r"C:\Program Files (x86)\Gitinash.exe"):
+        for candidate in ("C:/Program Files/Git/bin/bash.exe", "C:/Program Files (x86)/Git/bin/bash.exe"):
             if os.path.exists(candidate):
                 return candidate
     return "bash"
