@@ -8,8 +8,10 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -42,6 +44,11 @@ constexpr std::uint32_t TileDepth64KB = 0x18;
 constexpr std::uint32_t TileRenderTarget64KB = 0x1b;
 constexpr std::uint32_t Type2D = 9;
 constexpr std::uint32_t Type2DArray = 13;
+
+#ifdef __GLIBC__
+thread_local bool countingAllocations = false;
+thread_local std::size_t countedAllocations = 0;
+#endif
 
 std::uintptr_t nextHandle = 0x1000;
 
@@ -563,6 +570,30 @@ void TestUntrackedHtileDriverStore(const Context& context) {
     ClearDepthSurfaces(context.device);
 }
 
+void TestRepeatedDepthViewAllocations(const Context& context) {
+#ifdef __GLIBC__
+    ClearDepthSurfaces(context.device);
+    constexpr VkExtent2D extent{256, 256};
+    DepthTarget target{0xa4000000, 0xa5000000, extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    const auto draw = [&] { return DepthSurfaceViewWithStencilWriteIntent(context, target, true, true, true); };
+    const auto view = draw();
+    Require(view != VK_NULL_HANDLE, "a mirrorable depth and stencil surface must render");
+    draw();
+    const auto images = createdImages.size();
+    countedAllocations = 0;
+    countingAllocations = true;
+    VkImageView repeated = VK_NULL_HANDLE;
+    for (int index = 0; index < 16; ++index) repeated = draw();
+    countingAllocations = false;
+    Require(repeated == view && createdImages.size() == images, "a repeated draw into a resident depth surface must reuse its image and view");
+    Require(countedAllocations == 0, "a repeated draw into a resident depth surface allocated " + std::to_string(countedAllocations) + " times over 16 draws: its view resolution must not rebuild per-surface geometry");
+    ClearDepthSurfaces(context.device);
+#else
+    static_cast<void>(context);
+#endif
+}
+
 void TestUnmappedStalePlaneFlush(const Context& context) {
     ClearDepthSurfaces(context.device);
     constexpr VkExtent2D extent{256, 256};
@@ -639,6 +670,7 @@ void RunDepthSurfaceReuseTests() {
     TestUntrackedHtileScan(context);
     TestUntrackedHtileStencilScan(context);
     TestUntrackedHtileDriverStore(context);
+    TestRepeatedDepthViewAllocations(context);
     TestUnmappedStalePlaneFlush(context);
     TestReadOnlyStalePlaneFlush(context);
     constexpr std::uint64_t depth32 = 0x40000000;
@@ -736,3 +768,14 @@ void RunDepthSurfaceReuseTests() {
 
     ClearDepthSurfaces(context.device);
 }
+
+#ifdef __GLIBC__
+void* operator new(std::size_t bytes) {
+    if (countingAllocations) ++countedAllocations;
+    if (auto* allocation = std::malloc(bytes == 0 ? 1 : bytes)) return allocation;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+void operator delete(void* allocation, std::size_t) noexcept { std::free(allocation); }
+#endif
