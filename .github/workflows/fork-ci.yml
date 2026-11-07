@@ -586,6 +586,9 @@ jobs:
             if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
           done
           echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - name: Mount the workspace at the path of the gate bundle
+        if: ${{ matrix.kind == 'bundle' }}
+        run: cmd //c "mklink /J C:\ci-gate $(cygpath -w "$GITHUB_WORKSPACE")"
       - id: toolchain
         uses: actions/cache@v6
         with:
@@ -627,7 +630,7 @@ jobs:
           key: ${{ steps.vk-cache.outputs.cache-primary-key }}
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
-          key: windows-${{ matrix.side }}
+          key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side }}
           restore-keys: |
             windows-base
             windows-${{ matrix.side }}
@@ -638,18 +641,20 @@ jobs:
         uses: actions/cache/restore@v6
         with:
           path: build/externals
-          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}
+          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}${{ matrix.kind == 'bundle' && '-gate' || '' }}
       - id: seed-cache
         uses: actions/cache/restore@v6
         with:
           path: configure-seed.cmake
-          key: configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', 'tools/configure_seed.py', '.github/workflows/build.yml') }}
+          key: ${{ matrix.kind == 'bundle' && 'gate-' || '' }}configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', 'tools/configure_seed.py', '.github/workflows/build.yml') }}
       - name: Configure
         shell: cmd
+        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
         run: |
           if exist configure-seed.cmake (cmake -C configure-seed.cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=) else (cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=)
       - if: steps.seed-cache.outputs.cache-hit != 'true'
         shell: cmd
+        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
         run: python tools/configure_seed.py build/CMakeCache.txt configure-seed.cmake
       - if: steps.seed-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -665,6 +670,7 @@ jobs:
           key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - id: build
         name: Build
+        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
         env:
           KIND: ${{ matrix.kind }}
         run: |
@@ -695,6 +701,7 @@ jobs:
           fi
       - name: Build the libraries
         id: libs
+        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
         run: cmake --build build --target libs
       - name: Report compiler cache statistics
         if: ${{ !cancelled() }}
@@ -743,6 +750,7 @@ jobs:
           exit 0
       - name: Assemble the gate bundle
         id: bundle
+        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
         if: ${{ !cancelled() && matrix.kind == 'bundle' && steps.libs.outcome == 'success' }}
         env:
           SHA: ${{ matrix.sha }}
@@ -759,6 +767,12 @@ jobs:
           if not chosen:
               raise SystemExit("no test is selected")
           copied = {}
+          cache = open(os.path.join(build, "CMakeCache.txt"), errors="replace").read()
+          def cv(key):
+              m = re.search(r"^" + re.escape(key) + r":[A-Z]+=(.*)$", cache, re.M)
+              return m.group(1) if m else None
+          build_ci = cv("CMAKE_CACHEFILE_DIR")
+          dirs = set()
           def keep(path):
               rel = os.path.relpath(path, build).replace("\\", "/")
               if rel in copied or rel.startswith(".."):
@@ -769,12 +783,18 @@ jobs:
               copied[rel] = os.path.getsize(path)
           for path in glob.glob(build + "/**/CTestTestfile.cmake", recursive=True):
               keep(path)
-          src_prefix = None
           build_abs = os.path.abspath(build).replace("\\", "/")
-          roots, path_dirs = set(), set()
+          path_dirs = set()
           exes = set()
           for path in glob.glob(build + "/**/CTestTestfile.cmake", recursive=True):
               for line in open(path, encoding="utf-8", errors="replace"):
+                  tm = re.match(r"\s*(?:add_test|set_tests_properties)\(\[=\[(.*?)\]=\]", line)
+                  if tm and tm.group(1) in chosen:
+                      for ref in re.findall(re.escape(build_ci) + r"[^\s;\"\)\]]*", line):
+                          for cand in (ref, os.path.dirname(ref)):
+                              if os.path.isdir(cand):
+                                  dirs.add(os.path.relpath(cand, build).replace("\\", "/"))
+                                  break
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in chosen:
                       for word in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)):
@@ -786,7 +806,8 @@ jobs:
                       for d in re.findall(r"PATH=path_list_prepend:([^;\"]+)", m.group(2)):
                           if os.path.isdir(d):
                               path_dirs.add(d)
-          bundled = []
+          if not exes:
+              raise SystemExit("no executable of the selected tests lies under " + build_abs)
           for d in sorted(path_dirs):
               for root, dirs, files in os.walk(d):
                   dirs[:] = [x for x in dirs if x != "implib"]
@@ -798,6 +819,7 @@ jobs:
               for dll in glob.glob(os.path.join(os.path.dirname(exe), "*.dll")):
                   keep(dll)
           by_name = {}
+          keep(os.path.join(build, "CMakeCache.txt"))
           for path in glob.glob(build + "/**/*.dll", recursive=True):
               by_name.setdefault(os.path.basename(path).lower(), []).append(path)
           unresolved = set()
@@ -819,11 +841,6 @@ jobs:
                               queue.append(os.path.join(out, "build", rel))
                   else:
                       unresolved.add(name)
-          keep(os.path.join(build, "CMakeCache.txt"))
-          cache = open(os.path.join(build, "CMakeCache.txt"), errors="replace").read()
-          def cv(key):
-              m = re.search(r"^" + re.escape(key) + r":[A-Z]+=(.*)$", cache, re.M)
-              return m.group(1) if m else None
           tool = lambda *a: subprocess.run(list(a), capture_output=True, text=True).stdout.splitlines()[0]
           manifest = {
               "sha": e("SHA"),
@@ -832,12 +849,13 @@ jobs:
               "cmake": tool("cmake", "--version"),
               "ninja": tool("ninja", "--version"),
               "configure": e("CONFIGURE", "") + " -DANYPS5_AGC_EXECUTION_TESTS=",
-              "build_dir": os.path.abspath(build).replace("\\", "/"),
+              "build_dir": cv("CMAKE_CACHEFILE_DIR"),
               "source_dir": cv("CMAKE_HOME_DIRECTORY"),
               "build_type": cv("CMAKE_BUILD_TYPE"),
               "agc_execution_tests": cv("ANYPS5_AGC_EXECUTION_TESTS"),
               "tests_regex": e("TESTS"),
               "tests": sorted(chosen),
+              "dirs": sorted(d for d in dirs if d != "."),
               "unresolved_dlls": sorted(unresolved),
               "files": [[r, s] for r, s in sorted(copied.items())],
           }
