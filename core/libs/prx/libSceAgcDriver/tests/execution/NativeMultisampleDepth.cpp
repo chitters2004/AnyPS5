@@ -3149,6 +3149,13 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
         }
         Require(std::all_of(output.Bytes().begin(), output.Bytes().begin() + 16u, [](std::byte value) { return value == std::byte{0xa5}; }) && std::all_of(output.Bytes().end() - 16u, output.Bytes().end(), [](std::byte value) { return value == std::byte{0xa5}; }), "retirement fetch wrote beyond its output");
     }
+    if ((mode & 1u) != 0u) return;
+    firstTexture.reset();
+    recorder.Sync();
+    ClearCachedTextures(context.device);
+    const auto released = DepthSurfacesReleased();
+    Require(DepthSurfaceView(context, DepthTarget{colorMemory.Address(), 0u, extent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u}) != VK_NULL_HANDLE, "retirement fixture has no later depth attachment");
+    Require(DepthSurfacesReleased() == released + 1u, "a written native depth owner whose memory was released stayed cached after its views were released");
 }
 
 constexpr std::size_t DriverMetadataSpan = 131072u;
