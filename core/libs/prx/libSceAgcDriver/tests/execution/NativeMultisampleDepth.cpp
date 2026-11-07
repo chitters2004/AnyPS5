@@ -3041,12 +3041,18 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
         unmap(depthBytes, metadataBytes / 2u);
         guarded();
         unmap(depthBytes + metadataBytes / 2u, metadataBytes / 2u);
-    } else {
+    } else if (mode == 3u) {
         unmap(depthBytes / 2u, depthBytes / 2u + metadataBytes / 2u);
         guarded();
         unmap(0u, depthBytes / 2u);
         guarded();
         unmap(depthBytes + metadataBytes / 2u, metadataBytes / 2u);
+    } else if (mode == 4u) {
+        RetireResidentImagesOver_nid_no_patch(memory.Address(), 4096u);
+    } else if (mode == 5u) {
+        RetireResidentImagesOver_nid_no_patch(memory.Address() + depthBytes, metadataBytes);
+    } else {
+        RetireResidentImagesOver_nid_no_patch(memory.Address() + depthBytes / 2u, depthBytes / 2u + metadataBytes / 2u);
     }
     RequireNoResidentDepthRead_nid_no_patch(target.address, 1u);
     RequireNoResidentDepthRead_nid_no_patch(target.htileAddress, metadataBytes);
@@ -3766,8 +3772,8 @@ int main(int argc, char** argv) {
             std::uint32_t checked = 0u, unavailable = 0u;
             for (const auto format : {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT}) {
                 for (const auto samples : {2u, 4u, 8u}) {
-                    if (!DepthSupported(context, format, samples)) { unavailable += 4u; continue; }
-                    for (std::uint32_t mode = 0u; mode < 4u; ++mode) { CheckRetirement(context, format, samples, mode); ++checked; }
+                    if (!DepthSupported(context, format, samples)) { unavailable += 7u; continue; }
+                    for (std::uint32_t mode = 0u; mode < 7u; ++mode) { CheckRetirement(context, format, samples, mode); ++checked; }
                 }
             }
             std::printf("Native depth retirement cases checked=%u unavailable=%u\n", checked, unavailable);
