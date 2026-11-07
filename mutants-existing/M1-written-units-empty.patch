@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+index 338f3460be..8da4564b10 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -1361,7 +1361,7 @@ public:
+         std::vector<bool> changed;
+         const auto mark = [&](std::size_t unit) {
+             if (changed.empty()) changed.assign(unitGeneration.size(), false);
+-            changed[unit] = true;
++            static_cast<void>(unit);
+         };
+         if (collected == 0u) {
+             for (std::size_t unit = 0; unit < unitGeneration.size(); ++unit) {
