@@ -540,6 +540,15 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         std::size_t replayed = 0;
         for (auto found = report.find("\"frames\":1,\"p50\""); found != std::string::npos; found = report.find("\"frames\":1,\"p50\"", found + 1)) ++replayed;
         check(replayed == passes, "the replay did not replay the frame in each of " + std::to_string(passes) + " passes: " + report);
+        if (passes < 2) return;
+        const auto lastPass = [&](const std::string& name) {
+            const auto found = report.rfind("\"" + name + "\":");
+            check(found != std::string::npos, "the replay report has no " + name + ": " + report);
+            return std::strtoull(report.c_str() + found + name.size() + 3, nullptr, 10);
+        };
+        const auto rewritten = lastPass("rewritten_bytes");
+        const auto captured = lastPass("range_bytes");
+        check(rewritten != 0 && rewritten < captured, "the last pass rewrote " + std::to_string(rewritten) + " of " + std::to_string(captured) + " captured bytes, expected only the pages the earlier pass changed");
     };
     replay(1);
     replay(2);
