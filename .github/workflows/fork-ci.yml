@@ -17,7 +17,7 @@ on:
         required: true
         type: string
       jobs:
-        description: Comma list from linux-gate, windows, asan, tsan, census, mutants, warm
+        description: Comma list from linux-gate, windows, asan, tsan, census, mutants, warm, bundle
         required: false
         default: linux-gate,windows
         type: string
@@ -89,6 +89,7 @@ jobs:
       has_linux: ${{ steps.plan.outputs.has_linux }}
       windows: ${{ steps.plan.outputs.windows }}
       warm: ${{ steps.plan.outputs.warm }}
+      report: ${{ steps.plan.outputs.report }}
       win_matrix: ${{ steps.plan.outputs.win_matrix }}
       ref_sha: ${{ steps.plan.outputs.ref_sha }}
       base_sha: ${{ steps.plan.outputs.base_sha }}
@@ -124,7 +125,7 @@ jobs:
           python3 - <<'PY'
           import json, os, re
           jobs = {j.strip() for j in os.environ["JOBS"].split(",") if j.strip()}
-          unknown = jobs - {"linux-gate", "windows", "asan", "tsan", "census", "mutants", "warm"}
+          unknown = jobs - {"linux-gate", "windows", "asan", "tsan", "census", "mutants", "warm", "bundle"}
           if unknown:
               raise SystemExit(f"unknown jobs: {sorted(unknown)}")
           ref_sha, base_sha = os.environ["ref_sha"], os.environ["base_sha"]
@@ -153,13 +154,16 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write("matrix=" + json.dumps({"include": include}) + "\n")
               out.write("has_linux=" + ("true" if include else "false") + "\n")
-              out.write("windows=" + ("true" if jobs & {"windows", "warm"} else "false") + "\n")
+              out.write("windows=" + ("true" if jobs & {"windows", "warm", "bundle"} else "false") + "\n")
               out.write("warm=" + ("true" if "warm" in jobs else "false") + "\n")
+              out.write("report=" + ("true" if jobs - {"warm", "bundle"} else "false") + "\n")
               win = []
               if "windows" in jobs:
                   win += [dict(id="windows-ref", kind="gate", side="ref", sha=ref_sha), dict(id="windows-base", kind="gate", side="base", sha=base_sha)]
               if "warm" in jobs:
                   win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha))
+              if "bundle" in jobs:
+                  win.append(dict(id="windows-bundle", kind="bundle", side="ref", sha=ref_sha))
               out.write("win_matrix=" + json.dumps({"include": win}) + "\n")
               out.write("ref_sha=" + ref_sha + "\nbase_sha=" + base_sha + "\n")
           print(json.dumps(include, indent=1))
@@ -599,7 +603,7 @@ jobs:
           key: vk-windows-${{ env.VVL_VERSION }}-mesa${{ env.MESA_VERSION }}
       - name: Fetch Mesa lavapipe and the pinned LunarG loader and validation layer
         id: vk-install
-        if: ${{ steps.vk-cache.outputs.cache-hit != 'true' }}
+        if: ${{ steps.vk-cache.outputs.cache-hit != 'true' && matrix.kind != 'bundle' }}
         continue-on-error: true
         shell: pwsh
         run: |
@@ -665,7 +669,7 @@ jobs:
           KIND: ${{ matrix.kind }}
         run: |
           ccache --zero-stats
-          if [ "$REDUCED" = true ] && [ "$KIND" = gate ]; then
+          if [ "$REDUCED" = true ] && { [ "$KIND" = gate ] || [ "$KIND" = bundle ]; }; then
             ctest --test-dir build -N -R "$TESTS" | tee build/selected.txt
             python - <<'PY' > build/targets.txt
           import glob, os, re, subprocess
@@ -696,7 +700,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: ccache --show-stats | tee ccache-stats.txt
       - name: Register lavapipe and the validation layer with the loader
-        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.kind != 'warm' && matrix.kind != 'bundle' && steps.libs.outcome == 'success' }}
         continue-on-error: true
         shell: pwsh
         run: |
@@ -705,7 +709,7 @@ jobs:
           reg query HKLM\SOFTWARE\Khronos\Vulkan /s
       - name: Prove whether lavapipe and the validation layer load on Windows
         id: proof
-        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.kind != 'warm' && matrix.kind != 'bundle' && steps.libs.outcome == 'success' }}
         env:
           VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
           VK_LOADER_DEBUG: layer,driver
@@ -725,7 +729,7 @@ jobs:
           exit 0
       - name: Run the tests
         id: test
-        if: ${{ !cancelled() && matrix.kind != 'warm' && steps.libs.outcome == 'success' }}
+        if: ${{ !cancelled() && matrix.kind != 'warm' && matrix.kind != 'bundle' && steps.libs.outcome == 'success' }}
         env:
           VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
           VK_LOADER_DEBUG: layer
@@ -737,6 +741,117 @@ jobs:
           ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
           echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
           exit 0
+      - name: Assemble the gate bundle
+        id: bundle
+        if: ${{ !cancelled() && matrix.kind == 'bundle' && steps.libs.outcome == 'success' }}
+        env:
+          SHA: ${{ matrix.sha }}
+        run: |
+          ctest --test-dir build -N -R "$TESTS" > build/selected.txt
+          python - <<'PY'
+          import glob, json, os, re, shutil, subprocess, sys
+          e = os.environ.get
+          build = e("BUILD_DIR", "build")
+          out = e("BUNDLE_DIR", "gate-bundle")
+          junk = (".o", ".obj", ".a", ".lib", ".ilk", ".pdb")
+          selected = [n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open(e("SELECTED", os.path.join(build, "selected.txt")), errors="replace").read(), re.M)]
+          chosen = set(selected)
+          if not chosen:
+              raise SystemExit("no test is selected")
+          copied = {}
+          def keep(path):
+              rel = os.path.relpath(path, build).replace("\\", "/")
+              if rel in copied or rel.startswith(".."):
+                  return
+              dest = os.path.join(out, "build", rel)
+              os.makedirs(os.path.dirname(dest), exist_ok=True)
+              shutil.copy2(path, dest)
+              copied[rel] = os.path.getsize(path)
+          for path in glob.glob(build + "/**/CTestTestfile.cmake", recursive=True):
+              keep(path)
+          src_prefix = None
+          build_abs = os.path.abspath(build).replace("\\", "/")
+          roots, path_dirs = set(), set()
+          exes = set()
+          for path in glob.glob(build + "/**/CTestTestfile.cmake", recursive=True):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in chosen:
+                      for word in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)):
+                          word = word.replace("\\\\", "/").replace("\\", "/")
+                          if os.path.isfile(word) and word.lower().endswith((".exe", ".dll", ".prx", ".py", ".cmake")) and os.path.abspath(word).replace("\\", "/").startswith(build_abs + "/"):
+                              exes.add(word)
+                  m = re.match(r"\s*set_tests_properties\(\[=\[(.*?)\]=\]\s+PROPERTIES\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in chosen:
+                      for d in re.findall(r"PATH=path_list_prepend:([^;\"]+)", m.group(2)):
+                          if os.path.isdir(d):
+                              path_dirs.add(d)
+          bundled = []
+          for d in sorted(path_dirs):
+              for root, dirs, files in os.walk(d):
+                  dirs[:] = [x for x in dirs if x != "implib"]
+                  for f in files:
+                      if not f.lower().endswith(junk):
+                          keep(os.path.join(root, f))
+          for exe in sorted(exes):
+              keep(exe)
+              for dll in glob.glob(os.path.join(os.path.dirname(exe), "*.dll")):
+                  keep(dll)
+          by_name = {}
+          for path in glob.glob(build + "/**/*.dll", recursive=True):
+              by_name.setdefault(os.path.basename(path).lower(), []).append(path)
+          unresolved = set()
+          queue = [os.path.join(out, "build", r) for r in list(copied) if r.lower().endswith((".exe", ".dll"))]
+          seen = set()
+          while queue:
+              item = queue.pop()
+              if item in seen:
+                  continue
+              seen.add(item)
+              text = subprocess.run(["objdump", "-p", item], capture_output=True, text=True).stdout
+              for name in re.findall(r"DLL Name: (\S+)", text):
+                  have = [c for c in by_name.get(name.lower(), [])]
+                  if have:
+                      for c in have:
+                          rel = os.path.relpath(c, build).replace("\\", "/")
+                          if rel not in copied:
+                              keep(c)
+                              queue.append(os.path.join(out, "build", rel))
+                  else:
+                      unresolved.add(name)
+          keep(os.path.join(build, "CMakeCache.txt"))
+          cache = open(os.path.join(build, "CMakeCache.txt"), errors="replace").read()
+          def cv(key):
+              m = re.search(r"^" + re.escape(key) + r":[A-Z]+=(.*)$", cache, re.M)
+              return m.group(1) if m else None
+          tool = lambda *a: subprocess.run(list(a), capture_output=True, text=True).stdout.splitlines()[0]
+          manifest = {
+              "sha": e("SHA"),
+              "winlibs_zip": e("WINLIBS_ZIP"),
+              "gcc": tool("gcc", "--version"),
+              "cmake": tool("cmake", "--version"),
+              "ninja": tool("ninja", "--version"),
+              "configure": e("CONFIGURE", "") + " -DANYPS5_AGC_EXECUTION_TESTS=",
+              "build_dir": os.path.abspath(build).replace("\\", "/"),
+              "source_dir": cv("CMAKE_HOME_DIRECTORY"),
+              "build_type": cv("CMAKE_BUILD_TYPE"),
+              "agc_execution_tests": cv("ANYPS5_AGC_EXECUTION_TESTS"),
+              "tests_regex": e("TESTS"),
+              "tests": sorted(chosen),
+              "unresolved_dlls": sorted(unresolved),
+              "files": [[r, s] for r, s in sorted(copied.items())],
+          }
+          json.dump(manifest, open(os.path.join(out, "manifest.json"), "w"), indent=1)
+          total = sum(copied.values())
+          print(f"bundle: {len(copied)} files, {total / 1048576:.0f} MiB, {len(chosen)} tests, {len(exes)} test files, unresolved dlls {sorted(unresolved)}")
+          PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() && matrix.kind == 'bundle' && steps.bundle.outcome == 'success' }}
+        with:
+          name: bundle-${{ inputs.tag }}${{ matrix.id }}
+          path: gate-bundle/
+          retention-days: 3
+          if-no-files-found: error
       - name: Collect the result
         if: ${{ !cancelled() }}
         env:
@@ -772,12 +887,12 @@ jobs:
           KIND: ${{ matrix.kind }}
         run: |
           if [ "$LIBS_OUTCOME" != success ]; then echo "::error::the build failed"; exit 1; fi
-          if [ "$KIND" = warm ]; then exit 0; fi
+          if [ "$KIND" = warm ] || [ "$KIND" = bundle ]; then exit 0; fi
           if [ "${TEST_RC:-1}" != 0 ]; then echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base"; fi
 
   report:
     needs: [plan, linux, windows]
-    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.warm != 'true' }}
+    if: ${{ !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.warm != 'true' && needs.plan.outputs.report == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
