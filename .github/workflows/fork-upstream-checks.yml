@@ -1,0 +1,149 @@
+name: Fork upstream checks
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: Fork branch to check (for example draft/src/perf/some-branch)
+        required: true
+        type: string
+      base:
+        description: Upstream ref or SHA the branch is merged into (empty means the head of upstream main)
+        required: false
+        default: ''
+        type: string
+      title:
+        description: Pull request title to check (empty skips the title and template checks)
+        required: false
+        default: ''
+        type: string
+      body:
+        description: Pull request description text to check
+        required: false
+        default: ''
+        type: string
+      body_file:
+        description: Path inside the branch of a file holding the description (used when body is empty)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/boykopovar/AnyPS5.git
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      units: ${{ steps.plan.outputs.units }}
+      has_units: ${{ steps.plan.outputs.has_units }}
+      branch_sha: ${{ steps.plan.outputs.branch_sha }}
+      base_sha: ${{ steps.plan.outputs.base_sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/fork-upstream-checks
+          persist-credentials: false
+      - run: echo "ci/" >> .git/info/exclude && python3 -m pip install --quiet pyyaml
+      - id: plan
+        env:
+          BRANCH: ${{ inputs.branch }}
+          BASE: ${{ inputs.base }}
+        run: |
+          export BRANCH_SHA=$(git rev-parse HEAD)
+          python3 ci/.github/fork-upstream-checks/driver.py plan
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: plan
+          path: plan.json
+          if-no-files-found: ignore
+
+  run:
+    needs: plan
+    if: ${{ needs.plan.outputs.has_units == 'true' }}
+    name: ${{ matrix.id }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.units) }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.plan.outputs.branch_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/checkout@v7
+        with:
+          path: ci
+          sparse-checkout: .github/fork-upstream-checks
+          persist-credentials: false
+      - run: echo "ci/" >> .git/info/exclude
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --quiet pyyaml
+      - if: ${{ matrix.node != '' }}
+        uses: actions/setup-node@v6
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Read the description file
+        id: body
+        env:
+          BODY: ${{ inputs.body }}
+          BODY_FILE: ${{ inputs.body_file }}
+        run: |
+          if [ -z "$BODY" ] && [ -n "$BODY_FILE" ]; then BODY=$(cat "$BODY_FILE"); fi
+          {
+            echo "text<<FUC_EOF"
+            printf '%s\n' "$BODY"
+            echo "FUC_EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Run the upstream job
+        env:
+          UNIT: ${{ toJSON(matrix) }}
+          BRANCH: ${{ inputs.branch }}
+          BRANCH_SHA: ${{ needs.plan.outputs.branch_sha }}
+          BASE: ${{ needs.plan.outputs.base_sha }}
+          PR_TITLE: ${{ inputs.title }}
+          PR_BODY: ${{ steps.body.outputs.text }}
+        run: python ci/.github/fork-upstream-checks/driver.py run
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: result-${{ matrix.id }}
+          path: out/
+          if-no-files-found: ignore
+
+  report:
+    needs: [plan, run]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: .github/fork-upstream-checks
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: parts
+      - name: Write the table
+        env:
+          TITLE: ${{ inputs.title }}
+          HAS_BODY: ${{ inputs.body != '' || inputs.body_file != '' }}
+        run: python3 .github/fork-upstream-checks/report.py
