@@ -3030,13 +3030,14 @@ bool ResidentDepthGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t 
     });
 }
 
-void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+static void retireDepthOver(std::uintptr_t address, std::size_t bytes, bool replaced) {
     if (bytes == 0u) return;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth release range overflows");
     const auto end = address + bytes;
     noteUnmappedPlane(address, end);
     if (!HasResidentDepthGuards_nid_no_patch()) return;
     std::unique_lock lock(depthGuardMutex());
+    const auto overlaps = [&](const DepthGuard& range) { return address < range.address + range.bytes && range.address < end; };
     for (auto& range : depthGuards()) {
         std::vector<GuestMemory::UnchangedQuery> remaining;
         remaining.reserve(range.live.size() + 1u);
@@ -3053,13 +3054,23 @@ void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes)
         range.live = std::move(remaining);
     }
     for (const auto& range : depthGuards()) {
-        if (std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); })) {
+        const bool retired = replaced ? std::ranges::any_of(depthGuards(), [&](const auto& part) { return part.active == range.active && overlaps(part); })
+                                      : std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); });
+        if (retired) {
             range.active->store(false, std::memory_order_release);
             range.hostWritten->store(false, std::memory_order_release);
         }
     }
     std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
+}
+
+void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireDepthOver(address, bytes, false);
+}
+
+void RetireReplacedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireDepthOver(address, bytes, true);
 }
 
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples) {

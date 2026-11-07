@@ -306,7 +306,13 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             }
             commit(chunk);
 #ifdef __linux__
-            if (chunk.rangeKind == FrameRangeKind::Watched) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(pointer, bytes);
+            if (chunk.rangeKind == FrameRangeKind::Watched) {
+                const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+                const auto first = chunk.address & ~(page - 1);
+                const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
+                GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
+                if (!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes");
+            }
 #endif
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
@@ -315,54 +321,70 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     return skipped;
 }
 
-std::uint64_t resetRange(const FrameCaptureReader& reader, const FrameMemoryChunk& range, std::span<const FrameMemoryChunk* const> snapshot, std::vector<std::byte>& desired, std::vector<std::byte>& staged, std::mutex& driverMutex) {
-    constexpr std::uint64_t Page = 4096;
-    const auto rangeEnd = range.address + range.bytes;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> hostOnly;
-    {
-        std::lock_guard lock(driverMutex);
-        AgcDriverFlushGuestMemory_nid_no_patch(range.address, static_cast<std::size_t>(range.bytes));
-        AgcDriverHostOnlySampleRanges_nid_no_patch(range.address, static_cast<std::size_t>(range.bytes), hostOnly);
-    }
-    desired.assign(static_cast<std::size_t>(range.bytes), std::byte{0});
-    auto chunk = std::partition_point(snapshot.begin(), snapshot.end(), [&](const auto* piece) { return piece->address + piece->bytes <= range.address; });
-    for (; chunk != snapshot.end() && (*chunk)->address < rangeEnd; ++chunk) {
+using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+constexpr std::uint64_t ResetPage = 4096;
+constexpr std::uint64_t ResetWindow = 1024 * ResetPage;
+
+void desiredBytes(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+    desired.assign(static_cast<std::size_t>(end - begin), std::byte{0});
+    auto chunk = std::partition_point(snapshot.begin(), snapshot.end(), [&](const auto* piece) { return piece->address + piece->bytes <= begin; });
+    for (; chunk != snapshot.end() && (*chunk)->address < end; ++chunk) {
         const auto& piece = **chunk;
-        if (piece.address >= range.address && piece.address + piece.bytes <= rangeEnd) {
-            reader.Read(piece, std::span(desired.data() + (piece.address - range.address), static_cast<std::size_t>(piece.bytes)));
+        if (piece.address >= begin && piece.address + piece.bytes <= end) {
+            reader.Read(piece, std::span(desired.data() + (piece.address - begin), static_cast<std::size_t>(piece.bytes)));
             continue;
         }
-        const auto begin = std::max(piece.address, range.address);
-        const auto end = std::min(piece.address + piece.bytes, rangeEnd);
+        const auto first = std::max(piece.address, begin);
+        const auto last = std::min(piece.address + piece.bytes, end);
         staged.resize(static_cast<std::size_t>(piece.bytes));
         reader.Read(piece, staged);
-        std::memcpy(desired.data() + (begin - range.address), staged.data() + (begin - piece.address), static_cast<std::size_t>(end - begin));
+        std::memcpy(desired.data() + (first - begin), staged.data() + (first - piece.address), static_cast<std::size_t>(last - first));
     }
-    const auto* const current = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(range.address));
-    const auto next = [&](std::uint64_t address) { return std::min((address & ~(Page - 1)) + Page, rangeEnd); };
-    const auto differs = [&](std::uint64_t address) {
-        const auto end = next(address);
-        if (std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) return true;
-        return std::memcmp(current + (address - range.address), desired.data() + (address - range.address), static_cast<std::size_t>(end - address)) != 0;
-    };
-    std::uint64_t rewritten = 0;
-    for (auto address = range.address; address < rangeEnd;) {
-        if (!differs(address)) {
-            address = next(address);
-            continue;
+}
+
+Runs differingRuns(const FrameCaptureReader& reader, const FrameMemoryChunk& range, std::span<const FrameMemoryChunk* const> snapshot, const Runs& hostOnly, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+    const auto rangeEnd = range.address + range.bytes;
+    Runs runs;
+    for (auto window = range.address; window < rangeEnd; window += ResetWindow) {
+        const auto windowEnd = std::min(window + ResetWindow, rangeEnd);
+        desiredBytes(reader, snapshot, window, windowEnd, desired, staged);
+        for (auto address = window; address < windowEnd;) {
+            const auto end = std::min((address & ~(ResetPage - 1)) + ResetPage, windowEnd);
+            const bool differs = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; }) ||
+                                 std::memcmp(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - window), static_cast<std::size_t>(end - address)) != 0;
+            if (differs) {
+                if (!runs.empty() && runs.back().second == address) runs.back().second = end;
+                else runs.emplace_back(address, end);
+            }
+            address = end;
         }
-        auto end = next(address);
-        while (end < rangeEnd && differs(end)) end = next(end);
-        const auto bytes = static_cast<std::size_t>(end - address);
-        {
-            std::lock_guard lock(driverMutex);
-            AgcDriverReplaceGuestMemory_nid_no_patch(address, bytes);
-        }
-        std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - range.address), bytes);
-        rewritten += bytes;
-        address = end;
     }
-    return rewritten;
+    return runs;
+}
+
+void restoreRuns(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, const Runs& runs, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+    for (const auto& [begin, end] : runs) {
+        for (auto window = begin; window < end; window += ResetWindow) {
+            const auto windowEnd = std::min(window + ResetWindow, end);
+            desiredBytes(reader, snapshot, window, windowEnd, desired, staged);
+            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(window)), desired.data(), static_cast<std::size_t>(windowEnd - window));
+        }
+    }
+}
+
+template <class Work>
+void parallelRanges(std::size_t count, Work work) {
+    std::atomic<std::size_t> claimed{0};
+    std::vector<std::future<void>> workers;
+    for (std::size_t worker = 0; worker < std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, std::max<std::size_t>(1, count)); ++worker) {
+        workers.push_back(std::async(std::launch::async, [&] {
+            std::vector<std::byte> desired;
+            std::vector<std::byte> staged;
+            for (auto index = claimed++; index < count; index = claimed++) work(index, desired, staged);
+        }));
+    }
+    for (auto& worker : workers) worker.get();
 }
 
 std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
@@ -380,19 +402,25 @@ std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& re
         }
     }
     std::sort(snapshot.begin(), snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
-    std::mutex driverMutex;
-    std::atomic<std::size_t> claimed{0};
-    std::atomic<std::uint64_t> rewritten{0};
-    std::vector<std::future<void>> workers;
-    for (std::size_t worker = 0; worker < std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, std::max<std::size_t>(1, ranges.size())); ++worker) {
-        workers.push_back(std::async(std::launch::async, [&] {
-            std::vector<std::byte> desired;
-            std::vector<std::byte> staged;
-            for (auto index = claimed++; index < ranges.size(); index = claimed++) rewritten += resetRange(reader, *ranges[index], snapshot, desired, staged, driverMutex);
-        }));
+    for (const auto* range : ranges) AgcDriverFlushGuestMemory_nid_no_patch(range->address, static_cast<std::size_t>(range->bytes));
+    std::vector<Runs> hostOnly(ranges.size());
+    for (std::size_t index = 0; index < ranges.size(); ++index) AgcDriverHostOnlySampleRanges_nid_no_patch(ranges[index]->address, static_cast<std::size_t>(ranges[index]->bytes), hostOnly[index]);
+    std::vector<Runs> runs(ranges.size());
+    parallelRanges(ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, std::vector<std::byte>& staged) { runs[index] = differingRuns(reader, *ranges[index], snapshot, hostOnly[index], desired, staged); });
+    Runs replaced;
+    for (const auto& part : runs) replaced.insert(replaced.end(), part.begin(), part.end());
+    std::sort(replaced.begin(), replaced.end());
+    std::uint64_t rewritten = 0;
+    for (std::size_t index = 0; index < replaced.size();) {
+        auto end = replaced[index].second;
+        auto next = index + 1;
+        for (; next < replaced.size() && replaced[next].first <= end; ++next) end = std::max(end, replaced[next].second);
+        AgcDriverReplaceGuestMemory_nid_no_patch(replaced[index].first, static_cast<std::size_t>(end - replaced[index].first));
+        rewritten += end - replaced[index].first;
+        index = next;
     }
-    for (auto& worker : workers) worker.get();
-    return {rewritten.load(), rangeBytes};
+    parallelRanges(ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, std::vector<std::byte>& staged) { restoreRuns(reader, snapshot, runs[index], desired, staged); });
+    return {rewritten, rangeBytes};
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
