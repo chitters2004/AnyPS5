@@ -1,0 +1,38 @@
+{
+  "run": {
+    "conventions.yml": ["conventions"],
+    "emscripten-libraries.yml": ["library-portability"],
+    "input-mapper.yml": ["input-mapper"],
+    "progress-report.yml": ["report"],
+    "run-report-schema.yml": ["schema"],
+    "web-release-tools.yml": ["release-tools"],
+    "web-tests.yml": ["output-directory"],
+    "build.yml": ["relinker", "relinker-asan"]
+  },
+  "needs_outputs": {
+    "build.yml": {
+      "eligibility": {
+        "sha": "$MERGE_SHA",
+        "pr": "",
+        "head": "",
+        "relinker": "true",
+        "full": "false",
+        "relinker-hosts": "[{\"os\":\"ubuntu-latest\",\"compiler\":\"g++\"},{\"os\":\"windows-latest\",\"compiler\":\"g++\"},{\"os\":\"macos-latest\",\"compiler\":\"clang++\"}]"
+      }
+    }
+  },
+  "skip": {
+    "build.yml": {
+      "eligibility": "decides which jobs run from the pull request's file list through the GitHub API; replaced here by fixed outputs (relinker on, the pull request host set), so the path selection of the register-context, write-watch and edge-watch jobs is not reproduced",
+      "register-context": "selected by eligibility from changed paths; macOS native test; not reproduced (run it by hand if core/libs/tests/register_context or libc changed)",
+      "write-watch": "selected by eligibility from changed paths; macOS native test; not reproduced",
+      "edge-watch": "selected by eligibility from changed paths; macOS native test; not reproduced",
+      "linux": "self-hosted runner and a full build; the fork gate (fork-ci) covers the build and tests",
+      "windows": "full MSYS2 build and test run (long); the fork gate (fork-ci) covers it"
+    },
+    "pr-intake.yml": {"intake": "needs the GitHub API and write tokens (open PR limit by author history); cannot run on a branch"},
+    "pr-labels.yml": {"labels": "labels a real pull request through the GitHub API"},
+    "progress-comment.yml": {"comment": "posts a comment from a workflow_run on a real pull request"},
+    "conflict-label.yml": {"label": "labels real pull requests"}
+  }
+}
