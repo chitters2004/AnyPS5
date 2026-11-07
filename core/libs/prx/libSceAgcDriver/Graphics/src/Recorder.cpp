@@ -1659,7 +1659,7 @@ void CommandState::SetColorWriteMasks(const Context& context, std::span<const Vk
     Require(!masks.empty() && masks.size() <= value.masks.size(), "color write masks exceed the color attachments");
     value.count = static_cast<std::uint32_t>(masks.size());
     std::ranges::copy(masks, value.masks.begin());
-    const auto covered = [](const ColorWriteMasks& known, const ColorWriteMasks& wanted) { return wanted.count <= known.count && std::equal(wanted.masks.begin(), wanted.masks.begin() + wanted.count, known.masks.begin()); };
+    const auto covered = [](const ColorWriteMasks& known, const ColorWriteMasks& wanted) { return wanted.count <= known.count; };
     apply(ColorWriteMask, &CommandState::colorWriteMasks, value, covered, [&] { context.tracked(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, value.count, masks.data()); });
 }
 
