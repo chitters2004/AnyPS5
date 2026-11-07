@@ -1207,6 +1207,11 @@ void UpdateResidentImageUnmapObserver_nid_no_patch() {
     GuestAllocations::GuestAllocationsSetUnmapObserver_nid_postfix(anyGuarded().load(std::memory_order_acquire) || anySingleClears().load(std::memory_order_acquire) || HasResidentDepthGuards_nid_no_patch() || DepthPlanesStale() ? &retireUnmapped : nullptr);
 }
 
+void RetireResidentImagesOver_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireUnmapped(address, bytes);
+    UpdateResidentImageUnmapObserver_nid_no_patch();
+}
+
 std::optional<DccKeys> MultisampledCmaskKeys(std::uint8_t code) {
     const auto tile = code & 0xfu;
     if ((code >> 4u) != tile) return std::nullopt;
