@@ -793,6 +793,7 @@ jobs:
                       for ref in re.findall(re.escape(build_ci) + r"[^\s;\"\)\]]*", line, re.I):
                           if os.path.isfile(ref):
                               exes.add(ref)
+                              dirs.add(os.path.relpath(os.path.dirname(ref), build).replace("\\", "/"))
                               continue
                           for cand in (ref, os.path.dirname(ref)):
                               if os.path.isdir(cand):
@@ -812,8 +813,8 @@ jobs:
           if not exes:
               raise SystemExit("no executable of the selected tests lies under " + build_abs)
           for d in sorted(path_dirs):
-              for root, dirs, files in os.walk(d):
-                  dirs[:] = [x for x in dirs if x != "implib"]
+              for root, subs, files in os.walk(d):
+                  subs[:] = [x for x in subs if x != "implib"]
                   for f in files:
                       if not f.lower().endswith(junk):
                           keep(os.path.join(root, f))
