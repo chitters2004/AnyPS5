@@ -53,7 +53,7 @@ for r in failures:
         if step["status"] in ("failure", "unsupported"):
             w(f"Step `{step['name']}` {step['status']}:")
             w("```")
-            w(step["excerpt"])
+            w(step["excerpt"].replace("::error ", "error: ").replace("::warning ", "warning: ").replace("::", ": :"))
             w("```")
 w()
 w("## Verdict")

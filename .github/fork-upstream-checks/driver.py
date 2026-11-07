@@ -22,6 +22,14 @@ class Unsupported(Exception):
     pass
 
 
+def bash_exe():
+    if os.name == "nt":
+        for candidate in (r"C:\Program Files\Gitinash.exe", r"C:\Program Files (x86)\Gitinash.exe"):
+            if os.path.exists(candidate):
+                return candidate
+    return "bash"
+
+
 def git(*args, check=True, cwd=None):
     result = subprocess.run(["git", *args], capture_output=True, text=True, cwd=cwd)
     if check and result.returncode:
@@ -540,7 +548,7 @@ def run_unit(unit):
                 shell = step.get("shell") or defaults.get("shell") or ("pwsh" if runner_os == "Windows" else "bash")
                 directory = step.get("working-directory") or defaults.get("working-directory") or "."
                 if shell in ("bash", "sh"):
-                    command = [shell, "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script] if shell == "bash" else ["sh", "-e", "-c", script]
+                    command = [bash_exe(), "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", script] if shell == "bash" else ["sh", "-e", "-c", script]
                 elif shell == "pwsh":
                     path = tmp / f"step{index}.ps1"
                     path.write_text("$ErrorActionPreference = 'stop'\n" + script + "\nif ((Test-Path -LiteralPath variable:\\LASTEXITCODE)) { exit $LASTEXITCODE }", encoding="utf-8")
