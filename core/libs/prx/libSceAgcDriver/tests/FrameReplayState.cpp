@@ -127,8 +127,10 @@ void testWatchedExisting(const std::filesystem::path& directory) {
     auto* bytes = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Size, 65536));
     check(bytes != nullptr, "guest allocation failed");
     GuestArena::GuestArenaCommit_nid_postfix(bytes, Size, 0x04, Size);
-    GuestAllocations::Mutation mutation;
-    mutation.Add(bytes, Size, true, true, true);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(bytes, Size, true, true, true);
+    }
     const auto watched = bytes + 65536 + 0x30;
     const std::size_t watchedBytes = 0x100;
     check(!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(address(watched), watchedBytes), "the writable mapping was already write-watched");

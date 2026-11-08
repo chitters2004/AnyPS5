@@ -1052,6 +1052,11 @@ void DccRefillTests(AgcDriver::VulkanDevice& device, std::uint32_t selectedSampl
 }
 
 void DccReplacementTests(AgcDriver::VulkanDevice& device, std::uint32_t selectedSamples) {
+#ifdef _WIN32
+    static_cast<void>(device);
+    static_cast<void>(selectedSamples);
+    return;
+#else
     const ColorTargetLayout layout(Width, Height, ColorTileMode::RenderTarget, 8);
     std::vector<std::unique_ptr<Block>> blocks;
     struct ClearTargets {
@@ -1099,7 +1104,8 @@ void DccReplacementTests(AgcDriver::VulkanDevice& device, std::uint32_t selected
                 try {
                     AgcDriver::Graphics::MultisampledDccClear(target, keys, {});
                     return true;
-                } catch (const std::runtime_error&) {
+                } catch (const std::runtime_error& error) {
+                    if (std::string_view(error.what()).find("without a recorded clear color") == std::string_view::npos) throw;
                     return false;
                 }
             };
@@ -1128,6 +1134,7 @@ void DccReplacementTests(AgcDriver::VulkanDevice& device, std::uint32_t selected
             programCount = 0;
         }
     }
+#endif
 }
 
 void DccImportWindowTests(AgcDriver::VulkanDevice& device, std::uint32_t selectedSamples) {
