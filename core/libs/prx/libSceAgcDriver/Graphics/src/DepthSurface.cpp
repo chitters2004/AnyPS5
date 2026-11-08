@@ -3030,7 +3030,7 @@ bool ResidentDepthGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t 
     });
 }
 
-void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+static void retireDepthOver(std::uintptr_t address, std::size_t bytes, bool replaced) {
     if (bytes == 0u) return;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth release range overflows");
     const auto end = address + bytes;
@@ -3053,10 +3053,23 @@ void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes)
         range.live = std::move(remaining);
     }
     for (const auto& range : depthGuards()) {
-        if (std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); })) range.active->store(false, std::memory_order_release);
+        const bool retired = replaced ? !range.active->load(std::memory_order_acquire)
+                                      : std::ranges::all_of(depthGuards(), [&](const auto& part) { return part.active != range.active || part.live.empty(); });
+        if (retired) {
+            range.active->store(false, std::memory_order_release);
+            range.hostWritten->store(false, std::memory_order_release);
+        }
     }
     std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
+}
+
+void RetireUnmappedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireDepthOver(address, bytes, false);
+}
+
+void RetireReplacedDepth_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    retireDepthOver(address, bytes, true);
 }
 
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples) {
@@ -3145,7 +3158,12 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         auto& fresh = *surfaces().back();
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
-            for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten, fresh.hostEverWritten});
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> footprint;
+            for (const auto& range : fresh.sampling.initial) {
+                depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten, fresh.hostEverWritten});
+                footprint.emplace_back(range.address, range.bytes);
+            }
+            RegisterGpuFootprint(fresh.active, fresh.hostWritten, std::move(footprint));
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;
