@@ -2,7 +2,7 @@ name: Fork warm
 
 on:
   schedule:
-    - cron: '30 2 * * *'
+    - cron: '20 * * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -10,6 +10,10 @@ on:
         required: false
         default: false
         type: boolean
+
+concurrency:
+  group: fork-warm
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -53,7 +57,7 @@ jobs:
     if: ${{ needs.check.outputs.stale == 'true' }}
     permissions:
       contents: read
-      actions: read
+      actions: write
     uses: ./.github/workflows/fork-ci.yml
     with:
       repository: boykopovar/AnyPS5
