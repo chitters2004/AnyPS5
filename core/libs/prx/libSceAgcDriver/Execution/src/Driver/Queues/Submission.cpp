@@ -481,8 +481,30 @@ void Driver::SubmitFlip(const FlipInfo& info) {
     Submit(&packet, 0, true);
 }
 
+Driver::Admission::Admission(Driver& driver) : driver(driver) {
+    std::unique_lock lock(driver.mutex);
+    if (driver.exclusive) {
+        ++driver.blockedAdmissions;
+        driver.changed.wait(lock, [&] { return driver.failure != nullptr || driver.stopping || !driver.exclusive; });
+        --driver.blockedAdmissions;
+    }
+    driver.rethrowFailure();
+    driver.checkStopping();
+    ++driver.admitting;
+}
+
+Driver::Admission::~Admission() {
+    {
+        std::lock_guard lock(driver.mutex);
+        --driver.admitting;
+        if (!driver.exclusive) return;
+    }
+    driver.changed.notify_all();
+}
+
 void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const Admission admission(*this);
     CheckFailure();
     require(queue == 0 || (queue >= 0x20 && queue < SubmissionQueueEnd), "unsupported compute queue");
     static const bool ring = ReadSubmissionRingSettings();
@@ -591,6 +613,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
 void Driver::SuspendPoint() {
     const auto receivedAt = APS5_ENABLE_TIMING_LOG ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     require(!onWorkerThread(), "worker cannot suspend itself");
+    const Admission admission(*this);
     submitsQueue0() = true;
     auto* const capture = SubmissionCapture::Active();
     auto captured = capture != nullptr ? SubmissionCapture::Prepare(0, SubmissionKind::Suspend, {}, {}) : CapturedSubmission{};

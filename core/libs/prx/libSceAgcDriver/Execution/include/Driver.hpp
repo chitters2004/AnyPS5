@@ -5,6 +5,9 @@
 #include <cstdint>
 #include <span>
 #include <cstddef>
+#include <exception>
+#include <utility>
+#include <vector>
 #include "SceTypes.hpp"
 #include "SceShaders.hpp"
 
@@ -23,7 +26,14 @@ struct AwaitedWait {
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes);
-extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes);
+extern "C" void AgcDriverFlushGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes, std::exception_ptr* failure);
+extern "C" void AgcDriverGpuOwnedRanges_nid_no_patch(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::exception_ptr* failure);
+extern "C" void AgcDriverGpuOwnersOver_nid_no_patch(std::uint64_t address, std::size_t bytes, std::size_t* owners, std::exception_ptr* failure);
+extern "C" void AgcDriverGuestMemoryChangedSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::uint64_t* generation, std::exception_ptr* failure);
+extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes, std::exception_ptr* failure);
+extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context, std::exception_ptr* failure);
+extern "C" void AgcDriverSetGuestMemoryTransactionHookForTest_nid_no_patch(void (*hook)());
+extern "C" std::uint32_t AgcDriverBlockedSubmissionsForTest_nid_no_patch();
 extern "C" void AgcDriverWaitIdle_nid_postfix();
 extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords);
 extern "C" void AgcDriverUseGcnShaders_nid_postfix();

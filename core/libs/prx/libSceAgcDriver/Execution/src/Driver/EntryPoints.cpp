@@ -5,9 +5,12 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Screenshot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
+#include <exception>
 #include <mutex>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
@@ -249,7 +252,68 @@ extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address,
         AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
 }
 
-extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
-    AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+namespace {
+
+std::atomic<void (*)()> transactionHookForTest{nullptr};
+
+template<class Work>
+void captureFailure(std::exception_ptr* failure, Work&& work) noexcept {
+    try {
+        work();
+        *failure = nullptr;
+    } catch (...) {
+        *failure = std::current_exception();
+    }
+}
+
+}
+
+extern "C" void AgcDriverFlushGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes, std::exception_ptr* failure) {
+    captureFailure(failure, [&] {
+        AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
+        static_cast<void>(AgcDriver::Graphics::StorageTexture::FlushPending(address, bytes));
+        AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
+    });
+}
+
+extern "C" void AgcDriverGpuOwnedRanges_nid_no_patch(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::exception_ptr* failure) {
+    captureFailure(failure, [&] { ranges = AgcDriver::Graphics::GpuOwnedRanges(address, bytes); });
+}
+
+extern "C" void AgcDriverGpuOwnersOver_nid_no_patch(std::uint64_t address, std::size_t bytes, std::size_t* owners, std::exception_ptr* failure) {
+    captureFailure(failure, [&] { *owners = AgcDriver::Graphics::GpuOwnersOver(address, bytes); });
+}
+
+extern "C" void AgcDriverGuestMemoryChangedSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::uint64_t* generation, std::exception_ptr* failure) {
+    captureFailure(failure, [&] { *generation = AgcDriver::GuestMemory::ChangedSince(address, bytes, since, changed); });
+}
+
+extern "C" void AgcDriverSetGuestMemoryTransactionHookForTest_nid_no_patch(void (*hook)()) {
+    transactionHookForTest.store(hook, std::memory_order_release);
+}
+
+extern "C" std::uint32_t AgcDriverBlockedSubmissionsForTest_nid_no_patch() {
+    return AgcDriver::DriverDetail::Driver::Get().BlockedSubmissions();
+}
+
+extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context, std::exception_ptr* failure) {
+    captureFailure(failure, [&] {
+        auto& driver = AgcDriver::DriverDetail::Driver::Get();
+        driver.BeginExclusive();
+        struct Admit {
+            AgcDriver::DriverDetail::Driver& driver;
+            ~Admit() { driver.EndExclusive(); }
+        } admit{driver};
+        if (const auto hook = transactionHookForTest.load(std::memory_order_acquire)) hook();
+        const AgcDriver::Graphics::FlushExclusion exclusion;
+        driver.WaitDeviceIdle();
+        body(context);
+    });
+}
+
+extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes, std::exception_ptr* failure) {
+    captureFailure(failure, [&] {
+        AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
+        AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    });
 }

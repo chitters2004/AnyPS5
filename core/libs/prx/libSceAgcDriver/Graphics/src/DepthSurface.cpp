@@ -3000,6 +3000,16 @@ void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std:
     }
 }
 
+void AppendStaleDepthPlanes(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    const auto end = address + bytes;
+    if (bytes == 0u || !overlapsStalePlane(address, end)) return;
+    auto& planes = stalePlanes();
+    std::lock_guard lock(planes.mutex);
+    for (const auto& [begin, stop] : planes.ranges) {
+        if (begin < end && address < stop) ranges.emplace_back(begin, stop - begin);
+    }
+}
+
 void SetDepthPublicationHookForTest(void (*hook)(DepthPublicationStage)) {
     depthPublicationHook.store(hook, std::memory_order_release);
 }
