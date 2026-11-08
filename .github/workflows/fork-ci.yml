@@ -748,6 +748,24 @@ jobs:
           ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
           echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
           exit 0
+      - name: Diagnose the frame replay entry point
+        if: ${{ !cancelled() && matrix.kind == 'gate' }}
+        run: |
+          export PATH="/c/vk:$PATH"
+          exe=$(find build -name agc_frame_replay.exe | head -1)
+          echo "exe=$exe"; ls -l "$(dirname "$exe")" | head -40
+          libc=$(dirname "$(find build -name libc.prx | head -1)")
+          echo "libc dir=$libc"
+          echo "PATH=$PATH" | tr ':;' '
+
+' | head -60
+          python tools/ep_diag.py "$(cygpath -w "$PWD/$exe")" "$(cygpath -w "$PWD/$libc")" || true
+          set +e
+          PATH="$PWD/$libc:$PATH" "$exe" --help; echo "rc with libc dir on PATH: $?"
+          "$exe" --help; echo "rc plain: $?"
+          where gcc g++ || true
+          ls /c/Strawberry/c/bin 2>/dev/null | head -5
+          exit 0
       - name: Assemble the gate bundle
         id: bundle
         working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
