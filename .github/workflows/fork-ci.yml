@@ -756,9 +756,7 @@ jobs:
           echo "exe=$exe"; ls -l "$(dirname "$exe")" | head -40
           libc=$(dirname "$(find build -name libc.prx | head -1)")
           echo "libc dir=$libc"
-          echo "PATH=$PATH" | tr ':;' '
-
-' | head -60
+          echo "$PATH" | tr ':' '#' | head -c 3000; echo
           python tools/ep_diag.py "$(cygpath -w "$PWD/$exe")" "$(cygpath -w "$PWD/$libc")" || true
           set +e
           PATH="$PWD/$libc:$PATH" "$exe" --help; echo "rc with libc dir on PATH: $?"
