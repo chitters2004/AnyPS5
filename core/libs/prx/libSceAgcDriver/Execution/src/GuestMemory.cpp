@@ -1935,6 +1935,10 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+std::uint64_t CollectMemoHits() {
+    return collectMemoHits.load(std::memory_order_relaxed);
+}
+
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 thread_local bool proofThread = false;

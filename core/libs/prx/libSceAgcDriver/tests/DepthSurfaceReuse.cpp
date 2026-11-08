@@ -756,6 +756,77 @@ void TestRetireStaleSurfaceWithoutWrittenUnits(const Context& context) {
     ClearDepthSurfaces(context.device);
 }
 
+void TestDepthPlanesCollectedOncePerDraw(const Context& context) {
+    if (!AgcDriver::GuestMemory::WriteWatched()) return;
+    ClearDepthSurfaces(context.device);
+    constexpr VkExtent2D extent{256, 512};
+    const auto depthBytes = static_cast<std::size_t>(DepthSliceBytes(extent, 4u));
+    const auto stencilBytes = static_cast<std::size_t>(DepthSliceBytes(extent, 1u));
+    GuestBlock depth(depthBytes);
+    GuestBlock stencil(stencilBytes);
+    GuestBlock depthOnly(depthBytes);
+    GuestBlock written(depthBytes);
+    GuestBlock writtenStencil(stencilBytes);
+    const struct Release {
+        VkDevice device;
+        ~Release() { ClearDepthSurfaces(device); }
+    } release{context.device};
+    auto storageContext = context;
+    TextureDetiler detiler(storageContext);
+    storageContext.detiler = &detiler;
+    DepthTarget target{depth.Address(), stencil.Address(), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    DepthTarget plain{depthOnly.Address(), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    plain.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    const auto observations = [&](const DepthTarget& drawn) {
+        const auto before = AgcDriver::GuestMemory::CollectMemoHits();
+        DepthSurfaceViewWithStencilWriteIntent(storageContext, drawn, false, true, false);
+        return AgcDriver::GuestMemory::CollectMemoHits() - before;
+    };
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    observations(target);
+    observations(plain);
+    const auto depthPlane = observations(plain);
+    const auto bothPlanes = observations(target);
+    Require(depthPlane == 1u, "a draw over a depth plane must observe its writes once in a collect epoch, observed " + std::to_string(depthPlane));
+    Require(bothPlanes == 2u, "a draw over a depth and a stencil plane must observe each plane once in a collect epoch, observed " + std::to_string(bothPlanes));
+    const auto syncs = [&](GuestBlock& block) {
+        block.Write(100);
+        try {
+            observations(target);
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    observations(target);
+    Require(syncs(depth), "a CPU write into the depth plane between draws must be seen by the next draw");
+    ClearDepthSurfaces(context.device);
+    observations(target);
+    observations(target);
+    Require(syncs(stencil), "a CPU write into the stencil plane between draws must be seen by the next draw");
+    ClearDepthSurfaces(context.device);
+    for (const bool stencilPlane : {false, true}) {
+        DepthTarget overwritten{written.Address(), stencilPlane ? writtenStencil.Address() : 0, extent, stencilPlane ? VK_FORMAT_D32_SFLOAT_S8_UINT : VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        overwritten.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+        DepthSurfaceViewWithStencilWriteIntent(storageContext, overwritten, true, true, false);
+        const auto image = lastImage;
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Unmap(written.data, depthBytes, [](const void*, std::size_t, const void*, bool) {});
+            mutation.Add(written.data, depthBytes, true, true, true);
+        }
+        (stencilPlane ? writtenStencil : written).Write(100);
+        const auto stale = lookup(storageContext, {written.Address(), FormatR32Float, 256, 512, TileDepth64KB, Type2D, 0, 0, 1, 1});
+        Require(stale == nullptr, std::string("a CPU write into the ") + (stencilPlane ? "stencil" : "depth") + " plane after a draw must make the surface read as overwritten memory");
+        DepthSurfaceView(storageContext, {written.Address() + 0x4000000u, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+        Require(std::find(destroyedImages.begin(), destroyedImages.end(), image) != destroyedImages.end(), "an overwritten depth surface must be retired and its image freed");
+        ClearDepthSurfaces(context.device);
+    }
+    ClearDepthSurfaces(context.device);
+}
+
 void RunDepthSurfaceReuseTests() {
     static int deviceTag = 0;
     Context context{};
@@ -779,6 +850,7 @@ void RunDepthSurfaceReuseTests() {
     TestRetireStaleSurfaceWithoutWrittenUnits(context);
     TestUnmappedStalePlaneFlush(context);
     TestReadOnlyStalePlaneFlush(context);
+    TestDepthPlanesCollectedOncePerDraw(context);
     constexpr std::uint64_t depth32 = 0x40000000;
     constexpr std::uint64_t depth16 = 0x50000000;
     constexpr std::uint64_t depthStencil = 0x60000000;

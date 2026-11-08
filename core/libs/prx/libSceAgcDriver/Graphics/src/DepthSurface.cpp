@@ -1036,9 +1036,9 @@ public:
         return GuestMemory::WrittenSince(target.stencilAddress, static_cast<std::size_t>(stencilBytes()), stencilMemory);
     }
 
-    void NoteMemory() {
-        depthMemory = GuestMemory::CollectWrites(target.address, static_cast<std::size_t>(depthBytes()));
-        stencilMemory = target.stencilAddress != 0 ? GuestMemory::CollectWrites(target.stencilAddress, static_cast<std::size_t>(stencilBytes())) : 0;
+    void NoteMemory(std::uint64_t depthCollected = 0, std::uint64_t stencilCollected = 0) {
+        depthMemory = depthCollected != 0 && depthBytes() <= MirrorBytes() ? depthCollected : GuestMemory::CollectWrites(target.address, static_cast<std::size_t>(depthBytes()));
+        stencilMemory = target.stencilAddress == 0 ? 0 : stencilCollected != 0 && stencilBytes() <= StencilMirrorBytes() ? stencilCollected : GuestMemory::CollectWrites(target.stencilAddress, static_cast<std::size_t>(stencilBytes()));
     }
 
     bool OverwrittenOnGpu() const {
@@ -1385,10 +1385,11 @@ public:
         }
     }
 
-    std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation) {
+    std::vector<bool> WrittenUnits(const GuestTextureResource& resource, std::uint64_t& generation, std::uint64_t* observed = nullptr) {
         const auto bytes = static_cast<std::size_t>(MirrorBytes());
         SizeUnits(bytes);
         const auto collected = GuestMemory::CollectWrites(resource.baseAddress, bytes);
+        if (observed != nullptr) *observed = collected;
         generation = GuestMemory::TrackerGeneration();
         std::vector<bool> changed;
         const auto mark = [&](std::size_t unit) {
@@ -1429,12 +1430,13 @@ public:
         return changed;
     }
 
-    void SyncFromMemory(const GuestTextureResource& resource) {
+    std::uint64_t SyncFromMemory(const GuestTextureResource& resource) {
         std::uint64_t generation = 0;
-        const auto changed = WrittenUnits(resource, generation);
+        std::uint64_t observed = 0;
+        const auto changed = WrittenUnits(resource, generation, &observed);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
             unitGeneration.assign(unitGeneration.size(), generation);
-            return;
+            return observed;
         }
         ClearStale(changed);
         {
@@ -1460,6 +1462,7 @@ public:
             copyPlane(mirrorPlane, mirror, false, false, true);
         }
         written = ++depthWrites;
+        return observed;
     }
 
     void DropMirror() {
@@ -1470,13 +1473,13 @@ public:
         return target.samples == 1u && target.stencilAddress != 0u && target.depthSwizzle == XorSwizzleMode(TextureTileMode::kZ64KBX);
     }
 
-    void SyncStencilFromMemory(const GuestTextureResource& resource) {
+    std::uint64_t SyncStencilFromMemory(const GuestTextureResource& resource) {
         const auto bytes = static_cast<std::size_t>(StencilMirrorBytes());
-        GuestMemory::CollectWrites(resource.baseAddress, bytes);
+        const auto observed = GuestMemory::CollectWrites(resource.baseAddress, bytes);
         const auto generation = GuestMemory::TrackerGeneration();
         const bool changed = stencilGeneration != 0u && GuestMemory::WrittenSince(resource.baseAddress, bytes, stencilGeneration);
         stencilGeneration = generation;
-        if (!changed || (pendingClear & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) return;
+        if (!changed || (pendingClear & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) return observed;
         stencilStale = false;
         {
             struct Syncing {
@@ -1489,6 +1492,7 @@ public:
         }
         copyPlane(stencilMirror, stencilMirror.storage, true, false, true);
         written = ++depthWrites;
+        return observed;
     }
 
     std::shared_ptr<StorageTexture> StoreStencilPlane(const GuestTextureResource& resource) {
@@ -3224,14 +3228,14 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
-    if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
+    const auto depthCollected = mirrorable(target) ? surface->SyncFromMemory(mirrorResource(target)) : 0u;
+    const auto stencilCollected = surface->StencilMirrorable() ? surface->SyncStencilFromMemory(stencilResource(target)) : 0u;
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
-    surface->NoteMemory();
+    surface->NoteMemory(depthCollected, stencilCollected);
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
