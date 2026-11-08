@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -546,6 +547,18 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> hostOnly;
     AgcDriverHostOnlySampleRanges_nid_no_patch(at(planeLow.base), 2u * BlockBytes, hostOnly);
     check(!hostOnly.empty(), "the multisample depth draw left no samples only on the host");
+    bool contended = true;
+    AgcDriverGuestMemoryTransaction_nid_no_patch([](void* context) {
+        *static_cast<bool*>(context) = std::async(std::launch::async, [] {
+            std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::try_to_lock);
+            return lock.owns_lock();
+        }).get();
+    }, &contended);
+    check(!contended, "another thread took the GPU lock inside a guest memory transaction");
+    check(std::async(std::launch::async, [] {
+        std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::try_to_lock);
+        return lock.owns_lock();
+    }).get(), "a guest memory transaction kept the GPU lock after it ended");
     AgcDriverShutdown_nid_postfix();
 
     const FrameCaptureReader reader(capture);
@@ -564,7 +577,7 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         std::filesystem::remove(dump);
         const auto result = capture / ("multisample depth " + std::to_string(passes) + ".json");
         const auto log = capture / ("multisample depth " + std::to_string(passes) + ".log");
-        auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --repeat " + std::to_string(passes) + " --dump " + std::to_string(at(target)) + ":" + std::to_string(CopyBytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
+        auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --verify-reset --repeat " + std::to_string(passes) + " --dump " + std::to_string(at(target)) + ":" + std::to_string(CopyBytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
 #ifdef _WIN32
         command = "\"" + command + "\"";
 #endif

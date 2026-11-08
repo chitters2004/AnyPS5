@@ -24,6 +24,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -36,6 +37,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -70,6 +72,7 @@ struct Options {
     std::filesystem::path frames;
     bool pace = true;
     bool strict = false;
+    bool verifyReset = false;
     std::chrono::milliseconds paceTimeout{10000};
     std::chrono::milliseconds memoryPaceTimeout{10000};
     std::chrono::milliseconds releaseAfter{3};
@@ -274,6 +277,18 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
     }
 }
 
+#ifdef __linux__
+void requireWatch(const FrameMemoryChunk& chunk) {
+    const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+    const auto first = chunk.address & ~(page - 1);
+    const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
+    if (GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return;
+    const char* reason = GuestWriteWatch::GuestWriteWatchUnavailableReason_nid_postfix();
+    throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes: " + (*reason != '\0' ? reason : "registration did not take effect"));
+}
+#endif
+
 Skipped restoreMemory(const FrameCaptureReader& reader) {
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -291,8 +306,14 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind == FrameRangeKind::Host) continue;
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
             if (owned[index]) {
-                if (!gpu) skipped.Add(chunk);
-                else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+                if (!gpu) {
+                    skipped.Add(chunk);
+                } else {
+                    std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+#ifdef __linux__
+                    if (chunk.rangeKind == FrameRangeKind::Watched) requireWatch(chunk);
+#endif
+                }
                 continue;
             }
             auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
@@ -306,13 +327,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             }
             commit(chunk);
 #ifdef __linux__
-            if (chunk.rangeKind == FrameRangeKind::Watched) {
-                const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
-                const auto first = chunk.address & ~(page - 1);
-                const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
-                GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
-                if (!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes");
-            }
+            if (chunk.rangeKind == FrameRangeKind::Watched) requireWatch(chunk);
 #endif
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
@@ -326,7 +341,12 @@ using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 constexpr std::uint64_t ResetPage = 4096;
 constexpr std::uint64_t ResetWindow = 1024 * ResetPage;
 
-void desiredBytes(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+struct Staged {
+    const FrameMemoryChunk* piece = nullptr;
+    std::vector<std::byte> bytes;
+};
+
+void desiredBytes(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, std::uint64_t begin, std::uint64_t end, std::vector<std::byte>& desired, Staged& staged) {
     desired.assign(static_cast<std::size_t>(end - begin), std::byte{0});
     auto chunk = std::partition_point(snapshot.begin(), snapshot.end(), [&](const auto* piece) { return piece->address + piece->bytes <= begin; });
     for (; chunk != snapshot.end() && (*chunk)->address < end; ++chunk) {
@@ -337,13 +357,17 @@ void desiredBytes(const FrameCaptureReader& reader, std::span<const FrameMemoryC
         }
         const auto first = std::max(piece.address, begin);
         const auto last = std::min(piece.address + piece.bytes, end);
-        staged.resize(static_cast<std::size_t>(piece.bytes));
-        reader.Read(piece, staged);
-        std::memcpy(desired.data() + (first - begin), staged.data() + (first - piece.address), static_cast<std::size_t>(last - first));
+        if (staged.piece != &piece) {
+            staged.piece = nullptr;
+            staged.bytes.resize(static_cast<std::size_t>(piece.bytes));
+            reader.Read(piece, staged.bytes);
+            staged.piece = &piece;
+        }
+        std::memcpy(desired.data() + (first - begin), staged.bytes.data() + (first - piece.address), static_cast<std::size_t>(last - first));
     }
 }
 
-Runs differingRuns(const FrameCaptureReader& reader, const FrameMemoryChunk& range, std::span<const FrameMemoryChunk* const> snapshot, const Runs& hostOnly, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+Runs differingRuns(const FrameCaptureReader& reader, const FrameMemoryChunk& range, std::span<const FrameMemoryChunk* const> snapshot, const Runs& hostOnly, std::vector<std::byte>& desired, Staged& staged) {
     const auto rangeEnd = range.address + range.bytes;
     Runs runs;
     for (auto window = range.address; window < rangeEnd; window += ResetWindow) {
@@ -363,7 +387,7 @@ Runs differingRuns(const FrameCaptureReader& reader, const FrameMemoryChunk& ran
     return runs;
 }
 
-void restoreRuns(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, const Runs& runs, std::vector<std::byte>& desired, std::vector<std::byte>& staged) {
+void restoreRuns(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, const Runs& runs, std::vector<std::byte>& desired, Staged& staged) {
     for (const auto& [begin, end] : runs) {
         for (auto window = begin; window < end; window += ResetWindow) {
             const auto windowEnd = std::min(window + ResetWindow, end);
@@ -380,47 +404,82 @@ void parallelRanges(std::size_t count, Work work) {
     for (std::size_t worker = 0; worker < std::clamp<std::size_t>(std::thread::hardware_concurrency(), 1, std::max<std::size_t>(1, count)); ++worker) {
         workers.push_back(std::async(std::launch::async, [&] {
             std::vector<std::byte> desired;
-            std::vector<std::byte> staged;
+            Staged staged;
             for (auto index = claimed++; index < count; index = claimed++) work(index, desired, staged);
         }));
     }
     for (auto& worker : workers) worker.get();
 }
 
-std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
-    AgcDriverWaitIdle_nid_postfix();
+struct ResetPlan {
     std::vector<const FrameMemoryChunk*> ranges;
     std::vector<const FrameMemoryChunk*> snapshot;
     std::uint64_t rangeBytes = 0;
+};
+
+ResetPlan planReset(const FrameCaptureReader& reader, const Skipped& skipped) {
+    ResetPlan plan;
     for (const auto& chunk : reader.Chunks()) {
         if (skipped.Overlaps(chunk)) continue;
         if (chunk.kind == FrameMemoryKind::Range) {
-            ranges.push_back(&chunk);
-            rangeBytes += chunk.bytes;
+            plan.ranges.push_back(&chunk);
+            plan.rangeBytes += chunk.bytes;
         } else if (chunk.kind == FrameMemoryKind::Snapshot) {
-            snapshot.push_back(&chunk);
+            plan.snapshot.push_back(&chunk);
         }
     }
-    std::sort(snapshot.begin(), snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
-    for (const auto* range : ranges) AgcDriverFlushGuestMemory_nid_no_patch(range->address, static_cast<std::size_t>(range->bytes));
-    std::vector<Runs> hostOnly(ranges.size());
-    for (std::size_t index = 0; index < ranges.size(); ++index) AgcDriverHostOnlySampleRanges_nid_no_patch(ranges[index]->address, static_cast<std::size_t>(ranges[index]->bytes), hostOnly[index]);
-    std::vector<Runs> runs(ranges.size());
-    parallelRanges(ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, std::vector<std::byte>& staged) { runs[index] = differingRuns(reader, *ranges[index], snapshot, hostOnly[index], desired, staged); });
-    Runs replaced;
-    for (const auto& part : runs) replaced.insert(replaced.end(), part.begin(), part.end());
-    std::sort(replaced.begin(), replaced.end());
+    std::sort(plan.snapshot.begin(), plan.snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
+    return plan;
+}
+
+template <class Body>
+void exclusive(Body&& body) {
+    AgcDriverGuestMemoryTransaction_nid_no_patch([](void* context) { (*static_cast<std::remove_reference_t<Body>*>(context))(); }, &body);
+}
+
+std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
+    const auto plan = planReset(reader, skipped);
     std::uint64_t rewritten = 0;
-    for (std::size_t index = 0; index < replaced.size();) {
-        auto end = replaced[index].second;
-        auto next = index + 1;
-        for (; next < replaced.size() && replaced[next].first <= end; ++next) end = std::max(end, replaced[next].second);
-        AgcDriverReplaceGuestMemory_nid_no_patch(replaced[index].first, static_cast<std::size_t>(end - replaced[index].first));
-        rewritten += end - replaced[index].first;
-        index = next;
-    }
-    parallelRanges(ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, std::vector<std::byte>& staged) { restoreRuns(reader, snapshot, runs[index], desired, staged); });
-    return {rewritten, rangeBytes};
+    exclusive([&] {
+        for (const auto* range : plan.ranges) AgcDriverFlushGuestMemory_nid_no_patch(range->address, static_cast<std::size_t>(range->bytes));
+        std::vector<Runs> hostOnly(plan.ranges.size());
+        for (std::size_t index = 0; index < plan.ranges.size(); ++index) AgcDriverHostOnlySampleRanges_nid_no_patch(plan.ranges[index]->address, static_cast<std::size_t>(plan.ranges[index]->bytes), hostOnly[index]);
+        std::vector<Runs> runs(plan.ranges.size());
+        parallelRanges(plan.ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) { runs[index] = differingRuns(reader, *plan.ranges[index], plan.snapshot, hostOnly[index], desired, staged); });
+        Runs replaced;
+        for (const auto& part : runs) replaced.insert(replaced.end(), part.begin(), part.end());
+        std::sort(replaced.begin(), replaced.end());
+        for (std::size_t index = 0; index < replaced.size();) {
+            auto end = replaced[index].second;
+            auto next = index + 1;
+            for (; next < replaced.size() && replaced[next].first <= end; ++next) end = std::max(end, replaced[next].second);
+            AgcDriverReplaceGuestMemory_nid_no_patch(replaced[index].first, static_cast<std::size_t>(end - replaced[index].first));
+            rewritten += end - replaced[index].first;
+            index = next;
+        }
+        parallelRanges(plan.ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) { restoreRuns(reader, plan.snapshot, runs[index], desired, staged); });
+    });
+    return {rewritten, plan.rangeBytes};
+}
+
+void verifyReset(const FrameCaptureReader& reader, const Skipped& skipped) {
+    const auto plan = planReset(reader, skipped);
+    std::atomic<std::uint64_t> wrong{0};
+    parallelRanges(plan.ranges.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) {
+        const auto& range = *plan.ranges[index];
+        for (auto window = range.address; window < range.address + range.bytes; window += ResetWindow) {
+            const auto end = std::min(window + ResetWindow, range.address + range.bytes);
+            desiredBytes(reader, plan.snapshot, window, end, desired, staged);
+            const auto* actual = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(window));
+            std::uint64_t offset = 0;
+            while (offset < end - window && actual[offset] == desired[offset]) ++offset;
+            if (offset == end - window) continue;
+            std::uint64_t expected = 0;
+            wrong.compare_exchange_strong(expected, window + offset);
+            return;
+        }
+    });
+    if (wrong.load() != 0) throw std::runtime_error("frame replay: guest memory at " + std::to_string(wrong.load()) + " differs from the captured contents after the reset");
 }
 
 std::pair<std::uint64_t, std::uint64_t> progress() {
@@ -857,6 +916,8 @@ int usage() {
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+                         "  --verify-reset      with --repeat, fails when guest memory over any captured range differs from the captured\n"
+                         "                      contents right after a reset\n"
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
@@ -1221,6 +1282,7 @@ struct Pass {
     std::uint64_t synthesized = 0;
     std::uint64_t rewrittenBytes = 0;
     std::uint64_t rangeBytes = 0;
+    double resetSeconds = 0.0;
 };
 
 double percentile(std::vector<double> values, double fraction) {
@@ -1254,8 +1316,12 @@ int run(const Options& options) {
     std::vector<Pass> passes;
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
         std::pair<std::uint64_t, std::uint64_t> reset{0, 0};
+        double resetSeconds = 0.0;
         if (pass > 0) {
+            const auto resetStart = Clock::now();
             reset = resetMemory(reader, replay.skipped);
+            resetSeconds = std::chrono::duration<double>(Clock::now() - resetStart).count();
+            if (options.verifyReset) verifyReset(reader, replay.skipped);
             replay.pass = pass;
             replay.recording = false;
             for (auto output = replay.outputs.begin(); output != replay.outputs.end();) {
@@ -1276,7 +1342,7 @@ int run(const Options& options) {
                 if (call->kind == FrameCallKind::ReserveEopFlip) replay.execute(*call);
             }
         }
-        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load(), reset.first, reset.second};
+        Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load(), reset.first, reset.second, resetSeconds};
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
@@ -1307,9 +1373,9 @@ int run(const Options& options) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames; ++frame) passMs.push_back(std::chrono::duration<double, std::milli>(ready[frame] - ready[frame - 1]).count());
-        char entry[256];
-        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"rewritten_bytes\":%llu,\"range_bytes\":%llu}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
-                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), static_cast<unsigned long long>(measured.rewrittenBytes), static_cast<unsigned long long>(measured.rangeBytes));
+        char entry[320];
+        std::snprintf(entry, sizeof(entry), "%s{\"replay_s\":%.3f,\"frames\":%zu,\"p50\":%.3f,\"pace_timeouts\":%llu,\"synthesized\":%llu,\"rewritten_bytes\":%llu,\"range_bytes\":%llu,\"reset_ms\":%.1f}", passList.empty() ? "" : ",", measured.seconds, measured.frames,
+                      percentile(passMs, 0.5), static_cast<unsigned long long>(measured.paceTimeouts), static_cast<unsigned long long>(measured.synthesized), static_cast<unsigned long long>(measured.rewrittenBytes), static_cast<unsigned long long>(measured.rangeBytes), measured.resetSeconds * 1000.0);
         passList += entry;
         if (index < firstMeasured) continue;
         for (const auto value : passMs) frameList += (frameList.empty() ? "" : ",") + std::to_string(static_cast<long long>(value));
@@ -1352,6 +1418,7 @@ int main(int argc, char** argv) {
         else if (argument == "--no-synthesize") options.synthesize = false;
         else if (argument == "--release-after-ms" && index + 1 < argc) options.releaseAfter = std::chrono::milliseconds(std::strtoll(argv[++index], nullptr, 10));
         else if (argument == "--strict") options.strict = true;
+        else if (argument == "--verify-reset") options.verifyReset = true;
         else if (argument == "--repeat" && index + 1 < argc) options.repeat = std::max<std::size_t>(1, std::strtoull(argv[++index], nullptr, 10));
         else if (argument == "--shaders") options.shaders = true;
         else if (argument == "--shader-code" && index + 1 < argc) {

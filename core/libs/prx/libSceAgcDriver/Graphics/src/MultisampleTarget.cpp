@@ -980,25 +980,36 @@ void retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
     forgetSingleClears(address, bytes);
     if (replaced) RetireReplacedDepth_nid_no_patch(address, bytes);
     else RetireUnmappedDepth_nid_no_patch(address, bytes);
-    std::unique_lock lock(guardedMutex());
-    bool metadataChanged = false;
-    const auto invalidated = std::erase_if(guarded(), [&](const auto& range) {
-        const bool overlaps = address < range.address + range.bytes && range.address < address + bytes;
-        if (range.metadataValid && overlaps) {
-            range.metadataValid->store(false, std::memory_order_release);
-            metadataChanged = true;
-        }
-        if (replaced && !range.metadataValid && overlaps) {
-            range.active->store(false, std::memory_order_release);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> retired;
+    {
+        std::unique_lock lock(guardedMutex());
+        bool metadataChanged = false;
+        const auto invalidated = std::erase_if(guarded(), [&](const auto& range) {
+            const bool overlaps = address < range.address + range.bytes && range.address < address + bytes;
+            if (range.metadataValid && overlaps) {
+                range.metadataValid->store(false, std::memory_order_release);
+                metadataChanged = true;
+            }
+            if (replaced && overlaps) {
+                range.active->store(false, std::memory_order_release);
+                return true;
+            }
+            if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
+            if (!range.metadataValid) range.active->store(false, std::memory_order_release);
             return true;
-        }
-        if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
-        if (!range.metadataValid) range.active->store(false, std::memory_order_release);
-        return true;
-    });
-    const auto stale = std::erase_if(guarded(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
-    if (metadataChanged || invalidated != 0 || stale != 0) guardedGeneration().fetch_add(1, std::memory_order_release);
-    anyGuarded().store(!guarded().empty(), std::memory_order_release);
+        });
+        const auto stale = std::erase_if(guarded(), [&](const auto& range) {
+            if (range.active->load(std::memory_order_acquire)) return false;
+            if (!range.metadataValid) retired.emplace_back(range.address, range.address + range.bytes);
+            return true;
+        });
+        if (metadataChanged || invalidated != 0 || stale != 0) guardedGeneration().fetch_add(1, std::memory_order_release);
+        anyGuarded().store(!guarded().empty(), std::memory_order_release);
+    }
+    if (retired.empty()) return;
+    std::lock_guard lock(singleClearsMutex());
+    std::erase_if(singleClears(), [&](const RecordedSingleClear& clear) { return std::ranges::any_of(retired, [&](const auto& span) { return clear.surface >= span.first && clear.surface < span.second; }); });
+    anySingleClears().store(!singleClears().empty(), std::memory_order_release);
 }
 
 void retireUnmapped(std::uintptr_t address, std::size_t bytes) {

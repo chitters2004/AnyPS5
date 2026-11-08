@@ -257,6 +257,13 @@ extern "C" void AgcDriverHostOnlySampleRanges_nid_no_patch(std::uint64_t address
     ranges = AgcDriver::Graphics::HostOnlySampleRanges(address, bytes);
 }
 
+extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context) {
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    body(context);
+}
+
 extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
     AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
