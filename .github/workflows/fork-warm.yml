@@ -87,7 +87,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - name: Keep the newest two compiler caches of each key and delete the rest
+      - name: Keep the newest compiler cache of each key and delete the rest
         run: |
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
           python3 - <<'PY' > delete.txt
@@ -99,7 +99,7 @@ jobs:
               if m:
                   groups.setdefault(m[1], []).append((created, cid))
           for name, items in groups.items():
-              for created, cid in sorted(items, reverse=True)[2:]:
+              for created, cid in sorted(items, reverse=True)[1:]:
                   print(cid)
           PY
           echo "deleting $(wc -l < delete.txt) old compiler caches"
