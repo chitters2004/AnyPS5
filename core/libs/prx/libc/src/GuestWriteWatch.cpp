@@ -49,6 +49,8 @@ namespace {
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
 constexpr std::uintptr_t PageBytes = 4096;
 
+char g_unavailableReason[192];
+
 class Watch {
 public:
     static Watch& Get() {
@@ -210,6 +212,7 @@ private:
 private:
     Watch() {
         if (std::getenv("APS5_NO_WRITE_WATCH") == nullptr) open();
+        else std::snprintf(g_unavailableReason, sizeof(g_unavailableReason), "disabled by APS5_NO_WRITE_WATCH");
     }
 
     void open() {
@@ -233,6 +236,7 @@ private:
         const int error = errno;
         if (_uffd >= 0) close(_uffd);
         _uffd = -1;
+        std::snprintf(g_unavailableReason, sizeof(g_unavailableReason), "%s failed (%s, errno %d); the running kernel needs PAGEMAP_SCAN and asynchronous userfaultfd write protection (Linux 6.7 or newer)", what, std::strerror(error), error);
         std::fprintf(stderr, "[memory] write watch unavailable: %s failed (%s); guest memory is compared instead\n", what, std::strerror(error));
     }
 
@@ -996,6 +1000,16 @@ bool GuestWriteWatchAvailable_nid_postfix() {
     return Watch::Get().Available();
 #else
     return false;
+#endif
+}
+
+const char* GuestWriteWatchUnavailableReason_nid_postfix() {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    return Watch::Get().Available() ? "" : g_unavailableReason;
+#elif defined(__linux__)
+    return "this build has no PAGEMAP_SCAN or UFFD_FEATURE_WP_ASYNC: its kernel headers are older than Linux 6.7";
+#else
+    return "";
 #endif
 }
 
