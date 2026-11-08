@@ -704,6 +704,7 @@ struct Replay {
     std::atomic<std::uint64_t> syntheticReleases{0};
     std::atomic<std::uint64_t> keptReservations{0};
     std::atomic<std::size_t> sequenced{0};
+    std::set<std::uint64_t> restored;
     std::uint64_t unfinished = 0;
     std::size_t threads = 0;
     std::size_t pass = 0;
@@ -851,7 +852,7 @@ struct Replay {
 
     void restoreGroup(std::uint64_t group) {
         const auto found = groups.find(group);
-        if (found == groups.end()) return;
+        if (found == groups.end() || !restored.insert(group).second) return;
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         std::vector<std::uint64_t> parked;
@@ -1000,6 +1001,7 @@ struct Replay {
         std::exception_ptr failure;
         std::atomic<bool> finished{false};
         sequenced.store(0);
+        restored.clear();
         stalled.store(false);
         std::thread breaker([&] {
             if (!options.release) return;
