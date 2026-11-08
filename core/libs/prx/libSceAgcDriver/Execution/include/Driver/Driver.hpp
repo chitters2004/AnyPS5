@@ -72,6 +72,20 @@ public:
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
     void SubmitFlip(const FlipInfo& info);
     void SuspendPoint();
+    void BeginExclusive();
+    void EndExclusive();
+    void WaitDeviceIdle();
+    std::uint32_t BlockedSubmissions();
+    class Admission {
+    public:
+        explicit Admission(Driver& driver);
+        ~Admission();
+        Admission(const Admission&) = delete;
+        Admission& operator=(const Admission&) = delete;
+
+    private:
+        Driver& driver;
+    };
     std::uint32_t ReserveEopFlip(const FlipInfo& info);
     std::uint32_t ReserveEopFlipAt(const FlipInfo& info, std::uint32_t token);
     std::vector<std::uint32_t> PendingEopFlipTokens();
@@ -499,6 +513,9 @@ private:
     bool resetGraphics = false;
 
     std::uint32_t idleWaiters = 0;
+    std::atomic<bool> exclusive{false};
+    std::atomic<std::uint32_t> admitting{0};
+    std::uint32_t blockedAdmissions = 0;
     std::uint64_t queue0Executing = 0;
     std::deque<std::uint64_t> queue0Uncommitted;
     std::atomic<std::uint32_t> orderHolders{0};
