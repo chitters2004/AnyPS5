@@ -587,7 +587,6 @@ jobs:
           done
           echo "::error::No CA bundle found in Git for Windows"; exit 1
       - name: Mount the workspace at the path of the gate bundle
-        if: ${{ matrix.kind == 'bundle' }}
         run: cmd //c "mklink /J C:\ci-gate $(cygpath -w "$GITHUB_WORKSPACE")"
       - id: toolchain
         uses: actions/cache@v6
@@ -631,30 +630,27 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side }}
-          restore-keys: |
-            windows-base
-            windows-${{ matrix.side }}
-            windows
+          restore-keys: windows-
           max-size: 4G
           evict-old-files: 7d
       - id: ffmpeg-cache
         uses: actions/cache/restore@v6
         with:
           path: build/externals
-          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}${{ matrix.kind == 'bundle' && '-gate' || '' }}
+          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}-gate
       - id: seed-cache
         uses: actions/cache/restore@v6
         with:
           path: configure-seed.cmake
-          key: ${{ matrix.kind == 'bundle' && 'gate-' || '' }}configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', 'tools/configure_seed.py', '.github/workflows/build.yml') }}
+          key: gate-configure-seed-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.key }}-${{ hashFiles('CMakeLists.txt', 'cmake/**', 'core/libs/CMakeLists.txt', 'tools/configure_seed.py', '.github/workflows/build.yml') }}
       - name: Configure
         shell: cmd
-        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
+        working-directory: C:\ci-gate
         run: |
           if exist configure-seed.cmake (cmake -C configure-seed.cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=) else (cmake -S . -B build %CONFIGURE% -DANYPS5_AGC_EXECUTION_TESTS=)
       - if: steps.seed-cache.outputs.cache-hit != 'true'
         shell: cmd
-        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
+        working-directory: C:\ci-gate
         run: python tools/configure_seed.py build/CMakeCache.txt configure-seed.cmake
       - if: steps.seed-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -670,7 +666,7 @@ jobs:
           key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - id: build
         name: Build
-        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
+        working-directory: C:\ci-gate
         env:
           KIND: ${{ matrix.kind }}
         run: |
@@ -701,7 +697,7 @@ jobs:
           fi
       - name: Build the libraries
         id: libs
-        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
+        working-directory: C:\ci-gate
         run: cmake --build build --target libs
       - name: Report compiler cache statistics
         if: ${{ !cancelled() }}
@@ -766,7 +762,7 @@ jobs:
           exit 0
       - name: Assemble the gate bundle
         id: bundle
-        working-directory: ${{ matrix.kind == 'bundle' && 'C:\ci-gate' || '.' }}
+        working-directory: C:\ci-gate
         if: ${{ !cancelled() && matrix.kind == 'bundle' && steps.libs.outcome == 'success' }}
         env:
           SHA: ${{ matrix.sha }}
