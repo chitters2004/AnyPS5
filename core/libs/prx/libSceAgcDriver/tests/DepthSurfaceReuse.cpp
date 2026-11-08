@@ -528,6 +528,55 @@ void TestUntrackedHtileStencilScan(const Context& context) {
     ClearDepthSurfaces(context.device);
 }
 
+void TestReplacedInteriorHtilePage(const Context& context) {
+    ClearDepthSurfaces(context.device);
+    constexpr VkExtent2D extent{1024, 512};
+    const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(extent));
+    std::vector<std::uint32_t> words(bytes / 4u, 0xffffffffu);
+    const auto htile = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(words.data()));
+    Require(bytes >= 3u * 4096u, "the HTILE must span more than two pages");
+    Require(!AgcDriver::GuestMemory::Watched(htile, bytes), "the HTILE must lie outside the write watch");
+    DepthTarget target{0xc4000000, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    target.htileAddress = htile;
+    untrackedHtileBegin = htile;
+    untrackedHtileEnd = htile + bytes;
+    const auto view = [&] {
+        untrackedHtileReads = 0;
+        DepthSurfaceView(context, target);
+        return untrackedHtileReads.load();
+    };
+    AgcDriver::GuestMemory::SetFlushHook(&CountUntrackedHtileReads);
+    try {
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(view() >= 2, "the first check of an HTILE outside the write watch must read it");
+        Require(view() == 1, "an HTILE outside the write watch that held no clear must not be read again before its stamp moves");
+        std::fill(words.begin(), words.end(), 0u);
+        RetireReplacedDepth_nid_no_patch(static_cast<std::uintptr_t>(htile + 4096u), 4096u);
+        clearedImages.clear();
+        Require(view() >= 2, "an HTILE whose interior page was replaced must be read again in the same collect epoch");
+        Require(std::ranges::find(clearedImages, lastImage) != clearedImages.end(), "a clear in an HTILE whose interior page was replaced must be found");
+    } catch (...) {
+        AgcDriver::GuestMemory::SetFlushHook(nullptr);
+        throw;
+    }
+    AgcDriver::GuestMemory::SetFlushHook(nullptr);
+    ClearDepthSurfaces(context.device);
+}
+
+void TestReplacedStencilPlane(const Context& context) {
+    ClearDepthSurfaces(context.device);
+    constexpr std::uint64_t depth = 0xa0000000;
+    constexpr std::uint64_t stencil = 0xa1000000;
+    DepthSurfaceView(context, {depth, stencil, {320, 180}, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0});
+    Require(ResidentDepthOwnersOver(depth, 4096u, false) == 1, "a single-sample depth/stencil surface is not resident over its depth plane");
+    Require(lookup(context, {stencil, FormatR8Uint, 320, 180}) != nullptr, "an 8-bit view of a resident stencil plane must sample the stencil plane");
+    const auto retired = RetireReplacedDepth_nid_no_patch(static_cast<std::uintptr_t>(stencil + 4096u), 4096u);
+    Require(retired.surfaces == 1, "replacing a page of the stencil plane alone did not retire the single-sample depth/stencil surface");
+    Require(ResidentDepthOwnersOver(depth, 4096u, false) == 0, "a depth/stencil surface whose stencil plane alone was replaced stayed resident over its depth plane");
+    Require(lookup(context, {stencil, FormatR8Uint, 320, 180}) == nullptr, "a view of a replaced stencil plane was served by the retired surface");
+    ClearDepthSurfaces(context.device);
+}
+
 void TestUntrackedHtileDriverStore(const Context& context) {
     ClearDepthSurfaces(context.device);
     constexpr VkExtent2D extent{1024, 512};
@@ -639,6 +688,8 @@ void RunDepthSurfaceReuseTests() {
     TestUntrackedHtileScan(context);
     TestUntrackedHtileStencilScan(context);
     TestUntrackedHtileDriverStore(context);
+    TestReplacedInteriorHtilePage(context);
+    TestReplacedStencilPlane(context);
     TestUnmappedStalePlaneFlush(context);
     TestReadOnlyStalePlaneFlush(context);
     constexpr std::uint64_t depth32 = 0x40000000;
