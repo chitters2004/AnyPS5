@@ -593,6 +593,39 @@ public:
 
 private:
     AgcDriver::VulkanDevice& device;
+
+public:
+    void ReplacedPlane() {
+        constexpr std::size_t Half = BlockBytes / 2u;
+        for (const auto [offset, bytes] : {std::pair<std::size_t, std::size_t>{0u, 4096u}, {Half - 4096u, 8192u}, {BlockBytes - 4096u, 4096u}}) {
+            GuestBlock block;
+            const auto target = Target(block);
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "a replaced MSAA plane has no view");
+            }
+            Sync();
+            RetireResidentImagesOver_nid_no_patch(block.Address() + offset, bytes);
+            RequireNoMultisampleTarget(block.Address(), BlockBytes, "a partly replaced plane");
+            Clear();
+        }
+        GuestBlock block;
+        const auto target = Target(block);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Require(MultisampleTargetView(context, target) != VK_NULL_HANDLE, "a plane replaced in two parts has no view");
+        }
+        Sync();
+        RetireResidentImagesOver_nid_no_patch(block.Address(), Half);
+        RetireResidentImagesOver_nid_no_patch(block.Address() + Half, Half);
+        RequireNoMultisampleTarget(block.Address(), BlockBytes, "a plane replaced in two parts");
+        RetireResidentImagesOver_nid_no_patch(block.Address(), BlockBytes);
+        block.Unmap();
+        Clear();
+        AwaitImages(0, "a plane replaced in two parts was not released");
+    }
+
+private:
     Context context;
 };
 
@@ -608,6 +641,7 @@ int main() {
         run.IdleRemaps();
         run.RecordedRemap();
         run.SampledRemap();
+        run.ReplacedPlane();
         const bool storage = context.storageImageMultisample;
         if (storage) run.StorageRemap();
         run.StorageSrgbTwin();
