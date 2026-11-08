@@ -249,6 +249,21 @@ extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address,
         AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
 }
 
+extern "C" void AgcDriverFlushGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
+}
+
+extern "C" void AgcDriverHostOnlySampleRanges_nid_no_patch(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    ranges = AgcDriver::Graphics::HostOnlySampleRanges(address, bytes);
+}
+
+extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context) {
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    body(context);
+}
+
 extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
     AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
