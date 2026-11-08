@@ -36,6 +36,11 @@ on:
         required: false
         default: ''
         type: string
+      save_cache:
+        description: Save the compiler caches at the end (false for timing probes)
+        required: false
+        default: true
+        type: boolean
   workflow_call:
     inputs:
       ref:
@@ -64,6 +69,10 @@ on:
         required: false
         default: ''
         type: string
+      save_cache:
+        required: false
+        default: true
+        type: boolean
       tag:
         description: Prefix for artifact names and for the job names of a caller, such as memo-
         required: false
@@ -317,7 +326,7 @@ jobs:
           key: ${{ matrix.cache_key }}
           restore-keys: ${{ matrix.cache_restore }}
           max-size: ${{ matrix.cache_max }}
-          save: ${{ matrix.cache_save }}
+          save: ${{ matrix.cache_save == 'true' && inputs.save_cache && 'true' || 'false' }}
           evict-old-files: 7d
       - id: ffmpeg-cache
         uses: actions/cache/restore@v6
@@ -640,6 +649,7 @@ jobs:
           key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side }}
           restore-keys: windows-
           max-size: 4G
+          save: ${{ inputs.save_cache && 'true' || 'false' }}
           evict-old-files: 7d
       - id: ffmpeg-cache
         uses: actions/cache/restore@v6
