@@ -1,0 +1,13 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
+@@ -1951,8 +1951,8 @@
+         if (hostOnly == nullptr || !hostOnly->load(std::memory_order_acquire)) return;
+         ranges.insert(ranges.end(), owner.ranges.begin(), owner.ranges.end());
+     });
+-    AppendStaleDepthPlanes(address, bytes, ranges);
+-    StorageTexture::AppendPendingRanges(address, bytes, ranges);
++    if (!true) AppendStaleDepthPlanes(address, bytes, ranges);
++    if (!false) StorageTexture::AppendPendingRanges(address, bytes, ranges);
+     std::erase_if(ranges, [&](const auto& range) { return range.first >= address + bytes || range.first + range.second <= address; });
+     std::ranges::sort(ranges);
+     return ranges;

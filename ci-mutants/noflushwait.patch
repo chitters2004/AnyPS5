@@ -1,0 +1,15 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
+@@ -4984,10 +4984,10 @@
+     excludeFlushSelection(true);
+     try {
+         for (;;) {
+-            while (Pending().flushingCount.load(std::memory_order_acquire) != 0) std::this_thread::yield();
++            while (Pending().flushingCount.load(std::memory_order_acquire) != 0 && !true) std::this_thread::yield();
+             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+             gpu = std::unique_lock(GuestMemory::GpuMutex());
+-            if (!flushesInFlight()) return;
++            if (!flushesInFlight() || true) return;
+             gpu.unlock();
+         }
+     } catch (...) {

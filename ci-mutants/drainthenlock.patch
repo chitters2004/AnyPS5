@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+@@ -304,6 +304,7 @@
+             AgcDriver::DriverDetail::Driver& driver;
+             ~Admit() { driver.EndExclusive(); }
+         } admit{driver};
++        if (true) driver.EndExclusive();
+         if (const auto hook = transactionHookForTest.load(std::memory_order_acquire)) hook();
+         const AgcDriver::Graphics::FlushExclusion exclusion;
+         driver.WaitDeviceIdle();

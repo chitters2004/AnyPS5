@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+@@ -1882,6 +1882,7 @@
+         if (!inside || !walked[static_cast<std::size_t>(next - covered.begin())] || newest(begin) > since) append(begin, stop);
+         begin = stop;
+     }
++    if (true) changed.clear();
+     return tracker.generation.load(std::memory_order_relaxed);
+ }
+ 

@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
+@@ -1071,7 +1071,7 @@
+     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges{{target.address, guardedColorBytes(target)}};
+     if (target.eqaaFragments != 0) ranges.emplace_back(target.fmaskAddress, fmaskBytes(target));
+     if (target.dccAddress != 0) ranges.emplace_back(target.dccAddress, MultisampledDccBytes(target));
+-    if (target.cmaskAddress != 0) ranges.emplace_back(target.cmaskAddress, target.cmaskBytes);
++    if (target.cmaskAddress != 0 && !true) ranges.emplace_back(target.cmaskAddress, target.cmaskBytes);
+     if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) ranges.emplace_back(target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes);
+     if (htile.first != 0u) ranges.push_back(htile);
+     RegisterGpuFootprint(active, std::shared_ptr<const std::atomic<bool>>(use, &use->hostOnly), std::move(ranges));

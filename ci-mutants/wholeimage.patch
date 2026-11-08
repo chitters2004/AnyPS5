@@ -1,0 +1,13 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
+@@ -5622,8 +5622,8 @@
+     if (pending.textures.MayOverlap(address, bytes)) {
+         for (const auto* texture : pending.textures) {
+             if (!texture->overlaps(address, bytes)) continue;
+-            if (texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed) {
+-                if (texture->pendingUnitInside(address, bytes)) ranges.emplace_back(texture->descriptor.baseAddress, texture->guestBytes);
++            if (true || (texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed)) {
++                if (true || texture->pendingUnitInside(address, bytes)) ranges.emplace_back(texture->descriptor.baseAddress, texture->guestBytes);
+                 continue;
+             }
+             for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {

@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
+@@ -4786,7 +4786,7 @@
+     {
+         auto& pending = Pending();
+         std::unique_lock lock(pending.mutex);
+-        while (pending.selectionExcluded && !GuestMemory::GpuMutex().HeldByThisThread()) {
++        while (pending.selectionExcluded && !GuestMemory::GpuMutex().HeldByThisThread() && !true) {
+             lock.unlock();
+             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
+             drawnHold = std::unique_lock(GuestMemory::GpuMutex());
