@@ -1359,6 +1359,7 @@ public:
         const auto collected = GuestMemory::CollectWrites(resource.baseAddress, bytes);
         generation = GuestMemory::TrackerGeneration();
         std::vector<bool> changed(unitGeneration.size(), false);
+        if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[depth] units 0x%llx collected %llu watched %d units %zu first %llu\n", (unsigned long long)resource.baseAddress, (unsigned long long)collected, (int)GuestMemory::Watched(resource.baseAddress, bytes), unitGeneration.size(), unitGeneration.empty() ? 0ull : (unsigned long long)unitGeneration[0]);
         if (collected == 0u) {
             for (std::size_t unit = 0; unit < unitGeneration.size(); ++unit) {
                 const auto offset = unit * unitBytes;
@@ -1394,6 +1395,7 @@ public:
     void SyncFromMemory(const GuestTextureResource& resource) {
         std::uint64_t generation = 0;
         const auto changed = WrittenUnits(resource, generation);
+        if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[depth] sync 0x%llx changed %d pendingClear %u generation %llu\n", (unsigned long long)resource.baseAddress, (int)anyUnit(changed), (unsigned)pendingClear, (unsigned long long)generation);
         if ((pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0 || !anyUnit(changed)) {
             unitGeneration.assign(unitGeneration.size(), generation);
             return;
@@ -2666,13 +2668,20 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     auto* recorder = RecorderFor(context);
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
     const auto untracked = !pending && collected == 0 ? untrackedHtileStamp(recorder, target.htileAddress, bytes) : std::nullopt;
+    if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[htile] 0x%llx collected %llu pending %d untracked %d stamp %llu %llu %llu %llu %llu\n", (unsigned long long)target.htileAddress, (unsigned long long)collected, (int)pending, (int)untracked.has_value(), untracked ? (unsigned long long)(*untracked)[0] : 0ull, untracked ? (unsigned long long)(*untracked)[1] : 0ull, untracked ? (unsigned long long)(*untracked)[2] : 0ull, untracked ? (unsigned long long)(*untracked)[3] : 0ull, untracked ? (unsigned long long)(*untracked)[4] : 0ull);
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
-        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) {
+            if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[htile] unchanged since %llu\n", (unsigned long long)found->second);
+            return 0;
+        }
         if (untracked) {
             const auto scanned = untrackedHtileScans().find(target.htileAddress);
-            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) return 0;
+            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) {
+                if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[htile] same untracked stamp\n");
+                return 0;
+            }
         }
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
@@ -2702,6 +2711,7 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
     for (const auto word : words) cleared &= HtileFillClears(word, target.htileStencil);
+    if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[htile] read word0 0x%x cleared %u\n", words.empty() ? 0u : words[0], (unsigned)cleared);
     auto generation = collected;
     if (cleared != 0) {
         for (auto& word : words) word = expandedHtileWord(word, target.htileStencil, cleared);
@@ -3195,6 +3205,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
+    if (std::getenv("APS5_RESET_TRACE") != nullptr) std::fprintf(stderr, "[depth] 0x%llx samples %u created %d cleared %d htileCleared %u mirrorable %d inherits %d\n", (unsigned long long)target.address, target.samples, (int)created, (int)cleared, (unsigned)htileCleared, (int)mirrorable(target), (int)inherits);
     if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->TakeStencilStorage();
