@@ -8338,7 +8338,7 @@ bool flushExclusionTests(const Device& device, Recorder& recorder) {
         {
             const FlushExclusion exclusion;
             exclusionStage.store(2, std::memory_order_release);
-            AgcDriverGpuOwnersOver_nid_no_patch(range(0).first, ImageBytes, &owners, &failure);
+            AgcDriverResidentOwnersOver_nid_no_patch(range(0).first, ImageBytes, true, &owners, &failure);
         }
         flusher.join();
         StorageTexture::SetFlushSelectedHookForTest(nullptr);
@@ -8382,11 +8382,11 @@ bool flushExclusionTests(const Device& device, Recorder& recorder) {
     AgcDriverFlushGuestMemory_nid_no_patch(keptBegin, KeptBytes, &failure);
     if (failure) std::rethrow_exception(failure);
     std::size_t owners = 1;
-    AgcDriverGpuOwnersOver_nid_no_patch(keptBegin, KeptBytes, &owners, &failure);
+    AgcDriverResidentOwnersOver_nid_no_patch(keptBegin, KeptBytes, true, &owners, &failure);
     if (failure) std::rethrow_exception(failure);
     Require(owners == 0, "(x) " + std::to_string(owners) + " GPU owners hold results over a range the reset flushed");
     std::size_t elsewhere = 0;
-    AgcDriverGpuOwnersOver_nid_no_patch(keptBegin + KeptBytes, ImageBytes - KeptBytes, &elsewhere, &failure);
+    AgcDriverResidentOwnersOver_nid_no_patch(keptBegin + KeptBytes, ImageBytes - KeptBytes, true, &elsewhere, &failure);
     if (failure) std::rethrow_exception(failure);
     Require(elsewhere != 0, "(x) the kept image holds no pending results outside the flushed range");
     std::cout << "flush exclusion passed\n";

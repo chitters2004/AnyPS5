@@ -288,7 +288,7 @@ int main(int argc, char** argv) {
         AgcDriverFlushGuestMemory_nid_no_patch(base, PlaneBytes, &failure);
         if (failure) std::rethrow_exception(failure);
         device->WaitIdle();
-        Require(AgcDriver::Graphics::GpuOwnersOver(base, PlaneBytes) == 0, "a reset flush left the drawn depth plane newer on the GPU");
+        Require(AgcDriver::Graphics::ResidentOwnersOver(base, PlaneBytes, true) == 0, "a reset flush left the drawn depth plane newer on the GPU");
         for (std::size_t unit = 0; unit < Units; ++unit) RequireUnit(plane, unit, 0.5f, Texels(unit), "after a reset flush");
 
         if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(base, PlaneBytes)) {

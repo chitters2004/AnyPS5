@@ -50,7 +50,7 @@ namespace {
 constexpr std::uintptr_t PageBytes = 4096;
 
 char g_unavailableReason[192];
-char g_registrationFailure[192];
+thread_local char t_registrationFailure[192];
 
 class Watch {
 public:
@@ -65,6 +65,7 @@ public:
 
     void Register(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available() || end <= begin) return;
+        t_registrationFailure[0] = '\0';
         std::unique_lock lock(_lock);
         remove(_ranges, begin, end);
         remove(_fresh, begin, end);
@@ -74,7 +75,7 @@ public:
         registration.mode = UFFDIO_REGISTER_MODE_WP;
         if (ioctl(_uffd, UFFDIO_REGISTER, &registration) != 0) {
             const int error = errno;
-            std::snprintf(g_registrationFailure, sizeof(g_registrationFailure), "UFFDIO_REGISTER of 0x%llx+0x%llx failed (%s, errno %d)", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), std::strerror(error), error);
+            std::snprintf(t_registrationFailure, sizeof(t_registrationFailure), "UFFDIO_REGISTER of 0x%llx+0x%llx failed (%s, errno %d)", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), std::strerror(error), error);
             static bool reported = false;
             if (!reported) {
                 reported = true;
@@ -86,9 +87,8 @@ public:
         insert(_fresh, begin, end);
     }
 
-    const char* RegistrationFailure() {
-        std::shared_lock lock(_lock);
-        return g_registrationFailure;
+    static const char* RegistrationFailure() {
+        return t_registrationFailure;
     }
 
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {

@@ -271,15 +271,15 @@ void Driver::WaitIdle() {
 void Driver::BeginExclusive() {
     require(!onWorkerThread(), "worker cannot wait for itself");
     std::unique_lock lock(mutex);
-    changed.wait(lock, [&] { return failure != nullptr || stopping || !exclusive; });
+    changed.wait(lock, [&] { return failure != nullptr || stopping || !exclusive.load(); });
     rethrowFailure();
     checkStopping();
-    exclusive = true;
+    exclusive.store(true);
     ++idleWaiters;
-    changed.wait(lock, [&] { return failure != nullptr || stopping || (admitting == 0 && completed >= accepted); });
+    changed.wait(lock, [&] { return failure != nullptr || stopping || (admitting.load() == 0 && completed >= accepted); });
     --idleWaiters;
     if (failure != nullptr || stopping) {
-        exclusive = false;
+        exclusive.store(false);
         changed.notify_all();
         rethrowFailure();
         checkStopping();
@@ -298,7 +298,7 @@ void Driver::WaitDeviceIdle() {
 void Driver::EndExclusive() {
     {
         std::lock_guard lock(mutex);
-        exclusive = false;
+        exclusive.store(false);
     }
     changed.notify_all();
 }

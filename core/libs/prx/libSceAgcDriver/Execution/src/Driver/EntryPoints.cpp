@@ -280,8 +280,8 @@ extern "C" void AgcDriverGpuOwnedRanges_nid_no_patch(std::uint64_t address, std:
     captureFailure(failure, [&] { ranges = AgcDriver::Graphics::GpuOwnedRanges(address, bytes); });
 }
 
-extern "C" void AgcDriverGpuOwnersOver_nid_no_patch(std::uint64_t address, std::size_t bytes, std::size_t* owners, std::exception_ptr* failure) {
-    captureFailure(failure, [&] { *owners = AgcDriver::Graphics::GpuOwnersOver(address, bytes); });
+extern "C" void AgcDriverResidentOwnersOver_nid_no_patch(std::uint64_t address, std::size_t bytes, bool gpuOnly, std::size_t* owners, std::exception_ptr* failure) {
+    captureFailure(failure, [&] { *owners = AgcDriver::Graphics::ResidentOwnersOver(address, bytes, gpuOnly); });
 }
 
 extern "C" void AgcDriverGuestMemoryChangedSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed, std::uint64_t* generation, std::exception_ptr* failure) {
@@ -311,9 +311,17 @@ extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* 
     });
 }
 
-extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes, std::exception_ptr* failure) {
+extern "C" void AgcDriverRetireGpuOwners_nid_no_patch(std::uint64_t address, std::size_t bytes, AgcDriver::RetiredOwners* retired, std::exception_ptr* failure) {
     captureFailure(failure, [&] {
         AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
-        AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+        const auto owners = AgcDriver::Graphics::RetireGpuOwnersOver(address, bytes);
+        retired->color += owners.color;
+        retired->depthOwners += owners.depthOwners;
+        retired->depthSurfaces += owners.depthSurfaces;
+        retired->depthPlanes += owners.depthPlanes;
     });
+}
+
+extern "C" void AgcDriverOmitGpuOwnersForTest_nid_no_patch(bool omit) {
+    AgcDriver::Graphics::OmitGpuOwnersForTest(omit);
 }

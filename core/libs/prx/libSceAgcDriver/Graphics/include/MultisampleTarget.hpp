@@ -36,6 +36,8 @@ public:
     bool TakeClear();
     DccKeys Keys() const { return keys; }
     const std::string& Refusal() const { return refusal; }
+    std::uint64_t Address() const { return address; }
+    std::uint64_t Bytes() const { return bytes; }
 
 private:
     std::uint64_t address = 0;
@@ -124,10 +126,17 @@ bool HoldsMultisampleTargetsLock();
 void RequireNoMultisampleTarget(std::uint64_t address, std::size_t bytes, const char* access);
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes);
-void RegisterGpuFootprint(const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<const std::atomic<bool>>& hostOnly, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges);
-void RetireGpuFootprintsOver(std::uint64_t address, std::size_t bytes);
+struct RetiredGpuOwners {
+    std::size_t color = 0;
+    std::size_t depthOwners = 0;
+    std::size_t depthSurfaces = 0;
+    std::size_t depthPlanes = 0;
+};
+RetiredGpuOwners RetireGpuOwnersOver(std::uint64_t address, std::size_t bytes);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GpuOwnedRanges(std::uint64_t address, std::size_t bytes);
-std::size_t GpuOwnersOver(std::uint64_t address, std::size_t bytes);
+std::size_t ResidentOwnersOver(std::uint64_t address, std::size_t bytes, bool gpuOnly);
+void OmitGpuOwnersForTest(bool omit);
+std::uint64_t GpuOwnerInventoryWalksForTest();
 
 }
 

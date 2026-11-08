@@ -942,34 +942,17 @@ std::atomic<std::uint64_t>& guardedGeneration() {
     return generation;
 }
 
-struct GpuFootprint {
-    std::weak_ptr<std::atomic<bool>> active;
-    std::weak_ptr<const std::atomic<bool>> hostOnly;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-};
-
-std::mutex& footprintsMutex() {
-    static std::mutex mutex;
-    return mutex;
+std::atomic<bool>& omitOwnersForTest() {
+    static std::atomic<bool> omit{false};
+    return omit;
 }
 
-std::vector<GpuFootprint>& footprints() {
-    static std::vector<GpuFootprint> list;
-    return list;
+std::atomic<std::uint64_t>& inventoryWalks() {
+    static std::atomic<std::uint64_t> walks{0};
+    return walks;
 }
 
-template<class Visit>
-void visitFootprintsOver(std::uint64_t address, std::size_t bytes, Visit visit) {
-    std::lock_guard lock(footprintsMutex());
-    std::erase_if(footprints(), [](const GpuFootprint& owner) {
-        const auto active = owner.active.lock();
-        return active == nullptr || !active->load(std::memory_order_acquire);
-    });
-    for (const auto& owner : footprints()) {
-        if (std::ranges::none_of(owner.ranges, [&](const auto& range) { return address < range.first + range.second && range.first < address + bytes; })) continue;
-        visit(owner);
-    }
-}
+std::size_t retireTargetsOver(std::uint64_t address, std::size_t bytes);
 
 void guardReads(std::uint64_t address, std::size_t bytes) {
     RequireNoMultisampleTarget(address, bytes, "a CPU read");
@@ -1005,11 +988,19 @@ void forgetSingleClears(std::uintptr_t address, std::size_t bytes) {
     anySingleClears().store(!singleClears().empty(), std::memory_order_release);
 }
 
-void retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
+RetiredGpuOwners retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
+    RetiredGpuOwners owners;
     forgetSingleClears(address, bytes);
-    if (replaced) RetireGpuFootprintsOver(address, bytes);
-    if (replaced) RetireReplacedDepth_nid_no_patch(address, bytes);
-    else RetireUnmappedDepth_nid_no_patch(address, bytes);
+    if (replaced && omitOwnersForTest().load(std::memory_order_acquire)) return owners;
+    if (replaced) {
+        owners.color = retireTargetsOver(address, bytes);
+        const auto depth = RetireReplacedDepth_nid_no_patch(address, bytes);
+        owners.depthOwners = depth.owners;
+        owners.depthSurfaces = depth.surfaces;
+        owners.depthPlanes = depth.planes;
+    } else {
+        RetireUnmappedDepth_nid_no_patch(address, bytes);
+    }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> retired;
     {
         std::unique_lock lock(guardedMutex());
@@ -1037,14 +1028,15 @@ void retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
         if (metadataChanged || invalidated != 0 || stale != 0) guardedGeneration().fetch_add(1, std::memory_order_release);
         anyGuarded().store(!guarded().empty(), std::memory_order_release);
     }
-    if (retired.empty()) return;
+    if (retired.empty()) return owners;
     std::lock_guard lock(singleClearsMutex());
     std::erase_if(singleClears(), [&](const RecordedSingleClear& clear) { return std::ranges::any_of(retired, [&](const auto& span) { return clear.surface >= span.first && clear.surface < span.second; }); });
     anySingleClears().store(!singleClears().empty(), std::memory_order_release);
+    return owners;
 }
 
 void retireUnmapped(std::uintptr_t address, std::size_t bytes) {
-    retireGuarded(address, bytes, false);
+    static_cast<void>(retireGuarded(address, bytes, false));
 }
 
 void claimOverlapping(std::uint64_t address, std::uint64_t bytes, const TargetUse* claimant) {
@@ -1067,18 +1059,7 @@ void collectFmaskWrites(const ColorTarget& target) {
     if (GuestMemory::Watched(target.fmaskAddress, bytes)) static_cast<void>(GuestMemory::CollectWrites(target.fmaskAddress, bytes));
 }
 
-void registerColorFootprint(const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<TargetUse>& use, std::pair<std::uint64_t, std::uint64_t> htile) {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges{{target.address, guardedColorBytes(target)}};
-    if (target.eqaaFragments != 0) ranges.emplace_back(target.fmaskAddress, fmaskBytes(target));
-    if (target.dccAddress != 0) ranges.emplace_back(target.dccAddress, MultisampledDccBytes(target));
-    if (target.cmaskAddress != 0) ranges.emplace_back(target.cmaskAddress, target.cmaskBytes);
-    if (target.samples == 8u && target.fmaskAddress != 0u && target.cmaskAddress != 0u) ranges.emplace_back(target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes);
-    if (htile.first != 0u) ranges.push_back(htile);
-    RegisterGpuFootprint(active, std::shared_ptr<const std::atomic<bool>>(use, &use->hostOnly), std::move(ranges));
-}
-
-void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<std::atomic<bool>>& metadataValid, const std::shared_ptr<TargetUse>& use, std::pair<std::uint64_t, std::uint64_t> htile = {}) {
-    registerColorFootprint(target, active, use, htile);
+void guard(const Context& context, const ColorTarget& target, const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<std::atomic<bool>>& metadataValid, const std::shared_ptr<TargetUse>& use) {
     const auto bytes = guardedColorBytes(target);
     collectFmaskWrites(target);
     stampUse(*use, target.address, bytes);
@@ -1115,6 +1096,35 @@ std::vector<std::shared_ptr<MultisampleTarget>>& targets() {
 
 void discardRetiredTargets() {
     std::erase_if(targets(), [](const auto& target) { return !target->active->load(std::memory_order_acquire); });
+}
+
+template<class Visit>
+void visitFootprint(const MultisampleTarget& owner, Visit visit) {
+    const auto& target = owner.target;
+    visit(target.address, guardedColorBytes(target));
+    if (target.eqaaFragments != 0) visit(target.fmaskAddress, fmaskBytes(target));
+    if (target.dccAddress != 0) visit(target.dccAddress, MultisampledDccBytes(target));
+    if (owner.cmask.Address() != 0) visit(owner.cmask.Address(), owner.cmask.Bytes());
+    if (target.samples == 8u && target.fmaskAddress != 0u && owner.cmask.Address() != 0u) visit(target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes);
+    if (owner.htileAddress != 0u) visit(owner.htileAddress, owner.htileBytes);
+}
+
+bool footprintOverlaps(const MultisampleTarget& owner, std::uint64_t address, std::size_t bytes) {
+    bool overlaps = false;
+    visitFootprint(owner, [&](std::uint64_t begin, std::uint64_t length) { overlaps = overlaps || (begin < address + bytes && address < begin + length); });
+    return overlaps;
+}
+
+std::size_t retireTargetsOver(std::uint64_t address, std::size_t bytes) {
+    TargetsLock lock;
+    inventoryWalks().fetch_add(1, std::memory_order_relaxed);
+    std::size_t retired = 0;
+    for (const auto& target : targets()) {
+        if (!target->active->load(std::memory_order_acquire) || !footprintOverlaps(*target, address, bytes)) continue;
+        target->active->store(false, std::memory_order_release);
+        ++retired;
+    }
+    return retired;
 }
 
 bool holdHostOnly(const MultisampleTarget& target) {
@@ -1165,12 +1175,6 @@ MultisampleTarget& acquire(const Context& context, const ColorTarget& requested,
             target->cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
         }
         target->cmask.CheckAddress(use.cmaskAddress);
-        auto footprint = target->target;
-        if (use.cmaskAddress != 0) {
-            footprint.cmaskAddress = use.cmaskAddress;
-            footprint.cmaskBytes = use.cmaskBytes;
-        }
-        registerColorFootprint(footprint, target->active, target->use, {target->htileAddress, target->htileBytes});
         target->Keep();
         target->SettleStorageWrites();
         target->ApplyFastClear(use);
@@ -1254,7 +1258,7 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
     targets().push_back(std::move(target));
     auto& created = *targets().back();
     created.use->hostOnly.store(written, std::memory_order_release);
-    guard(context, use, created.active, created.metadataValid, created.use, {resource.dccAddress, htileBytes});
+    guard(context, use, created.active, created.metadataValid, created.use);
     if (uniform) created.colorFill.NoteFill(use.address, static_cast<std::size_t>(bytes), value);
     created.fromTexture = true;
     created.htileAddress = resource.dccAddress;
@@ -1277,8 +1281,13 @@ void UpdateResidentImageUnmapObserver_nid_no_patch() {
 }
 
 void RetireResidentImagesOver_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    retireGuarded(address, bytes, true);
+    static_cast<void>(RetireGpuOwnersOver(address, bytes));
+}
+
+RetiredGpuOwners RetireGpuOwnersOver(std::uint64_t address, std::size_t bytes) {
+    const auto owners = retireGuarded(static_cast<std::uintptr_t>(address), bytes, true);
     UpdateResidentImageUnmapObserver_nid_no_patch();
+    return owners;
 }
 
 std::optional<DccKeys> MultisampledCmaskKeys(std::uint8_t code) {
@@ -1924,33 +1933,22 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::u
     return ranges;
 }
 
-void RegisterGpuFootprint(const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<const std::atomic<bool>>& hostOnly, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    std::erase_if(ranges, [](const auto& range) { return range.second == 0u; });
-    std::lock_guard lock(footprintsMutex());
-    const auto found = std::ranges::find_if(footprints(), [&](const GpuFootprint& owner) { return owner.active.lock() == active; });
-    if (found != footprints().end()) {
-        found->hostOnly = hostOnly;
-        found->ranges = std::move(ranges);
-        return;
-    }
-    footprints().push_back({active, hostOnly, std::move(ranges)});
-}
-
-void RetireGpuFootprintsOver(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0) return;
-    visitFootprintsOver(address, bytes, [](const GpuFootprint& owner) {
-        if (const auto active = owner.active.lock()) active->store(false, std::memory_order_release);
-    });
-}
-
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GpuOwnedRanges(std::uint64_t address, std::size_t bytes) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     if (bytes == 0) return ranges;
-    visitFootprintsOver(address, bytes, [&](const GpuFootprint& owner) {
-        const auto hostOnly = owner.hostOnly.lock();
-        if (hostOnly == nullptr || !hostOnly->load(std::memory_order_acquire)) return;
-        ranges.insert(ranges.end(), owner.ranges.begin(), owner.ranges.end());
-    });
+    if (!omitOwnersForTest().load(std::memory_order_acquire)) {
+        {
+            TargetsLock lock;
+            inventoryWalks().fetch_add(1, std::memory_order_relaxed);
+            for (const auto& target : targets()) {
+                if (!target->active->load(std::memory_order_acquire) || !target->use->hostOnly.load(std::memory_order_acquire)) continue;
+                visitFootprint(*target, [&](std::uint64_t begin, std::uint64_t length) {
+                    if (begin < address + bytes && address < begin + length) ranges.emplace_back(begin, length);
+                });
+            }
+        }
+        AppendHostWrittenDepthRanges(address, bytes, ranges);
+    }
     AppendStaleDepthPlanes(address, bytes, ranges);
     StorageTexture::AppendPendingRanges(address, bytes, ranges);
     std::erase_if(ranges, [&](const auto& range) { return range.first >= address + bytes || range.first + range.second <= address; });
@@ -1958,14 +1956,27 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GpuOwnedRanges(std::uint64_
     return ranges;
 }
 
-std::size_t GpuOwnersOver(std::uint64_t address, std::size_t bytes) {
+std::size_t ResidentOwnersOver(std::uint64_t address, std::size_t bytes, bool gpuOnly) {
+    if (bytes == 0) return 0;
     std::size_t owners = 0;
-    if (bytes == 0) return owners;
-    visitFootprintsOver(address, bytes, [&](const GpuFootprint&) { ++owners; });
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    AppendStaleDepthPlanes(address, bytes, ranges);
-    StorageTexture::AppendPendingRanges(address, bytes, ranges);
-    return owners + static_cast<std::size_t>(std::ranges::count_if(ranges, [&](const auto& range) { return range.first < address + bytes && address < range.first + range.second; }));
+    {
+        TargetsLock lock;
+        owners += static_cast<std::size_t>(std::ranges::count_if(targets(), [&](const auto& target) {
+            return target->active->load(std::memory_order_acquire) && (!gpuOnly || target->use->hostOnly.load(std::memory_order_acquire)) && footprintOverlaps(*target, address, bytes);
+        }));
+    }
+    owners += ResidentDepthOwnersOver(address, bytes, gpuOnly);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
+    StorageTexture::AppendPendingRanges(address, bytes, pending);
+    return owners + pending.size();
+}
+
+void OmitGpuOwnersForTest(bool omit) {
+    omitOwnersForTest().store(omit, std::memory_order_release);
+}
+
+std::uint64_t GpuOwnerInventoryWalksForTest() {
+    return inventoryWalks().load(std::memory_order_relaxed);
 }
 
 std::optional<MultisampleColorAlias> MultisampleColorTargetOver(std::uint64_t address, std::size_t bytes) {

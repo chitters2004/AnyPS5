@@ -2,6 +2,7 @@
 #include "../tools/FrameReplay.cpp"
 #undef main
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <string_view>
@@ -119,6 +120,58 @@ void testSharedPage(const std::filesystem::path& directory) {
 #else
     static_cast<void>(directory);
 #endif
+}
+
+void testSubPageResets(const std::filesystem::path& directory) {
+    constexpr std::size_t Block = 65536;
+    auto* block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Block, Block));
+    check(block != nullptr, "guest reservation failed");
+    GuestArena::GuestArenaRelease_nid_postfix(block, Block);
+    auto* const left = block + 0x100;
+    auto* const right = block + 0x800;
+    const std::vector<std::byte> leftBytes(0x600, std::byte{0x11});
+    const std::vector<std::byte> rightBytes(0x400, std::byte{0x22});
+    const auto access = FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu;
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(left), leftBytes.size(), FrameRangeKind::Watched, ReadWrite, access);
+    writer.WriteRange(address(right), rightBytes.size(), FrameRangeKind::Watched, ReadWrite, access);
+    writer.WriteSnapshot(address(left), leftBytes);
+    writer.WriteSnapshot(address(right), rightBytes);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    const FrameCaptureReader reader(directory);
+    const auto skipped = restoreMemory(reader);
+    check(skipped.bytes == 0, "a range sharing a page with another was skipped");
+    check(AgcDriver::GuestMemory::Watched(address(block), 4096), "the page the two ranges share is not write-watched");
+    auto since = watchBaseline(reader, skipped);
+    const auto reset = [&] { return resetMemory(reader, skipped, since, ResetFault::None, true); };
+    const auto restored = [&] { return std::equal(leftBytes.begin(), leftBytes.end(), left) && std::equal(rightBytes.begin(), rightBytes.end(), right); };
+    const auto idle = reset();
+    check(idle.compared == 0 && idle.rewritten == 0, "a reset after a pass that wrote nothing compared or rewrote memory");
+    for (int pass = 0; pass < 4; ++pass) {
+        const bool both = pass % 2 == 1;
+        std::memset(left, 0x40 + pass, 0x10);
+        if (both) std::memset(right + 0x3f0, 0x50 + pass, 0x10);
+        const auto result = reset();
+        check(restored(), "a reset did not restore two ranges sharing one page");
+        check(result.compared == leftBytes.size() + rightBytes.size(), "a reset did not compare the two ranges of the written page");
+        check(result.rewritten == leftBytes.size() + (both ? rightBytes.size() : 0u), "a reset rewrote a range sharing a page with a written one, or missed a written range");
+    }
+    const auto settled = reset();
+    check(settled.compared == 0 && settled.rewritten == 0, "the writes a reset made counted as writes of the next pass");
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(true);
+    const auto unwalked = reset();
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(false);
+    check(unwalked.compared == leftBytes.size() + rightBytes.size() && unwalked.rewritten == 0, "a reset whose write walk failed did not compare the memory it could not walk");
+    bool refused = false;
+    try {
+        static_cast<void>(resetMemory(reader, skipped, since, ResetFault::Remap, false));
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("mapped or unmapped during the reset") != std::string_view::npos;
+    }
+    check(refused, "a reset accepted a mapping change made during it");
 }
 
 void testWatchedExisting(const std::filesystem::path& directory) {
@@ -552,6 +605,7 @@ int main(int argc, char** argv) {
         else if (mode.starts_with("shader_prologue_")) testShaderCode(directory, true, mode);
         else if (mode == "shared_page") testSharedPage(directory);
         else if (mode == "watched_existing") testWatchedExisting(directory);
+        else if (mode == "sub_page_resets") testSubPageResets(directory);
         else if (mode == "host_neighbors") testHostNeighbors(directory);
         else if (mode == "unwatched") testUnwatched();
         else if (mode == "tokens") testEopTokens();

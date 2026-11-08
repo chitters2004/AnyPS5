@@ -1838,6 +1838,12 @@ std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
 }
 
+std::atomic<bool> changedSinceWalkFailureForTest{false};
+
+void SetChangedSinceWalkFailureForTest(bool fail) {
+    changedSinceWalkFailureForTest.store(fail, std::memory_order_release);
+}
+
 std::uint64_t ChangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed) {
     changed.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
@@ -1866,7 +1872,7 @@ std::uint64_t ChangedSince(std::uint64_t address, std::size_t bytes, std::uint64
     for (std::size_t index = 0; index < covered.size(); ++index) {
         const auto first = covered[index].first & ~std::uint64_t{WritePageBytes - 1};
         const auto stop = (covered[index].second + WritePageBytes - 1) & ~std::uint64_t{WritePageBytes - 1};
-        walked[index] = walkWrites(tracker, first, stop, StampKind::Cpu);
+        walked[index] = walkWrites(tracker, first, stop, StampKind::Cpu) && !changedSinceWalkFailureForTest.load(std::memory_order_acquire);
     }
     const auto newest = [&](std::uint64_t begin) {
         const auto block = tracker.blockOf(begin);

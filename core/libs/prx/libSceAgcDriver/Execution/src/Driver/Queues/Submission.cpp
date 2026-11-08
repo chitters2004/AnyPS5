@@ -482,23 +482,25 @@ void Driver::SubmitFlip(const FlipInfo& info) {
 }
 
 Driver::Admission::Admission(Driver& driver) : driver(driver) {
+    driver.admitting.fetch_add(1);
+    if (!driver.exclusive.load()) return;
     std::unique_lock lock(driver.mutex);
-    if (driver.exclusive) {
+    while (driver.exclusive.load()) {
+        driver.admitting.fetch_sub(1);
+        driver.changed.notify_all();
         ++driver.blockedAdmissions;
-        driver.changed.wait(lock, [&] { return driver.failure != nullptr || driver.stopping || !driver.exclusive; });
+        driver.changed.wait(lock, [&] { return driver.failure != nullptr || driver.stopping || !driver.exclusive.load(); });
         --driver.blockedAdmissions;
+        driver.rethrowFailure();
+        driver.checkStopping();
+        driver.admitting.fetch_add(1);
     }
-    driver.rethrowFailure();
-    driver.checkStopping();
-    ++driver.admitting;
 }
 
 Driver::Admission::~Admission() {
-    {
-        std::lock_guard lock(driver.mutex);
-        --driver.admitting;
-        if (!driver.exclusive) return;
-    }
+    driver.admitting.fetch_sub(1);
+    if (!driver.exclusive.load()) return;
+    { std::lock_guard lock(driver.mutex); }
     driver.changed.notify_all();
 }
 

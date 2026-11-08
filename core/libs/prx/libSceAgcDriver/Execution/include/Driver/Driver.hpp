@@ -512,8 +512,8 @@ private:
     bool resetGraphics = false;
 
     std::uint32_t idleWaiters = 0;
-    bool exclusive = false;
-    std::uint32_t admitting = 0;
+    std::atomic<bool> exclusive{false};
+    std::atomic<std::uint32_t> admitting{0};
     std::uint32_t blockedAdmissions = 0;
     std::uint64_t queue0Executing = 0;
     std::deque<std::uint64_t> queue0Uncommitted;

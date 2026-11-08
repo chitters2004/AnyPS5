@@ -541,7 +541,7 @@ void testSingleSampleDepthPasses(const std::filesystem::path& tool) {
         AgcDriverFlushGuestMemory_nid_no_patch(at(planes.base), BlockBytes, &failure);
         if (failure) std::rethrow_exception(failure);
         std::size_t owners = 1;
-        AgcDriverGpuOwnersOver_nid_no_patch(at(planes.base), BlockBytes, &owners, &failure);
+        AgcDriverResidentOwnersOver_nid_no_patch(at(planes.base), BlockBytes, true, &owners, &failure);
         if (failure) std::rethrow_exception(failure);
         check(owners == 0, "the reset flush left " + std::to_string(owners) + " GPU owners over the single-sample depth plane");
         const auto* const plane = reinterpret_cast<const float*>(planes.base);
@@ -687,14 +687,20 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
 
     const FrameCaptureReader reader(capture);
     std::size_t expectedPages = 0;
+    std::size_t heldPages = 0;
+    std::size_t heldMatching = 0;
     for (const auto& [block, bytes] : finals) {
         const auto snapshot = snapshotOf(reader, at(block->base), BlockBytes);
         for (std::size_t offset = 0; offset < BlockBytes; offset += PageBytes) {
             const auto page = at(block->base) + offset;
             const bool held = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& range) { return range.first < page + PageBytes && page < range.first + range.second; });
-            expectedPages += held || std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+            const bool differs = std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+            expectedPages += differs;
+            heldPages += held;
+            heldMatching += held && !differs;
         }
     }
+    check(heldMatching != 0, "every page of the multisample depth owners differs from the snapshot, so an owner retired without a rewrite is not exercised");
 
     const auto dump = capture / "multisample depth copy.bin";
     const auto replay = [&](std::size_t passes) {
@@ -727,16 +733,20 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         const auto captured = passValues(report, "range_bytes");
         check(rewritten.size() == passes && captured.size() == passes && rewritten[0] == 0, "the replay report lists " + std::to_string(rewritten.size()) + " passes with rewritten bytes: " + report);
         const auto workers = passValues(report, "reset_workers");
-        check(workers.size() == passes, "the replay report lists " + std::to_string(workers.size()) + " passes with reset workers: " + report);
+        const auto compared = passValues(report, "compared_bytes");
+        const auto retiredDepth = passValues(report, "retired_depth_owners");
+        check(workers.size() == passes && compared.size() == passes && retiredDepth.size() == passes, "the replay report lists " + std::to_string(workers.size()) + " passes with reset workers: " + report);
         for (std::size_t pass = 1; pass < passes; ++pass) {
             check(std::thread::hardware_concurrency() < 2 || workers[pass] >= 2, "pass " + std::to_string(pass + 1) + " compared the captured ranges on " + std::to_string(workers[pass]) + " threads");
-            check(rewritten[pass] == expectedPages * PageBytes, "pass " + std::to_string(pass + 1) + " rewrote " + std::to_string(rewritten[pass]) + " of " + std::to_string(captured[pass]) + " captured bytes, expected exactly the " + std::to_string(expectedPages) + " pages the earlier pass changed");
+            check(rewritten[pass] == expectedPages * PageBytes, "pass " + std::to_string(pass + 1) + " rewrote " + std::to_string(rewritten[pass]) + " of " + std::to_string(captured[pass]) + " captured bytes, expected exactly the " + std::to_string(expectedPages) + " pages that differ from the snapshot (" + std::to_string(heldPages) + " pages hold GPU owners, " + std::to_string(heldMatching) + " of them unchanged)");
+            check(retiredDepth[pass] != 0, "pass " + std::to_string(pass + 1) + " retired no native depth owner although the earlier pass left samples only on the GPU");
+            check(compared[pass] < captured[pass], "pass " + std::to_string(pass + 1) + " compared all " + std::to_string(captured[pass]) + " captured bytes instead of the pages written or owned by the GPU");
         }
     };
     replay(1);
     replay(2);
     replay(3);
-    for (const auto& [fault, expected] : {std::pair<std::string, std::string>{"owners", "GPU owners over the restored memory"}, {"bytes", "differs from the captured contents"}}) {
+    for (const auto& [fault, expected] : {std::pair<std::string, std::string>{"owners", "survived the reset"}, {"omit", "survived the reset"}, {"bytes", "differs from the captured contents"}, {"remap", "mapped or unmapped during the reset"}}) {
         const auto faultLog = capture / ("multisample depth fault " + fault + ".log");
 #ifdef _WIN32
         _putenv_s("APS5_REPLAY_RESET_FAULT_FOR_TEST", fault.c_str());
