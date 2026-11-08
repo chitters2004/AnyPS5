@@ -1943,6 +1943,31 @@ void RetireGpuFootprintsOver(std::uint64_t address, std::size_t bytes) {
     });
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GpuOwnedRanges(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (bytes == 0) return ranges;
+    visitFootprintsOver(address, bytes, [&](const GpuFootprint& owner) {
+        const auto hostOnly = owner.hostOnly.lock();
+        if (hostOnly == nullptr || !hostOnly->load(std::memory_order_acquire)) return;
+        ranges.insert(ranges.end(), owner.ranges.begin(), owner.ranges.end());
+    });
+    AppendStaleDepthPlanes(address, bytes, ranges);
+    StorageTexture::AppendPendingRanges(address, bytes, ranges);
+    std::erase_if(ranges, [&](const auto& range) { return range.first >= address + bytes || range.first + range.second <= address; });
+    std::ranges::sort(ranges);
+    return ranges;
+}
+
+std::size_t GpuOwnersOver(std::uint64_t address, std::size_t bytes) {
+    std::size_t owners = 0;
+    if (bytes == 0) return owners;
+    visitFootprintsOver(address, bytes, [&](const GpuFootprint&) { ++owners; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    AppendStaleDepthPlanes(address, bytes, ranges);
+    StorageTexture::AppendPendingRanges(address, bytes, ranges);
+    return owners + static_cast<std::size_t>(std::ranges::count_if(ranges, [&](const auto& range) { return range.first < address + bytes && address < range.first + range.second; }));
+}
+
 std::optional<MultisampleColorAlias> MultisampleColorTargetOver(std::uint64_t address, std::size_t bytes) {
     const auto aliases = MultisampleColorTargetsOver(address, bytes);
     if (aliases.empty()) return std::nullopt;
