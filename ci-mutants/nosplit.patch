@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index 99bdc2a058..eb744bb327 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -483,7 +483,7 @@ std::vector<Piece> splitRuns(std::span<const Runs> ranges) {
+         std::uint64_t filled = 0;
+         for (auto [begin, end] : ranges[index]) {
+             while (begin < end) {
+-                if (filled >= ResetPiece) {
++                if (false && filled >= ResetPiece) {
+                     pieces.push_back({index, {}});
+                     filled = 0;
+                 }

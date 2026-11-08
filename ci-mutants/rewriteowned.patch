@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index 99bdc2a058..f988d611c9 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -437,7 +437,7 @@ Differing restoreDiffering(const FrameCaptureReader& reader, std::span<const Fra
+                 const auto end = std::min((address & ~(ResetPage - 1)) + ResetPage, windowEnd);
+                 auto* const actual = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(address));
+                 const auto* const wanted = desired.data() + (address - window);
+-                if (std::memcmp(actual, wanted, static_cast<std::size_t>(end - address)) != 0) {
++                if (std::memcmp(actual, wanted, static_cast<std::size_t>(end - address)) != 0 || std::any_of(owned.begin(), owned.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) {
+                     std::memcpy(actual, wanted, static_cast<std::size_t>(end - address));
+                     if (!runs.empty() && runs.back().second == address) runs.back().second = end;
+                     else runs.emplace_back(address, end);

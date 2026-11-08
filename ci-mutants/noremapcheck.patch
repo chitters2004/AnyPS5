@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -633,7 +633,7 @@
+         }
+         if (fault == ResetFault::Remap) std::thread([] { GuestAllocations::Mutation mutation; }).join();
+         for (const auto& [begin, end] : replaced) since = std::max(since, changedSince(begin, end - begin, std::numeric_limits<std::uint64_t>::max(), changed));
+-        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != mapping) throw std::runtime_error("frame replay: guest memory was mapped or unmapped during the reset, which the reset excludes");
++        if (GuestAllocations::GuestAllocationsGeneration_nid_postfix() != mapping && false) throw std::runtime_error("frame replay: guest memory was mapped or unmapped during the reset, which the reset excludes");
+         if (!verify) return;
+         const auto verifyStart = Clock::now();
+         verifyReset(reader, plan, candidates);

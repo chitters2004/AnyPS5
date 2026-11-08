@@ -1,0 +1,12 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp
+@@ -4969,8 +4969,7 @@
+ void excludeFlushSelection(bool excluded) {
+     auto& pending = Pending();
+     std::lock_guard lock(pending.mutex);
+-    if (excluded) ++pending.selectionExcluders;
+-    else --pending.selectionExcluders;
++    pending.selectionExcluders = excluded ? 1u : 0u;
+ }
+ 
+ bool flushesInFlight() {

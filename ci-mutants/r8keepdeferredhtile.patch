@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -3113,7 +3113,6 @@
+     std::lock_guard gpu(GuestMemory::GpuMutex());
+     std::lock_guard lock(surfacesMutex());
+     forgetHtileReads(address, bytes);
+-    std::erase_if(clearedHtiles(), [&](const auto& cleared) { return cleared.first < end && address < cleared.first + cleared.second; });
+     for (const auto& surface : surfaces()) {
+         if (surface->retired || !surfaceFootprintOverlaps(*surface, address, end)) continue;
+         surface->active->store(false, std::memory_order_release);

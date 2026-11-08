@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
+@@ -1104,7 +1104,7 @@
+     visit(target.address, guardedColorBytes(target));
+     if (target.eqaaFragments != 0) visit(target.fmaskAddress, fmaskBytes(target));
+     if (target.dccAddress != 0) visit(target.dccAddress, MultisampledDccBytes(target));
+-    if (owner.cmask.Address() != 0) visit(owner.cmask.Address(), owner.cmask.Bytes());
++    if (owner.cmask.Address() != 0) visit(owner.cmask.Address(), owner.cmask.Bytes() - 1u);
+     if (target.samples == 8u && target.fmaskAddress != 0u && owner.cmask.Address() != 0u) visit(target.fmaskAddress, DescribeSurface(fmaskResource(target)).guestBytes);
+     if (owner.htileAddress != 0u) visit(owner.htileAddress, owner.htileBytes);
+ }

@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+index 0bbc59a359..b72251da0c 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+@@ -308,7 +308,7 @@ extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void*
+             driver.WaitDeviceIdle();
+             body(context);
+         }
+-        if (driver.SerialProgress().first != idle) throw std::runtime_error("a submission was accepted during a guest memory transaction; the caller must stop submitting first");
++        if (false && driver.SerialProgress().first != idle) throw std::runtime_error("a submission was accepted during a guest memory transaction; the caller must stop submitting first");
+     });
+ }
+ 

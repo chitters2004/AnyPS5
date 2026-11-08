@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -496,7 +496,6 @@
+             }
+         }
+     }
+-    std::erase_if(pieces, [](const Piece& piece) { return piece.runs.empty(); });
+     return pieces;
+ }
+ 
