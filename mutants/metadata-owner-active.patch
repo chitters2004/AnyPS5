@@ -1,0 +1,14 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
+@@ -990,9 +990,9 @@
+                 range.metadataValid->store(false, std::memory_order_release);
+                 metadataChanged = true;
+             }
+-            if (replaced && overlaps) {
++            if (replaced && overlaps && !range.metadataValid) {
+                 range.active->store(false, std::memory_order_release);
+-                if (!range.metadataValid) retired.emplace_back(range.address, range.address + range.bytes);
++                retired.emplace_back(range.address, range.address + range.bytes);
+                 return true;
+             }
+             if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;

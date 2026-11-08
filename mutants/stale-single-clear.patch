@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/MultisampleTarget.cpp
+@@ -1009,7 +1009,7 @@
+     }
+     if (retired.empty()) return;
+     std::lock_guard lock(singleClearsMutex());
+-    std::erase_if(singleClears(), [&](const RecordedSingleClear& clear) { return std::ranges::any_of(retired, [&](const auto& span) { return clear.surface >= span.first && clear.surface < span.second; }); });
++    std::erase_if(singleClears(), [&](const RecordedSingleClear&) { return false; });
+     anySingleClears().store(!singleClears().empty(), std::memory_order_release);
+ }
+ 
