@@ -138,7 +138,7 @@ jobs:
           if unknown:
               raise SystemExit(f"unknown jobs: {sorted(unknown)}")
           ref_sha, base_sha = os.environ["ref_sha"], os.environ["base_sha"]
-          plain_restore = "plain-"
+          plain_restore = "plain-base"
           include = []
           if "linux-gate" in jobs:
               include.append(dict(id="gate-ref", kind="gate", side="ref", sha=ref_sha, group="plain",
@@ -647,7 +647,7 @@ jobs:
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
           key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side }}
-          restore-keys: windows-
+          restore-keys: windows-base
           max-size: 4G
           save: ${{ inputs.save_cache && 'true' || 'false' }}
           evict-old-files: 7d
