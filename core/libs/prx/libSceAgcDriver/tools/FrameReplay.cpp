@@ -883,9 +883,11 @@ struct Replay {
             }
             std::memcpy(target + from, bytes.data() + from, bytes.size() - from);
             deltaBytes += chunk->bytes;
+            for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
+            for (const auto& [control, value] : releases) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
+            controls.clear();
+            releases.clear();
         }
-        for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
-        for (const auto& [control, value] : releases) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
     }
 
     bool releaseRewind(const FrameCall& call, const AgcDriver::AwaitedWait& wait) {
