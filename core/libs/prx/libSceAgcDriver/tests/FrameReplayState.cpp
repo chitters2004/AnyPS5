@@ -3,11 +3,22 @@
 #undef main
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <string_view>
 #include <barrier>
 #include <new>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -120,6 +131,181 @@ void testSharedPage(const std::filesystem::path& directory) {
 #else
     static_cast<void>(directory);
 #endif
+}
+
+void testSubPageResets(const std::filesystem::path& directory) {
+    constexpr std::size_t Block = 65536;
+    auto* const block = allocate(Block);
+    auto* const left = block + 0x100;
+    auto* const right = block + 0x800;
+    const std::vector<std::byte> leftBytes(0x600, std::byte{0x11});
+    const std::vector<std::byte> rightBytes(0x400, std::byte{0x22});
+    const auto access = FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu;
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(left), leftBytes.size(), FrameRangeKind::Watched, ReadWrite, access);
+    writer.WriteRange(address(right), rightBytes.size(), FrameRangeKind::Watched, ReadWrite, access);
+    writer.WriteSnapshot(address(left), leftBytes);
+    writer.WriteSnapshot(address(right), rightBytes);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    const FrameCaptureReader reader(directory);
+    const auto skipped = restoreMemory(reader);
+    check(skipped.bytes == 0, "a range sharing a page with another was skipped");
+    check(AgcDriver::GuestMemory::Watched(address(block), 4096), "the page the two ranges share is not write-watched");
+    auto since = watchBaseline(reader, skipped);
+    const auto reset = [&] { return resetMemory(reader, skipped, since, ResetFault::None, true); };
+    const auto restored = [&] { return std::equal(leftBytes.begin(), leftBytes.end(), left) && std::equal(rightBytes.begin(), rightBytes.end(), right); };
+    const auto idle = reset();
+    check(idle.compared == 0 && idle.rewritten == 0, "a reset after a pass that wrote nothing compared or rewrote memory");
+    for (int pass = 0; pass < 4; ++pass) {
+        const bool both = pass % 2 == 1;
+        std::memset(left, 0x40 + pass, 0x10);
+        if (both) std::memset(right + 0x3f0, 0x50 + pass, 0x10);
+        const auto result = reset();
+        check(restored(), "a reset did not restore two ranges sharing one page");
+        check(result.compared == leftBytes.size() + rightBytes.size(), "a reset did not compare the two ranges of the written page");
+        check(result.rewritten == leftBytes.size() + (both ? rightBytes.size() : 0u), "a reset rewrote a range sharing a page with a written one, or missed a written range");
+    }
+    const auto settled = reset();
+    check(settled.compared == 0 && settled.rewritten == 0, "the writes a reset made counted as writes of the next pass");
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(true);
+    const auto unwalked = reset();
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(false);
+    check(unwalked.compared == leftBytes.size() + rightBytes.size() && unwalked.rewritten == 0, "a reset whose write walk failed did not compare the memory it could not walk");
+    bool refused = false;
+    try {
+        static_cast<void>(resetMemory(reader, skipped, since, ResetFault::Remap, false));
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("mapped or unmapped during the reset") != std::string_view::npos;
+    }
+    check(refused, "a reset accepted a mapping change made during it");
+}
+
+void testPartialWalk(const std::filesystem::path& directory) {
+    constexpr std::size_t Block = 65536;
+    constexpr std::size_t Bytes = 4 * Block;
+    auto* const bytes = allocate(Bytes);
+    std::vector<std::byte> captured(Bytes);
+    for (std::size_t index = 0; index < Bytes; ++index) captured[index] = static_cast<std::byte>(index * 7 + 3);
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(bytes), Bytes, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+    writer.WriteSnapshot(address(bytes), captured);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    const FrameCaptureReader reader(directory);
+    const auto skipped = restoreMemory(reader);
+    check(skipped.bytes == 0, "the captured range was skipped");
+    auto since = watchBaseline(reader, skipped);
+    const auto reset = [&] { return resetMemory(reader, skipped, since, ResetFault::None, true); };
+    const auto restored = [&] { return std::equal(captured.begin(), captured.end(), bytes); };
+    check(reset().compared == 0, "a reset after a pass that wrote nothing compared memory");
+    bytes[0] = ~bytes[0];
+    bytes[3 * Block + 0x123] = ~bytes[3 * Block + 0x123];
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(true);
+    ResetResult cut;
+    try {
+        cut = reset();
+    } catch (...) {
+        AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(false);
+        throw;
+    }
+    AgcDriver::GuestMemory::SetChangedSinceWalkFailureForTest(false);
+    check(restored(), "a reset whose write walks failed after collecting half of the range did not restore it");
+    check(cut.compared == Bytes && cut.rewritten == 2 * 4096u, "a reset whose write walks failed after collecting half of the range did not compare it whole and rewrite exactly the two written pages");
+    bytes[Block + 5] = ~bytes[Block + 5];
+    const auto next = reset();
+    check(restored() && next.rewritten == 4096u, "the reset after one whose write walks failed partway did not rewrite exactly the page written since");
+    check(reset().compared == 0, "the writes of a reset after a partial walk counted as writes of the next pass");
+}
+
+void testLargeRange(const std::filesystem::path& directory) {
+    constexpr std::size_t Bytes = 2 * ResetPiece + 65536;
+    auto* const bytes = allocate(Bytes);
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(bytes), Bytes, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    const FrameCaptureReader reader(directory);
+    const auto skipped = restoreMemory(reader);
+    check(skipped.bytes == 0, "the captured range was skipped");
+    auto since = watchBaseline(reader, skipped);
+    std::memset(bytes, 0x5a, Bytes);
+    const auto result = resetMemory(reader, skipped, since, ResetFault::None, true);
+    check(std::all_of(bytes, bytes + Bytes, [](std::byte value) { return value == std::byte{0}; }), "a reset of one large range did not restore it");
+    check(result.rewritten == Bytes, "a reset of one large written range did not rewrite all of it");
+    check(std::thread::hardware_concurrency() < 2 || result.workers >= 2, "a reset of one range larger than two pieces compared and rewrote it on fewer than two threads");
+}
+
+std::atomic<std::uint64_t> flushLandsAt{0};
+void (*flushChained)(std::uint64_t, std::size_t) = nullptr;
+
+void landRecordedStore(std::uint64_t address, std::size_t bytes) {
+    auto target = flushLandsAt.load(std::memory_order_acquire);
+    if (target != 0 && address <= target && target < address + bytes && flushLandsAt.compare_exchange_strong(target, 0)) *reinterpret_cast<volatile std::uint32_t*>(static_cast<std::uintptr_t>(target)) = 0x3f000000u;
+    if (flushChained != nullptr) flushChained(address, bytes);
+}
+
+bool testFlushedOwner(const std::filesystem::path& directory) {
+    std::unique_ptr<AgcDriver::VulkanDevice> device;
+    try {
+        device = std::make_unique<AgcDriver::VulkanDevice>();
+    } catch (const AgcDriver::VulkanUnavailable& error) {
+        if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
+        std::printf("skipped, no usable Vulkan device: %s\n", error.what());
+        return false;
+    }
+    constexpr std::size_t Bytes = 4u * 65536u;
+    auto* const block = allocate(Bytes);
+    const std::vector<std::byte> captured(Bytes, std::byte{0});
+    std::uintptr_t base = 0;
+    std::size_t arenaSize = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
+    FrameCaptureWriter writer(directory);
+    writer.WriteRange(address(block), Bytes, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
+    writer.WriteSnapshot(address(block), captured);
+    writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
+    const FrameCaptureReader reader(directory);
+    const auto skipped = restoreMemory(reader);
+    check(skipped.bytes == 0, "the captured range was skipped");
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+    AgcDriver::Graphics::DepthSurfaceView(context, {address(block), 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0}, false);
+    device->WaitIdle();
+    auto since = watchBaseline(reader, skipped);
+    std::exception_ptr failure;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> owned;
+    AgcDriverGpuOwnedRanges_nid_no_patch(address(block), Bytes, owned, &failure);
+    rethrowDriverFailure(failure);
+    check(owned.empty(), "a depth surface that holds no results only on the GPU is among the GPU-owned ranges");
+    std::size_t owners = 0;
+    AgcDriverResidentOwnersOver_nid_no_patch(address(block), 4096u, false, &owners, &failure);
+    rethrowDriverFailure(failure);
+    check(owners == 1, "the depth surface over the captured range is not resident");
+    flushChained = AgcDriver::GuestMemory::CurrentFlushHook();
+    AgcDriver::GuestMemory::SetFlushHook(&landRecordedStore);
+    flushLandsAt.store(address(block) + 0x100u, std::memory_order_release);
+    ResetResult result;
+    try {
+        result = resetMemory(reader, skipped, since, ResetFault::None, true);
+    } catch (...) {
+        AgcDriver::GuestMemory::SetFlushHook(flushChained);
+        throw;
+    }
+    AgcDriver::GuestMemory::SetFlushHook(flushChained);
+    check(flushLandsAt.load() == 0, "the reset's flush did not land the recorded store");
+    check(result.flushed != 0, "the reset did not add the page its flush wrote to the pages it compares");
+    check(result.retired.depthSurfaces == 1, "the reset did not retire the depth surface under the page its flush wrote");
+    AgcDriverResidentOwnersOver_nid_no_patch(address(block), 4096u, false, &owners, &failure);
+    rethrowDriverFailure(failure);
+    check(owners == 0, "a depth surface under a page the reset's flush wrote stayed resident");
+    check(std::all_of(block, block + Bytes, [](std::byte value) { return value == std::byte{0}; }), "the reset did not restore the page its flush wrote");
+    AgcDriver::Graphics::ClearDepthSurfaces(context.device);
+    return true;
 }
 
 void testWatchedExisting(const std::filesystem::path& directory) {
@@ -585,6 +771,12 @@ int main(int argc, char** argv) {
         else if (mode.starts_with("shader_prologue_")) testShaderCode(directory, true, mode);
         else if (mode == "shared_page") testSharedPage(directory);
         else if (mode == "watched_existing") testWatchedExisting(directory);
+        else if (mode == "sub_page_resets") testSubPageResets(directory);
+        else if (mode == "partial_walk") testPartialWalk(directory);
+        else if (mode == "large_range") testLargeRange(directory);
+        else if (mode == "flushed_owner") {
+            if (!testFlushedOwner(directory)) return 77;
+        }
         else if (mode == "host_neighbors") testHostNeighbors(directory);
         else if (mode == "unwatched") testUnwatched();
         else if (mode == "trace_window") testTraceWindow(directory);
