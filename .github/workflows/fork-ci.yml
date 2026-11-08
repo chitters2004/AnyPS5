@@ -1170,3 +1170,32 @@ jobs:
           name: summary-${{ inputs.tag || 'run' }}
           path: summary.json
           if-no-files-found: ignore
+  prune-ccache:
+    needs: [plan, linux, windows]
+    if: ${{ !cancelled() && needs.plan.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Keep the newest two ccache entries per key
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate --jq '.actions_caches[] | select(.key | startswith("ccache-")) | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
+          python3 - <<'PY'
+          import collections, re, subprocess, os
+          groups = collections.defaultdict(list)
+          for line in open("caches.tsv"):
+              cid, key, created, size = line.rstrip("\n").split("\t")
+              m = re.match(r"^(.*)-\d{4}-\d\d-\d\dT[\d:.]+Z$", key)
+              groups[m.group(1) if m else key].append((created, cid, key, int(size)))
+          freed = 0
+          for prefix, entries in sorted(groups.items()):
+              entries.sort(reverse=True)
+              for created, cid, key, size in entries[2:]:
+                  r = subprocess.run(["gh", "api", "-X", "DELETE", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/caches/{cid}"], capture_output=True, text=True)
+                  print(("deleted" if r.returncode == 0 else "kept (delete failed)"), key, size // 1048576, "MB")
+                  freed += size if r.returncode == 0 else 0
+          print(f"freed {freed // 1048576} MB across {len(groups)} keys")
+          PY
