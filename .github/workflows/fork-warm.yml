@@ -2,7 +2,7 @@ name: Fork warm
 
 on:
   schedule:
-    - cron: '20 * * * *'
+    - cron: '20,50 * * * *'
   workflow_dispatch:
     inputs:
       force:
