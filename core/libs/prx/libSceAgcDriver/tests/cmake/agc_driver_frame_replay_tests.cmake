@@ -51,5 +51,11 @@ if(BUILD_TESTING)
             set_tests_properties(agc_driver_frame_replay_rewind PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
+        foreach(repeat RANGE 1 30)
+            add_test(NAME agc_driver_frame_replay_rewind_repeat_${repeat} COMMAND agc_driver_frame_replay_tests $<TARGET_FILE:agc_frame_replay> rewind)
+            set_tests_properties(agc_driver_frame_replay_rewind_repeat_${repeat} PROPERTIES
+                    ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_FRAME_CAPTURE=${CMAKE_CURRENT_BINARY_DIR}/frame-replay-rewind-repeat-${repeat}-capture;APS5_FRAME_CAPTURE_AT_FLIP=1;APS5_FRAME_CAPTURE_FRAMES=1;APS5_FRAME_CAPTURE_MIN_FREE_BYTES=0"
+                    TIMEOUT 120 SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        endforeach()
     endif()
 endif()
