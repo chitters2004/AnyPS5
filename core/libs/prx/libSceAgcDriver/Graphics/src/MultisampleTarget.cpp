@@ -992,6 +992,7 @@ void retireGuarded(std::uintptr_t address, std::size_t bytes, bool replaced) {
             }
             if (replaced && overlaps) {
                 range.active->store(false, std::memory_order_release);
+                if (!range.metadataValid) retired.emplace_back(range.address, range.address + range.bytes);
                 return true;
             }
             if (range.address < address || range.address - address > bytes || range.bytes > bytes - (range.address - address)) return false;
