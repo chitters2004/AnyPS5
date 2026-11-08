@@ -529,6 +529,12 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
             rethrowDriverFailure(failure);
             since = std::max(since, changedSince(range.address, range.bytes, previous, changed));
             candidates[index] = candidateRuns(range, changed, owned[index]);
+            if (std::getenv("APS5_RESET_TRACE") != nullptr) {
+                std::fprintf(stderr, "[reset] range 0x%llx+0x%llx previous %llu since %llu\n", (unsigned long long)range.address, (unsigned long long)range.bytes, (unsigned long long)previous, (unsigned long long)since);
+                for (const auto& [b, e] : changed) std::fprintf(stderr, "[reset]   changed 0x%llx-0x%llx\n", (unsigned long long)b, (unsigned long long)e);
+                for (const auto& [b, n] : owned[index]) std::fprintf(stderr, "[reset]   owned 0x%llx+0x%llx\n", (unsigned long long)b, (unsigned long long)n);
+                for (const auto& [b, e] : candidates[index]) std::fprintf(stderr, "[reset]   candidate 0x%llx-0x%llx\n", (unsigned long long)b, (unsigned long long)e);
+            }
             for (const auto& [begin, end] : candidates[index]) result.compared += end - begin;
         }
         std::vector<Runs> runs(plan.ranges.size());
@@ -539,6 +545,9 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
         for (const auto& run : replaced) {
             if (!result.replaced.empty() && run.first <= result.replaced.back().second) result.replaced.back().second = std::max(result.replaced.back().second, run.second);
             else result.replaced.push_back(run);
+        }
+        if (std::getenv("APS5_RESET_TRACE") != nullptr) {
+            for (const auto& [b, e] : result.replaced) std::fprintf(stderr, "[reset] replaced 0x%llx-0x%llx\n", (unsigned long long)b, (unsigned long long)e);
         }
         for (const auto& [begin, end] : result.replaced) {
             if (fault != ResetFault::KeepOwners) {
