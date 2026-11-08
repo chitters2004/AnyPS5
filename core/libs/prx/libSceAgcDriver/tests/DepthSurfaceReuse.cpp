@@ -8,6 +8,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <iostream>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -741,15 +742,22 @@ void TestRetireStaleSurfaceWithoutWrittenUnits(const Context& context) {
     storageContext.detiler = &detiler;
     DepthTarget target{depth.Address(), stencil.Address(), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
     target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    std::cerr << "DIAG staleAtStart=" << DepthPlanesStale() << std::endl;
     DepthSurfaceViewWithStencilWriteIntent(storageContext, target, true, true, false);
+    const auto firstImage = lastImage;
     Require(DepthPlanesStale(), "a depth write must leave the plane stale");
     {
         GuestAllocations::Mutation mutation;
         mutation.Unmap(depth.data, depthBytes, [](const void*, std::size_t, const void*, bool) {});
         mutation.Add(depth.data, depthBytes, true, true, true);
     }
+    std::cerr << "DIAG watched=" << AgcDriver::GuestMemory::WriteWatched() << " wd=" << AgcDriver::GuestMemory::Watched(depth.Address(), depthBytes) << " ws=" << AgcDriver::GuestMemory::Watched(stencil.Address(), stencilBytes) << " staleBefore=" << DepthPlanesStale() << std::endl;
     stencil.Write(100);
+    std::cerr << "DIAG stencilWrittenSince1=" << AgcDriver::GuestMemory::WrittenSince(stencil.Address(), stencilBytes, 1) << " depthWrittenSince1=" << AgcDriver::GuestMemory::WrittenSince(depth.Address(), depthBytes, 1) << std::endl;
     const auto view = lookup(storageContext, {depth.Address(), FormatR32Float, 256, 512, TileDepth64KB, Type2D, 0, 0, 1, 1});
+    DepthSurfaceView(storageContext, {depth.Address() + 0x4000000u, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0});
+    std::cerr << "DIAG destroyed=" << (std::find(destroyedImages.begin(), destroyedImages.end(), firstImage) != destroyedImages.end()) << std::endl;
+    std::cerr << "DIAG view=" << (view != nullptr) << " staleAfter=" << DepthPlanesStale() << std::endl;
     Require(view == nullptr, "a view the depth surface cannot serve over memory the guest overwrote must be read as reused memory");
     Require(!DepthPlanesStale(), "a retired depth surface must not leave its plane stale");
     ClearDepthSurfaces(context.device);
