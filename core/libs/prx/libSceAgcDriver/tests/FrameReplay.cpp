@@ -553,6 +553,8 @@ void testSingleSampleDepthPasses(const std::filesystem::path& tool) {
     std::filesystem::remove(dump);
     const auto result = capture / "single sample depth.json";
     const auto log = capture / "single sample depth.log";
+    setenv("APS5_RESET_TRACE", "1", 1);
+    std::fprintf(stderr, "[diag] target 0x%llx planes 0x%llx htile 0x%llx\n", (unsigned long long)at(target), (unsigned long long)at(planes.base), (unsigned long long)at(planes.base + HtileOffset));
     auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --verify-reset --repeat 2 --dump " + std::to_string(at(target)) + ":" + std::to_string(Bytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
 #ifdef _WIN32
     command = "\"" + command + "\"";
@@ -567,7 +569,7 @@ void testSingleSampleDepthPasses(const std::filesystem::path& tool) {
         float found = 0.0f;
         std::memcpy(&expected, drawn.data() + index * sizeof(float), sizeof(float));
         std::memcpy(&found, copies.data() + index * sizeof(float), sizeof(float));
-        check(std::memcmp(&expected, &found, sizeof(float)) == 0, "pass 2 left " + std::to_string(found) + " in single-sample DB depth copy " + std::to_string(index / CopyTexels) + " at texel " + std::to_string(index % CopyTexels) + ", captured " + std::to_string(expected));
+        check(std::memcmp(&expected, &found, sizeof(float)) == 0, "pass 2 left " + std::to_string(found) + " in single-sample DB depth copy " + std::to_string(index / CopyTexels) + " at texel " + std::to_string(index % CopyTexels) + ", captured " + std::to_string(expected) + "\n" + std::string(reinterpret_cast<const char*>(errors.data()), errors.size()));
     }
 }
 
