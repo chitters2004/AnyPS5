@@ -873,7 +873,7 @@ struct Replay {
                 if (at > first && !waiting && ((header >> 30u) != 3u || ((header >> 8u) & 0xffu) != 0x59u)) continue;
                 std::uint32_t value = 0;
                 std::memcpy(&value, bytes.data() + at, sizeof(value));
-                (waiting ? releases : controls).emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
+                controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
                 held.push_back(at);
             }
             std::size_t from = 0;
