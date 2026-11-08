@@ -486,6 +486,9 @@ jobs:
             for g in "$f" "build/$f"; do if [ -f "$g" ]; then cp "$g" "result/$f"; fi; done
           done
           cp ccache-stats.txt result/ 2>/dev/null || true
+          ccache --show-stats -vv > result/ccache-stats-vv.txt 2>&1 || true
+          if [ -f build/.ninja_log ]; then gzip -c build/.ninja_log > result/ninja_log.gz; fi
+          { nproc; grep -m1 '^model name' /proc/cpuinfo; grep MemTotal /proc/meminfo; } > result/machine.txt 2>&1 || true
           if [ -d build ]; then
             find build -name '*.log' ! -name ctest.log ! -path '*/CMakeFiles/*' -size +0 -print0 | while IFS= read -r -d '' f; do
               if grep -q 'VUID-' "$f"; then gzip -c "$f" > "result/replay-$(echo "$f" | tr '/' '_').gz"; fi
@@ -895,6 +898,9 @@ jobs:
           if [ -f ctest.log ]; then gzip -c ctest.log > result/ctest.log.gz; fi
           cp build/ctest.xml result/ctest.xml 2>/dev/null || true
           cp ccache-stats.txt result/ 2>/dev/null || true
+          ccache --show-stats -vv > result/ccache-stats-vv.txt 2>&1 || true
+          if [ -f build/.ninja_log ]; then gzip -c build/.ninja_log > result/ninja_log.gz; fi
+          { echo "cores=$NUMBER_OF_PROCESSORS"; wmic cpu get name 2>/dev/null; wmic computersystem get TotalPhysicalMemory 2>/dev/null; } > result/machine.txt 2>&1 || true
           python tools/check_skips.py build/ctest.xml --job windows --list > result/skips.txt 2>&1 || true
           python - <<'PY'
           import json, os
