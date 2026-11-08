@@ -385,10 +385,12 @@ void testReservationError(const std::filesystem::path& tool) {
     check(std::string(reinterpret_cast<const char*>(report.data()), report.size()).find("\"p50\"") == std::string::npos, "a failed repeated reservation produced a successful replay report");
 }
 
-constexpr std::uint32_t DepthWidth = 64;
-constexpr std::uint32_t DepthHeight = 4;
+constexpr std::uint32_t DepthWidth = 128;
+constexpr std::uint32_t DepthHeight = 64;
 constexpr std::uint32_t DepthSamplesLog2 = 2;
 constexpr std::size_t HtileOffset = 64u * 1024u;
+constexpr std::size_t PageBytes = 4096;
+constexpr std::size_t PlaneBytes = static_cast<std::size_t>(DepthWidth) * DepthHeight * (1u << DepthSamplesLog2) * sizeof(float);
 constexpr std::size_t CopyTexels = DepthWidth * DepthHeight;
 constexpr std::size_t CopyBytes = 2u * CopyTexels * sizeof(float);
 constexpr std::uint32_t StandardLocations4x = 0x622ae6aeu;
@@ -472,13 +474,36 @@ void appendDepthDraw(std::vector<std::uint32_t>& commands, const std::uint32_t* 
     commands.insert(commands.end(), {0xc0012d00u, 3u, 2u});
 }
 
+std::vector<std::byte> snapshotOf(const FrameCaptureReader& reader, std::uint64_t address, std::size_t bytes) {
+    std::vector<std::byte> result(bytes);
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Snapshot || chunk.address + chunk.bytes <= address || address + bytes <= chunk.address) continue;
+        const auto piece = reader.Read(chunk);
+        const auto begin = std::max(chunk.address, address);
+        const auto end = std::min(chunk.address + chunk.bytes, address + bytes);
+        std::memcpy(result.data() + (begin - address), piece.data() + (begin - chunk.address), static_cast<std::size_t>(end - begin));
+    }
+    return result;
+}
+
+std::vector<std::uint64_t> passValues(const std::string& report, const std::string& name) {
+    std::vector<std::uint64_t> values;
+    const auto key = "\"" + name + "\":";
+    for (auto found = report.find(key); found != std::string::npos; found = report.find(key, found + 1)) values.push_back(std::strtoull(report.c_str() + found + key.size(), nullptr, 10));
+    return values;
+}
+
 void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     const char* directory = std::getenv("APS5_FRAME_CAPTURE");
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const std::filesystem::path capture(directory);
     const auto layout = allocate();
     check(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536) != nullptr, "cannot reserve the guest memory between the copy target and the depth planes");
-    const auto planes = allocate();
+    const auto planeLow = allocate();
+    const auto planeHigh = allocate();
+    check(planeHigh.base == planeLow.base + BlockBytes, "the two blocks holding the depth planes are not adjacent");
+    auto* const planeBase = planeLow.base + BlockBytes - PlaneBytes / 2u;
+    auto* const htileBase = planeHigh.base + HtileOffset;
     auto* const target = reinterpret_cast<float*>(layout.source);
     auto* const later = target + CopyTexels;
     std::fill(target, target + 2u * CopyTexels, Untouched);
@@ -490,9 +515,9 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
 
     flip();
     std::vector<std::uint32_t> commands;
-    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), true);
-    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), false);
-    appendDepthDraw(commands, vertex, pixel, later, at(planes.base), at(planes.base + HtileOffset), true);
+    appendDepthDraw(commands, vertex, pixel, target, at(planeBase), at(htileBase), true);
+    appendDepthDraw(commands, vertex, pixel, target, at(planeBase), at(htileBase), false);
+    appendDepthDraw(commands, vertex, pixel, later, at(planeBase), at(htileBase), true);
     check(commands.size() * sizeof(std::uint32_t) <= CommandBytes, "the multisample depth commands do not fit their buffer");
     std::copy(commands.begin(), commands.end(), layout.firstCommands);
     Packet packet{layout.firstCommands, static_cast<std::uint32_t>(commands.size()), 0, {}};
@@ -500,6 +525,7 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     flip();
     AgcDriverWaitIdle_nid_postfix();
     AgcDriver::GuestMemory::FlushGpuWrites(at(target), CopyBytes);
+    AgcDriver::GuestMemory::FlushGpuWrites(at(planeLow.base), 2u * BlockBytes);
     std::vector<std::byte> drawn(CopyBytes);
     std::memcpy(drawn.data(), target, CopyBytes);
     std::size_t cleared = 0;
@@ -512,7 +538,26 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     }
     check(cleared != 0, "the DB depth copy before the draw did not read the cleared depth");
     check(covered != 0 && covered != CopyTexels, "the multisample depth triangle covered " + std::to_string(covered) + " texels, expected an edge through the target");
+    const std::array<std::pair<const Layout*, std::vector<std::byte>>, 3> finals{{
+        {&layout, std::vector<std::byte>(layout.base, layout.base + BlockBytes)},
+        {&planeLow, std::vector<std::byte>(planeLow.base, planeLow.base + BlockBytes)},
+        {&planeHigh, std::vector<std::byte>(planeHigh.base, planeHigh.base + BlockBytes)},
+    }};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> hostOnly;
+    AgcDriverHostOnlySampleRanges_nid_no_patch(at(planeLow.base), 2u * BlockBytes, hostOnly);
+    check(!hostOnly.empty(), "the multisample depth draw left no samples only on the host");
     AgcDriverShutdown_nid_postfix();
+
+    const FrameCaptureReader reader(capture);
+    std::size_t expectedPages = 0;
+    for (const auto& [block, bytes] : finals) {
+        const auto snapshot = snapshotOf(reader, at(block->base), BlockBytes);
+        for (std::size_t offset = 0; offset < BlockBytes; offset += PageBytes) {
+            const auto page = at(block->base) + offset;
+            const bool held = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& range) { return range.first < page + PageBytes && page < range.first + range.second; });
+            expectedPages += held || std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+        }
+    }
 
     const auto dump = capture / "multisample depth copy.bin";
     const auto replay = [&](std::size_t passes) {
@@ -540,9 +585,23 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         std::size_t replayed = 0;
         for (auto found = report.find("\"frames\":1,\"p50\""); found != std::string::npos; found = report.find("\"frames\":1,\"p50\"", found + 1)) ++replayed;
         check(replayed == passes, "the replay did not replay the frame in each of " + std::to_string(passes) + " passes: " + report);
+        if (passes < 2) return;
+        const auto rewritten = passValues(report, "rewritten_bytes");
+        const auto captured = passValues(report, "range_bytes");
+        check(rewritten.size() == passes && captured.size() == passes && rewritten[0] == 0, "the replay report lists " + std::to_string(rewritten.size()) + " passes with rewritten bytes: " + report);
+        for (std::size_t pass = 1; pass < passes; ++pass) {
+            check(rewritten[pass] == expectedPages * PageBytes, "pass " + std::to_string(pass + 1) + " rewrote " + std::to_string(rewritten[pass]) + " of " + std::to_string(captured[pass]) + " captured bytes, expected exactly the " + std::to_string(expectedPages) + " pages the earlier pass changed");
+        }
     };
     replay(1);
     replay(2);
+    replay(3);
+#ifdef __linux__
+    const auto refusedLog = capture / "multisample depth unwatched.log";
+    const auto refused = std::system(("APS5_NO_WRITE_WATCH=1 \"" + tool.string() + "\" \"" + capture.string() + "\" --strict > /dev/null 2> \"" + refusedLog.string() + "\"").c_str());
+    const auto refusal = readFile(refusedLog);
+    check(refused != 0 && std::string(reinterpret_cast<const char*>(refusal.data()), refusal.size()).find("write watch does not cover") != std::string::npos, "the replay accepted a watched range without the guest write watch");
+#endif
 }
 
 }
