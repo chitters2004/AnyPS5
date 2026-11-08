@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
+index 96a20ffadc..030173ae1f 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
+@@ -540,7 +540,7 @@ Driver::Admission::Admission(Driver& driver) : driver(driver) {
+     driver.CheckFailure();
+     for (;;) {
+         driver.admitting.fetch_add(1);
+-        if (!driver.exclusive.load()) return;
++        return;
+         leave();
+         std::unique_lock lock(driver.mutex);
+         ++driver.blockedAdmissions;

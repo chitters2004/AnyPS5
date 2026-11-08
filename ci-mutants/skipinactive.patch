@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -3114,7 +3114,7 @@
+     std::lock_guard lock(surfacesMutex());
+     forgetHtileReads(address, bytes);
+     for (const auto& surface : surfaces()) {
+-        if (surface->retired || !surfaceFootprintOverlaps(*surface, address, end)) continue;
++        if (surface->retired || !surface->active->load(std::memory_order_acquire) || !surfaceFootprintOverlaps(*surface, address, end)) continue;
+         surface->active->store(false, std::memory_order_release);
+         surface->hostWritten->store(false, std::memory_order_release);
+         retired.planes += surface->AnyStale() || surface->stencilStale;

@@ -1,0 +1,12 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
+index 96a20ffadc..26057adbfa 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
+@@ -559,7 +559,6 @@ void Driver::Admission::leave() {
+     driver.admitting.fetch_sub(1);
+     if (!driver.exclusive.load()) return;
+     { std::lock_guard lock(driver.mutex); }
+-    driver.changed.notify_all();
+ }
+ 
+ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {

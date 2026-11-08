@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -547,7 +547,7 @@
+         rethrowDriverFailure(failure);
+         return owners;
+     };
+-    for (std::size_t index = 0; index < plan.ranges.size(); ++index) {
++    for (std::size_t index = 0; index < plan.ranges.size() && false; ++index) {
+         const auto& range = *plan.ranges[index];
+         if (const auto owners = survivors(range.address, range.bytes, true); owners != 0) throw std::runtime_error("frame replay: " + std::to_string(owners) + " GPU owners with results only on the GPU over the captured range at " + std::to_string(range.address) + " of " + std::to_string(range.bytes) + " bytes survived the reset");
+         for (const auto& [begin, end] : retired[index]) {

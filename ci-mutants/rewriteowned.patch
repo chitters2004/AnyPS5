@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -435,7 +435,7 @@
+             desiredBytes(reader, snapshot, window, windowEnd, desired, staged);
+             for (auto address = window; address < windowEnd;) {
+                 const auto end = std::min((address & ~(ResetPage - 1)) + ResetPage, windowEnd);
+-                if (std::memcmp(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - window), static_cast<std::size_t>(end - address)) != 0) {
++                if (std::memcmp(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - window), static_cast<std::size_t>(end - address)) != 0 || std::any_of(owned.begin(), owned.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) {
+                     if (!runs.empty() && runs.back().second == address) runs.back().second = end;
+                     else runs.emplace_back(address, end);
+                     if (std::any_of(owned.begin(), owned.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) differing.ownedBytes += end - address;
