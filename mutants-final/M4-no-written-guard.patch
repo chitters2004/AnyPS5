@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+index 338f3460be..d472523d7a 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -2933,7 +2933,7 @@ void retireStoringStale(DepthSurface& surface) {
+     const auto removed = unmappedUnits(surface.target.address, planeBytes, surface.unitBytes, surface.staleUnits.size(), surface.depthMark);
+     auto units = surface.staleUnits;
+     for (std::size_t unit = 0; unit < units.size(); ++unit) {
+-        if ((unit < written.size() && written[unit]) || removed[unit]) units[unit] = false;
++        if (written[unit] || removed[unit]) units[unit] = false;
+     }
+     std::shared_ptr<StorageTexture> mirror;
+     if (anyUnit(units) && (!anyUnit(written) || surface.StoresUnits(*surface.Mirror(resource)))) mirror = surface.StoreDepthPlane(resource, units);

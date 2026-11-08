@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+index 338f3460be..ebfedf5d5e 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -2865,7 +2865,7 @@ std::uint64_t DepthSurface::MirrorBytes() const {
+ }
+ 
+ std::uint64_t DepthSurface::StencilMirrorBytes() const {
+-    if (stencilMirrorBytes == 0) stencilMirrorBytes = DescribeSurface(stencilResource(target)).guestBytes;
++    if (stencilMirrorBytes == 0) stencilMirrorBytes = DescribeSurface(mirrorResource(target)).guestBytes;
+     return stencilMirrorBytes;
+ }
+ 

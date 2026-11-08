@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+index 338f3460be..103f8a5fe5 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/DepthSurface.cpp
+@@ -1360,7 +1360,7 @@ public:
+         generation = GuestMemory::TrackerGeneration();
+         std::vector<bool> changed;
+         const auto mark = [&](std::size_t unit) {
+-            if (changed.empty()) changed.assign(unitGeneration.size(), false);
++            if (changed.empty()) changed.assign(unit + 1, false);
+             changed[unit] = true;
+         };
+         if (collected == 0u) {
