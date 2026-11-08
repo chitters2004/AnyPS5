@@ -268,6 +268,41 @@ void Driver::WaitIdle() {
     if (const auto localDevice = device.Load()) localDevice->WaitIdle();
 }
 
+void Driver::BeginExclusive() {
+    require(!onWorkerThread(), "worker cannot wait for itself");
+    std::unique_lock lock(mutex);
+    changed.wait(lock, [&] { return failure != nullptr || stopping || !exclusive; });
+    rethrowFailure();
+    checkStopping();
+    exclusive = true;
+    ++idleWaiters;
+    changed.wait(lock, [&] { return failure != nullptr || stopping || (admitting == 0 && completed >= accepted); });
+    --idleWaiters;
+    if (failure != nullptr || stopping) {
+        exclusive = false;
+        changed.notify_all();
+        rethrowFailure();
+        checkStopping();
+    }
+}
+
+std::uint32_t Driver::BlockedSubmissions() {
+    std::lock_guard lock(mutex);
+    return blockedAdmissions;
+}
+
+void Driver::WaitDeviceIdle() {
+    if (const auto localDevice = device.Load()) localDevice->WaitIdle();
+}
+
+void Driver::EndExclusive() {
+    {
+        std::lock_guard lock(mutex);
+        exclusive = false;
+    }
+    changed.notify_all();
+}
+
 bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     require(!onWorkerThread(), "worker cannot wait for itself");
     std::unique_lock lock(mutex);

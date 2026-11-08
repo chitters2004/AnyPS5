@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iterator>
 #include <memory>
@@ -385,12 +386,15 @@ void testReservationError(const std::filesystem::path& tool) {
     check(std::string(reinterpret_cast<const char*>(report.data()), report.size()).find("\"p50\"") == std::string::npos, "a failed repeated reservation produced a successful replay report");
 }
 
-constexpr std::uint32_t DepthWidth = 64;
-constexpr std::uint32_t DepthHeight = 4;
+constexpr std::uint32_t DepthWidth = 128;
+constexpr std::uint32_t DepthHeight = 64;
 constexpr std::uint32_t DepthSamplesLog2 = 2;
 constexpr std::size_t HtileOffset = 64u * 1024u;
+constexpr std::size_t PageBytes = 4096;
+constexpr std::size_t PlaneBytes = static_cast<std::size_t>(DepthWidth) * DepthHeight * (1u << DepthSamplesLog2) * sizeof(float);
 constexpr std::size_t CopyTexels = DepthWidth * DepthHeight;
-constexpr std::size_t CopyBytes = 2u * CopyTexels * sizeof(float);
+constexpr std::size_t CopyCount = 5;
+constexpr std::size_t CopyBytes = CopyCount * CopyTexels * sizeof(float);
 constexpr std::uint32_t StandardLocations4x = 0x622ae6aeu;
 constexpr float DrawnDepth = 0.25f;
 constexpr float ClearedDepth = 0.0f;
@@ -431,13 +435,14 @@ void appendRegister(std::vector<std::uint32_t>& commands, std::uint32_t opcode, 
     commands.insert(commands.end(), {0xc0010000u | (opcode << 8u), offset, value});
 }
 
-void appendDepthDraw(std::vector<std::uint32_t>& commands, const std::uint32_t* vertex, const std::uint32_t* pixel, const float* color, std::uint64_t depth, std::uint64_t htile, bool depthCopy) {
+void appendDepthDraw(std::vector<std::uint32_t>& commands, const std::uint32_t* vertex, const std::uint32_t* pixel, const float* color, std::uint64_t depth, std::uint64_t htile, bool depthCopy, std::uint32_t copySample = 0, std::uint32_t samplesLog2 = DepthSamplesLog2) {
     const auto colorAddress = at(color);
-    const auto locations = depthCopy ? 0u : StandardLocations4x;
+    const bool multisampled = samplesLog2 != 0u;
+    const auto locations = depthCopy || !multisampled ? 0u : StandardLocations4x;
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b3, 0x2}, {0x1b4, 0x2}, {0x1b6, 0}, {0x207, 0}, {0x200, depthCopy ? 0u : 0x76u}, {0x203, 0},
-        {0x2dc, 0xaa00}, {0x2f8, depthCopy ? 0u : 0x0020c002u}, {0x293, 0},
+        {0x2dc, 0xaa00}, {0x2f8, depthCopy || !multisampled ? 0u : 0x0020c002u}, {0x293, 0},
         {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
         {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
         {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
@@ -455,9 +460,9 @@ void appendDepthDraw(std::vector<std::uint32_t>& commands, const std::uint32_t* 
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
         {0x2fe, locations}, {0x302, locations}, {0x306, locations}, {0x30a, locations},
         {0x318, static_cast<std::uint32_t>(colorAddress >> 8u)}, {0x390, static_cast<std::uint32_t>(colorAddress >> 40u)}, {0x292, depthCopy ? 2u : 3u},
-        {0x000, depthCopy ? 0x84u : 0u}, {0x002, 0}, {0x007, ((DepthHeight - 1u) << 16u) | (DepthWidth - 1u)},
+        {0x000, depthCopy ? (copySample == 0 ? 0x84u : 4u | (copySample << 8u)) : 0u}, {0x002, 0}, {0x007, ((DepthHeight - 1u) << 16u) | (DepthWidth - 1u)},
         {0x008, 0}, {0x009, std::bit_cast<std::uint32_t>(1.0f)}, {0x00a, 0}, {0x00b, 0},
-        {0x010, 3u | (DepthSamplesLog2 << 2u) | (24u << 4u) | (1u << 20u) | (1u << 29u)}, {0x011, 1u << 29u}, {0x2af, 1u << 18u},
+        {0x010, 3u | (samplesLog2 << 2u) | (24u << 4u) | (1u << 20u) | (1u << 29u)}, {0x011, 1u << 29u}, {0x2af, 1u << 18u},
         {0x012, static_cast<std::uint32_t>(depth >> 8u)}, {0x014, static_cast<std::uint32_t>(depth >> 8u)},
         {0x01a, static_cast<std::uint32_t>(depth >> 40u)}, {0x01c, static_cast<std::uint32_t>(depth >> 40u)},
         {0x005, static_cast<std::uint32_t>(htile >> 8u)}, {0x01e, static_cast<std::uint32_t>(htile >> 40u)},
@@ -472,16 +477,36 @@ void appendDepthDraw(std::vector<std::uint32_t>& commands, const std::uint32_t* 
     commands.insert(commands.end(), {0xc0012d00u, 3u, 2u});
 }
 
-void testMultisampleDepthPasses(const std::filesystem::path& tool) {
+std::vector<std::byte> snapshotOf(const FrameCaptureReader& reader, std::uint64_t address, std::size_t bytes) {
+    std::vector<std::byte> result(bytes);
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Snapshot || chunk.address + chunk.bytes <= address || address + bytes <= chunk.address) continue;
+        const auto piece = reader.Read(chunk);
+        const auto begin = std::max(chunk.address, address);
+        const auto end = std::min(chunk.address + chunk.bytes, address + bytes);
+        std::memcpy(result.data() + (begin - address), piece.data() + (begin - chunk.address), static_cast<std::size_t>(end - begin));
+    }
+    return result;
+}
+
+std::vector<std::uint64_t> passValues(const std::string& report, const std::string& name) {
+    std::vector<std::uint64_t> values;
+    const auto key = "\"" + name + "\":";
+    for (auto found = report.find(key); found != std::string::npos; found = report.find(key, found + 1)) values.push_back(std::strtoull(report.c_str() + found + key.size(), nullptr, 10));
+    return values;
+}
+
+void testSingleSampleDepthPasses(const std::filesystem::path& tool) {
     const char* directory = std::getenv("APS5_FRAME_CAPTURE");
     check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
     const std::filesystem::path capture(directory);
     const auto layout = allocate();
-    check(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536) != nullptr, "cannot reserve the guest memory between the copy target and the depth planes");
     const auto planes = allocate();
     auto* const target = reinterpret_cast<float*>(layout.source);
     auto* const later = target + CopyTexels;
-    std::fill(target, target + 2u * CopyTexels, Untouched);
+    constexpr std::size_t Copies = 2;
+    constexpr std::size_t Bytes = Copies * CopyTexels * sizeof(float);
+    std::fill(target, target + Copies * CopyTexels, Untouched);
     auto* const shaders = reinterpret_cast<std::byte*>(layout.secondCommands);
     const auto* const vertex = registerShader(shaders, DepthVertexCode, 2);
     const auto* const pixel = registerShader(shaders + 1024, DepthPixelCode, 1);
@@ -490,9 +515,88 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
 
     flip();
     std::vector<std::uint32_t> commands;
-    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), true);
-    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), false);
-    appendDepthDraw(commands, vertex, pixel, later, at(planes.base), at(planes.base + HtileOffset), true);
+    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), true, 0, 0);
+    appendDepthDraw(commands, vertex, pixel, target, at(planes.base), at(planes.base + HtileOffset), false, 0, 0);
+    appendDepthDraw(commands, vertex, pixel, later, at(planes.base), at(planes.base + HtileOffset), true, 0, 0);
+    std::copy(commands.begin(), commands.end(), layout.firstCommands);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(commands.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "the single-sample depth draw and its DB depth copies were not submitted");
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(at(target), Bytes);
+    std::vector<std::byte> drawn(Bytes);
+    std::memcpy(drawn.data(), target, Bytes);
+    std::size_t cleared = 0;
+    std::size_t covered = 0;
+    for (std::size_t index = 0; index < CopyTexels; ++index) {
+        check(target[index] == ClearedDepth || target[index] == Untouched, "the single-sample DB depth copy before the draw holds " + std::to_string(target[index]) + " at texel " + std::to_string(index));
+        check(later[index] == DrawnDepth || later[index] == ClearedDepth || later[index] == Untouched, "the single-sample DB depth copy after the draw holds " + std::to_string(later[index]) + " at texel " + std::to_string(index));
+        cleared += target[index] == ClearedDepth;
+        covered += later[index] == DrawnDepth;
+    }
+    check(cleared != 0, "the single-sample DB depth copy before the draw did not read the cleared depth");
+    check(covered != 0 && covered != CopyTexels, "the single-sample depth triangle covered " + std::to_string(covered) + " texels, expected an edge through the target");
+    {
+        std::exception_ptr failure;
+        AgcDriverFlushGuestMemory_nid_no_patch(at(planes.base), BlockBytes, &failure);
+        if (failure) std::rethrow_exception(failure);
+        std::size_t owners = 1;
+        AgcDriverGpuOwnersOver_nid_no_patch(at(planes.base), BlockBytes, &owners, &failure);
+        if (failure) std::rethrow_exception(failure);
+        check(owners == 0, "the reset flush left " + std::to_string(owners) + " GPU owners over the single-sample depth plane");
+        const auto* const plane = reinterpret_cast<const float*>(planes.base);
+        check(std::count(plane, plane + CopyTexels, DrawnDepth) != 0, "the reset flush did not store the drawn single-sample depth into guest memory");
+    }
+    AgcDriverShutdown_nid_postfix();
+
+    const auto dump = capture / "single sample depth copy.bin";
+    std::filesystem::remove(dump);
+    const auto result = capture / "single sample depth.json";
+    const auto log = capture / "single sample depth.log";
+    auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --verify-reset --repeat 2 --dump " + std::to_string(at(target)) + ":" + std::to_string(Bytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+#endif
+    const auto code = std::system(command.c_str());
+    const auto errors = readFile(log);
+    check(code == 0, "agc_frame_replay --repeat 2 of the single-sample depth frame exited with " + std::to_string(code) + ": " + std::string(reinterpret_cast<const char*>(errors.data()), errors.size()));
+    const auto copies = readFile(dump);
+    check(copies.size() == drawn.size(), "the replay dumped " + std::to_string(copies.size()) + " bytes of the single-sample DB depth copies");
+    for (std::size_t index = 0; index < Copies * CopyTexels; ++index) {
+        float expected = 0.0f;
+        float found = 0.0f;
+        std::memcpy(&expected, drawn.data() + index * sizeof(float), sizeof(float));
+        std::memcpy(&found, copies.data() + index * sizeof(float), sizeof(float));
+        check(std::memcmp(&expected, &found, sizeof(float)) == 0, "pass 2 left " + std::to_string(found) + " in single-sample DB depth copy " + std::to_string(index / CopyTexels) + " at texel " + std::to_string(index % CopyTexels) + ", captured " + std::to_string(expected));
+    }
+}
+
+void testMultisampleDepthPasses(const std::filesystem::path& tool) {
+    const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+    check(directory != nullptr && *directory != '\0', "APS5_FRAME_CAPTURE is not set");
+    const std::filesystem::path capture(directory);
+    const auto layout = allocate();
+    check(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536) != nullptr, "cannot reserve the guest memory between the copy target and the depth planes");
+    const auto planeLow = allocate();
+    const auto planeHigh = allocate();
+    check(planeHigh.base == planeLow.base + BlockBytes, "the two blocks holding the depth planes are not adjacent");
+    auto* const planeBase = planeLow.base + BlockBytes - PlaneBytes / 2u;
+    auto* const htileBase = planeHigh.base + HtileOffset;
+    auto* const target = reinterpret_cast<float*>(layout.source);
+    auto* const later = target + CopyTexels;
+    std::fill(target, target + CopyCount * CopyTexels, Untouched);
+    auto* const shaders = reinterpret_cast<std::byte*>(layout.secondCommands);
+    const auto* const vertex = registerShader(shaders, DepthVertexCode, 2);
+    const auto* const pixel = registerShader(shaders + 1024, DepthPixelCode, 1);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    std::vector<std::uint32_t> commands;
+    appendDepthDraw(commands, vertex, pixel, target, at(planeBase), at(htileBase), true);
+    appendDepthDraw(commands, vertex, pixel, target, at(planeBase), at(htileBase), false);
+    appendDepthDraw(commands, vertex, pixel, later, at(planeBase), at(htileBase), true);
+    for (std::uint32_t sample = 1; sample < 4; ++sample) appendDepthDraw(commands, vertex, pixel, later + sample * CopyTexels, at(planeBase), at(htileBase), true, sample);
     check(commands.size() * sizeof(std::uint32_t) <= CommandBytes, "the multisample depth commands do not fit their buffer");
     std::copy(commands.begin(), commands.end(), layout.firstCommands);
     Packet packet{layout.firstCommands, static_cast<std::uint32_t>(commands.size()), 0, {}};
@@ -500,6 +604,7 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     flip();
     AgcDriverWaitIdle_nid_postfix();
     AgcDriver::GuestMemory::FlushGpuWrites(at(target), CopyBytes);
+    AgcDriver::GuestMemory::FlushGpuWrites(at(planeLow.base), 2u * BlockBytes);
     std::vector<std::byte> drawn(CopyBytes);
     std::memcpy(drawn.data(), target, CopyBytes);
     std::size_t cleared = 0;
@@ -512,14 +617,91 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
     }
     check(cleared != 0, "the DB depth copy before the draw did not read the cleared depth");
     check(covered != 0 && covered != CopyTexels, "the multisample depth triangle covered " + std::to_string(covered) + " texels, expected an edge through the target");
+    bool samplesDiffer = false;
+    for (std::size_t copy = 2; copy < CopyCount; ++copy) {
+        std::size_t drawnTexels = 0;
+        for (std::size_t index = 0; index < CopyTexels; ++index) {
+            const auto value = target[copy * CopyTexels + index];
+            check(value == DrawnDepth || value == ClearedDepth || value == Untouched, "the DB depth copy of sample " + std::to_string(copy - 1) + " holds " + std::to_string(value) + " at texel " + std::to_string(index));
+            drawnTexels += value == DrawnDepth;
+            samplesDiffer |= value != later[index];
+        }
+        check(drawnTexels != 0, "the DB depth copy of sample " + std::to_string(copy - 1) + " holds no drawn depth");
+    }
+    check(samplesDiffer, "the DB depth copies of samples 1 to 3 equal the copy of sample 0 at every texel");
+    const std::array<std::pair<const Layout*, std::vector<std::byte>>, 3> finals{{
+        {&layout, std::vector<std::byte>(layout.base, layout.base + BlockBytes)},
+        {&planeLow, std::vector<std::byte>(planeLow.base, planeLow.base + BlockBytes)},
+        {&planeHigh, std::vector<std::byte>(planeHigh.base, planeHigh.base + BlockBytes)},
+    }};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> hostOnly;
+    std::exception_ptr failure;
+    AgcDriverGpuOwnedRanges_nid_no_patch(at(planeLow.base), 2u * BlockBytes, hostOnly, &failure);
+    if (failure) std::rethrow_exception(failure);
+    check(!hostOnly.empty(), "the multisample depth draw left no samples only on the host");
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "the multisample depth commands were not submitted again");
+    static Packet* admitted = nullptr;
+    static std::atomic<bool> submittedLate{false};
+    static std::atomic<bool> lateAccepted{false};
+    static std::uint64_t acceptedAtDrain = 0;
+    static std::thread late;
+    admitted = &packet;
+    AgcDriverSetGuestMemoryTransactionHookForTest_nid_no_patch([] {
+        std::uint64_t completed = 0;
+        AgcDriverSerialProgress_nid_postfix(&acceptedAtDrain, &completed);
+        late = std::thread([] {
+            lateAccepted.store(sceAgcDriverSubmitDcb(admitted) == 0, std::memory_order_release);
+            submittedLate.store(true, std::memory_order_release);
+        });
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (AgcDriverBlockedSubmissionsForTest_nid_no_patch() == 0 && !submittedLate.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    });
+    struct Probe {
+        bool contended = true;
+        bool lateInside = true;
+        std::uint64_t accepted = 0;
+        std::uint64_t completed = 1;
+    } probe;
+    AgcDriverGuestMemoryTransaction_nid_no_patch([](void* context) {
+        auto& inside = *static_cast<Probe*>(context);
+        AgcDriverSerialProgress_nid_postfix(&inside.accepted, &inside.completed);
+        inside.lateInside = submittedLate.load(std::memory_order_acquire);
+        inside.contended = std::async(std::launch::async, [] {
+            std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::try_to_lock);
+            return lock.owns_lock();
+        }).get();
+    }, &probe, &failure);
+    AgcDriverSetGuestMemoryTransactionHookForTest_nid_no_patch(nullptr);
+    late.join();
+    if (failure) std::rethrow_exception(failure);
+    check(!probe.lateInside && probe.accepted == acceptedAtDrain, "a submission made after the drain of a guest memory transaction was accepted inside it");
+    check(probe.accepted == probe.completed, "the GPU had work in flight inside a guest memory transaction");
+    check(!probe.contended, "another thread took the GPU lock inside a guest memory transaction");
+    check(lateAccepted.load(), "the submission held back by a guest memory transaction was not accepted after it");
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::async(std::launch::async, [] {
+        std::unique_lock lock(AgcDriver::GuestMemory::GpuMutex(), std::try_to_lock);
+        return lock.owns_lock();
+    }).get(), "a guest memory transaction kept the GPU lock after it ended");
     AgcDriverShutdown_nid_postfix();
+
+    const FrameCaptureReader reader(capture);
+    std::size_t expectedPages = 0;
+    for (const auto& [block, bytes] : finals) {
+        const auto snapshot = snapshotOf(reader, at(block->base), BlockBytes);
+        for (std::size_t offset = 0; offset < BlockBytes; offset += PageBytes) {
+            const auto page = at(block->base) + offset;
+            const bool held = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& range) { return range.first < page + PageBytes && page < range.first + range.second; });
+            expectedPages += held || std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+        }
+    }
 
     const auto dump = capture / "multisample depth copy.bin";
     const auto replay = [&](std::size_t passes) {
         std::filesystem::remove(dump);
         const auto result = capture / ("multisample depth " + std::to_string(passes) + ".json");
         const auto log = capture / ("multisample depth " + std::to_string(passes) + ".log");
-        auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --repeat " + std::to_string(passes) + " --dump " + std::to_string(at(target)) + ":" + std::to_string(CopyBytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
+        auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --verify-reset --repeat " + std::to_string(passes) + " --dump " + std::to_string(at(target)) + ":" + std::to_string(CopyBytes) + ":\"" + dump.string() + "\" > \"" + result.string() + "\" 2> \"" + log.string() + "\"";
 #ifdef _WIN32
         command = "\"" + command + "\"";
 #endif
@@ -528,7 +710,7 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         check(code == 0, "agc_frame_replay --repeat " + std::to_string(passes) + " exited with " + std::to_string(code) + ": " + std::string(reinterpret_cast<const char*>(errors.data()), errors.size()));
         const auto copies = readFile(dump);
         check(copies.size() == drawn.size(), "the replay with " + std::to_string(passes) + " passes dumped " + std::to_string(copies.size()) + " bytes of the DB depth copies");
-        for (std::size_t index = 0; index < 2u * CopyTexels; ++index) {
+        for (std::size_t index = 0; index < CopyCount * CopyTexels; ++index) {
             float expected = 0.0f;
             float found = 0.0f;
             std::memcpy(&expected, drawn.data() + index * sizeof(float), sizeof(float));
@@ -540,16 +722,54 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
         std::size_t replayed = 0;
         for (auto found = report.find("\"frames\":1,\"p50\""); found != std::string::npos; found = report.find("\"frames\":1,\"p50\"", found + 1)) ++replayed;
         check(replayed == passes, "the replay did not replay the frame in each of " + std::to_string(passes) + " passes: " + report);
+        if (passes < 2) return;
+        const auto rewritten = passValues(report, "rewritten_bytes");
+        const auto captured = passValues(report, "range_bytes");
+        check(rewritten.size() == passes && captured.size() == passes && rewritten[0] == 0, "the replay report lists " + std::to_string(rewritten.size()) + " passes with rewritten bytes: " + report);
+        const auto workers = passValues(report, "reset_workers");
+        check(workers.size() == passes, "the replay report lists " + std::to_string(workers.size()) + " passes with reset workers: " + report);
+        for (std::size_t pass = 1; pass < passes; ++pass) {
+            check(std::thread::hardware_concurrency() < 2 || workers[pass] >= 2, "pass " + std::to_string(pass + 1) + " compared the captured ranges on " + std::to_string(workers[pass]) + " threads");
+            check(rewritten[pass] == expectedPages * PageBytes, "pass " + std::to_string(pass + 1) + " rewrote " + std::to_string(rewritten[pass]) + " of " + std::to_string(captured[pass]) + " captured bytes, expected exactly the " + std::to_string(expectedPages) + " pages the earlier pass changed");
+        }
     };
     replay(1);
     replay(2);
+    replay(3);
+    for (const auto& [fault, expected] : {std::pair<std::string, std::string>{"owners", "GPU owners over the restored memory"}, {"bytes", "differs from the captured contents"}}) {
+        const auto faultLog = capture / ("multisample depth fault " + fault + ".log");
+#ifdef _WIN32
+        _putenv_s("APS5_REPLAY_RESET_FAULT_FOR_TEST", fault.c_str());
+#else
+        setenv("APS5_REPLAY_RESET_FAULT_FOR_TEST", fault.c_str(), 1);
+#endif
+        auto command = "\"" + tool.string() + "\" \"" + capture.string() + "\" --strict --verify-reset --repeat 2 > \"" + (capture / "multisample depth fault.json").string() + "\" 2> \"" + faultLog.string() + "\"";
+#ifdef _WIN32
+        command = "\"" + command + "\"";
+#endif
+        const auto code = std::system(command.c_str());
+#ifdef _WIN32
+        _putenv_s("APS5_REPLAY_RESET_FAULT_FOR_TEST", "");
+#else
+        unsetenv("APS5_REPLAY_RESET_FAULT_FOR_TEST");
+#endif
+        const auto errors = readFile(faultLog);
+        const std::string text(reinterpret_cast<const char*>(errors.data()), errors.size());
+        check(code != 0 && text.find(expected) != std::string::npos, "--verify-reset accepted a reset made faulty by " + fault + " (exit " + std::to_string(code) + "): " + text);
+    }
+#ifdef __linux__
+    const auto refusedLog = capture / "multisample depth unwatched.log";
+    const auto refused = std::system(("APS5_NO_WRITE_WATCH=1 \"" + tool.string() + "\" \"" + capture.string() + "\" --strict > /dev/null 2> \"" + refusedLog.string() + "\"").c_str());
+    const auto refusal = readFile(refusedLog);
+    check(refused != 0 && std::string(reinterpret_cast<const char*>(refusal.data()), refusal.size()).find("write watch does not cover") != std::string::npos, "the replay accepted a watched range without the guest write watch");
+#endif
 }
 
 }
 
 int main(int argc, char** argv) {
-    if (argc != 2 && !(argc == 3 && (std::string(argv[2]) == "concurrent" || std::string(argv[2]) == "pipelines" || std::string(argv[2]) == "reservation_error" || std::string(argv[2]) == "rewind" || std::string(argv[2]) == "multisample_depth"))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|multisample_depth]\n");
+    if (argc != 2 && !(argc == 3 && (std::string(argv[2]) == "concurrent" || std::string(argv[2]) == "pipelines" || std::string(argv[2]) == "reservation_error" || std::string(argv[2]) == "rewind" || std::string(argv[2]) == "multisample_depth" || std::string(argv[2]) == "single_sample_depth"))) {
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|multisample_depth|single_sample_depth]\n");
         return 2;
     }
     try {
@@ -558,6 +778,7 @@ int main(int argc, char** argv) {
         else if (argc == 3 && std::string(argv[2]) == "reservation_error") testReservationError(argv[1]);
         else if (argc == 3 && std::string(argv[2]) == "rewind") testParkedRewindReplays(argv[1]);
         else if (argc == 3 && std::string(argv[2]) == "multisample_depth") testMultisampleDepthPasses(argv[1]);
+        else if (argc == 3 && std::string(argv[2]) == "single_sample_depth") testSingleSampleDepthPasses(argv[1]);
         else testCaptureAndReplay(argv[1], argc == 3);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAILED: %s\n", error.what());

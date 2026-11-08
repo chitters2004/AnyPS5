@@ -126,6 +126,8 @@ void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, c
 std::vector<std::pair<std::uint64_t, std::uint64_t>> HostOnlySampleRanges(std::uint64_t address, std::size_t bytes);
 void RegisterGpuFootprint(const std::shared_ptr<std::atomic<bool>>& active, const std::shared_ptr<const std::atomic<bool>>& hostOnly, std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges);
 void RetireGpuFootprintsOver(std::uint64_t address, std::size_t bytes);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GpuOwnedRanges(std::uint64_t address, std::size_t bytes);
+std::size_t GpuOwnersOver(std::uint64_t address, std::size_t bytes);
 
 }
 
