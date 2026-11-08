@@ -862,6 +862,7 @@ struct Replay {
         for (const auto* chunk : found->second) {
             if (skipped.Overlaps(*chunk)) continue;
             auto bytes = reader.Read(*chunk);
+            std::vector<std::size_t> held;
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
             for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
                 std::uint32_t value = 0;
@@ -872,9 +873,14 @@ struct Replay {
                 const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
                 if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
                 controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
-                std::memcpy(bytes.data() + at, target + at, sizeof(value));
+                held.push_back(at);
             }
-            std::memcpy(target, bytes.data(), bytes.size());
+            std::size_t from = 0;
+            for (const auto at : held) {
+                std::memcpy(target + from, bytes.data() + from, at - from);
+                from = at + sizeof(std::uint32_t);
+            }
+            std::memcpy(target + from, bytes.data() + from, bytes.size() - from);
             deltaBytes += chunk->bytes;
         }
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
