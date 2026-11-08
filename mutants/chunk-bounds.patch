@@ -1,0 +1,15 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index a6ff1de5ec..f4957e2444 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -280,8 +280,8 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
+ #ifdef __linux__
+ void requireWatch(const FrameMemoryChunk& chunk) {
+     const auto page = static_cast<std::uint64_t>(sysconf(_SC_PAGESIZE));
+-    const auto first = chunk.address & ~(page - 1);
+-    const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
++    const auto first = chunk.address;
++    const auto last = chunk.address + chunk.bytes;
+     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
+     if (GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) return;
+     const char* reason = GuestWriteWatch::GuestWriteWatchUnavailableReason_nid_postfix();

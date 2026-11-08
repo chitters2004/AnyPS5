@@ -1,0 +1,12 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+index e33cae6fef..48460b9c85 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+@@ -260,7 +260,6 @@ extern "C" void AgcDriverHostOnlySampleRanges_nid_no_patch(std::uint64_t address
+ extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void* context), void* context) {
+     AgcDriverWaitIdle_nid_postfix();
+     AgcDriver::GuestMemory::TagGpuLockSite(AgcDriver::GuestMemory::GpuLockSite::Flush);
+-    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+     body(context);
+ }
+ 

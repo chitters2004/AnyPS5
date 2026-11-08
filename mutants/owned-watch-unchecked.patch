@@ -1,0 +1,14 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index a6ff1de5ec..010edcceb2 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -310,9 +310,6 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
+                     skipped.Add(chunk);
+                 } else {
+                     std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+-#ifdef __linux__
+-                    if (chunk.rangeKind == FrameRangeKind::Watched) requireWatch(chunk);
+-#endif
+                 }
+                 continue;
+             }

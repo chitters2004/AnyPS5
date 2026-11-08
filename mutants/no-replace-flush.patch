@@ -1,0 +1,11 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+index e33cae6fef..02aa834630 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/EntryPoints.cpp
+@@ -265,6 +265,5 @@ extern "C" void AgcDriverGuestMemoryTransaction_nid_no_patch(void (*body)(void*
+ }
+ 
+ extern "C" void AgcDriverReplaceGuestMemory_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+-    AgcDriverPrepareCommandWrite_nid_no_patch(address, bytes);
+     AgcDriver::Graphics::RetireResidentImagesOver_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+ }

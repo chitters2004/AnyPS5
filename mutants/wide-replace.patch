@@ -1,0 +1,12 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index a6ff1de5ec..e91100b854 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -462,6 +462,7 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
+             auto end = replaced[index].second;
+             auto next = index + 1;
+             for (; next < replaced.size() && replaced[next].first <= end; ++next) end = std::max(end, replaced[next].second);
++            end = (end + 65535u) & ~std::uint64_t{65535};
+             AgcDriverReplaceGuestMemory_nid_no_patch(replaced[index].first, static_cast<std::size_t>(end - replaced[index].first));
+             result.rewritten += end - replaced[index].first;
+             index = next;
