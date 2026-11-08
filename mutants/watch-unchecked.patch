@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index aaf1514790..97a968ffa0 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -311,7 +311,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
+                 const auto first = chunk.address & ~(page - 1);
+                 const auto last = (chunk.address + chunk.bytes + page - 1) & ~(page - 1);
+                 GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(first)), static_cast<std::size_t>(last - first));
+-                if (!GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes");
++                if (false && !GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(last - first))) throw std::runtime_error("frame replay: the guest write watch does not cover the captured range at " + std::to_string(chunk.address) + " of " + std::to_string(chunk.bytes) + " bytes");
+             }
+ #endif
+             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);

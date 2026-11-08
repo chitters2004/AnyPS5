@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index aaf1514790..5e088eebf2 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -351,7 +351,7 @@ Runs differingRuns(const FrameCaptureReader& reader, const FrameMemoryChunk& ran
+         desiredBytes(reader, snapshot, window, windowEnd, desired, staged);
+         for (auto address = window; address < windowEnd;) {
+             const auto end = std::min((address & ~(ResetPage - 1)) + ResetPage, windowEnd);
+-            const bool differs = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; }) ||
++            const bool differs = end == rangeEnd || std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; }) ||
+                                  std::memcmp(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(address)), desired.data() + (address - window), static_cast<std::size_t>(end - address)) != 0;
+             if (differs) {
+                 if (!runs.empty() && runs.back().second == address) runs.back().second = end;

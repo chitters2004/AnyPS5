@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index aaf1514790..003febc4b4 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -415,7 +415,7 @@ std::pair<std::uint64_t, std::uint64_t> resetMemory(const FrameCaptureReader& re
+         auto end = replaced[index].second;
+         auto next = index + 1;
+         for (; next < replaced.size() && replaced[next].first <= end; ++next) end = std::max(end, replaced[next].second);
+-        AgcDriverReplaceGuestMemory_nid_no_patch(replaced[index].first, static_cast<std::size_t>(end - replaced[index].first));
++        static_cast<void>(0);
+         rewritten += end - replaced[index].first;
+         index = next;
+     }
