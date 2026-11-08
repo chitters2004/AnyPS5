@@ -1,0 +1,12 @@
+diff --git a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+index 201c38978d..77c3a443ed 100644
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -646,7 +646,6 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
+             since = std::max(since, changedSince(range.address, range.bytes, previous, changed));
+             auto widened = candidateRuns(range, changed, owned[index]);
+             const auto flushed = subtractRuns(widened, candidates[index]);
+-            retire(flushed);
+             result.flushed += runBytes(flushed);
+             candidates[index] = std::move(widened);
+             result.compared += runBytes(candidates[index]);
