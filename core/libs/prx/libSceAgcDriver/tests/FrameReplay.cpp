@@ -687,14 +687,18 @@ void testMultisampleDepthPasses(const std::filesystem::path& tool) {
 
     const FrameCaptureReader reader(capture);
     std::size_t expectedPages = 0;
+    std::size_t heldMatching = 0;
     for (const auto& [block, bytes] : finals) {
         const auto snapshot = snapshotOf(reader, at(block->base), BlockBytes);
         for (std::size_t offset = 0; offset < BlockBytes; offset += PageBytes) {
             const auto page = at(block->base) + offset;
             const bool held = std::any_of(hostOnly.begin(), hostOnly.end(), [&](const auto& range) { return range.first < page + PageBytes && page < range.first + range.second; });
-            expectedPages += held || std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+            const bool differs = std::memcmp(bytes.data() + offset, snapshot.data() + offset, PageBytes) != 0;
+            expectedPages += differs;
+            heldMatching += held && !differs;
         }
     }
+    check(heldMatching != 0, "every page of the multisample depth owners differs from the snapshot, so an owner retired without a rewrite is not exercised");
 
     const auto dump = capture / "multisample depth copy.bin";
     const auto replay = [&](std::size_t passes) {
