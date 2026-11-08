@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -383,6 +383,7 @@
+         if (begin < end) spans.emplace_back(begin, end);
+     };
+     for (const auto& [begin, end] : changed) add(begin, end);
++    add(range.address, rangeEnd);
+     for (const auto& [address, bytes] : owned) add(address, address + bytes);
+     std::sort(spans.begin(), spans.end());
+     Runs merged;

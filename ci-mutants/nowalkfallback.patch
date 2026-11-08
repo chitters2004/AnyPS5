@@ -1,0 +1,11 @@
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+@@ -1885,7 +1885,7 @@
+         const auto stop = std::min<std::uint64_t>(end, (begin & ~std::uint64_t{WriteBlockBytes - 1}) + WriteBlockBytes);
+         while (next != covered.end() && next->second <= begin) ++next;
+         const bool inside = next != covered.end() && next->first <= begin;
+-        if (!inside || !walked[static_cast<std::size_t>(next - covered.begin())] || newest(begin) > since) append(begin, stop);
++        if (!inside || (!walked[static_cast<std::size_t>(next - covered.begin())] && false) || newest(begin) > since) append(begin, stop);
+         begin = stop;
+     }
+     return tracker.generation.load(std::memory_order_relaxed);

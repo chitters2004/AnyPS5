@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Queues/Submission.cpp
+@@ -487,7 +487,6 @@
+     std::unique_lock lock(driver.mutex);
+     while (driver.exclusive.load()) {
+         driver.admitting.fetch_sub(1);
+-        driver.changed.notify_all();
+         ++driver.blockedAdmissions;
+         driver.changed.wait(lock, [&] { return driver.failure != nullptr || driver.stopping || !driver.exclusive.load(); });
+         --driver.blockedAdmissions;
