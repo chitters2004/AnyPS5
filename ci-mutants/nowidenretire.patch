@@ -1,0 +1,10 @@
+--- a/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
++++ b/core/libs/prx/libSceAgcDriver/tools/FrameReplay.cpp
+@@ -612,7 +612,6 @@
+             since = std::max(since, changedSince(range.address, range.bytes, previous, changed));
+             auto widened = candidateRuns(range, changed, owned[index]);
+             const auto flushed = subtractRuns(widened, candidates[index]);
+-            retire(flushed);
+             result.flushed += runBytes(flushed);
+             candidates[index] = std::move(widened);
+             result.compared += runBytes(candidates[index]);
