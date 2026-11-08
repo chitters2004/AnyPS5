@@ -259,8 +259,11 @@ jobs:
       - name: Free disk space for the build
         run: |
           df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
+          avail=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$avail" -lt 30 ]; then
+            sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
+            df -h /
+          fi
       - name: Let ThreadSanitizer map its shadow memory
         if: ${{ matrix.kind == 'tsan' }}
         run: sudo sysctl -w vm.mmap_rnd_bits=28
