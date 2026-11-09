@@ -700,6 +700,69 @@ void PageStates::initialize() {
     ready.store(true, std::memory_order_release);
 }
 
+struct ConstantSpans {
+    std::array<std::pair<std::uintptr_t, std::uintptr_t>, 16> spans{};
+    std::size_t count = 0;
+
+    void add(std::uintptr_t first, std::uintptr_t last) {
+        if (first >= last) return;
+        if (count != 0 && spans[count - 1].second == first) spans[count - 1].second = last;
+        else if (count < spans.size()) spans[count++] = {first, last};
+    }
+};
+
+#ifdef __linux__
+int ownConstantSegments(dl_phdr_info* info, std::size_t, void* data) {
+    constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
+    const auto anchor = reinterpret_cast<std::uintptr_t>(&forgetSerial);
+    const auto start = [&](const ElfW(Phdr)& header) { return static_cast<std::uintptr_t>(info->dlpi_addr + header.p_vaddr); };
+    bool own = false;
+    for (int index = 0; index < info->dlpi_phnum; ++index) {
+        const auto& header = info->dlpi_phdr[index];
+        if (header.p_type == PT_LOAD && anchor >= start(header) && anchor - start(header) < header.p_memsz) own = true;
+    }
+    if (!own) return 0;
+    auto& spans = *static_cast<ConstantSpans*>(data);
+    for (int index = 0; index < info->dlpi_phnum; ++index) {
+        const auto& header = info->dlpi_phdr[index];
+        const bool readOnly = header.p_type == PT_LOAD && (header.p_flags & PF_R) != 0 && (header.p_flags & PF_W) == 0;
+        if (readOnly || header.p_type == PT_GNU_RELRO) spans.add((start(header) + mask) & ~mask, (start(header) + header.p_memsz) & ~mask);
+    }
+    return 1;
+}
+#endif
+
+const ConstantSpans& ownConstants() {
+    static const ConstantSpans constants = [] {
+        ConstantSpans spans;
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&forgetSerial), &module)) return spans;
+        constexpr auto mask = static_cast<std::uintptr_t>(PageBytes - 1);
+        const auto base = reinterpret_cast<std::uintptr_t>(module);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        const auto* section = IMAGE_FIRST_SECTION(nt);
+        for (unsigned index = 0; index < nt->FileHeader.NumberOfSections; ++index, ++section) {
+            if ((section->Characteristics & IMAGE_SCN_MEM_READ) == 0 || (section->Characteristics & (IMAGE_SCN_MEM_WRITE | IMAGE_SCN_MEM_DISCARDABLE)) != 0) continue;
+            const auto first = base + section->VirtualAddress;
+            spans.add(first, (first + section->Misc.VirtualSize + mask) & ~mask);
+        }
+#elif defined(__linux__)
+        dl_iterate_phdr(ownConstantSegments, &spans);
+#endif
+        return spans;
+    }();
+    return constants;
+}
+
+std::uintptr_t ownConstantEnd(std::uintptr_t address) {
+    const auto& constants = ownConstants();
+    for (std::size_t index = 0; index < constants.count; ++index) {
+        if (address >= constants.spans[index].first && address < constants.spans[index].second) return constants.spans[index].second;
+    }
+    return 0;
+}
+
 struct PageRun {
     std::uintptr_t begin;
     std::uintptr_t end;
@@ -725,6 +788,12 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 cursor = next;
                 continue;
             }
+        }
+        if (const auto constantEnd = ownConstantEnd(cursor); constantEnd != 0) {
+            const auto next = std::min(end, constantEnd);
+            if (!emit(PageRun{cursor, next, true, false})) return true;
+            cursor = next;
+            continue;
         }
 #ifdef _WIN32
         const TimedAccess timed(CounterQuery, 0);

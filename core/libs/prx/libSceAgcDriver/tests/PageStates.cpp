@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -16,6 +17,10 @@
 #endif
 #include <windows.h>
 #include <psapi.h>
+
+namespace AgcDriver::DriverDetail {
+std::uint64_t NullPixelProgramAddress();
+}
 
 namespace {
 using namespace AgcDriver::GuestMemory;
@@ -233,6 +238,154 @@ void CheckRuns() {
     Require(!DescribeCommitted(edgeFirst, edgePages * page + Unit, true).whole && CommittedRanges(edgeFirst, edgePages * page + Unit, true) == edgeRun, "a run into an unallocated chunk was reported past its committed pages");
     std::puts("page-state block scans across 64-page, 512-page and sparse-chunk boundaries passed");
 }
+
+std::atomic<std::uint64_t> queries{0};
+decltype(&VirtualQuery) realQuery = nullptr;
+
+SIZE_T WINAPI CountedQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION information, SIZE_T length) {
+    queries.fetch_add(1, std::memory_order_relaxed);
+    return realQuery(address, information, length);
+}
+
+const IMAGE_NT_HEADERS* Headers(std::uintptr_t base) {
+    return reinterpret_cast<const IMAGE_NT_HEADERS*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+}
+
+bool ReadOnlySection(const IMAGE_SECTION_HEADER& section) {
+    return (section.Characteristics & IMAGE_SCN_MEM_READ) != 0 && (section.Characteristics & IMAGE_SCN_MEM_WRITE) == 0;
+}
+
+void CountQueries(std::uintptr_t base) {
+    std::vector<FARPROC> targets;
+    for (const auto* name : {L"kernel32.dll", L"kernelbase.dll"}) {
+        if (const auto module = GetModuleHandleW(name)) {
+            if (const auto target = GetProcAddress(module, "VirtualQuery")) targets.push_back(target);
+        }
+    }
+    Require(!targets.empty(), "cannot resolve VirtualQuery");
+    realQuery = reinterpret_cast<decltype(&VirtualQuery)>(targets.front());
+    const auto& directory = Headers(base)->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    unsigned patched = 0;
+    for (auto* descriptor = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(base + directory.VirtualAddress); descriptor->Name != 0; ++descriptor) {
+        for (auto* thunk = reinterpret_cast<IMAGE_THUNK_DATA*>(base + descriptor->FirstThunk); thunk->u1.Function != 0; ++thunk) {
+            if (std::find(targets.begin(), targets.end(), reinterpret_cast<FARPROC>(thunk->u1.Function)) == targets.end()) continue;
+            DWORD previous = 0;
+            Require(VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function), PAGE_READWRITE, &previous) != 0, "cannot open the driver import table");
+            thunk->u1.Function = reinterpret_cast<ULONG_PTR>(&CountedQuery);
+            Require(VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function), previous, &previous) != 0, "cannot restore the driver import table");
+            ++patched;
+        }
+    }
+    Require(patched != 0, "the driver does not import VirtualQuery");
+}
+
+template <class Call>
+std::uint64_t Queried(Call&& call) {
+    const auto before = queries.load(std::memory_order_relaxed);
+    call();
+    return queries.load(std::memory_order_relaxed) - before;
+}
+
+template <class Call>
+double NanosecondsPerCall(Call&& call) {
+    constexpr unsigned calls = 200000;
+    const auto start = std::chrono::steady_clock::now();
+    for (unsigned index = 0; index < calls; ++index) call();
+    return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / calls;
+}
+
+std::uintptr_t BuiltinHeader(std::uintptr_t base, std::uint64_t code) {
+    const auto* headers = Headers(base);
+    const auto* sections = IMAGE_FIRST_SECTION(headers);
+    for (unsigned index = 0; index < headers->FileHeader.NumberOfSections; ++index) {
+        if (!ReadOnlySection(sections[index])) continue;
+        const auto first = base + sections[index].VirtualAddress;
+        for (auto at = first; at + 24 <= first + sections[index].Misc.VirtualSize; at += 8) {
+            std::uint32_t magic = 0;
+            std::uint64_t pointer = 0;
+            std::memcpy(&magic, reinterpret_cast<const void*>(at), sizeof(magic));
+            std::memcpy(&pointer, reinterpret_cast<const void*>(at + 16), sizeof(pointer));
+            if (magic == 0x34333231u && pointer == code) return at;
+        }
+    }
+    return 0;
+}
+
+void CheckConstants() {
+    const auto code = AgcDriver::DriverDetail::NullPixelProgramAddress();
+    HMODULE module = nullptr;
+    Require(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(code), &module) != 0, "built-in shader is outside a module");
+    const auto base = reinterpret_cast<std::uintptr_t>(module);
+    CountQueries(base);
+    const auto header = BuiltinHeader(base, code);
+    Require(header != 0, "the built-in shader header is not in the driver's read-only data");
+    for (const auto [address, size] : {std::pair{code, std::size_t{256}}, std::pair{static_cast<std::uint64_t>(header), std::size_t{96}}}) {
+        std::vector<std::byte> bytes(size);
+        std::memcpy(bytes.data(), reinterpret_cast<const void*>(address), bytes.size());
+        Require(CompareMapped(address, bytes) == Compare::Equal, "built-in shader bytes differ from themselves");
+        Require(Queried([&] { Require(CompareMapped(address, bytes) == Compare::Equal, "built-in shader compare changed"); }) == 0, "comparing a built-in shader queried the address space");
+        auto changed = bytes;
+        changed[17] ^= std::byte{1};
+        Require(Queried([&] { Require(CompareMapped(address, changed) == Compare::Differs, "a changed copy of a built-in shader compared equal"); }) == 0, "a differing built-in shader compare queried the address space");
+        std::vector<std::byte> copy(bytes.size());
+        Require(Queried([&] { Require(CopyMapped(address, copy) == Compare::Equal && copy == bytes, "built-in shader copy differs"); }) == 0, "copying a built-in shader queried the address space");
+        Require(Queried([&] { Require(Accessible(reinterpret_cast<const void*>(address), bytes.size()) && !Accessible(reinterpret_cast<const void*>(address), bytes.size(), true), "built-in shader access is not read-only"); }) == 0, "checking built-in shader access queried the address space");
+    }
+    const auto* headers = Headers(base);
+    const auto* sections = IMAGE_FIRST_SECTION(headers);
+    std::uintptr_t boundary = 0;
+    for (unsigned index = 0; index + 1 < headers->FileHeader.NumberOfSections; ++index) {
+        const auto& constant = sections[index];
+        const auto& written = sections[index + 1];
+        const auto constantEnd = (constant.VirtualAddress + constant.Misc.VirtualSize + 4095u) & ~4095u;
+        if (ReadOnlySection(constant) && (written.Characteristics & IMAGE_SCN_MEM_WRITE) != 0 && written.VirtualAddress == constantEnd && written.Misc.VirtualSize >= 64) {
+            boundary = base + written.VirtualAddress;
+            break;
+        }
+    }
+    Require(boundary != 0, "the driver has no read-only section followed by a writable one");
+    std::vector<std::byte> across(64);
+    std::memcpy(across.data(), reinterpret_cast<const void*>(boundary - 32), across.size());
+    Require(Queried([&] { Require(CompareMapped(boundary - 32, across) == Compare::Equal, "a compare across a constant section end differs"); }) != 0, "a range past the driver's constants skipped the query");
+    Require(Queried([&] { Require(Accessible(reinterpret_cast<const void*>(boundary), 32, true), "the writable section after the constants is not writable"); }) != 0, "a writable driver section was treated as constant");
+    auto* host = static_cast<std::byte*>(VirtualAlloc(nullptr, 2 * 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(host != nullptr, "cannot allocate host fixture");
+    std::memset(host, 0x3c, 2 * 4096);
+    DWORD previous = 0;
+    Require(VirtualProtect(host + 4096, 4096, PAGE_READWRITE | PAGE_GUARD, &previous) != 0, "cannot guard host fixture");
+    const auto hostAddress = reinterpret_cast<std::uint64_t>(host);
+    const std::vector<std::byte> page(4096, std::byte{0x3c});
+    const std::vector<std::byte> pages(2 * 4096, std::byte{0x3c});
+    Require(CompareMapped(hostAddress, page) == Compare::Equal, "a readable host page did not compare equal");
+    Require(CompareMapped(hostAddress, pages) == Compare::Unmapped, "a guard page compared as readable");
+    MEMORY_BASIC_INFORMATION guard{};
+    Require(VirtualQuery(host + 4096, &guard, sizeof(guard)) == sizeof(guard) && (guard.Protect & PAGE_GUARD) != 0, "the compare consumed the guard page");
+    Require(VirtualProtect(host, 4096, PAGE_NOACCESS, &previous) != 0, "cannot protect host fixture");
+    Require(CompareMapped(hostAddress, page) == Compare::Unmapped, "a host page made inaccessible kept a readable answer");
+    Require(VirtualProtect(host, 4096, PAGE_READONLY, &previous) != 0, "cannot restore host fixture");
+    Require(CompareMapped(hostAddress, page) == Compare::Equal, "a host page made readable again kept an inaccessible answer");
+    Require(VirtualFree(host, 0, MEM_RELEASE) != 0, "cannot release host fixture");
+    Require(CompareMapped(hostAddress, page) == Compare::Unmapped, "a released host page kept a readable answer");
+    const auto system = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(L"kernel32.dll"));
+    const auto* systemSections = IMAGE_FIRST_SECTION(Headers(system));
+    std::uintptr_t foreign = 0;
+    for (unsigned index = 0; index < Headers(system)->FileHeader.NumberOfSections; ++index) {
+        if (ReadOnlySection(systemSections[index]) && (systemSections[index].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0 && systemSections[index].Misc.VirtualSize >= 4096) {
+            foreign = system + systemSections[index].VirtualAddress;
+            break;
+        }
+    }
+    Require(foreign != 0, "kernel32 has no read-only data section");
+    std::vector<std::byte> foreignBytes(96);
+    std::memcpy(foreignBytes.data(), reinterpret_cast<const void*>(foreign), foreignBytes.size());
+    Require(Queried([&] { Require(CompareMapped(foreign, foreignBytes) == Compare::Equal, "foreign image bytes differ"); }) != 0, "another module's constants skipped the query");
+    std::vector<std::byte> headerBytes(96);
+    std::memcpy(headerBytes.data(), reinterpret_cast<const void*>(header), headerBytes.size());
+    const auto own = NanosecondsPerCall([&] { static_cast<void>(CompareMapped(header, headerBytes)); });
+    const auto other = NanosecondsPerCall([&] { static_cast<void>(CompareMapped(foreign, foreignBytes)); });
+    std::printf("CompareMapped of a 96-byte shader header: driver built-in %.1f ns/call; another module's read-only data %.1f ns/call\n", own, other);
+    std::puts("driver constants, section ends, guard pages and host protection passed");
+}
 }
 
 int main(int argc, char** argv) {
@@ -240,6 +393,7 @@ int main(int argc, char** argv) {
         Require(GuestArena::GuestArenaAvailable_nid_postfix(), "page-state fixture needs the guest arena");
         if (argc == 2 && std::string_view(argv[1]) == "--metadata") CheckMetadata();
         else if (argc == 2 && std::string_view(argv[1]) == "--runs") CheckRuns();
+        else if (argc == 2 && std::string_view(argv[1]) == "--constants") CheckConstants();
         else CheckBoundaries();
         return 0;
     } catch (const std::exception& error) {

@@ -2325,7 +2325,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
 }
 
 alignas(256) static const std::uint32_t NullPixelCode[64] = {0xbf810000u};
-static const Shader NullPixelShader = [] {
+constexpr Shader NullPixelShader = [] {
     Shader shader{};
     shader.file_header = 0x34333231u;
     shader.version = 0x18u;
@@ -2342,7 +2342,7 @@ std::uint64_t NullPixelProgramAddress() {
 
 alignas(256) static const std::uint32_t DepthCopyMultisamplePixelCode[64] = {0x360604ffu, 0x0000ffffu, 0x2c080490u, 0x7e0a0208u, 0xf0000130u, 0x00000603u, 0xbf8c3f70u, 0xf8001801u, 0x00000006u, 0xbf810000u};
 alignas(256) static const std::uint32_t DepthCopySinglePixelCode[64] = {0x360604ffu, 0x0000ffffu, 0x2c080490u, 0xf0000108u, 0x00000603u, 0xbf8c3f70u, 0xf8001801u, 0x00000006u, 0xbf810000u};
-static const Shader DepthCopyMultisamplePixelShader = [] {
+constexpr Shader DepthCopyMultisamplePixelShader = [] {
     Shader shader{};
     shader.file_header = 0x34333231u;
     shader.version = 0x18u;
@@ -2352,7 +2352,7 @@ static const Shader DepthCopyMultisamplePixelShader = [] {
     shader.type = 1;
     return shader;
 }();
-static const Shader DepthCopySinglePixelShader = [] {
+constexpr Shader DepthCopySinglePixelShader = [] {
     Shader shader{};
     shader.file_header = 0x34333231u;
     shader.version = 0x18u;
