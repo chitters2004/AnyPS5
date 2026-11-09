@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+index 2d1b196018..8f552ad462 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+@@ -1772,7 +1772,7 @@ public:
+ 
+ private:
+     static constexpr std::size_t StackBytes = 64u << 20u;
+-    static constexpr unsigned ForegroundBeforeBackground = 8;
++    static constexpr unsigned ForegroundBeforeBackground = 1u << 30;
+ 
+     void moveToFront(const PreparedShaders& prepared) {
+         const auto found = std::ranges::find_if(tasks, [&](const auto& task) { return task.prepared == &prepared; });
