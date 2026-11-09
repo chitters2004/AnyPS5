@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+index 1909468eb6..5d770e5660 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp
+@@ -1145,7 +1145,7 @@ struct WriteTracker {
+ 
+     bool exactlyObserved(std::uint64_t first, std::uint64_t stop, std::uint64_t need) const {
+         for (const auto& entry : exactObservations) {
+-            if (entry.tick >= need && entry.first <= first && stop <= entry.stop) return true;
++            if (entry.first <= first && stop <= entry.stop) return true;
+         }
+         return false;
+     }
