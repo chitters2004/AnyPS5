@@ -164,6 +164,11 @@ ImageTableReuseCounts ImageTableReuses();
 std::uint64_t SampledTexturesCleared();
 std::uint64_t SampledLookupKeyScans();
 std::uint64_t SampledLookupKeyProofs();
+struct GuestBufferGuardCounts {
+    std::uint64_t checks = 0;
+    std::uint64_t skipped = 0;
+};
+GuestBufferGuardCounts GuestBufferGuardChecks();
 
 struct PresyncSurface {
     std::uint64_t address;
@@ -414,6 +419,11 @@ private:
         bool imageTable = false;
     };
     std::vector<DescribedRange> describedRanges;
+    struct GuardsClearStamp {
+        mutable std::atomic<std::uint64_t> version{0};
+        GuardsClearStamp() = default;
+        GuardsClearStamp(GuardsClearStamp&& other) noexcept : version(other.version.load(std::memory_order_relaxed)) {}
+    };
     struct Allocation {
         std::uint64_t address;
         std::size_t size;
@@ -430,6 +440,7 @@ private:
         std::int64_t dataAllocation = -1;
         std::uint32_t dataByte = 0;
         bool oversized = false;
+        GuardsClearStamp guardsClear;
     };
     struct DataPatch {
         std::size_t allocation;

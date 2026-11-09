@@ -1964,6 +1964,8 @@ struct BufferWriteCounters {
     std::atomic<std::uint64_t> elements{0};
     std::atomic<std::uint64_t> readOnly{0};
     std::atomic<std::uint64_t> notesSkipped{0};
+    std::atomic<std::uint64_t> guardChecks{0};
+    std::atomic<std::uint64_t> guardSkips{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -1972,6 +1974,11 @@ BufferWriteCounters& BufferWrites() {
     return counters;
 }
 
+}
+
+GuestBufferGuardCounts GuestBufferGuardChecks() {
+    const auto& counters = BufferWrites();
+    return {counters.guardChecks.load(std::memory_order_relaxed), counters.guardSkips.load(std::memory_order_relaxed)};
 }
 
 double ShaderResources::phase(BuildPhase which) {
@@ -6454,14 +6461,37 @@ void ShaderResources::prepareFaultSlot() const {
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    static const bool memo = std::getenv("APS5_NO_GUEST_BUFFER_MEMO") == nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_GUEST_BUFFER_MEMO") != nullptr;
+    const auto version = ResidentDepthGuardVersion_nid_no_patch() + MultisampleColorGuardVersion();
+    std::uint64_t checks = 0;
+    std::uint64_t skips = 0;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        const auto address = override != moved.end() ? override->address : item.address;
-        const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
-        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        const bool fixed = override == moved.end();
+        const auto address = fixed ? item.address : override->address;
+        const auto bytes = fixed ? item.size : override->size;
+        ++checks;
+        const bool skippable = memo && fixed && item.guardsClear.version.load(std::memory_order_relaxed) == version;
+        if (skippable && !verify) {
+            ++skips;
+            continue;
+        }
+        const bool depthClear = RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+        const bool colorClear = RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        if (skippable) {
+            Require(depthClear && colorClear, "APS5_VERIFY_GUEST_BUFFER_MEMO: a guest buffer skipped its guard checks although a guard overlaps it");
+            ++skips;
+        } else if (memo && fixed && depthClear && colorClear) {
+            item.guardsClear.version.store(version, std::memory_order_relaxed);
+        }
+    }
+    if (checks != 0) {
+        auto& counters = BufferWrites();
+        counters.guardChecks.fetch_add(checks, std::memory_order_relaxed);
+        counters.guardSkips.fetch_add(skips, std::memory_order_relaxed);
     }
 }
 
@@ -6541,7 +6571,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto elements = counters.elements.load();
     const auto readOnly = counters.readOnly.load();
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound (cumulative): %llu total, %llu written, %llu read-only; %llu pending-write notes skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()));
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] descriptor elements bound (cumulative): %llu total, %llu written, %llu read-only; %llu pending-write notes skipped; %llu guest buffer guard checks, %llu skipped\n", static_cast<unsigned long long>(elements), static_cast<unsigned long long>(elements - readOnly), static_cast<unsigned long long>(readOnly), static_cast<unsigned long long>(counters.notesSkipped.load()), static_cast<unsigned long long>(counters.guardChecks.load()), static_cast<unsigned long long>(counters.guardSkips.load()));
 }
 
 void ShaderResources::CheckFaults() const {

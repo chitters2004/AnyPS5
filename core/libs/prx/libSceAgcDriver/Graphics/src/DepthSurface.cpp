@@ -221,6 +221,11 @@ std::atomic<bool>& anyDepthGuard() {
     return any;
 }
 
+std::atomic<std::uint64_t>& depthGuardAdditions() {
+    static std::atomic<std::uint64_t> additions{1};
+    return additions;
+}
+
 struct DepthSamplingState {
     std::vector<GuestMemory::UnchangedQuery> initial;
     std::optional<float> initialDepth;
@@ -3044,8 +3049,8 @@ std::uint64_t MultisampledDepthBytes_nid_no_patch(VkExtent2D extent, std::uint32
     return width * height * bytesPerTexel * samples;
 }
 
-void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool allowPublication) {
-    if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;
+bool RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool allowPublication) {
+    if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return true;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth read range overflows");
     const auto overlaps = [&](const DepthGuard& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     if (htileClear.has_value() && htileClear->second <= std::numeric_limits<std::uint64_t>::max() - htileClear->first && htileClear->first <= address && bytes <= htileClear->second && address - htileClear->first <= htileClear->second - bytes) {
@@ -3059,12 +3064,12 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
                 return metadata.address == range.address && metadata.bytes == range.bytes && metadata.address == htileClear->first && metadata.bytes <= htileClear->second;
             });
         });
-        if (accepted) return;
+        if (accepted) return std::ranges::none_of(depthGuards(), overlaps);
     }
     std::vector<std::shared_ptr<std::atomic<bool>>> written;
     {
         std::shared_lock lock(depthGuardMutex());
-        if (std::ranges::none_of(depthGuards(), overlaps)) return;
+        if (std::ranges::none_of(depthGuards(), overlaps)) return true;
         for (const auto& range : depthGuards()) {
             if (overlaps(range) && range.hostWritten->load(std::memory_order_acquire) && std::ranges::find(written, range.hostWritten) == written.end()) written.push_back(range.hostWritten);
         }
@@ -3083,6 +3088,11 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     }
     std::erase_if(depthGuards(), [](const auto& range) { return !range.active->load(std::memory_order_acquire); });
     anyDepthGuard().store(!depthGuards().empty(), std::memory_order_release);
+    return false;
+}
+
+std::uint64_t ResidentDepthGuardVersion_nid_no_patch() {
+    return depthGuardAdditions().load(std::memory_order_acquire);
 }
 
 void AppendHostWrittenDepthRanges(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
@@ -3242,6 +3252,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten, fresh.hostEverWritten});
+            depthGuardAdditions().fetch_add(1, std::memory_order_release);
             anyDepthGuard().store(true, std::memory_order_release);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;
