@@ -39,6 +39,7 @@ public:
         std::uint64_t waits = 0;
         std::uint64_t waitNs = 0;
         std::uint64_t encodeNs = 0;
+        std::uint64_t helped = 0;
     };
     Statistics Counts() const;
     static void SetDelayForTesting(std::function<void()> delay);
@@ -52,7 +53,7 @@ private:
     };
     void post();
     void run();
-    void execute(Chunk& chunk);
+    bool executeNext();
     DeviceFunctions& table;
     DeviceFunctions real;
     VkDevice device = VK_NULL_HANDLE;
@@ -76,6 +77,7 @@ private:
     std::atomic<std::uint64_t> waitCount{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> encodeNs{0};
+    std::atomic<std::uint64_t> helpCount{0};
 };
 
 }

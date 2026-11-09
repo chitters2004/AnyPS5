@@ -454,25 +454,42 @@ void CommandEncoder::Settle() {
     const auto through = posted.load(std::memory_order_acquire);
     if (executed.load(std::memory_order_acquire) >= through) return;
     const auto start = std::chrono::steady_clock::now();
-    if (!SpinUntil(HandoffSpinWindow(), [&] { return executed.load(std::memory_order_acquire) >= through; })) {
+    while (executed.load(std::memory_order_acquire) < through) {
+        if (executeNext()) {
+            helpCount.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
         for (auto seen = executed.load(std::memory_order_acquire); seen < through; seen = executed.load(std::memory_order_acquire)) executed.wait(seen, std::memory_order_acquire);
     }
     waitCount.fetch_add(1, std::memory_order_relaxed);
     waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
-void CommandEncoder::execute(Chunk& chunk) {
-    const auto start = std::chrono::steady_clock::now();
+bool CommandEncoder::executeNext() {
+    std::unique_lock lock(poolMutex);
+    std::unique_ptr<Chunk> chunk;
     {
-        std::lock_guard lock(poolMutex);
-        if (testDelay()) testDelay()();
-        for (std::size_t at = 0; at < chunk.used;) {
-            const auto record = *std::launder(reinterpret_cast<const Record*>(chunk.bytes.data() + at));
-            record.run(chunk.bytes.data() + at + RecordHeader, chunk.target, real);
-            at += record.bytes;
-        }
+        std::lock_guard queueLock(queueMutex);
+        if (queue.empty()) return false;
+        chunk = std::move(queue.front());
+        queue.pop_front();
+    }
+    const auto start = std::chrono::steady_clock::now();
+    if (testDelay()) testDelay()();
+    for (std::size_t at = 0; at < chunk->used;) {
+        const auto record = *std::launder(reinterpret_cast<const Record*>(chunk->bytes.data() + at));
+        record.run(chunk->bytes.data() + at + RecordHeader, chunk->target, real);
+        at += record.bytes;
     }
     encodeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    {
+        std::lock_guard queueLock(queueMutex);
+        free.push_back(std::move(chunk));
+    }
+    executed.fetch_add(1, std::memory_order_release);
+    lock.unlock();
+    executed.notify_all();
+    return true;
 }
 
 void CommandEncoder::run() {
@@ -486,31 +503,13 @@ void CommandEncoder::run() {
             }
             continue;
         }
-        std::unique_ptr<Chunk> chunk;
-        {
-            std::lock_guard lock(queueMutex);
-            if (!queue.empty()) {
-                chunk = std::move(queue.front());
-                queue.pop_front();
-            }
-        }
         ++taken;
-        if (chunk == nullptr) {
-            if (stopping.load(std::memory_order_acquire)) return;
-            continue;
-        }
-        execute(*chunk);
-        {
-            std::lock_guard lock(queueMutex);
-            free.push_back(std::move(chunk));
-        }
-        executed.fetch_add(1, std::memory_order_release);
-        executed.notify_all();
+        if (!executeNext() && stopping.load(std::memory_order_acquire)) return;
     }
 }
 
 CommandEncoder::Statistics CommandEncoder::Counts() const {
-    return {postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed)};
+    return {postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), helpCount.load(std::memory_order_relaxed)};
 }
 
 void CommandEncoder::SetDelayForTesting(std::function<void()> delay) {
