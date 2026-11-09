@@ -89,6 +89,7 @@ struct CollectReceipt {
 };
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, CollectReceipt& receipt);
 std::uint64_t RecollectWrites(std::uint64_t address, std::size_t bytes, const CollectReceipt& receipt);
+bool ReceiptHolds(std::uint64_t address, std::size_t bytes, const CollectReceipt& receipt);
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {
@@ -98,6 +99,8 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+// True only when every range is write-watched and no block of it is stamped after its generation.
+bool UnwrittenSinceAll(std::span<const UnchangedQuery> queries);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);

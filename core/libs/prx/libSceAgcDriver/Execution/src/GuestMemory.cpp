@@ -1899,16 +1899,19 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes, CollectRec
     return collectWrites(address, bytes, true, &receipt);
 }
 
+bool ReceiptHolds(std::uint64_t address, std::size_t bytes, const CollectReceipt& receipt) {
+    if (!receipt.memoized || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !collectMemoEnabled() || !epochCollectMapEnabled() || sharedCollectMemo()) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+    return epoch != 0 && stop > first && epoch == receipt.epoch && receipt.thread == collectThreadSerial() && receipt.first <= first && stop <= receipt.stop && receipt.unwatched == unwatchSerial.load(std::memory_order_acquire) && receipt.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+}
+
 std::uint64_t RecollectWrites(std::uint64_t address, std::size_t bytes, const CollectReceipt& receipt) {
-    if (receipt.memoized && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && collectMemoEnabled() && epochCollectMapEnabled() && !sharedCollectMemo()) {
-        constexpr std::uint64_t page = 4096;
-        const auto first = address & ~(page - 1);
-        const auto stop = (address + bytes + page - 1) & ~(page - 1);
-        const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
-        if (epoch != 0 && stop > first && epoch == receipt.epoch && receipt.thread == collectThreadSerial() && receipt.first <= first && stop <= receipt.stop && receipt.unwatched == unwatchSerial.load(std::memory_order_acquire) && receipt.mapping == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
-            ++receiptReuses;
-            return Tracker().stable.load(std::memory_order_acquire);
-        }
+    if (ReceiptHolds(address, bytes, receipt)) {
+        ++receiptReuses;
+        return Tracker().stable.load(std::memory_order_acquire);
     }
     return collectWrites(address, bytes, true);
 }
@@ -2290,6 +2293,21 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     for (const auto& [address, bytes, generation] : queries) {
         if (generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
         if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
+    }
+    return true;
+}
+
+bool UnwrittenSinceAll(std::span<const UnchangedQuery> queries) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return false;
+    for (const auto& [address, bytes, generation] : queries) {
+        if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return false;
+        const auto last = tracker.blockOf(address + bytes - 1);
+        for (auto block = tracker.blockOf(address); block <= last; ++block) {
+            if (tracker.stampOf(block) > generation) return false;
+        }
     }
     return true;
 }

@@ -45,6 +45,7 @@ namespace {
 
 std::uint64_t depthWrites = 0;
 std::uint64_t mirrorEpoch = 0;
+std::uint64_t planeProofHits = 0;
 std::atomic<void (*)(DepthPublicationStage)> depthPublicationHook{nullptr};
 
 std::pair<std::uint32_t, std::uint32_t> DepthBlockExtent(std::uint32_t bytesPerTexel) {
@@ -1050,6 +1051,17 @@ public:
         return GuestMemory::WrittenSince(target.stencilAddress, static_cast<std::size_t>(stencilBytes()), stencilMemory);
     }
 
+    bool PlanesProven() const {
+        const auto depth = static_cast<std::size_t>(MirrorBytes());
+        if (!GuestMemory::ReceiptHolds(target.address, depth, proof.depth)) return false;
+        const std::array<GuestMemory::UnchangedQuery, 2> queries{{{target.address, depth, proof.depthGeneration}, {target.stencilAddress, StencilMirrorable() ? static_cast<std::size_t>(StencilMirrorBytes()) : 0u, proof.stencilGeneration}}};
+        return GuestMemory::UnwrittenSinceAll(std::span(queries).first(StencilMirrorable() ? 2u : 1u));
+    }
+
+    void ProvePlanes(const GuestMemory::CollectReceipt& depthToken, const GuestMemory::CollectReceipt& stencilToken) {
+        proof = {depthToken, stencilToken, unitGeneration.empty() ? 0u : *std::min_element(unitGeneration.begin(), unitGeneration.end()), stencilGeneration};
+    }
+
     void NoteMemory(const GuestMemory::CollectReceipt& depthToken = {}, const GuestMemory::CollectReceipt& stencilToken = {}) {
         depthMemory = GuestMemory::RecollectWrites(target.address, static_cast<std::size_t>(depthBytes()), depthToken);
         stencilMemory = target.stencilAddress != 0 ? GuestMemory::RecollectWrites(target.stencilAddress, static_cast<std::size_t>(stencilBytes()), stencilToken) : 0;
@@ -1522,6 +1534,12 @@ public:
         stencilGeneration = generation;
     }
 
+    struct PlaneProof {
+        GuestMemory::CollectReceipt depth;
+        GuestMemory::CollectReceipt stencil;
+        std::uint64_t depthGeneration = 0;
+        std::uint64_t stencilGeneration = 0;
+    } proof;
     bool stencilStale = false;
     std::uint64_t stencilGeneration = 0;
 
@@ -3192,6 +3210,10 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+std::uint64_t DepthPlaneProofHits() {
+    return planeProofHits;
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
     return DepthSurfaceViewWithStencilWriteIntent(context, target, depthWritten, stencilTested, true);
 }
@@ -3269,14 +3291,26 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (!created) surface->NoteHtileClear(htileCleared);
     GuestMemory::CollectReceipt depthToken;
     GuestMemory::CollectReceipt stencilToken;
-    if (mirrorable(target)) depthToken = surface->SyncFromMemory(mirrorResource(target));
-    if (surface->StencilMirrorable()) stencilToken = surface->SyncStencilFromMemory(stencilResource(target));
+    static const bool proofOff = std::getenv("APS5_NO_DEPTH_PLANE_PROOF") != nullptr;
+    static const bool proofVerify = std::getenv("APS5_VERIFY_DEPTH_PLANE_PROOF") != nullptr;
+    const bool proven = !proofOff && mirrorable(target) && surface->PlanesProven();
+    if (proven) ++planeProofHits;
+    if (proven && !proofVerify) {
+        depthToken = surface->proof.depth;
+        stencilToken = surface->proof.stencil;
+    } else {
+        const auto writesBefore = depthWrites;
+        if (mirrorable(target)) depthToken = surface->SyncFromMemory(mirrorResource(target));
+        if (surface->StencilMirrorable()) stencilToken = surface->SyncStencilFromMemory(stencilResource(target));
+        Require(!proven || depthWrites == writesBefore, "a depth plane proof skipped a plane the guest wrote");
+    }
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory(depthToken, stencilToken);
+    if (mirrorable(target) && !proven && !proofOff) surface->ProvePlanes(depthToken, stencilToken);
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);

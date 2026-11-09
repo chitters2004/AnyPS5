@@ -800,14 +800,15 @@ void TestDepthPlanesCollectedOncePerDraw(const Context& context) {
         return Lookups{AgcDriver::GuestMemory::CollectWalks() - walks, AgcDriver::GuestMemory::CollectMemoHits() - hits, AgcDriver::GuestMemory::ThreadReceiptReuses() - reuses};
     };
     const auto observations = [&](const DepthTarget& drawn) { return lookups(drawn).hits; };
+    const bool skipped = std::getenv("APS5_NO_DEPTH_PLANE_PROOF") == nullptr && std::getenv("APS5_VERIFY_DEPTH_PLANE_PROOF") == nullptr;
     AgcDriver::GuestMemory::BumpCollectEpoch();
     const auto first = lookups(target);
     Require(first.walks == 2u && first.reuses == 2u, "the first draw of a depth and stencil surface must walk each plane once and reuse each token, walks " + std::to_string(first.walks) + ", memo hits " + std::to_string(first.hits) + ", reuses " + std::to_string(first.reuses));
     observations(plain);
     const auto depthPlane = lookups(plain);
     const auto bothPlanes = lookups(target);
-    Require(depthPlane.hits == 1u && depthPlane.reuses == 1u && depthPlane.walks == 0u, "a steady draw over a depth plane must make one memo hit and one reuse, walks " + std::to_string(depthPlane.walks) + ", memo hits " + std::to_string(depthPlane.hits) + ", reuses " + std::to_string(depthPlane.reuses));
-    Require(bothPlanes.hits == 2u && bothPlanes.reuses == 2u && bothPlanes.walks == 0u, "a steady draw over a depth and a stencil plane must make one memo hit and one reuse per plane, walks " + std::to_string(bothPlanes.walks) + ", memo hits " + std::to_string(bothPlanes.hits) + ", reuses " + std::to_string(bothPlanes.reuses));
+    Require(depthPlane.hits == (skipped ? 0u : 1u) && depthPlane.reuses == 1u && depthPlane.walks == 0u, "a steady draw over a depth plane must make one memo hit and one reuse, walks " + std::to_string(depthPlane.walks) + ", memo hits " + std::to_string(depthPlane.hits) + ", reuses " + std::to_string(depthPlane.reuses));
+    Require(bothPlanes.hits == (skipped ? 0u : 2u) && bothPlanes.reuses == 2u && bothPlanes.walks == 0u, "a steady draw over a depth and a stencil plane must make one memo hit and one reuse per plane, walks " + std::to_string(bothPlanes.walks) + ", memo hits " + std::to_string(bothPlanes.hits) + ", reuses " + std::to_string(bothPlanes.reuses));
     const auto syncs = [&](GuestBlock& block) {
         block.Write(100);
         try {
@@ -843,6 +844,111 @@ void TestDepthPlanesCollectedOncePerDraw(const Context& context) {
         Require(std::find(destroyedImages.begin(), destroyedImages.end(), image) != destroyedImages.end(), "an overwritten depth surface must be retired and its image freed");
         ClearDepthSurfaces(context.device);
     }
+    ClearDepthSurfaces(context.device);
+}
+
+void TestDepthPlaneProof(const Context& context) {
+    if (!AgcDriver::GuestMemory::WriteWatched() || std::getenv("APS5_NO_COLLECT_MEMO") != nullptr || std::getenv("APS5_NO_DEPTH_PLANE_PROOF") != nullptr) return;
+    ClearDepthSurfaces(context.device);
+    constexpr VkExtent2D extent{256, 512};
+    const auto depthBytes = static_cast<std::size_t>(DepthSliceBytes(extent, 4u));
+    const auto stencilBytes = static_cast<std::size_t>(DepthSliceBytes(extent, 1u));
+    GuestBlock depth(depthBytes);
+    GuestBlock stencil(stencilBytes);
+    GuestBlock plain(depthBytes);
+    GuestBlock unrelated(65536);
+    GuestBlock unwatched(depthBytes);
+    GuestBlock unwatchedStencil(stencilBytes);
+    const struct Release {
+        VkDevice device;
+        ~Release() { ClearDepthSurfaces(device); }
+    } release{context.device};
+    auto storageContext = context;
+    TextureDetiler detiler(storageContext);
+    storageContext.detiler = &detiler;
+    DepthTarget target{depth.Address(), stencil.Address(), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    target.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    DepthTarget depthOnly{plain.Address(), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    depthOnly.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    DepthTarget other{unwatched.Address(), 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    other.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    DepthTarget halfWatched{depth.Address(), unwatchedStencil.Address(), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0};
+    halfWatched.depthSwizzle = XorSwizzleMode(TextureTileMode::kZ64KBX);
+    struct Draw {
+        std::uint64_t proofs;
+        bool synced;
+    };
+    const auto draw = [&](const DepthTarget& drawn) {
+        const auto before = DepthPlaneProofHits();
+        bool synced = false;
+        try {
+            DepthSurfaceViewWithStencilWriteIntent(storageContext, drawn, false, true, false);
+        } catch (const std::runtime_error& error) {
+            Require(MockSyncFailure(error), std::string("unexpected failure while syncing a plane: ") + error.what());
+            synced = true;
+        }
+        return Draw{DepthPlaneProofHits() - before, synced};
+    };
+    const auto expect = [&](const Draw& drawn, std::uint64_t proofs, bool synced, const char* what) {
+        Require(drawn.proofs == proofs && drawn.synced == synced, std::string(what) + ": proof hits " + std::to_string(drawn.proofs) + ", synced " + std::to_string(drawn.synced));
+    };
+    const auto arm = [&](const DepthTarget& drawn) {
+        ClearDepthSurfaces(context.device);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        expect(draw(drawn), 0u, false, "the first draw of a depth surface must not skip its plane checks");
+        expect(draw(drawn), 1u, false, "a second draw of an unchanged depth surface in the same collect epoch must skip its plane checks");
+    };
+    arm(target);
+    expect(draw(target), 1u, false, "a third draw of an unchanged depth and stencil surface must skip its plane checks");
+    arm(target);
+    AgcDriver::GuestMemory::MarkWritten(unrelated.Address(), 4);
+    AgcDriver::GuestMemory::CollectWrites(unrelated.Address(), unrelated.bytes);
+    expect(draw(target), 1u, false, "stores to unrelated memory between draws must not defeat the proof");
+    arm(target);
+    AgcDriver::GuestMemory::MarkWritten(depth.Address() + 100, 4);
+    expect(draw(target), 0u, true, "a stamp over the depth plane between draws must be synced, not skipped");
+    arm(target);
+    AgcDriver::GuestMemory::MarkWritten(stencil.Address() + 100, 4);
+    expect(draw(target), 0u, true, "a stamp over the stencil plane between draws must be synced, not skipped");
+    arm(depthOnly);
+    AgcDriver::GuestMemory::MarkWritten(plain.Address() + 100, 4);
+    expect(draw(depthOnly), 0u, true, "a stamp over the plane of a depth only surface between draws must be synced, not skipped");
+    arm(target);
+    depth.Write(100);
+    expect(draw(target), 0u, true, "a CPU store over the depth plane before a new collect epoch must be synced, not skipped");
+    arm(target);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect(draw(target), 0u, false, "a new collect epoch must walk the planes again, not skip them");
+    expect(draw(target), 1u, false, "the draw after a new collect epoch's walk must skip the plane checks again");
+    arm(depthOnly);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect(draw(depthOnly), 0u, false, "a new collect epoch must walk the plane of a depth only surface again, not skip it");
+    arm(target);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Unmap(unrelated.data, unrelated.bytes, [](const void*, std::size_t, const void*, bool) {});
+        mutation.Add(unrelated.data, unrelated.bytes, true, true, true);
+    }
+    expect(draw(target), 0u, false, "a mapping change between draws must walk the planes again, not skip them");
+    arm(target);
+    AgcDriver::GuestMemory::Unwatch(unrelated.Address(), unrelated.bytes);
+    expect(draw(target), 0u, false, "a watch change between draws must walk the planes again, not skip them");
+    arm(target);
+    expect(draw(other), 0u, false, "the first draw of a second surface must not borrow the first surface's proof");
+    expect(draw(other), 1u, false, "a second draw of the second surface must skip its plane checks");
+    expect(draw(target), 1u, false, "drawing another surface must not disturb a surface's proof");
+    ClearDepthSurfaces(context.device);
+    AgcDriver::GuestMemory::Unwatch(unwatched.Address(), depthBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    for (int i = 0; i < 3; ++i) expect(draw(other), 0u, false, "a plane that is not write watched must never be skipped");
+    ClearDepthSurfaces(context.device);
+    AgcDriver::GuestMemory::Unwatch(unwatchedStencil.Address(), stencilBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    for (int i = 0; i < 3; ++i) expect(draw(halfWatched), 0u, false, "a stencil plane that is not write watched must never be skipped");
+    ClearDepthSurfaces(context.device);
+    std::thread([&] {
+        for (int i = 0; i < 3; ++i) expect(draw(target), 0u, false, "a thread that never bumps its collect epoch must never skip the planes");
+    }).join();
     ClearDepthSurfaces(context.device);
 }
 
@@ -1000,6 +1106,7 @@ void RunDepthSurfaceReuseTests() {
     TestUnmappedStalePlaneFlush(context);
     TestReadOnlyStalePlaneFlush(context);
     TestDepthPlanesCollectedOncePerDraw(context);
+    TestDepthPlaneProof(context);
     TestStoresBetweenObservations(context);
     constexpr std::uint64_t depth32 = 0x40000000;
     constexpr std::uint64_t depth16 = 0x50000000;
