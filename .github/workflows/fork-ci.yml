@@ -1200,14 +1200,14 @@ jobs:
     steps:
       - name: Keep the newest ccache entry per key
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate --jq '.actions_caches[] | select(.key | startswith("ccache-")) | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
+          gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate --jq '.actions_caches[] | select(.key | startswith("ccache-")) | [.id, .key, .created_at, .size_in_bytes, .ref] | @tsv' > caches.tsv
           python3 - <<'PY'
           import collections, re, subprocess, os
           groups = collections.defaultdict(list)
           for line in open("caches.tsv"):
-              cid, key, created, size = line.rstrip("\n").split("\t")
+              cid, key, created, size, ref = line.rstrip("\n").split("\t")
               m = re.match(r"^(.*)-\d{4}-\d\d-\d\dT[\d:.]+Z$", key)
-              groups[m.group(1) if m else key].append((created, cid, key, int(size)))
+              groups[(ref, m.group(1) if m else key)].append((created, cid, key, int(size)))
           freed = 0
           for prefix, entries in sorted(groups.items()):
               entries.sort(reverse=True)

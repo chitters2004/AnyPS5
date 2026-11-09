@@ -93,15 +93,15 @@ jobs:
     steps:
       - name: Keep the newest compiler cache of each key and delete the rest
         run: |
-          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes] | @tsv' > caches.tsv
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" -q '.actions_caches[] | [.id, .key, .created_at, .size_in_bytes, .ref] | @tsv' > caches.tsv
           python3 - <<'PY' > delete.txt
           import re
           rows = [line.split() for line in open("caches.tsv")]
           groups = {}
-          for cid, key, created, size in rows:
+          for cid, key, created, size, ref in rows:
               m = re.match(r"(ccache-[a-z]+(?:-[a-z]+)?)-\d{4}-", key)
               if m:
-                  groups.setdefault(m[1], []).append((created, cid))
+                  groups.setdefault((ref, m[1]), []).append((created, cid))
           for name, items in groups.items():
               for created, cid in sorted(items, reverse=True)[1:]:
                   print(cid)
