@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+index 2d1b196018..350817e35b 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+@@ -196,7 +196,7 @@ namespace {
+ 
+ void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
+     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
+-    prepared.settled.wait(lock, [&] { return !prepared.pending; });
++    while (prepared.pending || prepared.resolving != 0) prepared.settled.wait_for(lock, std::chrono::milliseconds(20));
+     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
+ }
+ 
