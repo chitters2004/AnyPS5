@@ -41,7 +41,7 @@ namespace {
 using namespace AgcDriver::Graphics;
 
 constexpr std::size_t BlockBytes = 65536;
-constexpr std::size_t Blocks = 4;
+constexpr std::size_t Blocks = 2;
 constexpr std::size_t AllocationBytes = Blocks * BlockBytes;
 constexpr VkExtent2D DepthExtent{5u, 3u};
 constexpr std::uint32_t Samples = 4u;
@@ -49,43 +49,45 @@ constexpr std::uint32_t ColorSide = 64u;
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(std::size_t bytes = AllocationBytes) : size((bytes + 4095u) & ~std::size_t{4095}) {
 #ifdef _WIN32
-        data = GuestArena::GuestArenaAllocate_nid_postfix(AllocationBytes, BlockBytes);
-        if (data != nullptr) GuestArena::GuestArenaCommit_nid_postfix(data, AllocationBytes, PAGE_READWRITE, AllocationBytes);
+        data = GuestArena::GuestArenaAllocate_nid_postfix(size, BlockBytes);
+        if (data != nullptr) GuestArena::GuestArenaCommit_nid_postfix(data, size, PAGE_READWRITE, size);
 #else
-        void* mapped = mmap(nullptr, AllocationBytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* mapped = mmap(nullptr, size + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + BlockBytes - 1) & ~(static_cast<std::uintptr_t>(BlockBytes) - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
-            if (aligned + AllocationBytes != begin + AllocationBytes + BlockBytes) munmap(reinterpret_cast<void*>(aligned + AllocationBytes), begin + BlockBytes - aligned);
+            if (aligned + size != begin + size + BlockBytes) munmap(reinterpret_cast<void*>(aligned + size), begin + BlockBytes - aligned);
             data = reinterpret_cast<void*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, AllocationBytes);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, size);
         }
 #endif
         Require(data != nullptr, "cannot allocate tracked guard memory");
-        std::memset(data, 0, AllocationBytes);
-        GuestAllocations::Mutation().Add(data, AllocationBytes, true, true, true);
+        std::memset(data, 0, size);
+        GuestAllocations::Mutation().Add(data, size, true, true, true);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(data);
 #ifdef _WIN32
-        GuestArena::GuestArenaReset_nid_postfix(data, AllocationBytes);
-        GuestArena::GuestArenaRelease_nid_postfix(data, AllocationBytes);
+        GuestArena::GuestArenaReset_nid_postfix(data, size);
+        GuestArena::GuestArenaRelease_nid_postfix(data, size);
 #else
-        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, AllocationBytes);
-        munmap(data, AllocationBytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, size);
+        munmap(data, size);
 #endif
     }
 
     GuestBlock(const GuestBlock&) = delete;
     GuestBlock& operator=(const GuestBlock&) = delete;
+    void Fill(int value) const { std::memset(data, value, size); }
     std::uint64_t Block(std::size_t index) const { return reinterpret_cast<std::uintptr_t>(data) + index * BlockBytes; }
 
 private:
     void* data = nullptr;
+    std::size_t size;
 };
 
 bool MemoEnabled() {
@@ -94,8 +96,8 @@ bool MemoEnabled() {
 
 class Fixture {
 public:
-    Fixture(AgcDriver::VulkanDevice& device) : device(device), context(AgcDriver::VulkanDeviceTestAccess::ContextOf(device)) {
-        const std::uint64_t address = block.Block(0);
+    Fixture(AgcDriver::VulkanDevice& device, std::uint64_t bufferAddress = 0u) : device(device), context(AgcDriver::VulkanDeviceTestAccess::ContextOf(device)) {
+        const std::uint64_t address = bufferAddress != 0u ? bufferAddress : block.Block(0);
         ShaderRecompiler::DescriptorBinding binding{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::GuestBuffers, 0, 0, 1, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (16u << 16u), 4u, 0x20077facu}};
         binding.bufferWritten = {false};
         binding.bufferAtomic = {false};
@@ -165,15 +167,18 @@ public:
         device.WaitIdle();
     }
 
-    DepthTarget Depth(std::uint64_t address) const {
-        DepthTarget target{address, 0u, DepthExtent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, block.Block(3), false, Samples};
+    static DepthTarget Depth(const GuestBlock& depth, const GuestBlock& stencil, const GuestBlock& htile) {
+        DepthTarget target{depth.Block(0), stencil.Block(0), DepthExtent, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.0f, 0x5au, htile.Block(0), false, Samples};
         target.depthSwizzle = 24u;
-        target.iterate256 = target.htilePipeAligned = true;
+        target.pipeBankXor = 0x8c00u;
+        target.iterate256 = true;
+        target.htilePipeAligned = true;
+        target.htileDepthOnly = true;
         return target;
     }
 
-    void AddDepth(std::uint64_t address) {
-        Require(DepthSurfaceView(context, Depth(address)) != VK_NULL_HANDLE, "the native depth target has no view");
+    void AddDepth(const GuestBlock& depth, const GuestBlock& stencil, const GuestBlock& htile) {
+        Require(DepthSurfaceView(context, Depth(depth, stencil, htile)) != VK_NULL_HANDLE, "the native depth target has no view");
     }
 
     AgcDriver::VulkanDevice& device;
@@ -214,7 +219,13 @@ void CheckOneFragmentFmaskRegistry(AgcDriver::VulkanDevice& device) {
 
 void CheckDepthRegistry(AgcDriver::VulkanDevice& device) {
     std::puts("checking the resident depth registry");
-    Fixture fixture(device);
+    const auto depthBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(DepthExtent, 4u, Samples));
+    const auto stencilBytes = static_cast<std::size_t>(MultisampledDepthBytes_nid_no_patch(DepthExtent, 1u, Samples));
+    GuestBlock depth(depthBytes), stencil(stencilBytes), htile(BlockBytes);
+    GuestBlock otherDepth(depthBytes), otherStencil(stencilBytes), otherHtile(BlockBytes);
+    stencil.Fill(0x5a);
+    otherStencil.Fill(0x5a);
+    Fixture fixture(device, depth.Block(0));
     Recorder recorder(fixture.context);
     recorder.Activate();
     struct Cleanup {
@@ -223,15 +234,15 @@ void CheckDepthRegistry(AgcDriver::VulkanDevice& device) {
     } cleanup{recorder};
     fixture.WarmAndSkip("with no guards");
 
-    fixture.AddDepth(fixture.block.Block(1));
+    fixture.AddDepth(otherDepth, otherStencil, otherHtile);
     Require(HasResidentDepthGuards_nid_no_patch(), "the disjoint native depth target registered no guard");
-    Require(!ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the disjoint native depth target guards the buffer");
+    Require(!ResidentDepthGuardOverlaps_nid_no_patch(depth.Block(0), 64u), "the disjoint native depth target guards the buffer");
     fixture.ExpectChecked("a disjoint native depth target was added");
 
-    fixture.AddDepth(fixture.block.Block(0));
-    Require(ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the overlapping native depth target registered no guard over the buffer");
+    fixture.AddDepth(depth, stencil, htile);
+    Require(ResidentDepthGuardOverlaps_nid_no_patch(depth.Block(0), 64u), "the overlapping native depth target registered no guard over the buffer");
     Require(!fixture.Skipped(), "a guest buffer over a new native depth guard skipped its checks");
-    Require(!ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the guest buffer check did not retire the guard of a depth target no draw wrote");
+    Require(!ResidentDepthGuardOverlaps_nid_no_patch(depth.Block(0), 64u), "the guest buffer check did not retire the guard of a depth target no draw wrote");
 }
 
 }

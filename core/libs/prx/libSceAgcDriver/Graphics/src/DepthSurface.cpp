@@ -3249,6 +3249,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         surfaces().push_back(std::make_unique<DepthSurface>(context, target, std::move(sampling)));
         ++mirrorEpoch;
         auto& fresh = *surfaces().back();
+        std::fprintf(stderr, "DIAGDEPTH sampleable=%d refusal=%s\n", fresh.sampleable ? 1 : 0, fresh.sampling.refusal.c_str());
         if (target.samples != 1u && fresh.sampleable && fresh.sampling.refusal.empty()) {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : fresh.sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, fresh.active, {{range.address, range.bytes, 0u}}, fresh.hostWritten, fresh.hostEverWritten});
