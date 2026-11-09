@@ -197,6 +197,7 @@ jobs:
       TESTS: ${{ inputs.tests }}
       REDUCED: ${{ inputs.reduced }}
       CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: pch_defines,time_macros
       VVL_VERSION: 1.4.363.1
       VVL_SHA256: b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8
       VVL_DIR: /home/runner/vvl
