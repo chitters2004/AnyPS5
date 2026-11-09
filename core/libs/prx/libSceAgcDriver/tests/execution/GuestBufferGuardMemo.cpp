@@ -41,7 +41,7 @@ namespace {
 using namespace AgcDriver::Graphics;
 
 constexpr std::size_t BlockBytes = 65536;
-constexpr std::size_t Blocks = 4;
+constexpr std::size_t Blocks = 6;
 constexpr std::size_t AllocationBytes = Blocks * BlockBytes;
 constexpr VkExtent2D DepthExtent{5u, 3u};
 constexpr std::uint32_t Samples = 4u;
@@ -82,6 +82,7 @@ public:
 
     GuestBlock(const GuestBlock&) = delete;
     GuestBlock& operator=(const GuestBlock&) = delete;
+    void Fill(std::size_t index, int value) const { std::memset(static_cast<std::byte*>(data) + index * BlockBytes, value, BlockBytes); }
     std::uint64_t Block(std::size_t index) const { return reinterpret_cast<std::uintptr_t>(data) + index * BlockBytes; }
 
 private:
@@ -101,6 +102,8 @@ public:
         binding.bufferAtomic = {false};
         binding.bufferRead = {true};
         program.bindings.push_back(binding);
+        block.Fill(2, 0x5a);
+        block.Fill(4, 0x5a);
         shader = CompiledShader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
         resources = std::make_unique<ShaderResources>(context, shader);
     }
@@ -165,15 +168,18 @@ public:
         device.WaitIdle();
     }
 
-    DepthTarget Depth(std::uint64_t address) const {
-        DepthTarget target{address, 0u, DepthExtent, VK_FORMAT_D32_SFLOAT, 0.0f, 0u, block.Block(3), false, Samples};
+    DepthTarget Depth(std::size_t depthBlock, std::size_t stencilBlock, std::size_t htileBlock) const {
+        DepthTarget target{block.Block(depthBlock), block.Block(stencilBlock), DepthExtent, VK_FORMAT_D32_SFLOAT_S8_UINT, 0.0f, 0x5au, block.Block(htileBlock), false, Samples};
         target.depthSwizzle = 24u;
-        target.iterate256 = target.htilePipeAligned = true;
+        target.pipeBankXor = 0x8c00u;
+        target.iterate256 = true;
+        target.htilePipeAligned = true;
+        target.htileDepthOnly = true;
         return target;
     }
 
-    void AddDepth(std::uint64_t address) {
-        Require(DepthSurfaceView(context, Depth(address)) != VK_NULL_HANDLE, "the native depth target has no view");
+    void AddDepth(std::size_t depthBlock, std::size_t stencilBlock, std::size_t htileBlock) {
+        Require(DepthSurfaceView(context, Depth(depthBlock, stencilBlock, htileBlock)) != VK_NULL_HANDLE, "the native depth target has no view");
     }
 
     AgcDriver::VulkanDevice& device;
@@ -223,12 +229,12 @@ void CheckDepthRegistry(AgcDriver::VulkanDevice& device) {
     } cleanup{recorder};
     fixture.WarmAndSkip("with no guards");
 
-    fixture.AddDepth(fixture.block.Block(1));
+    fixture.AddDepth(1, 4, 5);
     Require(HasResidentDepthGuards_nid_no_patch(), "the disjoint native depth target registered no guard");
     Require(!ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the disjoint native depth target guards the buffer");
     fixture.ExpectChecked("a disjoint native depth target was added");
 
-    fixture.AddDepth(fixture.block.Block(0));
+    fixture.AddDepth(0, 2, 3);
     Require(ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the overlapping native depth target registered no guard over the buffer");
     Require(!fixture.Skipped(), "a guest buffer over a new native depth guard skipped its checks");
     Require(!ResidentDepthGuardOverlaps_nid_no_patch(fixture.block.Block(0), 64u), "the guest buffer check did not retire the guard of a depth target no draw wrote");
