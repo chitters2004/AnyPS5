@@ -1,0 +1,24 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+index 2d1b196018..0c59a53763 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/Driver/Shaders/ShaderRegistry.cpp
+@@ -1541,10 +1541,7 @@ public:
+     ResolvingAbi(const ResolvingAbi&) = delete;
+     ResolvingAbi& operator=(const ResolvingAbi&) = delete;
+ 
+-    ~ResolvingAbi() {
+-        std::lock_guard lock(snapshot->prepared->mutex);
+-        --snapshot->prepared->resolving;
+-    }
++    ~ResolvingAbi() {}
+ 
+     const ShaderSnapshot& Snapshot() const {
+         return *snapshot;
+@@ -1566,6 +1563,7 @@ void PrepareResolvedAbi(const ResolvingAbi& resolving, RegisteredPreparation& pl
+         failure = error.what();
+     }
+     std::lock_guard lock(snapshot.prepared->mutex);
++    --snapshot.prepared->resolving;
+     if (failure) {
+         DeferPipelineStage(*snapshot.prepared, snapshot, failure->c_str());
+         return;
