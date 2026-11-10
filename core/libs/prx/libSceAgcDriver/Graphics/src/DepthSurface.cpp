@@ -2787,10 +2787,25 @@ std::optional<UntrackedHtileStamp> untrackedHtileStamp(const Recorder* recorder,
     return stamp;
 }
 
+struct HtileGpuDecided {
+    std::uint64_t recorder;
+    std::uint64_t note;
+    std::size_t bytes;
+    bool stencil;
+    std::uint64_t generation;
+};
+
+std::map<std::uint64_t, HtileGpuDecided>& htileGpuDecided() {
+    static auto* decided = new std::map<std::uint64_t, HtileGpuDecided>();
+    return *decided;
+}
+
 void forgetHtileReads(std::uint64_t address, std::size_t bytes) {
     std::lock_guard lock(htileReadsMutex());
     auto& reads = htileReads();
     reads.erase(reads.lower_bound(address), reads.lower_bound(address + bytes));
+    auto& decided = htileGpuDecided();
+    decided.erase(decided.lower_bound(address), decided.lower_bound(address + bytes));
     auto& scans = untrackedHtileScans();
     scans.erase(scans.lower_bound(address), scans.lower_bound(address + bytes));
 }
@@ -2915,11 +2930,73 @@ void forgetCopiesInside(std::uint64_t address, std::size_t bytes) {
     std::erase_if(copyDestinations(), [&](const auto& range) { return address <= range.first && range.second <= address + bytes; });
 }
 
-VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
-    if (target.htileAddress == 0) return 0;
+struct HtileBindCounters {
+    std::atomic<std::uint64_t> gpuDecisions{0};
+    std::atomic<std::uint64_t> gpuDecided{0};
+    std::atomic<std::uint64_t> pendingReads{0};
+    std::atomic<std::uint64_t> readOnly{0};
+    std::atomic<std::uint64_t> created{0};
+    std::atomic<std::uint64_t> stencilPlane{0};
+    std::atomic<std::uint64_t> unpublished{0};
+    std::atomic<std::uint64_t> unsupported{0};
+    std::atomic<std::uint64_t> unreduced{0};
+};
+
+HtileBindCounters& htileBindCounters() {
+    static HtileBindCounters counters;
+    return counters;
+}
+
+struct HtileBindDecision {
+    VkImageAspectFlags cleared = 0;
+    bool undecided = false;
+};
+
+struct HtileReduction {
+    VkBuffer htile = VK_NULL_HANDLE;
+    VkDeviceSize offset = 0;
+    std::size_t bytes = 0;
+    std::shared_ptr<DeviceBuffer> predicates;
+};
+
+bool htileDecidableOnGpu(const Context& context, const DepthTarget& target, std::size_t bytes) {
+    static const bool disabled = std::getenv("APS5_NO_GPU_HTILE_DECISION") != nullptr;
+    const auto alignment = std::max<std::uint64_t>(context.limits.minStorageBufferOffsetAlignment, 4u);
+    return !disabled && context.conditionalRendering && context.dynamicRendering && context.detiler != nullptr && target.htileAddress % 4u == 0 && bytes % 4u == 0 && (bytes / 4u + 63u) / 64u <= context.limits.maxComputeWorkGroupCount[0] && bytes + alignment <= context.limits.maxStorageBufferRange;
+}
+
+bool pendingWritesPublished(const Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    const auto writes = recorder.PendingWritesOver(address, bytes);
+    return !writes.empty() && std::ranges::all_of(writes, [](const Recorder::PendingWrite& write) { return write.gpuPublished; });
+}
+
+std::optional<HtileReduction> reduceHtileOnGpu(const Context& context, const DepthTarget& target) {
+    auto* recorder = RecorderFor(context);
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
-    if (copiedOver(target.htileAddress, bytes)) return 0;
+    if (recorder == nullptr || !htileDecidableOnGpu(context, target, bytes) || !pendingWritesPublished(*recorder, target.htileAddress, bytes)) return std::nullopt;
+    const auto* import = HostImportFor(context, target.htileAddress, bytes);
+    if (import == nullptr) return std::nullopt;
+    recorder->FlushKeyStoresOverlapping(target.htileAddress, bytes);
+    recorder->FlushStoresOverlapping(target.htileAddress, bytes);
+    if (!pendingWritesPublished(*recorder, target.htileAddress, bytes) || copiedOver(target.htileAddress, bytes)) return std::nullopt;
+    const auto commands = recorder->Commands();
+    HtileReduction reduction{import->buffer, HostImportOffset(*import, target.htileAddress), bytes, recorder->HtilePredicates()};
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Fill);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, reduction.predicates->Handle(), 0, 2 * sizeof(std::uint32_t), 1u);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    context.detiler->DispatchHtileClearDecision(commands, reduction.htile, reduction.offset, bytes, reduction.predicates->Handle(), target.htileStencil, false);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
+    Recorder::CountBarriers(Recorder::CommandClass::Fill, 3);
+    recorder->EndGpuTiming(timing, bytes);
+    return reduction;
+}
+
+HtileBindDecision storeBackClearedHtile(const Context& context, const DepthTarget& target, bool allowGpu) {
+    if (target.htileAddress == 0) return {};
+    const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return {};
+    if (copiedOver(target.htileAddress, bytes)) return {};
     const auto collected = GuestMemory::CollectWrites(target.htileAddress, bytes);
     auto* recorder = RecorderFor(context);
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes);
@@ -2927,10 +3004,18 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     if (!pending) {
         std::lock_guard lock(htileReadsMutex());
         const auto found = htileReads().find(target.htileAddress);
-        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return 0;
+        if (found != htileReads().end() && found->second != 0 && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second)) return {};
         if (untracked) {
             const auto scanned = untrackedHtileScans().find(target.htileAddress);
-            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) return 0;
+            if (scanned != untrackedHtileScans().end() && scanned->second.bytes == bytes && scanned->second.stencil == target.htileStencil && scanned->second.stamp == *untracked) return {};
+        }
+    }
+    if (pending) {
+        std::lock_guard lock(htileReadsMutex());
+        const auto found = htileGpuDecided().find(target.htileAddress);
+        if (found != htileGpuDecided().end() && found->second.recorder == recorder->Id() && found->second.bytes == bytes && found->second.stencil == target.htileStencil && found->second.note == recorder->NewestWriteNote(target.htileAddress, bytes) && GuestMemory::UnchangedSince(target.htileAddress, bytes, found->second.generation)) {
+            htileBindCounters().gpuDecided.fetch_add(1, std::memory_order_relaxed);
+            return {};
         }
     }
     static const bool pendingFills = std::getenv("APS5_NO_PENDING_HTILE_FILLS") == nullptr;
@@ -2941,21 +3026,26 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
             if (cleared == 0) {
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = collected;
-                return 0;
+                return {};
             }
             if (storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, expandedHtileWord(*landed, target.htileStencil, cleared))) {
                 const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
                 std::lock_guard lock(htileReadsMutex());
                 htileReads()[target.htileAddress] = generation;
-                return cleared;
+                return {cleared};
             }
         } else if (const auto known = htileAfterMaskClear(*recorder, target, bytes); known.has_value() && storeHtileOnGpu(context, *recorder, target.htileAddress, bytes, known->second)) {
             const auto generation = GuestMemory::CollectWrites(target.htileAddress, bytes);
             std::lock_guard lock(htileReadsMutex());
             htileReads()[target.htileAddress] = generation;
-            return known->first;
+            return {known->first};
+        } else if (allowGpu) {
+            if (!htileDecidableOnGpu(context, target, bytes)) htileBindCounters().unsupported.fetch_add(1, std::memory_order_relaxed);
+            else if (!pendingWritesPublished(*recorder, target.htileAddress, bytes)) htileBindCounters().unpublished.fetch_add(1, std::memory_order_relaxed);
+            else return {0, true};
         }
     }
+    if (pending) htileBindCounters().pendingReads.fetch_add(1, std::memory_order_relaxed);
     std::vector<std::uint32_t> words(bytes / 4u);
     GuestMemory::Read(target.htileAddress, std::as_writable_bytes(std::span(words)), 4);
     VkImageAspectFlags cleared = VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
@@ -2970,7 +3060,60 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     htileReads()[target.htileAddress] = generation;
     if (cleared == 0 && untracked) untrackedHtileScans()[target.htileAddress] = {bytes, target.htileStencil, *untracked};
     else untrackedHtileScans().erase(target.htileAddress);
-    return cleared;
+    return {cleared};
+}
+
+void applyHtileDecision(DepthSurface& surface, const DepthTarget& target, const HtileReduction& reduction) {
+    const auto& context = surface.context;
+    auto* recorder = RecorderFor(context);
+    const auto commands = recorder->Commands();
+    recorder->Keep(reduction.predicates);
+    constexpr VkAccessFlags attachment = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    constexpr VkPipelineStageFlags tests = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, tests, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, attachment);
+    VkRenderingAttachmentInfoKHR depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+    depth.imageView = surface.view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    const bool stencilAttachment = HasStencil(surface.hostFormat);
+    VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+    rendering.renderArea = {{0, 0}, target.extent};
+    rendering.layerCount = 1;
+    rendering.pDepthAttachment = &depth;
+    if (stencilAttachment) rendering.pStencilAttachment = &depth;
+    context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+    const auto begin = context.Function<PFN_vkCmdBeginConditionalRenderingEXT>("vkCmdBeginConditionalRenderingEXT");
+    const auto end = context.Function<PFN_vkCmdEndConditionalRenderingEXT>("vkCmdEndConditionalRenderingEXT");
+    const auto clearAttachments = context.Function<PFN_vkCmdClearAttachments>("vkCmdClearAttachments");
+    const auto clearAspect = [&](VkImageAspectFlags aspect, VkDeviceSize offset) {
+        VkConditionalRenderingBeginInfoEXT condition{VK_STRUCTURE_TYPE_CONDITIONAL_RENDERING_BEGIN_INFO_EXT};
+        condition.buffer = reduction.predicates->Handle();
+        condition.offset = offset;
+        begin(commands, &condition);
+        VkClearAttachment clear{aspect, 0, {}};
+        clear.clearValue.depthStencil = {surface.clearDepth, surface.clearStencil};
+        const VkClearRect rect{{{0, 0}, target.extent}, 0, 1};
+        clearAttachments(commands, 1, &clear, 1, &rect);
+        end(commands);
+    };
+    clearAspect(VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+    if (target.htileStencil && stencilAttachment) clearAspect(VK_IMAGE_ASPECT_STENCIL_BIT, sizeof(std::uint32_t));
+    context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
+    RecordMemoryBarrier(context, commands, tests, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, attachment | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    context.detiler->DispatchHtileClearDecision(commands, reduction.htile, reduction.offset, reduction.bytes, reduction.predicates->Handle(), target.htileStencil, true);
+    constexpr VkAccessFlags written = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, written);
+    Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
+    recorder->MarkCovered(written);
+    recorder->NotePendingGpuWrite(target.htileAddress, reduction.bytes);
+    GuestMemory::MarkWritten(target.htileAddress, reduction.bytes);
+    const auto generation = GuestMemory::CollectWrites(target.htileAddress, reduction.bytes);
+    std::lock_guard lock(htileReadsMutex());
+    htileReads()[target.htileAddress] = generation;
+    untrackedHtileScans().erase(target.htileAddress);
+    htileGpuDecided()[target.htileAddress] = {recorder->Id(), recorder->NewestWriteNote(target.htileAddress, reduction.bytes), reduction.bytes, target.htileStencil, generation};
+    htileBindCounters().gpuDecisions.fetch_add(1, std::memory_order_relaxed);
 }
 
 struct StalePlanes {
@@ -3387,6 +3530,21 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     return DepthSurfaceViewWithStencilWriteIntent(context, target, depthWritten, stencilTested, true);
 }
 
+DepthSurface* findDepthSurface(const Context& context, const DepthTarget& target) {
+    for (const auto& candidate : surfaces()) {
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) return candidate.get();
+    }
+    for (const auto& candidate : surfaces()) {
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) return candidate.get();
+    }
+    return nullptr;
+}
+
+HtileBindReads HtileBindReadCounts() {
+    const auto& counters = htileBindCounters();
+    return {counters.gpuDecisions.load(std::memory_order_relaxed), counters.gpuDecided.load(std::memory_order_relaxed), counters.pendingReads.load(std::memory_order_relaxed), counters.readOnly.load(std::memory_order_relaxed), counters.created.load(std::memory_order_relaxed), counters.stencilPlane.load(std::memory_order_relaxed), counters.unpublished.load(std::memory_order_relaxed), counters.unsupported.load(std::memory_order_relaxed), counters.unreduced.load(std::memory_order_relaxed)};
+}
+
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
@@ -3394,21 +3552,39 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
-    std::lock_guard gpu(GuestMemory::GpuMutex());
-    settlePendingHtileClear(context, target.address);
-    std::unique_lock lock(surfacesMutex());
-    const bool cleared = takeClearedHtile(target);
+    const bool nativeOwner = RoutesToNativeDepthOwner(target);
+    std::unique_lock gpu(GuestMemory::GpuMutex(), std::defer_lock);
+    std::unique_lock lock(surfacesMutex(), std::defer_lock);
+    VkImageAspectFlags htileCleared = 0;
     DepthSurface* surface = nullptr;
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
-            surface = candidate.get();
-            break;
+    std::optional<HtileReduction> reduction;
+    for (bool allowGpu = true;; allowGpu = false) {
+        const auto decision = nativeOwner ? HtileBindDecision{} : storeBackClearedHtile(context, target, allowGpu);
+        htileCleared = decision.cleared;
+        gpu.lock();
+        settlePendingHtileClear(context, target.address);
+        lock.lock();
+        surface = findDepthSurface(context, target);
+        if (!decision.undecided) break;
+        auto& counters = htileBindCounters();
+        if (surface == nullptr) {
+            counters.created.fetch_add(1, std::memory_order_relaxed);
+        } else if (!depthWritten) {
+            counters.readOnly.fetch_add(1, std::memory_order_relaxed);
+        } else if (target.htileStencil && surface->StencilMirrorable() && !stencilWritten) {
+            counters.stencilPlane.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            lock.unlock();
+            reduction = reduceHtileOnGpu(context, target);
+            lock.lock();
+            if (reduction.has_value() && findDepthSurface(context, target) == surface) break;
+            reduction.reset();
+            counters.unreduced.fetch_add(1, std::memory_order_relaxed);
         }
+        lock.unlock();
+        gpu.unlock();
     }
-    for (const auto& candidate : surfaces()) {
-        if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
-    }
+    const bool cleared = takeClearedHtile(target);
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();
     GuestAllocations::Lease creationLease;
@@ -3469,6 +3645,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
+    if (reduction.has_value()) applyHtileDecision(*surface, target, *reduction);
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;

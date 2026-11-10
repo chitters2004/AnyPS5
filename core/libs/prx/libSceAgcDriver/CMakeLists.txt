@@ -195,6 +195,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcHtileClearDecisionShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/HtileClearDecision.comp)
+set(agcHtileClearDecisionShaderSpv ${agcTextureDetileGeneratedDir}/HtileClearDecision.spv)
+set(agcHtileClearDecisionShaderHeader ${agcTextureDetileGeneratedDir}/HtileClearDecision_spv.h)
+add_custom_command(
+        OUTPUT "${agcHtileClearDecisionShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcHtileClearDecisionShaderSpv}" "${agcHtileClearDecisionShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcHtileClearDecisionShaderSpv} -DOUTPUT=${agcHtileClearDecisionShaderHeader}
+        -DSYMBOL=HTILE_CLEAR_DECISION_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcHtileClearDecisionShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcTextureRepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/TextureRepack.comp)
 set(agcTextureRepackShaderSpv ${agcTextureDetileGeneratedDir}/TextureRepack.spv)
 set(agcTextureRepackShaderHeader ${agcTextureDetileGeneratedDir}/TextureRepack_spv.h)
@@ -489,6 +502,7 @@ set(agcDriverSources
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}
         ${agcCmaskClearShaderHeader}
+        ${agcHtileClearDecisionShaderHeader}
         ${agcPackedMergeShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingCopyBackShaderHeader}

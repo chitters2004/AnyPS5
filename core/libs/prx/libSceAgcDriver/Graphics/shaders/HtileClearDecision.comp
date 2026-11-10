@@ -1,0 +1,48 @@
+#version 450
+
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) buffer Htile { uint words[]; } htile;
+layout(set = 0, binding = 1, std430) buffer Predicates { uint clears[2]; } predicates;
+
+layout(push_constant) uniform Push {
+    uint base;
+    uint count;
+    uint stencil;
+    uint normalize;
+} push;
+
+shared uint keep[2];
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (push.normalize != 0u) {
+        uint depth = predicates.clears[0];
+        uint stencil = predicates.clears[1];
+        if (index >= push.count || (depth == 0u && stencil == 0u)) return;
+        uint word = htile.words[push.base + index];
+        if (push.stencil == 0u) {
+            word = 0xfffc000fu;
+        } else {
+            if (depth != 0u) word = (word & 0x3f0u) | 0xfffff00fu;
+            if (stencil != 0u) word |= 0x3f0u;
+        }
+        htile.words[push.base + index] = word;
+        return;
+    }
+    if (gl_LocalInvocationIndex == 0u) {
+        keep[0] = 1u;
+        keep[1] = push.stencil != 0u ? 1u : 0u;
+    }
+    barrier();
+    if (index < push.count) {
+        uint word = htile.words[push.base + index];
+        if ((word & 0xfu) != 0u) atomicAnd(keep[0], 0u);
+        if (((word >> 8u) & 3u) != 0u) atomicAnd(keep[1], 0u);
+    }
+    barrier();
+    if (gl_LocalInvocationIndex == 0u) {
+        if (keep[0] == 0u) atomicAnd(predicates.clears[0], 0u);
+        if (keep[1] == 0u) atomicAnd(predicates.clears[1], 0u);
+    }
+}

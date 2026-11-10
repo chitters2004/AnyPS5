@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
@@ -45,12 +47,18 @@ constexpr auto HtileFillBytes = static_cast<std::uint32_t>(HtileBytes);
 
 class GuestBlock {
 public:
-    GuestBlock() {
+    explicit GuestBlock(bool watched = false) {
         constexpr std::size_t bytes = 65536;
 #ifdef _WIN32
-        block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        if (watched) {
+            block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, bytes));
+            if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
+        } else {
+            block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
 #else
         block = static_cast<std::uint8_t*>(std::aligned_alloc(bytes, bytes));
+        if (watched && block != nullptr) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
 #endif
         Require(block != nullptr, "depth fast clear submit: cannot allocate a guest block");
         std::memset(block, 0, bytes);
@@ -68,9 +76,9 @@ private:
     std::uint8_t* block = nullptr;
 };
 
-GuestBlock& NewBlock() {
+GuestBlock& NewBlock(bool watched = false) {
     static auto* blocks = new std::deque<GuestBlock>();
-    return blocks->emplace_back();
+    return blocks->emplace_back(watched);
 }
 
 std::uint32_t Low(std::uint64_t value) { return static_cast<std::uint32_t>(value); }
@@ -324,6 +332,11 @@ void RecordedMaskClearClearsWithoutWait(AgcDriver::VulkanDevice& device, const S
     }
 }
 
+bool GpuDecides(AgcDriver::VulkanDevice& device) {
+    const auto context = device.graphicsContext();
+    return std::getenv("APS5_NO_GPU_HTILE_DECISION") == nullptr && context.conditionalRendering && context.dynamicRendering;
+}
+
 void RecordedMaskKeepingZMaskReadsBack(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
     for (const bool stencil : {false, true}) {
         auto& htile = NewBlock();
@@ -338,8 +351,10 @@ void RecordedMaskKeepingZMaskReadsBack(AgcDriver::VulkanDevice& device, const Sh
             device.NoteHtileMask({htile.Address(), HtileFillBytes, mask, 0u});
         }
         const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+        const auto decisions = AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions;
         Require(Draw(device, shaders, surface, {.depthWrite = true}) == 0u, "an HTILE mask clear that keeps non-zero ZMask bits cleared the depth");
-        Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() != waits, "the bind after an HTILE mask clear that keeps the ZMask did not read the HTILE back");
+        if (GpuDecides(device)) Require(AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions == decisions + 1u && AgcDriver::Graphics::Recorder::ThreadHookWaits() == waits, "the bind after an HTILE mask clear that keeps the ZMask was not decided on the GPU without a wait");
+        else Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() != waits, "the bind after an HTILE mask clear that keeps the ZMask did not read the HTILE back");
     }
 }
 
@@ -469,6 +484,193 @@ void MaskCleanupIsolation(AgcDriver::VulkanDevice& device, AgcDriver::VulkanDevi
     if (previous != nullptr) previous->Activate();
 }
 
+void FillHtile(AgcDriver::VulkanDevice& device, const GuestBlock& htile, std::uint32_t offset, std::uint32_t bytes, const std::array<std::uint32_t, 4>& pattern) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    Require(device.FillBuffer(htile.Address() + offset, bytes, pattern), "an HTILE fill was not recorded on the GPU");
+}
+
+std::array<std::uint32_t, 4> Uniform(std::uint32_t word) { return {word, word, word, word}; }
+
+struct UnknownWriter {
+    const char* name;
+    std::vector<std::pair<std::uint32_t, std::array<std::uint32_t, 4>>> fills;
+    bool clears;
+    std::uint32_t lastWords;
+};
+
+std::vector<UnknownWriter> UnknownWriters(bool stencil) {
+    const std::uint32_t half = HtileFillBytes / 2u;
+    const std::uint32_t keep = stencil ? 0x3f0u : 0u;
+    return {
+        {"two clearing fills of different words", {{0u, Uniform(0x0u | keep)}, {half, Uniform(0x10u | keep)}}, true, 0x10u | keep},
+        {"a clearing pattern fill", {{0u, {0x0u | keep, 0x10u | keep, 0x0u | keep, 0x20u | keep}}}, true, 0x20u | keep},
+        {"two fills, the second half not clearing", {{0u, Uniform(0x0u | keep)}, {half, Uniform(0xfu | keep)}}, false, 0xfu | keep},
+        {"a pattern fill with one word not clearing", {{0u, {0x0u | keep, 0x0u | keep, 0x0u | keep, 0x1u | keep}}}, false, 0x1u | keep},
+        {"only the last word not clearing", {{0u, Uniform(0x0u | keep)}, {HtileFillBytes - 16u, {0x0u | keep, 0x0u | keep, 0x0u | keep, 0x1u | keep}}}, false, 0x1u | keep},
+    };
+}
+
+void UnknownHtileWritersDecideWithoutWait(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    const bool gpu = GpuDecides(device);
+    for (const auto& writer : UnknownWriters(false)) {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        Require(Draw(device, shaders, surface, {}) == 0u, "a draw at depth 0.5 passed LESS against the 0.5 written before it");
+        for (std::size_t index = 0; index < writer.fills.size(); ++index) {
+            const auto offset = writer.fills[index].first;
+            FillHtile(device, htile, offset, (index + 1u < writer.fills.size() ? writer.fills[index + 1u].first : HtileFillBytes) - offset, writer.fills[index].second);
+        }
+        const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+        const auto decisions = AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions;
+        const auto covered = Draw(device, shaders, surface, {.depthWrite = true});
+        const auto* seen = WordsAt(htile, 0);
+        Require(covered == (writer.clears ? Covered : 0u), std::string(writer.name) + (writer.clears ? ": the HTILE did not clear the depth to DB_DEPTH_CLEAR (1.0)" : ": an HTILE with a word that does not clear the depth cleared it") + " (covered " + std::to_string(covered) + ", first word " + std::to_string(seen[0]) + ", last word " + std::to_string(seen[HtileFillBytes / 4u - 1u]) + ", GPU decisions " + std::to_string(AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions - decisions) + ", read back " + std::to_string(AgcDriver::Graphics::HtileBindReadCounts().pendingReads) + ")");
+        if (gpu) {
+            Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() == waits, std::string(writer.name) + ": the bind waited for the GPU to run the writer of its HTILE");
+            Require(AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions == decisions + 1u, std::string(writer.name) + ": the bind did not decide the clear on the GPU");
+        }
+        const auto* words = WordsAt(htile, 0);
+        if (writer.clears) Require(AllWords(words, 0xfffc000fu), std::string(writer.name) + ": the cleared HTILE was not stored back as expanded (0xfffc000f)");
+        else Require(words[HtileFillBytes / 4u - 1u] == writer.lastWords && words[0] == writer.fills.front().second[0], std::string(writer.name) + ": an HTILE that does not clear was changed by the bind");
+        Require(Draw(device, shaders, surface, {}) == 0u, std::string(writer.name) + ": the depth drawn after the bind was cleared again");
+    }
+}
+
+void UnknownStencilHtileWriters(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    const VkStencilOpState writeFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS, 0xffu, 0xffu, 5u};
+    const VkStencilOpState equalFive{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 5u};
+    const VkStencilOpState equalZero{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 0u};
+    struct Case {
+        const char* name;
+        std::uint32_t first;
+        std::uint32_t second;
+        bool depth;
+        bool stencil;
+    };
+    for (const auto& item : {Case{"depth and stencil", 0x000u, 0x010u, true, true}, Case{"stencil only", 0x00fu, 0x01fu, false, true}, Case{"depth only", 0x300u, 0x310u, true, false}, Case{"neither", 0x30fu, 0x31fu, false, false}}) {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), NewBlock().Address(), htile.Address(), true, VK_FORMAT_D32_SFLOAT_S8_UINT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true, .stencilTest = true, .stencil = writeFive}) == Covered, "a new depth-stencil surface was not cleared");
+        FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(item.first));
+        FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(item.second));
+        Require(Draw(device, shaders, surface, {.depthTest = true, .depthWrite = true, .stencilTest = true, .stencil = item.stencil ? equalZero : equalFive}) == (item.depth ? Covered : 0u), std::string(item.name) + ": the depth and stencil after the HTILE clear decision are wrong");
+        const auto* words = WordsAt(htile, 0);
+        const auto expanded = [&](std::uint32_t word) {
+            if (item.depth) word = (word & 0x3f0u) | 0xfffff00fu;
+            if (item.stencil) word |= 0x3f0u;
+            return word;
+        };
+        Require(words[0] == expanded(item.first) && words[HtileFillBytes / 4u - 1u] == expanded(item.second), std::string(item.name) + ": the HTILE words after the clear decision differ from the expanded words");
+        Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = item.stencil ? equalZero : equalFive}) == Covered, std::string(item.name) + ": the stencil after the HTILE clear decision is wrong");
+    }
+}
+
+void GpuDecisionEligibility(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    if (!GpuDecides(device)) {
+        std::puts("GPU HTILE decision eligibility not run: the device or the environment decides on the CPU");
+        return;
+    }
+    using AgcDriver::Graphics::HtileBindReadCounts;
+    {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+        FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(0x10u));
+        const auto before = HtileBindReadCounts();
+        const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+        Require(Draw(device, shaders, surface, {}) == Covered, "a read-only bind over a clearing HTILE did not clear the depth");
+        Require(HtileBindReadCounts().readOnly == before.readOnly + 1u && HtileBindReadCounts().gpuDecisions == before.gpuDecisions, "a read-only depth bind was decided on the GPU");
+        Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() != waits, "a read-only depth bind over an unknown HTILE writer did not read the HTILE back");
+    }
+    {
+        auto& htile = NewBlock();
+        FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+        FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(0x10u));
+        const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+        const auto before = HtileBindReadCounts();
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface over a clearing HTILE was not cleared");
+        Require(HtileBindReadCounts().created == before.created + 1u && HtileBindReadCounts().gpuDecisions == before.gpuDecisions, "the first bind of a new depth surface was decided on the GPU");
+    }
+    {
+        auto& htile = NewBlock();
+        const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            auto* recorder = AgcDriver::Graphics::Recorder::Active();
+            Require(recorder != nullptr, "no active recorder for the CPU-published writer");
+            std::memset(htile.Data(), 0, HtileFillBytes);
+            recorder->NotePendingWrite(htile.Address(), HtileFillBytes);
+            AgcDriver::GuestMemory::MarkWritten(htile.Address(), HtileFillBytes);
+        }
+        const auto before = HtileBindReadCounts();
+        const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "an HTILE a CPU-published writer cleared did not clear the depth");
+        Require(HtileBindReadCounts().unpublished == before.unpublished + 1u && HtileBindReadCounts().gpuDecisions == before.gpuDecisions, "a writer published by the CPU was decided on the GPU");
+        Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() != waits, "a writer published by the CPU was not read back");
+    }
+}
+
+void RepeatedGpuDecisions(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    auto& htile = NewBlock();
+    const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+    for (int round = 0; round < 6; ++round) {
+        const bool clears = round % 2 == 0;
+        FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+        FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(clears ? 0x10u : 0x1u));
+        Require(Draw(device, shaders, surface, {.depthWrite = true}) == (clears ? Covered : 0u), "a repeated HTILE clear decision took the wrong outcome (predicate reuse)");
+    }
+}
+
+void GpuDecisionsInOneBatch(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    if (!GpuDecides(device)) {
+        std::puts("GPU HTILE decisions in one batch not run: the device or the environment decides on the CPU");
+        return;
+    }
+    alignas(256) static std::array<std::byte, DepthFastClearHarness::Width * DepthFastClearHarness::Height * 4> unread{};
+    using AgcDriver::Graphics::HtileBindReadCounts;
+    auto& htile = NewBlock(true);
+    if (!AgcDriver::GuestMemory::Watched(htile.Address(), HtileFillBytes)) {
+        std::puts("GPU HTILE decisions in one batch not run: guest write watch is unavailable");
+        return;
+    }
+    const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+    const auto before = HtileBindReadCounts();
+    const auto waits = AgcDriver::Graphics::Recorder::ThreadHookWaits();
+    FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+    FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(0x10u));
+    Draw(device, shaders, surface, {.depthWrite = true, .minDepth = 0.75f, .maxDepth = 0.75f, .wait = false}, {DepthFastClearHarness::Width, DepthFastClearHarness::Height}, unread);
+    Draw(device, shaders, surface, {.depthWrite = true, .minDepth = 0.75f, .maxDepth = 0.75f, .wait = false}, {DepthFastClearHarness::Width, DepthFastClearHarness::Height}, unread);
+    Require(HtileBindReadCounts().gpuDecisions == before.gpuDecisions + 1u, "a bind after a GPU decision with no newer HTILE write decided again");
+    FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+    FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(0x1u));
+    Draw(device, shaders, surface, {.depthWrite = true, .minDepth = 0.9f, .maxDepth = 0.9f, .wait = false}, {DepthFastClearHarness::Width, DepthFastClearHarness::Height}, unread);
+    Require(Draw(device, shaders, surface, {.minDepth = 0.6f, .maxDepth = 0.6f}) == Covered, "the first of two GPU decisions in one batch did not clear the depth");
+    Require(Draw(device, shaders, surface, {.minDepth = 0.8f, .maxDepth = 0.8f}) == 0u, "the second of two GPU decisions in one batch cleared the depth");
+    Require(HtileBindReadCounts().gpuDecisions == before.gpuDecisions + 2u, "a new HTILE writer after a GPU decision was not decided again");
+    Require(AgcDriver::Graphics::Recorder::ThreadHookWaits() == waits, "a read-only bind after a GPU decision waited for the GPU");
+    const auto* words = WordsAt(htile, 0);
+    Require(words[0] == 0u && words[HtileFillBytes / 4u - 1u] == 0x1u, "an HTILE that does not clear was changed by the second decision");
+}
+
+void CopiedHtileOverridesGpuDecision(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
+    auto& htile = NewBlock();
+    const Surface surface{NewBlock().Address(), 0, htile.Address(), false, VK_FORMAT_D32_SFLOAT};
+    Require(Draw(device, shaders, surface, {.depthWrite = true}) == Covered, "a new depth surface was not cleared to DB_DEPTH_CLEAR (1.0)");
+    FillHtile(device, htile, 0u, HtileFillBytes / 2u, Uniform(0u));
+    FillHtile(device, htile, HtileFillBytes / 2u, HtileFillBytes / 2u, Uniform(0x10u));
+    AgcDriver::Graphics::NoteCopyDestination(htile.Address(), HtileFillBytes);
+    const auto decisions = AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions;
+    Require(Draw(device, shaders, surface, {.depthWrite = true}) == 0u, "clear words in an HTILE a copy wrote cleared the depth over a pending writer");
+    Require(AgcDriver::Graphics::HtileBindReadCounts().gpuDecisions == decisions, "an HTILE a copy wrote was decided on the GPU");
+    const auto* words = WordsAt(htile, 0);
+    Require(words[0] == 0u && words[HtileFillBytes / 4u - 1u] == 0x10u, "an HTILE a copy wrote was changed by the bind");
+}
+
 void DepthOnlyFillKeepsStencil(AgcDriver::VulkanDevice& device, const Shaders& shaders) {
     const auto& htile = NewBlock();
     const Surface surface{NewBlock().Address(), NewBlock().Address(), htile.Address(), true, VK_FORMAT_D32_SFLOAT_S8_UINT};
@@ -517,6 +719,12 @@ int main(int argc, char** argv) {
             RecordedFillClearsWithoutWait(*device, shaders);
             RecordedMaskClearClearsWithoutWait(*device, shaders);
             RecordedMaskKeepingZMaskReadsBack(*device, shaders);
+            UnknownHtileWritersDecideWithoutWait(*device, shaders);
+            UnknownStencilHtileWriters(*device, shaders);
+            GpuDecisionEligibility(*device, shaders);
+            RepeatedGpuDecisions(*device, shaders);
+            CopiedHtileOverridesGpuDecision(*device, shaders);
+            GpuDecisionsInOneBatch(*device, shaders);
             DispatchFillClearsDepth(*device, shaders);
             DispatchBufferPatternFillClearsDepth(*device, shaders);
             UnknownKernelClearsTwice(*device, shaders);

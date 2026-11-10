@@ -55,6 +55,7 @@ namespace AgcDriver::Graphics {
         void BeginBatch();
         void DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask, std::uint64_t cmaskOffset, std::size_t cmaskBytes, VkImageView view, std::uint32_t width, std::uint32_t height, std::uint32_t elementBytes, const std::array<std::uint32_t, 2>& clearWords, bool write);
         std::uint32_t CmaskErrors();
+        void DispatchHtileClearDecision(VkCommandBuffer commands, VkBuffer htile, std::uint64_t htileOffset, std::size_t htileBytes, VkBuffer predicates, bool stencil, bool normalize);
         void DispatchMultisampleReadback(VkCommandBuffer commands, VkFormat format, VkBuffer destination, std::uint64_t offset, std::uint64_t bytes, VkImageView arrayView, std::uint32_t width, std::uint32_t height, std::uint32_t layers, std::uint32_t fragments, std::uint32_t firstElement, std::uint32_t elements);
         void DispatchMultisampleImage(VkCommandBuffer commands, std::uint32_t elementBytes, VkBuffer source, std::uint64_t offset, std::uint64_t bytes, VkImageView arrayView, std::uint32_t width, std::uint32_t height, std::uint32_t layers, std::uint32_t fragments, std::uint32_t firstElement, std::uint32_t elements);
 
@@ -87,6 +88,10 @@ namespace AgcDriver::Graphics {
         VkPipeline cmaskPipeline = VK_NULL_HANDLE;
         DescriptorRing cmaskDescriptorSets;
         std::unique_ptr<Buffer> cmaskErrors;
+        VkDescriptorSetLayout htileDescriptorLayout = VK_NULL_HANDLE;
+        VkPipelineLayout htilePipelineLayout = VK_NULL_HANDLE;
+        VkPipeline htilePipeline = VK_NULL_HANDLE;
+        DescriptorRing htileDescriptorSets;
         VkDescriptorSetLayout imageDescriptorLayout = VK_NULL_HANDLE;
         VkPipelineLayout imagePipelineLayout = VK_NULL_HANDLE;
         VkShaderModule imageModule = VK_NULL_HANDLE;

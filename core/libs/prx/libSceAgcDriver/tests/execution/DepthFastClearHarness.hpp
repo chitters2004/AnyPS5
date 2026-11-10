@@ -52,6 +52,7 @@ struct DrawOptions {
     VkStencilOpState stencil{};
     float minDepth = 0.0f;
     float maxDepth = 1.0f;
+    bool wait = true;
 };
 
 inline std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
@@ -141,6 +142,7 @@ inline std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& compil
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangles().size()), 0, 1, 0, false};
     device.Draw(state, draw, shaders);
+    if (!options.wait) return 0;
     device.WaitIdle();
     std::uint32_t covered = 0;
     for (std::size_t pixel = 0; pixel < pixels.size() / 4u; ++pixel) {

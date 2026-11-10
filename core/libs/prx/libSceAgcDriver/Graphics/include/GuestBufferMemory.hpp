@@ -429,6 +429,7 @@ public:
         return false;
     }
     void MarkStagedWrites() const;
+    void SplitWritesByPublication(std::vector<std::pair<std::uint64_t, std::uint64_t>>& gpu, std::vector<std::pair<std::uint64_t, std::uint64_t>>& other) const;
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }

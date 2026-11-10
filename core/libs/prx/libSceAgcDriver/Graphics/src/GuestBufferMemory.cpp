@@ -7054,6 +7054,16 @@ void GuestBufferMemory::MarkStagedWrites() const {
     }
 }
 
+void GuestBufferMemory::SplitWritesByPublication(std::vector<std::pair<std::uint64_t, std::uint64_t>>& gpu, std::vector<std::pair<std::uint64_t, std::uint64_t>>& other) const {
+    gpu.clear();
+    other.clear();
+    for (const auto& range : writes) {
+        const auto* found = owner(range.first, range.second);
+        const bool published = found != nullptr && (found->direct != nullptr || (found->gpuCopy && (found->copiedBack || found->deviceLocal)));
+        (published ? gpu : other).push_back(range);
+    }
+}
+
 void GuestBufferMemory::MarkDirectWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);

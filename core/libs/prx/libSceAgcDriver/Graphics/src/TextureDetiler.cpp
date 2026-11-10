@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetile_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/CmaskClear_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/HtileClearDecision_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetileImage_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureRepack_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/TextureDetileImageWords_spv.h"
@@ -13,6 +14,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -119,6 +121,10 @@ void TextureDetiler::release() noexcept {
     if (cmaskPipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, cmaskPipelineLayout, nullptr);
     if (cmaskDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, cmaskDescriptorLayout, nullptr);
     cmaskErrors.reset();
+    for (const auto pool : htileDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
+    if (htilePipeline) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, htilePipeline, nullptr);
+    if (htilePipelineLayout) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, htilePipelineLayout, nullptr);
+    if (htileDescriptorLayout) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, htileDescriptorLayout, nullptr);
     for (const auto pool : descriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     for (const auto pool : imageDescriptorSets.pools) context.Function<PFN_vkDestroyDescriptorPool>("vkDestroyDescriptorPool")(context.device, pool, nullptr);
     if (imageModule) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, imageModule, nullptr);
@@ -422,6 +428,68 @@ void TextureDetiler::DispatchCmaskClear(VkCommandBuffer commands, VkBuffer cmask
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT, anyAccess);
     context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, cmask, cmaskOffset, cmaskBytes, 0xffffffffu);
     barrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, anyAccess);
+}
+
+void TextureDetiler::DispatchHtileClearDecision(VkCommandBuffer commands, VkBuffer htile, std::uint64_t htileOffset, std::size_t htileBytes, VkBuffer predicates, bool stencil, bool normalize) {
+    Require(commands != VK_NULL_HANDLE && htile != VK_NULL_HANDLE && predicates != VK_NULL_HANDLE, "an HTILE clear decision needs a command buffer, the HTILE buffer and the predicate buffer");
+    Require(htileOffset % 4 == 0 && htileBytes % 4 == 0 && htileBytes != 0 && htileBytes / 4 <= std::numeric_limits<std::uint32_t>::max(), "an HTILE clear decision needs a word-aligned HTILE");
+    if (htilePipeline == VK_NULL_HANDLE) {
+        std::array<VkDescriptorSetLayoutBinding, 2> bindings{};
+        for (std::uint32_t index = 0; index < bindings.size(); ++index) {
+            bindings[index].binding = index;
+            bindings[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[index].descriptorCount = 1;
+            bindings[index].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+        layoutInfo.pBindings = bindings.data();
+        Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &htileDescriptorLayout), "vkCreateDescriptorSetLayout HTILE clear decision");
+        const VkPushConstantRange pushRange{VK_SHADER_STAGE_COMPUTE_BIT, 0, 4 * sizeof(std::uint32_t)};
+        VkPipelineLayoutCreateInfo pipelineLayoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        pipelineLayoutInfo.setLayoutCount = 1;
+        pipelineLayoutInfo.pSetLayouts = &htileDescriptorLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushRange;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &pipelineLayoutInfo, nullptr, &htilePipelineLayout), "vkCreatePipelineLayout HTILE clear decision");
+        VkShaderModule htileModule = CreateShaderModule(context, HTILE_CLEAR_DECISION_SPV, sizeof(HTILE_CLEAR_DECISION_SPV), "vkCreateShaderModule HTILE clear decision");
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = htileModule;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.layout = htilePipelineLayout;
+        VkResult created;
+        {
+            auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            created = context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &htilePipeline);
+        }
+        context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, htileModule, nullptr);
+        Check(created, "vkCreateComputePipelines HTILE clear decision");
+    }
+    const auto set = allocateFrom(htileDescriptorSets, htileDescriptorLayout, {{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 64 * 2}}, "vkCreateDescriptorPool HTILE clear decision", "vkAllocateDescriptorSets HTILE clear decision", "vkResetDescriptorPool HTILE clear decision");
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+    const auto descriptorOffset = htileOffset - htileOffset % alignment;
+    const auto base = htileOffset - descriptorOffset;
+    const VkDescriptorBufferInfo htileInfo{htile, descriptorOffset, base + htileBytes};
+    const VkDescriptorBufferInfo predicateInfo{predicates, 0, 2 * sizeof(std::uint32_t)};
+    std::array<VkWriteDescriptorSet, 2> writes{};
+    for (std::uint32_t index = 0; index < writes.size(); ++index) {
+        writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[index].dstSet = set;
+        writes[index].dstBinding = index;
+        writes[index].descriptorCount = 1;
+        writes[index].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
+    writes[0].pBufferInfo = &htileInfo;
+    writes[1].pBufferInfo = &predicateInfo;
+    context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, htilePipeline);
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, htilePipelineLayout, 0, 1, &set, 0, nullptr);
+    const auto words = static_cast<std::uint32_t>(htileBytes / 4);
+    const std::array<std::uint32_t, 4> push{static_cast<std::uint32_t>(base / 4), words, stencil ? 1u : 0u, normalize ? 1u : 0u};
+    context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, htilePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push.data());
+    context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, (words + 63u) / 64u, 1, 1);
 }
 
 void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer tiled, std::uint64_t tiledOffset, VkImageView view, const TileMipLayout& layout, bool retile, std::uint32_t slice, const DetileWindow& window) {

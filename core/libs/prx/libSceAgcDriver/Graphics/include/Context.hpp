@@ -275,6 +275,8 @@ struct Context {
     bool maintenance8 = false;
     bool pushDescriptors = false;
     bool graphicsPipelineLibrary = false;
+    bool dynamicRendering = false;
+    bool conditionalRendering = false;
     bool pipelineLinkTimeOptimization = true;
     bool dynamicColorWriteMask = false;
     std::uint32_t srgbDecodeFormats = 0;
