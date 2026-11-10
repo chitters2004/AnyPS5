@@ -1112,3 +1112,8 @@ if(BUILD_TESTING)
 endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
+
+target_compile_definitions(libSceAgcDriver PRIVATE WC_TRACE=1)
+
+target_sources(libSceAgcDriver PRIVATE Probe.cpp)
+target_link_options(libSceAgcDriver PRIVATE LINKER:--wrap=pthread_mutex_lock,--wrap=pthread_rwlock_rdlock,--wrap=pthread_rwlock_wrlock,--wrap=pthread_rwlock_unlock,--wrap=__emutls_get_address)

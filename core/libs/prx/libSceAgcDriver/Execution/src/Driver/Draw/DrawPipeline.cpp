@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -180,6 +181,7 @@ void DrawFinisher::Enqueue(Job job) {
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
+    WaitCensus::Scope enqueueScope(WaitCensus::FinEnqueue);
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -188,7 +190,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (jobs.size() >= depth) { WC_SCOPE(FinEnqueueFull); idle.wait(lock, [&] { return jobs.size() < depth; }); }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -204,21 +206,24 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    WaitCensus::NameThread("draw finisher");
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
+        WaitCensus::Scope idleScope(WaitCensus::FinIdle);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
+            idleScope.Done();
             job = &jobs.front();
             failed = failure != nullptr;
         }
         std::exception_ptr error;
         try {
-            if (!failed) (*job)();
+            if (!failed) { WC_SCOPE(FinJob); (*job)(); }
         } catch (...) {
             error = std::current_exception();
         }
@@ -235,16 +240,18 @@ void DrawFinisher::run() {
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    WC_SCOPE(FinSettle);
     std::unique_lock lock(mutex);
     idle.wait(lock, [&] { return jobs.empty(); });
 }
 
-void DrawFinisher::Drain() {
+void DrawFinisher::Drain(int site) {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
+    WaitCensus::Scope drainScope(site);
+    { WC_SCOPE(FinDrainSpin); SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; }); }
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) { WC_SCOPE(FinDrainCv); idle.wait(lock, [&] { return jobs.empty(); }); }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -336,7 +343,8 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 }
 
 void DrawPipeline::enqueue(Item item) {
-    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain(WaitCensus::FinDrainEnqueue);
+    WC_SCOPE(CommitEnqueue);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -356,7 +364,7 @@ void DrawPipeline::enqueue(Item item) {
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= resumeAt; });
+        { WC_SCOPE(CommitEnqueueFull); idle.wait(lock, [&] { return items.size() <= resumeAt; }); }
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -431,16 +439,19 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
+    WaitCensus::NameThread("draw committer");
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        WaitCensus::Scope idleScope(WaitCensus::CommitIdle);
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            idleScope.Done();
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
@@ -450,7 +461,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            if (commit != nullptr) (*commit)();
+            if (commit != nullptr) { WC_SCOPE(CommitJob); (*commit)(); }
             if (!isDraw) GuestMemory::BreakProofs();
         } catch (const std::exception&) {
             failed = true;
@@ -508,8 +519,9 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
-    if (finisherBusy) DrawFinisher::Get().Drain();
+    if (finisherBusy) DrawFinisher::Get().Drain(WaitCensus::FinDrainPipe);
     if (!Busy()) return;
+    WC_SCOPE(CommitDrain);
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);

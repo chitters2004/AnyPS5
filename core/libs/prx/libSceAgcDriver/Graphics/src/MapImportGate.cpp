@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include <algorithm>
@@ -79,6 +80,7 @@ void UnlockShared(const Stripes& stripes) {
 }
 
 void Backoff(std::uint32_t round) {
+    WC_SCOPE(MapImport);
     if (round < 16) {
         std::this_thread::yield();
         return;

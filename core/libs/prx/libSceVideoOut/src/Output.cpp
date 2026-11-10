@@ -1,4 +1,5 @@
 #include "prx/libSceVideoOut/include/VideoOut.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include <algorithm>
 #include <array>
 #include <charconv>
@@ -375,7 +376,7 @@ int APS5_VABI sceVideoOutWaitVblank(int handle) try {
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
     const uint64_t count = cfg->vblankStatus.count;
-    cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return !cfg->opened || cfg->closing || cfg->failure || cfg->vblankStatus.count != count; });
+    { WC_SCOPE(VoWaitVblank); cfg->vblankCond.wait(lock, cfg->shutdownToken, [&] { return !cfg->opened || cfg->closing || cfg->failure || cfg->vblankStatus.count != count; }); }
     cfg->Check();
     return 0;
 } catch (const ProcessShutdown&) {

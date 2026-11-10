@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -451,7 +452,7 @@ void ReleaseThreadMain() {
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
     for (;;) {
-        queue.wake.wait(lock, [&] { return !queue.items.empty() || queue.stop; });
+        { WC_SCOPE(RecorderRelease); queue.wake.wait(lock, [&] { return !queue.items.empty() || queue.stop; }); }
         if (queue.items.empty()) return;
         auto items = std::move(queue.items);
         queue.items.clear();
@@ -1305,7 +1306,7 @@ struct Recorder::ProgressWatcher {
                 const auto token = wakes.load(std::memory_order_acquire);
                 if (stop.load(std::memory_order_acquire)) return;
                 if (submitted.load(std::memory_order_acquire) <= seen) {
-                    wakes.wait(token, std::memory_order_acquire);
+                    { WC_SCOPE(ProgressWatcher); wakes.wait(token, std::memory_order_acquire); }
                     continue;
                 }
                 const std::uint64_t target = seen + 1;
@@ -4302,7 +4303,9 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
+    WaitCensus::Scope submitScope(WaitCensus::QueueSubmit);
     const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    submitScope.Done();
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
@@ -4374,6 +4377,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
+    WC_SCOPE(GpuTimeline);
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
@@ -4403,6 +4407,7 @@ bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
     const UnlockedWaiter waiter{id};
+    WC_SCOPE(GpuSerialFor);
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -4791,6 +4796,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
         const auto waitFences = function(waitForFences, "vkWaitForFences");
+        WC_SCOPE(GpuFence);
         auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.

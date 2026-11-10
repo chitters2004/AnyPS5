@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <stdexcept>
+extern "C" { void ProbeCount(int); void ProbePacket(); void ProbeMark(unsigned long long, unsigned long long); void ProbeRemoved(); void ProbeGuard(int, unsigned long long, unsigned long long); void ProbeExact(int); void ProbeRetired(int); }
 
 static constexpr int SCE_OK = 0;
 static constexpr int SCE_KERNEL_ERROR_EPERM = 0x80020001;
@@ -94,6 +95,7 @@ int APS5_VABI scePthreadRwlockInit(PthreadRwlock* rwlock, const PthreadRwlockatt
 }
 
 int APS5_VABI scePthreadRwlockRdlock(PthreadRwlock* rwlock) {
+    ProbeCount(4);
     auto* lock = RequireRwlock(rwlock, __func__);
     if (!lock) return SCE_KERNEL_ERROR_EINVAL;
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;
@@ -124,6 +126,7 @@ int APS5_VABI scePthreadRwlockTimedrdlock(PthreadRwlock* rwlock, KernelUseconds 
 }
 
 int APS5_VABI scePthreadRwlockWrlock(PthreadRwlock* rwlock) {
+    ProbeCount(5);
     auto* lock = RequireRwlock(rwlock, __func__);
     if (!lock) return SCE_KERNEL_ERROR_EINVAL;
     if (OwnsWrite(lock)) return SCE_KERNEL_ERROR_EDEADLK;

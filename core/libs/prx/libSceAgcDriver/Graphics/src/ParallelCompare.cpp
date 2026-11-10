@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -28,7 +29,7 @@ public:
         {
             std::unique_lock lock(mutex);
             if (stopping) return false;
-            finished.wait(lock, [&] { return working == 0; });
+            { WC_SCOPE(ParCmpWait); finished.wait(lock, [&] { return working == 0; }); }
             jobSpans = spans;
             jobEqual = equal;
             next.store(0, std::memory_order_relaxed);
@@ -38,7 +39,7 @@ public:
         wake.notify_all();
         drain(spans, equal);
         std::unique_lock lock(mutex);
-        finished.wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == spans.size(); });
+        { WC_SCOPE(ParCmpWait); finished.wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == spans.size(); }); }
         jobSpans = {};
         jobEqual = {};
         return true;
@@ -74,7 +75,7 @@ private:
         std::uint64_t seen = 0;
         std::unique_lock lock(mutex);
         for (;;) {
-            wake.wait(lock, [&] { return generation != seen || stopping; });
+            { WC_SCOPE(ParCmpIdle); wake.wait(lock, [&] { return generation != seen || stopping; }); }
             if (stopping) break;
             seen = generation;
             const auto spans = jobSpans;

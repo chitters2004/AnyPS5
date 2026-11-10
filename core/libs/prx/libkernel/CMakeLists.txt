@@ -2848,3 +2848,6 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+target_sources(libkernel PRIVATE Probe.cpp)
+target_link_options(libkernel PRIVATE LINKER:--wrap=pthread_mutex_lock,--wrap=pthread_rwlock_rdlock,--wrap=pthread_rwlock_wrlock,--wrap=pthread_rwlock_unlock,--wrap=__emutls_get_address)

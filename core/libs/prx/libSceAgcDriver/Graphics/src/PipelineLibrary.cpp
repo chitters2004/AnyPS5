@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
@@ -69,7 +70,7 @@ LibraryStore& Libraries() {
 void runJobs(LibraryStore& store) {
     std::unique_lock lock(store.mutex);
     for (;;) {
-        store.work.wait(lock, [&] { return !store.jobs.empty() || store.stopping; });
+        { WC_SCOPE(PipelineLibIdle); store.work.wait(lock, [&] { return !store.jobs.empty() || store.stopping; }); }
         if (store.stopping) break;
         auto [device, job] = std::move(store.jobs.front());
         store.jobs.pop_front();
@@ -347,13 +348,13 @@ void OptimizedPipeline::Schedule() {
 void WaitForOptimizedPipelines(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
-    store.idle.wait(lock, [&] { return store.pending[device] == 0; });
+    { WC_SCOPE(PipelineLib); store.idle.wait(lock, [&] { return store.pending[device] == 0; }); }
 }
 
 void ClearPipelineLibraries(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
-    store.idle.wait(lock, [&] { return store.pending[device] == 0 && store.activeBuilds[device] == 0; });
+    { WC_SCOPE(PipelineLib); store.idle.wait(lock, [&] { return store.pending[device] == 0 && store.activeBuilds[device] == 0; }); }
     const auto found = store.devices.find(device);
     if (found == store.devices.end()) return;
     auto& libraries = found->second;

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -166,7 +167,10 @@ void Driver::run(std::uint32_t id) noexcept {
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
+        WaitCensus::NameThread(role);
+        WaitCensus::Busy busyScope(WaitCensus::QwBusy);
         for (;;) {
+            busyScope.End();
             submission = Submission{};
             struct Running {
                 std::atomic<std::uint32_t>& count;
@@ -190,7 +194,8 @@ void Driver::run(std::uint32_t id) noexcept {
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
                 PerformanceTimer timing("Driver.WorkerWait");
-                std::unique_lock lock(mutex);
+                std::unique_lock lock(mutex, std::defer_lock);
+                WaitCensus::LockTimed(WaitCensus::QwMutex, lock);
                 timing.Mark("mutex_wait");
                 auto& worker = workers.at(id);
                 auto& pending = worker.pending;
@@ -216,6 +221,7 @@ void Driver::run(std::uint32_t id) noexcept {
 #endif
                 };
 
+                WaitCensus::Scope idleLoop(WaitCensus::QwIdle);
                 while (!ready()) {
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
@@ -253,6 +259,8 @@ void Driver::run(std::uint32_t id) noexcept {
                     reapCompletionLabels();
                     lock.lock();
                 }
+                idleLoop.Done();
+                busyScope.Begin();
                 timing.Mark("idle_and_completion_poll");
                 rethrowFailure();
                 if (stopping || shutdownToken.stop_requested() || pending.empty()) {

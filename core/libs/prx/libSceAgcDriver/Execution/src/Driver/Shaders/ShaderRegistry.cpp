@@ -1,4 +1,5 @@
 #include "prx/libc/include/general/LogMacros.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -196,7 +197,7 @@ namespace {
 
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
-    prepared.settled.wait(lock, [&] { return !prepared.pending; });
+    { WC_SCOPE(ShaderPrepared); prepared.settled.wait(lock, [&] { return !prepared.pending; }); }
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
@@ -1475,7 +1476,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
 PreparedAtUse PrepareDeferredAbis(const ShaderSnapshot& snapshot, std::unique_lock<std::mutex>& lock) {
     auto& prepared = *snapshot.prepared;
     if (prepared.deferredPreparing) {
-        prepared.settled.wait(lock, [&] { return !prepared.deferredPreparing; });
+        { WC_SCOPE(ShaderPrepared); prepared.settled.wait(lock, [&] { return !prepared.deferredPreparing; }); }
         return std::nullopt;
     }
     if (prepared.deferredAbis.empty()) return std::nullopt;
@@ -1669,7 +1670,7 @@ public:
         std::vector<std::uint64_t> sequences;
         for (auto entry = first; entry != last; ++entry) sequences.push_back(entry->second);
         moveToFront(prepared);
-        idle.wait(lock, [&] { return std::ranges::none_of(sequences, [&](const auto sequence) { return unfinished.contains(sequence); }); });
+        { WC_SCOPE(ShaderUnfinished); idle.wait(lock, [&] { return std::ranges::none_of(sequences, [&](const auto sequence) { return unfinished.contains(sequence); }); }); }
     }
 
     void Prioritize(std::span<const std::uint64_t> programs) {
@@ -1685,7 +1686,7 @@ public:
     void AwaitSubmitted() {
         std::unique_lock lock(mutex);
         const auto ticket = submitted;
-        idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
+        { WC_SCOPE(ShaderUnfinished); idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; }); }
     }
 
     void Close(bool dropQueued) {

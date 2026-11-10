@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
 #include <array>
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -149,7 +150,7 @@ public:
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
-    void Drain();
+    void Drain(int site = WaitCensus::FinDrainOther);
     void Settle();
     void ReleaseRan();
 

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
@@ -21,6 +22,7 @@
 namespace AgcDriver::DriverDetail {
 
 void PollSleep() {
+    WC_SCOPE(PollSleep);
 #ifdef _WIN32
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
     if (timer != nullptr) {
@@ -349,6 +351,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::uint32_t queue;
         ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
+    WC_SCOPE(WaitRegMem);
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
     const auto spinLimit = queue == 0 ? std::chrono::microseconds(1500) : std::chrono::microseconds(100);

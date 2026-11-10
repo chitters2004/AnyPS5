@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -681,7 +682,7 @@ void ResidentBuffer::submit(const std::vector<VkSparseMemoryBind>& binds) {
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
         else gpuLock = std::unique_lock(GuestMemory::GpuMutex());
         submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
-        if (submitted == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (submitted == VK_SUCCESS) { WC_SCOPE(MirrorFence); waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX); }
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (submitted != VK_SUCCESS) fail("vkQueueBindSparse of a resident heap mirror", submitted);

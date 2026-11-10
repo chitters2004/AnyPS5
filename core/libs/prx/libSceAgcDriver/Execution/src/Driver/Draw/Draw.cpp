@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -404,9 +405,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
+            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain(WaitCensus::FinDrainReloc);
+            timing.Mark("prep_a_reloc_drain");
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            std::lock_guard cacheLock(drawCacheMutex);
+            std::unique_lock cacheLock(drawCacheMutex, std::defer_lock);
+            WaitCensus::LockTimed(WaitCensus::CacheLockReloc, cacheLock);
+            timing.Mark("prep_b_reloc_lock");
             learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
@@ -416,20 +420,30 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
+        timing.Mark("prep_b2_reloc_lookup");
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
+        timing.Mark("prep_c_key");
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
-                std::lock_guard peekLock(drawCacheMutex);
+                std::unique_lock peekLock(drawCacheMutex, std::defer_lock);
+                WaitCensus::LockTimed(WaitCensus::CacheLockPeek, peekLock);
                 const auto shape = drawShapes.find(shapeKey);
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
-            const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
-            if (drain) DrawFinisher::Get().Drain();
+            bool drain;
+            {
+                WC_SCOPE(FinPendingKey);
+                drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
+            }
+            if (drain) DrawFinisher::Get().Drain(WaitCensus::FinDrainLookup);
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
-        std::unique_lock cacheLock(drawCacheMutex);
+        timing.Mark("prep_d_finisher_check_drain");
+        std::unique_lock cacheLock(drawCacheMutex, std::defer_lock);
+        WaitCensus::LockTimed(WaitCensus::CacheLockLookup, cacheLock);
+        timing.Mark("prep_e_cache_lock");
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
         if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
@@ -487,6 +501,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
+    timing.Mark("prep_f_lookup_relocate_validate");
 
     if (dataEntry != nullptr) {
         auto refreshed = std::make_shared<DrawDecode>(*dataEntry->decode);
@@ -567,6 +582,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::fprintf(stderr, "%s\n", line.c_str());
     }
     phaseTiming.Phase(DrawRowDecode);
+    timing.Mark("prep_g_decode");
 
     const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
         const auto words = UserDataWords(programs, roles, location);
@@ -586,9 +602,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (DrawFinisher::Busy()) {
         const bool drain = !DrawFinisher::Overlap();
-        if (drain) DrawFinisher::Get().Drain();
+        if (drain) DrawFinisher::Get().Drain(WaitCensus::FinDrainReads);
         else DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Reads, false);
     }
+    timing.Mark("prep_h_indirect_reads_drain");
     auto& memory = tail.memory;
     auto& linked = tail.linked;
     memory.reserve(2 * programs.size() + 32);
@@ -598,7 +615,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& program = programs[i];
         linked.push_back({roles[i], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
     }
-    timing.Mark("prepare");
+    timing.Mark("prep_i_program_memory");
     phaseTiming.Phase(DrawRowProgramPrepare);
 
     auto& vertexInfos = tail.vertexInfos;
@@ -761,7 +778,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     noteFinisherHandOff(false);
     if (DrawFinisher::Busy()) {
-        DrawFinisher::Get().Drain();
+        DrawFinisher::Get().Drain(WaitCensus::FinDrainKept);
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
     tail.queue = &queue;

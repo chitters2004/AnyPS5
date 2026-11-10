@@ -16,6 +16,7 @@
 #include <thread>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
+extern "C" { void ProbeCount(int); void ProbePacket(); void ProbeMark(unsigned long long, unsigned long long); void ProbeRemoved(); void ProbeGuard(int, unsigned long long, unsigned long long); void ProbeExact(int); void ProbeRetired(int); }
 #endif
 
 namespace {
@@ -251,6 +252,7 @@ int APS5_VABI scePthreadMutexDestroy(PthreadMutex* mutex) {
 }
 
 int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
+    ProbeCount(0);
     auto* current = resolveMutex(mutex, true);
     return acquireMutex(current, [current](auto& native) {
 #ifdef _WIN32

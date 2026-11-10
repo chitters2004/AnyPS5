@@ -19,6 +19,7 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+extern "C" { void ProbeCount(int); void ProbePacket(); void ProbeMark(unsigned long long, unsigned long long); void ProbeRemoved(); void ProbeGuard(int, unsigned long long, unsigned long long); void ProbeExact(int); void ProbeRetired(int); }
 
 namespace {
 
@@ -251,6 +252,7 @@ int APS5_VABI scePthreadCondDestroy(PthreadCond* cond) {
 }
 
 int APS5_VABI scePthreadCondSignal(PthreadCond* cond) {
+    ProbeCount(1);
     const auto resolved = resolveCond(cond);
     if (!resolved)
         return SCE_KERNEL_ERROR_EINVAL;
@@ -259,6 +261,7 @@ int APS5_VABI scePthreadCondSignal(PthreadCond* cond) {
 }
 
 int APS5_VABI scePthreadCondBroadcast(PthreadCond* cond) {
+    ProbeCount(2);
     const auto resolved = resolveCond(cond);
     if (!resolved)
         return SCE_KERNEL_ERROR_EINVAL;
@@ -279,6 +282,7 @@ int APS5_VABI scePthreadCondSignalto(PthreadCond* cond, Pthread thread) {
 }
 
 int APS5_VABI scePthreadCondWait(PthreadCond* cond, PthreadMutex* mutex) {
+    ProbeCount(3);
     return waitUntil(resolveCond(cond), mutex, std::nullopt, __builtin_return_address(0));
 }
 

@@ -1,4 +1,5 @@
 #include <bit>
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include <charconv>
 #include <chrono>
 #include <cstdlib>
@@ -174,6 +175,7 @@ public:
         : _config(std::move(config)), _index(index), _ticket(ticket) {}
     void Wait() override {
         std::unique_lock lock(_config->mutex);
+        WC_SCOPE(VoRenderingWait);
         _config->vblankCond.wait(lock, _config->shutdownToken, [&] {
             return _config->failure || _config->Closed() ||
                 _config->bufferReuse[_index].IsComplete(_ticket);
@@ -195,6 +197,7 @@ public:
 
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
+        WC_SCOPE(VoFlipRoom);
         const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {
             return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < VIDEO_OUT_FLIP_QUEUE_CAPACITY;
         });
@@ -639,7 +642,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
-        req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
+        { WC_SCOPE(VoFlipVblank); req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; }); }
         timing.Mark("vblank_wait");
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
@@ -783,7 +786,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
-                flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); });
+                { WC_SCOPE(VoPresentIdle); flipQueue->changed.WaitUntil(lock, TimedWait::DeadlineNanos(PRESENT_POLL_MICROS), [&] { return token.stop_requested() || flipQueue->failure || !flipQueue->requests.empty(); }); }
                 if (flipQueue->failure) std::rethrow_exception(flipQueue->failure);
                 if (token.stop_requested()) break;
                 if (!flipQueue->requests.empty()) {
@@ -895,13 +898,14 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
 }
 
 void VideoOutDriver::vblankLoop(std::stop_token token) {
+    WaitCensus::NameThread("vblank");
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
     const auto start = std::chrono::steady_clock::now();
     try {
         for (int64_t frame = 1; !token.stop_requested(); ++frame) {
             const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(Frame(frame));
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - std::chrono::steady_clock::now()).count();
-            if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+            if (remaining > 0) { WC_SCOPE(VoVblankSleep); PreciseSleepUs(static_cast<unsigned long long>(remaining)); }
             {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;

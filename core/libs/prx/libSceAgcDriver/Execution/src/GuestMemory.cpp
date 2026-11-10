@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -2998,6 +2999,20 @@ namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+void NoteGpuWait(std::size_t site, std::uint64_t begin, std::uint64_t end) {
+    static char buffers[GpuLockSiteCount][32];
+    static const char* names[GpuLockSiteCount];
+    static std::once_flag once;
+    std::call_once(once, [] {
+        for (std::size_t i = 0; i < GpuLockSiteCount; ++i) {
+            std::snprintf(buffers[i], sizeof buffers[i], "GpuMutex.wait.%s", GpuLockSiteNames[i]);
+            names[i] = buffers[i];
+        }
+        WaitCensus::SetGpuNames(names, static_cast<int>(GpuLockSiteCount));
+    });
+    WaitCensus::Record(WaitCensus::GpuBase + static_cast<int>(site), begin, end, true);
+}
+
 void GpuMutexType::enter() {
     if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
 }
@@ -3079,16 +3094,11 @@ void AssertGpuLockHeld(const char* where) {
 
 void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
-        auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
-        if (trace == nullptr) {
-            enter();
-        } else {
-            const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
-            if (!tryEnter()) {
-                const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
-                trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
-            }
+        const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
+        if (!tryEnter()) {
+            const auto start = WaitCensus::Now();
+            LockSpinning(mutex, HandoffSpinWindow());
+            NoteGpuWait(site, start, WaitCensus::Now());
         }
         acquired();
         return;
@@ -3181,7 +3191,6 @@ void GpuMutexType::lock() {
 
 void TagGpuLockSite(GpuLockSite site) {
     // Off the profiled path the tag is never read, so the thread-local is not touched either.
-    if (!GpuLockProfiled() && !PerformanceTrace::Recording()) return;
     LockStats().nextSite = site;
 }
 

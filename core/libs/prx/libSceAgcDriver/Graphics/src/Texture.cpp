@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -496,7 +497,7 @@ static VkDeviceSize BindSparseLevels(const Context& context, OwnedImage& owned, 
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
         else gpuLock = std::unique_lock(GuestMemory::GpuMutex());
         submitted = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
-        if (submitted == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (submitted == VK_SUCCESS) { WC_SCOPE(TexFence); waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX); }
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     Check(submitted, "vkQueueBindSparse sparse texture levels");
@@ -4737,7 +4738,7 @@ void ResolveLabelTrap(std::uintptr_t begin, std::uintptr_t end) {
     const auto bytes = static_cast<std::size_t>(end - begin);
     GuestMemory::FlushGpuWrites(begin, bytes);
     while (AgcDriver::DriverDetail::DrawPipeline::HeldReads(begin, bytes)) {
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        { WC_SCOPE(TexSleep); std::this_thread::sleep_for(std::chrono::microseconds(50)); }
         GuestMemory::FlushGpuWrites(begin, bytes);
     }
 }
@@ -4950,8 +4951,7 @@ bool StorageTexture::WaitForFlushing(std::uint64_t address, std::size_t bytes, c
             std::lock_guard lock(pending.mutex);
             if (std::none_of(pending.flushing.begin(), pending.flushing.end(), [&](const StorageTexture* texture) { return texture != except && texture != exempt && texture->overlaps(address, bytes); })) return waited;
         }
-        { std::lock_guard gpu(GuestMemory::GpuMutex()); }
-        std::this_thread::yield();
+        { WC_SCOPE(TexYield); { std::lock_guard gpu(GuestMemory::GpuMutex()); } std::this_thread::yield(); }
     }
 }
 

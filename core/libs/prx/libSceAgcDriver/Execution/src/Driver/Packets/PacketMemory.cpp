@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -276,6 +277,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (drains) {
 
         static const bool unlockedDrain = std::getenv("APS5_NO_UNLOCKED_DRAIN") == nullptr && !drainAll;
+        WC_SCOPE(DevDrain);
 
         bumpEpoch(&EpochBumps::drains);
         std::shared_ptr<VulkanDevice> draining;
@@ -297,14 +299,14 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (draining != nullptr) {
                 static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("drain"));
                 if (unlockedDrain && draining->CanWaitUnlocked()) epoch = draining->SubmitAndEpoch();
-                else draining->WaitIdle();
+                else { WC_SCOPE(DevDrainIdle); draining->WaitIdle(); }
             }
             if (epoch == 0) draining.reset();
         }
         if (epoch != 0) {
             ++unlockedDrains;
             try {
-                draining->WaitRecorded(epoch);
+                { WC_SCOPE(DevDrainRecorded); draining->WaitRecorded(epoch); }
             } catch (...) {
 
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);

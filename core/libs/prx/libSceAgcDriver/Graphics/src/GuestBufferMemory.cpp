@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
@@ -454,7 +455,7 @@ void bumpEpoch(HostImports& state) {
 
 #ifdef _WIN32
 void waitSettleBatch(const ImportSettle& settle, VkDevice device, const SettleBatch& batch) {
-    if (batch.busy && settle.waitForFences != nullptr) Check(settle.waitForFences(device, 1, &batch.fence, VK_TRUE, 60'000'000'000ull), "vkWaitForFences (settle batch)");
+    if (batch.busy && settle.waitForFences != nullptr) { WC_SCOPE(BufFence); Check(settle.waitForFences(device, 1, &batch.fence, VK_TRUE, 60'000'000'000ull), "vkWaitForFences (settle batch)"); }
 }
 
 bool settleBatchRunning(const ImportSettle& settle, VkDevice device, const SettleBatch& batch) {
@@ -1006,7 +1007,7 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
         std::unique_lock<std::mutex> queueLock;
         if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
         bound = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
-        if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
+        if (bound == VK_SUCCESS) { WC_SCOPE(BufFence); waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX); }
     }
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (bound != VK_SUCCESS) fail("vkQueueBindSparse", bound);
@@ -1188,7 +1189,8 @@ const char* settleImport(const Context& context, HostImports& state, const HostI
 #ifdef _WIN32
         ++state.settlesWaited;
 #endif
-        if ((result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &settle.settleFence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences (settle)";
+        { WC_SCOPE(BufFence); result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &settle.settleFence, VK_TRUE, 10'000'000'000ull); }
+        if (result != VK_SUCCESS) return "vkWaitForFences (settle)";
         return nullptr;
     };
     const char* step = run();
@@ -3001,7 +3003,7 @@ public:
         wake.notify_all();
         work(blocks);
         std::unique_lock lock(mutex);
-        done.wait(lock, [&] { return finished == helpers; });
+        { WC_SCOPE(BufHelpers); done.wait(lock, [&] { return finished == helpers; }); }
         job = {};
         return copiedBlocks.load(std::memory_order_relaxed);
     }
@@ -3034,7 +3036,9 @@ private:
             std::span<const RefreshBlock> blocks;
             {
                 std::unique_lock lock(mutex);
+                WaitCensus::Scope helperIdle(WaitCensus::BufHelperIdle);
                 if (!wake.wait(lock, token, [&] { return serial != seen; })) return;
+                helperIdle.Done();
                 seen = serial;
                 blocks = job;
             }
@@ -3817,6 +3821,7 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) {
             synced = true;
             drained = true;
         } else {
+            WC_SCOPE(BufYield);
             std::this_thread::yield();
         }
         if (recorder != nullptr) recorder->FlushDeferredReleases();
@@ -4150,7 +4155,8 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
             submit.pCommandBuffers = &buffer;
             if ((probe.result = context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submit, fence)) != VK_SUCCESS) return "vkQueueSubmit";
             submitted = true;
-            if ((probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull)) != VK_SUCCESS) return "vkWaitForFences";
+            { WC_SCOPE(BufFence); probe.result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 10'000'000'000ull); }
+            if (probe.result != VK_SUCCESS) return "vkWaitForFences";
             submitted = false;
             return nullptr;
         };

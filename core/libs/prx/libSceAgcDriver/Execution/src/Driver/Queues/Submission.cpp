@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
@@ -370,11 +371,17 @@ void Driver::holdFlipBehindWorker(const Submission& submission, bool cpuFlip) {
     }
     if (!flips) return;
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    {
+    WC_SCOPE(FlipAhead);
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    }
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
     if (cpuFlip || failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipsAhead.load(std::memory_order_acquire) != 0) return;
     flipHolders.fetch_add(1, std::memory_order_acq_rel);
+    {
+    WC_SCOPE(FlipWork);
     changed.wait(lock, [&] { return failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipWorkOpen.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire); });
+    }
     flipHolders.fetch_sub(1, std::memory_order_acq_rel);
     if (failure != nullptr || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested() || flipWorkOpen.load(std::memory_order_acquire) != 0) return;
     const auto workSerial = flipWorkSerial.load(std::memory_order_acquire);
@@ -513,6 +520,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
             std::uint32_t queue;
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
+        WC_SCOPE(RewindBlocked);
         StallWatch stall(stalled.queue);
         while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
@@ -626,7 +634,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     const auto progressDeadline = progress ? std::chrono::steady_clock::now() + std::chrono::milliseconds(2) : std::chrono::steady_clock::time_point{};
     {
         std::unique_lock lock(mutex);
-        if (captureHold.load(std::memory_order_relaxed)) changed.wait(lock, [&] { return !captureHold.load(std::memory_order_relaxed); });
+        if (captureHold.load(std::memory_order_relaxed)) { WC_SCOPE(CaptureHold); changed.wait(lock, [&] { return !captureHold.load(std::memory_order_relaxed); }); }
         rethrowFailure();
         checkStopping();
         require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");
@@ -697,7 +705,7 @@ void Driver::SuspendPoint() {
     auto* const capture = SubmissionCapture::Active();
     auto captured = capture != nullptr ? SubmissionCapture::Prepare(0, SubmissionKind::Suspend, {}, {}) : CapturedSubmission{};
     std::unique_lock lock(mutex);
-    if (captureHold.load(std::memory_order_relaxed)) changed.wait(lock, [&] { return !captureHold.load(std::memory_order_relaxed); });
+    if (captureHold.load(std::memory_order_relaxed)) { WC_SCOPE(CaptureHold); changed.wait(lock, [&] { return !captureHold.load(std::memory_order_relaxed); }); }
     rethrowFailure();
     checkStopping();
     require(accepted != std::numeric_limits<std::uint64_t>::max(), "submission serial overflow");

@@ -2382,3 +2382,6 @@ if(MINGW)
             FAIL_REGULAR_EXPRESSION "stack words from rsp;data at stack words")
     endif()
 endif()
+
+target_sources(libc PRIVATE Probe.cpp)
+target_link_options(libc PRIVATE LINKER:--wrap=pthread_mutex_lock,--wrap=pthread_rwlock_rdlock,--wrap=pthread_rwlock_wrlock,--wrap=pthread_rwlock_unlock,--wrap=__emutls_get_address)

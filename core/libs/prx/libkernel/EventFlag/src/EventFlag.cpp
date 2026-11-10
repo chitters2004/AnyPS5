@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+extern "C" { void ProbeCount(int); void ProbePacket(); void ProbeMark(unsigned long long, unsigned long long); void ProbeRemoved(); void ProbeGuard(int, unsigned long long, unsigned long long); void ProbeExact(int); void ProbeRetired(int); }
 
 static constexpr int SCE_OK = 0;
 static constexpr int SCE_KERNEL_ERROR_EPERM = 0x80020001;
@@ -225,6 +226,7 @@ int APS5_VABI sceKernelDeleteEventFlag(KernelEventFlag ef) {
 }
 
 int APS5_VABI sceKernelSetEventFlag(KernelEventFlag ef, uint64_t bit_pattern) {
+    ProbeCount(6);
     const auto entry = ResolveEventFlag(ef);
     if (!entry) return SCE_KERNEL_ERROR_ESRCH;
     KernelEventFlagPrivate* flag = entry->flag.get();

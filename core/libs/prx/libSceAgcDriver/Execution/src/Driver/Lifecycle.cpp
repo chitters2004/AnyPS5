@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -190,7 +191,7 @@ void Driver::stop() {
         if (worker.thread.joinable()) worker.thread.join();
     }
     try {
-        DrawFinisher::Get().Drain();
+        DrawFinisher::Get().Drain(WaitCensus::FinDrainLife);
     } catch (...) {
     }
     DrawPipeline::Queue0().Stop();
