@@ -11352,6 +11352,49 @@ void inPassSampleDumpTests(Recorder& recorder, const Context& context, const Cov
     if (context.occlusionQueryPrecise) Require(folded == base + passes * CoverPass::Samples, "segments folded at Submit without a dump counted the wrong samples");
 }
 
+void discardedSampleTests(Recorder& recorder, const Context& context, const CoverPass& cover, std::uint64_t* words, std::uint64_t address, VkDeviceAddress target) {
+    const auto passes = [&](std::size_t count) {
+        for (std::size_t i = 0; i < count; ++i) {
+            Require(!cover.Draw(recorder), "a draw after other work continued a pass");
+            recorder.Commands();
+        }
+    };
+    const auto failSubmit = [&] {
+        Recorder::FailNextSubmitsForTest(1u);
+        bool discarded = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            discarded = std::string(error.what()).find("injected failure") != std::string::npos;
+        }
+        Recorder::FailNextSubmitsForTest(0u);
+        Require(discarded, "the batch with closed occlusion segments was not discarded");
+    };
+    recorder.Sync();
+    const auto base = recorder.SamplesTotal();
+    passes(2);
+    failSubmit();
+    Require(recorder.SamplesTotal() == base, "the segments of a discarded batch were read");
+    passes(3);
+    recorder.Submit();
+    passes(70);
+    failSubmit();
+    std::fill(words, words + 64, 0);
+    Require(recorder.DumpSamples(target, address), "a dump after a discarded fold was not made on the GPU");
+    recorder.Sync();
+    const auto kept = (words[0] & ~SampleReady) - base;
+    Require((words[0] & SampleReady) != 0 && kept > 0, "a discarded batch that folded the segments of a submitted one lost their samples");
+    Require(recorder.SamplesTotal() - base == kept, "the host total and the dump disagree after a discarded fold");
+    if (context.occlusionQueryPrecise) Require(kept == 3 * CoverPass::Samples, "a discarded batch's segments were counted beside the submitted ones it folded");
+    std::fill(words, words + 64, 0);
+    passes(1);
+    Require(recorder.DumpSamples(target, address), "a dump after a discarded batch was not made on the GPU");
+    recorder.Sync();
+    const auto total = recorder.SamplesTotal();
+    Require((words[0] & ~SampleReady) == total && total > base + kept, "a dump after a discarded batch counted the wrong draws");
+    if (context.occlusionQueryPrecise) Require(total == base + 4 * CoverPass::Samples, "a dump after a discarded batch counted the wrong samples");
+}
+
 bool pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -11618,6 +11661,7 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     }
     CoverPass cover(context);
     inPassSampleDumpTests(recorder, context, cover, words, address, target);
+    discardedSampleTests(recorder, context, cover, words, address, target);
 }
 
 void uncountedPassTests(const Device& device) {
