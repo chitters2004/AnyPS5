@@ -1968,8 +1968,14 @@ void CheckUnwrittenGuestAccess(Context context, VkFormat format, std::uint32_t f
         ~Cleanup() { recorder.Sync(); ClearCachedTextures(context.device); ClearDepthSurfaces(context.device); }
     } cleanup{recorder, context};
     const auto resident = [&] { return HasResidentDepthGuards_nid_no_patch() && DepthSurfaceAt(target.address); };
+    for (std::size_t round = 0; round < 2; ++round) ShaderResources::RequireGuestRange(target.address, bytes, std::nullopt);
     auto view = DepthSurfaceView(context, target);
     Require(view != VK_NULL_HANDLE && resident(), "unwritten native depth fixture has no resident owner");
+    ShaderResources::RequireGuestRange(target.address, bytes, std::nullopt);
+    Require(!resident(), "a shader buffer over an unwritten native depth surface, checked clean before it existed, did not retire it");
+    recorder.Sync();
+    view = DepthSurfaceView(context, target);
+    Require(view != VK_NULL_HANDLE && resident(), "rebinding after a shader buffer access did not import a new native depth surface");
     auto otherDevice = context;
     otherDevice.device = VK_NULL_HANDLE;
     TargetRefuses([&] { NoteDepthSurfaceWrite(otherDevice, target); }, "retired while its draw resolved resources");
@@ -3100,6 +3106,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     target.iterate256 = target.htilePipeAligned = target.htileDepthOnly = true;
     const auto words = DepthSampleWords(target);
     const auto resource = DecodeTextureResource(words);
+    for (std::size_t round = 0; round < 2; ++round) ShaderResources::RequireGuestRange(target.address, 1u, std::nullopt);
     const auto firstView = DepthSurfaceView(context, target);
     NoteDepthSurfaceWrite(context, target);
     auto firstTexture = DepthSurfaceTexture(context, words, resource, VkComponentMapping{});
@@ -3112,6 +3119,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     recorder.Sync();
     const auto guarded = [&] {
         TargetRefuses([&] { RequireNoResidentDepthRead_nid_no_patch(target.address, 1u); }, "sample-preserving");
+        TargetRefuses([&] { ShaderResources::RequireGuestRange(target.address, 1u, std::nullopt); }, "sample-preserving");
     };
     {
         GuestAllocations::Mutation mutation;
@@ -3150,6 +3158,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
     }
     RequireNoResidentDepthRead_nid_no_patch(target.address, 1u);
     RequireNoResidentDepthRead_nid_no_patch(target.htileAddress, metadataBytes);
+    ShaderResources::RequireGuestRange(target.address, 1u, std::nullopt);
     Require(!DepthSurfaceHolds(context, resource, firstTexture.get()) && !DepthSurfaceAt(target.address), "a fully released depth owner remains discoverable");
     if ((mode & 1u) != 0u) {
         ClearDepthSurfaces(context.device);

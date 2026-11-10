@@ -6911,9 +6911,59 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
-        RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
-        RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
+        RequireGuestRange(address, bytes, htileClear);
     }
+}
+
+namespace {
+constexpr std::size_t GuestRangeWays = 4;
+constexpr std::size_t GuestRangeSets = 256;
+struct ClearGuestRange {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t depth = 0;
+    std::uint64_t color = 0;
+};
+struct ClearGuestRanges {
+    std::array<ClearGuestRange, GuestRangeSets * GuestRangeWays> entries{};
+    std::size_t victim = 0;
+};
+std::atomic<std::uint64_t> guestRangeScans{0};
+}
+
+std::uint64_t ShaderResources::GuestRangeScans() {
+    return guestRangeScans.load(std::memory_order_relaxed);
+}
+
+std::size_t ShaderResources::GuestRangeSet(std::uint64_t address, std::size_t bytes) {
+    return ((address >> 4) ^ (static_cast<std::uint64_t>(bytes) * 0x9e3779b97f4a7c15ull >> 40)) % GuestRangeSets;
+}
+
+void ShaderResources::RequireGuestRange(std::uint64_t address, std::size_t bytes, const std::optional<std::pair<std::uint64_t, std::size_t>>& htileClear) {
+    if (bytes == 0) return;
+    thread_local ClearGuestRanges* tableSlot = nullptr;
+    auto& table = ShaderRecompiler::ThreadOwned(tableSlot);
+    const auto set = table.entries.data() + GuestRangeSet(address, bytes) * GuestRangeWays;
+    const auto depth = ResidentDepthGuardGeneration();
+    const auto color = MultisampleGuardSpansGeneration();
+    ClearGuestRange* reusable = nullptr;
+    for (std::size_t way = 0; way < GuestRangeWays; ++way) {
+        auto& entry = set[way];
+        if (entry.address == address && entry.bytes == bytes) {
+            if (entry.depth == depth && entry.color == color) return;
+            reusable = &entry;
+            break;
+        }
+        if (!reusable && (entry.bytes == 0 || entry.depth != depth || entry.color != color)) reusable = &entry;
+    }
+    guestRangeScans.fetch_add(1, std::memory_order_relaxed);
+    if (address <= std::numeric_limits<std::uint64_t>::max() - bytes && !ResidentDepthGuardMayOverlap(address, bytes) && !MultisampleGuardMayOverlap(address, bytes)) {
+        if (!reusable) reusable = &set[table.victim++ % GuestRangeWays];
+        *reusable = {address, bytes, depth, color};
+        return;
+    }
+    RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
+    RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

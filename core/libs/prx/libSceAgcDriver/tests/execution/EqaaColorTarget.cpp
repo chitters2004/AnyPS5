@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -240,6 +241,15 @@ std::string GuardRefusal(std::uint64_t address, std::size_t bytes) {
     return {};
 }
 
+std::string RangeRefusal(std::uint64_t address, std::size_t bytes) {
+    try {
+        AgcDriver::Graphics::ShaderResources::RequireGuestRange(address, bytes, std::nullopt);
+    } catch (const std::runtime_error& error) {
+        return error.what();
+    }
+    return {};
+}
+
 }
 
 int main() {
@@ -259,6 +269,27 @@ int main() {
         Require(eqaa.samples == Samples && msaa.samples == Samples, "the EQAA and 4x targets are not drawn at their 4 coverage samples");
         Require(AgcDriver::Graphics::MultisampledColorBytes(eqaa) == EqaaBytes && AgcDriver::Graphics::MultisampledColorBytes(msaa) == MsaaBytes, "the 4-sample 2-fragment target does not occupy the 512 KiB of its fragments, or the 4x target the 1 MiB of its samples");
 
+        const auto scansBefore = AgcDriver::Graphics::ShaderResources::GuestRangeScans();
+        for (std::size_t round = 0; round < 3; ++round) {
+            Require(RangeRefusal(eqaaFmask.Address(), 256u).empty() && RangeRefusal(eqaaColor.Address() + EqaaBytes - 1u, 1u).empty(), "a range no target guards was refused");
+        }
+        Require(AgcDriver::Graphics::ShaderResources::GuestRangeScans() == scansBefore + 2u, "two ranges checked three times each were not scanned exactly once each");
+
+        {
+            constexpr std::size_t Ways = 4;
+            constexpr std::uint64_t Base = 0x700000000000ull;
+            const auto set = AgcDriver::Graphics::ShaderResources::GuestRangeSet(Base, 64u);
+            std::vector<std::uint64_t> colliding;
+            for (std::uint64_t candidate = Base; colliding.size() < Ways; candidate += 16u) {
+                if (AgcDriver::Graphics::ShaderResources::GuestRangeSet(candidate, 64u) == set) colliding.push_back(candidate);
+            }
+            const auto collidingBefore = AgcDriver::Graphics::ShaderResources::GuestRangeScans();
+            for (std::size_t round = 0; round < 3; ++round) {
+                for (const auto address : colliding) Require(RangeRefusal(address, 64u).empty(), "a range no target guards was refused");
+            }
+            Require(AgcDriver::Graphics::ShaderResources::GuestRangeScans() == collidingBefore + Ways, "ranges that map to one table set evicted each other");
+        }
+
         const auto red = Program({1.0f, 0.0f, 0.0f, 1.0f});
         const auto green = Program({0.0f, 1.0f, 0.0f, 1.0f});
         for (const auto* target : {&eqaa, &msaa}) {
@@ -270,6 +301,10 @@ int main() {
         const auto fmaskRefusal = GuardRefusal(eqaaFmask.Address(), 256u);
         Require(fmaskRefusal.find("the FMASK of EQAA color target") != std::string::npos && fmaskRefusal.find("whose samples are only on the host") != std::string::npos, "a read of the EQAA target's FMASK was not refused by name: " + fmaskRefusal);
         Require(!GuardRefusal(eqaaColor.Address() + EqaaBytes - 1u, 1u).empty(), "the last byte of the EQAA target's fragments is not guarded");
+        const auto rangeRefusal = RangeRefusal(eqaaFmask.Address(), 256u);
+        Require(rangeRefusal.find("the FMASK of EQAA color target") != std::string::npos && rangeRefusal.find("a shader buffer access") != std::string::npos, "a shader buffer over the FMASK of a target drawn after the range was last checked was not refused: " + rangeRefusal);
+        Require(!RangeRefusal(eqaaColor.Address() + EqaaBytes - 1u, 1u).empty(), "a shader buffer over the color plane of a target drawn after the range was last checked was not refused");
+        Require(RangeRefusal(eqaaColor.Address() - 1u, 1u).empty() && !RangeRefusal(eqaaColor.Address() - 1u, 2u).empty() && !RangeRefusal(eqaaColor.Address(), 1u).empty(), "a shader buffer range was judged by the range checked before it at the same start");
         Require(GuardRefusal(eqaaColor.Address() + EqaaBytes, static_cast<std::size_t>(MsaaBytes - EqaaBytes)).empty(), "memory past the EQAA target's two fragments is guarded as if it held four samples");
         Require(GuardRefusal(msaaFmask.Address(), 256u).empty(), "the FMASK of a 4-sample 4-fragment target was guarded");
 
@@ -283,8 +318,10 @@ int main() {
 
         Block movedFmask(BlockBytes);
         const auto moved = DecodeTarget(eqaaColor, &movedFmask, CompressedUnorm8x4Info, EqaaAttrib);
+        Require(RangeRefusal(movedFmask.Address(), 256u).empty() && RangeRefusal(movedFmask.Address(), 256u).empty(), "a range no target guards yet was refused");
         Draw(*device, moved, Lower, red);
         device->WaitIdle();
+        Require(RangeRefusal(movedFmask.Address(), 256u).find("the FMASK of EQAA color target") != std::string::npos, "a shader buffer over the FMASK base a target moved to was not refused");
         const auto movedRefusal = GuardRefusal(movedFmask.Address(), 256u);
         Require(movedRefusal.find("the FMASK of EQAA color target") != std::string::npos, "a read of the FMASK base the EQAA target was last drawn with was not refused by name: " + movedRefusal);
         Require(GuardRefusal(eqaaFmask.Address(), 256u).empty(), "the FMASK base the EQAA target was drawn with before is still guarded");

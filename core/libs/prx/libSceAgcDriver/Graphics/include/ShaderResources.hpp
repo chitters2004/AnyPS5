@@ -207,6 +207,9 @@ public:
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void RequireGuestBuffers() const { requireGuestBuffers(); }
+    static void RequireGuestRange(std::uint64_t address, std::size_t bytes, const std::optional<std::pair<std::uint64_t, std::size_t>>& htileClear);
+    static std::uint64_t GuestRangeScans();
+    static std::size_t GuestRangeSet(std::uint64_t address, std::size_t bytes);
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;

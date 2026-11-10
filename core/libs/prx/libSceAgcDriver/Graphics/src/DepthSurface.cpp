@@ -1074,7 +1074,7 @@ public:
         {
             std::unique_lock guardLock(depthGuardMutex());
             for (const auto& range : sampling.initial) depthGuards().push_back({context.device, range.address, range.bytes, active, {{range.address, range.bytes, 0u}}, hostWritten, hostEverWritten});
-            anyDepthGuard().store(true, std::memory_order_release);
+            publishDepthGuards(true);
         }
         InstallResidentImageReadGuard_nid_no_patch();
         samplingActive = true;
@@ -3247,6 +3247,14 @@ void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target) {
         }
     }
     Require(attached, "a native multisample depth attachment was retired while its draw resolved resources");
+}
+
+std::uint64_t ResidentDepthGuardGeneration() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+bool ResidentDepthGuardMayOverlap(std::uint64_t address, std::uint64_t bytes) {
+    return mayOverlapDepthGuard(address, bytes);
 }
 
 bool HasResidentDepthGuards_nid_no_patch() {

@@ -12365,8 +12365,11 @@ void oneFragmentFmaskGuardTests(const Device& device) {
     target.samples = 1;
     target.coverageSamples = 4;
     target.fmaskAddress = address;
+    const std::optional<std::pair<std::uint64_t, std::size_t>> noClear;
+    for (std::size_t round = 0; round < 2; ++round) ShaderResources::RequireGuestRange(address + 256u, 64u, noClear);
     GuardOneFragmentFmask(context, target);
     GuardOneFragmentFmask(context, target);
+    refused([&] { ShaderResources::RequireGuestRange(address + 256u, 64u, noClear); }, "a shader buffer range");
     std::array<std::byte, 64> words{};
     refused([&] { AgcDriver::GuestMemory::Read(address + 256u, words); }, "a CPU read");
     refused([&] { RequireNoMultisampleTarget(address + 65535u, 1u, "a DMA copy"); }, "a DMA copy of the last guarded byte");
