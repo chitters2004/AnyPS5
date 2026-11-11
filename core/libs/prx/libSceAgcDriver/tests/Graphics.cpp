@@ -13659,6 +13659,15 @@ void recordedDrawRetentionTests() {
     Require(retentionFences.size() == 1, "the first replay batch was not submitted");
     const auto hit = DrawWithRecipe(context, state, draw, shaders, {}, *replayed);
     Require(hit.recorded, "the replay draw did not record from its recipe");
+    const auto effectsBefore = ShaderResources::EffectRepeatCounts();
+    const auto again = DrawWithRecipe(context, state, draw, shaders, {}, *replayed);
+    Require(again.recorded, "the second replay draw in the batch did not record from its recipe");
+    const auto effectsAfter = ShaderResources::EffectRepeatCounts();
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        Require(effectsAfter.probed == effectsBefore.probed + 1 && effectsAfter.repeated == effectsBefore.repeated + 1 && effectsAfter.identical == effectsBefore.identical + 1, "a recipe hit repeating its resources in one batch was not counted as a repeat with unchanged effect inputs");
+    } else {
+        Require(effectsAfter.probed == effectsBefore.probed, "resources effects were probed without APS5_PROFILE_DRAW");
+    }
     Require(owned(), "recorded owners expired after a recipe hit in the next batch");
     mock.signaled.at(retentionFences.front()) = true;
     Require(recorder.Reap(), "the first replay batch was not retired");

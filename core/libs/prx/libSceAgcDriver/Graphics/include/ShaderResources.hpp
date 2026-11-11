@@ -335,6 +335,11 @@ public:
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
+    void ProbeEffectRepeat(const Recorder& recorder);
+    struct EffectRepeats {
+        std::uint64_t probed, repeated, identical;
+    };
+    static EffectRepeats EffectRepeatCounts();
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
@@ -668,6 +673,8 @@ private:
     std::shared_ptr<ShaderResources> afterRunSelf;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
+    struct EffectInputs;
+    std::unique_ptr<EffectInputs> effectInputs;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
     bool bdaReadOnly = true;

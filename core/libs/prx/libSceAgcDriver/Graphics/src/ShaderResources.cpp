@@ -2847,6 +2847,7 @@ std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
 std::atomic<std::uint64_t> inPlaceReadReuses{0};
+std::atomic<std::uint64_t> effectsProbed{0}, effectsRepeated{0}, effectsIdentical{0};
 thread_local bool indexProof = false;
 
 }
@@ -2910,6 +2911,51 @@ std::uint64_t ShaderResources::DepthGuardRefusals() {
 
 std::uint64_t ShaderResources::InPlaceReadReuses() {
     return inPlaceReadReuses.load(std::memory_order_relaxed);
+}
+
+struct ShaderResources::EffectInputs {
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    const void* space = nullptr;
+    Recorder::ReadKind kind = Recorder::ReadKind::Count;
+    std::vector<std::pair<const void*, bool>> images;
+    bool operator==(const EffectInputs&) const = default;
+};
+
+namespace {
+
+Recorder::ReadKind InPlaceReadKind(bool lease, bool usesBda, bool bdaReadOnly) {
+    static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
+    return !lease ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+}
+
+}
+
+ShaderResources::EffectRepeats ShaderResources::EffectRepeatCounts() {
+    return {effectsProbed.load(std::memory_order_relaxed), effectsRepeated.load(std::memory_order_relaxed), effectsIdentical.load(std::memory_order_relaxed)};
+}
+
+void ShaderResources::ProbeEffectRepeat(const Recorder& recorder) {
+    auto current = std::make_unique<EffectInputs>();
+    current->recorder = &recorder;
+    current->batch = recorder.BatchEpoch();
+    const auto space = guestMemory.SplitInPlaceReads(current->reads);
+    if (space == nullptr) guestMemory.InPlaceReads(current->reads);
+    current->space = space.get();
+    current->kind = InPlaceReadKind(guestMemory.HoldsLease(), usesBda, bdaReadOnly);
+    const auto image = [&](const std::shared_ptr<StorageTexture>& texture) {
+        if (texture != nullptr) current->images.emplace_back(texture.get(), texture->Cached());
+    };
+    for (const auto& texture : storageTextures) image(texture);
+    for (const auto& texture : textures) {
+        if (texture != nullptr) image(texture->SharedStorageSource());
+    }
+    const bool repeated = effectInputs != nullptr && effectInputs->recorder == current->recorder && effectInputs->batch == current->batch;
+    effectsProbed.fetch_add(1, std::memory_order_relaxed);
+    if (repeated) effectsRepeated.fetch_add(1, std::memory_order_relaxed);
+    if (repeated && *effectInputs == *current) effectsIdentical.fetch_add(1, std::memory_order_relaxed);
+    effectInputs = std::move(current);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -6976,8 +7022,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
-    const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    const auto kind = InPlaceReadKind(guestMemory.HoldsLease(), usesBda, bdaReadOnly);
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
     auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
     auto reads = std::move(ownedReads);
