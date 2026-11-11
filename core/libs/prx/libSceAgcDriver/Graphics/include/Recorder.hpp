@@ -964,6 +964,12 @@ private:
         std::size_t bytes = 0;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    std::uint64_t drawSnapshotsVersion = 0;
+    struct DrawSnapshotProbe {
+        DrawSnapshotKey key{};
+        std::map<DrawSnapshotKey, DrawSnapshot>::iterator at{};
+        std::uint64_t version = ~std::uint64_t{0};
+    } drawSnapshotProbe;
     struct UnwrittenSnapshot {
         std::size_t bytes;
         std::shared_ptr<Buffer> buffer;
@@ -975,6 +981,8 @@ private:
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    std::map<DrawSnapshotKey, DrawSnapshot>::iterator drawSnapshotAtLeast(const DrawSnapshotKey& key);
+    std::map<DrawSnapshotKey, DrawSnapshot>::iterator drawSnapshotExact(const DrawSnapshotKey& key);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
