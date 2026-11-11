@@ -3252,6 +3252,73 @@ void RunMappingBench(int collectors, int spinners) {
 }
 #endif
 
+enum WalkCount : std::size_t { Walks, ReleasedWalks, ConcurrentWalks, GranuleOnlyWalks, WaitedWalks, WaitNanoseconds, LockedNanoseconds, ReleasedNanoseconds, ClosureRanges, ClosureGranules = ClosureRanges + 4, WalkCountTotal = ClosureGranules + 4 };
+
+std::array<std::uint64_t, WalkCountTotal> WalkCounts() {
+    std::array<std::uint64_t, WalkCountTotal> counts{};
+    WalkCountersForTest(counts.data(), counts.size());
+    return counts;
+}
+
+std::uint64_t WalkDelta(const std::array<std::uint64_t, WalkCountTotal>& before, const std::array<std::uint64_t, WalkCountTotal>& after, std::size_t index) {
+    return after[index] - before[index];
+}
+
+void CheckWalkCounters() {
+    constexpr std::size_t granule = std::size_t{1} << 21;
+    constexpr std::size_t bytes = 3 * granule;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto first = (base + granule - 1) & ~static_cast<std::uint64_t>(granule - 1);
+    std::memset(memory, 0x11, bytes);
+#ifndef _WIN32
+    SetReleasedWalksForTest(true);
+#endif
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    auto before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(first, Block));
+    auto after = WalkCounts();
+    Require(WalkDelta(before, after, Walks) == 1, "a collect was not counted as one walk");
+    Require(WalkDelta(before, after, ClosureRanges) == 1 && WalkDelta(before, after, ClosureGranules) == 1, "a walk of one unaliased block was not counted with one range in one granule");
+    Require(WalkDelta(before, after, ConcurrentWalks) == 0 && WalkDelta(before, after, WaitedWalks) == 0, "a lone walk was counted as concurrent or waiting");
+#ifdef _WIN32
+    Require(WalkDelta(before, after, LockedNanoseconds) != 0, "the locked walk's time was not counted");
+#else
+    Require(WalkDelta(before, after, ReleasedWalks) == 1 && WalkDelta(before, after, ReleasedNanoseconds) != 0, "a released walk or its time was not counted");
+    const auto views = MapAliasedViews("aps5-walk-counters", true);
+    static_cast<void>(CollectWritesUncached(views.first, Block));
+    before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(views.first, Block));
+    after = WalkCounts();
+    Require(WalkDelta(before, after, ClosureRanges + 1) == 1, "a walk of an aliased view was not counted with its alias in its closure");
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(first, Block)); });
+    AwaitHeldWalk(1);
+    before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(first + granule, Block));
+    after = WalkCounts();
+    const bool otherGranule = WalkDelta(before, after, ConcurrentWalks) == 1 && WalkDelta(before, after, GranuleOnlyWalks) == 0;
+    before = after;
+    static_cast<void>(CollectWritesUncached(first + 2 * Block, Block));
+    after = WalkCounts();
+    const bool sameGranule = WalkDelta(before, after, ConcurrentWalks) == 1 && WalkDelta(before, after, GranuleOnlyWalks) == 1;
+    before = after;
+    std::thread waiter([&] { static_cast<void>(CollectWritesUncached(first, Block)); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (WalkCounts()[WaitedWalks] == before[WaitedWalks] && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool waited = WalkCounts()[WaitedWalks] != before[WaitedWalks];
+    ReleaseWalk(1);
+    walker.join();
+    waiter.join();
+    DisarmWalkGate();
+    after = WalkCounts();
+    Require(otherGranule, "a walk in another granule beside a held walk was not counted as concurrent only");
+    Require(sameGranule, "a disjoint walk in a held walk's granule was not counted as sharing only its granule");
+    Require(waited, "a walk overlapping a held walk was not counted as waiting");
+    Require(WalkDelta(before, after, WaitNanoseconds) != 0, "the time a walk waited was not counted");
+#endif
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -3266,6 +3333,15 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--lossless-consume") {
             CheckLosslessConsume();
             std::cout << "lossless consume tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--walk-counters") {
+            if (std::getenv("APS5_PROFILE_DRAW") == nullptr) {
+                std::cout << "walk counters count only under APS5_PROFILE_DRAW: skipped\n";
+                return 77;
+            }
+            CheckWalkCounters();
+            std::cout << "walk counter tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--mapping-changes") {

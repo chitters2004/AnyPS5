@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -351,6 +352,48 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+constexpr unsigned ShardGranuleShift = 21;
+struct WalkCounters {
+    std::atomic<std::uint64_t> walks{0};
+    std::atomic<std::uint64_t> released{0};
+    std::atomic<std::uint64_t> concurrent{0};
+    std::atomic<std::uint64_t> granuleOnly{0};
+    std::atomic<std::uint64_t> waited{0};
+    std::atomic<std::uint64_t> waitNanoseconds{0};
+    std::atomic<std::uint64_t> lockedNanoseconds{0};
+    std::atomic<std::uint64_t> releasedNanoseconds{0};
+    std::array<std::atomic<std::uint64_t>, 4> closureRanges{};
+    std::array<std::atomic<std::uint64_t>, 4> closureGranules{};
+};
+WalkCounters walkCounters;
+
+std::size_t walkBucket(std::size_t count) {
+    return count <= 1 ? 0 : count <= 4 ? 1 : count <= 16 ? 2 : 3;
+}
+
+#ifdef __linux__
+std::atomic<std::uint64_t> reportedShootdowns{0};
+
+std::uint64_t tlbShootdowns() {
+    std::ifstream interrupts("/proc/interrupts");
+    std::string line;
+    while (std::getline(interrupts, line)) {
+        const auto label = line.find_first_not_of(' ');
+        if (label == std::string::npos || line.compare(label, 4, "TLB:") != 0) continue;
+        std::uint64_t total = 0;
+        const char* cursor = line.c_str() + label + 4;
+        for (;;) {
+            char* end = nullptr;
+            const auto value = std::strtoull(cursor, &end, 10);
+            if (end == cursor) break;
+            total += value;
+            cursor = end;
+        }
+        return total;
+    }
+    return 0;
+}
+#endif
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -576,6 +619,12 @@ public:
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        const auto& walks = walkCounters;
+        AgcDriver::ProfilePrint_nid_no_patch(" | walks %llu released %llu concurrent %llu granule-only %llu waited %llu (%.1f ms) walk ms locked %.1f released %.1f closure ranges %llu/%llu/%llu/%llu granules %llu/%llu/%llu/%llu", static_cast<unsigned long long>(walks.walks.load()), static_cast<unsigned long long>(walks.released.load()), static_cast<unsigned long long>(walks.concurrent.load()), static_cast<unsigned long long>(walks.granuleOnly.load()), static_cast<unsigned long long>(walks.waited.load()), walks.waitNanoseconds.load() / 1e6, walks.lockedNanoseconds.load() / 1e6, walks.releasedNanoseconds.load() / 1e6, static_cast<unsigned long long>(walks.closureRanges[0].load()), static_cast<unsigned long long>(walks.closureRanges[1].load()), static_cast<unsigned long long>(walks.closureRanges[2].load()), static_cast<unsigned long long>(walks.closureRanges[3].load()), static_cast<unsigned long long>(walks.closureGranules[0].load()), static_cast<unsigned long long>(walks.closureGranules[1].load()), static_cast<unsigned long long>(walks.closureGranules[2].load()), static_cast<unsigned long long>(walks.closureGranules[3].load()));
+#ifdef __linux__
+        const auto shootdowns = tlbShootdowns();
+        AgcDriver::ProfilePrint_nid_no_patch(" tlb-ipis in 10 s %llu", static_cast<unsigned long long>(shootdowns - reportedShootdowns.exchange(shootdowns)));
+#endif
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -1387,6 +1436,12 @@ struct WriteTracker {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> walking;
     std::condition_variable_any walked;
 
+    bool walkSharesGranule(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+        return std::any_of(walking.begin(), walking.end(), [&](const auto& busy) {
+            return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return (busy.first >> ShardGranuleShift) <= ((range.second - 1) >> ShardGranuleShift) && (range.first >> ShardGranuleShift) <= ((busy.second - 1) >> ShardGranuleShift); });
+        });
+    }
+
     bool walkOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
         return std::any_of(ranges.begin(), ranges.end(), [&](const auto& wanted) { return std::any_of(walking.begin(), walking.end(), [&](const auto& range) { return range.first < wanted.second && wanted.first < range.second; }); });
     }
@@ -1814,12 +1869,38 @@ public:
         return active;
     }
 
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> AwaitWalks(std::uint64_t first, std::uint64_t stop) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> AwaitWalks(std::uint64_t first, std::uint64_t stop, bool walk = false) {
+        std::chrono::steady_clock::time_point waitStart{};
         for (;;) {
             auto closure = walkClosure(first, stop);
-            if (!tracker.walkOverlaps(closure)) return closure;
+            if (!tracker.walkOverlaps(closure)) {
+                if (walk) noteWalk(closure, waitStart);
+                return closure;
+            }
+            if (walk && MemoryProfiled() && waitStart == std::chrono::steady_clock::time_point{}) {
+                waitStart = std::chrono::steady_clock::now();
+                walkCounters.waited.fetch_add(1, std::memory_order_relaxed);
+            }
             tracker.walked.wait(lock);
         }
+    }
+
+    void noteWalk(std::span<const std::pair<std::uint64_t, std::uint64_t>> closure, std::chrono::steady_clock::time_point waitStart) const {
+        if (!MemoryProfiled()) return;
+        auto& counters = walkCounters;
+        counters.walks.fetch_add(1, std::memory_order_relaxed);
+        if (waitStart != std::chrono::steady_clock::time_point{}) counters.waitNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), std::memory_order_relaxed);
+        if (!tracker.walking.empty()) {
+            counters.concurrent.fetch_add(1, std::memory_order_relaxed);
+            if (tracker.walkSharesGranule(closure)) counters.granuleOnly.fetch_add(1, std::memory_order_relaxed);
+        }
+        counters.closureRanges[walkBucket(closure.size())].fetch_add(1, std::memory_order_relaxed);
+        std::vector<std::uint64_t> granules;
+        for (const auto& [begin, end] : closure) {
+            for (auto granule = begin >> ShardGranuleShift; granule <= (end - 1) >> ShardGranuleShift; ++granule) granules.push_back(granule);
+        }
+        std::sort(granules.begin(), granules.end());
+        counters.closureGranules[walkBucket(static_cast<std::size_t>(std::unique(granules.begin(), granules.end()) - granules.begin()))].fetch_add(1, std::memory_order_relaxed);
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
@@ -2135,6 +2216,20 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 
 std::atomic<void (*)(int stage)> releasedWalkHook{nullptr};
 
+class WalkTimer {
+public:
+    explicit WalkTimer(std::atomic<std::uint64_t>& total) : total(total), start(MemoryProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~WalkTimer() {
+        if (MemoryProfiled()) total.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    }
+    WalkTimer(const WalkTimer&) = delete;
+    WalkTimer& operator=(const WalkTimer&) = delete;
+
+private:
+    std::atomic<std::uint64_t>& total;
+    std::chrono::steady_clock::time_point start;
+};
+
 #ifndef _WIN32
 std::atomic<int> releasedWalksForTest{-1};
 
@@ -2168,8 +2263,10 @@ bool walkReleased(TrackerLock& lock, WriteTracker& tracker, const std::vector<st
     ConsumedRuns written;
     bool complete = false;
     std::exception_ptr failure;
+    if (MemoryProfiled()) walkCounters.released.fetch_add(1, std::memory_order_relaxed);
     {
         const TrackerLock::Suspension suspended{lock};
+        const WalkTimer timer{walkCounters.releasedNanoseconds};
         try {
             const auto hook = releasedWalkHook.load(std::memory_order_acquire);
             if (hook != nullptr) hook(0);
@@ -2202,12 +2299,13 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     auto* lock = TrackerLock::activeLock();
 #ifndef _WIN32
     if (lock != nullptr) {
-        const auto closure = lock->AwaitWalks(first, stop);
+        const auto closure = lock->AwaitWalks(first, stop, true);
         if (kind == StampKind::Cpu && window == nullptr && releasedWalks()) return walkReleased(*lock, tracker, closure, armedOnly);
     }
 #else
-    if (lock != nullptr) static_cast<void>(lock->AwaitWalks(first, stop));
+    if (lock != nullptr) static_cast<void>(lock->AwaitWalks(first, stop, true));
 #endif
+    const WalkTimer timer{walkCounters.lockedNanoseconds};
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
@@ -2984,6 +3082,12 @@ void SetConsumeCapacityForTest(std::size_t runs) {
 
 std::uint64_t ConsumeCompactionsForTest() {
     return consumeCompactions.load(std::memory_order_acquire);
+}
+
+void WalkCountersForTest(std::uint64_t* values, std::size_t count) {
+    const auto& counters = walkCounters;
+    const std::array<std::uint64_t, 16> all{counters.walks.load(), counters.released.load(), counters.concurrent.load(), counters.granuleOnly.load(), counters.waited.load(), counters.waitNanoseconds.load(), counters.lockedNanoseconds.load(), counters.releasedNanoseconds.load(), counters.closureRanges[0].load(), counters.closureRanges[1].load(), counters.closureRanges[2].load(), counters.closureRanges[3].load(), counters.closureGranules[0].load(), counters.closureGranules[1].load(), counters.closureGranules[2].load(), counters.closureGranules[3].load()};
+    std::copy_n(all.begin(), std::min(count, all.size()), values);
 }
 
 std::uint64_t ConservativeInvalidationsForTest() {
