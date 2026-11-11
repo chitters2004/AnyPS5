@@ -230,6 +230,7 @@ struct WriteIndex {
     AgcDriver::Mutex overflowMutex;
     std::atomic<std::uint64_t> live{0};
     std::atomic<std::uint64_t> backedLive{0};
+    std::atomic<std::uint64_t> calls{0};
     std::vector<std::uint32_t> freeSlots;
     std::uint64_t slotCount = 0;
     std::array<std::atomic<Chunk*>, ChunkCount> chunks{};
@@ -367,6 +368,7 @@ Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource sourc
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
     auto& index = Index();
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
+    index.calls.fetch_add(1, std::memory_order_relaxed);
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto first = address / IndexBlockBytes;
@@ -592,6 +594,7 @@ void NoteTextureReleased(std::uint64_t address) {
 WriteIndexStats WriteIndexCounted() {
     auto& index = Index();
     WriteIndexStats stats;
+    stats.calls = index.calls.load(std::memory_order_relaxed);
     stats.subscriptions = index.subscriptions.load(std::memory_order_relaxed);
     stats.blocks = index.blocks.load(std::memory_order_relaxed);
     stats.bumps = index.bumps.load(std::memory_order_relaxed);
@@ -609,7 +612,7 @@ WriteIndexStats WriteIndexCounted() {
 
 void ResetWriteIndexCounts() {
     auto& index = Index();
-    for (auto* counter : {&index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds}) counter->store(0, std::memory_order_relaxed);
+    for (auto* counter : {&index.calls, &index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds}) counter->store(0, std::memory_order_relaxed);
     for (auto& counter : index.bySource) counter.store(0, std::memory_order_relaxed);
     for (auto& sizes : index.bySize) {
         for (auto& counter : sizes) counter.store(0, std::memory_order_relaxed);

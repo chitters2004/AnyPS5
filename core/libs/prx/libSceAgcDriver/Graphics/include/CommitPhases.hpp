@@ -96,6 +96,7 @@ enum class CommitPhase : std::uint8_t {
     RecordBeginBind,
     RecordBeginDynamic,
     RecordBeginLibrary,
+    RevalidateCertified,
     Count
 };
 
