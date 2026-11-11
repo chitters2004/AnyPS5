@@ -8,7 +8,7 @@
 #include <optional>
 #include <span>
 #include <atomic>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -179,7 +179,7 @@ struct PreparedShaders : PreparedShaderState {
     std::vector<DeferredAbi> deferredAbis;
     bool deferredPreparing = false;
     std::mutex mutex;
-    std::condition_variable settled;
+    AddressCondition settled;
     std::exception_ptr failure;
     std::atomic<bool> demanded{false};
     bool pending = false;

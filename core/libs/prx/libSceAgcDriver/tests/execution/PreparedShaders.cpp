@@ -441,7 +441,7 @@ void SettleLater(AgcDriver::DriverDetail::PreparedShaders& prepared, std::vector
         prepared.failure = failure;
         prepared.pending = false;
     }
-    prepared.settled.notify_all();
+    prepared.settled.NotifyAll();
 }
 
 std::exception_ptr InjectedFailure() {
@@ -518,7 +518,7 @@ void ReferencedRegistrationPreparation() {
             std::lock_guard lock(snapshot->prepared->mutex);
             snapshot->prepared->pending = false;
         }
-        snapshot->prepared->settled.notify_all();
+        snapshot->prepared->settled.NotifyAll();
     };
     boundSnapshot->prepared->pending = true;
     unrelatedSnapshot->prepared->pending = true;
@@ -723,7 +723,7 @@ void PendingPreparationOutsideTransactionLock() {
         std::lock_guard lock(pending.prepared->mutex);
         pending.prepared->pending = false;
     }
-    pending.prepared->settled.notify_all();
+    pending.prepared->settled.NotifyAll();
     waiter.get();
     other.get();
     Require(independent, "a transaction on a prepared shader waited for another transaction's pending registration preparation");
