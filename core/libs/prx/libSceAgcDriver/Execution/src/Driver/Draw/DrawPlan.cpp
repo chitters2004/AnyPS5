@@ -354,7 +354,8 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
             drawPlanCounters.Add(DrawPlanCount::RebasedHits);
             drawPlanCounters.Add(DrawPlanCount::RebasedBuffers, outcome.movedBuffers);
         }
-        if (plan->servable && outcome.movedBuffers == 0 && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
+        if (outcome.templateInstance) drawPlanCounters.Add(DrawPlanCount::TemplateInstanceHits);
+        if (plan->servable && outcome.movedBuffers == 0 && !outcome.templateInstance && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
         if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
         if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         return true;
@@ -364,7 +365,17 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         case Graphics::DrawRecipeMiss::TargetGone: drawPlanCounters.Add(DrawPlanCount::MissTargetGone); break;
         case Graphics::DrawRecipeMiss::TemplateGone: drawPlanCounters.Add(DrawPlanCount::MissTemplateGone); break;
         case Graphics::DrawRecipeMiss::Proof: drawPlanCounters.Add(DrawPlanCount::MissProof); break;
-        case Graphics::DrawRecipeMiss::Instance: drawPlanCounters.Add(DrawPlanCount::MissInstance); break;
+        case Graphics::DrawRecipeMiss::Instance:
+            drawPlanCounters.Add(DrawPlanCount::MissInstance);
+            switch (outcome.instance) {
+                case Graphics::DrawPlanInstance::Shape: drawPlanCounters.Add(DrawPlanCount::InstanceShape); break;
+                case Graphics::DrawPlanInstance::Template: drawPlanCounters.Add(DrawPlanCount::InstanceTemplate); break;
+                case Graphics::DrawPlanInstance::Target: drawPlanCounters.Add(DrawPlanCount::InstanceTarget); break;
+                case Graphics::DrawPlanInstance::View: drawPlanCounters.Add(DrawPlanCount::InstanceView); break;
+                case Graphics::DrawPlanInstance::Depth: drawPlanCounters.Add(DrawPlanCount::InstanceDepth); break;
+                default: break;
+            }
+            break;
         case Graphics::DrawRecipeMiss::Moved: drawPlanCounters.Add(outcome.patchedData ? DrawPlanCount::MissPatchedData : DrawPlanCount::MissMoved); break;
         default: drawPlanCounters.Add(DrawPlanCount::MissObjectsGone); break;
     }

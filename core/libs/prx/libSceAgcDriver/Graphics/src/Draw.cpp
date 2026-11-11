@@ -1489,6 +1489,11 @@ bool DrawPlans() {
     return forced < 0 ? plans : forced != 0;
 }
 
+bool DrawPlanTemplates() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_PLAN_TEMPLATES") == nullptr;
+    return enabled;
+}
+
 bool VerifyDrawPlans() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr;
     return verify;
@@ -3973,6 +3978,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
             recipe->renderExtent = state.renderExtent;
+            const auto layouts = resources->SetLayouts();
+            recipe->mainSetKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+            recipe->fragmentSetKey.assign(layouts.fragmentKey.begin(), layouts.fragmentKey.end());
+            recipe->splitSets = layouts.split;
             if (DrawPlans()) {
                 for (const auto& shader : shaders) {
                     recipe->bindingWords.push_back(PlanStageWordsOf(shader));
@@ -4386,7 +4395,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 namespace {
 
-void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
+void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const ResourceCache::Key& key, bool templateInstance, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
     DrawOutcome scratch;
     DrawTimer scratchTimer(false);
     const auto full = planDraw(context, state, draw, shaders, nullptr, scratch, scratchTimer);
@@ -4394,7 +4403,8 @@ void requirePlanDecisionsRepeat(const Context& context, const State& state, cons
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
     const auto& layout = full.VertexLayout();
     Require(!full.nothing && full.fragmentOutputs == plan.fragmentOutputs && full.shaderStages == plan.shaderStages && std::ranges::equal(layout.bindings, plan.vertexInput.bindings, sameBinding) && std::ranges::equal(layout.attributes, plan.vertexInput.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLANS: the plan's fragment outputs, pipeline stages or vertex input differ from the full path's");
-    Require(full.keyed && full.contentKey == plan.key, "APS5_VERIFY_DRAW_PLANS: the plan's resource template key differs from the full path's");
+    Require(full.keyed && full.contentKey == key, "APS5_VERIFY_DRAW_PLANS: the resource template key a plan hit used differs from the full path's");
+    Require(!templateInstance || SharedResourceCache().Find(key).get() == &resources, "APS5_VERIFY_DRAW_PLANS: a plan hit with another template bound one the resource cache does not hold for the draw's key");
     if (!moved.empty()) {
         const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(full.indexBytes), snapshots);
         Require(resources.BoundBuffers(moved) == fresh.BoundBuffers(), "APS5_VERIFY_DRAW_PLANS: the buffers a plan hit rebound differ from those a full build of the draw binds");
@@ -4438,8 +4448,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     const bool planned = use == DrawRecipeUse::Plan;
     bool rebinds = false;
+    const ResourceCache::Key* usedKey = &recipe.key;
+    ResourceCache::Key instanceKey;
+    std::shared_ptr<ShaderResources> instanceTemplate;
+    const auto instanceMiss = [&](DrawPlanInstance reason) {
+        result.instance = reason;
+        return miss(DrawRecipeMiss::Instance);
+    };
     if (planned) {
-        if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
+        if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return instanceMiss(DrawPlanInstance::Shape);
         rebinds = recipe.movedBases != 0;
         for (std::size_t index = 0; index < shaders.size(); ++index) {
             const auto words = PlanStageWordsOf(shaders[index]);
@@ -4455,7 +4472,18 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             if (!same) rebinds = true;
         }
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-        if (rebinds && DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey) != recipe.key) return miss(DrawRecipeMiss::Instance);
+        if (rebinds) {
+            instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+            if (instanceKey != recipe.key) {
+                if (!DrawPlanTemplates()) return instanceMiss(DrawPlanInstance::Template);
+                instanceTemplate = SharedResourceCache().Find(instanceKey);
+                if (instanceTemplate == nullptr || !instanceTemplate->Reusable() || instanceTemplate->SpaceReuse()) return instanceMiss(DrawPlanInstance::Template);
+                const auto layouts = instanceTemplate->SetLayouts();
+                if (layouts.split != recipe.splitSets || !std::ranges::equal(layouts.mainKey, recipe.mainSetKey) || !std::ranges::equal(layouts.fragmentKey, recipe.fragmentSetKey)) return instanceMiss(DrawPlanInstance::Template);
+                usedKey = &instanceKey;
+                result.templateInstance = true;
+            }
+        }
         ValidateVertexAddresses(shaders.front().program->vertexAttributes);
     }
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
@@ -4480,7 +4508,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr) return miss(DrawRecipeMiss::TargetGone);
         const auto surface = SurfaceForTarget(state.colors[index]);
-        if (planned && !StorageImageCachedFor(context, stored.get(), surface)) return miss(StorageImageCached(context, stored.get()) ? DrawRecipeMiss::Instance : DrawRecipeMiss::TargetGone);
+        if (planned && !StorageImageCachedFor(context, stored.get(), surface)) return StorageImageCached(context, stored.get()) ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
         if ((!planned && !StorageImageCached(context, stored.get())) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
@@ -4490,27 +4518,27 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         const auto& color = state.colors[index];
-        if (planned && resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index]) return miss(DrawRecipeMiss::Instance);
+        if (planned && resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index]) return instanceMiss(DrawPlanInstance::View);
         targets.push_back(std::move(resident));
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
         const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
         timer.phase(PhaseReadTarget);
-        if (recipe.targetViews.back() != depthView) return miss(planned ? DrawRecipeMiss::Instance : DrawRecipeMiss::TargetGone);
+        if (recipe.targetViews.back() != depthView) return planned ? instanceMiss(DrawPlanInstance::Depth) : miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
-    auto resources = recipe.templateRef.lock();
+    auto resources = instanceTemplate != nullptr ? std::move(instanceTemplate) : recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
-        SharedResourceCache().Remove(recipe.key, resources.get());
+        SharedResourceCache().Remove(*usedKey, resources.get());
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
         recorder->Keep(std::move(resources));
@@ -4529,7 +4557,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-    SharedResourceCache().Touch(recipe.key);
+    SharedResourceCache().Touch(*usedKey);
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();
@@ -4540,7 +4568,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // same objects), so AcquireFramebuffer only runs when the list evicted it.
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
-    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *resources, moved, pipeline, targets);
+    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *usedKey, result.templateInstance, *resources, moved, pipeline, targets);
     const bool sameExtent = recipe.renderExtent.width == state.renderExtent.width && recipe.renderExtent.height == state.renderExtent.height;
     auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {

@@ -67,6 +67,12 @@ enum class DrawPlanCount : std::size_t {
     MissPatchedData,
     RebasedHits,
     RebasedBuffers,
+    InstanceShape,
+    InstanceTemplate,
+    InstanceTarget,
+    InstanceView,
+    InstanceDepth,
+    TemplateInstanceHits,
     Count
 };
 

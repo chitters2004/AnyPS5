@@ -110,6 +110,7 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // resource cache and kept by the batch).
 enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Instance, Moved, Count };
 enum class DrawRecipeUse : std::uint8_t { Exact, Plan };
+enum class DrawPlanInstance : std::uint8_t { None, Shape, Template, Target, View, Depth };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -122,6 +123,8 @@ struct DrawRecipeOutcome {
     std::uint32_t comparedBindingStages = 0;
     std::uint32_t movedBuffers = 0;
     bool patchedData = false;
+    DrawPlanInstance instance = DrawPlanInstance::None;
+    bool templateInstance = false;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
@@ -134,6 +137,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 bool DrawRecipes();
 bool DrawPlanShadow();
 bool DrawPlans();
+bool DrawPlanTemplates();
 bool VerifyDrawPlans();
 void SetDrawPlansForTest(int enabled);
 struct StageKeyMemoCounts {

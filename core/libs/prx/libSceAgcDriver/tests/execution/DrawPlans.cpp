@@ -416,6 +416,13 @@ void ReboundPlansStayOffTheExactPath() {
         Draw(target, {.colourBuffer = &moved, .colourStride = 4u, .scale = 8.0f});
         const auto stride = Since(beforeStride);
         if (planned && PlansOn()) Expect(stride[DrawPlanCount::Hits] == 0 && stride[DrawPlanCount::MissInstance] == 1, "a moved colour buffer whose descriptor also changed its stride was not refused as another instance");
+        const auto beforeRepeat = Counts();
+        Draw(target, {.colourBuffer = &moved, .colourStride = 4u, .scale = 8.0f});
+        const auto repeat = Since(beforeRepeat);
+        if (planned && PlansOn()) {
+            if (AgcDriver::Graphics::DrawPlanTemplates()) Expect(repeat[DrawPlanCount::Hits] == 1 && repeat[DrawPlanCount::TemplateInstanceHits] == 1, "a draw whose template the resource cache held under another key than its plan's was not served by the plan with that template");
+            else Expect(repeat[DrawPlanCount::Hits] == 0 && repeat[DrawPlanCount::InstanceTemplate] == 1, "a draw with another template than its plan's was served while APS5_NO_DRAW_PLAN_TEMPLATES is set");
+        }
         return Since(before);
     };
     GuestBlock planned;

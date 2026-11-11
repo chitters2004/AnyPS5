@@ -93,6 +93,9 @@ struct DrawRecipe {
     VkExtent2D renderExtent{};
     std::vector<PlanStageWords> bindingWords;
     std::vector<std::vector<std::uint32_t>> verifyWords;
+    std::vector<std::uint32_t> mainSetKey;
+    std::vector<std::uint32_t> fragmentSetKey;
+    bool splitSets = false;
     bool servable = true;
     bool plannable = true;
     std::uint32_t movedBases = 0;
