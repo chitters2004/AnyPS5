@@ -935,6 +935,9 @@ private:
     std::atomic<std::size_t> recordedLabels{0};
     std::unique_ptr<Batch> open;
     std::uint64_t batchEpoch = 0;
+    static std::size_t pointerHash(const void* object) {
+        return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(object) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u);
+    }
     template<typename TKey, typename THash>
     class BatchKeySet {
     public:
@@ -988,6 +991,15 @@ private:
         }
     };
     BatchKeySet<ReadKey, ReadKeyHash> notedReadKeys;
+    struct ReadListKey {
+        const void* list = nullptr;
+        ReadKind kind = ReadKind::Count;
+        bool operator==(const ReadListKey&) const = default;
+    };
+    struct ReadListKeyHash {
+        std::size_t operator()(const ReadListKey& key) const { return pointerHash(key.list) ^ static_cast<std::size_t>(key.kind); }
+    };
+    BatchKeySet<ReadListKey, ReadListKeyHash> notedReadLists;
     void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
 
     std::vector<std::shared_ptr<void>> holdKept;
