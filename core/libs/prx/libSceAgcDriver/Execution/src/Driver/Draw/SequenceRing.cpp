@@ -70,7 +70,8 @@ void SequenceRing::Reclaim() {
     }
 }
 
-std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock) {
+std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock, std::uint8_t tag) {
+    if (tag >= Tags) throw std::invalid_argument("a sequence ring item tag is out of range");
     claimProducer();
     if (stopping.load(std::memory_order_acquire)) throw std::logic_error("an item was pushed into a stopped sequence ring");
     Reclaim();
@@ -89,6 +90,8 @@ std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock) {
     slot.sequence = sequence;
     slot.work = std::move(work);
     slot.held = std::move(held);
+    slot.tag = tag;
+    if (options.timed) slot.pushedAt = std::chrono::steady_clock::now();
     issued.store(sequence, std::memory_order_release);
     pushed.store(index + 1, std::memory_order_seq_cst);
     if (!started.load(std::memory_order_acquire)) {
@@ -161,6 +164,11 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
     counters.fullWaits = fullWaits.exchange(0, std::memory_order_relaxed);
     counters.fullWaitNs = fullWaitNs.exchange(0, std::memory_order_relaxed);
     counters.preparerSleeps = preparerSleeps.exchange(0, std::memory_order_relaxed);
+    for (std::size_t tag = 0; tag < Tags; ++tag) {
+        counters.residency[tag].items = residency[tag].items.exchange(0, std::memory_order_relaxed);
+        counters.residency[tag].totalNs = residency[tag].totalNs.exchange(0, std::memory_order_relaxed);
+        counters.residency[tag].longestNs = residency[tag].longestNs.exchange(0, std::memory_order_relaxed);
+    }
     return counters;
 }
 
@@ -196,6 +204,13 @@ void SequenceRing::run() {
                 failed.store(true, std::memory_order_release);
             }
             runningSequence = 0;
+        }
+        if (options.timed) {
+            const auto resident = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - slot.pushedAt).count());
+            auto& counters = residency[slot.tag];
+            counters.items.fetch_add(1, std::memory_order_relaxed);
+            counters.totalNs.fetch_add(resident, std::memory_order_relaxed);
+            if (resident > counters.longestNs.load(std::memory_order_relaxed)) counters.longestNs.store(resident, std::memory_order_relaxed);
         }
         preparedSequence.store(sequence, std::memory_order_release);
         prepared.store(index + 1, std::memory_order_seq_cst);

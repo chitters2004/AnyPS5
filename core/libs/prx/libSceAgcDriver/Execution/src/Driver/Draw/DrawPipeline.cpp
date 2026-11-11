@@ -34,6 +34,11 @@ std::atomic<std::uint64_t> drawKeysSeenRecently{0};
 std::atomic<std::uint64_t> drawShapesSameAsPrevious{0};
 std::atomic<std::uint64_t> drawShapesSeenRecently{0};
 
+bool pipelineStats() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
@@ -68,6 +73,7 @@ DrawFinisher& DrawFinisher::Get() {
             options.capacity = SequenceDepth;
             options.spin = HandoffSpinWindow();
             options.pause = &SpinPause;
+            options.timed = pipelineStats();
             options.preparerStart = [] {
                 finisherThread = true;
                 PerformanceTrace::BindThread("draw finisher");
@@ -272,9 +278,13 @@ DrawPipeline::QueuedWrite DrawFinisher::StoredBytes(std::uint64_t address, std::
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
+    Enqueue(std::move(job), std::move(held), 0);
+}
+
+void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
     finisherProducer = true;
     if (Sequenced()) {
-        ring->Push(std::move(job), std::move(held), GuestMemory::GpuMutex().HeldByThisThread());
+        ring->Push(std::move(job), std::move(held), GuestMemory::GpuMutex().HeldByThisThread(), tag);
         return;
     }
     constexpr std::size_t depth = 16;
@@ -477,10 +487,11 @@ void DrawPipeline::enqueue(Item item) {
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
+            const auto tag = static_cast<std::uint8_t>(1 + static_cast<std::size_t>(item.kind));
             finisher.Enqueue([this, item = std::move(item)]() mutable {
                 item.sequence = SequenceRing::Running();
                 admit(std::move(item));
-            }, std::move(held));
+            }, std::move(held), tag);
             return;
         }
         item.sequence = finisher.Bypass();
@@ -581,7 +592,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     if (DrawFinisher::Sequenced()) {
         const auto ring = DrawFinisher::Get().Ring().TakeCounters();
-        AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()));
+        std::string residencyText;
+        for (std::size_t tag = 0; tag < ring.residency.size(); ++tag) {
+            const auto& residency = ring.residency[tag];
+            if (residency.items == 0) continue;
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu (%.1f us, longest %.1f us)", tag == 0 ? "prepare" : tag - 1 < KindNames.size() ? KindNames[tag - 1] : "other", static_cast<unsigned long long>(residency.items), static_cast<double>(residency.totalNs) / 1e3 / static_cast<double>(residency.items), static_cast<double>(residency.longestNs) / 1e3);
+            residencyText += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
     }
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));

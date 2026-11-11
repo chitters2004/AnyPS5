@@ -272,6 +272,25 @@ void WaitingItemsAreVisibleNewestFirst() {
     Require(!ring.AnyNewestFirst([](const SequenceRing::Held&) { return true; }), "a prepared item stayed visible");
 }
 
+void ResidencyIsCountedPerTag() {
+    auto options = Small(8);
+    options.timed = true;
+    SequenceRing ring(std::move(options));
+    for (int i = 0; i < 3; ++i) ring.Push([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); }, {}, false, 0);
+    ring.Push([] {}, {}, false, 5);
+    ring.Drain();
+    const auto counters = ring.TakeCounters();
+    Require(counters.residency[0].items == 3 && counters.residency[5].items == 1, "residency was not counted under each item's tag");
+    Require(counters.residency[0].totalNs >= 3'000'000 && counters.residency[0].longestNs >= 1'000'000, "residency does not cover the time an item waited and ran");
+    Require(counters.residency[5].totalNs >= 1'000'000, "an item behind slower ones does not count the time it waited in the ring");
+    Require(ring.TakeCounters().residency[0].items == 0, "taking the counters did not reset them");
+    Require(Throws([&] { ring.Push([] {}, {}, false, SequenceRing::Tags); }), "an out-of-range tag was accepted");
+    SequenceRing untimed(Small(4));
+    untimed.Push([] {}, {});
+    untimed.Drain();
+    Require(untimed.TakeCounters().residency[0].items == 0, "an untimed ring counted residency");
+}
+
 void PreparedWorkIsReleasedByTheProducer() {
     SequenceRing ring(Small(4));
     auto held = std::make_shared<int>(1);
@@ -302,6 +321,7 @@ int main() {
         OneProducerOnly();
         WaitingItemsAreVisibleNewestFirst();
         PreparedWorkIsReleasedByTheProducer();
+        ResidencyIsCountedPerTag();
         std::cout << "sequence ring tests passed\n";
         return 0;
     } catch (const std::exception& error) {
