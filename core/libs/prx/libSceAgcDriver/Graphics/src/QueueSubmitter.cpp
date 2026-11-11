@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <chrono>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -14,7 +15,7 @@ namespace {
 
 struct Submitters {
     std::mutex mutex;
-    std::map<VkQueue, QueueSubmitter*> byQueue;
+    std::map<VkQueue, std::weak_ptr<QueueSubmitter>> byQueue;
 };
 
 Submitters& AllSubmitters() {
@@ -28,19 +29,23 @@ bool QueueSubmitter::Enabled() {
     return RuntimeSwitches::Set(RuntimeSwitch::AsyncSubmit);
 }
 
-QueueSubmitter& QueueSubmitter::For(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle) {
+std::shared_ptr<QueueSubmitter> QueueSubmitter::Acquire(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle) {
     auto& all = AllSubmitters();
+    std::shared_ptr<QueueSubmitter> replaced;
     std::lock_guard lock(all.mutex);
     auto& entry = all.byQueue[queue];
-    if (entry == nullptr) entry = new QueueSubmitter(device, queue, submit, waitIdle);
-    return *entry;
+    replaced = entry.lock();
+    if (replaced != nullptr && replaced->device == device) return replaced;
+    std::shared_ptr<QueueSubmitter> created(new QueueSubmitter(device, queue, submit, waitIdle));
+    entry = created;
+    return created;
 }
 
-QueueSubmitter* QueueSubmitter::Existing(VkQueue queue) {
+std::shared_ptr<QueueSubmitter> QueueSubmitter::Existing(VkQueue queue) {
     auto& all = AllSubmitters();
     std::lock_guard lock(all.mutex);
     const auto found = all.byQueue.find(queue);
-    return found != all.byQueue.end() ? found->second : nullptr;
+    return found != all.byQueue.end() ? found->second.lock() : nullptr;
 }
 
 QueueSubmitter::QueueSubmitter(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle) :
@@ -49,7 +54,19 @@ QueueSubmitter::QueueSubmitter(VkDevice device, VkQueue queue, PFN_vkQueueSubmit
         RaiseWorkerThreadPriority("queue submitter");
         run();
     });
-    thread.detach();
+}
+
+QueueSubmitter::~QueueSubmitter() {
+    {
+        std::lock_guard lock(mutex);
+        stopping = true;
+    }
+    ready.notify_all();
+    thread.join();
+    auto& all = AllSubmitters();
+    std::lock_guard lock(all.mutex);
+    const auto found = all.byQueue.find(queue);
+    if (found != all.byQueue.end() && found->second.expired()) all.byQueue.erase(found);
 }
 
 void SubmitOutcome::Wait() const {
@@ -69,7 +86,7 @@ void SubmitOutcome::resolve(std::uint8_t outcome, std::exception_ptr reason) {
 std::shared_ptr<SubmitOutcome> QueueSubmitter::Enqueue(Job job) {
     bool wake = false;
     job.outcome = std::make_shared<SubmitOutcome>();
-    job.outcome->failures = failures;
+    job.outcome->failures = job.failures;
     auto outcome = job.outcome;
     {
         std::lock_guard lock(mutex);
@@ -91,6 +108,7 @@ void QueueSubmitter::run() {
         {
             std::unique_lock lock(mutex);
             while (jobs.empty()) {
+                if (stopping) return;
                 sleeping = true;
                 ready.wait(lock);
                 sleeping = false;
@@ -142,7 +160,7 @@ void QueueSubmitter::run() {
             if (result != VK_SUCCESS) failure = std::make_exception_ptr(std::runtime_error("AGC graphics: vkQueueSubmit recorder (queue submitter): Vulkan result " + std::to_string(static_cast<int>(result))));
         }
         job.encode.reset();
-        if (failure != nullptr) failures->raised.fetch_add(1, std::memory_order_acq_rel);
+        if (failure != nullptr) job.failures->raised.fetch_add(1, std::memory_order_acq_rel);
         job.outcome->resolve(failure == nullptr ? SubmitOutcome::Submitted : SubmitOutcome::Failure, failure);
         {
             std::lock_guard lock(mutex);

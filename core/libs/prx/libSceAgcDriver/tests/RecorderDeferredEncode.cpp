@@ -374,13 +374,13 @@ struct Fixture {
     Context context{};
     std::thread::id main = std::this_thread::get_id();
 
-    Fixture() {
+    explicit Fixture(VkQueue queue = VK_NULL_HANDLE) {
         mock = &device;
         device.contextPool = handleOf<VkCommandPool>(device.Handle());
         device.pools.insert(device.contextPool);
         context.device = handleOf<VkDevice>(device.Handle());
         nextQueue += 0x10;
-        context.queue = handleOf<VkQueue>(nextQueue);
+        context.queue = queue != VK_NULL_HANDLE ? queue : handleOf<VkQueue>(nextQueue);
         context.pool = device.contextPool;
         context.deviceProc = RecordCommandStreams(context.device, mockProc);
     }
@@ -680,6 +680,41 @@ void SparseBindsShareTheQueueWithTheSubmitter() {
     }
 }
 
+void SubmittersAreScopedToTheirDevice() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    VkQueue reused = VK_NULL_HANDLE;
+    for (int round = 0; round < 3; ++round) {
+        const Watchdog watchdog("a device that reuses a queue handle");
+        Fixture fixture(reused);
+        reused = fixture.context.queue;
+        std::weak_ptr<QueueSubmitter> submitter;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            fixture.Fill(recorder, 1);
+            recorder.Submit();
+            recorder.Sync();
+            submitter = QueueSubmitter::Existing(reused);
+            Expect(!submitter.expired(), "a recorder that submitted asynchronously has no submitter");
+            if (round == 0) {
+                {
+                    std::lock_guard lock(fixture.device.mutex);
+                    fixture.device.failSubmits = 1;
+                }
+                fixture.Fill(recorder, 2);
+                recorder.Submit();
+                Expect(!Reported([&] { recorder.Sync(); }).empty(), "a failed submit was not reported");
+            }
+            fixture.Fill(recorder, 3);
+            recorder.Sync();
+            const auto submissions = fixture.Submissions();
+            Expect(!submissions.empty() && joined(submissions.back().recorded) == "[fill 3]", "a batch on a reused queue handle was not submitted through its own device");
+        }
+        Expect(submitter.expired() && QueueSubmitter::Existing(reused) == nullptr, "a submitter outlived the recorder that owned it");
+    }
+}
+
 void DeferredEncodeIsDecidedPerBatch() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     Fixture fixture;
@@ -873,6 +908,7 @@ int main(int argc, char** argv) {
             FailedEncodeNeverCompletes();
             FailedSubmitReachesFinish();
             SparseBindsShareTheQueueWithTheSubmitter();
+            SubmittersAreScopedToTheirDevice();
             DeferredEncodeIsDecidedPerBatch();
             AsyncSubmitOffEncodesInline();
             DiscardedBatchIsNeverEncoded();

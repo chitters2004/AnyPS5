@@ -1345,7 +1345,7 @@ struct Recorder::ProgressWatcher {
     }
 };
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), submitFailures(std::make_shared<SubmitFailures>()) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -4354,14 +4354,13 @@ void Recorder::Submit() {
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
     if (async) {
-        auto* submitter = QueueSubmitter::Existing(context.queue);
-        if (submitter == nullptr) submitter = &QueueSubmitter::For(context.device, context.queue, function(queueSubmit, "vkQueueSubmit"), reinterpret_cast<PFN_vkDeviceWaitIdle>(context.deviceProc(context.device, "vkDeviceWaitIdle")));
+        if (submitter == nullptr) submitter = QueueSubmitter::Acquire(context.device, context.queue, function(queueSubmit, "vkQueueSubmit"), reinterpret_cast<PFN_vkDeviceWaitIdle>(context.deviceProc(context.device, "vkDeviceWaitIdle")));
         if (batchEncoders != nullptr) {
             batch->encode = std::make_shared<EncodeTicket>(std::move(batch->stream), batch->traceId);
-            batch->outcome = submitter->Enqueue({VK_NULL_HANDLE, batch->fence, hold, holdValue, timeline, serial, batch->encode});
+            batch->outcome = submitter->Enqueue({VK_NULL_HANDLE, batch->fence, hold, holdValue, timeline, serial, batch->encode, submitFailures});
             batchEncoders->Encode(batch->encode);
         } else {
-            batch->outcome = submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
+            batch->outcome = submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial, nullptr, submitFailures});
         }
     } else {
         VkResult result;
@@ -4462,7 +4461,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial, submitFailures());
+    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial, submitFailures);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -4678,7 +4677,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const auto device = context.device;
     const auto semaphore = timeline;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
-    const auto failures = submitFailures();
+    const auto failures = submitFailures;
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
@@ -5048,11 +5047,6 @@ void Recorder::release(Batch& batch, bool retired) noexcept {
     batch.fence = VK_NULL_HANDLE;
 }
 
-std::shared_ptr<SubmitFailures> Recorder::submitFailures() const {
-    const auto* submitter = QueueSubmitter::Existing(context.queue);
-    return submitter != nullptr ? submitter->Failures() : nullptr;
-}
-
 std::unique_ptr<CommandStream> Recorder::takeStream() {
     if (spareStreams.empty()) return std::make_unique<CommandStream>();
     auto stream = std::move(spareStreams.back());
@@ -5099,13 +5093,13 @@ CommandEncoders& Recorder::commandEncoders() {
 }
 
 void Recorder::stopEncoders() noexcept {
-    if (encoders == nullptr) return;
     try {
-        if (auto* submitter = QueueSubmitter::Existing(context.queue); submitter != nullptr) submitter->Drain();
+        if (submitter != nullptr) submitter->Drain();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
     encoders.reset();
+    submitter.reset();
 }
 
 }

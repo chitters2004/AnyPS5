@@ -882,7 +882,6 @@ private:
     void discard(std::unique_ptr<Batch> batch) noexcept;
     void removeLabels(Batch& batch);
     void release(Batch& batch, bool retired = false) noexcept;
-    std::shared_ptr<SubmitFailures> submitFailures() const;
     std::unique_ptr<CommandStream> takeStream();
     void recycleStream(std::unique_ptr<CommandStream> stream) noexcept;
     void encodeInline(Batch& batch);
@@ -963,6 +962,8 @@ private:
     std::vector<std::unique_ptr<CommandStream>> spareStreams;
     std::size_t spareStreamBytes = 0;
     std::unique_ptr<CommandEncoders> encoders;
+    std::shared_ptr<QueueSubmitter> submitter;
+    const std::shared_ptr<SubmitFailures> submitFailures;
     mutable AgcDriver::Mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;
     std::uint64_t newestSubmitted = 0;

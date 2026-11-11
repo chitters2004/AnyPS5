@@ -51,16 +51,20 @@ public:
         VkSemaphore signal = VK_NULL_HANDLE;
         std::uint64_t signalValue = 0;
         std::shared_ptr<EncodeTicket> encode;
+        std::shared_ptr<SubmitFailures> failures;
         std::shared_ptr<SubmitOutcome> outcome;
     };
 
     static bool Enabled();
-    static QueueSubmitter& For(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle);
-    static QueueSubmitter* Existing(VkQueue queue);
+    static std::shared_ptr<QueueSubmitter> Acquire(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle);
+    static std::shared_ptr<QueueSubmitter> Existing(VkQueue queue);
+
+    ~QueueSubmitter();
+    QueueSubmitter(const QueueSubmitter&) = delete;
+    QueueSubmitter& operator=(const QueueSubmitter&) = delete;
 
     std::shared_ptr<SubmitOutcome> Enqueue(Job job);
     void Drain();
-    std::shared_ptr<SubmitFailures> Failures() const { return failures; }
     AgcDriver::Mutex& QueueMutex() { return queueMutex; }
 
 private:
@@ -78,7 +82,7 @@ private:
     std::deque<Job> jobs;
     bool busy = false;
     bool sleeping = false;
-    std::shared_ptr<SubmitFailures> failures = std::make_shared<SubmitFailures>();
+    bool stopping = false;
     std::thread thread;
 };
 
@@ -90,7 +94,7 @@ public:
     QueueAccess& operator=(const QueueAccess&) = delete;
 
 private:
-    QueueSubmitter* submitter;
+    std::shared_ptr<QueueSubmitter> submitter;
 };
 
 inline VkResult QueueBindSparse(const Context& context, const VkBindSparseInfo& bind, VkFence fence) {
