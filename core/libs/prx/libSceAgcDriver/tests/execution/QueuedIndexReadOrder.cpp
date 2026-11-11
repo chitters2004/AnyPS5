@@ -280,13 +280,17 @@ void LandPool() {
     Require(!IndicesIntact(), "queued index read: the image's results never reached the memory they cover, so the run above proves nothing");
 }
 
+std::uint32_t LoadWord(std::uint64_t address) {
+    return std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(address)).load(std::memory_order_acquire);
+}
+
 void WaitForWord(std::uint64_t address, std::uint32_t value, const char* what) {
     const auto start = std::chrono::steady_clock::now();
     const auto deadline = start + std::chrono::seconds(10);
-    while (*reinterpret_cast<const volatile std::uint32_t*>(address) != value) {
+    while (LoadWord(address) != value) {
         if (std::chrono::steady_clock::now() >= deadline) {
             char message[256];
-            std::snprintf(message, sizeof(message), "queued index read: %s: 0x%08llx held 0x%08x after %.1f s, expected 0x%08x", what, static_cast<unsigned long long>(address), *reinterpret_cast<const volatile std::uint32_t*>(address), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), value);
+            std::snprintf(message, sizeof(message), "queued index read: %s: 0x%08llx held 0x%08x after %.1f s, expected 0x%08x", what, static_cast<unsigned long long>(address), LoadWord(address), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), value);
             Require(false, message);
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
