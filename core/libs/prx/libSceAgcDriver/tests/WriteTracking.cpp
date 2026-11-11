@@ -3186,6 +3186,19 @@ LatencySummary Summarize(std::vector<double>& samples) {
     return {samples[samples.size() / 2], samples[samples.size() * 99 / 100]};
 }
 
+void CheckProofBreakSources() {
+    Require(ProofBreaksCounted(), "proof breaks are counted only under APS5_PROFILE_DRAW");
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const std::array<std::byte, 4> bytes{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    const auto before = ProofBreakCounts();
+    static_cast<void>(StoreOwnBytes(base + 64, bytes));
+    const auto after = ProofBreakCounts();
+    const auto moved = [&](ProofBreak source) { return after[static_cast<std::size_t>(source)] - before[static_cast<std::size_t>(source)]; };
+    Require(moved(ProofBreak::OwnStore) == 2, "an own store did not break proofs as an own store when it began and when it was stored");
+    Require(moved(ProofBreak::Unlabelled) == 0, "an own store broke proofs without a source");
+}
+
 void RunMemoHitBench(int threads) {
     constexpr std::size_t Hits = 2000000;
     const auto lanes = static_cast<std::size_t>(threads);
@@ -3482,6 +3495,11 @@ int main(int argc, char** argv) {
         if (argc >= 3 && argc <= 5 && std::string_view(argv[1]) == "--contention-bench") {
             const auto option = [&](std::string_view name) { return (argc >= 4 && std::string_view(argv[3]) == name) || (argc == 5 && std::string_view(argv[4]) == name); };
             RunContentionBench(std::stoi(argv[2]), option("overlap"), !option("clean"));
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--proof-break-sources") {
+            CheckProofBreakSources();
+            std::cout << "proof break source test passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
