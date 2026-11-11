@@ -115,6 +115,8 @@ std::uintptr_t userAddressLimit() {
 struct WriteSubscription {
     mutable std::atomic<std::uint64_t> version{0};
     std::atomic<std::uint64_t> head{1};
+    std::atomic<std::uint32_t> generation{1};
+    std::uint32_t slot = 0;
     std::uint32_t typeMask = WriteChangeAll;
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint64_t> keys;
@@ -180,10 +182,44 @@ void backingKeysOf(std::uint64_t address, std::uint64_t bytes, const std::functi
     }
 }
 
+constexpr std::uint64_t GenerationMask = (std::uint64_t{1} << 24) - 1;
+constexpr std::size_t LeafKeys = 1024;
+constexpr std::size_t InlineHandles = 4;
+constexpr std::size_t TopLeaves = std::size_t{1} << 21;
+constexpr std::uint64_t TopKeys = static_cast<std::uint64_t>(TopLeaves) * LeafKeys;
+constexpr std::size_t DirectoryEntries = std::size_t{1} << 14;
+constexpr std::size_t ChunkSlots = 256;
+constexpr std::size_t ChunkCount = std::size_t{1} << 12;
+
+struct KeySlot {
+    std::array<std::atomic<std::uint64_t>, InlineHandles> handles{};
+    std::atomic<std::uint32_t> overflow{0};
+};
+
+struct Leaf {
+    std::array<KeySlot, LeafKeys> slots{};
+};
+
+struct DirectoryEntry {
+    std::atomic<std::uint64_t> leafIndex{0};
+    std::atomic<Leaf*> leaf{nullptr};
+};
+
+struct Chunk {
+    std::array<WriteSubscription, ChunkSlots> subscriptions;
+};
+
+std::array<std::atomic<Leaf*>, TopLeaves> radixTop{};
+std::array<DirectoryEntry, DirectoryEntries> radixDirectory{};
+
 struct WriteIndex {
     AgcDriver::Mutex mutex;
+    AgcDriver::Mutex overflowMutex;
     std::atomic<std::uint64_t> live{0};
-    std::unordered_map<std::uint64_t, std::vector<WriteSubscription*>> byBlock;
+    std::vector<std::uint32_t> freeSlots;
+    std::uint64_t slotCount = 0;
+    std::array<std::atomic<Chunk*>, ChunkCount> chunks{};
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> overflowed;
     std::atomic<std::uint64_t> subscriptions{0};
     std::atomic<std::uint64_t> blocks{0};
     std::atomic<std::uint64_t> bumps{0};
@@ -198,6 +234,76 @@ struct WriteIndex {
 WriteIndex& Index() {
     static auto* index = new WriteIndex;
     return *index;
+}
+
+Leaf* leafOf(std::uint64_t leafIndex, bool create) {
+    if (leafIndex < TopLeaves) {
+        auto* leaf = radixTop[leafIndex].load(std::memory_order_acquire);
+        if (leaf != nullptr || !create) return leaf;
+        leaf = new Leaf{};
+        radixTop[leafIndex].store(leaf, std::memory_order_release);
+        return leaf;
+    }
+    auto probe = static_cast<std::size_t>((leafIndex * 0x9E3779B97F4A7C15ull) >> 50) & (DirectoryEntries - 1);
+    for (std::size_t step = 0; step < DirectoryEntries; ++step, probe = (probe + 1) & (DirectoryEntries - 1)) {
+        auto& entry = radixDirectory[probe];
+        const auto found = entry.leafIndex.load(std::memory_order_acquire);
+        if (found == leafIndex) return entry.leaf.load(std::memory_order_acquire);
+        if (found != 0) continue;
+        if (!create) return nullptr;
+        auto* leaf = new Leaf{};
+        entry.leaf.store(leaf, std::memory_order_release);
+        entry.leafIndex.store(leafIndex, std::memory_order_release);
+        return leaf;
+    }
+    require(false, "the write index directory is full");
+    return nullptr;
+}
+
+KeySlot* slotOf(std::uint64_t key, bool create) {
+    auto* leaf = leafOf(key / LeafKeys, create);
+    return leaf == nullptr ? nullptr : &leaf->slots[key % LeafKeys];
+}
+
+WriteSubscription& subscriptionOf(std::uint64_t handle) {
+    const auto slot = handle >> 24;
+    return Index().chunks[slot / ChunkSlots].load(std::memory_order_acquire)->subscriptions[slot % ChunkSlots];
+}
+
+bool handleLive(std::uint64_t handle) {
+    return subscriptionOf(handle).generation.load(std::memory_order_acquire) == (handle & GenerationMask);
+}
+
+template <class Visit>
+void forHandles(std::uint64_t key, KeySlot& slot, Visit&& visit) {
+    for (auto& cell : slot.handles) {
+        if (const auto handle = cell.load(std::memory_order_acquire); handle != 0) visit(handle);
+    }
+    if (slot.overflow.load(std::memory_order_acquire) == 0) return;
+    auto& index = Index();
+    std::lock_guard lock(index.overflowMutex);
+    if (const auto found = index.overflowed.find(key); found != index.overflowed.end()) {
+        for (const auto handle : found->second) visit(handle);
+    }
+}
+
+template <class Visit>
+void forVaSlots(std::uint64_t first, std::uint64_t last, Visit&& visit) {
+    if (first < TopKeys) {
+        const auto stop = std::min(last, TopKeys - 1);
+        for (auto leafIndex = first / LeafKeys; leafIndex <= stop / LeafKeys; ++leafIndex) {
+            auto* leaf = radixTop[leafIndex].load(std::memory_order_acquire);
+            if (leaf == nullptr) continue;
+            for (auto key = std::max(first, leafIndex * LeafKeys); key <= std::min<std::uint64_t>(stop, leafIndex * LeafKeys + LeafKeys - 1); ++key) visit(key, leaf->slots[key % LeafKeys]);
+        }
+    }
+    if (last < TopKeys) return;
+    for (auto& entry : radixDirectory) {
+        const auto leafIndex = entry.leafIndex.load(std::memory_order_acquire);
+        if (leafIndex == 0 || leafIndex * LeafKeys + LeafKeys - 1 < std::max(first, TopKeys) || leafIndex * LeafKeys > last) continue;
+        auto* leaf = entry.leaf.load(std::memory_order_acquire);
+        for (auto key = std::max(first, leafIndex * LeafKeys); key <= std::min<std::uint64_t>(last, leafIndex * LeafKeys + LeafKeys - 1); ++key) visit(key, leaf->slots[key % LeafKeys]);
+    }
 }
 
 bool brokenSource(WriteBumpSource source) {
@@ -218,21 +324,29 @@ void moveVersion(WriteSubscription& subscription) {
     while ((version & 1u) != 0 && !subscription.version.compare_exchange_weak(version, version + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
 }
 
-bool bumpSubscription(WriteSubscription& subscription, std::uint64_t block, WriteBumpSource source) {
-    bool overflowed = false;
-    {
-        std::lock_guard lock(subscription.historyMutex);
+enum class Bumped { Stale, Done, Overflowed };
+
+Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource source) {
+    auto& subscription = subscriptionOf(handle);
+    auto result = Bumped::Done;
+    std::lock_guard lock(subscription.historyMutex);
+    if (subscription.generation.load(std::memory_order_relaxed) != (handle & GenerationMask)) return Bumped::Stale;
+    const auto append = [&](std::uint64_t block) {
         const auto sequence = subscription.head.load(std::memory_order_relaxed) + 1;
         if (!subscription.bumps.empty() && subscription.bumps.back().block == block && subscription.bumps.back().source == source) subscription.bumps.back().sequence = sequence;
         else if (subscription.bumps.size() < MaxRecordedBumps) subscription.bumps.push_back({sequence, block, source});
         else if (subscription.overflowedAt == 0) {
             subscription.overflowedAt = sequence;
-            overflowed = true;
+            result = Bumped::Overflowed;
         }
         subscription.head.store(sequence, std::memory_order_release);
-    }
+    };
+    if ((key & BackingKeyFlag) != 0) {
+        const auto range = std::equal_range(subscription.backed.begin(), subscription.backed.end(), std::pair<std::uint64_t, std::uint64_t>{key, 0}, [](const auto& left, const auto& right) { return left.first < right.first; });
+        for (auto it = range.first; it != range.second; ++it) append(it->second);
+    } else append(key);
     if ((subscription.typeMask & WriteChangeBit(WriteChangeOf(source))) != 0) moveVersion(subscription);
-    return overflowed;
+    return result;
 }
 
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
@@ -249,37 +363,18 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     std::uint64_t lookups = 0;
     std::uint64_t bumped = 0;
     std::uint64_t overflowed = 0;
-    {
-        std::lock_guard lock(index.mutex);
-        const auto visit = [&](std::uint64_t block, const std::vector<WriteSubscription*>& subscribers) {
-            for (auto* subscription : subscribers) {
-                if (bumpSubscription(*subscription, block, source)) ++overflowed;
-                ++bumped;
-            }
-        };
-        if (last - first >= index.byBlock.size()) {
-            ++lookups;
-            for (const auto& [block, subscribers] : index.byBlock) {
-                if ((block & BackingKeyFlag) == 0 && block >= first && block <= last) visit(block, subscribers);
-            }
-        } else {
-            for (auto block = first; block <= last; ++block) {
-                ++lookups;
-                if (const auto found = index.byBlock.find(block); found != index.byBlock.end()) visit(block, found->second);
-            }
-        }
-        for (const auto key : backing) {
-            ++lookups;
-            const auto found = index.byBlock.find(key);
-            if (found == index.byBlock.end()) continue;
-            for (auto* subscription : found->second) {
-                const auto range = std::equal_range(subscription->backed.begin(), subscription->backed.end(), std::pair<std::uint64_t, std::uint64_t>{key, 0}, [](const auto& left, const auto& right) { return left.first < right.first; });
-                for (auto it = range.first; it != range.second; ++it) {
-                    if (bumpSubscription(*subscription, it->second, source)) ++overflowed;
-                    ++bumped;
-                }
-            }
-        }
+    const auto visit = [&](std::uint64_t key, KeySlot& slot) {
+        ++lookups;
+        forHandles(key, slot, [&](std::uint64_t handle) {
+            const auto result = bumpHandle(handle, key, source);
+            if (result == Bumped::Stale) return;
+            ++bumped;
+            if (result == Bumped::Overflowed) ++overflowed;
+        });
+    };
+    forVaSlots(first, last, visit);
+    for (const auto key : backing) {
+        if (auto* slot = slotOf(key, false)) visit(key, *slot);
     }
     index.lookups.fetch_add(lookups, std::memory_order_relaxed);
     if (bumped != 0) {
@@ -290,20 +385,54 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     if (timed) index.lookupNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
+void addHandle(std::uint64_t key, std::uint64_t handle) {
+    auto& slot = *slotOf(key, true);
+    for (auto& cell : slot.handles) {
+        if (const auto held = cell.load(std::memory_order_relaxed); held == 0 || !handleLive(held)) {
+            cell.store(handle, std::memory_order_release);
+            return;
+        }
+    }
+    auto& index = Index();
+    std::lock_guard lock(index.overflowMutex);
+    auto& list = index.overflowed[key];
+    list.erase(std::remove_if(list.begin(), list.end(), [](std::uint64_t held) { return !handleLive(held); }), list.end());
+    list.push_back(handle);
+    slot.overflow.store(1, std::memory_order_release);
+}
+
+WriteSubscription& acquireSubscription() {
+    auto& index = Index();
+    std::uint32_t slot = 0;
+    if (!index.freeSlots.empty()) {
+        slot = index.freeSlots.back();
+        index.freeSlots.pop_back();
+    } else {
+        slot = static_cast<std::uint32_t>(index.slotCount++);
+        require(slot / ChunkSlots < ChunkCount, "the write index is out of subscription slots");
+        if (index.chunks[slot / ChunkSlots].load(std::memory_order_relaxed) == nullptr) index.chunks[slot / ChunkSlots].store(new Chunk, std::memory_order_release);
+    }
+    auto& subscription = index.chunks[slot / ChunkSlots].load(std::memory_order_relaxed)->subscriptions[slot % ChunkSlots];
+    subscription.slot = slot;
+    return subscription;
+}
+
 void releaseSubscription(WriteSubscription* subscription) {
     auto& index = Index();
+    std::lock_guard lock(index.mutex);
     {
-        std::lock_guard lock(index.mutex);
-        for (const auto key : subscription->keys) {
-            const auto found = index.byBlock.find(key);
-            if (found == index.byBlock.end()) continue;
-            auto& subscribers = found->second;
-            subscribers.erase(std::remove(subscribers.begin(), subscribers.end(), subscription), subscribers.end());
-            if (subscribers.empty()) index.byBlock.erase(found);
-        }
-        index.live.fetch_sub(1, std::memory_order_acq_rel);
+        std::lock_guard history(subscription->historyMutex);
+        const auto next = (subscription->generation.load(std::memory_order_relaxed) + 1) & GenerationMask;
+        subscription->generation.store(static_cast<std::uint32_t>(next), std::memory_order_release);
+        std::vector<std::uint64_t>().swap(subscription->blocks);
+        std::vector<std::uint64_t>().swap(subscription->keys);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(subscription->backed);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(subscription->spans);
+        std::vector<WriteSubscription::Bump>().swap(subscription->bumps);
+        subscription->overflowedAt = 0;
     }
-    delete subscription;
+    if (subscription->generation.load(std::memory_order_relaxed) != 0) index.freeSlots.push_back(subscription->slot);
+    index.live.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 }
@@ -2569,29 +2698,29 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
 
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask) {
     Pages().initialize();
-    auto* subscription = new WriteSubscription;
-    subscription->typeMask = typeMask;
+    std::vector<std::uint64_t> blocks;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> watched;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
     constexpr std::uint64_t page = 4096;
     for (const auto& [begin, end] : ranges) {
         if (end <= begin) continue;
-        for (auto block = begin / IndexBlockBytes; block <= (end - 1) / IndexBlockBytes; ++block) subscription->blocks.push_back(block);
-        backingKeysOf(begin, end - begin, [&](std::uint64_t key, std::uint64_t block) { subscription->backed.emplace_back(key, block); });
+        for (auto block = begin / IndexBlockBytes; block <= (end - 1) / IndexBlockBytes; ++block) blocks.push_back(block);
+        backingKeysOf(begin, end - begin, [&](std::uint64_t key, std::uint64_t block) { backed.emplace_back(key, block); });
         const auto first = begin & ~(page - 1);
         const auto stop = (end + page - 1) & ~(page - 1);
         if (Watched(first, static_cast<std::size_t>(stop - first))) watched.emplace_back(first, stop);
     }
-    std::sort(subscription->blocks.begin(), subscription->blocks.end());
-    subscription->blocks.erase(std::unique(subscription->blocks.begin(), subscription->blocks.end()), subscription->blocks.end());
-    std::sort(subscription->backed.begin(), subscription->backed.end());
-    subscription->backed.erase(std::unique(subscription->backed.begin(), subscription->backed.end()), subscription->backed.end());
-    subscription->keys = subscription->blocks;
-    for (const auto& [key, block] : subscription->backed) {
-        if (subscription->keys.size() == subscription->blocks.size() || subscription->keys.back() != key) subscription->keys.push_back(key);
+    std::sort(blocks.begin(), blocks.end());
+    blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
+    std::sort(backed.begin(), backed.end());
+    backed.erase(std::unique(backed.begin(), backed.end()), backed.end());
+    std::vector<std::uint64_t> keys = blocks;
+    for (const auto& [key, block] : backed) {
+        if (keys.size() == blocks.size() || keys.back() != key) keys.push_back(key);
     }
     std::sort(watched.begin(), watched.end());
     for (const auto& range : watched) {
-        auto& spans = subscription->spans;
         if (!spans.empty() && range.first <= spans.back().second + SpanGapBytes) {
             const auto end = std::max(spans.back().second, range.second);
             if (range.first <= spans.back().second || Watched(spans.back().first, static_cast<std::size_t>(end - spans.back().first))) {
@@ -2602,13 +2731,29 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
         spans.push_back(range);
     }
     auto& index = Index();
+    const auto keyCount = keys.size();
+    const auto blockCount = blocks.size();
+    WriteSubscription* subscription = nullptr;
     {
         std::lock_guard lock(index.mutex);
-        for (const auto key : subscription->keys) index.byBlock[key].push_back(subscription);
+        subscription = &acquireSubscription();
+        std::uint64_t handle = 0;
+        {
+            std::lock_guard history(subscription->historyMutex);
+            subscription->typeMask = typeMask;
+            subscription->version.store(0, std::memory_order_relaxed);
+            subscription->head.store(1, std::memory_order_relaxed);
+            subscription->blocks = std::move(blocks);
+            subscription->keys = std::move(keys);
+            subscription->backed = std::move(backed);
+            subscription->spans = std::move(spans);
+            handle = (static_cast<std::uint64_t>(subscription->slot) << 24) | subscription->generation.load(std::memory_order_relaxed);
+        }
+        for (const auto key : subscription->keys) addHandle(key, handle);
         index.live.fetch_add(1, std::memory_order_acq_rel);
     }
     index.subscriptions.fetch_add(1, std::memory_order_relaxed);
-    index.blocks.fetch_add(subscription->keys.size(), std::memory_order_relaxed);
+    index.blocks.fetch_add(keyCount == 0 ? blockCount : keyCount, std::memory_order_relaxed);
     return std::shared_ptr<WriteSubscription>(subscription, &releaseSubscription);
 }
 
