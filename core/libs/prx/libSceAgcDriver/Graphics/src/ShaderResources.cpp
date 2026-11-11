@@ -6645,6 +6645,38 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
     return moved;
 }
 
+std::vector<ShaderResources::BoundBuffer> ShaderResources::BoundBuffers(std::span<const MovedBuffer> moved) const {
+    std::vector<BoundBuffer> bound;
+    bound.reserve(allocations.size());
+    for (const auto& item : allocations) {
+        if (item.role != ShaderRecompiler::DescriptorRole::GuestBuffers && !DataRole(item.role)) continue;
+        BoundBuffer buffer{item.role, item.guest, item.guest ? item.address : 0, item.size, {}};
+        if (DataRole(item.role)) {
+            if (!item.dataWords.empty()) buffer.words = item.dataWords;
+            else if (item.buffer != nullptr) {
+                buffer.words.resize(item.size / sizeof(std::uint32_t));
+                std::memcpy(buffer.words.data(), item.buffer->Bytes().data(), buffer.words.size() * sizeof(std::uint32_t));
+            }
+        }
+        bound.push_back(std::move(buffer));
+    }
+    std::size_t listed = 0;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (item.role != ShaderRecompiler::DescriptorRole::GuestBuffers && !DataRole(item.role)) continue;
+        for (const auto& move : moved) {
+            if (move.allocation != index) continue;
+            if (!move.words.empty()) bound[listed].words.assign(move.words.begin(), move.words.end());
+            else {
+                bound[listed].address = move.address;
+                bound[listed].size = move.size;
+            }
+        }
+        ++listed;
+    }
+    return bound;
+}
+
 const char* ShaderResources::MoveRefusalName(MoveRefusal refusal) {
     switch (refusal) {
         case MoveRefusal::None: return "none";

@@ -63,6 +63,10 @@ enum class DrawPlanCount : std::size_t {
     FullNanoseconds,
     SharedBindingStages,
     ComparedBindingStages,
+    MissMoved,
+    MissPatchedData,
+    RebasedHits,
+    RebasedBuffers,
     Count
 };
 

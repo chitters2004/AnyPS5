@@ -1458,7 +1458,7 @@ std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "instance"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "instance", "moved"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -3848,10 +3848,12 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        const bool servable = DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples();
-        if (recipeOut != nullptr && (servable || DrawPlanShadow())) {
+        const bool plannable = DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && !multisampled && !pipeline->ReordersSamples();
+        const bool servable = plannable && resolved.moved.empty();
+        if (recipeOut != nullptr && (servable || DrawPlanShadow() || (plannable && DrawPlans()))) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->servable = servable;
+            recipe->plannable = plannable;
             recipe->movedBases = static_cast<std::uint32_t>(resolved.moved.size());
             recipe->device = context.device;
             recipe->templateRef = resources;
@@ -4282,7 +4284,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 namespace {
 
-void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& plan, const ShaderResources& resources, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
+void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
     DrawOutcome scratch;
     DrawTimer scratchTimer(false);
     const auto full = planDraw(context, state, draw, shaders, nullptr, scratch, scratchTimer);
@@ -4291,6 +4293,10 @@ void requirePlanDecisionsRepeat(const Context& context, const State& state, cons
     const auto& layout = full.VertexLayout();
     Require(!full.nothing && full.fragmentOutputs == plan.fragmentOutputs && full.shaderStages == plan.shaderStages && std::ranges::equal(layout.bindings, plan.vertexInput.bindings, sameBinding) && std::ranges::equal(layout.attributes, plan.vertexInput.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLANS: the plan's fragment outputs, pipeline stages or vertex input differ from the full path's");
     Require(full.keyed && full.contentKey == plan.key, "APS5_VERIFY_DRAW_PLANS: the plan's resource template key differs from the full path's");
+    if (!moved.empty()) {
+        const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(full.indexBytes), snapshots);
+        Require(resources.BoundBuffers(moved) == fresh.BoundBuffers(), "APS5_VERIFY_DRAW_PLANS: the buffers a plan hit rebound differ from those a full build of the draw binds");
+    }
     Require(PushConstantStages(shaders) == plan.pushStages, "APS5_VERIFY_DRAW_PLANS: the plan's push constant stages differ from the full path's");
     const auto masked = maskedState(state, full.fragmentOutputs);
     const auto sameMask = [](const VkPipelineColorBlendAttachmentState& a, const VkPipelineColorBlendAttachmentState& b) { return a.colorWriteMask == b.colorWriteMask; };
@@ -4305,7 +4311,6 @@ void requirePlanDecisionsRepeat(const Context& context, const State& state, cons
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawRecipeUse use) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -4330,8 +4335,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     const bool planned = use == DrawRecipeUse::Plan;
+    bool rebinds = false;
     if (planned) {
         if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
+        rebinds = recipe.movedBases != 0;
         for (std::size_t index = 0; index < shaders.size(); ++index) {
             const auto words = PlanBindingWords(shaders[index]);
             if (words == recipe.bindingWords[index]) {
@@ -4339,8 +4346,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
                 continue;
             }
             ++result.comparedBindingStages;
-            if (*words != *recipe.bindingWords[index]) return miss(DrawRecipeMiss::Instance);
+            if (*words != *recipe.bindingWords[index]) rebinds = true;
         }
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        if (rebinds && DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey) != recipe.key) return miss(DrawRecipeMiss::Instance);
         ValidateVertexAddresses(shaders.front().program->vertexAttributes);
     }
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
@@ -4402,6 +4411,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    std::vector<ShaderResources::MovedBuffer> moved;
+    if (rebinds) {
+        auto rebound = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &result.patchedData);
+        if (!rebound.has_value()) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Moved);
+        }
+        moved = std::move(*rebound);
+        result.movedBuffers = static_cast<std::uint32_t>(moved.size());
+    }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
@@ -4415,7 +4434,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // same objects), so AcquireFramebuffer only runs when the list evicted it.
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
-    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, recipe, *resources, pipeline, targets);
+    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *resources, moved, pipeline, targets);
     const bool sameExtent = recipe.renderExtent.width == state.renderExtent.width && recipe.renderExtent.height == state.renderExtent.height;
     auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
@@ -4429,6 +4448,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.masked = recipe.masked.has_value() ? &*recipe.masked : nullptr;
     record.completion = outcome.completion;
     record.resources = std::move(resources);
+    record.moved = std::move(moved);
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
