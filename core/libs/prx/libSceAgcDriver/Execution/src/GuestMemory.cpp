@@ -525,6 +525,7 @@ std::uint64_t DomainVersion(WriteDomain domain) {
     case WriteDomain::Proof: return ProofSerial();
     case WriteDomain::Unwatch: return UnwatchSerial();
     case WriteDomain::Mapping: return GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    case WriteDomain::CertifiedProof: return CertificateBreakSerial();
     default: return 0;
     }
 }
@@ -558,6 +559,7 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
     const auto mutant = certificateMutant.load(std::memory_order_relaxed);
     if (mutant == CertificateMutant::HideUnwatch) domainMask &= ~WriteDomainBit(WriteDomain::Unwatch);
     if (mutant == CertificateMutant::HideMapping) domainMask &= ~WriteDomainBit(WriteDomain::Mapping);
+    if (mutant == CertificateMutant::HideCertifiedProof) domainMask &= ~WriteDomainBit(WriteDomain::CertifiedProof);
     const auto domains = readDomains(domainMask);
     for (std::size_t i = 0; i < domains.size(); ++i) {
         if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) return false;
@@ -2820,6 +2822,8 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
+std::atomic<std::uint64_t> certificateBreakSerial{1};
+constexpr std::uint32_t CertificateCoveredBreaks = 0;
 thread_local bool proofThread = false;
 const bool proofBreaksCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
@@ -2845,8 +2849,17 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
+bool ProofBreakVoidsCertificates(ProofBreak source) {
+    return (CertificateCoveredBreaks & (std::uint32_t{1} << static_cast<unsigned>(source))) == 0;
+}
+
+std::uint64_t CertificateBreakSerial() {
+    return certificateBreakSerial.load(std::memory_order_acquire);
+}
+
 void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (ProofBreakVoidsCertificates(source)) certificateBreakSerial.fetch_add(1, std::memory_order_acq_rel);
     if (proofBreaksCounted) proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
