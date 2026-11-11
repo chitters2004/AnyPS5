@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
@@ -49,6 +50,19 @@ struct WriteIndexOutcomes {
     std::uint64_t builds = 0;
 };
 WriteIndexOutcomes WriteIndexOutcomesCounted();
+enum class CertifiedMiss : std::size_t { Uncertified, Sweep, Subscription, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
+enum class CertifyRefusal : std::size_t { Unsubscribed, PerElementTextures, ComparedTextures, ComparedTables, DepthCopies, StorageImages, PendingMoved, DepthSurfacesMoved, Count };
+struct CertifiedProofOutcomes {
+    std::uint64_t proved = 0;
+    std::uint64_t swept = 0;
+    std::uint64_t issued = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t disagreed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+};
+CertifiedProofOutcomes CertifiedProofOutcomesCounted();
+bool CertifiedProofs();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 struct StorageTextureBudgetSnapshot {
     std::optional<std::uint32_t> heap;
@@ -827,6 +841,15 @@ private:
     bool refreshPerUseCopies();
     StampAge provedAge = StampAge::Current;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
+    ProofFailure proveImports();
+    ProofFailure recordStaging();
+    std::optional<bool> certifiedRevalidate(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::optional<CertifyRefusal> certifyRefusal() const;
+    GuestMemory::WriteCertificate certificate;
+    std::uint64_t certifiedEpoch = 0;
+    std::uint64_t certifiedPending = 0;
+    std::uint64_t certifiedDepth = 0;
+    bool certified = false;
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     bool importsReconcilable = false;
