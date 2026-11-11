@@ -182,6 +182,10 @@ int main() {
         Require(AgcDriver::Graphics::InertFragment(null), "the null pixel program is not an inert fragment program");
         Require(!AgcDriver::Graphics::InertFragment(plain), "a color-exporting pixel program is inert");
         Require(!AgcDriver::Graphics::InertFragment(depthExport), "a depth-exporting pixel program is inert");
+        Require(AgcDriver::Graphics::InertFragment(null), "the null pixel program's memoized answer changed");
+        auto replaced = null;
+        replaced.spirv = plain.spirv;
+        Require(!AgcDriver::Graphics::InertFragment(replaced), "a copied result kept its source's inert answer for other SPIR-V");
 
         Reset(*device, full, plain);
         const auto expected = Draw(*device, half, plain, {.color = true, .depthTest = false});

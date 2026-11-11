@@ -672,7 +672,9 @@ bool DeclaresEarlyFragmentTests(const ShaderRecompiler::RecompileResult& program
     return false;
 }
 
-bool InertFragment(const ShaderRecompiler::RecompileResult& program) {
+namespace {
+
+bool ScanInertFragment(const ShaderRecompiler::RecompileResult& program) {
     const auto words = program.spirv.Words();
     if (words.size() < 5 || words[0] != spv::MagicNumber) return false;
     std::map<std::uint32_t, std::uint32_t> pointerTypes;
@@ -770,6 +772,16 @@ bool InertFragment(const ShaderRecompiler::RecompileResult& program) {
         cursor += count;
     }
     return true;
+}
+
+}
+
+bool InertFragment(const ShaderRecompiler::RecompileResult& program) {
+    auto& memo = program.inertFragmentMemo.state;
+    if (const auto known = memo.load(std::memory_order_acquire); known != 0) return known == 2u;
+    const bool inert = ScanInertFragment(program);
+    memo.store(inert ? 2u : 1u, std::memory_order_release);
+    return inert;
 }
 
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing, bool imageInt64Atomics, bool geometryShader, bool sampleRateShading, bool bufferInt64Atomics, bool shaderClipDistance, bool shaderCullDistance, bool viewportIndexLayer, bool runtimeDescriptorArray, bool demoteToHelperInvocation, bool shaderTerminateInvocation, bool meshShader, bool shaderResourceMinLod, bool fmaFloat16) {
