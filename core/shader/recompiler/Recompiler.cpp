@@ -1,4 +1,5 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include "Recompiler.hpp"
 #include "RdnaDecoder/DiagnosticSink.hpp"
 #include "StencilReplay.hpp"
@@ -448,14 +449,6 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
 
 namespace {
 
-class PrimedSharedMutex : public std::shared_mutex {
-public:
-    PrimedSharedMutex() {
-        lock();
-        unlock();
-    }
-};
-
 struct ResourceProgram {
     explicit ResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) : program(std::make_unique<IrProgram>(PrepareResourceProgram(request, preparation))) {
         const auto clearRegisterState = [](const auto& storage) {
@@ -508,7 +501,7 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right);
 void attachSubstitutes(CompiledVariant& variant);
 
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true, const SourceHandle* preparedHandle = nullptr) {
-    static PrimedSharedMutex mutex;
+    static NativeSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
     static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
     struct SourceKeyStorage {};
@@ -982,7 +975,7 @@ struct PreparedBindingPlan {
     std::once_flag ready;
     std::exception_ptr failure;
     DescriptorBindingPlan bindings;
-    PrimedSharedMutex mutex;
+    NativeSharedMutex mutex;
     std::map<std::vector<std::uint32_t>, std::shared_ptr<PreparedModuleEntry>> modules;
 };
 
@@ -1000,7 +993,7 @@ SharedSpirv lockedWords(const SpecializedModule& module) {
 SpecializedSpirv registrationModule(std::uint64_t variantId, std::span<const std::uint32_t> moduleKey, const std::function<SpecializedSpirv()>& specialize) {
     std::vector<std::uint64_t> key{variantId};
     key.insert(key.end(), moduleKey.begin(), moduleKey.end());
-    static PrimedSharedMutex mutex;
+    static NativeSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<RegistrationModuleEntry>> modules;
     std::shared_ptr<RegistrationModuleEntry> entry;
     {
@@ -1060,7 +1053,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     }
     key.push_back(exports.size());
     for (const auto mapping : exports) key.push_back(mapping);
-    static PrimedSharedMutex mutex;
+    static NativeSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<PreparedBindingPlan>> plans;
     std::shared_ptr<PreparedBindingPlan> plan;
     {
@@ -1093,7 +1086,7 @@ SpecializedSpirv specializeModule(const CompiledShaderArtifact& artifact, std::s
     key.clear();
     key.push_back(artifact.variantId);
     for (const auto& constant : constants) key.push_back((static_cast<std::uint64_t>(constant.id) << 32u) | constant.value);
-    static PrimedSharedMutex mutex;
+    static NativeSharedMutex mutex;
     static std::map<std::vector<std::uint64_t>, std::shared_ptr<SpecializedModuleEntry>> modules;
     std::shared_ptr<SpecializedModuleEntry> entry;
     {
