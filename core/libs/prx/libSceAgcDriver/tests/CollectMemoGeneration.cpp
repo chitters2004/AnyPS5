@@ -837,14 +837,152 @@ void CheckCoverageThreadAndDriverWrites() {
     Require(Walked(Base + Block, 2 * Block, Base + Block + Page, false), "an uncached collection reused an observation");
 }
 
+
+std::shared_ptr<WriteSubscription> Subscribe(std::uint64_t address, std::uint64_t blocks, std::uint32_t mask = WriteChangeAll) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{address, address + blocks * Block}}};
+    return SubscribeWrites(ranges, mask);
+}
+
+void Pending(std::uint64_t address) {
+    NoteGpuPending(address, 4);
+}
+
+void CheckObserveAndArm() {
+    const auto subscription = Subscribe(Base, 3);
+    const auto seen = ObserveSubscription(*subscription);
+    Require((seen & 1u) != 0 && ObserveSubscription(*subscription) == seen, "an observe without a bump changed the version");
+    Pending(Base);
+    const auto moved = ObserveSubscription(*subscription);
+    Require(moved != seen, "a bump after an observe did not move the version the reader holds");
+    Pending(Base);
+    Require(ObserveSubscription(*subscription) != moved, "a bump after the next observe did not move the version again");
+    const auto before = ObserveSubscription(*subscription);
+    const auto since = SubscriptionGeneration(*subscription);
+    Pending(Base + Block);
+    Pending(Base + 2 * Block);
+    const auto after = ObserveSubscription(*subscription);
+    Require(after == before + 2, "two bumps without a read in between moved the version " + std::to_string((after - before) / 2) + " times instead of once");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(Base + Block), WriteBlockOf(Base + 2 * Block)} && lookup.empty(), "the history did not list both blocks bumped without a read in between");
+}
+
+void CheckHistoryOutlivesTheArmedBit() {
+    const auto subscription = Subscribe(Base, 3);
+    const auto since = SubscriptionGeneration(*subscription);
+    NoteTextureReleased(Base);
+    Pending(Base + Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup), "the history reported an overflow after two bumps");
+    Require(lookup == std::vector<std::uint64_t>{WriteBlockOf(Base)}, "the history lost the bump that moved the version");
+    Require(plain == std::vector<std::uint64_t>{WriteBlockOf(Base + Block)}, "the history lost a bump made while the queried bit was clear");
+}
+
+void CheckTypeMask() {
+    const auto subscription = Subscribe(Base, 2, WriteChangeBit(WriteChange::Identity));
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*subscription);
+    Pending(Base);
+    Require(ObserveSubscription(*subscription) == seen, "a bump of a type outside the mask moved the version");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(Base)}, "a bump of a type outside the mask was left out of the history");
+    NoteTextureReleased(Base + Block);
+    Require(ObserveSubscription(*subscription) != seen, "a bump of a type inside the mask did not move the version");
+}
+
+void CheckReusedSlot() {
+    {
+        const auto first = Subscribe(Base, 2);
+        Pending(Base);
+    }
+    const auto second = Subscribe(Base + 8 * Block, 2);
+    const auto since = SubscriptionGeneration(*second);
+    const auto seen = ObserveSubscription(*second);
+    Pending(Base);
+    NoteTextureReleased(Base + Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(ObserveSubscription(*second) == seen && SubscriptionBumpsSince(*second, since, plain, lookup) && plain.empty() && lookup.empty(), "a bump of a released subscription's range reached the subscription that replaced it");
+    Pending(Base + 8 * Block);
+    Require(ObserveSubscription(*second) != seen, "a bump over a subscription's own range did not reach it");
+}
+
+constexpr std::uint64_t AliasA = std::uint64_t{1} << 36;
+constexpr std::uint64_t AliasB = AliasA + 64 * Block;
+
+bool ResolveAlias(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset) {
+    for (const auto base : {AliasA, AliasB}) {
+        if (address >= base && address + bytes <= base + 8 * Block) {
+            *file = 5;
+            *offset = address - base;
+            return true;
+        }
+    }
+    return false;
+}
+
+void CheckBackingKeys() {
+    struct Scope {
+        Scope() { SetWriteBackingResolver(&ResolveAlias); }
+        ~Scope() { SetWriteBackingResolver(nullptr); }
+    } scope;
+    const auto subscription = Subscribe(AliasA, 4);
+    const auto bystander = Subscribe(AliasA + 16 * Block, 2);
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*bystander);
+    Pending(AliasB + 2 * Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(AliasA + 2 * Block)}, "a bump through an alias did not reach a subscription registered through the other view");
+    Require(ObserveSubscription(*bystander) == seen, "a bump through an alias reached a subscription over other memory");
+    const auto reverse = SubscriptionGeneration(*subscription);
+    const auto other = Subscribe(AliasB + 2 * Block, 2);
+    const auto otherSince = SubscriptionGeneration(*other);
+    NoteTextureReleased(AliasA + 3 * Block);
+    Require(SubscriptionBumpsSince(*other, otherSince, plain, lookup) && lookup == std::vector<std::uint64_t>{WriteBlockOf(AliasB + 3 * Block)} && plain.empty(), "a bump through the first view did not reach a subscription registered through the alias");
+    Require(SubscriptionBumpsSince(*subscription, reverse, plain, lookup) && plain.empty() && lookup == std::vector<std::uint64_t>{WriteBlockOf(AliasA + 3 * Block)}, "a bump through the first view did not reach its own subscription");
+}
+
+void CheckDomains() {
+    const auto subscription = Subscribe(Base, 2);
+    constexpr std::uint32_t all = WriteDomainBit(WriteDomain::Proof) | WriteDomainBit(WriteDomain::Unwatch) | WriteDomainBit(WriteDomain::Mapping);
+    auto certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a certificate did not hold with nothing changed");
+    BreakProofs();
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after BreakProofs");
+    Require(CertificateHolds(*subscription, certificate, all & ~WriteDomainBit(WriteDomain::Proof)), "a certificate that does not depend on the proof domain failed on it");
+    certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a fresh certificate did not hold");
+    Unwatch(Base + 64 * Block, Block);
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after an Unwatch");
+    certificate = CertifySubscription(*subscription, all);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 96 * Block), static_cast<std::size_t>(Block));
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after an allocation invalidation");
+    certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a fresh certificate did not hold after the domains settled");
+    Pending(Base);
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after a bump of its range");
+}
+
+void CheckWriteIndex() {
+    CheckObserveAndArm();
+    CheckHistoryOutlivesTheArmedBit();
+    CheckTypeMask();
+    CheckReusedSlot();
+    CheckBackingKeys();
+    CheckDomains();
+}
 }
 
 int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
         SetObservationServiceForTest(false);
+        const bool writeIndexOnly = argc == 2 && std::string(argv[1]) == "--write-index";
 #ifndef _WIN32
-        CheckObservedProofCopiesEarlierStamps();
+        if (!writeIndexOnly) CheckObservedProofCopiesEarlierStamps();
 #endif
 #ifdef _WIN32
         if (!WriteWatched()) {
@@ -852,15 +990,18 @@ int main(int argc, char** argv) {
             return 77;
         }
         const Arena arena;
-        CheckObservedProofCopiesEarlierStamps();
+        if (!writeIndexOnly) CheckObservedProofCopiesEarlierStamps();
 #else
-        CheckMemoHitDuringWalk();
-        CheckFailedWalkIsRetried();
-        CheckSubBlockCollectThatCannotWidenIsObservedOnce();
+        if (!writeIndexOnly) {
+            CheckMemoHitDuringWalk();
+            CheckFailedWalkIsRetried();
+            CheckSubBlockCollectThatCannotWidenIsObservedOnce();
+        }
 #endif
         if (argc == 2) {
             const std::string selected = argv[1];
-            if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
+            if (selected == "--write-index") CheckWriteIndex();
+            else if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
             else if (selected == "--unions") {
                 CheckAdjacentCoverage();
                 CheckOverlappingCoverage();
