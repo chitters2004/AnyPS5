@@ -2551,6 +2551,185 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+std::atomic<int> releasedWalkHookCalls{0};
+std::atomic<bool> releasedWalkScanned{false};
+
+void DelayFirstReleasedWalk() {
+    if (releasedWalkHookCalls.fetch_add(1, std::memory_order_acq_rel) != 0) return;
+    releasedWalkScanned.store(true, std::memory_order_release);
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+void RandomReleasedWalkDelay() {
+    thread_local std::uint32_t state = static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1u;
+    state ^= state << 13u;
+    state ^= state >> 17u;
+    state ^= state << 5u;
+    if (state % 4u == 0u) std::this_thread::sleep_for(std::chrono::microseconds(state % 200u));
+}
+
+void HoldFirstReleasedWalk() {
+    releasedWalkHookCalls.store(0, std::memory_order_release);
+    releasedWalkScanned.store(false, std::memory_order_release);
+    SetReleasedWalkHookForTest(&DelayFirstReleasedWalk);
+}
+
+void CheckReleasedWalkWaits() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the released walk fixture was not collected");
+    data[Block + 64] = 0x22;
+    HoldFirstReleasedWalk();
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    const bool seen = !UnchangedSince(base, bytes, before);
+    walker.join();
+    SetReleasedWalkHookForTest(nullptr);
+    Require(seen, "a collect overlapping a released walk returned before that walk stamped the write it found");
+}
+
+void CheckReleasedWalkWatermark() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto walked = base + 2 * Block;
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the watermark fixture was not collected");
+    data[2 * Block + 64] = 0x33;
+    HoldFirstReleasedWalk();
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(walked, 2 * Block)); });
+    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, Block));
+    const auto held = CollectWrites(base, Block);
+    walker.join();
+    SetReleasedWalkHookForTest(nullptr);
+    Require(!UnchangedSince(walked, 2 * Block, held), "a write a released walk found was stamped no newer than a generation handed out while it walked");
+}
+
+void CheckReleasedWalkMemoHit() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the memo fixture was not collected");
+    const auto beforeOld = TrackerGeneration();
+    data[64] = 0x44;
+    BumpCollectEpoch();
+    const auto recorded = CollectWrites(base, bytes);
+    Require(recorded != 0, "the memo entry's collect failed");
+    data[Block + 64] = 0x55;
+    HoldFirstReleasedWalk();
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
+    const auto held = CollectWrites(base, bytes);
+    const bool oldSeen = !UnchangedSince(base, bytes, beforeOld);
+    const bool newBeforeStamp = !UnchangedSince(base, bytes, held);
+    walker.join();
+    SetReleasedWalkHookForTest(nullptr);
+    const bool newAfterStamp = !UnchangedSince(base, bytes, held);
+    Require(held <= TrackerGeneration(), "a memo hit returned a generation newer than the tracker's");
+    Require(oldSeen, "a memo hit on a range a held walk had scanned reported a write older than its epoch unchanged");
+    Require(!newBeforeStamp, "a write the held walk had not stamped yet was visible before its stamp");
+    Require(newAfterStamp, "a write found by a walk held across a memo hit was stamped no newer than the generation the memo hit returned");
+}
+
+void CheckReleasedWalkStress(bool released) {
+    SetReleasedWalksForTest(released);
+    SetReleasedWalkHookForTest(&RandomReleasedWalkDelay);
+    constexpr int Threads = 4;
+    constexpr int Rounds = 400;
+    constexpr std::size_t Lanes = Threads + 1;
+    void* memory = AllocateWatched(Lanes * Block);
+    std::memset(memory, 0x11, Lanes * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, Lanes * Block) != 0, "the stress fixture was not collected");
+    std::atomic<int> missed{0};
+    std::vector<std::thread> pool;
+    for (int lane = 0; lane < Threads; ++lane) {
+        pool.emplace_back([&, lane] {
+            const auto range = base + static_cast<std::uint64_t>(lane) * Block;
+            auto* data = reinterpret_cast<std::uint8_t*>(range);
+            std::uint32_t state = static_cast<std::uint32_t>(lane) * 2654435761u + 1u;
+            for (int round = 0; round < Rounds; ++round) {
+                state ^= state << 13u;
+                state ^= state >> 17u;
+                state ^= state << 5u;
+                const auto offset = static_cast<std::size_t>(state % (2 * Block / 4096)) * 4096;
+                const auto before = TrackerGeneration();
+                std::atomic_ref<std::uint8_t>(data[offset]).store(static_cast<std::uint8_t>(round), std::memory_order_relaxed);
+                static_cast<void>(CollectWritesUncached(range, 2 * Block));
+                if (UnchangedSince(range + offset, 4096, before)) missed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : pool) thread.join();
+    SetReleasedWalkHookForTest(nullptr);
+    Require(missed.load() == 0, "a write made after a generation was read was reported unchanged since it after its own collect");
+}
+
+std::vector<std::uint8_t> PhasedVerdicts(bool released) {
+    SetReleasedWalksForTest(released);
+    SetReleasedWalkHookForTest(&RandomReleasedWalkDelay);
+    constexpr int Threads = 4;
+    constexpr int Phases = 24;
+    void* memory = AllocateWatched(Threads * Block);
+    std::memset(memory, 0x11, Threads * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, Threads * Block) != 0, "the differential fixture was not collected");
+    std::vector<std::uint8_t> verdicts;
+    for (int phase = 0; phase < Phases; ++phase) {
+        const auto start = TrackerGeneration();
+        std::vector<std::thread> writers;
+        for (int lane = 0; lane < Threads; ++lane) {
+            writers.emplace_back([&, lane] {
+                if ((lane + phase) % 3 == 0) return;
+                const auto block = static_cast<std::uint64_t>((lane * 7 + phase * 3) % Threads);
+                reinterpret_cast<std::uint8_t*>(base + block * Block)[(phase * 4096) % Block] = static_cast<std::uint8_t>(phase + 1);
+            });
+        }
+        for (auto& thread : writers) thread.join();
+        std::vector<std::thread> collectors;
+        for (int lane = 0; lane < Threads; ++lane) {
+            collectors.emplace_back([&, lane] {
+                const auto blocks = lane + 1 < Threads ? 2 : 1;
+                static_cast<void>(CollectWritesUncached(base + static_cast<std::uint64_t>(lane) * Block, static_cast<std::size_t>(blocks) * Block));
+            });
+        }
+        for (auto& thread : collectors) thread.join();
+        for (int block = 0; block < Threads; ++block) verdicts.push_back(UnchangedSince(base + static_cast<std::uint64_t>(block) * Block, Block, start) ? 0 : 1);
+    }
+    SetReleasedWalkHookForTest(nullptr);
+    return verdicts;
+}
+
+void CheckReleasedWalkDifferential() {
+    constexpr int Threads = 4;
+    constexpr int Phases = 24;
+    std::vector<std::uint8_t> expected;
+    for (int phase = 0; phase < Phases; ++phase) {
+        std::vector<std::uint8_t> written(Threads, 0);
+        for (int lane = 0; lane < Threads; ++lane) {
+            if ((lane + phase) % 3 != 0) written[static_cast<std::size_t>((lane * 7 + phase * 3) % Threads)] = 1;
+        }
+        expected.insert(expected.end(), written.begin(), written.end());
+    }
+    const auto locked = PhasedVerdicts(false);
+    const auto released = PhasedVerdicts(true);
+    Require(locked == expected, "the serialized walks' verdicts differ from the writes made");
+    Require(released == locked, "the released walks' verdicts differ from the serialized walks'");
+}
+
 struct LatencySummary {
     double median = 0.0;
     double p99 = 0.0;
@@ -2562,7 +2741,7 @@ LatencySummary Summarize(std::vector<double>& samples) {
     return {samples[samples.size() / 2], samples[samples.size() * 99 / 100]};
 }
 
-void RunContentionBench(int collectors) {
+void RunContentionBench(int collectors, bool overlapping) {
     constexpr std::size_t RangeBlocks = 4;
     constexpr int Rounds = 20000;
     const auto lanes = static_cast<std::size_t>(collectors) + 1;
@@ -2591,13 +2770,14 @@ void RunContentionBench(int collectors) {
     std::vector<double> walks;
     queries.reserve(Rounds);
     walks.reserve(Rounds);
-    const auto own = base;
+    const auto own = overlapping && collectors > 0 ? base + RangeBlocks * Block : base;
     const auto since = CollectWritesUncached(own, RangeBlocks * Block);
     start.store(true, std::memory_order_release);
     const auto began = std::chrono::steady_clock::now();
     for (int round = 0; round < Rounds; ++round) {
         const auto queried = std::chrono::steady_clock::now();
-        Require(UnchangedSince(own, RangeBlocks * Block, since), "the bench's own range changed");
+        const bool unchanged = UnchangedSince(own, RangeBlocks * Block, since);
+        Require(unchanged || overlapping, "the bench's own range changed");
         const auto walked = std::chrono::steady_clock::now();
         static_cast<void>(CollectWritesUncached(own, RangeBlocks * Block));
         const auto done = std::chrono::steady_clock::now();
@@ -2609,7 +2789,7 @@ void RunContentionBench(int collectors) {
     for (auto& thread : pool) thread.join();
     const auto query = Summarize(queries);
     const auto walk = Summarize(walks);
-    std::printf("contention bench: %d collectors; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f written collects/s\n", collectors, Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
+    std::printf("contention bench: %d collectors%s; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f written collects/s\n", collectors, overlapping ? " sharing the committer's range" : "", Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
 }
 
 int main(int argc, char** argv) {
@@ -2623,8 +2803,18 @@ int main(int argc, char** argv) {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
-        if (argc == 3 && std::string_view(argv[1]) == "--contention-bench") {
-            RunContentionBench(std::stoi(argv[2]));
+        if (argc == 2 && std::string_view(argv[1]) == "--released-walks") {
+            CheckReleasedWalkWaits();
+            CheckReleasedWalkWatermark();
+            CheckReleasedWalkMemoHit();
+            CheckReleasedWalkStress(true);
+            CheckReleasedWalkStress(false);
+            CheckReleasedWalkDifferential();
+            std::cout << "released walk tests passed\n";
+            return 0;
+        }
+        if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--contention-bench") {
+            RunContentionBench(std::stoi(argv[2]), argc == 4 && std::string_view(argv[3]) == "overlap");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {

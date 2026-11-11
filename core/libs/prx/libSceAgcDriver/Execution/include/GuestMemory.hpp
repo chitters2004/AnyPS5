@@ -159,6 +159,8 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
+void SetReleasedWalkHookForTest(void (*hook)());
+void SetReleasedWalksForTest(bool released);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the

@@ -16,6 +16,7 @@
 #include <mutex>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <atomic>
 #include <algorithm>
 #include <bit>
@@ -1330,6 +1331,12 @@ struct WriteTracker {
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint64_t> generation{1};
     std::atomic<std::uint64_t> stable{1};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> walking;
+    std::condition_variable_any walked;
+
+    bool walkOverlaps(std::uint64_t first, std::uint64_t stop) const {
+        return std::any_of(walking.begin(), walking.end(), [&](const auto& range) { return range.first < stop && first < range.second; });
+    }
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -1719,7 +1726,8 @@ WriteTracker& Tracker() {
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
 class TrackerLock {
 public:
-    explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
+    explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock), previous(activeLock()) {
+        activeLock() = this;
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (!profile) {
             lock.lock();
@@ -1733,6 +1741,16 @@ public:
     }
     ~TrackerLock() {
         if (lock.owns_lock()) publish();
+        if (activeLock() == this) activeLock() = previous;
+    }
+
+    static TrackerLock*& activeLock() {
+        thread_local TrackerLock* active = nullptr;
+        return active;
+    }
+
+    void AwaitWalks(std::uint64_t first, std::uint64_t stop) {
+        while (tracker.walkOverlaps(first, stop)) tracker.walked.wait(lock);
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
@@ -1775,6 +1793,7 @@ private:
 
     WriteTracker& tracker;
     std::unique_lock<AgcDriver::Mutex> lock;
+    TrackerLock* previous = nullptr;
 };
 
 TrackerLock lockTracker(WriteTracker& tracker) {
@@ -1784,7 +1803,7 @@ TrackerLock lockTracker(WriteTracker& tracker) {
 #ifdef _WIN32
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
     tracker.coverage.Restore(address, bytes, generation);
     ++tracker.generation;
@@ -1986,7 +2005,54 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
+std::atomic<void (*)()> releasedWalkHook{nullptr};
+
+#ifndef _WIN32
+std::atomic<int> releasedWalksForTest{-1};
+
+bool releasedWalks() {
+    static const bool enabled = std::getenv("APS5_LOCKED_COLLECT_WALKS") == nullptr;
+    const auto forced = releasedWalksForTest.load(std::memory_order_acquire);
+    return forced >= 0 ? forced != 0 : enabled;
+}
+
+void recordWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    static_cast<std::vector<std::pair<std::uint64_t, std::uint64_t>>*>(context)->emplace_back(begin, end);
+}
+
+bool walkReleased(TrackerLock& lock, WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
+    tracker.walking.emplace_back(first, stop);
+    struct Finish {
+        WriteTracker& tracker;
+        std::pair<std::uint64_t, std::uint64_t> range;
+        ~Finish() {
+            if (const auto found = std::find(tracker.walking.begin(), tracker.walking.end(), range); found != tracker.walking.end()) tracker.walking.erase(found);
+            tracker.walked.notify_all();
+        }
+    } finish{tracker, {first, stop}};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    bool complete = false;
+    {
+        const TrackerLock::Suspension suspended{lock};
+        const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
+        complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &recordWrittenRun, &written);
+        if (const auto hook = releasedWalkHook.load(std::memory_order_acquire)) hook();
+    }
+    ++tracker.generation;
+    StampRuns runs{tracker, StampKind::Cpu, 0, nullptr, {}};
+    const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
+    for (const auto& [begin, end] : written) stampWrittenRun(&runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end));
+    if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    return complete;
+}
+#endif
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+    auto* lock = TrackerLock::activeLock();
+    if (lock != nullptr) lock->AwaitWalks(first, stop);
+#ifndef _WIN32
+    if (lock != nullptr && kind == StampKind::Cpu && window == nullptr && releasedWalks()) return walkReleased(*lock, tracker, first, stop, armedOnly);
+#endif
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
@@ -2039,7 +2105,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
     auto cursor = first;
@@ -2107,7 +2173,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     written.clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return 0;
 #ifdef _WIN32
@@ -2231,7 +2297,7 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
     std::uint64_t end = 0;
     {
         auto& tracker = Tracker();
-        const auto lock = lockTracker(tracker);
+        auto lock = lockTracker(tracker);
         tracker.initialize();
         if (!tracker.watched || !tracker.coverage.ExcludedSpan(address, bytes, &begin, &end)) return;
     }
@@ -2253,6 +2319,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
+    if (auto* lock = TrackerLock::activeLock(); lock != nullptr && bytes != 0) lock->AwaitWalks(address, address + bytes);
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {
@@ -2315,7 +2382,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     unwatchLocked(tracker, address, bytes);
 }
@@ -2323,7 +2390,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
 #ifdef _WIN32
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return;
     bool restored = false;
@@ -2442,7 +2509,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
 
 bool WriteWatched() {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     return tracker.watched;
 }
@@ -2450,7 +2517,7 @@ bool WriteWatched() {
 bool Watched(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
@@ -2507,7 +2574,7 @@ bool SweepSubscription(const WriteSubscription& subscription) {
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     return tracker.rangeUnchanged(address, bytes, generation);
@@ -2515,7 +2582,7 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return false;
     for (const auto& [address, bytes, generation] : queries) {
@@ -2540,7 +2607,7 @@ std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, s
 
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0) return false;
     for (const auto& [begin, end] : ranges) {
@@ -2587,7 +2654,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
         return tracker.generation;
     };
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return stampStored(tracker, store({}));
     constexpr std::uint64_t page = 4096;
@@ -2701,7 +2768,7 @@ std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std:
 
 bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return true;
 #ifdef _WIN32
@@ -2713,7 +2780,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return false;
     const auto end = address + bytes;
@@ -2741,19 +2808,31 @@ std::uint64_t TrackerGeneration() {
     auto& tracker = Tracker();
     // Under the mutex: a collect bumps the generation before its walk, and a walk still running
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     return tracker.generation;
+}
+
+void SetReleasedWalkHookForTest(void (*hook)()) {
+    releasedWalkHook.store(hook, std::memory_order_release);
+}
+
+void SetReleasedWalksForTest(bool released) {
+#ifndef _WIN32
+    releasedWalksForTest.store(released ? 1 : 0, std::memory_order_release);
+#else
+    static_cast<void>(released);
+#endif
 }
 
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     if (generation > tracker.generation.load(std::memory_order_relaxed)) tracker.generation.store(generation, std::memory_order_relaxed);
 }
 
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     return bytes == 0 ? 0 : tracker.newestStamp(address, address + bytes);
 }
@@ -2795,7 +2874,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     const auto epoch = currentCollectEpoch();
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
@@ -2821,7 +2900,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     return tracker.cpuUnchanged(address, bytes, generation);
 }
@@ -2829,14 +2908,14 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
 bool CpuWroteSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (generation == 0 || bytes == 0 || CollectWritesUncached(address, bytes) == 0) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     return tracker.watched && tracker.covers(address, bytes) && !tracker.cpuUnchanged(address, bytes, generation);
 }
 
 bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (bytes == 0u || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0u || !tracker.covers(address, bytes)) return false;
     return tracker.cpuUnchanged(address, bytes, generation) && tracker.rangeUnchanged(address, bytes, generation, false);
@@ -2844,7 +2923,7 @@ bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::ui
 
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
@@ -2859,7 +2938,7 @@ bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
