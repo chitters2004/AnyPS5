@@ -341,14 +341,85 @@ double NanosecondsPerOperation(int threads, int iterations, bool shared) {
     return std::chrono::duration<double, std::nano>(elapsed).count() / iterations;
 }
 
+enum class Contention { Shared, Exclusive, Mixed };
+
+bool Writes(Contention contention, int thread, int iteration) {
+    return contention == Contention::Exclusive || (contention == Contention::Mixed && (iteration + thread) % 10 == 0);
+}
+
+template<typename TMutex>
+double NanosecondsPerContendedOperation(int threads, int iterations, Contention contention) {
+    TMutex mutex;
+    std::uint64_t first = 0;
+    std::uint64_t second = 0;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<bool> broken{false};
+    std::vector<std::thread> workers;
+    for (int t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int i = 0; i < iterations; ++i) {
+                if (Writes(contention, t, i)) {
+                    mutex.lock();
+                    ++first;
+                    ++second;
+                    mutex.unlock();
+                } else {
+                    mutex.lock_shared();
+                    if (first != second) broken.store(true, std::memory_order_relaxed);
+                    mutex.unlock_shared();
+                }
+            }
+        });
+    }
+    while (ready.load() != threads) std::this_thread::yield();
+    const auto start = std::chrono::steady_clock::now();
+    go.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    std::uint64_t expected = 0;
+    for (int t = 0; t < threads; ++t) {
+        for (int i = 0; i < iterations; ++i) expected += Writes(contention, t, i) ? 1u : 0u;
+    }
+    Check(!broken.load() && first == expected && second == expected, std::is_same_v<TMutex, std::shared_mutex> ? "std::shared_mutex lost a contended write or let a reader see a half-written pair" : "NativeSharedMutex lost a contended write or let a reader see a half-written pair");
+    return std::chrono::duration<double, std::nano>(elapsed).count() / (static_cast<double>(threads) * iterations);
+}
+
+std::vector<int> ThreadCounts(int maximumThreads) {
+    std::vector<int> counts;
+    for (int threads = 1; threads < maximumThreads; threads *= 2) counts.push_back(threads);
+    counts.push_back(maximumThreads);
+    return counts;
+}
+
+void ContendedBenchmark(int maximumThreads, int iterations) {
+    std::printf("all threads share one lock, %d operations each; ns per operation across all threads (wall time / (threads x operations))\n", iterations);
+    std::printf("%8s %14s %14s %14s %14s %14s %14s\n", "threads", "std shared", "native shared", "std excl", "native excl", "std 10% w", "native 10% w");
+    std::fflush(stdout);
+    const auto cell = [](double nanoseconds) {
+        std::printf(" %14.1f", nanoseconds);
+        std::fflush(stdout);
+    };
+    for (const int threads : ThreadCounts(maximumThreads)) {
+        std::printf("%8d", threads);
+        std::fflush(stdout);
+        cell(NanosecondsPerContendedOperation<std::shared_mutex>(threads, iterations, Contention::Shared));
+        cell(NanosecondsPerContendedOperation<NativeSharedMutex>(threads, iterations, Contention::Shared));
+        cell(NanosecondsPerContendedOperation<std::shared_mutex>(threads, iterations, Contention::Exclusive));
+        cell(NanosecondsPerContendedOperation<NativeSharedMutex>(threads, iterations, Contention::Exclusive));
+        cell(NanosecondsPerContendedOperation<std::shared_mutex>(threads, iterations, Contention::Mixed));
+        cell(NanosecondsPerContendedOperation<NativeSharedMutex>(threads, iterations, Contention::Mixed));
+        std::printf("\n");
+    }
+}
+
 void Benchmark(int maximumThreads, int iterations) {
     std::printf("each thread locks and unlocks its own lock %d times; ns per operation per thread (wall time / iterations)\n", iterations);
     std::printf("NativeSharedMutex is %s on this platform\n", std::is_same_v<NativeSharedMutex, std::shared_mutex> ? "std::shared_mutex" : "a native lock");
     std::printf("%8s %22s %22s %22s %22s\n", "threads", "std shared", "native shared", "std exclusive", "native exclusive");
-    std::vector<int> counts;
-    for (int threads = 1; threads < maximumThreads; threads *= 2) counts.push_back(threads);
-    counts.push_back(maximumThreads);
-    for (const int threads : counts) {
+    for (const int threads : ThreadCounts(maximumThreads)) {
         const auto stdShared = NanosecondsPerOperation<std::shared_mutex>(threads, iterations, true);
         const auto nativeShared = NanosecondsPerOperation<NativeSharedMutex>(threads, iterations, true);
         const auto stdExclusive = NanosecondsPerOperation<std::shared_mutex>(threads, iterations, false);
@@ -364,7 +435,9 @@ int main(int argc, char** argv) {
         const int hardware = static_cast<int>(std::max(1u, std::thread::hardware_concurrency()));
         const int maximumThreads = argc >= 3 ? std::max(1, std::atoi(argv[2])) : hardware;
         const int iterations = argc >= 4 ? std::max(1, std::atoi(argv[3])) : 1000000;
+        const int contendedIterations = argc >= 5 ? std::max(1, std::atoi(argv[4])) : 100000;
         Benchmark(maximumThreads, iterations);
+        ContendedBenchmark(maximumThreads, contendedIterations);
         return failures == 0 ? 0 : 1;
     }
     ExclusiveCounts(8, 20000);
@@ -380,6 +453,7 @@ int main(int argc, char** argv) {
     StaticLock();
     NanosecondsPerOperation<NativeSharedMutex>(4, 10000, true);
     NanosecondsPerOperation<NativeSharedMutex>(4, 10000, false);
+    NanosecondsPerContendedOperation<NativeSharedMutex>(4, 10000, Contention::Mixed);
     if (failures != 0) {
         std::fprintf(stderr, "%d shared mutex check(s) failed\n", failures);
         return 1;
