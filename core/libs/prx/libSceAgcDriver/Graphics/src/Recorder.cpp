@@ -1886,7 +1886,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
-    if (barrier) {
+    if (barrier && !DiagNoPassBarriers()) {
         recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess);
         CountBarriers(CommandClass::Draw);
     }
@@ -2091,6 +2091,7 @@ void Recorder::recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sour
         RecordMemoryBarrier(context, commands, sourceStage, destinationStage, sourceAccess, destinationAccess);
         return;
     }
+    NoteBarrierMasks(sourceStage, destinationStage);
     const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, sourceAccess, destinationAccess};
     cmdPipelineBarrier(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
@@ -2260,6 +2261,38 @@ struct TimingTotals { std::uint64_t count = 0; double ms = 0; std::uint64_t byte
 AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
+std::array<TimingTotals, PassBreakCount> timingByPassReason{};
+constexpr std::size_t MaskSlots = 64;
+struct MaskSlot {
+    std::atomic<std::uint64_t> key{0};
+    std::atomic<std::uint64_t> count{0};
+};
+MaskSlot maskSlots[MaskSlots];
+
+std::size_t GpuTopCount() {
+    static const std::size_t count = [] {
+        const char* text = std::getenv("APS5_PROFILE_GPU_TOP");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoul(text, nullptr, 10)) : std::size_t{12};
+    }();
+    return count;
+}
+
+std::string StageText(std::uint32_t mask) {
+    constexpr std::pair<std::uint32_t, const char*> names[] = {{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, "ALL_COMMANDS"}, {VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, "ALL_GRAPHICS"}, {VK_PIPELINE_STAGE_HOST_BIT, "HOST"}, {VK_PIPELINE_STAGE_TRANSFER_BIT, "TRANSFER"}, {VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, "COMPUTE"}, {VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, "DRAW_INDIRECT"}, {VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, "VERTEX_INPUT"}, {VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, "VERTEX"}, {VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, "FRAGMENT"}, {VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT, "EARLY_TESTS"}, {VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, "LATE_TESTS"}, {VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, "COLOR_OUT"}, {VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, "TOP"}, {VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, "BOTTOM"}};
+    std::string text;
+    for (const auto& [bit, name] : names) {
+        if ((mask & bit) == 0) continue;
+        if (!text.empty()) text += '|';
+        text += name;
+        mask &= ~bit;
+    }
+    if (mask != 0) {
+        char rest[16];
+        std::snprintf(rest, sizeof(rest), "%s0x%x", text.empty() ? "" : "|", mask);
+        text += rest;
+    }
+    return text.empty() ? "0" : text;
+}
 std::uint64_t timingBatches = 0;
 
 bool DrawOrGpuProfiled() {
@@ -2288,6 +2321,19 @@ void reportBarriers() {
         mergedLine += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> masks;
+    for (auto& slot : maskSlots) {
+        const auto count = slot.count.exchange(0, std::memory_order_relaxed);
+        if (count != 0) masks.emplace_back(count, slot.key.load(std::memory_order_relaxed));
+    }
+    std::sort(masks.begin(), masks.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string maskLine;
+    for (std::size_t i = 0; i < masks.size() && i < 16; ++i) {
+        const auto source = static_cast<std::uint32_t>((masks[i].second >> 32u) & 0x7fffffffu);
+        const auto destination = static_cast<std::uint32_t>(masks[i].second & 0xffffffffu);
+        maskLine += " " + StageText(source) + ">" + StageText(destination) + " x" + std::to_string(masks[i].first);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s\n", maskLine.c_str());
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -2321,6 +2367,25 @@ bool Recorder::GpuTimingEnabled() {
 
 bool Recorder::BatchStampsEnabled() {
     return GpuTimingEnabled() || DrawProfiled() || PerformanceTrace::Configured() || batchStampsRequested.load(std::memory_order_relaxed);
+}
+
+void Recorder::NoteBarrierMasks(VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage) {
+    if (!DrawOrGpuProfiled()) return;
+    const std::uint64_t key = (static_cast<std::uint64_t>(sourceStage) << 32u | destinationStage) | (std::uint64_t{1} << 63u);
+    const auto first = static_cast<std::size_t>((key * 0x9E3779B97F4A7C15ull) >> 58u);
+    for (std::size_t probe = 0; probe < MaskSlots; ++probe) {
+        auto& slot = maskSlots[(first + probe) % MaskSlots];
+        auto current = slot.key.load(std::memory_order_relaxed);
+        if (current == 0 && slot.key.compare_exchange_strong(current, key, std::memory_order_relaxed)) current = key;
+        if (current != key) continue;
+        slot.count.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
+bool Recorder::DiagNoPassBarriers() {
+    static const bool skip = std::getenv("APS5_DIAG_NO_PASS_BARRIERS") != nullptr;
+    return skip;
 }
 
 void Recorder::CountBarriers(CommandClass which, std::uint32_t count) {
@@ -2473,10 +2538,16 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(0xff);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
+}
+
+void Recorder::TagGpuTiming(std::uint32_t index, std::uint8_t tag) {
+    if (index == NoTiming || open == nullptr || index >= open->timedTags.size()) return;
+    open->timedTags[index] = tag;
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
@@ -3146,6 +3217,11 @@ void Recorder::readGpuTiming(Batch& batch) {
         ++totals.count;
         totals.ms += ns / 1e6;
         totals.bytes += batch.timedBytes[i];
+        if (key == ClassKey(CommandClass::Draw) && i < batch.timedTags.size() && batch.timedTags[i] < PassBreakCount) {
+            auto& reason = timingByPassReason[batch.timedTags[i]];
+            ++reason.count;
+            reason.ms += ns / 1e6;
+        }
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
@@ -3177,8 +3253,18 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" %s x%llu %.0fms", Recorder::TimingKeyLabel(hot[i].first).c_str(), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    for (std::size_t i = 0; i < hot.size() && i < GpuTopCount(); ++i) AgcDriver::ProfilePrint_nid_no_patch(" %s x%llu %.0fms", Recorder::TimingKeyLabel(hot[i].first).c_str(), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    std::string reasons;
+    for (std::size_t reason = 0; reason < PassBreakCount; ++reason) {
+        const auto& totals = timingByPassReason[reason];
+        if (totals.count == 0) continue;
+        char text[160];
+        std::snprintf(text, sizeof(text), " %s x%llu %.1fms (per present x%.1f %.2fms)", PassBreakNames[reason], static_cast<unsigned long long>(totals.count), totals.ms, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent);
+        reasons += text;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[gpupass] draw passes by start reason:%s\n", reasons.c_str());
+    timingByPassReason.fill({});
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     timingBatches = 0;
