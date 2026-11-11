@@ -2550,7 +2550,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
 
 bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders) {
     const auto fragmentSet = [](const CompiledShader& shader) { return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet; }); };
-    const auto fragmentStage = [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment; };
+    const auto fragmentStage = [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && (shader.program == nullptr || !shader.program->bindings.empty() || !OmitsInertFragments() || !InertFragment(*shader.program)); };
     return std::any_of(shaders.begin(), shaders.end(), fragmentSet) || (context.graphicsPipelineLibrary && std::any_of(shaders.begin(), shaders.end(), fragmentStage));
 }
 
