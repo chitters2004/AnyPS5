@@ -19,6 +19,7 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t ChunkBytes = 64 * 1024;
+constexpr std::size_t PooledChunks = 16;
 std::atomic<bool> anySubmitPosted{false};
 thread_local const CommandEncoder* encoderThread = nullptr;
 constexpr long long LongestIdleSpinUs = 10000;
@@ -573,6 +574,16 @@ std::unique_ptr<CommandEncoder> CommandEncoder::Attach(VkDevice device, DeviceFu
 CommandEncoder::CommandEncoder(VkDevice device, DeviceFunctions& table, std::size_t slot) : table(table), real(table), device(device), slot(slot) {
     static_cast<void>(IdleSite());
     static_cast<void>(AwaitSite());
+    try {
+        for (; chunkCount < PooledChunks; ++chunkCount) {
+            auto chunk = std::make_unique<Chunk>();
+            chunk->bytes.resize(ChunkBytes);
+            giveSpare(chunk.release());
+        }
+    } catch (...) {
+        for (auto* chunk = spares.exchange(nullptr, std::memory_order_acquire); chunk != nullptr;) delete std::exchange(chunk, chunk->next.load(std::memory_order_relaxed));
+        throw;
+    }
     worker = std::thread([this] { run(); });
     std::lock_guard lock(slotMutex());
     slots()[slot].real = real;
@@ -622,6 +633,7 @@ void CommandEncoder::RefuseForeignProducer() {
 }
 
 void CommandEncoder::Close() {
+    if (appended != 0) commandCount.fetch_add(std::exchange(appended, 0), std::memory_order_relaxed);
     if (filling != nullptr) ++filling->windows;
     const auto closed = windows.back().commands;
     windows.pop_back();
@@ -649,7 +661,14 @@ std::byte* CommandEncoder::Append(Run run, std::size_t bytes) {
     if (filling != nullptr && filling->records == 0 && filling->bytes.size() < need) giveSpare(std::exchange(filling, nullptr));
     if (filling == nullptr) {
         filling = takeSpare();
-        if (filling == nullptr) filling = new Chunk;
+        while (filling == nullptr && chunkCount >= PooledChunks && executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire)) {
+            awaitSpare();
+            filling = takeSpare();
+        }
+        if (filling == nullptr) {
+            filling = new Chunk;
+            ++chunkCount;
+        }
         try {
             if (filling->bytes.size() < std::max(ChunkBytes, need)) filling->bytes.resize(std::max(ChunkBytes, need));
         } catch (...) {
@@ -668,6 +687,7 @@ std::byte* CommandEncoder::Append(Run run, std::size_t bytes) {
     new (at) Record{run, static_cast<std::uint32_t>(need)};
     filling->used += need;
     ++filling->records;
+    ++appended;
     return at + RecordHeader;
 }
 
@@ -713,7 +733,6 @@ void CommandEncoder::giveSpare(Chunk* chunk) noexcept {
 
 void CommandEncoder::publish(Chunk* chunk, PostCause cause) noexcept {
     const auto records = chunk->records;
-    commandCount.fetch_add(records, std::memory_order_relaxed);
     postCount.fetch_add(1, std::memory_order_relaxed);
     windowCount.fetch_add(chunk->windows, std::memory_order_relaxed);
     postsBy[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
@@ -916,6 +935,20 @@ void CommandEncoder::await() noexcept {
         awaiting.fetch_sub(1, std::memory_order_relaxed);
     }
     PerformanceTrace::Handoff(AwaitSite(), spin);
+    const auto end = std::chrono::steady_clock::now();
+    waitCount.fetch_add(1, std::memory_order_relaxed);
+    waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
+    if (PerformanceTrace::Recording()) {
+        if (auto* thread = PerformanceTrace::Thread()) thread->Add(TraceFormat::EncoderWaitScope, nullptr, start, end);
+    }
+}
+
+void CommandEncoder::awaitSpare() noexcept {
+    const auto start = std::chrono::steady_clock::now();
+    awaiting.fetch_add(1, std::memory_order_seq_cst);
+    const auto seen = executed.load(std::memory_order_seq_cst);
+    if (spares.load(std::memory_order_acquire) == nullptr) AddressWait(executed, seen);
+    awaiting.fetch_sub(1, std::memory_order_relaxed);
     const auto end = std::chrono::steady_clock::now();
     waitCount.fetch_add(1, std::memory_order_relaxed);
     waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);

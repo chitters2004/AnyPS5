@@ -12245,8 +12245,8 @@ void encodedSegmentFailureTest(const Device& device) {
     const auto failed = segment(true);
     const auto failedQueries = countedQueries.load(std::memory_order_relaxed);
     const auto healthy = segment(false);
-    const auto healthyQueries = countedQueries.load(std::memory_order_relaxed);
     recorder.Sync();
+    const auto healthyQueries = countedQueries.load(std::memory_order_relaxed);
     CommandEncoder::SetDelayForTesting({});
     Require(failed == "injected replay failure", "a batch whose replay failed before its occlusion segment was submitted or refused with '" + failed + "'");
     Require(failedQueries == 0, "an occlusion segment recorded " + std::to_string(failedQueries) + " query commands into a batch after a replay into it failed");

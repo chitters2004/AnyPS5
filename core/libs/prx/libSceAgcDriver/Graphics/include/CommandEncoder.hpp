@@ -175,6 +175,7 @@ private:
     void submit(SubmitRequest& request) noexcept;
     void settle(SubmitRequest& request, SubmitRequest::State state) noexcept;
     void await() noexcept;
+    void awaitSpare() noexcept;
     DeviceFunctions& table;
     DeviceFunctions real;
     VkDevice device = VK_NULL_HANDLE;
@@ -192,6 +193,7 @@ private:
     std::atomic<Chunk*> parked{nullptr};
     std::atomic<Chunk*> spares{nullptr};
     Chunk* ownSpares = nullptr;
+    std::size_t chunkCount = 0;
     std::atomic<std::uint64_t> posted{0};
     std::atomic<std::uint64_t> executed{0};
     std::atomic<bool> sleeping{false};
@@ -202,6 +204,7 @@ private:
     std::atomic<std::thread::id> owner{};
     std::atomic<std::uint64_t> postCount{0};
     std::atomic<std::uint64_t> commandCount{0};
+    std::uint64_t appended = 0;
     std::atomic<std::uint64_t> waitCount{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> encodeNs{0};

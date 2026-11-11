@@ -1153,19 +1153,21 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
-            std::unique_lock<AgcDriver::Mutex> mainQueueLock;
-            std::unique_lock<std::mutex> sparseQueueLock;
-            std::unique_lock<std::mutex> settleQueueLock;
-            std::unique_lock<std::mutex> presentQueueLock;
-            if (Graphics::QueueAccessEnabled()) {
-                if (Graphics::QueueSubmitsPosted()) Graphics::SettleQueueSubmits(device, false);
-                mainQueueLock = std::unique_lock(mainQueueMutex);
-                sparseQueueLock = std::unique_lock(sparseQueueMutex);
-                settleQueueLock = std::unique_lock(settleQueueMutex);
-                presentQueueLock = std::unique_lock(presentQueueMutex);
+            {
+                std::unique_lock<AgcDriver::Mutex> mainQueueLock;
+                std::unique_lock<std::mutex> sparseQueueLock;
+                std::unique_lock<std::mutex> settleQueueLock;
+                std::unique_lock<std::mutex> presentQueueLock;
+                if (Graphics::QueueAccessEnabled()) {
+                    if (Graphics::QueueSubmitsPosted()) Graphics::SettleQueueSubmits(device, false);
+                    mainQueueLock = std::unique_lock(mainQueueMutex);
+                    sparseQueueLock = std::unique_lock(sparseQueueMutex);
+                    settleQueueLock = std::unique_lock(settleQueueMutex);
+                    presentQueueLock = std::unique_lock(presentQueueMutex);
+                }
+                const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
+                if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             }
-            const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
-            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
             {
                 std::lock_guard lock(presentMutex);
@@ -2956,11 +2958,13 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
-    std::optional<Graphics::QueueAccess> allQueues;
-    std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
-    if (Graphics::QueueAccessEnabled()) allQueues.emplace(graphicsContext(), Graphics::QueueAccess::Queues::All);
-    else if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
-    check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    {
+        std::optional<Graphics::QueueAccess> allQueues;
+        std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
+        if (Graphics::QueueAccessEnabled()) allQueues.emplace(graphicsContext(), Graphics::QueueAccess::Queues::All);
+        else if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+        check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
+    }
     Graphics::CheckPixelFunctionLds(graphicsContext());
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
 }
