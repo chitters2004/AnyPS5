@@ -2158,19 +2158,25 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     const bool candidate = recordable && plan.candidate;
     resolved.cacheable = recordable && plan.keyed;
-    const auto address = candidate && !ShaderResources::SpaceReuseDisabled() ? addressStages(shaders) : AddressStages::None;
+    const auto address = candidate && !ShaderResources::SpaceReuseDisabled() ? InCommitPhase(CommitPhase::ResolveSetup, [&] { return addressStages(shaders); }) : AddressStages::None;
+    CountCommit(CommitCounter::ResolveDraws);
+    if (address != AddressStages::None) CountCommit(CommitCounter::ResolveAddressStages);
     std::optional<AddressDrawReuse> reuse;
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
+        CountCommit(CommitCounter::ResolveCacheable);
         resolved.contentKey = plan.contentKey;
         if (auto cached = InCommitPhase(CommitPhase::ResolveCache, [&] { return SharedResourceCache().Find(resolved.contentKey); })) {
+            CountCommit(CommitCounter::ResolveFound);
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
             bool spaceHeld = !cached->SpaceReuse();
             bool inUse = false;
             if (!spaceHeld) {
+                const CommitPhaseScope space(CommitPhase::ResolveSpace);
+                CountCommit(CommitCounter::ResolveSpaceChecks);
                 if (auto* active = Recorder::Active(); active != nullptr) {
                     GuestBufferMemory::ReleaseRetainedSpaces(active->Id(), active->CompletedThrough());
                     static_cast<void>(cached->ReleaseCompletedSpace(active->Id(), active->CompletedThrough()));
@@ -2200,12 +2206,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 const CommitPhaseScope revalidate(CommitPhase::Revalidate);
                 return cached->Revalidate(shaders);
             }();
+            if (valid) CountCommit(CommitCounter::ResolveValid);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+            if (valid && recorder != nullptr) moved = InCommitPhase(CommitPhase::ResolveMoved, [&] { return cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched); });
             if (moved.has_value()) {
+                CountCommit(CommitCounter::ResolveHits);
+                if (!moved->empty()) CountCommit(CommitCounter::ResolveMovedHits);
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
                 static_cast<void>(heldSpace.release());
@@ -2215,10 +2224,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
-                if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
+                if (valid && cached->SpaceReuse()) InCommitPhase(CommitPhase::ResolveEvict, [&] { static_cast<void>(cached->ReleaseSpace()); });
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                CountCommit(CommitCounter::ResolveInvalidated);
+                const CommitPhaseScope evict(CommitPhase::ResolveEvict);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
@@ -2229,7 +2240,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
+        CountCommit(CommitCounter::ResolveBuilds);
+        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled()); });
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -3509,10 +3521,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); }));
     }
     timer.phase(PhasePrepare);
-    BeginCommitPhase(CommitPhase::Resolve);
+    BeginCommitPhase(CommitPhase::ResolveSetup);
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
+    BeginCommitPhase(CommitPhase::Resolve);
     auto& resolved = prepared.resolved;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, plan, outcome, timer);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
