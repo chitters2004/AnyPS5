@@ -173,7 +173,10 @@ void QueueSubmitter::run() {
             if (result != VK_SUCCESS) failure = std::make_exception_ptr(std::runtime_error("AGC graphics: vkQueueSubmit recorder (queue submitter): Vulkan result " + std::to_string(static_cast<int>(result))));
         }
         job.encode.reset();
-        if (failure != nullptr) job.failures->raised.fetch_add(1, std::memory_order_acq_rel);
+        if (failure != nullptr) {
+            if (job.signal != VK_NULL_HANDLE) job.failures->Fail(job.signalValue);
+            job.failures->raised.fetch_add(1, std::memory_order_acq_rel);
+        }
         job.outcome->resolve(failure == nullptr ? SubmitOutcome::Submitted : SubmitOutcome::Failure, failure);
         {
             std::lock_guard lock(mutex);

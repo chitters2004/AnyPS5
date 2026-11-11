@@ -68,6 +68,8 @@ struct MockDevice {
     std::vector<std::string> violations;
     bool gate = false;
     bool jitter = false;
+    std::uint64_t timelineValue = 0;
+    std::size_t fenceSignals = 0;
     bool gateOpen = false;
     bool holdSubmitReturn = false;
     bool submitReturnOpen = false;
@@ -301,7 +303,17 @@ VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue queue, std::uint32_t coun
         }
         mock->submissions.push_back(std::move(submission));
     }
-    if (fence != VK_NULL_HANDLE) mock->signaled[fence] = true;
+    for (std::uint32_t submit = 0; submit < count; ++submit) {
+        for (const auto* next = static_cast<const VkBaseInStructure*>(submits[submit].pNext); next != nullptr; next = next->pNext) {
+            if (next->sType != VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR) continue;
+            const auto& timeline = *reinterpret_cast<const VkTimelineSemaphoreSubmitInfoKHR*>(next);
+            for (std::uint32_t value = 0; value < timeline.signalSemaphoreValueCount; ++value) mock->timelineValue = std::max(mock->timelineValue, timeline.pSignalSemaphoreValues[value]);
+        }
+    }
+    if (fence != VK_NULL_HANDLE) {
+        mock->signaled[fence] = true;
+        ++mock->fenceSignals;
+    }
     if (mock->holdSubmitReturn) {
         if (fence != VK_NULL_HANDLE) mock->fencesInSubmit.insert(fence);
         mock->buffersInSubmit.insert(submitted.begin(), submitted.end());
@@ -312,6 +324,26 @@ VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue queue, std::uint32_t coun
     }
     mock->changed.notify_all();
     return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateSemaphore(VkDevice, const VkSemaphoreCreateInfo*, const VkAllocationCallbacks*, VkSemaphore* semaphore) {
+    std::lock_guard lock(mock->mutex);
+    *semaphore = handleOf<VkSemaphore>(mock->Handle());
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroySemaphore(VkDevice, VkSemaphore, const VkAllocationCallbacks*) {}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockGetSemaphoreCounterValue(VkDevice, VkSemaphore, std::uint64_t* value) {
+    std::lock_guard lock(mock->mutex);
+    *value = mock->timelineValue;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockWaitSemaphores(VkDevice, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
+    std::unique_lock lock(mock->mutex);
+    const auto wanted = info->pValues[0];
+    return mock->changed.wait_for(lock, std::chrono::nanoseconds(timeout), [&] { return mock->timelineValue >= wanted; }) ? VK_SUCCESS : VK_TIMEOUT;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateFence(VkDevice, const VkFenceCreateInfo*, const VkAllocationCallbacks*, VkFence* fence) {
@@ -365,6 +397,10 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
         {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
         {"vkQueueBindSparse", reinterpret_cast<PFN_vkVoidFunction>(mockQueueBindSparse)},
+        {"vkCreateSemaphore", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSemaphore)},
+        {"vkDestroySemaphore", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySemaphore)},
+        {"vkGetSemaphoreCounterValueKHR", reinterpret_cast<PFN_vkVoidFunction>(mockGetSemaphoreCounterValue)},
+        {"vkWaitSemaphoresKHR", reinterpret_cast<PFN_vkVoidFunction>(mockWaitSemaphores)},
         {"vkCreateFence", reinterpret_cast<PFN_vkVoidFunction>(mockCreateFence)},
         {"vkDestroyFence", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyFence)},
         {"vkGetFenceStatus", reinterpret_cast<PFN_vkVoidFunction>(mockGetFenceStatus)},
@@ -563,9 +599,7 @@ std::string Reported(const std::function<void()>& action) {
 
 std::size_t SignaledFences(Fixture& fixture) {
     std::lock_guard lock(fixture.device.mutex);
-    std::size_t count = 0;
-    for (const auto& [fence, signaled] : fixture.device.signaled) count += signaled ? 1 : 0;
-    return count;
+    return fixture.device.fenceSignals;
 }
 
 void FailedEncodeNeverCompletes() {
@@ -680,6 +714,58 @@ void BatchesBehindAFailureAreNotSubmitted() {
             const auto submissions = fixture.Submissions();
             Expect(submissions.size() == 1 && joined(submissions[0].recorded) == "[fill 9]", "the " + kind + " batch after the reported failures was not submitted");
         }
+    }
+}
+
+void TimelineWaitsGiveUpOnAFailedBatch() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    for (const bool deferred : {true, false}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, deferred);
+        const std::string kind = deferred ? "deferred" : "direct";
+        Fixture fixture;
+        const Watchdog watchdog("a timeline wait on a failed " + kind + " batch");
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(fixture.context, true);
+        {
+            std::lock_guard lock(fixture.device.mutex);
+            fixture.device.failSubmits = 1;
+        }
+        fixture.Fill(recorder, 1);
+        recorder.Submit();
+        fixture.Drain();
+        Expect(!Reported([&] { recorder.WaitSerial(1); }).empty(), "a timeline wait for a failed " + kind + " batch did not fail");
+        Reported([&] { recorder.Sync(); });
+        fixture.Fill(recorder, 2);
+        recorder.Submit();
+        fixture.Drain();
+        recorder.WaitSerial(2);
+        recorder.Sync();
+    }
+}
+
+void TeardownRetiresEveryBatchAfterAFailure() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    for (const bool deferred : {true, false}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, deferred);
+        const std::string kind = deferred ? "deferred" : "direct";
+        Fixture fixture;
+        {
+            const Watchdog watchdog("the teardown of a recorder with failed " + kind + " batches");
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.failSubmits = 1;
+            }
+            for (std::uint32_t batch = 0; batch < 3; ++batch) {
+                fixture.Fill(recorder, batch);
+                recorder.Submit();
+                fixture.Drain();
+            }
+        }
+        std::lock_guard lock(fixture.device.mutex);
+        Expect(fixture.device.signaled.empty(), "the teardown after a failed " + kind + " submit left " + std::to_string(fixture.device.signaled.size()) + " fences alive");
+        Expect(fixture.device.allocated == fixture.device.freed, "the teardown after a failed " + kind + " submit left command buffers allocated");
     }
 }
 
@@ -1125,6 +1211,8 @@ int main(int argc, char** argv) {
             SubmitWaitsForTheEncodeAndDrainWaitsForBoth();
             FailedEncodeNeverCompletes();
             FailedSubmitReachesFinish();
+            TimelineWaitsGiveUpOnAFailedBatch();
+            TeardownRetiresEveryBatchAfterAFailure();
             BatchesBehindAFailureAreNotSubmitted();
             SparseBindsShareTheQueueWithTheSubmitter();
             SubmittersAreScopedToTheirDevice();

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -21,6 +23,20 @@ struct SubmitFailures {
     std::atomic<std::uint64_t> raised{0};
     std::atomic<std::uint64_t> reported{0};
     bool Unreported() const { return raised.load(std::memory_order_acquire) > reported.load(std::memory_order_acquire); }
+    // The timeline values of the batches that failed: nothing ever signals them, so a wait for one of
+    // them must give up instead of waiting out VK_TIMEOUT.
+    void Fail(std::uint64_t serial) {
+        std::lock_guard lock(failedMutex);
+        failedSerials.push_back(serial);
+    }
+    bool Failed(std::uint64_t serial) const {
+        std::lock_guard lock(failedMutex);
+        return std::find(failedSerials.begin(), failedSerials.end(), serial) != failedSerials.end();
+    }
+
+private:
+    mutable std::mutex failedMutex;
+    std::vector<std::uint64_t> failedSerials;
 };
 
 class SubmitOutcome {

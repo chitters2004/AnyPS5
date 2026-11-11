@@ -1391,10 +1391,16 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(co
 }
 
 Recorder::~Recorder() {
-    try {
-        Sync();
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
+    // Every batch is retired even when some failed: a throwing Sync() retires the failed batch it
+    // reports and leaves the rest for the next call.
+    for (std::size_t attempts = 0;; ++attempts) {
+        try {
+            Sync();
+            break;
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
+            if (Idle() || attempts > 100000) break;
+        }
     }
     ForgetHtileMasks_nid_no_patch(id);
     progressWatcher.reset();
@@ -4453,11 +4459,15 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
     wait.pValues = &serial;
-    auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
-    for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+    // A batch whose encode or submit failed never signals its value, so the wait runs in slices and
+    // gives up once the batch is known to have failed (finish() reports why).
+    constexpr std::uint64_t slice = 50'000'000ull;
+    auto result = waitSemaphores(device, &wait, slice);
+    for (std::uint64_t waited = slice; result == VK_TIMEOUT; waited += slice) {
+        if (failures != nullptr && failures->Failed(serial)) return VK_ERROR_UNKNOWN;
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
-        std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), waited);
-        result = waitSemaphores(device, &wait, 5'000'000'000ull);
+        if (waited % 5'000'000'000ull == 0) std::fprintf(stderr, "[gpu] recorded batch %llu still running on the GPU after %d s (timeline wait)\n", static_cast<unsigned long long>(serial), static_cast<int>(waited / 1'000'000'000ull));
+        result = waitSemaphores(device, &wait, slice);
     }
     return result;
 }
