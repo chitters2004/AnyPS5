@@ -34,6 +34,8 @@ class CommandEncoders;
 class DeviceBuffer;
 class EncodeTicket;
 class QueueSubmitter;
+struct SubmitFailures;
+class SubmitOutcome;
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -627,8 +629,7 @@ private:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         std::unique_ptr<CommandStream> stream;
         std::shared_ptr<EncodeTicket> encode;
-        QueueSubmitter* submitter = nullptr;
-        std::uint64_t submitPosition = 0;
+        std::shared_ptr<SubmitOutcome> outcome;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -881,6 +882,7 @@ private:
     void discard(std::unique_ptr<Batch> batch) noexcept;
     void removeLabels(Batch& batch);
     void release(Batch& batch, bool retired = false) noexcept;
+    std::shared_ptr<SubmitFailures> submitFailures() const;
     std::unique_ptr<CommandStream> takeStream();
     void recycleStream(std::unique_ptr<CommandStream> stream) noexcept;
     void encodeInline(Batch& batch);

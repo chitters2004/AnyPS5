@@ -16,6 +16,30 @@ namespace AgcDriver::Graphics {
 
 class EncodeTicket;
 
+struct SubmitFailures {
+    std::atomic<std::uint64_t> raised{0};
+    std::atomic<std::uint64_t> reported{0};
+    bool Unreported() const { return raised.load(std::memory_order_acquire) > reported.load(std::memory_order_acquire); }
+};
+
+class SubmitOutcome {
+public:
+    bool Resolved() const { return state.load(std::memory_order_acquire) != Pending; }
+    bool Failed() const { return state.load(std::memory_order_acquire) == Failure; }
+    void Wait() const;
+    std::exception_ptr Error() const { return error; }
+    void Report() const;
+
+private:
+    friend class QueueSubmitter;
+    static constexpr std::uint8_t Pending = 0, Submitted = 1, Failure = 2;
+    void resolve(std::uint8_t outcome, std::exception_ptr reason);
+
+    std::atomic<std::uint8_t> state{Pending};
+    std::exception_ptr error;
+    std::shared_ptr<SubmitFailures> failures;
+};
+
 class QueueSubmitter {
 public:
     struct Job {
@@ -26,18 +50,17 @@ public:
         VkSemaphore signal = VK_NULL_HANDLE;
         std::uint64_t signalValue = 0;
         std::shared_ptr<EncodeTicket> encode;
+        std::shared_ptr<SubmitOutcome> outcome;
     };
 
     static bool Enabled();
     static QueueSubmitter& For(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle);
     static QueueSubmitter* Existing(VkQueue queue);
 
-    std::uint64_t Enqueue(Job job);
-    void WaitSubmitReturned(std::uint64_t position) const;
+    std::shared_ptr<SubmitOutcome> Enqueue(Job job);
     void Drain();
-    void RethrowFailure();
+    std::shared_ptr<SubmitFailures> Failures() const { return failures; }
     AgcDriver::Mutex& QueueMutex() { return queueMutex; }
-    std::uint64_t Submitted() const;
 
 private:
     QueueSubmitter(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle);
@@ -54,11 +77,7 @@ private:
     std::deque<Job> jobs;
     bool busy = false;
     bool sleeping = false;
-    std::uint64_t submitted = 0;
-    std::uint64_t enqueued = 0;
-    std::uint64_t taken = 0;
-    std::atomic<std::uint64_t> returned{0};
-    std::exception_ptr failure;
+    std::shared_ptr<SubmitFailures> failures = std::make_shared<SubmitFailures>();
     std::thread thread;
 };
 

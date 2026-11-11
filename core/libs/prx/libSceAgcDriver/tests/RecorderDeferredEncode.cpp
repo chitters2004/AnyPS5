@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,9 @@ struct MockDevice {
     std::set<VkFence> fencesInSubmit;
     std::set<VkCommandBuffer> buffersInSubmit;
     VkResult encoderEndResult = VK_SUCCESS;
+    VkResult failedSubmitResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    std::uint32_t failSubmits = 0;
+    std::uint32_t failedSubmitCalls = 0;
 
     std::uintptr_t Handle() {
         next += 0x10;
@@ -228,6 +232,12 @@ VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer commands, VkPipe
 
 VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
     std::unique_lock lock(mock->mutex);
+    if (mock->failSubmits != 0) {
+        --mock->failSubmits;
+        ++mock->failedSubmitCalls;
+        mock->changed.notify_all();
+        return mock->failedSubmitResult;
+    }
     std::vector<VkCommandBuffer> submitted;
     for (std::uint32_t submit = 0; submit < count; ++submit) {
         Submission submission;
@@ -476,42 +486,122 @@ void SubmitWaitsForTheEncodeAndDrainWaitsForBoth() {
     Expect(after.waits > before.waits && after.waitNs > before.waitNs, "the submitter's wait for a held encode was not counted");
 }
 
-void EncodeFailureIsRethrown() {
+struct Watchdog {
+    std::atomic<bool> done{false};
+    std::thread thread;
+    explicit Watchdog(std::string what) {
+        thread = std::thread([this, what = std::move(what)] {
+            for (int tick = 0; tick < 150; ++tick) {
+                if (done.load()) return;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            if (done.load()) return;
+            std::fprintf(stderr, "FAIL: %s did not finish within 15 s
+", what.c_str());
+            std::fflush(stderr);
+            std::_Exit(1);
+        });
+    }
+    ~Watchdog() {
+        done.store(true);
+        thread.join();
+    }
+};
+
+std::string Reported(const std::function<void()>& action) {
+    try {
+        action();
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+std::size_t SignaledFences(Fixture& fixture) {
+    std::lock_guard lock(fixture.device.mutex);
+    std::size_t count = 0;
+    for (const auto& [fence, signaled] : fixture.device.signaled) count += signaled ? 1 : 0;
+    return count;
+}
+
+void FailedEncodeNeverCompletes() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
     const auto before = CommandEncoders::Totals();
     Fixture fixture;
     {
+        const Watchdog watchdog("a batch whose encode failed");
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
         Recorder recorder(fixture.context);
+        bool completed = false;
+        recorder.OnComplete([&] { completed = true; });
         {
             std::lock_guard lock(fixture.device.mutex);
             fixture.device.encoderEndResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
         }
         fixture.Fill(recorder, 5);
         recorder.Submit();
-        recorder.Sync();
-        const auto submissions = fixture.Submissions();
-        Expect(submissions.size() == 1 && submissions[0].commands == VK_NULL_HANDLE && submissions[0].fence != VK_NULL_HANDLE, "a batch whose encode failed did not signal its fence with an empty submission");
+        const auto reported = Reported([&] { recorder.Sync(); });
+        Expect(reported.find("vkEndCommandBuffer encoder") != std::string::npos, "the sync of a batch whose encode failed did not report the failure: '" + reported + "'");
+        Expect(!completed, "a batch whose encode failed ran its completions");
+        Expect(fixture.Submissions().empty(), "a batch whose encode failed was submitted");
+        Expect(SignaledFences(fixture) == 0, "a batch whose encode failed signaled its fence");
+        Expect(recorder.Idle(), "a batch whose encode failed stayed in flight after it was reported");
         {
             std::lock_guard lock(fixture.device.mutex);
             fixture.device.encoderEndResult = VK_SUCCESS;
         }
         fixture.Fill(recorder, 6);
-        std::string reported;
-        try {
-            recorder.Submit();
-        } catch (const std::exception& error) {
-            reported = error.what();
-        }
-        Expect(reported.find("vkEndCommandBuffer encoder") != std::string::npos, "the next submit did not rethrow the encoder's failure: '" + reported + "'");
-        Expect(!recorder.Recording() && fixture.Submissions().size() == 1, "the batch refused after the encode failure was submitted or left open");
         recorder.Sync();
+        const auto submissions = fixture.Submissions();
+        Expect(submissions.size() == 1 && joined(submissions[0].recorded) == "[fill 6]", "the batch after a failed encode was not submitted with its own commands");
     }
     const auto after = CommandEncoders::Totals();
     Expect(after.failures - before.failures == 1, "the failed encode was not counted");
     std::lock_guard lock(fixture.device.mutex);
     Expect(fixture.device.allocated == fixture.device.freed, "a failed encode leaked " + std::to_string(fixture.device.allocated - fixture.device.freed) + " command buffers");
+}
+
+void FailedSubmitReachesFinish() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    for (const bool deferred : {true, false}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, deferred);
+        const std::string kind = deferred ? "deferred" : "direct";
+        for (const bool reap : {false, true}) {
+            Fixture fixture;
+            {
+                const Watchdog watchdog("a " + kind + " batch whose vkQueueSubmit failed");
+                std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+                Recorder recorder(fixture.context);
+                bool completed = false;
+                recorder.OnComplete([&] { completed = true; });
+                {
+                    std::lock_guard lock(fixture.device.mutex);
+                    fixture.device.failSubmits = 1;
+                }
+                fixture.Fill(recorder, 1);
+                recorder.Submit();
+                fixture.Drain();
+                std::string reported;
+                if (reap) {
+                    reported = Reported([&] { recorder.Reap(); });
+                    Expect(!reported.empty(), "a " + kind + " batch whose vkQueueSubmit failed was not retired by Reap");
+                } else {
+                    reported = Reported([&] { recorder.Sync(); });
+                }
+                Expect(reported.find("vkQueueSubmit recorder") != std::string::npos, "a " + kind + " batch whose vkQueueSubmit failed reported '" + reported + "'");
+                Expect(!completed, "a " + kind + " batch whose vkQueueSubmit failed ran its completions");
+                Expect(SignaledFences(fixture) == 0, "a " + kind + " batch whose vkQueueSubmit failed signaled its fence");
+                Expect(recorder.Idle(), "a " + kind + " batch whose vkQueueSubmit failed stayed in flight after it was reported");
+                fixture.Fill(recorder, 2);
+                recorder.Sync();
+                const auto submissions = fixture.Submissions();
+                Expect(submissions.size() == 1 && joined(submissions[0].recorded) == "[fill 2]", "the " + kind + " batch after a failed vkQueueSubmit was not submitted with its own commands");
+            }
+            std::lock_guard lock(fixture.device.mutex);
+            Expect(fixture.device.allocated == fixture.device.freed, "a failed " + kind + " submit leaked " + std::to_string(fixture.device.allocated - fixture.device.freed) + " command buffers");
+        }
+    }
 }
 
 void DeferredEncodeIsDecidedPerBatch() {
@@ -704,7 +794,8 @@ int main(int argc, char** argv) {
         } else {
             DeferredBatchesEncodeOffTheRecordingThread();
             SubmitWaitsForTheEncodeAndDrainWaitsForBoth();
-            EncodeFailureIsRethrown();
+            FailedEncodeNeverCompletes();
+            FailedSubmitReachesFinish();
             DeferredEncodeIsDecidedPerBatch();
             AsyncSubmitOffEncodesInline();
             DiscardedBatchIsNeverEncoded();

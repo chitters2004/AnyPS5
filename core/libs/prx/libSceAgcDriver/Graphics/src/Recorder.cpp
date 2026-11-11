@@ -4358,12 +4358,11 @@ void Recorder::Submit() {
         if (submitter == nullptr) submitter = &QueueSubmitter::For(context.device, context.queue, function(queueSubmit, "vkQueueSubmit"), reinterpret_cast<PFN_vkDeviceWaitIdle>(context.deviceProc(context.device, "vkDeviceWaitIdle")));
         if (batchEncoders != nullptr) {
             batch->encode = std::make_shared<EncodeTicket>(std::move(batch->stream), batch->traceId);
-            batch->submitPosition = submitter->Enqueue({VK_NULL_HANDLE, batch->fence, hold, holdValue, timeline, serial, batch->encode});
+            batch->outcome = submitter->Enqueue({VK_NULL_HANDLE, batch->fence, hold, holdValue, timeline, serial, batch->encode});
             batchEncoders->Encode(batch->encode);
         } else {
-            batch->submitPosition = submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
+            batch->outcome = submitter->Enqueue({batch->commands, batch->fence, hold, holdValue, timeline, serial});
         }
-        batch->submitter = submitter;
     } else {
         VkResult result;
         {
@@ -4441,7 +4440,7 @@ struct RestoreSyncSite {
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
-VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial, const std::shared_ptr<SubmitFailures>& failures) {
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
     wait.pSemaphores = &timeline;
@@ -4463,7 +4462,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial, submitFailures());
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
@@ -4679,6 +4678,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const auto device = context.device;
     const auto semaphore = timeline;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
+    const auto failures = submitFailures();
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
     const RestoreSyncSite restoreSite{BeginSyncSite(source, site)};
@@ -4716,7 +4716,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial, failures);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -4783,7 +4783,8 @@ bool Recorder::Reap() {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        const auto& front = *inFlight.front();
+        if (!(front.outcome != nullptr && front.outcome->Failed()) && fenceStatus(front.fence) != VK_SUCCESS) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);
@@ -4825,6 +4826,18 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }
     } finishingScope{*this, batch.get()};
     finishing.push_back(batch.get());
+    if (batch->outcome != nullptr) {
+        batch->outcome->Wait();
+        if (batch->outcome->Failed()) {
+            const auto failure = batch->outcome->Error();
+            batch->outcome->Report();
+            removeLabels(*batch);
+            batch->completions.clear();
+            batch->kept.clear();
+            release(*batch, true);
+            std::rethrow_exception(failure);
+        }
+    }
     if (wait) {
         // APS5_PROFILE_DRAW: how long the CPU waits for recorded GPU work, reported every 10 s.
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4882,7 +4895,6 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(result, "vkWaitForFences recorder");
         }
     }
-    if (batch->submitter != nullptr) batch->submitter->WaitSubmitReturned(batch->submitPosition);
     readGpuTiming(*batch);
     readSamples(*batch);
     if (batch->serial != 0) {
@@ -5034,6 +5046,11 @@ void Recorder::release(Batch& batch, bool retired) noexcept {
     }
     if (batch.fence != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, batch.fence, nullptr);
     batch.fence = VK_NULL_HANDLE;
+}
+
+std::shared_ptr<SubmitFailures> Recorder::submitFailures() const {
+    const auto* submitter = QueueSubmitter::Existing(context.queue);
+    return submitter != nullptr ? submitter->Failures() : nullptr;
 }
 
 std::unique_ptr<CommandStream> Recorder::takeStream() {
