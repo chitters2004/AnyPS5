@@ -13710,6 +13710,7 @@ void compiledBindingsTests(const Device& device) {
     std::size_t decisionsCompared = 0;
     for (std::size_t trial = 0; trial < 48; ++trial) {
         ShaderRecompiler::RecompileResult program;
+        program.pushConstants.resize(64);
         const auto bindingCount = 1 + below(3);
         std::size_t elements = 0;
         for (std::uint32_t index = 0; index < bindingCount; ++index) {
@@ -13720,7 +13721,8 @@ void compiledBindingsTests(const Device& device) {
             binding.binding = index;
             binding.count = static_cast<std::uint32_t>(1 + below(5));
             for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const auto offset = 4096 + below(bytes - 32768) / 256 * 256;
+                const std::array<std::uint64_t, 3> alignments{1, 4, 256};
+                const auto offset = 4096 + below(bytes - 32768) / alignments[trial % alignments.size()] * alignments[trial % alignments.size()];
                 const auto size = static_cast<std::uint32_t>(4 + below(12288));
                 const auto words = descriptorWords(address + offset, size);
                 binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
