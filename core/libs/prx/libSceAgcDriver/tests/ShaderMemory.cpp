@@ -45,6 +45,7 @@
 #include <iostream>
 #include <map>
 #include <future>
+#include <barrier>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -539,22 +540,19 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> compileConcurrentPixel(
 
 void verifyConcurrentRecompile() {
     using namespace ShaderRecompiler;
-    constexpr std::uint32_t Shaders = 6u;
-    constexpr std::uint32_t Values = 4u;
+    constexpr std::uint32_t Shaders = 16u;
+    constexpr std::uint32_t Values = 8u;
     constexpr std::uint32_t Keys = Shaders * Values;
     const auto threads = std::max(4u, std::thread::hardware_concurrency());
     std::vector<std::shared_ptr<const RecompileResult>> results(static_cast<std::size_t>(threads) * Keys);
-    std::atomic<unsigned> ready{0u};
-    std::atomic<bool> go{false};
+    std::barrier start(static_cast<std::ptrdiff_t>(threads));
     std::mutex failureMutex;
     std::string failure;
     std::vector<std::thread> workers;
     for (unsigned thread = 0; thread < threads; ++thread) {
         workers.emplace_back([&, thread] {
-            ready.fetch_add(1u);
-            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
-            for (std::uint32_t step = 0; step < Keys; ++step) {
-                const auto key = (step + thread * 5u) % Keys;
+            for (std::uint32_t key = 0; key < Keys; ++key) {
+                start.arrive_and_wait();
                 try {
                     results[static_cast<std::size_t>(thread) * Keys + key] = compileConcurrentPixel(key / Values, key % Values + 1u, true);
                 } catch (const std::exception& error) {
@@ -564,8 +562,6 @@ void verifyConcurrentRecompile() {
             }
         });
     }
-    while (ready.load() != threads) std::this_thread::yield();
-    go.store(true, std::memory_order_release);
     for (auto& worker : workers) worker.join();
     require(failure.empty(), ("concurrent recompile: a compile failed: " + failure).c_str());
     for (std::uint32_t key = 0; key < Keys; ++key) {
