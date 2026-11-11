@@ -131,6 +131,17 @@ std::size_t ExponentMasks(std::span<const std::uint32_t> words) {
     return masks;
 }
 
+std::size_t OpcodeCount(std::span<const std::uint32_t> words, spv::Op wanted) {
+    std::size_t count = 0;
+    for (std::size_t offset = 5; offset < words.size();) {
+        const auto length = words[offset] >> spv::WordCountShift;
+        if (length == 0 || length > words.size() - offset) throw std::runtime_error("the recompiler returned a malformed SPIR-V instruction");
+        if ((words[offset] & spv::OpCodeMask) == wanted) ++count;
+        offset += length;
+    }
+    return count;
+}
+
 }
 
 int main() {
@@ -488,6 +499,25 @@ int main() {
         const auto emulated = ExponentMasks(Recompiled(code, false));
         if (hardware != 1u) std::fprintf(stderr, "  %zu f32 exponent masks with the hardware flush, expected 1\n", hardware);
         return hardware == 1u && emulated > hardware;
+    });
+
+    passed &= run("a v_cmp_lt_f32 of two registers flushes them through a host add only under the hardware flush", [] {
+        const std::array<std::uint32_t, 6> code{
+            0x7e026f00u,
+            0x7c020300u,
+            0x02040300u,
+            0xe0700000u, 0x80000200u,
+            0xbf810000u,
+        };
+        const auto hardware = Recompiled(code, true);
+        const auto emulated = Recompiled(code, false);
+        const auto hardwareMasks = ExponentMasks(hardware);
+        const auto emulatedMasks = ExponentMasks(emulated);
+        const auto hardwareAdds = OpcodeCount(hardware, spv::OpFAdd);
+        const auto emulatedAdds = OpcodeCount(emulated, spv::OpFAdd);
+        if (hardwareMasks != 0u || hardwareAdds != 2u) std::fprintf(stderr, "  hardware flush: %zu exponent masks and %zu adds, expected 0 and 2\n", hardwareMasks, hardwareAdds);
+        if (emulatedMasks != 2u || emulatedAdds != 0u) std::fprintf(stderr, "  emulated flush: %zu exponent masks and %zu adds, expected 2 and 0\n", emulatedMasks, emulatedAdds);
+        return hardwareMasks == 0u && hardwareAdds == 2u && emulatedMasks == 2u && emulatedAdds == 0u;
     });
 
     return passed ? 0 : 1;

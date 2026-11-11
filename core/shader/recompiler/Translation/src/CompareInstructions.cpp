@@ -141,13 +141,18 @@ void TranslationContext::emitFloatCompare(const RdnaInstruction& inst, IrOpcode 
             emitCompareResult(inst, floatCompareKeepingDenormals(opcode, IrU32(*lhsBits), IrU32(*rhsBits)), false, cmpx);
             return;
         }
-        lhs = &ir.BitCastF32(flushF32Denormal(IrU32(*lhsBits)).Value());
-        rhs = &ir.BitCastF32(flushF32Denormal(IrU32(*rhsBits)).Value());
+        lhs = &flushedForCompare(IrU32(*lhsBits)).Value();
+        rhs = &flushedForCompare(IrU32(*rhsBits)).Value();
         emitCompareResult(inst, IrU1(ir.Emit(opcode, IrType::U1, {lhs, rhs})), false, cmpx);
         return;
     }
     if (swap) std::swap(lhs, rhs);
     emitCompareResult(inst, IrU1(ir.Emit(opcode, IrType::U1, {lhs, rhs})), false, cmpx);
+}
+
+IrF32 TranslationContext::flushedForCompare(IrU32 bits) {
+    if (!float32FlushToZero || bits.Value().HasImmediate()) return IrF32(ir.BitCastF32(flushF32Denormal(bits).Value()));
+    return IrF32(ir.Emit(IrOpcode::FPAdd32, IrType::F32, {&ir.BitCastF32(bits.Value()), &ir.ConstantF32(0.0f)}));
 }
 
 IrU1 TranslationContext::floatCompareKeepingDenormals(IrOpcode opcode, IrU32 lhsBits, IrU32 rhsBits) {
