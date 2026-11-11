@@ -1232,7 +1232,65 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+bool KeyShapes() {
+    static const bool enabled = std::getenv("APS5_NO_KEY_SHAPE") == nullptr;
+    return enabled;
+}
+
+bool ProfileKeyShapes() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+bool VerifyKeyMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_KEY_MEMO") != nullptr;
+    return verify;
+}
+
+struct StageKeyMemoCounterSet {
+    std::atomic<std::uint64_t> staticHits{0};
+    std::atomic<std::uint64_t> staticFills{0};
+    std::atomic<std::uint64_t> staticLosses{0};
+    std::atomic<std::uint64_t> patchedSegments{0};
+    std::atomic<std::uint64_t> layoutSplitMisses{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> resultHits{0};
+    std::atomic<std::uint64_t> resultWalks{0};
+};
+
+StageKeyMemoCounterSet& stageKeyMemoCounters() {
+    static StageKeyMemoCounterSet counters;
+    return counters;
+}
+
+const ShaderRecompiler::ResultKeyShape* KeyShapeOf(const CompiledShader& shader) {
+    return KeyShapes() && shader.program != nullptr ? shader.program->keyShape.get() : nullptr;
+}
+
+ShaderRecompiler::ResultKeyShape::Static BuildStaticKeys(const CompiledShader& shader, const ShaderRecompiler::ResultKeyShape& shape) {
+    ShaderRecompiler::ResultKeyShape::Static keys;
+    ShaderResources::AppendStaticContentKey(shader, true, MovableBuffers(), shape.patchedBindings, keys.drawWords);
+    ShaderResources::AppendStaticContentKey(shader, true, false, shape.patchedBindings, keys.planWords);
+    return keys;
+}
+
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StaticKeys(const CompiledShader& shader, const ShaderRecompiler::ResultKeyShape& shape) {
+    auto& counters = stageKeyMemoCounters();
+    if (auto current = shape.words.load(std::memory_order_acquire)) {
+        counters.staticHits.fetch_add(1, std::memory_order_relaxed);
+        if (VerifyKeyMemo() || VerifyDrawPlans()) {
+            Require(BuildStaticKeys(shader, shape) == *current, "APS5_VERIFY_KEY_MEMO: a program's shared static content key differs from a walk of its own bindings outside the patched slots");
+            counters.verified.fetch_add(1, std::memory_order_relaxed);
+        }
+        return current;
+    }
+    bool won = false;
+    auto published = ShaderRecompiler::PublishOnce(shape.words, [&] { return BuildStaticKeys(shader, shape); }, &won);
+    (won ? counters.staticFills : counters.staticLosses).fetch_add(1, std::memory_order_relaxed);
+    return published;
+}
+
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, bool shapes = true) {
     ResourceCache::Key key;
     key.reserve(256);
     key.push_back(0xffffffffu);
@@ -1242,13 +1300,22 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     };
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    bool shaped = false;
     for (const auto& shader : shaders) {
         const auto sizeAt = key.size();
         key.push_back(0u);
         auto& memo = shader.program->drawKeyMemo.words;
-        if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
+        if (const auto* shape = shapes ? KeyShapeOf(shader) : nullptr) {
+            const auto statics = StaticKeys(shader, *shape);
+            key.insert(key.end(), statics->drawWords.begin(), statics->drawWords.end());
+            for (const auto binding : shape->patchedBindings) ShaderResources::AppendBindingContentKey(shader, binding, true, MovableBuffers(), key);
+            stageKeyMemoCounters().patchedSegments.fetch_add(shape->patchedBindings.size(), std::memory_order_relaxed);
+            shaped = true;
+        } else if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
+            stageKeyMemoCounters().resultHits.fetch_add(1, std::memory_order_relaxed);
         } else {
+            stageKeyMemoCounters().resultWalks.fetch_add(1, std::memory_order_relaxed);
             ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
             memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
         }
@@ -1260,6 +1327,14 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         append64(target.bytes);
         append64(indexAddress);
         append64(indexBytes);
+    }
+    if (shaped && VerifyKeyMemo()) {
+        static AgcDriver::Mutex mutex;
+        static std::map<ResourceCache::Key, ResourceCache::Key> seen;
+        auto full = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false);
+        std::lock_guard lock(mutex);
+        Require(seen.emplace(key, std::move(full)).first->second == DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false), "APS5_VERIFY_KEY_MEMO: two draws share a split content key but not their full content key");
+        stageKeyMemoCounters().verified.fetch_add(1, std::memory_order_relaxed);
     }
     return key;
 }
@@ -1423,7 +1498,29 @@ void SetDrawPlansForTest(int enabled) {
     drawPlansForTest.store(enabled, std::memory_order_relaxed);
 }
 
+StageKeyMemoCounts StageKeyMemoCounters() {
+    const auto& counters = stageKeyMemoCounters();
+    return {counters.staticHits.load(std::memory_order_relaxed), counters.staticFills.load(std::memory_order_relaxed), counters.staticLosses.load(std::memory_order_relaxed), counters.patchedSegments.load(std::memory_order_relaxed), counters.layoutSplitMisses.load(std::memory_order_relaxed), counters.verified.load(std::memory_order_relaxed), counters.resultHits.load(std::memory_order_relaxed), counters.resultWalks.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StageStaticKeys(const CompiledShader& shader) {
+    const auto* shape = KeyShapeOf(shader);
+    return shape != nullptr ? StaticKeys(shader, *shape) : nullptr;
+}
+
 namespace {
+
+std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const CompiledShader& shader);
+
+PlanStageWords PlanStageWordsOf(const CompiledShader& shader) {
+    if (const auto* shape = KeyShapeOf(shader)) {
+        const auto statics = StaticKeys(shader, *shape);
+        PlanStageWords words{std::shared_ptr<const std::vector<std::uint32_t>>(statics, &statics->planWords), {}};
+        for (const auto binding : shape->patchedBindings) ShaderResources::AppendBindingContentKey(shader, binding, true, false, words.patched);
+        return words;
+    }
+    return {PlanBindingWords(shader), {}};
+}
 
 std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const CompiledShader& shader) {
     const auto walk = [&] {
@@ -2254,6 +2351,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
+        } else if (ProfileKeyShapes() && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return KeyShapeOf(shader) != nullptr; })) {
+            if (SharedResourceCache().Find(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, false)) != nullptr) stageKeyMemoCounters().layoutSplitMisses.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
         countCache(&DrawProfile::uncacheable);
@@ -3875,7 +3974,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->hasDepth = state.depth.has_value();
             recipe->renderExtent = state.renderExtent;
             if (DrawPlans()) {
-                for (const auto& shader : shaders) recipe->bindingWords.push_back(PlanBindingWords(shader));
+                for (const auto& shader : shaders) {
+                    recipe->bindingWords.push_back(PlanStageWordsOf(shader));
+                    if (VerifyDrawPlans()) ShaderResources::AppendContentKey(shader, true, false, recipe->verifyWords.emplace_back());
+                }
             }
             if (servable) *recipeOut = std::move(recipe);
             else DrawPlanShadowSlot() = std::move(recipe);
@@ -4340,13 +4442,17 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
         rebinds = recipe.movedBases != 0;
         for (std::size_t index = 0; index < shaders.size(); ++index) {
-            const auto words = PlanBindingWords(shaders[index]);
-            if (words == recipe.bindingWords[index]) {
-                ++result.sharedBindingStages;
-                continue;
+            const auto words = PlanStageWordsOf(shaders[index]);
+            const auto& planned = recipe.bindingWords[index];
+            const bool shared = words.fixed == planned.fixed;
+            ++(shared ? result.sharedBindingStages : result.comparedBindingStages);
+            const bool same = (shared || *words.fixed == *planned.fixed) && words.patched == planned.patched;
+            if (same && VerifyDrawPlans() && index < recipe.verifyWords.size()) {
+                std::vector<std::uint32_t> full;
+                ShaderResources::AppendContentKey(shaders[index], true, false, full);
+                Require(full == recipe.verifyWords[index], "APS5_VERIFY_DRAW_PLANS: the split plan binding words of a stage equal the plan's while its full content key does not");
             }
-            ++result.comparedBindingStages;
-            if (*words != *recipe.bindingWords[index]) rebinds = true;
+            if (!same) rebinds = true;
         }
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
         if (rebinds && DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey) != recipe.key) return miss(DrawRecipeMiss::Instance);

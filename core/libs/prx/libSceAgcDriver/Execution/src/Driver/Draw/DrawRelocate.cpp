@@ -356,6 +356,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    rebased->keyShape = nullptr;
     for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
         if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;

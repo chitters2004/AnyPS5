@@ -477,6 +477,8 @@ int main() {
         PlanHitsSeeGuestWrites();
         ReboundPlansStayOffTheExactPath();
         PlannedSceneMatchesFullPath();
+        const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();
+        std::printf("stage key memo: %llu static hits, %llu static fills, %llu patched segments; unshaped: %llu per-result memo hits, %llu full walks\n", static_cast<unsigned long long>(keys.staticHits), static_cast<unsigned long long>(keys.staticFills), static_cast<unsigned long long>(keys.patchedSegments), static_cast<unsigned long long>(keys.resultHits), static_cast<unsigned long long>(keys.resultWalks));
         AgcDriverShutdown_nid_postfix();
         return 0;
     } catch (const std::exception& error) {
