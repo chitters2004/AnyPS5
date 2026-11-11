@@ -7,6 +7,7 @@
 #include <cstdint>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include <atomic>
 #include <array>
 #include <cstring>
@@ -126,7 +127,7 @@ struct RegisteredEventCallback {
 };
 
 std::vector<std::shared_ptr<RegisteredEventCallback>> eventCallbacks;
-std::shared_mutex eventCallbacksMutex;
+NativeSharedMutex eventCallbacksMutex;
 struct CallbackInvocation {
  const RegisteredEventCallback* entry;
  CallbackInvocation* previous;
