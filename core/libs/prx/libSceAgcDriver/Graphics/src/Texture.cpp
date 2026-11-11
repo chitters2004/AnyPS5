@@ -2776,32 +2776,44 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     } else if (dropped) {
         reconcilePending();
     }
+    const bool uploads = std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; });
+    std::vector<std::uint64_t> before;
+    if (anyBorrowed || uploads) before = layerGeneration;
     if (anyBorrowed) {
         uploadReason = "alias";
         const auto lentBytes = borrowUnits(alias != nullptr ? *alias : *lender, borrowed);
-        std::vector<std::array<std::uint64_t, 3>> previous;
+        std::size_t lentUnits = 0;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) {
-                if (lender != nullptr) previous.push_back({unit, currentFor(unit), layerGeneration[unit]});
+                ++lentUnits;
                 layerGeneration[unit] = currentFor(unit);
                 forgetUnwatchHash(unit, 1);
             }
         }
         refreshGeneration();
-        if (lender != nullptr) {
-            noteSyncedBorrow(previous.size(), lentBytes);
-            if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) recorder->OnDiscard([weak = weak_from_this(), previous = std::move(previous)] {
-                if (auto self = weak.lock()) self->rollBackSyncedBorrow(previous);
-            });
-        }
+        if (lender != nullptr) noteSyncedBorrow(lentUnits, lentBytes);
     }
-    if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
+    if (uploads) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
     } else {
         uploadedKeys = keys;
     }
+    if (!before.empty()) armRefreshRollBack(before);
     return false;
+}
+
+void StorageTexture::armRefreshRollBack(const std::vector<std::uint64_t>& before) {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder->Device() != context.device || before.size() != trackedLayers) return;
+    std::vector<std::array<std::uint64_t, 3>> moved;
+    for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+        if (layerGeneration[unit] != before[unit]) moved.push_back({unit, layerGeneration[unit], before[unit]});
+    }
+    if (moved.empty()) return;
+    recorder->OnDiscard([weak = weak_from_this(), moved = std::move(moved)] {
+        if (auto self = weak.lock()) self->rollBackRefresh(moved);
+    });
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
@@ -6830,7 +6842,7 @@ std::shared_ptr<StorageTexture> StorageTexture::syncedAlias(const std::vector<bo
     return best;
 }
 
-void StorageTexture::rollBackSyncedBorrow(std::span<const std::array<std::uint64_t, 3>> units) {
+void StorageTexture::rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units) {
     bool rolledBack = false;
     for (const auto& [unit, set, previous] : units) {
         if (unit >= trackedLayers || layerGeneration[static_cast<std::size_t>(unit)] != set) continue;
@@ -6868,7 +6880,7 @@ void StorageTexture::noteSyncedBorrow(std::size_t units, std::uint64_t bytes) {
     const auto presents = Recorder::Presents();
     const auto windowPresents = presents - lastPresents;
     const auto windowBytes = counts.bytes - last.bytes;
-    AgcDriver::ProfilePrint_nid_no_patch("[native-kept] (10 s) %llu refreshes took %llu units (%.1f MiB) from an in-sync alias image on the device instead of a guest import upload, %.1f KiB per present over %llu presents, %llu rolled back by discarded batches\n", static_cast<unsigned long long>(counts.borrows - last.borrows), static_cast<unsigned long long>(counts.units - last.units), windowBytes / 1048576.0, windowPresents != 0 ? windowBytes / 1024.0 / static_cast<double>(windowPresents) : 0.0, static_cast<unsigned long long>(windowPresents), static_cast<unsigned long long>(counts.rollBacks - last.rollBacks));
+    AgcDriver::ProfilePrint_nid_no_patch("[native-kept] (10 s) %llu refreshes took %llu units (%.1f MiB) from an in-sync alias image on the device instead of a guest import upload, %.1f KiB per present over %llu presents, %llu refreshes rolled back by discarded batches\n", static_cast<unsigned long long>(counts.borrows - last.borrows), static_cast<unsigned long long>(counts.units - last.units), windowBytes / 1048576.0, windowPresents != 0 ? windowBytes / 1024.0 / static_cast<double>(windowPresents) : 0.0, static_cast<unsigned long long>(windowPresents), static_cast<unsigned long long>(counts.rollBacks - last.rollBacks));
     last = counts;
     lastPresents = presents;
 }

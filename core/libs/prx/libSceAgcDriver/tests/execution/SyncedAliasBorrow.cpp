@@ -328,6 +328,39 @@ int Run(AgcDriver::VulkanDevice& device) {
     lender->SetCached(false);
     std::puts("synced alias borrow: a discarded borrow gives its units back to guest memory");
 
+    const auto solo = StorageTexture::Create(context, detiler, fixture.uints, 0);
+    Settle();
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        Write(fixture, 0, bytes, 0x77);
+        before = StorageTexture::SyncedBorrows();
+        Refresh(*solo, "the recorded upload");
+        Require(Delta(before).units == 0, "synced alias borrow: the recorded upload took units from an alias although none is cached");
+        Recorder::FailNextSubmitsForTest(1u);
+        bool discarded = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            discarded = std::string(error.what()).find("injected failure") != std::string::npos;
+        }
+        Recorder::FailNextSubmitsForTest(0u);
+        Require(discarded, "synced alias borrow: the batch holding the upload was not discarded");
+        Require(Delta(before).rollBacks == 1, "synced alias borrow: the discarded upload was not rolled back");
+        Refresh(*solo, "the refresh after the discarded upload");
+        recorder.Sync();
+        CheckMatchesGuest(fixture, *solo, Format32UInt, "after the discarded upload and a second refresh");
+        Write(fixture, 0, bytes, 0x78);
+        before = StorageTexture::SyncedBorrows();
+        Refresh(*solo, "the committed upload");
+        recorder.Sync();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(solo->Refresh(), "synced alias borrow: a committed upload left the image claiming stale guest bytes");
+        Require(Delta(before).rollBacks == 0, "synced alias borrow: a committed upload was rolled back");
+        CheckMatchesGuest(fixture, *solo, Format32UInt, "after a committed upload");
+    }
+    std::puts("synced alias borrow: a discarded upload gives its units back to guest memory, a committed one keeps them");
+
     std::puts("synced alias borrow tests passed");
     return 0;
 }
