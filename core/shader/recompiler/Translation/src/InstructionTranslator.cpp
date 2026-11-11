@@ -729,7 +729,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     };
     const auto regionsOf = [&](const BasicBlock& source) {
         std::vector<SpeculationRegion> regions;
-        if (!speculation.enabled || source.terminator.loopHeader || relativeBlocks.contains(source.id)) return regions;
+        if (!speculation.enabled || options.stage == ShaderStageKind::Pixel || source.terminator.loopHeader || relativeBlocks.contains(source.id)) return regions;
         std::uint32_t index = source.instructionBegin;
         while (index < source.instructionEnd) {
             if (!pureVector(decoded.instructions[index])) {
