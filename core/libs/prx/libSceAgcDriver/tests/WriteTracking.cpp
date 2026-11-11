@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -2550,6 +2551,67 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+struct LatencySummary {
+    double median = 0.0;
+    double p99 = 0.0;
+};
+
+LatencySummary Summarize(std::vector<double>& samples) {
+    if (samples.empty()) return {};
+    std::sort(samples.begin(), samples.end());
+    return {samples[samples.size() / 2], samples[samples.size() * 99 / 100]};
+}
+
+void RunContentionBench(int collectors) {
+    constexpr std::size_t RangeBlocks = 4;
+    constexpr int Rounds = 20000;
+    const auto lanes = static_cast<std::size_t>(collectors) + 1;
+    void* memory = AllocateWatched(lanes * RangeBlocks * Block);
+    std::memset(memory, 0x5a, lanes * RangeBlocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    BumpCollectEpoch();
+    Require(CollectWritesUncached(base, lanes * RangeBlocks * Block) != 0, "the bench region was not collected");
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> collected{0};
+    std::vector<std::thread> pool;
+    for (int lane = 1; lane <= collectors; ++lane) {
+        pool.emplace_back([&, lane] {
+            auto* range = static_cast<std::uint8_t*>(memory) + static_cast<std::size_t>(lane) * RangeBlocks * Block;
+            const auto address = reinterpret_cast<std::uint64_t>(range);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (std::uint64_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
+                range[(round % (RangeBlocks * Block / 4096)) * 4096] = static_cast<std::uint8_t>(round);
+                static_cast<void>(CollectWritesUncached(address, RangeBlocks * Block));
+                collected.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    std::vector<double> queries;
+    std::vector<double> walks;
+    queries.reserve(Rounds);
+    walks.reserve(Rounds);
+    const auto own = base;
+    const auto since = CollectWritesUncached(own, RangeBlocks * Block);
+    start.store(true, std::memory_order_release);
+    const auto began = std::chrono::steady_clock::now();
+    for (int round = 0; round < Rounds; ++round) {
+        const auto queried = std::chrono::steady_clock::now();
+        Require(UnchangedSince(own, RangeBlocks * Block, since), "the bench's own range changed");
+        const auto walked = std::chrono::steady_clock::now();
+        static_cast<void>(CollectWritesUncached(own, RangeBlocks * Block));
+        const auto done = std::chrono::steady_clock::now();
+        queries.push_back(std::chrono::duration<double, std::micro>(walked - queried).count());
+        walks.push_back(std::chrono::duration<double, std::micro>(done - walked).count());
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& thread : pool) thread.join();
+    const auto query = Summarize(queries);
+    const auto walk = Summarize(walks);
+    std::printf("contention bench: %d collectors; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f written collects/s\n", collectors, Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2560,6 +2622,10 @@ int main(int argc, char** argv) {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--contention-bench") {
+            RunContentionBench(std::stoi(argv[2]));
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
             CheckGenerationWrap();
