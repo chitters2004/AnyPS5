@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <limits>
 #include <map>
 #include <memory>
@@ -1355,8 +1356,8 @@ struct WriteTracker {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> walking;
     std::condition_variable_any walked;
 
-    bool walkOverlaps(std::uint64_t first, std::uint64_t stop) const {
-        return std::any_of(walking.begin(), walking.end(), [&](const auto& range) { return range.first < stop && first < range.second; });
+    bool walkOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+        return std::any_of(ranges.begin(), ranges.end(), [&](const auto& wanted) { return std::any_of(walking.begin(), walking.end(), [&](const auto& range) { return range.first < wanted.second && wanted.first < range.second; }); });
     }
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
@@ -1743,6 +1744,14 @@ WriteTracker& Tracker() {
     return tracker;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> walkClosure(std::uint64_t first, std::uint64_t stop) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> closure{{first, stop}};
+#ifndef _WIN32
+    GuestWriteWatch::GuestWriteWatchAliasRanges_nid_postfix(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), [](void* context, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uint64_t, std::uint64_t>>*>(context)->emplace_back(begin, end); }, &closure);
+#endif
+    return closure;
+}
+
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
 class TrackerLock {
@@ -1770,8 +1779,12 @@ public:
         return active;
     }
 
-    void AwaitWalks(std::uint64_t first, std::uint64_t stop) {
-        while (tracker.walkOverlaps(first, stop)) tracker.walked.wait(lock);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> AwaitWalks(std::uint64_t first, std::uint64_t stop) {
+        for (;;) {
+            auto closure = walkClosure(first, stop);
+            if (!tracker.walkOverlaps(closure)) return closure;
+            tracker.walked.wait(lock);
+        }
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
@@ -2026,7 +2039,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
-std::atomic<void (*)()> releasedWalkHook{nullptr};
+std::atomic<void (*)(int stage)> releasedWalkHook{nullptr};
 
 #ifndef _WIN32
 std::atomic<int> releasedWalksForTest{-1};
@@ -2041,38 +2054,71 @@ void recordWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     static_cast<std::vector<std::pair<std::uint64_t, std::uint64_t>>*>(context)->emplace_back(begin, end);
 }
 
-bool walkReleased(TrackerLock& lock, WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, bool armedOnly) {
-    tracker.walking.emplace_back(first, stop);
+void recordHookedWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
+    if (const auto hook = releasedWalkHook.load(std::memory_order_acquire)) hook(2);
+    recordWrittenRun(context, begin, end);
+}
+
+bool walkReleased(TrackerLock& lock, WriteTracker& tracker, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& closure, bool armedOnly) {
+    const auto first = closure.front().first;
+    const auto stop = closure.front().second;
+    const auto mappingSerial = GuestWriteWatch::GuestWriteWatchMappingSerial_nid_postfix();
+    std::size_t pages = 0;
+    for (const auto& [begin, end] : closure) pages += static_cast<std::size_t>((end - begin + WritePageBytes - 1) / WritePageBytes) + 1;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    written.reserve(pages);
+    tracker.walking.insert(tracker.walking.end(), closure.begin(), closure.end());
     struct Finish {
         WriteTracker& tracker;
-        std::pair<std::uint64_t, std::uint64_t> range;
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>& closure;
         ~Finish() {
-            if (const auto found = std::find(tracker.walking.begin(), tracker.walking.end(), range); found != tracker.walking.end()) tracker.walking.erase(found);
+            for (const auto& range : closure) {
+                if (const auto found = std::find(tracker.walking.begin(), tracker.walking.end(), range); found != tracker.walking.end()) tracker.walking.erase(found);
+            }
             tracker.walked.notify_all();
         }
-    } finish{tracker, {first, stop}};
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    } finish{tracker, closure};
     bool complete = false;
+    std::exception_ptr failure;
     {
         const TrackerLock::Suspension suspended{lock};
-        const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
-        complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &recordWrittenRun, &written);
-        if (const auto hook = releasedWalkHook.load(std::memory_order_acquire)) hook();
+        try {
+            const auto hook = releasedWalkHook.load(std::memory_order_acquire);
+            if (hook != nullptr) hook(0);
+            const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
+            complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), hook != nullptr ? &recordHookedWrittenRun : &recordWrittenRun, &written);
+            if (const auto hook = releasedWalkHook.load(std::memory_order_acquire)) hook(1);
+        } catch (...) {
+            failure = std::current_exception();
+        }
     }
     ++tracker.generation;
     StampRuns runs{tracker, StampKind::Cpu, 0, nullptr, {}};
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     for (const auto& [begin, end] : written) stampWrittenRun(&runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end));
+    if (failure != nullptr || GuestWriteWatch::GuestWriteWatchMappingSerial_nid_postfix() != mappingSerial) {
+        auto consumed = closure;
+        const auto now = walkClosure(first, stop);
+        consumed.insert(consumed.end(), now.begin(), now.end());
+        for (const auto& [begin, end] : consumed) {
+            if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) stampWrittenRun(&runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end));
+        }
+    }
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (failure != nullptr) std::rethrow_exception(failure);
     return complete;
 }
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     auto* lock = TrackerLock::activeLock();
-    if (lock != nullptr) lock->AwaitWalks(first, stop);
 #ifndef _WIN32
-    if (lock != nullptr && kind == StampKind::Cpu && window == nullptr && releasedWalks()) return walkReleased(*lock, tracker, first, stop, armedOnly);
+    if (lock != nullptr) {
+        const auto closure = lock->AwaitWalks(first, stop);
+        if (kind == StampKind::Cpu && window == nullptr && releasedWalks()) return walkReleased(*lock, tracker, closure, armedOnly);
+    }
+#else
+    if (lock != nullptr) static_cast<void>(lock->AwaitWalks(first, stop));
 #endif
     ++tracker.generation;
     StampRuns runs{tracker, kind, 0, window, {}};
@@ -2340,7 +2386,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched) return;
-    if (auto* lock = TrackerLock::activeLock(); lock != nullptr && bytes != 0) lock->AwaitWalks(address, address + bytes);
+    if (auto* lock = TrackerLock::activeLock(); lock != nullptr && bytes != 0) static_cast<void>(lock->AwaitWalks(address, address + bytes));
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {
@@ -2833,7 +2879,7 @@ std::uint64_t TrackerGeneration() {
     return tracker.generation;
 }
 
-void SetReleasedWalkHookForTest(void (*hook)()) {
+void SetReleasedWalkHookForTest(void (*hook)(int stage)) {
     releasedWalkHook.store(hook, std::memory_order_release);
 }
 

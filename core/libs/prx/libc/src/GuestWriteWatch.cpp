@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -60,9 +61,23 @@ public:
         return _pagemap >= 0;
     }
 
+    std::uint64_t MappingSerial() const {
+        return _mappingSerial.load(std::memory_order_acquire);
+    }
+
+    void AliasRanges(std::uintptr_t begin, std::uintptr_t end, void (*range)(void*, std::uintptr_t, std::uintptr_t), void* context) {
+        if (!Available()) return;
+        begin &= ~(PageBytes - 1);
+        end = (end + PageBytes - 1) & ~(PageBytes - 1);
+        if (end <= begin) return;
+        const auto plan = aliasPlan(begin, end);
+        for (const auto& alias : plan.aliases) range(context, alias.begin, alias.end);
+    }
+
     void Register(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available() || end <= begin) return;
         std::unique_lock lock(_lock);
+        _mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         remove(_ranges, begin, end);
         remove(_fresh, begin, end);
         cut(begin, end);
@@ -85,6 +100,7 @@ public:
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available() || end <= begin) return false;
         std::unique_lock lock(_lock);
+        _mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         const bool watched = remove(_ranges, begin, end);
         remove(_fresh, begin, end);
         cut(begin, end);
@@ -95,6 +111,7 @@ public:
         if (!Available() || bytes == 0 || first == second || (first | second | bytes) % PageBytes != 0) return false;
         std::unique_lock lock(_lock);
         if (!covers(first, first + bytes) || !covers(second, second + bytes)) return false;
+        _mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         link(first, first + bytes, second);
         link(second, second + bytes, first);
         return true;
@@ -466,6 +483,7 @@ private:
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
     std::multimap<std::uintptr_t, Link> _links;
     std::uintptr_t _linkBytes = 0;
+    std::atomic<std::uint64_t> _mappingSerial{0};
 };
 
 const bool g_opened = (Watch::Get(), true);
@@ -1168,6 +1186,26 @@ bool GuestWriteWatchAlias_nid_postfix(const void* first, const void* second, std
     static_cast<void>(second);
     static_cast<void>(bytes);
     return false;
+#endif
+}
+
+void GuestWriteWatchAliasRanges_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*range)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    if (bytes == 0 || address + bytes < address) return;
+    Watch::Get().AliasRanges(address, address + bytes, range, context);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(range);
+    static_cast<void>(context);
+#endif
+}
+
+std::uint64_t GuestWriteWatchMappingSerial_nid_postfix() {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    return Watch::Get().MappingSerial();
+#else
+    return 0;
 #endif
 }
 
