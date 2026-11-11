@@ -59,6 +59,11 @@ void Driver::markCompleted(std::uint64_t serial) {
     }
 }
 
+std::shared_ptr<const Submission>& Driver::executingSubmission() {
+    static thread_local std::shared_ptr<const Submission> executing;
+    return executing;
+}
+
 bool& Driver::completionDeferred() {
     static thread_local bool deferred = false;
     return deferred;
@@ -160,14 +165,23 @@ void Driver::run(std::uint32_t id) noexcept {
 
     GuestMemory::TagGpuLockThread(id);
     StartWorkerSampler(id);
-    Submission submission;
+    std::shared_ptr<Submission> owner;
+    const auto retire = [&owner] {
+        if (owner == nullptr) return;
+        owner->flips.clear();
+        owner->renderingWaits.clear();
+        owner->progress.reset();
+        owner.reset();
+    };
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
         for (;;) {
-            submission = Submission{};
+            retire();
+            owner = std::make_shared<Submission>();
+            auto& submission = *owner;
             struct Running {
                 std::atomic<std::uint32_t>& count;
                 std::atomic<std::uint64_t>& idleEpoch;
@@ -299,7 +313,13 @@ void Driver::run(std::uint32_t id) noexcept {
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
             retireLabelTakes(id, submission.received);
-            execute(submission);
+            {
+                struct Executing {
+                    std::shared_ptr<const Submission>& slot;
+                    ~Executing() { slot.reset(); }
+                } executing{executingSubmission() = owner};
+                execute(submission);
+            }
             if (submission.progress && submission.rewindTail == nullptr && !completionDeferred()) submitOpenWork(submission.progress);
             if (traceGpu) std::fprintf(stderr, "[gpu] %.1f done serial=%llu queue=0x%x\n", TraceMs(), static_cast<unsigned long long>(submission.serial), id);
             const auto completeStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -326,10 +346,13 @@ void Driver::run(std::uint32_t id) noexcept {
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
         }
     } catch (const ProcessShutdown&) {
-        submission = Submission{};
+        retire();
     } catch (...) {
         const auto error = std::current_exception();
-        for (const auto& [offset, flip] : submission.flips) flip->Fail(error);
+        if (owner != nullptr) {
+            for (const auto& [offset, flip] : owner->flips) flip->Fail(error);
+        }
+        retire();
         ReportFailure(error);
     }
 }
