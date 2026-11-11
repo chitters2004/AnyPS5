@@ -241,7 +241,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_ADDRESS_READ_PASSES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | stops a draw that only reads through its buffer descriptors from counting as read-only, so it breaks the pass instead of continuing the producer's |
 | `APS5_NO_ADDRESS_SPACE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | disables the address-space cache so every build rebuilds its space |
 | `APS5_NO_ADJACENT_GENERATION` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | leaves adjacent pending images at their generation during a write-back, as before |
-| `APS5_NO_ALIAS_BORROW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | disables borrowing a pending aliased storage image |
+| `APS5_NO_ALIAS_BORROW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | disables borrowing a pending aliased storage image, and borrowing an in-sync one |
 | `APS5_NO_ATOMIC_STAGING` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | binds atomic shader elements in place instead of staging them through a device-local buffer |
 | `APS5_NO_BARRIER_BATCH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/RuntimeSwitches.cpp` |  | records the staging, write-back and label-run leading barriers that a covering barrier already orders, instead of leaving them out; APS5_AB can toggle it |
 | `APS5_NO_BARRIER_ELISION` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records every leading barrier instead of merging it into the following submission |
@@ -395,6 +395,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_STORED_KNOWN_VALUES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/WriteEvidence.cpp` |  | makes a capture wait for the GPU over a store it recorded instead of reading the recorded bytes |
 | `APS5_NO_SYNC_SITES` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | leaves only the per-source and per-thread sync counts, with no per-site attribution |
 | `APS5_NO_SYNC_THROUGH` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | makes every pending-write sync a full Sync instead of the targeted unlocked wait |
+| `APS5_NO_SYNCED_ALIAS_BORROW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | makes a refreshed storage image re-upload units from its host import instead of copying them on the device from an aliased image of the same shape whose units match guest memory |
 | `APS5_NO_TABLE_REPLAY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | makes a reused bound image table rerun each element's checks instead of replaying its recorded bind outcomes |
 | `APS5_NO_TABLE_REUSE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/ShaderResources.cpp` |  | disables reusing a materialized image table |
 | `APS5_NO_TARGET_WRITEBACK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | skips writing render targets back to guest memory after the draw |
