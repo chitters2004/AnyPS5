@@ -21,6 +21,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDepthRepeatFind,
     HandwrittenPlanState,
     PlanAttachments,
+    NoResidentTargets,
     Count,
 };
 

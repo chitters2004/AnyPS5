@@ -224,6 +224,7 @@ enum class DrawStopForTest { None = 0, ReturnAfterResolve = 1, ThrowAfterResolve
 void SetSpaceKeepFailuresForTest(std::uint32_t count);
 void SetDrawStopAfterResolveForTest(DrawStopForTest stop);
 std::uint64_t TargetMemoBuildsForTest();
+std::uint64_t CopiedTargetResolutionsForTest();
 
 }
 
