@@ -207,7 +207,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; flushes that waited for a writer %llu, that skipped only writers stamped when recorded %llu; readback stores before labels: %llu sweeps stored %llu images in %.1f ms; storing flushes spent %.1f ms waiting, %.1f ms writing back, %.1f ms publishing; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), take(flushWaits), take(stampedWaitsSkipped), take(labelStoreSweeps), take(labelStoreImages), take(labelStoreNanos) / 1e6, take(flushWaitNanos) / 1e6, take(flushWriteBackNanos) / 1e6, take(flushPublishNanos) / 1e6, static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; flushes that waited for a writer %llu, that skipped only writers stamped when recorded %llu; readback stores before labels: %llu sweeps over %llu listed images in %.1f ms; storing flushes spent %.1f ms waiting, %.1f ms writing back, %.1f ms publishing; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), take(flushWaits), take(stampedWaitsSkipped), take(labelStoreSweeps), take(labelStoreImages), take(labelStoreNanos) / 1e6, take(flushWaitNanos) / 1e6, take(flushWriteBackNanos) / 1e6, take(flushPublishNanos) / 1e6, static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -4554,9 +4554,14 @@ void waitForIdlePublish(const char* reason) {
 }
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device) {
-    static_cast<void>(FlushDepthPlanes(address, bytes));
+    const std::array<std::pair<std::uint64_t, std::size_t>, 1> range{{{address, bytes}}};
+    return FlushPendingRanges(range, except, reason, scope, published, waited, device);
+}
+
+bool StorageTexture::FlushPendingRanges(std::span<const std::pair<std::uint64_t, std::size_t>> ranges, const StorageTexture* except, const char* reason, PublishScope scope, bool* published, bool waited, VkDevice device) {
+    for (const auto& [address, bytes] : ranges) static_cast<void>(FlushDepthPlanes(address, bytes));
     if (published != nullptr) *published = false;
-    const auto nothingToStore = [&] {
+    const auto nothingToStore = [&](std::uint64_t address, std::size_t bytes) {
         auto& pending = Pending();
         if (pending.flushingCount.load(std::memory_order_acquire) != 0) return false;
         if (!pending.textures.SurelyClear(address, bytes)) {
@@ -4567,17 +4572,23 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
         return scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes);
     };
-    if (nothingToStore()) return false;
-    if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
-        queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
-        return false;
+    std::vector<std::pair<std::uint64_t, std::size_t>> live;
+    for (const auto& [address, bytes] : ranges) {
+        if (nothingToStore(address, bytes)) continue;
+        if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
+            queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        live.emplace_back(address, bytes);
     }
+    if (live.empty()) return false;
+    const auto overlapsLive = [&live](const StorageTexture& texture) { return std::any_of(live.begin(), live.end(), [&texture](const auto& range) { return texture.overlaps(range.first, range.second); }); };
     std::unique_lock<GuestMemory::GpuMutexType> drawnHold;
     if (auto& drawnPending = Pending(); drawnPending.drawnCount.load(std::memory_order_acquire) != 0 && !GuestMemory::GpuMutex().HeldByThisThread()) {
         bool overlap = false;
         {
             std::lock_guard lock(drawnPending.mutex);
-            overlap = std::any_of(drawnPending.drawn.begin(), drawnPending.drawn.end(), [&](const PendingWrites::Drawn& entry) { return entry.texture->dirty && entry.texture->overlaps(address, bytes); });
+            overlap = std::any_of(drawnPending.drawn.begin(), drawnPending.drawn.end(), [&](const PendingWrites::Drawn& entry) { return entry.texture->dirty && overlapsLive(*entry.texture); });
         }
         if (overlap) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
@@ -4591,16 +4602,17 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const auto* exempt = refreshing;
-        for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
+        const bool mayOverlap = std::any_of(live.begin(), live.end(), [&pending](const auto& range) { return pending.textures.MayOverlap(range.first, range.second); });
+        for (auto it = mayOverlap ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
-            if (texture != except && texture != exempt && (device == VK_NULL_HANDLE || texture->context.device == device) && texture->overlaps(address, bytes)) {
-                if (!texture->pendingUnitInside(address, bytes)) {
+            if (texture != except && texture != exempt && (device == VK_NULL_HANDLE || texture->context.device == device) && overlapsLive(*texture)) {
+                if (std::none_of(live.begin(), live.end(), [texture](const auto& range) { return texture->overlaps(range.first, range.second) && texture->pendingUnitInside(range.first, range.second); })) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     ++it;
                     continue;
                 }
                 texture->dirty = false;
-                if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
+                if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && std::any_of(live.begin(), live.end(), [texture](const auto& range) { return texture->skippedResultsInside(range.first, range.second); })) {
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
                 }
@@ -4633,10 +4645,12 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     if (flush.empty()) {
         if (drawnHold.owns_lock()) drawnHold.unlock();
-        const bool stored = WaitForFlushing(address, bytes, except);
+        bool stored = false;
+        for (const auto& [address, bytes] : live) stored = WaitForFlushing(address, bytes, except) || stored;
         // Units shadowed over the range (another image's results retiled into the import's unit
         // shadow, or an earlier flush's) still reach the import as the scope asks.
-        const bool units = PublishShadowsOnly(address, bytes, scope, reason, waited || stored);
+        bool units = false;
+        for (const auto& [address, bytes] : live) units = PublishShadowsOnly(address, bytes, scope, reason, waited || stored) || units;
         if (published != nullptr) *published = units;
         return stored;
     }
@@ -4653,7 +4667,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
-        for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
+        for (const auto& texture : flush) {
+            for (const auto& [address, bytes] : live) {
+                if (texture->overlaps(address, bytes)) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
+            }
+        }
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4665,13 +4683,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             std::vector<std::pair<std::uint64_t, std::uint64_t>> stored;
             const auto waitRanges = [&] {
                 stored.clear();
-                if (wholeRange) {
-                    stored.emplace_back(address, address + bytes);
-                    return;
-                }
-                for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
-                if (publishes) {
-                    for (const auto& range : LiveShadowedRanges(address, bytes, scope)) stored.push_back(range);
+                for (const auto& [address, bytes] : live) {
+                    if (wholeRange) {
+                        stored.emplace_back(address, address + bytes);
+                        continue;
+                    }
+                    for (const auto& texture : flush) texture->appendStoredLayers(address, bytes, stored);
+                    if (publishes) {
+                        for (const auto& range : LiveShadowedRanges(address, bytes, scope)) stored.push_back(range);
+                    }
                 }
             };
             const auto pendingWriter = [&](const Recorder& active) {
@@ -4679,10 +4699,12 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 std::uint64_t writer = 0;
                 if (publishes) {
                     constexpr auto top = std::numeric_limits<std::uint64_t>::max();
-                    const auto first = address / block * block;
-                    const auto end = bytes > top - address ? top : address + bytes;
-                    const auto last = end > top - block ? end : (end + block - 1) / block * block;
-                    writer = active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
+                    for (const auto& [address, bytes] : live) {
+                        const auto first = address / block * block;
+                        const auto end = bytes > top - address ? top : address + bytes;
+                        const auto last = end > top - block ? end : (end + block - 1) / block * block;
+                        writer = std::max(writer, active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first)));
+                    }
                 }
                 for (const auto& [begin, end] : stored) {
                     if (writer == active.OpenSerial()) break;
@@ -4725,7 +4747,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
-            texture->writeBack(address, bytes);
+            bool overlapped = false;
+            for (const auto& [address, bytes] : live) {
+                if (!texture->overlaps(address, bytes)) continue;
+                overlapped = true;
+                texture->writeBack(address, bytes);
+            }
+            if (!overlapped) texture->writeBack(live.front().first, live.front().second);
         } catch (...) {
             if (!failure) failure = std::current_exception();
         }
@@ -4736,7 +4764,8 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
-        const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
+        std::size_t units = 0;
+        for (const auto& [address, bytes] : live) units += PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
         if (units != 0) waitForIdlePublish(reason);
         if (published != nullptr) *published = units != 0;
         if (profile) chargeNanos(flushPublishNanos, phase);
@@ -5138,12 +5167,11 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    std::uint64_t stored = 0;
-    for (const auto& [address, bytes] : ranges) stored += FlushPending(address, bytes, nullptr, reason) ? 1 : 0;
-    for (const auto& [address, bytes] : occasional) stored += FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device) ? 1 : 0;
+    if (!ranges.empty()) static_cast<void>(FlushPendingRanges(ranges, nullptr, reason));
+    if (!occasional.empty()) static_cast<void>(FlushPendingRanges(occasional, nullptr, reason, PublishScope::Whole, nullptr, false, device));
     if (!profile || (ranges.empty() && occasional.empty())) return;
     labelStoreSweeps.fetch_add(1, std::memory_order_relaxed);
-    labelStoreImages.fetch_add(stored, std::memory_order_relaxed);
+    labelStoreImages.fetch_add(ranges.size() + occasional.size(), std::memory_order_relaxed);
     labelStoreNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
 }
 
