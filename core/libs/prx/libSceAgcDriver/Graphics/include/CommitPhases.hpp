@@ -107,6 +107,10 @@ enum class CommitCounter : std::uint8_t {
     DepthFoundRepeated,
     PreparedSurfaceHits,
     PreparedSurfaceMisses,
+    TargetEpochNeverStamped,
+    TargetEpochOtherThread,
+    TargetEpochThisThread,
+    TargetEpochExitStamps,
     Count
 };
 

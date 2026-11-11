@@ -403,7 +403,7 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_refresh_upload_proof COMMAND agc_driver_recorder_tests --refresh-proof-only)
-    set_tests_properties(agc_refresh_upload_proof PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_UPLOAD_REFRESH_PROOF=1")
+    set_tests_properties(agc_refresh_upload_proof PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_UPLOAD_REFRESH_PROOF=1;APS5_REFRESH_EXIT_EPOCH_STAMP=1")
     if(WIN32)
         set_tests_properties(agc_refresh_upload_proof PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

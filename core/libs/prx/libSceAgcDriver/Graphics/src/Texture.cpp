@@ -2416,6 +2416,21 @@ std::atomic<int> flushFailureFiredForTest{0};
 
 }
 
+namespace {
+
+std::uint64_t refreshThreadTag() {
+    static std::atomic<std::uint64_t> tags{0};
+    thread_local const std::uint64_t tag = tags.fetch_add(1, std::memory_order_relaxed) + 1;
+    return tag;
+}
+
+}
+
+bool StorageTexture::RefreshExitEpochStamps() {
+    static const bool enabled = std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr;
+    return enabled;
+}
+
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const auto callerPhase = CurrentCommitPhase();
     const bool targetPhase = callerPhase == CommitPhase::TargetsRefresh || callerPhase == CommitPhase::TargetsLookup;
@@ -2435,21 +2450,32 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (targetPhase) {
         const bool moved = epoch != 0 && provedEpoch.load(std::memory_order_relaxed) != epoch;
         CountCommit(epoch == 0 ? CommitCounter::TargetEpochOff : moved ? CommitCounter::TargetEpochMoved : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? CommitCounter::TargetEpochProofMoved : CommitCounter::TargetEpochPendingMoved);
-        if (moved) CountCommit(EpochCauseCounter(EpochCauses()));
+        if (moved) {
+            CountCommit(EpochCauseCounter(EpochCauses()));
+            CountCommit(provedEpoch.load(std::memory_order_relaxed) == 0 ? CommitCounter::TargetEpochNeverStamped : provedThread.load(std::memory_order_relaxed) != refreshThreadTag() ? CommitCounter::TargetEpochOtherThread : CommitCounter::TargetEpochThisThread);
+        }
         if (CommitPhasesEnabled() && epoch != 0 && missedEpoch.exchange(epoch, std::memory_order_relaxed) != epoch) CountCommit(CommitCounter::TargetMissFirstInEpoch);
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
+    const auto stampEpoch = [&] {
+        if (epoch == 0) return;
+        provedEpoch.store(epoch, std::memory_order_relaxed);
+        provedProof.store(proofBefore, std::memory_order_relaxed);
+        provedPending.store(pendingBefore, std::memory_order_relaxed);
+        provedThread.store(refreshThreadTag(), std::memory_order_relaxed);
+    };
+    const auto stampExit = [&] {
+        if (!RefreshExitEpochStamps() || refreshProof.generation == 0 || epoch == 0) return;
+        stampEpoch();
+        if (targetPhase) CountCommit(CommitCounter::TargetEpochExitStamps);
+    };
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     auto refused = CommitCounter::Count;
     if (refreshProved(refused)) {
         layerBehind.clear();
-        if (epoch != 0) {
-            provedEpoch.store(epoch, std::memory_order_relaxed);
-            provedProof.store(proofBefore, std::memory_order_relaxed);
-            provedPending.store(pendingBefore, std::memory_order_relaxed);
-        }
+        stampEpoch();
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile && keyProof.pendingNote != 0) refreshesProvedPendingKeys.fetch_add(1, std::memory_order_relaxed);
@@ -2685,7 +2711,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             if (!outsideChanged || !outside[layer]) layerGeneration[layer] = currentFor(layer);
         }
         refreshGeneration();
-        if (layerBehind.empty()) takeRefreshProof(alias != nullptr);
+        if (layerBehind.empty()) {
+            takeRefreshProof(alias != nullptr);
+            stampExit();
+        }
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
@@ -2786,7 +2815,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
-        if (UploadRefreshProofs() && !scoped && layerBehind.empty() && !anyBorrowed && current != 0 && generation >= current) takeRefreshProof(alias != nullptr);
+        if (UploadRefreshProofs() && !scoped && layerBehind.empty() && !anyBorrowed && current != 0 && generation >= current) {
+            takeRefreshProof(alias != nullptr);
+            stampExit();
+        }
     } else {
         uploadedKeys = keys;
     }
