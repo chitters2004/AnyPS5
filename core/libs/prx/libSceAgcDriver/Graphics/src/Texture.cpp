@@ -4495,7 +4495,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         records.serial.store(serial, std::memory_order_release);
         layoutSerial = serial;
     } else {
-        layoutStoresSkipped.fetch_add(1, std::memory_order_relaxed);
+        layoutStoresSkipped.store(layoutStoresSkipped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
@@ -4553,7 +4553,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
     if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
-        pendingSinceLoopsSkipped.fetch_add(1, std::memory_order_relaxed);
+        pendingSinceLoopsSkipped.store(pendingSinceLoopsSkipped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     } else {
         bool everyUnit = true;
         for (std::uint32_t layer = first; layer < first + count; ++layer) {

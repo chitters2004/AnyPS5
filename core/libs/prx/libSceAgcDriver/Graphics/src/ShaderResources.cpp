@@ -7102,7 +7102,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         guestMemory.InPlaceReads(reads);
     }
-    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.fetch_add(1, std::memory_order_relaxed);
+    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.store(inPlaceReadReuses.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     recorder.NotePendingReads(reads, kind);
     ownedReads = std::move(reads);
     const auto inRun = std::exchange(afterRunSelf, nullptr);

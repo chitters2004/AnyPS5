@@ -3874,7 +3874,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     noteRead(address, address + bytes, kind);
-    readsNoted.fetch_add(1, std::memory_order_relaxed);
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
@@ -3884,14 +3884,14 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) noteRead(begin, end, kind);
     }
-    readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges.size(), std::memory_order_relaxed);
 }
 
 void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
     open->reads.push_back({begin, end, kind});
     if (FlipReadCheck() || notedReadKeys.Insert({begin, end, kind}, batchEpoch)) return;
     open->reads.pop_back();
-    readsRepeated.fetch_add(1, std::memory_order_relaxed);
+    readsRepeated.store(readsRepeated.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
@@ -3909,7 +3909,7 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
         return;
     }
     ensureOpen();
-    readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges->size(), std::memory_order_relaxed);
     for (const auto& note : open->readLists) {
         if (note.ranges == ranges && note.kind == kind) return;
     }
