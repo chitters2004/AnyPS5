@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
@@ -408,6 +409,7 @@ void ReleasePixelFunctionLds(VkDevice device) {
 }
 
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
+    const CommitPhaseScope phase(CommitPhase::RecordLocal);
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -1305,13 +1307,16 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         const auto sizeAt = key.size();
         key.push_back(0u);
         auto& memo = shader.program->drawKeyMemo.words;
-        if (const auto* shape = shapes ? KeyShapeOf(shader) : nullptr) {
+        const auto* shape = shapes ? KeyShapeOf(shader) : nullptr;
+        auto words = shape == nullptr ? memo.load(std::memory_order_acquire) : nullptr;
+        NoteCommitKeyMemo(shape != nullptr || words != nullptr);
+        if (shape != nullptr) {
             const auto statics = StaticKeys(shader, *shape);
             key.insert(key.end(), statics->drawWords.begin(), statics->drawWords.end());
             for (const auto binding : shape->patchedBindings) ShaderResources::AppendBindingContentKey(shader, binding, true, MovableBuffers(), key);
             stageKeyMemoCounters().patchedSegments.fetch_add(shape->patchedBindings.size(), std::memory_order_relaxed);
             shaped = true;
-        } else if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
+        } else if (words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
             stageKeyMemoCounters().resultHits.fetch_add(1, std::memory_order_relaxed);
         } else {
@@ -1344,6 +1349,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
 // another draw's render target and index buffer. The same conditions and messages, so a draw that
 // would have failed its build fails its hit.
 void CheckBufferAliases(std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+    const CommitPhaseScope phase(CommitPhase::ResolveAlias);
     const auto overlap = [](std::uint64_t first, std::uint64_t firstSize, std::uint64_t second, std::uint64_t secondSize) { return first < second + secondSize && second < first + firstSize; };
     const auto targetAddress = target.MemoryAddress();
     for (const auto& shader : shaders) {
@@ -1635,7 +1641,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        copy.generation = GuestMemory::CollectWrites(address, bytes);
+        copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (copy.buffer != nullptr) {
@@ -1644,7 +1650,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.buffer->Bytes(), alignment); });
     return copy;
 }
 
@@ -1662,7 +1668,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
     if (keep) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        copy.generation = GuestMemory::CollectWrites(address, readable);
+        copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, readable); });
         std::uint32_t keptReadable = 0;
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable);
         if (copy.buffer != nullptr && keptReadable == readable) {
@@ -1673,8 +1679,10 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     const auto span = copy.buffer->Bytes();
-    GuestMemory::Read(address, span.subspan(0, readable), 1);
-    std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
+    InCommitPhase(CommitPhase::InputsLocal, [&] {
+        GuestMemory::Read(address, span.subspan(0, readable), 1);
+        std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
+    });
     if (keep) recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
     return copy;
 }
@@ -1704,7 +1712,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto* import = InCommitPhase(CommitPhase::InputsCollect, [&] { return HostImportFor(context, address, bytes); });
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
     if (behindGpuWrite != nullptr && behind) *behindGpuWrite = true;
@@ -1715,17 +1723,17 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
     InPlaceIndices indices;
     if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
-        indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+        indices.highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(range, indexSize, skipRestart); });
         return indices;
     }
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
     const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto generation = GuestMemory::CollectWrites(address, bytes);
+    const auto generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
     if (generation != 0 && recorder.KnownHighestIndex(address, bytes, use, indices.highest)) {
         indices.reused = true;
         return indices;
     }
-    indices.highest = HighestDrawIndex(range, indexSize, skipRestart);
+    indices.highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(range, indexSize, skipRestart); });
     recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest);
     return indices;
 }
@@ -1877,7 +1885,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        plan.contentKey = InCommitPhase(CommitPhase::PlanKey, [&] { return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey); });
+        NoteCommitKey(plan.contentKey.size());
         timer.charge(PhaseLookup, keyStart);
     }
     return plan;
@@ -2011,12 +2020,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         GuestMemory::FlushGpuWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
         auto compacted = std::make_shared<Buffer>(context, static_cast<std::size_t>(indexBytes), VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
         const auto bytes = compacted->Bytes().first(static_cast<std::size_t>(indexBytes));
-        GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
+        InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize); });
         const auto primitiveSize = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST ? 1u : state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST ? 2u : 3u;
         const auto count = draw.indirect ? draw.indexCount : CompactListRestart(bytes, draw.indexSize, primitiveSize);
         const auto kept = bytes.first(static_cast<std::size_t>(count) * draw.indexSize);
         const bool restartLeft = draw.indirect.has_value();
-        auto highest = HighestDrawIndex(kept, draw.indexSize, restartLeft);
+        auto highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(kept, draw.indexSize, restartLeft); });
         constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
         if (const auto zeroFrom = highest && !shaders.front().program->vertexAttributes.empty() ? ZeroFetchVertex(shaders.front().program->vertexAttributes) : std::nullopt) {
             const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
@@ -2045,7 +2054,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart);
+            highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart); });
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -2195,20 +2204,38 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+void noteRepeatedTargets(const State& state, bool recipe) {
+    thread_local std::vector<std::uint64_t>* previousSlot = nullptr;
+    auto& previous = ShaderRecompiler::ThreadOwned(previousSlot);
+    thread_local std::vector<std::uint64_t>* currentSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(currentSlot);
+    current.clear();
+    for (const auto& color : state.colors) {
+        current.insert(current.end(), {color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), std::uint64_t{color.extent.width} << 32u | color.extent.height, color.dccAddress, color.cmaskAddress, color.fmaskAddress, std::uint64_t{color.samples} << 32u | color.mip, std::uint64_t{color.arraySlice} << 32u | color.layers});
+    }
+    current.push_back(state.depth.has_value() ? state.depth->address : 0u);
+    CountCommit(CommitCounter::TargetDraws);
+    if (recipe) CountCommit(CommitCounter::RecipeTargetDraws);
+    CountCommit(CommitCounter::ColorTargets, state.colors.size());
+    if (state.depth.has_value()) CountCommit(CommitCounter::DepthTargets);
+    if (current == previous) CountCommit(CommitCounter::RepeatedTargets);
+    std::swap(current, previous);
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
-        if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        if (resident != nullptr) InCommitPhase(CommitPhase::TargetsClearCheck, [&] { materializeRegisterClear(context, color, *resident); });
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (resident != nullptr) InCommitPhase(CommitPhase::TargetsCmask, [&] { materializeCmaskClear(context, color, resident); });
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -2310,7 +2337,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
         resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        if (auto cached = InCommitPhase(CommitPhase::ResolveCache, [&] { return SharedResourceCache().Find(resolved.contentKey); })) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2342,7 +2369,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && cached->Revalidate(shaders);
+            const bool valid = spaceHeld && [&] {
+                const CommitPhaseScope revalidate(CommitPhase::Revalidate);
+                return cached->Revalidate(shaders);
+            }();
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -2771,11 +2801,14 @@ void patchDepthRemapPush(std::array<std::byte, PipelinePushConstantBytes>& block
 
 void recordStencilReplay(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, std::span<const std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> replay, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes = nullptr, VkShaderStageFlags stages = 0) {
     State selected = state;
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
-        stages = PushConstantStages(shaders);
-    }
+    auto block = InCommitPhase(CommitPhase::RecordLocal, [&] {
+        auto assembled = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+        if (bytes == nullptr) {
+            resources.PatchPushConstants(assembled);
+            stages = PushConstantStages(shaders);
+        }
+        return assembled;
+    });
     patchDepthRemapPush(block, state);
     const auto fragment = std::ranges::find_if(shaders, [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && !shader.program->stencilReferences.empty(); });
     Require(fragment != shaders.end(), "stencil replay fragment stage is missing");
@@ -2811,11 +2844,14 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
 }
 
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0) {
-    auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
-    if (bytes == nullptr) {
-        resources.PatchPushConstants(block);
-        stages = PushConstantStages(shaders);
-    }
+    auto block = InCommitPhase(CommitPhase::RecordLocal, [&] {
+        auto assembled = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
+        if (bytes == nullptr) {
+            resources.PatchPushConstants(assembled);
+            stages = PushConstantStages(shaders);
+        }
+        return assembled;
+    });
     patchDepthRemapPush(block, state);
     if (state.stages.tessellation) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
@@ -2966,6 +3002,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
+    BeginCommitPhase(CommitPhase::PassAccessLocal);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
@@ -2987,10 +3024,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
+    BeginCommitPhase(CommitPhase::PassAccess);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    BeginCommitPhase(CommitPhase::Effects);
     const auto drawUse = resources.BeginDrawUse(*recorder);
+    BeginCommitPhase(CommitPhase::Bindings);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    BeginCommitPhase(CommitPhase::PassAccess);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -3018,6 +3059,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    BeginCommitPhase(CommitPhase::Record);
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
@@ -3164,8 +3206,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
+    BeginCommitPhase(CommitPhase::Effects);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
+    BeginCommitPhase(CommitPhase::Record);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
         for (auto& write : record.staged) {
@@ -3389,7 +3433,7 @@ std::shared_ptr<Pipeline> shapePipeline(const Context& context, std::uint64_t sh
         if (!sameChoice(choice, input, layouts, shaders, attachmentLayout, fragmentOutputs)) continue;
         const auto hash = choice.hash;
         const auto expected = choice.pipeline;
-        return TouchCachedPipeline(context, hash, expected);
+        return InCommitPhase(CommitPhase::PlanStore, [&] { return TouchCachedPipeline(context, hash, expected); });
     }
     return nullptr;
 }
@@ -3487,13 +3531,17 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
+    BeginCommitPhase(CommitPhase::Plan);
     const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
     if (plan.nothing) return false;
+    BeginCommitPhase(CommitPhase::Inputs);
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
         if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
         return false;
     }
+    BeginCommitPhase(CommitPhase::Targets);
+    if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
@@ -3506,6 +3554,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         if (color.samples > 1) {
+            const CommitPhaseScope multisample(CommitPhase::TargetsMultisample);
             binding.multisampled = true;
             timer.phase(PhaseSetup);
             if (color.staged) {
@@ -3526,8 +3575,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        BeginCommitPhase(CommitPhase::TargetsSettle);
         static_cast<void>(FlushDepthPlanes(color.address, colorLayout.Bytes(), DepthPlaneScope::Whole));
         RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
+        BeginCommitPhase(CommitPhase::TargetsClaims);
         ClaimMultisampleTargetMemory(color.address, colorLayout.Bytes());
         if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -3536,6 +3587,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
         const bool linearResident = residentLinear && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
+        BeginCommitPhase(CommitPhase::Targets);
         if ((binding.gpuTiling || ((!ColorTileModeIsLinear(color.tileMode) || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
@@ -3544,6 +3596,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                const CommitPhaseScope lookup(CommitPhase::TargetsLookup);
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3571,7 +3624,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+            targetViews.push_back(InCommitPhase(CommitPhase::TargetsView, [&] { return binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice); }));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -3628,9 +3681,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) {
-        targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
+        targetViews.push_back(InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); }));
     }
     timer.phase(PhasePrepare);
+    BeginCommitPhase(CommitPhase::Resolve);
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
@@ -3641,6 +3695,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (stop == 1) return false;
         if (stop == 2) throw std::runtime_error("injected failure after the draw's resources were resolved");
     }
+    BeginCommitPhase(CommitPhase::Classify);
     if (state.depth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     auto& resources = resolved.resources;
     for (std::size_t index = 0; index < targets.size(); ++index) {
@@ -3805,6 +3860,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         resolved.moved.clear();
     }
     if (state.depth) RequireNoNativeDepthFeedback_nid_no_patch(context, *state.depth, resources->SampledTextures());
+    BeginCommitPhase(CommitPhase::Plan);
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
@@ -3829,7 +3885,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         selected.stencilReplayReference = reference;
         selected.stencilFront.reference = reference;
         selected.stencilBack.reference = reference;
-        auto selectedPipeline = stencilReplay.empty() ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+        auto selectedPipeline = stencilReplay.empty() ? InCommitPhase(CommitPhase::PlanStore, [&] { return CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL); }) : stencilReplay.front().second;
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
@@ -3847,7 +3903,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             noteShapeMemoVerified(true);
         }
         const bool repeated = pipeline != nullptr;
-        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        if (!repeated) pipeline = InCommitPhase(CommitPhase::PlanStore, [&] { return CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash); });
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
@@ -3862,7 +3918,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     Require(!pipeline->ReordersSamples() || std::ranges::none_of(state.colors, [](const ColorTarget& color) { return color.staged; }), "a partial write of a multisampled packed color target on a device that puts the guest's samples in order is not implemented");
     auto& framebuffer = prepared.framebuffer;
-    framebuffer = pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+    framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(targetViews, framebufferOwners, state.renderExtent, state.renderLayers); });
     auto& reordered = prepared.reordered;
     auto& reorderPass = prepared.reorderPass;
     if (pipeline->ReordersSamples()) {
@@ -3881,6 +3937,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
 }
 
 void recordPreparedDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, PreparedDraw& prepared) {
+    BeginCommitPhase(CommitPhase::Record);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     static AgcDriver::Mutex dumpMutex;
@@ -3980,6 +4037,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->vertexInput = inputs.VertexLayout();
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
+                const CommitPhaseScope local(CommitPhase::RecordLocal);
                 recipe->pushBytes = AssemblePushConstants(shaders);
                 resources->PatchPushConstants(recipe->pushBytes);
             }
@@ -4216,8 +4274,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
+        BeginCommitPhase(CommitPhase::Effects);
         keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, [&] { std::vector<std::pair<std::uint32_t, std::uint32_t>> slices; for (const auto& binding : targets) slices.emplace_back(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u); return slices; }(), state.scissor, std::move(scratch), std::move(checkRecords), listed, completion, outcome, drawUse, prepared.spaceKeep != nullptr ? prepared.spaceKeep.get() : nullptr);
         timer.phase(PhaseKeep);
+        BeginCommitPhase(CommitPhase::Record);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
             // write-back runs before the next packet, so the CPU never reads copied results or
@@ -4380,6 +4440,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
         return;
     }
+    const CommitPhaseDraw commitPhases;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PreparedDraw prepared(profile);
     prepared.recipeOut = recipeOut;
@@ -4434,6 +4495,7 @@ void requirePlanDecisionsRepeat(const Context& context, const State& state, cons
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawRecipeUse use) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    const CommitPhaseDraw commitPhases;
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
@@ -4497,8 +4559,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         }
         ValidateVertexAddresses(shaders.front().program->vertexAttributes);
     }
+    BeginCommitPhase(CommitPhase::Plan);
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
+    BeginCommitPhase(CommitPhase::Inputs);
     if (plan.nothing) inputs.nothing = true;
     else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
@@ -4511,17 +4575,21 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
+    BeginCommitPhase(CommitPhase::Targets);
+    if (CommitPhasesEnabled()) noteRepeatedTargets(state, true);
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
-        if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
+        if (state.colors[index].fmaskAddress != 0) InCommitPhase(CommitPhase::TargetsClaims, [&] { GuardOneFragmentFmask(context, state.colors[index]); });
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr) return miss(DrawRecipeMiss::TargetGone);
         const auto surface = SurfaceForTarget(state.colors[index]);
-        if (planned && !StorageImageCachedFor(context, stored.get(), surface)) return StorageImageCached(context, stored.get()) ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
-        if ((!planned && !StorageImageCached(context, stored.get())) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        const auto cached = [&] { return InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCached(context, stored.get()); }); };
+        if (planned && !InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCachedFor(context, stored.get(), surface); })) return cached() ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
+        if ((!planned && !cached()) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
+            const CommitPhaseScope refresh(CommitPhase::TargetsRefresh);
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh();
             return stored;
@@ -4534,7 +4602,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
-        const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
+        const auto depthView = InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
         timer.phase(PhaseReadTarget);
         if (recipe.targetViews.back() != depthView) return planned ? instanceMiss(DrawPlanInstance::Depth) : miss(DrawRecipeMiss::TargetGone);
     }
@@ -4546,7 +4614,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const bool proved = resources->ProveCurrent(shaders, &result.proof);
+    const bool proved = [&] {
+        const CommitPhaseScope revalidate(CommitPhase::Revalidate);
+        return resources->ProveCurrent(shaders, &result.proof);
+    }();
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
         SharedResourceCache().Remove(*usedKey, resources.get());
@@ -4566,9 +4637,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         moved = std::move(*rebound);
         result.movedBuffers = static_cast<std::uint32_t>(moved.size());
     }
+    BeginCommitPhase(CommitPhase::Classify);
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-    SharedResourceCache().Touch(*usedKey);
+    InCommitPhase(CommitPhase::ResolveCache, [&] { SharedResourceCache().Touch(*usedKey); });
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();
@@ -4577,6 +4649,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // or its eviction bound drops it: a miss). The framebuffer is the recipe's while the pipeline's
     // list holds it: the views are the stored targets' (stable while they live, and they are the
     // same objects), so AcquireFramebuffer only runs when the list evicted it.
+    BeginCommitPhase(CommitPhase::Plan);
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *usedKey, result.templateInstance, *resources, moved, pipeline, targets);
@@ -4584,9 +4657,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
-        framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
+        framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers); });
     }
     timer.phase(PhasePipeline);
+    BeginCommitPhase(CommitPhase::Record);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
     record.recorder = recorder;
@@ -4601,6 +4675,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
     auto pushBytes = recipe.pushBytes;
     if (recipe.pushStages != 0) {
+        const CommitPhaseScope local(CommitPhase::RecordLocal);
         pushBytes = AssemblePushConstants(shaders);
         record.resources->PatchPushConstants(pushBytes);
     }

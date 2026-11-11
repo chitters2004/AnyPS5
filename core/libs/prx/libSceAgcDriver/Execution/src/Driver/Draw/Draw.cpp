@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -124,6 +125,7 @@ std::string_view TrimmedReason(std::string_view reason) {
 
 struct DrawTail {
     using GpuLock = std::unique_lock<std::remove_reference_t<decltype(GuestMemory::GpuMutex())>>;
+    std::shared_ptr<const Submission> owner;
     bool profile = false;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
     std::uint64_t captures = 0;
@@ -740,6 +742,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
+        if (executingSubmission().get() == &submission) tail.owner = executingSubmission();
         tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
@@ -863,8 +866,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const auto decodeVertexInfo = [&](std::size_t i) {
         const auto& program = programs[i];
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
-        decodeReads[i].clear();
-        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
+        vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, decodeReads[i], 8u - program.firstUserSgpr);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
     };
     const auto fold = [&](const ShaderRecompiler::RecompileResult& main, Pm4::DrawParameters& parameters) { FoldDrawOffsets(main, programs.front(), parameters); };
@@ -1443,7 +1445,8 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         }
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
-    noteDrawWriters(stages, queue);
+    const Graphics::CommitPhaseDraw commitPhases;
+    Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueWriters, [&] { noteDrawWriters(stages, queue); });
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
@@ -1459,7 +1462,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() && planKey == nullptr ? nullptr : &built, tracePtr, shape);
     countFullPlanDraw(fullStart);
     if (planKey != nullptr) shadowDrawPlan(planKey, built != nullptr ? built : Graphics::TakeDrawPlanShadowDecision());
-    if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
+    if (built != nullptr && !recipeStages.empty()) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor); });
 }
 
 }
