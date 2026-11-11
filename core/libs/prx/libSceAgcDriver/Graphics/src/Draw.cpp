@@ -2945,8 +2945,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto eachDrawTiming = Recorder::NoTiming;
     if (timeEachDraw) {
         std::uint64_t key = 0;
+        const bool byFragment = !record.pipeline->InertFragmentStage();
         for (const auto& shader : shaders) {
-            if (shader.program != nullptr && (key == 0 || shader.stage == ShaderRecompiler::ShaderStage::Fragment)) key = shader.program->variantId;
+            if (shader.program != nullptr && (key == 0 || (byFragment && shader.stage == ShaderRecompiler::ShaderStage::Fragment))) key = shader.program->variantId;
         }
         eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
     }
