@@ -10,6 +10,7 @@
 #include <exception>
 #include <functional>
 #include <initializer_list>
+#include <optional>
 #include <set>
 #include <span>
 #include <spirv/unified1/spirv.hpp>
@@ -761,6 +762,48 @@ int main() {
         const bool anisotropic = flags(56u, 0u, 2u) == Flags{{0u, 0u}};
         if (!(point && snorm && float32 && float16 && bilinear && magnified && anisotropic)) std::fprintf(stderr, "  point %d snorm %d float32 %d float16 %d bilinear %d magnified %d anisotropic %d\n", point, snorm, float32, float16, bilinear, magnified, anisotropic);
         return point && snorm && float32 && float16 && bilinear && magnified && anisotropic;
+    });
+
+    passed &= run("a gathered image keeps its normalized flag under any filter and loses it with a border-reading clamp mode or a float format", [] {
+        const auto flag = [](std::uint32_t format, std::uint32_t clamp, std::uint32_t xyFilters, std::uint32_t borderType) {
+            ShaderInfo info;
+            ImageResource image;
+            image.resourceClass = ImageResourceClass::Sampled;
+            image.numericClass = IrTextureNumericClass::Float;
+            image.dimension = RdnaImageDimension::Dim2D;
+            info.images = {image};
+            info.runtimeImageModes = {{image}};
+            info.samplers.push_back(SamplerResource{});
+            info.sampledPairs.push_back(SampledResourcePair{0u, 0u});
+            ResourceSnapshot snapshot;
+            DescriptorValue texture;
+            texture.dwords = {0x00001000u, format << 20u, 0x0001c007u, 0x90000facu, 0u, 0u, 0u, 0u};
+            texture.dwordCount = 8u;
+            texture.availableDwordMask = 0xffu;
+            snapshot.images = {texture};
+            DescriptorValue sampler;
+            sampler.dwords = {clamp | (clamp << 3u) | (clamp << 6u), 0x00fff000u, xyFilters << 20u, borderType << 30u};
+            sampler.dwordCount = 4u;
+            sampler.availableDwordMask = 0xfu;
+            snapshot.samplers = {sampler};
+            const auto plan = DescriptorBindingBuilder{}.Prepare(IrBindingLayout{}, info, IrShaderStage::Compute, snapshot);
+            std::optional<std::uint32_t> found;
+            for (const auto& constant : plan.specialization) {
+                if (constant.id == PipelineSpecialization::NormalizedImageBase) found = constant.value;
+            }
+            return found;
+        };
+        const bool edge = flag(56u, 2u, 0u, 0u) == 1u;
+        const bool bilinear = flag(56u, 2u, 5u, 0u) == 1u;
+        const bool wrapped = flag(57u, 0u, 5u, 0u) == 1u;
+        const bool bordered = flag(56u, 6u, 0u, 2u) == 0u;
+        const bool customBorder = flag(56u, 6u, 0u, 3u) == 0u;
+        const bool halfBorder = flag(56u, 4u, 0u, 0u) == 0u;
+        const bool float32 = flag(22u, 2u, 0u, 0u) == 0u;
+        const bool float16 = flag(13u, 2u, 0u, 0u) == 0u;
+        const bool all = edge && bilinear && wrapped && bordered && customBorder && halfBorder && float32 && float16;
+        if (!all) std::fprintf(stderr, "  edge %d bilinear %d wrapped %d bordered %d customBorder %d halfBorder %d float32 %d float16 %d\n", edge, bilinear, wrapped, bordered, customBorder, halfBorder, float32, float16);
+        return all;
     });
 
     return passed ? 0 : 1;

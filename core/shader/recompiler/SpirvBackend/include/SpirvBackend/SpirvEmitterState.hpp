@@ -75,6 +75,11 @@ struct MemoryResourceAccess {
     std::uint32_t misalignment = 0;
 };
 
+struct NormalizedBound {
+    std::vector<std::uint32_t> images;
+    double limit = 0.0;
+};
+
 struct SpirvTableImageVariable {
     DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
     std::uint32_t variable = 0;
@@ -97,6 +102,7 @@ struct SpirvEmitterState {
     const IrProgram& program;
     ShaderStageInputInfo inputInfo;
     std::unordered_map<const IrValue*, std::optional<std::vector<std::uint32_t>>> normalizedSampleImages;
+    std::map<std::pair<const IrValue*, std::uint32_t>, std::optional<NormalizedBound>> normalizedBounds;
     std::array<std::uint32_t, 11> tessVariables {};
     std::uint32_t tessInnerVariable = 0;
 

@@ -449,14 +449,14 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::SLessThan64: return Invoke(EmitSLessThan64, ctx, inst);
         case IrOpcode::ULessThan32: return Invoke(EmitULessThan32, ctx, inst);
         case IrOpcode::ULessThan64: return Invoke(EmitULessThan64, ctx, inst);
-        case IrOpcode::IEqual32: return Invoke(EmitIEqual32, ctx, inst);
+        case IrOpcode::IEqual32: return Invoke(EmitSampleInfQuery, ctx, inst);
         case IrOpcode::IEqual64: return Invoke(EmitIEqual64, ctx, inst);
         case IrOpcode::SLessThanEqual32: return Invoke(EmitSLessThanEqual32, ctx, inst);
         case IrOpcode::ULessThanEqual32: return Invoke(EmitULessThanEqual32, ctx, inst);
         case IrOpcode::SGreaterThan32: return Invoke(EmitSGreaterThan32, ctx, inst);
         case IrOpcode::UGreaterThan32: return Invoke(EmitSampleNanQuery, ctx, inst);
         case IrOpcode::UGreaterThan64: return Invoke(EmitUGreaterThan64, ctx, inst);
-        case IrOpcode::INotEqual32: return Invoke(EmitINotEqual32, ctx, inst);
+        case IrOpcode::INotEqual32: return Invoke(EmitSampleInfQuery, ctx, inst);
         case IrOpcode::INotEqual64: return Invoke(EmitINotEqual64, ctx, inst);
         case IrOpcode::SGreaterThanEqual32: return Invoke(EmitSGreaterThanEqual32, ctx, inst);
         case IrOpcode::UGreaterThanEqual32: return Invoke(EmitUGreaterThanEqual32, ctx, inst);

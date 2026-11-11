@@ -10,7 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cmath>
 #include <initializer_list>
+#include <limits>
 #include <map>
 #include <optional>
 #include <ranges>
@@ -1708,10 +1710,343 @@ std::uint32_t SampleNanQuery(SpirvValueEmitContext& ctx, const IrValue* source, 
 
 }
 
+namespace {
+
+constexpr std::uint32_t LowHalf = 0u;
+constexpr std::uint32_t HighHalf = 16u;
+constexpr std::uint32_t WholeF32 = 32u;
+constexpr double RoundingSlack = 1.0 + 1.0 / 1024.0;
+constexpr double F16Overflow = 65520.0;
+constexpr double F32Overflow = 3.4e38;
+constexpr double Unbounded = std::numeric_limits<double>::infinity();
+
+std::uint32_t FieldBits(std::uint32_t bits, std::uint32_t view) {
+    return view == WholeF32 ? bits : (bits >> view) & 0xffffu;
+}
+
+std::uint32_t SignBit(std::uint32_t view) {
+    return view == WholeF32 ? 0x80000000u : 0x8000u;
+}
+
+std::uint32_t AllBits(std::uint32_t view) {
+    return view == WholeF32 ? 0xffffffffu : 0xffffu;
+}
+
+std::optional<double> Magnitude(std::uint32_t field, std::uint32_t view) {
+    if (view == WholeF32) {
+        const auto value = std::fabs(static_cast<double>(std::bit_cast<float>(field)));
+        if (std::isnan(value)) return std::nullopt;
+        return value;
+    }
+    const auto magnitude = field & 0x7fffu;
+    const auto exponent = magnitude >> 10u;
+    const auto mantissa = magnitude & 0x3ffu;
+    if (exponent == 31u) return mantissa == 0u ? std::optional(Unbounded) : std::nullopt;
+    if (exponent == 0u) return std::ldexp(static_cast<double>(mantissa), -24);
+    return std::ldexp(static_cast<double>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+}
+
+std::optional<std::uint32_t> ImmediateOperand(const IrValue* value, const IrValue*& other) {
+    const auto lhs = value->Argument(0)->Resolve();
+    const auto rhs = value->Argument(1)->Resolve();
+    if (rhs->HasImmediate()) {
+        other = lhs;
+        return rhs->ImmediateU32();
+    }
+    if (lhs->HasImmediate()) {
+        other = rhs;
+        return lhs->ImmediateU32();
+    }
+    return std::nullopt;
+}
+
+std::optional<std::uint32_t> ImmediateArgument(const IrValue* value, std::size_t index) {
+    const auto argument = value->Argument(index)->Resolve();
+    return argument->HasImmediate() ? std::optional(argument->ImmediateU32()) : std::nullopt;
+}
+
+double Rounded(double exact, std::uint32_t view) {
+    const auto rounded = exact * RoundingSlack + (view == WholeF32 ? std::ldexp(1.0, -149) : std::ldexp(1.0, -24));
+    return rounded < (view == WholeF32 ? F32Overflow : F16Overflow) ? rounded : Unbounded;
+}
+
+class NormalizedBounds {
+public:
+    explicit NormalizedBounds(SpirvEmitterState& state) : program(state.program), known(state.normalizedBounds) {}
+
+    std::optional<NormalizedBound> Of(const IrValue* value, std::uint32_t view) {
+        value = value->Resolve();
+        const auto key = std::make_pair(value, view);
+        if (const auto found = known.find(key); found != known.end()) return found->second;
+        known.emplace(key, std::nullopt);
+        auto result = compute(value, view);
+        known[key] = result;
+        return result;
+    }
+
+private:
+    static NormalizedBound Zero() {
+        return {};
+    }
+
+    static std::optional<NormalizedBound> Joined(std::optional<NormalizedBound> lhs, const std::optional<NormalizedBound>& rhs, double limit) {
+        if (!lhs || !rhs) return std::nullopt;
+        lhs->images.insert(lhs->images.end(), rhs->images.begin(), rhs->images.end());
+        std::ranges::sort(lhs->images);
+        lhs->images.erase(std::unique(lhs->images.begin(), lhs->images.end()), lhs->images.end());
+        lhs->limit = limit;
+        return lhs;
+    }
+
+    static std::optional<NormalizedBound> Joined(std::optional<NormalizedBound> lhs, const std::optional<NormalizedBound>& rhs) {
+        if (!lhs || !rhs) return std::nullopt;
+        const auto limit = std::max(lhs->limit, rhs->limit);
+        return Joined(std::move(lhs), rhs, limit);
+    }
+
+    static std::optional<NormalizedBound> Constant(std::uint32_t field, std::uint32_t view) {
+        const auto magnitude = Magnitude(field, view);
+        if (!magnitude) return std::nullopt;
+        return NormalizedBound{{}, *magnitude};
+    }
+
+    bool zeroField(const IrValue* value, std::uint32_t view) {
+        value = value->Resolve();
+        if (value->HasImmediate()) return FieldBits(value->ImmediateU32(), view) == 0u;
+        if (view == WholeF32) return false;
+        const IrValue* other = nullptr;
+        switch (value->Opcode()) {
+            case IrOpcode::BitwiseAnd32:
+                if (const auto mask = ImmediateOperand(value, other)) return FieldBits(*mask, view) == 0u;
+                return zeroField(value->Argument(0), view) || zeroField(value->Argument(1), view);
+            case IrOpcode::ShiftLeftLogical32:
+                return view == LowHalf && ImmediateArgument(value, 1u) == 16u;
+            case IrOpcode::ShiftRightLogical32:
+                return view == HighHalf && ImmediateArgument(value, 1u) == 16u;
+            case IrOpcode::BitFieldUExtract:
+                return view == HighHalf && ImmediateArgument(value, 2u).value_or(32u) <= 16u;
+            case IrOpcode::ConvertU32U16:
+                return view == HighHalf;
+            default:
+                return false;
+        }
+    }
+
+    bool signField(const IrValue* value, std::uint32_t view) {
+        value = value->Resolve();
+        const IrValue* other = nullptr;
+        if (value->Opcode() == IrOpcode::BitwiseAnd32) {
+            if (const auto mask = ImmediateOperand(value, other)) return (FieldBits(*mask, view) & ~SignBit(view)) == 0u;
+        }
+        return zeroField(value, view);
+    }
+
+    std::optional<NormalizedBound> masked(const IrValue* value, std::uint32_t view) {
+        const IrValue* other = nullptr;
+        const auto mask = ImmediateOperand(value, other);
+        if (!mask) return std::nullopt;
+        const auto field = FieldBits(*mask, view);
+        if ((field & ~SignBit(view)) == 0u) return Zero();
+        if (field == AllBits(view) || field == (AllBits(view) & ~SignBit(view))) return Of(other, view);
+        return std::nullopt;
+    }
+
+    std::optional<NormalizedBound> combined(const IrValue* value, std::uint32_t view) {
+        const IrValue* other = nullptr;
+        if (const auto bits = ImmediateOperand(value, other)) {
+            const auto field = FieldBits(*bits, view);
+            if (field == 0u) return Of(other, view);
+            if (signField(other, view)) return Constant(field & ~SignBit(view), view);
+            return std::nullopt;
+        }
+        if (zeroField(value->Argument(0), view)) return Of(value->Argument(1), view);
+        if (zeroField(value->Argument(1), view)) return Of(value->Argument(0), view);
+        return std::nullopt;
+    }
+
+    std::optional<NormalizedBound> sum(const IrValue* value, std::uint32_t view) {
+        const auto lhs = Of(value->Argument(0), view);
+        const auto rhs = Of(value->Argument(1), view);
+        if (!lhs || !rhs || (lhs->limit == Unbounded && rhs->limit == Unbounded)) return std::nullopt;
+        return Joined(lhs, rhs, Rounded(lhs->limit + rhs->limit, view));
+    }
+
+    std::optional<NormalizedBound> product(const IrValue* value, std::uint32_t view) {
+        const auto lhs = Of(value->Argument(0), view);
+        const auto rhs = Of(value->Argument(1), view);
+        if (!lhs || !rhs || lhs->limit == Unbounded || rhs->limit == Unbounded) return std::nullopt;
+        return Joined(lhs, rhs, Rounded(lhs->limit * rhs->limit, view));
+    }
+
+    std::optional<NormalizedBound> fused(const IrValue* value, std::uint32_t view) {
+        const auto lhs = Of(value->Argument(0), view);
+        const auto rhs = Of(value->Argument(1), view);
+        const auto addend = Of(value->Argument(2), view);
+        if (!lhs || !rhs || !addend || lhs->limit == Unbounded || rhs->limit == Unbounded) return std::nullopt;
+        if (addend->limit == Unbounded && Rounded(lhs->limit * rhs->limit, view) == Unbounded) return std::nullopt;
+        return Joined(Joined(lhs, rhs, 0.0), addend, Rounded(lhs->limit * rhs->limit + addend->limit, view));
+    }
+
+    std::optional<NormalizedBound> texels(const IrValue* vector, std::uint32_t index, std::uint32_t view) {
+        if (vector->Opcode() != IrOpcode::ImageSampleRaw && vector->Opcode() != IrOpcode::ImageGatherRaw && vector->Opcode() != IrOpcode::ImageRead) return std::nullopt;
+        const auto& memoryInfo = program.Resources().memoryInfo;
+        const auto entry = vector->Flags<MemoryFlags>().index;
+        if (entry >= memoryInfo.size()) return std::nullopt;
+        const auto& memory = memoryInfo[entry];
+        if (memory.kind != ResourceKind::Image || memory.imageR128 || memory.imagePacked || (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) return std::nullopt;
+        const auto& images = program.Info().images;
+        if (memory.resource >= images.size()) return std::nullopt;
+        const auto& image = images[memory.resource];
+        if (image.table != NoTable || image.numericClass != IrTextureNumericClass::Float || image.depthBits || image.packed) return std::nullopt;
+        const bool halves = memory.dataBits == 16u && vector->Opcode() != IrOpcode::ImageRead && view != WholeF32 && index < std::min(memory.dataDwords, 4u);
+        const bool words = memory.dataBits == 32u && !memory.d16 && view == WholeF32;
+        if (!halves && !words) return std::nullopt;
+        return NormalizedBound{{memory.resource}, 1.0};
+    }
+
+    std::optional<NormalizedBound> compute(const IrValue* value, std::uint32_t view) {
+        if (value->HasImmediate()) return Constant(FieldBits(value->ImmediateU32(), view), view);
+        switch (value->Opcode()) {
+            case IrOpcode::Phi: {
+                std::optional<NormalizedBound> result = Zero();
+                for (std::size_t index = 0; index < value->ArgumentCount() && result; ++index) result = Joined(std::move(result), Of(value->Argument(index), view));
+                return result;
+            }
+            case IrOpcode::SelectU32:
+            case IrOpcode::SelectF32:
+                return Joined(Of(value->Argument(1), view), Of(value->Argument(2), view));
+            case IrOpcode::BitCastU32F32:
+            case IrOpcode::BitCastF32U32:
+                return Of(value->Argument(0), view);
+            case IrOpcode::FPAbs32:
+            case IrOpcode::FPNeg32:
+                return view == WholeF32 ? Of(value->Argument(0), view) : std::nullopt;
+            case IrOpcode::BitwiseAnd32:
+                return masked(value, view);
+            case IrOpcode::BitwiseXor32: {
+                const IrValue* other = nullptr;
+                const auto bits = ImmediateOperand(value, other);
+                if (bits && (FieldBits(*bits, view) & ~SignBit(view)) == 0u) return Of(other, view);
+                return std::nullopt;
+            }
+            case IrOpcode::BitwiseOr32:
+                return combined(value, view);
+            case IrOpcode::ShiftLeftLogical32:
+                if (view == WholeF32 || ImmediateArgument(value, 1u) != 16u) return std::nullopt;
+                return view == LowHalf ? std::optional(Zero()) : Of(value->Argument(0), LowHalf);
+            case IrOpcode::ShiftRightLogical32:
+                if (view == WholeF32 || ImmediateArgument(value, 1u) != 16u) return std::nullopt;
+                return view == HighHalf ? std::optional(Zero()) : Of(value->Argument(0), HighHalf);
+            case IrOpcode::BitFieldUExtract: {
+                if (view == WholeF32 || ImmediateArgument(value, 2u) != 16u) return std::nullopt;
+                if (view == HighHalf) return Zero();
+                const auto offset = ImmediateArgument(value, 1u);
+                if (offset == 0u || offset == 16u) return Of(value->Argument(0), *offset);
+                return std::nullopt;
+            }
+            case IrOpcode::ConvertU32U16:
+                if (view == WholeF32) return std::nullopt;
+                return view == HighHalf ? std::optional(Zero()) : Of(value->Argument(0), LowHalf);
+            case IrOpcode::ConvertU16U32:
+            case IrOpcode::BitCastU16F16:
+            case IrOpcode::BitCastF16U16:
+                return view == LowHalf ? Of(value->Argument(0), LowHalf) : std::nullopt;
+            case IrOpcode::ConvertF32F16:
+                return view == WholeF32 ? Of(value->Argument(0), LowHalf) : std::nullopt;
+            case IrOpcode::ConvertF16F32: {
+                if (view != LowHalf) return std::nullopt;
+                auto source = Of(value->Argument(0), WholeF32);
+                if (source) source->limit = Rounded(source->limit, LowHalf);
+                return source;
+            }
+            case IrOpcode::PackHalf2x16: {
+                if (view == WholeF32) return std::nullopt;
+                const auto pair = value->Argument(0)->Resolve();
+                if (pair->Opcode() != IrOpcode::CompositeConstructF32x2) return std::nullopt;
+                auto source = Of(pair->Argument(view == LowHalf ? 0u : 1u), WholeF32);
+                if (source) source->limit = Rounded(source->limit, LowHalf);
+                return source;
+            }
+            case IrOpcode::FPAdd16x2:
+                return view == WholeF32 ? std::nullopt : sum(value, view);
+            case IrOpcode::FPMul16x2:
+                return view == WholeF32 ? std::nullopt : product(value, view);
+            case IrOpcode::FPFma16x2:
+                return view == WholeF32 ? std::nullopt : fused(value, view);
+            case IrOpcode::FPAdd32:
+            case IrOpcode::FPSub32:
+                return view == WholeF32 ? sum(value, view) : std::nullopt;
+            case IrOpcode::FPMul32:
+                return view == WholeF32 ? product(value, view) : std::nullopt;
+            case IrOpcode::FPFma32:
+                return view == WholeF32 ? fused(value, view) : std::nullopt;
+            case IrOpcode::FPMin32:
+            case IrOpcode::FPMax32:
+                return view == WholeF32 ? Joined(Of(value->Argument(0), view), Of(value->Argument(1), view)) : std::nullopt;
+            case IrOpcode::CompositeExtractU32x4: {
+                const auto index = ImmediateArgument(value, 1u);
+                if (!index || *index >= 4u) return std::nullopt;
+                const auto vector = value->Argument(0)->Resolve();
+                if (vector->Opcode() == IrOpcode::CompositeConstructU32x4) return Of(vector->Argument(*index), view);
+                return texels(vector, *index, view);
+            }
+            default:
+                return std::nullopt;
+        }
+    }
+
+    const IrProgram& program;
+    std::map<std::pair<const IrValue*, std::uint32_t>, std::optional<NormalizedBound>>& known;
+};
+
+struct BoundQuery {
+    const IrValue* source = nullptr;
+    std::uint32_t view = LowHalf;
+    bool needsFinite = false;
+    bool answer = false;
+};
+
+std::optional<BoundQuery> BoundQueryOf(const IrValue& inst) {
+    if (inst.Opcode() == IrOpcode::FPIsNan32) return BoundQuery{inst.Argument(0)->Resolve(), WholeF32, false, false};
+    const auto limit = ImmediateArgument(&inst, 1u);
+    if (!limit || (*limit != 0x7c00u && *limit != 0x7f800000u)) return std::nullopt;
+    const auto view = *limit == 0x7c00u ? LowHalf : WholeF32;
+    const auto source = MaskedValue(inst.Argument(0), AllBits(view) & ~SignBit(view));
+    if (source == nullptr) return std::nullopt;
+    switch (inst.Opcode()) {
+        case IrOpcode::UGreaterThan32: return BoundQuery{source, view, false, false};
+        case IrOpcode::IEqual32: return BoundQuery{source, view, true, false};
+        case IrOpcode::INotEqual32: return BoundQuery{source, view, true, true};
+        default: return std::nullopt;
+    }
+}
+
+std::uint32_t BoundedQuery(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t fallback) {
+    const auto query = BoundQueryOf(inst);
+    if (!query) return fallback;
+    NormalizedBounds bounds(ctx.state);
+    const auto bound = bounds.Of(query->source, query->view);
+    if (!bound || bound->images.empty() || (query->needsFinite && bound->limit == Unbounded)) return fallback;
+    auto normalized = ConstantBool(ctx.state, true);
+    for (const auto image : bound->images) {
+        const auto flags = ctx.state.module.SpecializationConstant(TypeU32(ctx.state), PipelineSpecialization::NormalizedImageBase + image, 0u);
+        normalized = Binary(ctx.state, spv::OpLogicalAnd, TypeBool(ctx.state), normalized, Binary(ctx.state, spv::OpINotEqual, TypeBool(ctx.state), flags, ConstantU32(ctx.state, 0u)));
+    }
+    return Select(ctx.state, TypeBool(ctx.state), normalized, ConstantBool(ctx.state, query->answer), fallback);
+}
+
+}
+
+std::uint32_t EmitSampleInfQuery(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    const auto fallback = inst.Opcode() == IrOpcode::IEqual32 ? EmitIEqual32(ctx.state, ctx.Arg(inst, 0), ctx.Arg(inst, 1)) : EmitINotEqual32(ctx.state, ctx.Arg(inst, 0), ctx.Arg(inst, 1));
+    return BoundedQuery(ctx, inst, fallback);
+}
+
 std::uint32_t EmitSampleNanQuery(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto fallback = inst.Opcode() == IrOpcode::FPIsNan32 ? EmitFPIsNan32(ctx.state, ctx.Arg(inst, 0)) : EmitUGreaterThan32(ctx.state, ctx.Arg(inst, 0), ctx.Arg(inst, 1));
     const auto source = NanQuerySource(&inst);
-    return source != nullptr ? SampleNanQuery(ctx, source, fallback) : fallback;
+    const auto sampled = source != nullptr ? SampleNanQuery(ctx, source, fallback) : fallback;
+    return sampled != fallback ? sampled : BoundedQuery(ctx, inst, fallback);
 }
 
 std::uint32_t EmitIdentity(SpirvValueEmitContext&, std::uint32_t value) {
