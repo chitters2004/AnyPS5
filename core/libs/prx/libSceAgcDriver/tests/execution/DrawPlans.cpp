@@ -696,6 +696,54 @@ void PlansDrawIntoTheirOwnDepth() {
     std::puts("draw plans: I7d, plan hits write and test the depth/stencil surface of their own draw");
 }
 
+void RepeatedOwnAttachmentDrawsBecomeRecipeHits() {
+    constexpr std::uint64_t Repeats = 8;
+    GuestBlock first;
+    GuestBlock second;
+    GuestBlock fullFirst;
+    GuestBlock fullSecond;
+    const Look red{.colour = 1.0f, .blended = true, .blendConstant = 0.375f};
+    const Look green{.colour = 0.5f, .blended = true, .blendConstant = 0.375f};
+    Draw(first, red);
+    Draw(first, red);
+    const auto phasesBefore = AgcDriver::Graphics::ReadCommitPhases();
+    const auto before = Counts();
+    for (std::uint64_t round = 0; round < Repeats; ++round) Draw(second, green);
+    const auto counts = Since(before);
+    const auto phases = AgcDriver::Graphics::ReadCommitPhases() - phasesBefore;
+    {
+        const FullPath fullPath;
+        Draw(fullFirst, red);
+        Draw(fullFirst, red);
+        for (std::uint64_t round = 0; round < Repeats; ++round) Draw(fullSecond, green);
+    }
+    Report("I7f repeated draws into another render target", counts);
+    std::printf("I7f exact recipes offered with own attachments: %llu\n", static_cast<unsigned long long>(counts[DrawPlanCount::OwnRecipes]));
+    if (AgcDriver::Graphics::CommitPhasesEnabled()) {
+        const auto kindDraws = [&](AgcDriver::Graphics::CommitDrawKind kind) { return phases.kindDraws[static_cast<std::size_t>(kind)]; };
+        const auto kindUs = [&](AgcDriver::Graphics::CommitDrawKind kind) {
+            std::uint64_t ns = 0;
+            for (const auto value : phases.kindNs[static_cast<std::size_t>(kind)]) ns += value;
+            return kindDraws(kind) == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(kindDraws(kind));
+        };
+        std::printf("I7f committed draws by kind: %llu full at %.2f us, %llu recipe hits at %.2f us, %llu plan hits at %.2f us\n", static_cast<unsigned long long>(kindDraws(AgcDriver::Graphics::CommitDrawKind::Full)), kindUs(AgcDriver::Graphics::CommitDrawKind::Full), static_cast<unsigned long long>(kindDraws(AgcDriver::Graphics::CommitDrawKind::RecipeHit)), kindUs(AgcDriver::Graphics::CommitDrawKind::RecipeHit), static_cast<unsigned long long>(kindDraws(AgcDriver::Graphics::CommitDrawKind::PlanHit)), kindUs(AgcDriver::Graphics::CommitDrawKind::PlanHit));
+    }
+    ExpectNoHitsWhileOff(counts);
+    const bool ownAttachments = PlansOn() && std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    if (ownAttachments) {
+        const auto lookups = counts[DrawPlanCount::Hits];
+        Expect(lookups != 0 && counts[DrawPlanCount::OwnRecipes] == lookups && counts[DrawPlanCount::MissInstance] == 0, "a draw into another render target did not offer an exact recipe with its own attachments");
+        Expect(lookups <= 2, "repeats of a draw served into its own attachments kept reaching the plan instead of its exact recipe: " + std::to_string(lookups) + " plan hits for " + std::to_string(Repeats) + " draws");
+        if (AgcDriver::Graphics::CommitPhasesEnabled()) {
+            const auto recipeHits = phases.kindDraws[static_cast<std::size_t>(AgcDriver::Graphics::CommitDrawKind::RecipeHit)];
+            Expect(recipeHits == Repeats - lookups, "repeats of a draw served into its own attachments were " + std::to_string(recipeHits) + " recipe hits, expected " + std::to_string(Repeats - lookups));
+        }
+    }
+    Expect(Pixels(second) == Pixels(fullSecond), "repeats into another render target differ from the full path's");
+    Expect(Pixels(first) == Pixels(fullFirst), "the plan's own target differs from the full path's after repeats into another target");
+    std::puts("draw plans: I7f, repeats of a draw served into its own attachments become exact recipe hits");
+}
+
 void PlansRefuseTemplatesWithOtherSetLayouts() {
     GuestBlock planned;
     GuestBlock reference;
@@ -864,6 +912,7 @@ int main(int argc, char** argv) {
         ReboundPlansStayOffTheExactPath();
         PlansRefuseTemplatesWithOtherSetLayouts();
         PlansDrawIntoTheirOwnDepth();
+        RepeatedOwnAttachmentDrawsBecomeRecipeHits();
         PlannedSceneMatchesFullPath();
         IndexedPlansFollowTheirIndexRange();
         const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();

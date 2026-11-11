@@ -5089,6 +5089,18 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(drawnViews, framebufferOwners, state.renderExtent, state.renderLayers); });
     }
+    if (result.ownAttachments && recipe.servable && result.movedBuffers == 0 && !result.templateInstance) {
+        auto own = std::make_shared<DrawRecipe>(recipe);
+        own->framebuffer = framebuffer;
+        own->targets.assign(targets.begin(), targets.end());
+        own->targetViews = drawnViews;
+        own->targetViewInputs.clear();
+        for (const auto& color : state.colors) own->targetViewInputs.push_back(TargetViewInputs(color));
+        own->depthViewInputs = DepthViewInputs(state);
+        own->passKey = DrawRenderPassKey(context, state, drawnViews);
+        own->renderExtent = state.renderExtent;
+        result.ownRecipe = std::move(own);
+    }
     timer.phase(PhasePipeline);
     BeginCommitPhase(CommitPhase::Record);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
