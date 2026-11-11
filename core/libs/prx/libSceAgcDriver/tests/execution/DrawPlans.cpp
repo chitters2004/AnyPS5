@@ -118,6 +118,7 @@ struct Look {
     std::uint32_t primitive = List;
     bool blended = false;
     float blendConstant = 1.0f;
+    const GuestBlock* indices = nullptr;
 };
 
 void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
@@ -168,7 +169,13 @@ void Draw(const GuestBlock& target, const Look& look) {
     if (look.colourBuffer != nullptr) {
         for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x00b, 4u << 1u}, {0x00c, static_cast<std::uint32_t>(loaded)}, {0x00d, static_cast<std::uint32_t>((loaded >> 32u) & 0xffffu) | (look.colourStride << 16u)}, {0x00e, 4u}, {0x00f, 0x31016facu}}) Append(commands, 0x76, {offset, value});
     }
-    Append(commands, 0x2d, {3, 2});
+    if (look.indices != nullptr) {
+        const auto indices = look.indices->At(0);
+        Append(commands, 0x2a, {1});
+        Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), 3, 0});
+    } else {
+        Append(commands, 0x2d, {3, 2});
+    }
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw plans: the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -629,9 +636,37 @@ void PlansRefuseTemplatesWithOtherSetLayouts() {
     const auto counts = run(planned, true);
     static_cast<void>(run(reference, false));
     Report("I7c a template with other set layouts", counts);
-    if (PlansOn()) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::TemplateInstanceHits] == 0 && counts[DrawPlanCount::InstanceTemplate] == 1, "a plan hit took a cached template whose set layouts differ from the plan's");
+    Expect(counts[DrawPlanCount::TemplateInstanceHits] == 0, "a plan hit took a cached template whose set layouts differ from the plan's");
+    if (PlansOn() && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::InstanceTemplate] == 1, "a plan hit took a cached template whose set layouts differ from the plan's");
     Expect(Pixels(planned) == Pixels(reference), "draws refused a template with other set layouts render differently from the full path");
     std::puts("draw plans: I7c, a template whose set layouts differ from the plan's is never served by the plan");
+}
+
+void IndexedPlansFollowTheirIndexRange() {
+    GuestBlock firstIndices;
+    GuestBlock secondIndices;
+    const std::array<std::uint32_t, 3> order{0u, 1u, 2u};
+    for (const auto* block : {&firstIndices, &secondIndices}) std::memcpy(block->Bytes(0), order.data(), sizeof(order));
+    GuestBlock planned;
+    GuestBlock full;
+    const Look first{.colour = 0.375f, .indices = &firstIndices};
+    const Look second{.colour = 0.4375f, .indices = &secondIndices};
+    Draw(planned, first);
+    Draw(planned, first);
+    const auto counts = Measure(planned, second);
+    {
+        const FullPath fullPath;
+        Draw(full, first);
+        Draw(full, first);
+        Draw(full, second);
+    }
+    Report("I11 another index buffer", counts);
+    ExpectNoHitsWhileOff(counts);
+    const bool untrimmed = std::getenv("APS5_NO_DRAW_KEY_TRIM") != nullptr;
+    if (PlansOn() && !untrimmed) Expect(counts[DrawPlanCount::Hits] == 1, "an indexed draw that differs in its index buffer and push data was not served its plan");
+    if (PlansOn() && untrimmed) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::MissInstance] == 1, "with the index range in the resource key, a draw with another index buffer was served the plan's template");
+    Expect(Pixels(planned) == Pixels(full), "the indexed draws with plans differ from the full path's");
+    std::puts("draw plans: I11, a plan follows the draw's index range wherever the resource key holds it");
 }
 
 void PlannedSceneMatchesFullPath() {
@@ -744,6 +779,7 @@ int main(int argc, char** argv) {
         ReboundPlansStayOffTheExactPath();
         PlansRefuseTemplatesWithOtherSetLayouts();
         PlannedSceneMatchesFullPath();
+        IndexedPlansFollowTheirIndexRange();
         const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();
         std::printf("stage key memo: %llu static hits, %llu static fills, %llu patched segments; unshaped: %llu per-result memo hits, %llu full walks\n", static_cast<unsigned long long>(keys.staticHits), static_cast<unsigned long long>(keys.staticFills), static_cast<unsigned long long>(keys.patchedSegments), static_cast<unsigned long long>(keys.resultHits), static_cast<unsigned long long>(keys.resultWalks));
         AgcDriverShutdown_nid_postfix();

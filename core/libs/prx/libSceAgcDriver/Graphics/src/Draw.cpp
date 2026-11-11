@@ -4493,7 +4493,7 @@ std::uint8_t PlanInstanceMismatches(const Context& context, const State& state, 
             if (!((words.fixed == planned.fixed || *words.fixed == *planned.fixed) && words.patched == planned.patched)) rebinds = true;
         }
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-        if (rebinds) {
+        if (rebinds || !trimKey) {
             const auto key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
             if (key != recipe.key) {
                 const auto candidate = DrawPlanTemplates() ? SharedResourceCache().Peek(key) : nullptr;
@@ -4596,7 +4596,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         }
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
         BeginCommitPhase(CommitPhase::PlanHitInstance);
-        if (rebinds) {
+        if (rebinds || !trimKey) {
             instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
             if (instanceKey != recipe.key) {
                 if (!DrawPlanTemplates()) return instanceMiss(DrawPlanInstance::Template);
