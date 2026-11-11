@@ -3113,9 +3113,13 @@ std::uint32_t GpuMutexType::DepthOnThisThread() const {
     return HeldByThisThread() ? depth : 0;
 }
 
-void AssertGpuLockHeld(const char* where) {
+bool GpuLockAssertsEnabled() {
     static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
-    if (!enabled || GpuMutex().HeldByThisThread()) return;
+    return enabled;
+}
+
+void AssertGpuLockHeld(const char* where) {
+    if (!GpuLockAssertsEnabled() || GpuMutex().HeldByThisThread()) return;
     std::fprintf(stderr, "[lock] ASSERT: %s reached without GuestMemory::GpuMutex on thread tagged 0x%x\n", where, GpuLockThreadTag());
     std::abort();
 }

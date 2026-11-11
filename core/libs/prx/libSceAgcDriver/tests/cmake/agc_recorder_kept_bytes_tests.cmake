@@ -7,8 +7,10 @@ configure_windows_unwind(agc_recorder_kept_bytes_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_recorder_kept_bytes_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder_kept_bytes COMMAND agc_recorder_kept_bytes_tests)
+    add_test(NAME agc_recorder_assert_open_batch COMMAND agc_recorder_kept_bytes_tests --assert-open-batch)
+    set_tests_properties(agc_recorder_assert_open_batch PROPERTIES ENVIRONMENT "APS5_ASSERT_GPU_LOCK=1")
     if(WIN32)
-        set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_recorder_kept_bytes agc_recorder_assert_open_batch PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

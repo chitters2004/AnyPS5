@@ -12,6 +12,10 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
@@ -442,7 +446,21 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
 
 }
 
-int main() {
+int AssertsWithOpenBatch() {
+    mock = MockDevice{};
+    Recorder recorder(mockContext());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::make_shared<int>(0));
+    }
+    std::signal(SIGABRT, [](int) { std::_Exit(0); });
+    recorder.NotePendingRead(0x10000, 16, Recorder::ReadKind::CopySource);
+    std::fprintf(stderr, "FAIL: a read noted without the GPU mutex into an open batch did not assert under APS5_ASSERT_GPU_LOCK\n");
+    std::_Exit(1);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--assert-open-batch") return AssertsWithOpenBatch();
     try {
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
