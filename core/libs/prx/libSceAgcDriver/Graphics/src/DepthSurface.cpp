@@ -3173,6 +3173,15 @@ void retireStoringStale(DepthSurface& surface) {
 }
 }
 
+namespace {
+std::atomic<std::uint64_t> repeatedDepthFinds{0};
+std::atomic<std::uint64_t> scannedDepthFinds{0};
+}
+
+DepthSurfaceFinds DepthSurfaceFindCounts() {
+    return {repeatedDepthFinds.load(std::memory_order_relaxed), scannedDepthFinds.load(std::memory_order_relaxed)};
+}
+
 std::uint64_t DepthSurfacesSerial() {
     return surfacesSerial.load(std::memory_order_acquire);
 }
@@ -3386,15 +3395,25 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     phase(CommitPhase::TargetsDepthFind);
+    static const bool repeatFind = std::getenv("APS5_NO_DEPTH_REPEAT_FIND") == nullptr;
     DepthSurface* surface = nullptr;
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
-            surface = candidate.get();
-            break;
+    if (repeatFind && drawnDepth != nullptr && drawnDepth->active->load(std::memory_order_acquire) && drawnDepth->context.device == context.device && sameSurface(drawnDepth->target, target)) {
+        surface = drawnDepth;
+        repeatedDepthFinds.fetch_add(1, std::memory_order_relaxed);
+        if (phased) CountCommit(CommitCounter::DepthFoundRepeated);
+    } else {
+        scannedDepthFinds.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& candidate : surfaces()) {
+            if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+                surface = candidate.get();
+                break;
+            }
         }
     }
-    for (const auto& candidate : surfaces()) {
-        if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
+    if (surface == nullptr) {
+        for (const auto& candidate : surfaces()) {
+            if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
+        }
     }
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();
