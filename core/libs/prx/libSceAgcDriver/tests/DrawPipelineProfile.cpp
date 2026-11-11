@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -179,8 +180,51 @@ void TestRingPhasesKeepTheirNames() {
     }
 }
 
+void TestDrainThrough() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    auto& pipeline = DrawPipeline::Queue0();
+    Check(DrawPipeline::Depth() >= 3, "the drain-through test requires at least three pipeline slots");
+    RuntimeSwitches::Assign(RuntimeSwitch::PartialDrains, true);
+    std::binary_semaphore first{0};
+    std::binary_semaphore second{0};
+    std::binary_semaphore third{0};
+    std::atomic<bool> thirdCommitted{false};
+    pipeline.Enqueue([&] { first.acquire(); }, {{0x10000, 0x10010}});
+    pipeline.Enqueue([&] { second.acquire(); }, {{0x20000, 0x20010}});
+    pipeline.Enqueue([&] {
+        third.acquire();
+        thirdCommitted.store(true, std::memory_order_release);
+    }, {{0x30000, 0x30010}});
+    const std::array<DrawPipeline::Range, 1> elsewhere{{{0x40000, 0x40004}}};
+    pipeline.DrainThrough(elsewhere, DrawPipeline::CaptureSite::Decode);
+    const bool clearWaited = thirdCommitted.load(std::memory_order_acquire);
+    std::atomic<bool> drained{false};
+    std::thread waiter([&] {
+        const std::array<DrawPipeline::Range, 1> read{{{0x20004, 0x20008}}};
+        pipeline.DrainThrough(read, DrawPipeline::CaptureSite::Validate);
+        drained.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const bool early = drained.load(std::memory_order_acquire);
+    first.release();
+    second.release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!drained.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool drainedBeforeThird = drained.load(std::memory_order_acquire) && !thirdCommitted.load(std::memory_order_acquire);
+    third.release();
+    waiter.join();
+    pipeline.Drain(DrawPipeline::DrainReason::Capture);
+    RuntimeSwitches::Assign(RuntimeSwitch::PartialDrains, false);
+    Check(!clearWaited, "a drain-through over memory no queued item writes waited for the queue");
+    Check(!early, "a drain-through returned before the queued item that writes its reads committed");
+    Check(drainedBeforeThird, "a drain-through waited for queued items behind the last one that writes its reads");
+}
+
 int main() {
     try {
+        TestDrainThrough();
         TestRingPhasesKeepTheirNames();
         TestFollowEpochForwardOnly();
         TestReport();
