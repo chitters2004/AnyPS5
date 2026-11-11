@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -27,6 +28,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include <algorithm>
@@ -2470,21 +2472,27 @@ bool StorageTexture::Refresh() {
     return refresh(0, trackedLayers);
 }
 
-bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
-    const auto whole = [this] {
-        static_cast<void>(FlushDepthPlanes(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        return Refresh();
-    };
-    if (count == 0 || geometry.thick || geometry.imageLayers <= 1 || first >= geometry.imageLayers || count > geometry.imageLayers - first || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) return whole();
+std::pair<std::uint32_t, std::uint32_t> StorageTexture::refreshUnits(std::uint32_t first, std::uint32_t count) const {
+    const std::pair whole{std::uint32_t{0}, trackedLayers};
+    if (count == 0 || geometry.thick || geometry.imageLayers <= 1 || first >= geometry.imageLayers || count > geometry.imageLayers - first || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) return whole;
     const auto begin = geometry.GuestLayerOffset(first);
     const auto end = geometry.GuestLayerOffset(first + count - 1) + geometry.layerBytes;
     const auto firstLayer = static_cast<std::uint32_t>(begin / trackedLayerBytes);
     const auto lastLayer = static_cast<std::uint32_t>(std::min<std::uint64_t>((end + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers));
-    if (firstLayer >= lastLayer || (firstLayer == 0 && lastLayer == trackedLayers)) return whole();
+    if (firstLayer >= lastLayer) return whole;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (layerPending[layer] && (layer < firstLayer || layer >= lastLayer)) return whole();
+        if (layerPending[layer] && (layer < firstLayer || layer >= lastLayer)) return whole;
     }
-    if (pendingAlias() != nullptr) return whole();
+    if (pendingAlias() != nullptr) return whole;
+    return {firstLayer, lastLayer};
+}
+
+bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
+    const auto [firstLayer, lastLayer] = refreshUnits(first, count);
+    if (firstLayer == 0 && lastLayer == trackedLayers) {
+        static_cast<void>(FlushDepthPlanes(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
+        return Refresh();
+    }
     const auto scopeBegin = layerBegin(firstLayer);
     static_cast<void>(FlushDepthPlanes(scopeBegin, static_cast<std::size_t>(layerBegin(lastLayer - 1) + layerBytes(lastLayer - 1) - scopeBegin)));
     return refresh(firstLayer, lastLayer);
@@ -2512,8 +2520,7 @@ std::uint64_t refreshThreadTag() {
 }
 
 bool StorageTexture::RefreshExitEpochStamps() {
-    static const bool enabled = std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr;
-    return enabled;
+    return RuntimeSwitches::Set(RuntimeSwitch::RefreshExitEpochStamp);
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
@@ -2909,6 +2916,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     std::vector<std::uint64_t> before;
     if (anyBorrowed || uploads) before = layerGeneration;
     if (anyBorrowed) {
+        NoteRefreshWork();
         uploadReason = "alias";
         const auto lentBytes = borrowUnits(alias != nullptr ? *alias : *lender, borrowed);
         std::size_t lentUnits = 0;
@@ -2923,6 +2931,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (lender != nullptr) noteSyncedBorrow(lentUnits, lentBytes);
     }
     if (uploads) {
+        NoteRefreshWork();
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
         if (UploadRefreshProofs() && !scoped && layerBehind.empty() && !anyBorrowed && current != 0 && generation >= current) {
@@ -2981,6 +2990,31 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
+const char* StorageTexture::RefreshObligation(std::uint32_t first, std::uint32_t count) const {
+    const auto [firstLayer, lastLayer] = refreshUnits(first, count);
+    const auto scoped = firstLayer != 0 || lastLayer != trackedLayers;
+    {
+        const auto base = scoped ? layerBegin(firstLayer) : descriptor.baseAddress;
+        const auto bytes = scoped ? static_cast<std::size_t>(layerBegin(lastLayer - 1) + layerBytes(lastLayer - 1) - base) : static_cast<std::size_t>(guestBytes);
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(base, bytes); };
+        const auto owed = [&](const StorageTexture* texture) { return other(texture) && texture->pendingUnitInside(base, bytes); };
+        if (std::any_of(pending.textures.begin(), pending.textures.end(), owed) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other)) return "another image's pending results";
+    }
+    auto* recorder = Recorder::Active();
+    const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
+    if (descriptor.dccAddress != 0 && keyCount != 0 && (recorder == nullptr || !recorder->PendingWriteOverlaps(descriptor.dccAddress, keyCount)) && ScannedDccKeys(descriptor.dccAddress, keyCount) != uploadedKeys) return "a DCC key change";
+    if (original.size() != guestBytes) return nullptr;
+    for (auto unit = firstLayer; unit < lastLayer; ++unit) {
+        if (layerPending[unit] || !layerOriginal[unit]) continue;
+        const auto begin = layerBegin(unit);
+        const auto bytes = static_cast<std::size_t>(layerBytes(unit));
+        if (std::memcmp(reinterpret_cast<const void*>(begin), original.data() + (begin - descriptor.baseAddress), bytes) != 0) return "guest bytes the image does not hold";
+    }
+    return nullptr;
+}
+
 bool StorageTexture::refreshProved(CommitCounter& refused) {
     const auto refuse = [&](CommitCounter reason) {
         refused = reason;
@@ -3020,8 +3054,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
 }
 
 bool StorageTexture::UploadRefreshProofs() {
-    static const bool enabled = std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr;
-    return enabled;
+    return RuntimeSwitches::Set(RuntimeSwitch::UploadRefreshProof);
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {
@@ -4593,7 +4626,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     }
     std::optional<MapImportGate::PublishHold> publication;
     if (!layerPending.Any()) publication.emplace(descriptor.baseAddress, guestBytes);
-    if (!layerPending.AllIn(first, count)) {
+    const bool newUnits = !layerPending.AllIn(first, count);
+    if (newUnits) {
         std::vector<bool> unsaved;
         bool anyUnsaved = false;
         const bool trims = CommitTrims();
@@ -4695,7 +4729,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent || newUnits) BumpPendingSerial();
         return;
     }
     dirty = true;
@@ -6144,6 +6178,23 @@ std::array<StorageTexture::FlushWaitCounts, 2> StorageTexture::TakeFlushWaitCoun
     return counts;
 }
 
+namespace {
+struct OwnPendingMovesSlot {};
+struct OwnRefreshWorkSlot {};
+}
+
+std::uint64_t StorageTexture::OwnPendingMoves() {
+    return HostThreadSlot<std::uint64_t, OwnPendingMovesSlot>::Get();
+}
+
+std::uint64_t StorageTexture::OwnRefreshWork() {
+    return HostThreadSlot<std::uint64_t, OwnRefreshWorkSlot>::Get();
+}
+
+void StorageTexture::NoteRefreshWork() {
+    HostThreadSlot<std::uint64_t, OwnRefreshWorkSlot>::Set(OwnRefreshWork() + 1);
+}
+
 StorageTexture::OrderedSkipCounts StorageTexture::TakeOrderedSkipCounts() {
     return {orderedFlushSkips.exchange(0, std::memory_order_relaxed), orderedRefreshSkips.exchange(0, std::memory_order_relaxed)};
 }
@@ -6162,6 +6213,7 @@ bool StorageTexture::OrderedFlushArmedForTest() {
 
 void StorageTexture::BumpPendingSerial() {
     pendingSerial.fetch_add(1, std::memory_order_release);
+    HostThreadSlot<std::uint64_t, OwnPendingMovesSlot>::Set(OwnPendingMoves() + 1);
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {

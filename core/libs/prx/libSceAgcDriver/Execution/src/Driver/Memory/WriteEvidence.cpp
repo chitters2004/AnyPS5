@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include <array>
 #include <cstdlib>
 #include <cstring>
 
@@ -226,12 +227,13 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     if (DrawPipeline::SeesQueuedWrites()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy()) queued = pipeline.StoredBytes(address, bytes, known.size() == bytes ? known : std::span<std::byte>{});
+        const std::array<DrawPipeline::Range, 1> read{{{address, address + bytes}}};
         if (queued == DrawPipeline::QueuedWrite::Stored && known.size() == bytes) {
             if (!knownValueVerify()) return Policy::KnownValue;
-            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+            pipeline.DrainThrough(read, DrawPipeline::CaptureSite::Query);
             return Policy::VerifyKnownValue;
         }
-        if (queued == DrawPipeline::QueuedWrite::Unknown) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (queued == DrawPipeline::QueuedWrite::Unknown) pipeline.DrainThrough(read, DrawPipeline::CaptureSite::Query);
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;

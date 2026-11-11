@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -13,10 +14,10 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale", "plan.hit.find", "plan.hit.words", "plan.hit.instance", "plan.hit.targets", "plan.hit.rebind", "resolve.setup", "resolve.space", "resolve.moved", "resolve.build", "resolve.evict", "targets.lookup.pure", "targets.lookup.guards", "targets.lookup.cache", "inputs.validate", "inputs.flush", "inputs.inplace", "inputs.reuse", "inputs.arm", "inputs.alloc", "inputs.keep", "inputs.indexrange", "inputs.expand", "inputs.layout", "record.setup", "record.pass", "record.begin", "record.bind", "record.push", "record.commands", "record.leave", "record.after", "record.recipe", "record.stores", "record.passkey", "record.begin.continue", "record.begin.proxies", "record.begin.barriers", "record.begin.lds", "record.begin.arguments", "record.begin.order", "record.begin.staged", "record.begin.pipeline", "record.begin.bind", "record.begin.dynamic", "record.begin.library", "revalidate certified"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale", "plan.hit.find", "plan.hit.words", "plan.hit.instance", "plan.hit.targets", "plan.hit.rebind", "resolve.setup", "resolve.space", "resolve.moved", "resolve.build", "resolve.evict", "targets.lookup.pure", "targets.lookup.guards", "targets.lookup.cache", "inputs.validate", "inputs.flush", "inputs.inplace", "inputs.reuse", "inputs.arm", "inputs.alloc", "inputs.keep", "inputs.indexrange", "inputs.expand", "inputs.layout", "record.setup", "record.pass", "record.begin", "record.bind", "record.push", "record.commands", "record.leave", "record.after", "record.recipe", "record.stores", "record.passkey", "record.begin.continue", "record.begin.proxies", "record.begin.barriers", "record.begin.lds", "record.begin.arguments", "record.begin.order", "record.begin.staged", "record.begin.pipeline", "record.begin.bind", "record.begin.dynamic", "record.begin.library", "revalidate certified", "targets.memo"};
 static_assert(PhaseNames.back() != nullptr);
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "plan.hit", "plan.hit", "plan.hit", "plan.hit", "plan.hit", "resolve", "resolve", "resolve", "resolve", "resolve", "targets", "targets", "targets", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "revalidate"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "plan.hit", "plan.hit", "plan.hit", "plan.hit", "plan.hit", "resolve", "resolve", "resolve", "resolve", "resolve", "targets", "targets", "targets", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "inputs", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "record", "revalidate", "targets"};
 static_assert(PhaseGroups.back() != nullptr);
 
 constexpr std::array<const char*, 13> GroupOrder{"other", "plan", "plan.hit", "inputs", "targets", "resolve", "revalidate", "classify", "record", "bindings", "pass access", "effects", "epilogue"};
@@ -37,13 +38,13 @@ struct ThreadPhases {
 
 thread_local ThreadPhases threadPhases;
 thread_local unsigned threadEpochCauses = 0;
-std::atomic<std::uint64_t> drawCount{0};
-std::atomic<std::uint64_t> keyCount{0};
-std::atomic<std::uint64_t> keyWordCount{0};
-std::atomic<std::uint64_t> keyMemoHitCount{0};
-std::atomic<std::uint64_t> keyMemoMissCount{0};
-std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitCounter::Count)> counterValues{};
-std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
+ProfileCounter drawCount;
+ProfileCounter keyCount;
+ProfileCounter keyWordCount;
+ProfileCounter keyMemoHitCount;
+ProfileCounter keyMemoMissCount;
+std::array<ProfileCounter, static_cast<std::size_t>(CommitCounter::Count)> counterValues{};
+std::array<ProfileCounter, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
 std::array<std::atomic<std::uint64_t>, KindCount> kindDrawCount{};
 std::array<std::array<std::atomic<std::uint64_t>, PhaseCount>, KindCount> kindPhaseNs{};
 std::atomic<std::int64_t> reportedAt{0};
@@ -53,7 +54,7 @@ CommitPhaseTotals reported;
 void charge(ThreadPhases& phases, Clock::time_point now) {
     const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(now - phases.mark).count();
     if (spent > 0) {
-        phaseNs[static_cast<std::size_t>(phases.current)].fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
+        phaseNs[static_cast<std::size_t>(phases.current)].Add(static_cast<std::uint64_t>(spent));
         phases.drawNs[static_cast<std::size_t>(phases.current)] += static_cast<std::uint64_t>(spent);
     }
     phases.mark = now;
@@ -124,9 +125,10 @@ void reportDue(Clock::time_point now) {
     const auto indexed = std::max(1.0, count(CommitCounter::InputIndexed));
     std::fprintf(stderr, "[commit-inputs] (10 s) %.0f draws prepared their inputs, %.1f%% indexed; per indexed draw: %.3f in place (%.3f with the highest index known), copies %.3f fresh, %.3f snapshot reused, %.3f owned reused, %.3f armed; %.3f expanded, %.3f restart compacted, %.3f clamped; per draw: %.2f vertex ranges, %.2f in place, copies %.2f fresh, %.2f snapshot reused, %.2f owned reused, %.2f armed; %.2f zero-padded fetches (%.2f reused), %.2f zeroed attributes\n", count(CommitCounter::InputDraws), 100.0 * count(CommitCounter::InputIndexed) / inputDraws, count(CommitCounter::InputIndexInPlace) / indexed, count(CommitCounter::InputIndexRangeKnown) / indexed, count(CommitCounter::InputIndexCopyFresh) / indexed, count(CommitCounter::InputIndexCopySnapshot) / indexed, count(CommitCounter::InputIndexCopyOwned) / indexed, count(CommitCounter::InputIndexCopyArmed) / indexed, count(CommitCounter::InputIndexExpanded) / indexed, count(CommitCounter::InputIndexCompacted) / indexed, count(CommitCounter::InputIndexClamped) / indexed, count(CommitCounter::InputVertexRanges) / inputDraws, count(CommitCounter::InputVertexInPlace) / inputDraws, count(CommitCounter::InputVertexCopyFresh) / inputDraws, count(CommitCounter::InputVertexCopySnapshot) / inputDraws, count(CommitCounter::InputVertexCopyOwned) / inputDraws, count(CommitCounter::InputVertexCopyArmed) / inputDraws, count(CommitCounter::InputVertexPadded) / inputDraws, count(CommitCounter::InputVertexPaddedReused) / inputDraws, count(CommitCounter::InputVertexZeroed) / inputDraws);
     const auto depthPreps = std::max(1.0, count(CommitCounter::DepthPreps));
-    std::fprintf(stderr, "[commit-target-causes] (10 s) epoch moved per draw by the ordering points since the committing thread's previous epoch: %.3f submission start, %.3f WAIT_REG_MEM, %.3f drain, %.3f reap, %.3f packet, %.3f several kinds, %.3f unknown; target refresh proofs refused per draw: %.3f no proof, %.3f image generation moved, %.3f GPU lock not held, %.3f collect refused, %.3f DCC keys, %.3f memory changed, %.3f other pending results; depth preps %.0f: %.1f%% on the previous draw's surface, %.1f%% created, %.1f%% after a clear, %.1f%% mirrored, %.1f%% scanned other surfaces for stale mirrors, %.1f%% found as the previous draw's surface without a scan; prepared colour surfaces %.0f repeated, %.0f computed; committing threads followed the epoch token %.0f times (%.0f to an older token than the one followed before, %.0f older tokens kept the newer epoch; with a submission start %.0f, WAIT_REG_MEM %.0f, drain %.0f, reap %.0f, packet %.0f, no new ordering point %.0f); epoch-moved target misses per draw %.3f never stamped, %.3f stamped by another thread, %.3f stamped in an earlier epoch of this thread; target refresh exits stamped with the epoch per draw %.3f; target epoch misses per draw %.3f first for that image in the epoch; slow target refreshes per draw %.3f again for an image already slow-refreshed in the epoch\n", perDraw(CommitCounter::TargetEpochBySubmission), perDraw(CommitCounter::TargetEpochByWait), perDraw(CommitCounter::TargetEpochByDrain), perDraw(CommitCounter::TargetEpochByReap), perDraw(CommitCounter::TargetEpochByPacket), perDraw(CommitCounter::TargetEpochBySeveral), perDraw(CommitCounter::TargetEpochByUnknown), perDraw(CommitCounter::TargetProofNone), perDraw(CommitCounter::TargetProofGeneration), perDraw(CommitCounter::TargetProofUnlocked), perDraw(CommitCounter::TargetProofRefused), perDraw(CommitCounter::TargetProofKeys), perDraw(CommitCounter::TargetProofChanged), perDraw(CommitCounter::TargetProofPending), count(CommitCounter::DepthPreps), 100.0 * count(CommitCounter::DepthSameSurface) / depthPreps, 100.0 * count(CommitCounter::DepthCreated) / depthPreps, 100.0 * count(CommitCounter::DepthCleared) / depthPreps, 100.0 * count(CommitCounter::DepthMirrored) / depthPreps, 100.0 * count(CommitCounter::DepthStaleScans) / depthPreps, 100.0 * count(CommitCounter::DepthFoundRepeated) / depthPreps, count(CommitCounter::PreparedSurfaceHits), count(CommitCounter::PreparedSurfaceMisses), count(CommitCounter::EpochFollows), count(CommitCounter::EpochFollowsBackward), count(CommitCounter::EpochFollowsSkipped), count(CommitCounter::EpochFollowsBySubmission), count(CommitCounter::EpochFollowsByWait), count(CommitCounter::EpochFollowsByDrain), count(CommitCounter::EpochFollowsByReap), count(CommitCounter::EpochFollowsByPacket), count(CommitCounter::EpochFollowsByNone), perDraw(CommitCounter::TargetEpochNeverStamped), perDraw(CommitCounter::TargetEpochOtherThread), perDraw(CommitCounter::TargetEpochThisThread), perDraw(CommitCounter::TargetEpochExitStamps), perDraw(CommitCounter::TargetMissFirstInEpoch), perDraw(CommitCounter::TargetSlowAgainInEpoch));
+    std::fprintf(stderr, "[commit-target-causes] (10 s) epoch moved per draw by the ordering points since the committing thread's previous epoch: %.3f submission start, %.3f WAIT_REG_MEM, %.3f drain, %.3f reap, %.3f packet, %.3f several kinds, %.3f unknown; target refresh proofs refused per draw: %.3f no proof, %.3f image generation moved, %.3f GPU lock not held, %.3f collect refused, %.3f DCC keys, %.3f memory changed, %.3f other pending results; depth preps %.0f: %.1f%% on the previous draw's surface, %.1f%% created, %.1f%% after a clear, %.1f%% mirrored, %.1f%% scanned other surfaces for stale mirrors, %.1f%% found as the previous draw's surface without a scan; committing threads followed the epoch token %.0f times (%.0f to an older token than the one followed before, %.0f older tokens kept the newer epoch; with a submission start %.0f, WAIT_REG_MEM %.0f, drain %.0f, reap %.0f, packet %.0f, no new ordering point %.0f); epoch-moved target misses per draw %.3f never stamped, %.3f stamped by another thread, %.3f stamped in an earlier epoch of this thread; target refresh exits stamped with the epoch per draw %.3f; target epoch misses per draw %.3f first for that image in the epoch; slow target refreshes per draw %.3f again for an image already slow-refreshed in the epoch\n", perDraw(CommitCounter::TargetEpochBySubmission), perDraw(CommitCounter::TargetEpochByWait), perDraw(CommitCounter::TargetEpochByDrain), perDraw(CommitCounter::TargetEpochByReap), perDraw(CommitCounter::TargetEpochByPacket), perDraw(CommitCounter::TargetEpochBySeveral), perDraw(CommitCounter::TargetEpochByUnknown), perDraw(CommitCounter::TargetProofNone), perDraw(CommitCounter::TargetProofGeneration), perDraw(CommitCounter::TargetProofUnlocked), perDraw(CommitCounter::TargetProofRefused), perDraw(CommitCounter::TargetProofKeys), perDraw(CommitCounter::TargetProofChanged), perDraw(CommitCounter::TargetProofPending), count(CommitCounter::DepthPreps), 100.0 * count(CommitCounter::DepthSameSurface) / depthPreps, 100.0 * count(CommitCounter::DepthCreated) / depthPreps, 100.0 * count(CommitCounter::DepthCleared) / depthPreps, 100.0 * count(CommitCounter::DepthMirrored) / depthPreps, 100.0 * count(CommitCounter::DepthStaleScans) / depthPreps, 100.0 * count(CommitCounter::DepthFoundRepeated) / depthPreps, count(CommitCounter::EpochFollows), count(CommitCounter::EpochFollowsBackward), count(CommitCounter::EpochFollowsSkipped), count(CommitCounter::EpochFollowsBySubmission), count(CommitCounter::EpochFollowsByWait), count(CommitCounter::EpochFollowsByDrain), count(CommitCounter::EpochFollowsByReap), count(CommitCounter::EpochFollowsByPacket), count(CommitCounter::EpochFollowsByNone), perDraw(CommitCounter::TargetEpochNeverStamped), perDraw(CommitCounter::TargetEpochOtherThread), perDraw(CommitCounter::TargetEpochThisThread), perDraw(CommitCounter::TargetEpochExitStamps), perDraw(CommitCounter::TargetMissFirstInEpoch), perDraw(CommitCounter::TargetSlowAgainInEpoch));
     const auto resolveDraws = std::max(1.0, count(CommitCounter::ResolveDraws));
     std::fprintf(stderr, "[commit-resolve] (10 s) %.0f draws resolved their resources (%.1f%% of all draws); of those %.1f%% keyed, %.1f%% found a template, %.1f%% checked its address space, %.1f%% revalidated it, %.1f%% hit (%.1f%% with moved buffers), %.1f%% built anew, %.1f%% invalidated a template, %.1f%% with address-based stages\n", count(CommitCounter::ResolveDraws), 100.0 * count(CommitCounter::ResolveDraws) / static_cast<double>(totals.draws), 100.0 * count(CommitCounter::ResolveCacheable) / resolveDraws, 100.0 * count(CommitCounter::ResolveFound) / resolveDraws, 100.0 * count(CommitCounter::ResolveSpaceChecks) / resolveDraws, 100.0 * count(CommitCounter::ResolveValid) / resolveDraws, 100.0 * count(CommitCounter::ResolveHits) / resolveDraws, 100.0 * count(CommitCounter::ResolveMovedHits) / resolveDraws, 100.0 * count(CommitCounter::ResolveBuilds) / resolveDraws, 100.0 * count(CommitCounter::ResolveInvalidated) / resolveDraws, 100.0 * count(CommitCounter::ResolveAddressStages) / resolveDraws);
+    std::fprintf(stderr, "[commit-target-memo] (10 s) %.0f draws with targets; repeated attachment sets and fallbacks by cause: Accept %.0f; AcceptWithDepthMiss %.0f; Invalid %.0f; Descriptor %.0f; Resident %.0f; DepthOverlap %.0f; Epoch %.0f; Proofs %.0f; Pending %.0f; Unwatch %.0f; Allocations %.0f; Surfaces %.0f; Released %.0f; Claims %.0f; Recorder %.0f; Device %.0f; Metadata %.0f; PostDepthInvalidated %.0f; DepthFallback %.0f; AvoidedRefreshLookups %.0f;\n", count(CommitCounter::TargetDraws), count(CommitCounter::TargetMemoAccept), count(CommitCounter::TargetMemoAcceptWithDepthMiss), count(CommitCounter::TargetMemoInvalid), count(CommitCounter::TargetMemoDescriptor), count(CommitCounter::TargetMemoResident), count(CommitCounter::TargetMemoDepthOverlap), count(CommitCounter::TargetMemoEpoch), count(CommitCounter::TargetMemoProofs), count(CommitCounter::TargetMemoPending), count(CommitCounter::TargetMemoUnwatch), count(CommitCounter::TargetMemoAllocations), count(CommitCounter::TargetMemoSurfaces), count(CommitCounter::TargetMemoReleased), count(CommitCounter::TargetMemoClaims), count(CommitCounter::TargetMemoRecorder), count(CommitCounter::TargetMemoDevice), count(CommitCounter::TargetMemoMetadata), count(CommitCounter::TargetMemoPostDepthInvalidated), count(CommitCounter::TargetMemoDepthFallback), count(CommitCounter::TargetMemoAvoidedRefreshLookups));
 }
 
 }
@@ -153,13 +155,13 @@ void BeginCommitPhase(CommitPhase phase) {
 
 void NoteCommitKey(std::size_t words) {
     if (!threadPhases.active) return;
-    keyCount.fetch_add(1, std::memory_order_relaxed);
-    keyWordCount.fetch_add(words, std::memory_order_relaxed);
+    keyCount.Add(1);
+    keyWordCount.Add(words);
 }
 
 void NoteCommitKeyMemo(bool hit) {
     if (!threadPhases.active) return;
-    (hit ? keyMemoHitCount : keyMemoMissCount).fetch_add(1, std::memory_order_relaxed);
+    (hit ? keyMemoHitCount : keyMemoMissCount).Add(1);
 }
 
 void NoteCommitDrawKind(CommitDrawKind kind) {
@@ -172,11 +174,11 @@ void NoteEpochCauses(unsigned causes) {
 }
 
 void NoteEpochFollowSkipped() {
-    counterValues[static_cast<std::size_t>(CommitCounter::EpochFollowsSkipped)].fetch_add(1, std::memory_order_relaxed);
+    counterValues[static_cast<std::size_t>(CommitCounter::EpochFollowsSkipped)].Add(1);
 }
 
 void NoteEpochFollow(bool backward, unsigned causes) {
-    const auto add = [](CommitCounter counter) { counterValues[static_cast<std::size_t>(counter)].fetch_add(1, std::memory_order_relaxed); };
+    const auto add = [](CommitCounter counter) { counterValues[static_cast<std::size_t>(counter)].Add(1); };
     add(CommitCounter::EpochFollows);
     if (backward) add(CommitCounter::EpochFollowsBackward);
     if (causes == 0) add(CommitCounter::EpochFollowsByNone);
@@ -197,7 +199,7 @@ CommitCounter EpochCauseCounter(unsigned causes) {
 
 void CountCommit(CommitCounter counter, std::uint64_t amount) {
     if (!threadPhases.active) return;
-    counterValues[static_cast<std::size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
+    counterValues[static_cast<std::size_t>(counter)].Add(amount);
 }
 
 CommitPhase CurrentCommitPhase() {
@@ -212,13 +214,13 @@ void RelabelCommitPhase(CommitPhase phase) {
 
 CommitPhaseTotals ReadCommitPhases() {
     CommitPhaseTotals totals;
-    totals.draws = drawCount.load(std::memory_order_relaxed);
-    totals.keys = keyCount.load(std::memory_order_relaxed);
-    totals.keyWords = keyWordCount.load(std::memory_order_relaxed);
-    totals.keyMemoHits = keyMemoHitCount.load(std::memory_order_relaxed);
-    totals.keyMemoMisses = keyMemoMissCount.load(std::memory_order_relaxed);
-    for (std::size_t counter = 0; counter < totals.counters.size(); ++counter) totals.counters[counter] = counterValues[counter].load(std::memory_order_relaxed);
-    for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].load(std::memory_order_relaxed);
+    totals.draws = drawCount.Sum();
+    totals.keys = keyCount.Sum();
+    totals.keyWords = keyWordCount.Sum();
+    totals.keyMemoHits = keyMemoHitCount.Sum();
+    totals.keyMemoMisses = keyMemoMissCount.Sum();
+    for (std::size_t counter = 0; counter < totals.counters.size(); ++counter) totals.counters[counter] = counterValues[counter].Sum();
+    for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].Sum();
     for (std::size_t kind = 0; kind < KindCount; ++kind) {
         totals.kindDraws[kind] = kindDrawCount[kind].load(std::memory_order_relaxed);
         for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.kindNs[kind][phase] = kindPhaseNs[kind][phase].load(std::memory_order_relaxed);
@@ -266,7 +268,7 @@ CommitPhaseDraw::~CommitPhaseDraw() {
     const auto now = Clock::now();
     charge(phases, now);
     phases.active = false;
-    drawCount.fetch_add(1, std::memory_order_relaxed);
+    drawCount.Add(1);
     const auto kind = static_cast<std::size_t>(phases.kind);
     kindDrawCount[kind].fetch_add(1, std::memory_order_relaxed);
     for (std::size_t phase = 0; phase < PhaseCount; ++phase) {

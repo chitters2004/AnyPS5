@@ -2857,6 +2857,7 @@ thread_local bool proofThread = false;
 const bool proofBreaksCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
 constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakNames{"unlabelled", "own-store", "mark-written", "gpu-lock", "write-changed", "write-changed-if-held", "completion-store", "completion-action", "written-back", "copied-writer", "pipeline-commit", "resource-writes"};
+struct OwnProofBreaksSlot {};
 }
 
 const char* ProofBreakName(ProofBreak source) {
@@ -2886,10 +2887,15 @@ std::uint64_t CertificateBreakSerial() {
     return certificateBreakSerial.load(std::memory_order_acquire);
 }
 
+std::uint64_t OwnProofBreaks() {
+    return HostThreadSlot<std::uint64_t, OwnProofBreaksSlot>::Get();
+}
+
 void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
     if (ProofBreakVoidsCertificates(source)) certificateBreakSerial.fetch_add(1, std::memory_order_acq_rel);
     if (proofBreaksCounted) proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+    HostThreadSlot<std::uint64_t, OwnProofBreaksSlot>::Set(OwnProofBreaks() + 1);
 }
 
 void MarkProofThread() {
@@ -3273,6 +3279,11 @@ static GuestAllocations::Lease::Ranges pinStoreRanges(std::uint64_t address, std
     return pinned;
 }
 
+struct BreakWhenStored {
+    ProofBreak source;
+    ~BreakWhenStored() { BreakProofs(source); }
+};
+
 static std::atomic<bool> ownStoreCompare{false};
 
 void SetOwnStoreCompare(bool compare) {
@@ -3283,6 +3294,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
     BreakProofs(GuestMemory::ProofBreak::OwnStore);
+    const BreakWhenStored breakStored{GuestMemory::ProofBreak::OwnStore};
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -3351,6 +3363,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
     BreakProofs(GuestMemory::ProofBreak::MarkWritten);
     const MarkWrittenBumpsMute mute;
+    const BreakWhenStored breakStored{GuestMemory::ProofBreak::MarkWritten};
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;

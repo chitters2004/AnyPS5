@@ -178,6 +178,7 @@ bool ProofBreakVoidsCertificates(ProofBreak source);
 std::uint64_t CertificateBreakSerial();
 bool ProofBreaksCounted();
 std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakCounts();
+std::uint64_t OwnProofBreaks();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

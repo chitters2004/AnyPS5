@@ -97,6 +97,7 @@ enum class CommitPhase : std::uint8_t {
     RecordBeginDynamic,
     RecordBeginLibrary,
     RevalidateCertified,
+    TargetsMemo,
     Count
 };
 
@@ -158,8 +159,6 @@ enum class CommitCounter : std::uint8_t {
     ResolveBuilds,
     ResolveInvalidated,
     ResolveAddressStages,
-    PreparedSurfaceHits,
-    PreparedSurfaceMisses,
     TargetEpochNeverStamped,
     TargetEpochOtherThread,
     TargetEpochThisThread,
@@ -184,6 +183,26 @@ enum class CommitCounter : std::uint8_t {
     InputVertexCopySnapshot,
     InputVertexCopyOwned,
     InputVertexCopyArmed,
+    TargetMemoAccept,
+    TargetMemoAcceptWithDepthMiss,
+    TargetMemoInvalid,
+    TargetMemoDescriptor,
+    TargetMemoResident,
+    TargetMemoDepthOverlap,
+    TargetMemoEpoch,
+    TargetMemoProofs,
+    TargetMemoPending,
+    TargetMemoUnwatch,
+    TargetMemoAllocations,
+    TargetMemoSurfaces,
+    TargetMemoReleased,
+    TargetMemoClaims,
+    TargetMemoRecorder,
+    TargetMemoDevice,
+    TargetMemoMetadata,
+    TargetMemoPostDepthInvalidated,
+    TargetMemoDepthFallback,
+    TargetMemoAvoidedRefreshLookups,
     Count
 };
 

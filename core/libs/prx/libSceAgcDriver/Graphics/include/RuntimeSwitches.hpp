@@ -26,6 +26,12 @@ enum class RuntimeSwitch : std::size_t {
     NoCertifiedProofScope,
     SharePushDonor,
     NoBarRing,
+    NoTargetMemo,
+    FollowOlderEpochTokens,
+    UploadRefreshProof,
+    RefreshExitEpochStamp,
+    NoDepthRepeatFind,
+    PartialDrains,
     Count,
 };
 

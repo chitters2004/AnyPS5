@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <vector>
 #include <mutex>
@@ -72,6 +73,13 @@ std::atomic<std::uint64_t> finisherBusyCpuNs{0};
 std::atomic<std::uint64_t> finisherBusyWallNs{0};
 std::atomic<std::uint64_t> finisherIdleNs{0};
 std::atomic<std::uint64_t> finisherSleeps{0};
+
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CaptureSite::Count)> CaptureSiteNames{"decode", "validate", "query", "fill", "shader"};
+std::array<ProfileCounter, static_cast<std::size_t>(DrawPipeline::CaptureSite::Count)> captureFullDrains{};
+std::array<ProfileCounter, static_cast<std::size_t>(DrawPipeline::CaptureSite::Count)> capturePartialDrains{};
+std::array<ProfileCounter, static_cast<std::size_t>(DrawPipeline::CaptureSite::Count)> captureClear{};
+ProfileCounter partialSpared;
+ProfileCounter partialWaitNs;
 
 ProfileCounter heldReadRanges;
 ProfileCounter heldReadQueries;
@@ -479,7 +487,7 @@ std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
 
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
-    static const bool backwardFollows = std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr;
+    const bool backwardFollows = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FollowOlderEpochTokens);
     if (followed == token) return;
     const bool backward = token < followed;
     if (backward && !backwardFollows) {
@@ -677,6 +685,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.Sum()), static_cast<unsigned long long>(heldReadHits.Take()), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
     AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    {
+        std::string sites;
+        for (std::size_t site = 0; site < CaptureSiteNames.size(); ++site) {
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu full / %llu partial / %llu clear", CaptureSiteNames[site], static_cast<unsigned long long>(captureFullDrains[site].Take()), static_cast<unsigned long long>(capturePartialDrains[site].Take()), static_cast<unsigned long long>(captureClear[site].Take()));
+            sites += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[capture-drains] (10 s): by site:%s; partial drains spared %llu queued items and waited %.1f ms\n", sites.c_str(), static_cast<unsigned long long>(partialSpared.Take()), static_cast<double>(partialWaitNs.Take()) / 1e6);
+    }
     std::string kindText;
     for (std::size_t i = 0; i < kindCommits.size(); ++i) {
         const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
@@ -814,7 +831,7 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        if ((idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) || throughWaiters != 0) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -860,6 +877,52 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
+    rethrowFailure();
+}
+
+void DrawPipeline::DrainThrough(std::span<const Range> reads, CaptureSite site, std::uint32_t opcode) {
+    const auto siteIndex = static_cast<std::size_t>(site);
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::PartialDrains)) {
+        captureFullDrains[siteIndex].Add();
+        Drain(DrainReason::Capture, opcode);
+        return;
+    }
+    drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
+    reasonRequests[static_cast<std::size_t>(DrainReason::Capture)].fetch_add(1, std::memory_order_relaxed);
+    const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
+    if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(DrainReason::Capture)) + ", opcode " + std::to_string(opcode) + ")");
+    if (finisherBusy) DrawFinisher::Get().Drain();
+    else DrawFinisher::Get().RethrowFailure();
+    const auto start = std::chrono::steady_clock::now();
+    std::unique_lock lock(mutex);
+    std::size_t last = items.size();
+    for (std::size_t index = items.size(); index-- > 0;) {
+        const auto& writes = items[index].writes;
+        const bool overlaps = std::any_of(writes.begin(), writes.end(), [&](const Range& write) {
+            return std::any_of(reads.begin(), reads.end(), [&](const Range& read) { return read.first < write.second && write.first < read.second; });
+        });
+        if (overlaps) {
+            last = index;
+            break;
+        }
+    }
+    if (last == items.size()) {
+        captureClear[siteIndex].Add();
+        rethrowFailure();
+        return;
+    }
+    const auto through = retiredItems.load(std::memory_order_relaxed) + last + 1;
+    partialSpared.Add(items.size() - last - 1);
+    capturePartialDrains[siteIndex].Add();
+    ++throughWaiters;
+    idle.wait(lock, [&] { return retiredItems.load(std::memory_order_relaxed) >= through; });
+    --throughWaiters;
+    const auto index = static_cast<std::size_t>(DrainReason::Capture);
+    ++drains[index];
+    ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
+    const auto waited = elapsedNs(start);
+    drainWaitNs[index] += waited;
+    partialWaitNs.Add(waited);
     rethrowFailure();
 }
 

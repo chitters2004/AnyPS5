@@ -34,7 +34,6 @@ struct TextureDetilerTestAccess {
 void RunTextureFormatTests();
 void RunTextureTilingTests();
 void RunGuestTextureResourceTests();
-bool RunPreparedSurfaceTests();
 void RunDepthSurfaceReuseTests();
 void RunGuestSamplerResourceTests();
 void RunLastRecordIndicesTests();

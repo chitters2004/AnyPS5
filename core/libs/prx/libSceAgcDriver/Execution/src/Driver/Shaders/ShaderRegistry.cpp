@@ -66,7 +66,8 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address, const
     const auto drain = [](std::uint64_t first, std::size_t bytes) {
         if (!DrawPipeline::SeesQueuedWrites()) return;
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        const std::array<DrawPipeline::Range, 1> read{{{first, first + bytes}}};
+        if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) pipeline.DrainThrough(read, DrawPipeline::CaptureSite::Shader);
     };
     static std::mutex cacheMutex;
     static std::list<std::shared_ptr<const ShaderSnapshot>> cache;

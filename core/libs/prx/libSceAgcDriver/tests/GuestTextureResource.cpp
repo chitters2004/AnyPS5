@@ -143,43 +143,6 @@ static void RunR128TextureTests() {
     Require(DecodeTextureResource(pack(clamped)).minLod == 0u, "a MIN_LOD clamp below the base level must vanish when read from the resident levels");
 }
 
-bool RunPreparedSurfaceTests() {
-    if (!PreparedTargets()) return false;
-    GuestTextureResource first{};
-    first.baseAddress = 0x40000000;
-    first.width = 1920;
-    first.height = 1080;
-    first.mipCount = 1;
-    first.tileMode = TextureTileMode::kR64KBX;
-    first.dimension = TextureDimension::k2D;
-    first.format = 56;
-    auto second = first;
-    second.baseAddress = 0x42000000;
-    auto narrowed = first;
-    narrowed.fmaskCmaskAddress = 0x44000000;
-    auto layered = first;
-    layered.dimension = TextureDimension::k2DArray;
-    layered.depthOrLastArray = 7;
-    const auto fresh = [](const GuestTextureResource& resource, std::uint32_t layers) {
-        const auto viewed = ArrayLayerWindow(resource, layers);
-        return std::pair{viewed.baseAddress, DescribeSurface(viewed).guestBytes};
-    };
-    const auto check = [&](const GuestTextureResource& resource, std::uint32_t layers, bool repeated, const char* what) {
-        const auto prepared = PrepareViewedSurface(resource, layers);
-        Require(prepared.repeated == repeated, std::string(what) + (repeated ? ": was not taken from the prepared surfaces" : ": was taken from a prepared surface of other inputs"));
-        Require(std::pair{prepared.viewed.baseAddress, prepared.viewedBytes} == fresh(resource, layers), std::string(what) + ": differs from the surface computed for it");
-    };
-    check(first, 2048, false, "the first surface");
-    check(first, 2048, true, "the same surface again");
-    check(second, 2048, false, "a surface at another address");
-    check(first, 2048, true, "the first surface after another");
-    check(narrowed, 2048, false, "a surface differing only in its last field");
-    check(first, 1024, false, "the same surface under another array layer limit");
-    check(layered, 2048, false, "an array surface");
-    check(layered, 2048, true, "the array surface again");
-    return true;
-}
-
 void RunGuestTextureResourceTests() {
     Fields base;
     const auto baseWords = pack(base);

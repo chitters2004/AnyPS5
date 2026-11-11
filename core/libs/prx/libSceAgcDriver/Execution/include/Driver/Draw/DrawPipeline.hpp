@@ -32,6 +32,7 @@ public:
         std::vector<Range> writes;
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    enum class CaptureSite : std::uint8_t { Decode, Validate, Query, Fill, Shader, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
     enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
 
@@ -55,6 +56,7 @@ public:
     static DbClearBlocker DbClearBlockerOf(bool stencilClear, bool stencilTest, bool partialSampleMask, bool layered);
     static void NoteDbClear(bool depth, bool stencil, DbClearBlocker blocker, std::uint64_t vertexProgram);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void DrainThrough(std::span<const Range> reads, CaptureSite site, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -112,6 +114,7 @@ private:
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t throughWaiters = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;

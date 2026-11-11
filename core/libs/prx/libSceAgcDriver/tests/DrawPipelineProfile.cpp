@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -148,6 +150,8 @@ void TestFollowEpochForwardOnly() {
     std::uint64_t afterOlder = 0;
     std::uint64_t afterSame = 0;
     std::uint64_t afterNewer = 0;
+    std::uint64_t mintedBackward = 0;
+    std::uint64_t beforeBackward = 0;
     std::thread committer([&] {
         DrawPipeline::FollowEpoch(1000);
         followed = AgcDriver::GuestMemory::CollectEpoch();
@@ -157,8 +161,14 @@ void TestFollowEpochForwardOnly() {
         afterSame = AgcDriver::GuestMemory::CollectEpoch();
         DrawPipeline::FollowEpoch(1001);
         afterNewer = AgcDriver::GuestMemory::CollectEpoch();
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FollowOlderEpochTokens, true);
+        beforeBackward = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1000);
+        mintedBackward = AgcDriver::GuestMemory::CollectEpoch();
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FollowOlderEpochTokens, false);
     });
     committer.join();
+    Check(mintedBackward != beforeBackward, "an older epoch token did not take a new collect epoch with APS5_FOLLOW_OLDER_EPOCH_TOKENS flipped on at run time");
     Check(followed != 0, "following an epoch token left the committing thread without a collect epoch");
     Check(afterOlder == followed && afterSame == followed, "a token older than the one already followed took a new collect epoch");
     Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");
@@ -171,7 +181,7 @@ void TestAppendedPhasesKeepTheirNames() {
         std::string_view name;
         std::string_view group;
     };
-    const std::array<Named, 51> phases{{
+    const std::array<Named, 52> phases{{
         {CommitPhase::TargetsDepthClaims, "targets.depth.claims", "targets"},
         {CommitPhase::TargetsDepthClear, "targets.depth.clear", "targets"},
         {CommitPhase::TargetsDepthFind, "targets.depth.find", "targets"},
@@ -223,6 +233,7 @@ void TestAppendedPhasesKeepTheirNames() {
         {CommitPhase::RecordBeginDynamic, "record.begin.dynamic", "record"},
         {CommitPhase::RecordBeginLibrary, "record.begin.library", "record"},
         {CommitPhase::RevalidateCertified, "revalidate certified", "revalidate"},
+        {CommitPhase::TargetsMemo, "targets.memo", "targets"},
     }};
     const auto first = static_cast<std::size_t>(phases.front().phase);
     for (std::size_t index = 0; index < phases.size(); ++index) {
@@ -234,9 +245,52 @@ void TestAppendedPhasesKeepTheirNames() {
     Check(static_cast<std::size_t>(phases.back().phase) + 1 == static_cast<std::size_t>(CommitPhase::Count), "an appended commit phase is missing from the name test");
 }
 
+void TestDrainThrough() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    auto& pipeline = DrawPipeline::Queue0();
+    Check(DrawPipeline::Depth() >= 3, "the drain-through test requires at least three pipeline slots");
+    RuntimeSwitches::Assign(RuntimeSwitch::PartialDrains, true);
+    std::binary_semaphore first{0};
+    std::binary_semaphore second{0};
+    std::binary_semaphore third{0};
+    std::atomic<bool> thirdCommitted{false};
+    pipeline.Enqueue([&] { first.acquire(); }, {{0x10000, 0x10010}});
+    pipeline.Enqueue([&] { second.acquire(); }, {{0x20000, 0x20010}});
+    pipeline.Enqueue([&] {
+        third.acquire();
+        thirdCommitted.store(true, std::memory_order_release);
+    }, {{0x30000, 0x30010}});
+    const std::array<DrawPipeline::Range, 1> elsewhere{{{0x40000, 0x40004}}};
+    pipeline.DrainThrough(elsewhere, DrawPipeline::CaptureSite::Decode);
+    const bool clearWaited = thirdCommitted.load(std::memory_order_acquire);
+    std::atomic<bool> drained{false};
+    std::thread waiter([&] {
+        const std::array<DrawPipeline::Range, 1> read{{{0x20004, 0x20008}}};
+        pipeline.DrainThrough(read, DrawPipeline::CaptureSite::Validate);
+        drained.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const bool early = drained.load(std::memory_order_acquire);
+    first.release();
+    second.release();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!drained.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool drainedBeforeThird = drained.load(std::memory_order_acquire) && !thirdCommitted.load(std::memory_order_acquire);
+    third.release();
+    waiter.join();
+    pipeline.Drain(DrawPipeline::DrainReason::Capture);
+    RuntimeSwitches::Assign(RuntimeSwitch::PartialDrains, false);
+    Check(!clearWaited, "a drain-through over memory no queued item writes waited for the queue");
+    Check(!early, "a drain-through returned before the queued item that writes its reads committed");
+    Check(drainedBeforeThird, "a drain-through waited for queued items behind the last one that writes its reads");
+}
+
 int main() {
     try {
         TestAppendedPhasesKeepTheirNames();
+        TestDrainThrough();
         TestFollowEpochForwardOnly();
         TestDbClearBlockers();
         TestReport();
