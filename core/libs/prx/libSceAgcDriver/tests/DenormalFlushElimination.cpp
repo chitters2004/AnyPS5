@@ -565,5 +565,43 @@ int main() {
         return true;
     });
 
+    passed &= run("an add of +0.0 that only feeds compares is dropped when its source is denormal-free", [] {
+        Builder b;
+        const auto value = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&bits}); };
+        auto& x = value(b.flush(b.unknown()));
+        auto& raw = value(b.unknown());
+        auto& y = value(b.unknown());
+        const auto compared = [&](IrValue& added) {
+            auto& less = b.emit(IrOpcode::FPOrdLessThan32, IrType::Bool, {&added, &y});
+            auto& nan = b.emit(IrOpcode::FPIsNan32, IrType::Bool, {&added});
+            b.keep(b.emit(IrOpcode::SelectU32, IrType::U32, {&b.emit(IrOpcode::LogicalOr, IrType::Bool, {&less, &nan}), &b.constant(1u), &b.constant(0u)}));
+        };
+        auto& proven = b.emit(IrOpcode::FPAdd32, IrType::F32, {&x, &b.constant(0u)});
+        auto& unproven = b.emit(IrOpcode::FPAdd32, IrType::F32, {&raw, &b.constant(0u)});
+        auto& stored = b.emit(IrOpcode::FPAdd32, IrType::F32, {&x, &b.constant(0u)});
+        auto& one = b.emit(IrOpcode::FPAdd32, IrType::F32, {&x, &b.constant(0x3f800000u)});
+        auto& negativeZero = b.emit(IrOpcode::FPAdd32, IrType::F32, {&x, &b.constant(0x80000000u)});
+        compared(proven);
+        compared(unproven);
+        compared(stored);
+        b.keep(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&stored}));
+        compared(one);
+        compared(negativeZero);
+        return b.eliminate() == 1u && !proven.HasUses() && unproven.HasUses() && stored.HasUses() && one.HasUses() && negativeZero.HasUses();
+    });
+
+    passed &= run("a v_cmp_lt_f32 of two v_mul_f32 products compares the products directly under the hardware flush", [] {
+        const std::array<std::uint32_t, 8> code{
+            0x10040100u, 0x7e026f00u, 0x10060301u, 0x7c020702u, 0x02080702u,
+            0xe0700000u, 0x80000400u,
+            0xbf810000u,
+        };
+        const auto hardware = Recompiled(code, true);
+        const auto adds = OpcodeCount(hardware, spv::OpFAdd);
+        const auto masks = ExponentMasks(hardware);
+        if (adds != 0u || masks != 0u) std::fprintf(stderr, "  %zu adds and %zu exponent masks, expected 0 and 0\n", adds, masks);
+        return adds == 0u && masks == 0u;
+    });
+
     return passed ? 0 : 1;
 }

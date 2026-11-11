@@ -112,6 +112,35 @@ IrValue* flushedSource(const IrValue& value) {
     return maskedOperand(value.Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 0x80000000u) == source ? source : nullptr;
 }
 
+bool comparesOnly(IrOpcode opcode) {
+    switch (opcode) {
+        case IrOpcode::FPOrdEqual32:
+        case IrOpcode::FPUnordEqual32:
+        case IrOpcode::FPOrdNotEqual32:
+        case IrOpcode::FPUnordNotEqual32:
+        case IrOpcode::FPOrdLessThan32:
+        case IrOpcode::FPUnordLessThan32:
+        case IrOpcode::FPOrdLessThanEqual32:
+        case IrOpcode::FPUnordLessThanEqual32:
+        case IrOpcode::FPOrdGreaterThan32:
+        case IrOpcode::FPUnordGreaterThan32:
+        case IrOpcode::FPOrdGreaterThanEqual32:
+        case IrOpcode::FPUnordGreaterThanEqual32:
+        case IrOpcode::FPIsNan32:
+            return true;
+        default:
+            return false;
+    }
+}
+
+IrValue* compareFlushSource(const IrValue& value) {
+    if (value.Opcode() != IrOpcode::FPAdd32 || value.ArgumentCount() != 2u || !isImmediate(value.Argument(1)->Resolve(), 0u)) return nullptr;
+    for (const IrValue* user : value.Uses()) {
+        if (!comparesOnly(user->Opcode())) return nullptr;
+    }
+    return value.Argument(0)->Resolve();
+}
+
 bool isFloatMinMax(IrOpcode opcode) {
     return opcode == IrOpcode::FPMin32 || opcode == IrOpcode::FPMax32 || opcode == IrOpcode::FPMinTri32 || opcode == IrOpcode::FPMaxTri32 || opcode == IrOpcode::FPMedTri32;
 }
@@ -206,6 +235,7 @@ DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& prog
         for (auto* inst : block->Instructions()) {
             if (!inst->HasUses()) continue;
             IrValue* source = flushedSource(*inst);
+            if (source == nullptr) source = compareFlushSource(*inst);
             if (source == nullptr || !denormalFree.Contains(source)) continue;
             inst->ReplaceAllUsesWith(source);
             ++stats.removedFlushes;
