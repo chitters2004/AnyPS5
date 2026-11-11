@@ -1,0 +1,10 @@
+add_test_executable(agc_sequence_ring_tests EXCLUDE_FROM_ALL tests/SequenceRing.cpp Execution/src/Driver/Draw/SequenceRing.cpp)
+target_include_directories(agc_sequence_ring_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_sequence_ring_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(agc_sequence_ring_tests)
+
+if(BUILD_TESTING)
+    set_target_properties(agc_sequence_ring_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_sequence_ring COMMAND agc_sequence_ring_tests)
+    set_tests_properties(agc_sequence_ring PROPERTIES TIMEOUT 30)
+endif()
