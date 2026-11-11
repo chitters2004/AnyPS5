@@ -35,6 +35,7 @@ public:
         std::function<void()> preparerStart;
         std::function<void(std::exception_ptr)> failed;
         bool timed = false;
+        std::uint64_t (*threadCpu)() = nullptr;
     };
     static constexpr std::size_t Tags = 32;
     struct Residency {
@@ -48,6 +49,10 @@ public:
         std::uint64_t fullWaits = 0;
         std::uint64_t fullWaitNs = 0;
         std::uint64_t preparerSleeps = 0;
+        std::uint64_t worked = 0;
+        std::uint64_t busyCpuNs = 0;
+        std::uint64_t busyWallNs = 0;
+        std::uint64_t idleNs = 0;
         std::array<Residency, Tags> residency{};
     };
 
@@ -124,6 +129,10 @@ private:
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullWaitNs{0};
     std::atomic<std::uint64_t> preparerSleeps{0};
+    std::atomic<std::uint64_t> worked{0};
+    std::atomic<std::uint64_t> busyCpuNs{0};
+    std::atomic<std::uint64_t> busyWallNs{0};
+    std::atomic<std::uint64_t> idleNs{0};
     std::array<ResidencyCounters, Tags> residency{};
 };
 

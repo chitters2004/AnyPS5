@@ -164,6 +164,10 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
     counters.fullWaits = fullWaits.exchange(0, std::memory_order_relaxed);
     counters.fullWaitNs = fullWaitNs.exchange(0, std::memory_order_relaxed);
     counters.preparerSleeps = preparerSleeps.exchange(0, std::memory_order_relaxed);
+    counters.worked = worked.exchange(0, std::memory_order_relaxed);
+    counters.busyCpuNs = busyCpuNs.exchange(0, std::memory_order_relaxed);
+    counters.busyWallNs = busyWallNs.exchange(0, std::memory_order_relaxed);
+    counters.idleNs = idleNs.exchange(0, std::memory_order_relaxed);
     for (std::size_t tag = 0; tag < Tags; ++tag) {
         counters.residency[tag].items = residency[tag].items.exchange(0, std::memory_order_relaxed);
         counters.residency[tag].totalNs = residency[tag].totalNs.exchange(0, std::memory_order_relaxed);
@@ -175,9 +179,11 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
 void SequenceRing::run() {
     preparerId.store(std::this_thread::get_id(), std::memory_order_release);
     if (options.preparerStart) options.preparerStart();
+    const auto nanosSince = [](std::chrono::steady_clock::time_point since) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count()); };
     for (;;) {
         const auto index = prepared.load(std::memory_order_relaxed);
         const auto ready = [&] { return pushed.load(std::memory_order_acquire) != index; };
+        const auto idleSince = options.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!spinFor(options.spin, options.pause, ready)) {
             for (;;) {
                 const auto seen = wakeSignal.load(std::memory_order_seq_cst);
@@ -189,12 +195,16 @@ void SequenceRing::run() {
             preparerSleeping.store(false, std::memory_order_relaxed);
             if (!ready()) {
                 if (stopping.load(std::memory_order_acquire)) break;
+                if (options.timed) idleNs.fetch_add(nanosSince(idleSince), std::memory_order_relaxed);
                 continue;
             }
         }
+        if (options.timed) idleNs.fetch_add(nanosSince(idleSince), std::memory_order_relaxed);
         auto& slot = slots[index & mask];
         const auto sequence = slot.sequence;
         if (!failed.load(std::memory_order_acquire)) {
+            const auto busySince = options.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto cpuSince = options.timed && options.threadCpu != nullptr ? options.threadCpu() : 0;
             runningSequence = sequence;
             try {
                 slot.work();
@@ -210,6 +220,11 @@ void SequenceRing::run() {
                 if (first && options.failed) options.failed(error);
             }
             runningSequence = 0;
+            if (options.timed) {
+                worked.fetch_add(1, std::memory_order_relaxed);
+                busyWallNs.fetch_add(nanosSince(busySince), std::memory_order_relaxed);
+                if (options.threadCpu != nullptr) busyCpuNs.fetch_add(options.threadCpu() - cpuSince, std::memory_order_relaxed);
+            }
         }
         if (options.timed) {
             const auto resident = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - slot.pushedAt).count());

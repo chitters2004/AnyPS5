@@ -43,6 +43,12 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::atomic<std::uint64_t> finisherJobs{0};
+std::atomic<std::uint64_t> finisherBusyCpuNs{0};
+std::atomic<std::uint64_t> finisherBusyWallNs{0};
+std::atomic<std::uint64_t> finisherIdleNs{0};
+std::atomic<std::uint64_t> finisherSleeps{0};
+
 std::atomic<std::uint64_t> heldReadRanges{0};
 std::atomic<std::uint64_t> heldReadQueries{0};
 std::atomic<std::uint64_t> heldReadHits{0};
@@ -74,6 +80,7 @@ DrawFinisher& DrawFinisher::Get() {
             options.spin = HandoffSpinWindow();
             options.pause = &SpinPause;
             options.timed = pipelineStats();
+            options.threadCpu = &ThreadCpuNanos;
             options.failed = [](std::exception_ptr error) {
                 try {
                     std::rethrow_exception(error);
@@ -323,23 +330,34 @@ void DrawFinisher::run() {
     NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
     ReserveFinisherCore();
+    const bool timed = pipelineStats();
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
+        const auto idleSince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            if (timed && jobs.empty()) finisherSleeps.fetch_add(1, std::memory_order_relaxed);
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
         }
+        const auto busySince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto cpuSince = timed ? ThreadCpuNanos() : 0;
+        if (timed) finisherIdleNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(busySince - idleSince).count()), std::memory_order_relaxed);
         std::exception_ptr error;
         try {
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
+        }
+        if (timed) {
+            finisherJobs.fetch_add(1, std::memory_order_relaxed);
+            finisherBusyWallNs.fetch_add(elapsedNs(busySince), std::memory_order_relaxed);
+            finisherBusyCpuNs.fetch_add(ThreadCpuNanos() - cpuSince, std::memory_order_relaxed);
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
@@ -601,8 +619,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         kindText += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    SequenceRing::Counters ringWork;
     if (DrawFinisher::Sequenced()) {
         const auto ring = DrawFinisher::Get().Ring().TakeCounters();
+        ringWork = ring;
         std::string residencyText;
         for (std::size_t tag = 0; tag < ring.residency.size(); ++tag) {
             const auto& residency = ring.residency[tag];
@@ -612,6 +632,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
             residencyText += item;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
+    }
+    {
+        struct Finisher {
+            const char* name;
+            std::uint64_t jobs, cpuNs, wallNs, idleNs, sleeps;
+        } finisherCounters{"queue", finisherJobs.exchange(0, std::memory_order_relaxed), finisherBusyCpuNs.exchange(0, std::memory_order_relaxed), finisherBusyWallNs.exchange(0, std::memory_order_relaxed), finisherIdleNs.exchange(0, std::memory_order_relaxed), finisherSleeps.exchange(0, std::memory_order_relaxed)};
+        if (DrawFinisher::Sequenced()) finisherCounters = {"ring preparer", ringWork.worked, ringWork.busyCpuNs, ringWork.busyWallNs, ringWork.idleNs, ringWork.preparerSleeps};
+        const auto perJob = [&](std::uint64_t ns) { return finisherCounters.jobs == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(finisherCounters.jobs); };
+        AgcDriver::ProfilePrint_nid_no_patch("[finisher] %s (10 s): %llu jobs, busy %.1f ms CPU and %.1f ms wall (%.1f / %.1f us per job), idle %.1f ms wall, %llu sleeps\n", finisherCounters.name, static_cast<unsigned long long>(finisherCounters.jobs), static_cast<double>(finisherCounters.cpuNs) / 1e6, static_cast<double>(finisherCounters.wallNs) / 1e6, perJob(finisherCounters.cpuNs), perJob(finisherCounters.wallNs), static_cast<double>(finisherCounters.idleNs) / 1e6, static_cast<unsigned long long>(finisherCounters.sleeps));
     }
     {
         const auto preparerWaits = preparerStarved.exchange(0, std::memory_order_relaxed);
