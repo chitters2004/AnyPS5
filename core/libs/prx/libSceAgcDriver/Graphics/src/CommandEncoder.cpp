@@ -608,7 +608,8 @@ void CommandEncoder::Recording::refuse() {
 }
 
 void CommandEncoder::Open(VkCommandBuffer commands, Recording& recording) {
-    if (recent.load(std::memory_order_relaxed) != commands) Quiesce();
+    if (recent.load(std::memory_order_relaxed) != commands && !handedOff) Quiesce();
+    handedOff = false;
     windows.push_back({commands, &recording});
     owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
     this->recording = &recording;
@@ -801,6 +802,7 @@ void CommandEncoder::PostSubmit(SubmitRequest& request) noexcept {
     marker->target = request.commands;
     marker->recording = request.recording;
     request.encoder = this;
+    handedOff = windows.empty();
     request.state.store(static_cast<std::uint32_t>(SubmitRequest::State::Pending), std::memory_order_relaxed);
     submitsPosted.fetch_add(1, std::memory_order_seq_cst);
     enqueue(marker);
@@ -853,9 +855,9 @@ void CommandEncoder::submit(SubmitRequest& request) noexcept {
         std::lock_guard lock(poolMutex);
         result = request.endCommandBuffer(request.commands);
     }
-    if (result == VK_SUCCESS && request.injectFailure) {
+    if (result == VK_SUCCESS && request.injectFailure != VK_SUCCESS) {
         request.error = std::make_exception_ptr(std::runtime_error("vkQueueSubmit recorder: injected failure"));
-        result = VK_ERROR_UNKNOWN;
+        result = request.injectFailure;
     }
     if (result != VK_SUCCESS) {
         request.result = result;

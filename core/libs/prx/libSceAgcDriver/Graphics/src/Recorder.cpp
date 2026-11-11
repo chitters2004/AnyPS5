@@ -574,6 +574,7 @@ bool ProcTable() {
 AgcDriver::Mutex labelTableMutex;
 std::atomic<unsigned> injectedSubmitFailures{0};
 std::atomic<unsigned> injectedAsyncSubmitFailures{0};
+std::atomic<VkResult> injectedAsyncSubmitResult{VK_ERROR_UNKNOWN};
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -2012,8 +2013,9 @@ void Recorder::ensureOpen() {
             allocation.commandPool = encoderPool != VK_NULL_HANDLE ? encoderPool : context.pool;
             allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
             allocation.commandBufferCount = 1;
+            const bool handedOff = encoder != nullptr && CommandEncoder::SubmitsAsync();
             {
-                quiesce();
+                if (!handedOff) quiesce();
                 std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
                 Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
             }
@@ -2027,7 +2029,10 @@ void Recorder::ensureOpen() {
             }
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            {
+                std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
+                Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            }
         } catch (...) {
             release(*batch);
             throw;
@@ -2038,10 +2043,12 @@ void Recorder::ensureOpen() {
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
         open->predictedSerial = submissions + 1;
-        try {
-            if (open->queue == 0) WriteCheckpointSerial(context, live(), open->predictedSerial, open->queue);
-            else WriteCheckpointSentinel(context, live());
-        } catch (...) {
+        if (CheckpointMarkersEnabled()) {
+            try {
+                if (open->queue == 0) WriteCheckpointSerial(context, live(), open->predictedSerial, open->queue);
+                else WriteCheckpointSentinel(context, live());
+            } catch (...) {
+            }
         }
         if (PerformanceTrace::Recording()) {
             static std::atomic<std::uint64_t> traceIds{0};
@@ -2929,8 +2936,8 @@ void Recorder::foldSegments() {
 }
 
 void Recorder::endSamples(Batch& batch) {
-    quiesce();
     if (!batch.sampleActive) return;
+    quiesce();
     function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.samples, 0);
     batch.sampleActive = false;
     if (sampleCounterState > 0 && batch.samplesDrawn) {
@@ -4305,7 +4312,8 @@ void Recorder::FailNextSubmitsForTest(unsigned count) {
     injectedSubmitFailures.store(count, std::memory_order_relaxed);
 }
 
-void Recorder::FailNextAsyncSubmitsForTest(unsigned count) {
+void Recorder::FailNextAsyncSubmitsForTest(unsigned count, VkResult result) {
+    injectedAsyncSubmitResult.store(result, std::memory_order_relaxed);
     injectedAsyncSubmitFailures.store(count, std::memory_order_relaxed);
 }
 
@@ -4347,7 +4355,7 @@ void Recorder::dispatchAsync(std::unique_ptr<Batch>& batch, const std::string& t
     request->settled = &Recorder::asyncSubmitSettled;
     request->owner = this;
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
-    if (injectedAsyncSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedAsyncSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) request->injectFailure = true;
+    if (injectedAsyncSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedAsyncSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) request->injectFailure = injectedAsyncSubmitResult.load(std::memory_order_relaxed);
     if (timeline != VK_NULL_HANDLE && !progressWatcher) {
         progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
                                                             context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
@@ -4417,20 +4425,19 @@ void Recorder::confirmThrough(std::uint64_t serial) {
             noteConfirmed(batch);
             continue;
         }
-        while (inFlight.size() > index + 1) {
-            auto later = std::move(inFlight.back());
-            inFlight.pop_back();
-            inFlightKeptBytes -= later->keptBytes;
-            discard(std::move(later));
-        }
-        auto failed = std::move(inFlight.back());
-        inFlight.pop_back();
+        auto failed = std::move(inFlight[index]);
+        inFlight.erase(inFlight.begin() + static_cast<std::ptrdiff_t>(index));
         inFlightKeptBytes -= failed->keptBytes;
         failAsync(std::move(failed), state);
     }
 }
 
 void Recorder::failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRequest::State state) {
+    if (failed->request->Result() == VK_ERROR_DEVICE_LOST) {
+        const QueueAccess access(context, QueueAccess::Queues::All);
+        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    }
     while (!inFlight.empty() && inFlight.back()->serial > failed->serial) {
         auto later = std::move(inFlight.back());
         inFlight.pop_back();
@@ -4442,24 +4449,25 @@ void Recorder::failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRe
     const auto error = failed->request->Error();
     discard(std::move(failed));
     if (state == CommandEncoder::SubmitRequest::State::NotSubmitted) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: an earlier submit on its queue failed");
-    if (result == VK_ERROR_DEVICE_LOST) {
-        const QueueAccess access(context, QueueAccess::Queues::All);
-        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
-    }
     if (error) std::rethrow_exception(error);
     Check(result, "vkQueueSubmit recorder");
     throw std::logic_error("AGC graphics: an async submit failed without a result");
 }
 
-bool Recorder::asyncSubmitFailed(std::uint64_t serial) {
-    if (serial > asyncDispatched.load(std::memory_order_acquire)) return false;
+Recorder::AsyncSubmit Recorder::awaitAsyncSubmit(std::uint64_t serial, std::chrono::steady_clock::time_point deadline) {
+    if (serial > asyncDispatched.load(std::memory_order_acquire)) return AsyncSubmit::Made;
     if (asyncSettled.load(std::memory_order_acquire) < serial) {
         asyncWaiters.fetch_add(1, std::memory_order_seq_cst);
-        for (auto seen = asyncSettled.load(std::memory_order_seq_cst); seen < serial; seen = asyncSettled.load(std::memory_order_seq_cst)) AgcDriver::AddressWait(asyncSettled, seen);
+        for (auto seen = asyncSettled.load(std::memory_order_seq_cst); seen < serial; seen = asyncSettled.load(std::memory_order_seq_cst)) {
+            if (deadline == std::chrono::steady_clock::time_point::max()) AgcDriver::AddressWait(asyncSettled, seen);
+            else if (!AgcDriver::AddressWaitUntil(asyncSettled, seen, deadline) && asyncSettled.load(std::memory_order_seq_cst) < serial) {
+                asyncWaiters.fetch_sub(1, std::memory_order_relaxed);
+                return AsyncSubmit::Pending;
+            }
+        }
         asyncWaiters.fetch_sub(1, std::memory_order_relaxed);
     }
-    return asyncFailedFrom.load(std::memory_order_acquire) <= serial;
+    return asyncFailedFrom.load(std::memory_order_acquire) <= serial ? AsyncSubmit::Failed : AsyncSubmit::Made;
 }
 
 void Recorder::Submit() {
@@ -4521,6 +4529,7 @@ void Recorder::Submit() {
         dispatchAsync(batch, TraceTokens(batch->drawTraceTokens));
         return;
     }
+    if (asyncFailedFrom.load(std::memory_order_acquire) != ~std::uint64_t{0}) throw std::runtime_error("AGC graphics: a batch was not submitted: an earlier async submit on its queue failed, and a later signal would mark the failed batch done");
     if (encoder != nullptr) {
         encoder->FinishBatch();
         batch->recording.Finish();
@@ -4653,7 +4662,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 void Recorder::WaitSerial(std::uint64_t serial) {
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
-    if (asyncSubmitFailed(serial)) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
+    if (awaitAsyncSubmit(serial, std::chrono::steady_clock::time_point::max()) == AsyncSubmit::Failed) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
@@ -4668,7 +4677,12 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
-    if (asyncSubmitFailed(serial)) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
+    const auto start = std::chrono::steady_clock::now();
+    const auto submit = awaitAsyncSubmit(serial, start + std::chrono::nanoseconds(std::min<std::uint64_t>(timeoutNanos, std::chrono::nanoseconds::max().count() / 2)));
+    if (submit == AsyncSubmit::Failed) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
+    if (submit == AsyncSubmit::Pending) return false;
+    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    timeoutNanos = spent < timeoutNanos ? timeoutNanos - spent : 0;
     const UnlockedWaiter waiter{id};
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;

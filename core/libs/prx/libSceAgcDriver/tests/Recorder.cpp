@@ -560,6 +560,19 @@ public:
                 minLod.pNext = address.pNext;
                 address.pNext = &minLod;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelineSemaphores = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelineSemaphores) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDeviceExtendedDynamicState3FeaturesEXT dynamicState3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
             if (std::getenv("APS5_NO_DYNAMIC_COLOR_WRITE_MASK") == nullptr && hasExtension(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dynamicState3};
@@ -689,6 +702,7 @@ public:
         return &functions;
     }
     bool Graphics() const { return graphics; }
+    bool TimelineSemaphores() const { return timelineSemaphores; }
     bool Timestamps() const {
         std::uint32_t count = 0;
         const auto queues = function<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
@@ -745,6 +759,7 @@ private:
     VkInstance instance = VK_NULL_HANDLE;
     Context context{};
     bool graphics = false;
+    bool timelineSemaphores = false;
     std::mutex settleMutex;
     bool nullDescriptors = false;
     DeviceFunctions functions{};
@@ -1814,6 +1829,10 @@ void completionWaitTests(const Device& device, Recorder& recorder) {
 template<typename Lock>
 void encoderFailureFollowsTheBatchTests(const Device& device, Recorder& recorder, Lock& gpu) {
     if (!recorder.Encodes()) return;
+    if (CommandEncoder::SubmitsAsync()) {
+        std::cout << "Command encoder failure tests skipped: with async submit a replay failure fails its submit and refuses the later ones (agc_driver_command_encoder covers it)\n";
+        return;
+    }
     const auto& context = device.GetContext();
     std::atomic<int> failures{0};
     CommandEncoder::SetDelayForTesting([&] {
@@ -11884,13 +11903,13 @@ bool asyncSubmitTests(const Device& device) {
     const auto& context = device.GetContext();
     DeviceFunctions table{};
     FillDeviceFunctions(context, table);
-    Recorder recorder(context, false, &table, context.queueFamily);
+    Recorder recorder(context, device.TimelineSemaphores(), &table, context.queueFamily);
     if (!recorder.Encodes()) return false;
     RuntimeSwitches::Assign(RuntimeSwitch::EncoderAsyncSubmit, true);
     Require(CommandEncoder::SubmitsAsync(), "APS5_ENCODER_ASYNC_SUBMIT did not take effect with APS5_QUEUE_ACCESS set");
-    const auto work = [&] {
-        const auto commands = recorder.Commands();
-        const Recorder::EncodingWindow window(recorder);
+    const auto work = [&](Recorder& target) {
+        const auto commands = target.Commands();
+        const Recorder::EncodingWindow window(target);
         const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
         table.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
     };
@@ -11899,7 +11918,7 @@ bool asyncSubmitTests(const Device& device) {
     constexpr std::uint64_t batches = 20;
     std::uint64_t last = 0;
     for (std::uint64_t i = 0; i < batches; ++i) {
-        work();
+        work(recorder);
         last = recorder.SubmitAndEpoch();
         Require(last != 0, "an async submit returned no serial");
         if (i % 5 == 4) recorder.WaitSerial(last);
@@ -11908,12 +11927,6 @@ bool asyncSubmitTests(const Device& device) {
     const auto submitted = recorder.EncoderCounts();
     Require(submitted.submits - before.submits == batches, "the encoder submitted " + std::to_string(submitted.submits - before.submits) + " of " + std::to_string(batches) + " batches");
     Require(recorder.NewestSubmitted() == last, "the newest submitted serial is " + std::to_string(recorder.NewestSubmitted()) + ", not the last async submit " + std::to_string(last));
-    Recorder::FailNextAsyncSubmitsForTest(1u);
-    work();
-    const auto failed = recorder.SubmitAndEpoch();
-    Recorder::FailNextAsyncSubmitsForTest(0u);
-    work();
-    recorder.Submit();
     const auto error = [](const std::function<void()>& wait) {
         try {
             wait();
@@ -11922,13 +11935,56 @@ bool asyncSubmitTests(const Device& device) {
         }
         return std::string();
     };
+    if (device.TimelineSemaphores()) {
+        std::atomic<bool> gate{false};
+        std::atomic<bool> held{false};
+        CommandEncoder::SetDelayForTesting([&] {
+            if (held.exchange(true)) return;
+            while (!gate.load()) std::this_thread::yield();
+        });
+        work(recorder);
+        const auto stalled = recorder.SubmitAndEpoch();
+        const auto start = std::chrono::steady_clock::now();
+        const bool done = recorder.WaitSerialFor(stalled, 20'000'000ull);
+        const auto waited = std::chrono::steady_clock::now() - start;
+        gate.store(true);
+        Require(!done && waited < std::chrono::seconds(1), "a bounded wait for a batch whose async submit was still posted returned " + std::string(done ? "done" : "not done") + " after " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(waited).count()) + " ms");
+        Require(recorder.WaitSerialFor(stalled, 5'000'000'000ull), "a bounded wait did not see an async submit complete once it was made");
+        recorder.Sync();
+        CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::microseconds(200)); });
+    }
+    {
+        Recorder lost(context, device.TimelineSemaphores(), &table, context.queueFamily);
+        Require(lost.Encodes(), "a second recorder with a device table got no command encoder");
+        Recorder::FailNextAsyncSubmitsForTest(1u, VK_ERROR_DEVICE_LOST);
+        work(lost);
+        lost.Submit();
+        Recorder::FailNextAsyncSubmitsForTest(0u);
+        const auto synced = error([&] { lost.Sync(); });
+        Require(synced.find("injected failure") != std::string::npos, "a sync after an async submit lost the device returned '" + synced + "'");
+        Require(lost.EncoderCounts().submitFailures == 1, "a lost device was counted as " + std::to_string(lost.EncoderCounts().submitFailures) + " failed submits");
+    }
+    Recorder::FailNextAsyncSubmitsForTest(1u);
+    work(recorder);
+    const auto failed = recorder.SubmitAndEpoch();
+    Recorder::FailNextAsyncSubmitsForTest(0u);
+    work(recorder);
+    const auto later = recorder.SubmitAndEpoch();
+    if (device.TimelineSemaphores()) {
+        const auto waited = error([&] { recorder.WaitSerial(later); });
+        Require(waited.find("was not submitted") != std::string::npos, "a wait for a batch after a failed async submit returned '" + waited + "'");
+    }
     const auto synced = error([&] { recorder.Sync(); });
     Require(synced.find("injected failure") != std::string::npos, "a sync after a failed async submit returned '" + synced + "'");
     Require(recorder.NewestSubmitted() < failed, "a failed async submit was confirmed as submitted");
-    work();
+    work(recorder);
     recorder.Submit();
     const auto after = error([&] { recorder.Sync(); });
     Require(after.find("was not submitted") != std::string::npos, "a batch after a failed async submit returned '" + after + "' instead of being refused");
+    RuntimeSwitches::Assign(RuntimeSwitch::EncoderAsyncSubmit, false);
+    work(recorder);
+    const auto synchronous = error([&] { recorder.Submit(); });
+    Require(synchronous.find("earlier async submit") != std::string::npos, "a synchronous submit after a failed async one returned '" + synchronous + "' instead of being refused");
     const auto failures = recorder.EncoderCounts().submitFailures - before.submitFailures;
     Require(failures == 3, "the encoder counted " + std::to_string(failures) + " async submit failures, not the failed one and the two after it");
     CommandEncoder::SetDelayForTesting({});

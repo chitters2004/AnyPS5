@@ -1353,34 +1353,43 @@ void AsyncSubmitsFollowTheirChunks(std::uint32_t seed, bool delays) {
     for (std::uint64_t index = 0; index < Batches; ++index) Require(settled[index] == std::make_pair(index + 1, SubmitState::Submitted), "the owner heard of submit " + std::to_string(settled[index].first) + " out of order or as not submitted");
 }
 
-void AFailedSubmitIsSticky(bool deviceLost) {
+enum class SubmitFailure { Injected, DeviceLost, Replay };
+
+void AFailedSubmitIsSticky(SubmitFailure failure) {
     ResetSubmits();
     auto table = FakeTable();
     const auto device = Handle<VkDevice>(0x59);
+    const bool deviceLost = failure == SubmitFailure::DeviceLost;
     std::vector<std::unique_ptr<CommandEncoder::SubmitRequest>> requests;
     Settled settled;
     std::uint64_t failures = 0;
     std::vector<VkCommandBuffer> buffers;
+    std::atomic<bool> failReplay{false};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (failReplay.exchange(false)) throw std::runtime_error("injected replay failure");
+    });
     {
         const auto attached = Attached(device, table);
         auto& encoder = *attached;
         for (std::uint64_t batch = 1; batch <= 6; ++batch) {
             const auto commands = Handle<VkCommandBuffer>(0x4000 + batch * 0x10);
             buffers.push_back(commands);
-            PostOne(encoder, table, commands, static_cast<std::uint32_t>(batch));
-            requests.push_back(Request(commands, batch, settled));
             if (batch == 3) {
                 encoder.SettleSubmits();
-                if (deviceLost) fakeSubmitResult.store(VK_ERROR_DEVICE_LOST);
-                else requests.back()->injectFailure = true;
+                if (failure == SubmitFailure::DeviceLost) fakeSubmitResult.store(VK_ERROR_DEVICE_LOST);
+                if (failure == SubmitFailure::Replay) failReplay.store(true);
             }
+            PostOne(encoder, table, commands, static_cast<std::uint32_t>(batch));
+            requests.push_back(Request(commands, batch, settled));
+            if (batch == 3 && failure == SubmitFailure::Injected) requests.back()->injectFailure = VK_ERROR_UNKNOWN;
             encoder.PostSubmit(*requests.back());
         }
         encoder.SettleSubmits();
         fakeSubmitResult.store(VK_SUCCESS);
         failures = encoder.Counts().submitFailures;
     }
-    const std::string scenario = deviceLost ? "a lost device" : "an injected failure";
+    CommandEncoder::SetDelayForTesting({});
+    const std::string scenario = deviceLost ? "a lost device" : failure == SubmitFailure::Replay ? "a replay failure" : "an injected failure";
     const SubmitState states[6]{SubmitState::Submitted, SubmitState::Submitted, SubmitState::Failed, SubmitState::NotSubmitted, SubmitState::NotSubmitted, SubmitState::NotSubmitted};
     for (std::size_t index = 0; index < 6; ++index) {
         Require(requests[index]->Current() == states[index], "after " + scenario + " on submit 3, submit " + std::to_string(index + 1) + " ended in state " + std::to_string(static_cast<int>(requests[index]->Current())));
@@ -1394,9 +1403,11 @@ void AFailedSubmitIsSticky(bool deviceLost) {
         } catch (const std::runtime_error& error) {
             kept = error.what();
         }
-        Require(kept == "vkQueueSubmit recorder: injected failure", "an injected failure was kept as '" + kept + "', not as the failed submit's error");
+        const std::string expected = failure == SubmitFailure::Replay ? "injected replay failure" : "vkQueueSubmit recorder: injected failure";
+        Require(kept == expected, scenario + " was kept as '" + kept + "', not as the failed submit's error");
     }
     Require(Submitted() == std::vector<std::uint64_t>{1, 2}, "after " + scenario + ", a submit after the failed one reached the queue");
+    if (failure == SubmitFailure::Replay) Require(Recorded(buffers[2]) == 0, "a batch whose replay failed was ended");
     for (std::size_t index = 3; index < 6; ++index) Require(Recorded(buffers[index]) == 1, "a batch after " + scenario + " was ended though it is never submitted");
     Require(failures == 4, "the encoder counted " + std::to_string(failures) + " failed submits, not the failed one and the three after it");
 }
@@ -1525,10 +1536,50 @@ void QueueAccessSettlesPostedSubmits() {
     CommandEncoder::SetDelayForTesting({});
 }
 
+void NextBatchDoesNotWaitForTheSubmit() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5d);
+    Settled settled;
+    std::atomic<bool> gate{false};
+    std::atomic<bool> held{false};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (held.exchange(true)) return;
+        while (!gate.load()) std::this_thread::yield();
+    });
+    std::chrono::steady_clock::duration opened{};
+    SubmitState stateAfterOpen = SubmitState::Submitted;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto first = Handle<VkCommandBuffer>(0x8000);
+        const auto second = Handle<VkCommandBuffer>(0x8100);
+        PostOne(encoder, table, first, 1);
+        const auto request = Request(first, 1, settled);
+        encoder.PostSubmit(*request);
+        std::thread release([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            gate.store(true);
+        });
+        const auto start = std::chrono::steady_clock::now();
+        PostOne(encoder, table, second, 2);
+        opened = std::chrono::steady_clock::now() - start;
+        stateAfterOpen = request->Current();
+        release.join();
+        encoder.SettleSubmits();
+        encoder.Quiesce();
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Require(stateAfterOpen == SubmitState::Pending && opened < std::chrono::milliseconds(250), "the next batch's window waited " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(opened).count()) + " ms for the previous batch's posted submit");
+    Compare({{Handle<VkCommandBuffer>(0x8000), {"draw 1 1 0 0", "end", SubmitLine(1)}}, {Handle<VkCommandBuffer>(0x8100), {"draw 2 1 0 0"}}}, "a window on the next batch while the previous submit is posted");
+}
+
 void RunAsyncSubmit() {
+    NextBatchDoesNotWaitForTheSubmit();
     for (std::uint32_t seed = 1; seed <= 4; ++seed) AsyncSubmitsFollowTheirChunks(seed, seed % 2 == 0);
-    AFailedSubmitIsSticky(false);
-    AFailedSubmitIsSticky(true);
+    AFailedSubmitIsSticky(SubmitFailure::Injected);
+    AFailedSubmitIsSticky(SubmitFailure::DeviceLost);
+    AFailedSubmitIsSticky(SubmitFailure::Replay);
     SettleOnTheEncoderThreadIsRefused();
     TeardownLeavesNoSubmitPending();
     QueueAccessSettlesPostedSubmits();

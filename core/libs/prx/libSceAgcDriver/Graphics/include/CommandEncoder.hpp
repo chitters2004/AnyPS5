@@ -64,7 +64,7 @@ public:
         PFN_vkQueueSubmit queueSubmit = nullptr;
         AgcDriver::Mutex* queueMutex = nullptr;
         Recording* recording = nullptr;
-        bool injectFailure = false;
+        VkResult injectFailure = VK_SUCCESS;
         Settled settled = nullptr;
         void* owner = nullptr;
         State Current() const noexcept { return static_cast<State>(state.load(std::memory_order_acquire)); }
@@ -210,6 +210,7 @@ private:
     std::atomic<std::uint64_t> submitsDone{0};
     std::atomic<std::uint32_t> settling{0};
     bool submitFailed = false;
+    bool handedOff = false;
     std::atomic<std::uint64_t> submitCount{0};
     std::atomic<std::uint64_t> submitFailures{0};
     std::array<std::atomic<std::uint64_t>, 2> settleWaits{};

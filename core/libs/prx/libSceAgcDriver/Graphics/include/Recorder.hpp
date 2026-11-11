@@ -415,7 +415,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
-    static void FailNextAsyncSubmitsForTest(unsigned count);
+    static void FailNextAsyncSubmitsForTest(unsigned count, VkResult result = VK_ERROR_UNKNOWN);
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -905,7 +905,8 @@ private:
     void confirmReady();
     void confirmThrough(std::uint64_t serial);
     [[noreturn]] void failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRequest::State state);
-    bool asyncSubmitFailed(std::uint64_t serial);
+    enum class AsyncSubmit : std::uint8_t { Made, Pending, Failed };
+    AsyncSubmit awaitAsyncSubmit(std::uint64_t serial, std::chrono::steady_clock::time_point deadline);
     std::atomic<std::uint64_t> asyncDispatched{0};
     std::atomic<std::uint64_t> asyncSettled{0};
     std::atomic<std::uint64_t> asyncFailedFrom{~std::uint64_t{0}};
