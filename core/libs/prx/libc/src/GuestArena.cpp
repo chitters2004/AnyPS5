@@ -691,6 +691,19 @@ bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t byt
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }
 
+std::size_t GuestArenaMappingLockCounts_nid_no_patch(std::uint64_t* values, std::size_t count, std::uint64_t* tickFrequency) {
+    const auto counts = WindowsMappings::Get().LockCounts();
+    if (tickFrequency != nullptr) *tickFrequency = WindowsMappings::LockTickFrequency();
+    std::size_t written = 0;
+    for (const auto& site : counts) {
+        for (const auto value : {site.acquisitions, site.contended, site.waitTicks}) {
+            if (written < count) values[written] = value;
+            ++written;
+        }
+    }
+    return written;
+}
+
 bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear, WindowsMappings::Collection::Armed);
 }
