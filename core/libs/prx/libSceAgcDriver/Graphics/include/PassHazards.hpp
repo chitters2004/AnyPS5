@@ -61,6 +61,7 @@ private:
 class PassHazards {
 public:
     PassHazard Check(const PassAccess& access, bool samePass) const;
+    bool SharesAttachment(const PassAccess& access) const;
     void Add(const PassAccess& access);
     void BeginPass() { ++pass; }
     void SealWriteOnly();
