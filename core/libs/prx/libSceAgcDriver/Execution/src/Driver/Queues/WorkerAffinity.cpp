@@ -6,8 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <pthread.h>
+#include <time.h>
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -36,6 +39,22 @@ void NameDriverThread(const char* name) {
 #else
     const int nameResult = pthread_setname_np(pthread_self(), name);
     if (nameResult != 0) std::fprintf(stderr, "[thread-name] could not name %s (%s)\n", name, std::strerror(nameResult));
+#endif
+}
+
+std::uint64_t ThreadCpuNanos() {
+#ifdef _WIN32
+    FILETIME creation{};
+    FILETIME exited{};
+    FILETIME kernel{};
+    FILETIME user{};
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) return 0;
+    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
+    return (ticks(kernel) + ticks(user)) * 100;
+#else
+    timespec now{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return 0;
+    return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(now.tv_nsec);
 #endif
 }
 

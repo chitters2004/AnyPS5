@@ -11,6 +11,8 @@ void PinWorkerThread(const char* role);
 
 void NameDriverThread(const char* name);
 
+std::uint64_t ThreadCpuNanos();
+
 }
 
 #endif
