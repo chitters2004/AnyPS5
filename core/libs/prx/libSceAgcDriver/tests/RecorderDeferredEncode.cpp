@@ -68,7 +68,6 @@ struct MockDevice {
     std::vector<std::string> violations;
     bool gate = false;
     bool jitter = false;
-    bool jitter = false;
     bool gateOpen = false;
     bool holdSubmitReturn = false;
     bool submitReturnOpen = false;
@@ -427,7 +426,7 @@ struct Fixture {
     }
 
     void Drain() const {
-        if (auto* submitter = QueueSubmitter::Existing(context.queue); submitter != nullptr) submitter->Drain();
+        if (const auto submitter = QueueSubmitter::Existing(context.queue); submitter != nullptr) submitter->Drain();
     }
 };
 
@@ -542,8 +541,7 @@ struct Watchdog {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
             if (done.load()) return;
-            std::fprintf(stderr, "FAIL: %s did not finish within 15 s
-", what.c_str());
+            std::fprintf(stderr, "FAIL: %s did not finish within 15 s\n", what.c_str());
             std::fflush(stderr);
             std::_Exit(1);
         });
