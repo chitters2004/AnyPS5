@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
@@ -4844,6 +4845,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us; command buffers freed at batch release %llu, fences kept for reuse %llu\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs, static_cast<unsigned long long>(commandBuffersFreed.load()), static_cast<unsigned long long>(fencesKept.load()));
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu, address-based read-only %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.hits[7]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] repeated batch effects skipped: %llu reads already noted, %llu layout stores, %llu pending-since loops, %llu in-place read lists filled without allocating\n", static_cast<unsigned long long>(reads.repeated), static_cast<unsigned long long>(StorageTexture::LayoutStoreSkips()), static_cast<unsigned long long>(StorageTexture::PendingSinceSkips()), static_cast<unsigned long long>(ShaderResources::InPlaceReadReuses()));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
