@@ -378,6 +378,20 @@ int main() {
         Require(afterRecycling.adopted == 2 && afterRecycling.covered, "prepared vertex inputs: a draw whose copies were staged in recycled buffers did not adopt both or drew wrong");
         {
             const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+            using Use = AgcDriver::Graphics::Recorder::SnapshotUse;
+            const auto mapped = AgcDriver::Graphics::DrawInputMemoryProperties(context, Use::Vertex);
+            const auto host = AgcDriver::Graphics::DrawInputMemoryProperties(context, Use::PaddedVertex);
+            Require(mapped == context.SnapshotProperties() && mapped != host, "prepared vertex inputs: the device offers no memory class for vertex copies apart from host memory, so keeping the class cannot be tested");
+            static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 20u));
+            constexpr std::size_t vertexBytes = Triangle.size() * 16u;
+            const auto beforeMismatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            const auto mismatched = AgcDriver::Graphics::NewDrawInputBuffer(context, vertexBytes, Use::PaddedVertex);
+            const auto afterMismatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            const auto matched = AgcDriver::Graphics::NewDrawInputBuffer(context, vertexBytes, Use::Vertex);
+            const auto afterMatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            std::printf("recycled %zu-byte vertex buffers: a host-class request took %llu from the stash (properties 0x%x), a vertex request took %llu (properties 0x%x, the snapshot class is 0x%x)\n", vertexBytes, static_cast<unsigned long long>(afterMismatch.stashHits[1] - beforeMismatch.stashHits[1]), mismatched->Properties(), static_cast<unsigned long long>(afterMatch.stashHits[1] - afterMismatch.stashHits[1]), matched->Properties(), mapped);
+            Require(afterMismatch.stashHits[1] == beforeMismatch.stashHits[1] && mismatched->Properties() == host, "prepared vertex inputs: a host-class vertex request reused a recycled buffer of the snapshot memory class");
+            Require(afterMatch.stashHits[1] == afterMismatch.stashHits[1] + 1 && matched->Properties() == mapped, "prepared vertex inputs: the recycled vertex copy did not keep its snapshot memory class, or a vertex request did not reuse it");
             const auto hitKey = AgcDriver::Graphics::DrawResourceCacheKey(context, epochState, epochDraw, programs->shaders);
             Require(!hitKey.empty(), "prepared vertex inputs: the draw has no resource cache key, so a cache hit cannot be predicted for it");
             bool predicted = true;
