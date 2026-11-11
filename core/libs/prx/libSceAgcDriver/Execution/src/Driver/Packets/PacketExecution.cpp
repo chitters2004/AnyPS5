@@ -294,7 +294,8 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
+            const bool sequencedStore = pipelined && !predicated && opcode == 0x83 && DrawFinisher::Sequenced() && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor);
+            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || sequencedStore || keepsDrawPipeline(packet, header, opcode));
             if (!beside) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
