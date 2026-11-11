@@ -86,6 +86,7 @@ DrawFinisher& DrawFinisher::Get() {
             };
             options.preparerStart = [] {
                 finisherThread = true;
+                NameDriverThread("draw-finish");
                 PerformanceTrace::BindThread("draw finisher");
             };
             created->ring = std::make_unique<SequenceRing>(std::move(options));
