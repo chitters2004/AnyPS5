@@ -188,8 +188,11 @@ StorageTexture::SyncedBorrowCounts Delta(const StorageTexture::SyncedBorrowCount
     return {after.borrows - before.borrows, after.units - before.units, after.bytes - before.bytes, after.rollBacks - before.rollBacks};
 }
 
+bool IgnoringPageWrites = false;
+
 void Write(Fixture& fixture, std::size_t offset, std::size_t length, std::uint8_t value) {
     std::memset(fixture.guest + offset, value, length);
+    if (IgnoringPageWrites) AgcDriver::GuestMemory::MarkWritten(AddressOf(fixture.guest + offset), length);
 }
 
 void Refresh(StorageTexture& texture, const std::string& what) {
@@ -244,6 +247,10 @@ int Run(AgcDriver::VulkanDevice& device) {
         std::printf("synced alias borrow: the device keeps no write-watched host import of the surface; skipped\n");
         return VulkanTestSkipped;
     }
+    if (IgnoringPageWrites) AgcDriver::GuestMemory::IgnorePageWritesForTest(address, bytes);
+    struct StopIgnoring {
+        ~StopIgnoring() { AgcDriver::GuestMemory::IgnorePageWritesForTest(0, 0); }
+    } stopIgnoring;
     Fixture fixture{context, detiler, Surface(address, Format32Float), Surface(address, Format32UInt), bytes, block.Data()};
     auto floats = Cached(fixture, Format32Float);
     auto uints = Cached(fixture, Format32UInt);
@@ -287,7 +294,7 @@ int Run(AgcDriver::VulkanDevice& device) {
     std::puts("synced alias borrow: an image over memory forgotten since it read it lends nothing");
 
     const char* forced = std::getenv("APS5_WRITE_WATCH_IMPORTS");
-    if (forced != nullptr && std::strcmp(forced, "watch") == 0) {
+    if (!IgnoringPageWrites && forced != nullptr && std::strcmp(forced, "watch") == 0) {
         std::puts("synced alias borrow: with the write watch forced on by APS5_WRITE_WATCH_IMPORTS, this device's GPU stores into the import are collected as CPU stores; the GPU-store cases run where imports stay watched on their own");
     } else {
         GpuStores(fixture, units);
@@ -327,8 +334,9 @@ int Run(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        IgnoringPageWrites = argc == 2 && std::string(argv[1]) == "--ignore-page-writes";
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         return Run(*device);
