@@ -728,6 +728,37 @@ void CheckHeldServiceLeavesTheCollectToItsOwnWalk() {
     Require(seen, "a collect beside a held service hid a store made before the ordering point");
 }
 
+void CheckObservedProofCopiesEarlierStamps() {
+    const auto address = Base + 120 * Block;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> settled;
+    static_cast<void>(CollectWrittenBlocks(address, Block, 0, settled));
+    const auto before = TrackerGeneration();
+    const auto written = MarkWritten(address, Page);
+    Require(written > before, "the driver write did not advance the tracker");
+    BumpCollectEpoch();
+    Require(CollectWrites(address, Block) != 0, "the first collect of the leaf failed");
+    Require(!UnchangedSinceObserved(address, Page, before), "an observed proof missed a stamp made before its observation table existed");
+    Require(UnchangedSinceObserved(address, Page, written), "an observed proof rejected an unchanged block");
+}
+
+void CheckObservedProofSeesLaterStamps() {
+    const auto address = Base + 122 * Block;
+    const auto page = address + 3 * Page;
+    BumpCollectEpoch();
+    const auto collected = CollectWrites(address, Block);
+    Require(collected != 0 && UnchangedSinceObserved(address, Block, collected), "a freshly collected block did not prove unchanged");
+    const auto driver = MarkWritten(address + Page, Page);
+    Require(driver > collected, "the driver write did not advance the tracker");
+    Require(!UnchangedSinceObserved(address, Block, collected), "an observed proof missed a driver stamp made after the walk");
+    BumpCollectEpoch();
+    Require(CollectWrites(address, Block) != 0, "the second collect failed");
+    const auto settled = TrackerGeneration();
+    Store(page);
+    BumpCollectEpoch();
+    Require(CollectWrites(address, Block) != 0, "the third collect failed");
+    Require(!UnchangedSinceObserved(page, Page, settled), "an observed proof missed a CPU store stamped by the epoch's walk");
+}
+
 void CheckPartialGroupIsNotAHit() {
     for (std::uint64_t offset = 0; offset < 64; ++offset) {
         BumpCollectEpoch();
@@ -812,12 +843,16 @@ int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
         SetObservationServiceForTest(false);
+#ifndef _WIN32
+        CheckObservedProofCopiesEarlierStamps();
+#endif
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
             return 77;
         }
         const Arena arena;
+        CheckObservedProofCopiesEarlierStamps();
 #else
         CheckMemoHitDuringWalk();
         CheckFailedWalkIsRetried();
@@ -863,6 +898,7 @@ int main(int argc, char** argv) {
         CheckAdoptingAnOlderEpochKeepsTheNewer();
         CheckServiceObservesUsedRunsAhead();
         CheckHeldServiceLeavesTheCollectToItsOwnWalk();
+        CheckObservedProofSeesLaterStamps();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;

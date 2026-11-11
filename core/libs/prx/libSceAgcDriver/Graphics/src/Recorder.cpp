@@ -3326,7 +3326,7 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     }
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto guestBytes = use == SnapshotUse::PaddedVertex ? static_cast<std::size_t>(found->second.derived) : bytes;
-    if (!sameRegistry || !GuestMemory::UnchangedSince(address, guestBytes, found->second.generation)) {
+    if (!sameRegistry || !(use == SnapshotUse::Storage ? GuestMemory::UnchangedSince(address, guestBytes, found->second.generation) : GuestMemory::UnchangedSinceObserved(address, guestBytes, found->second.generation))) {
         if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
             eraseDrawSnapshot(found);
             return {};
