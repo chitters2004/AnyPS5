@@ -1425,6 +1425,27 @@ void SetDrawPlansForTest(int enabled) {
 
 namespace {
 
+std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const CompiledShader& shader) {
+    const auto walk = [&] {
+        std::vector<std::uint32_t> words;
+        ShaderResources::AppendContentKey(shader, true, false, words);
+        return words;
+    };
+    auto& memo = shader.program->planKeyMemo.words;
+    auto words = memo.load(std::memory_order_acquire);
+    if (words == nullptr) {
+        words = std::make_shared<const std::vector<std::uint32_t>>(walk());
+        memo.store(words, std::memory_order_release);
+    } else if (VerifyDrawPlans()) {
+        Require(*words == walk(), "APS5_VERIFY_DRAW_PLANS: a program's memoized plan binding words differ from a walk of its bindings");
+    }
+    return words;
+}
+
+}
+
+namespace {
+
 std::shared_ptr<const DrawRecipe>& DrawPlanShadowSlot() {
     thread_local std::shared_ptr<const DrawRecipe>* slot = nullptr;
     return ShaderRecompiler::ThreadOwned(slot);
@@ -3852,7 +3873,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->hasDepth = state.depth.has_value();
             recipe->renderExtent = state.renderExtent;
             if (DrawPlans()) {
-                for (const auto& shader : shaders) ShaderResources::AppendContentKey(shader, true, false, recipe->bindingWords);
+                for (const auto& shader : shaders) recipe->bindingWords.push_back(PlanBindingWords(shader));
             }
             if (servable) *recipeOut = std::move(recipe);
             else DrawPlanShadowSlot() = std::move(recipe);
@@ -4310,12 +4331,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
     const bool planned = use == DrawRecipeUse::Plan;
     if (planned) {
-        if (recipe.bindingWords.empty() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
-        thread_local std::vector<std::uint32_t>* wordsSlot = nullptr;
-        auto& words = ShaderRecompiler::ThreadOwned(wordsSlot);
-        words.clear();
-        for (const auto& shader : shaders) ShaderResources::AppendContentKey(shader, true, false, words);
-        if (words != recipe.bindingWords) return miss(DrawRecipeMiss::Instance);
+        if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
+        for (std::size_t index = 0; index < shaders.size(); ++index) {
+            const auto words = PlanBindingWords(shaders[index]);
+            if (words == recipe.bindingWords[index]) {
+                ++result.sharedBindingStages;
+                continue;
+            }
+            ++result.comparedBindingStages;
+            if (*words != *recipe.bindingWords[index]) return miss(DrawRecipeMiss::Instance);
+        }
         ValidateVertexAddresses(shaders.front().program->vertexAttributes);
     }
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);

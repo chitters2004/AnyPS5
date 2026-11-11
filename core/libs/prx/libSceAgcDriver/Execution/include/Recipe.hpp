@@ -86,7 +86,7 @@ struct DrawRecipe {
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
     VkExtent2D renderExtent{};
-    std::vector<std::uint32_t> bindingWords;
+    std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> bindingWords;
     bool servable = true;
     std::uint32_t movedBases = 0;
 };
