@@ -92,6 +92,13 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    void RecordPassStartBarrier(VkCommandBuffer commands);
+    void SettlePassEnd();
+    static bool FuseBarriers();
+    struct FusionStatistics {
+        std::uint64_t fused, settled, fencedKeyOnly, trailingFused;
+    };
+    static FusionStatistics FusionCounts();
     void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -556,6 +563,9 @@ public:
     std::uint32_t BeginInPassGpuTiming(std::uint64_t key);
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
+    void TagGpuTiming(std::uint32_t index, std::uint8_t tag);
+    static void NoteBarrierMasks(VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage);
+    static bool DiagNoPassBarriers();
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
@@ -566,6 +576,7 @@ public:
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    void OweTrailingBarrier(const BarrierMask& mask, CommandClass which);
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
@@ -634,6 +645,8 @@ public:
     static bool FlipReadCheck();
 
 private:
+    void settleOwed();
+    void oweBarrier(const BarrierMask& mask, CommandClass which, bool passEnd);
     struct Batch;
     struct WideLabel {
         std::uint64_t end;
@@ -693,6 +706,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::uint8_t> timedTags;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -770,6 +784,10 @@ private:
             PassBreak closedBy = PassBreak::NewBatch;
         } renderPass;
         PassHazards passHazards;
+        bool owing = false;
+        bool owesPassEnd = false;
+        BarrierMask owed{};
+        CommandClass owedClass = CommandClass::Draw;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -823,6 +841,7 @@ private:
     };
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
+    bool holdOwed = false;
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;

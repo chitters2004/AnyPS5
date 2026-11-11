@@ -11234,6 +11234,8 @@ public:
         }
     }
     ~CoverPass() { release(); }
+    void Begin(VkCommandBuffer commands) const { begin(commands); }
+    VkPipeline Pipeline() const { return pipeline; }
     CoverPass(const CoverPass&) = delete;
     CoverPass& operator=(const CoverPass&) = delete;
 
@@ -11318,6 +11320,250 @@ private:
     VkShaderModule fragment = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
 };
+
+namespace FusionTrace {
+
+enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch };
+
+struct Event {
+    Kind kind;
+    BarrierMask mask;
+};
+
+std::vector<Event> events;
+constexpr std::uint32_t DispatchValue = 0xd15;
+PFN_vkGetDeviceProcAddr realProc = nullptr;
+PFN_vkCmdPipelineBarrier realBarrier = nullptr;
+PFN_vkCmdBeginRenderPass realBeginPass = nullptr;
+PFN_vkCmdBeginRenderingKHR realBeginRendering = nullptr;
+PFN_vkCmdEndRenderPass realEndPass = nullptr;
+PFN_vkCmdEndRenderingKHR realEndRendering = nullptr;
+PFN_vkCmdDraw realDraw = nullptr;
+PFN_vkCmdFillBuffer realFill = nullptr;
+
+VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
+    BarrierMask mask{source, destination, 0, 0};
+    for (std::uint32_t i = 0; i < memoryCount; ++i) {
+        mask.srcAccess |= memory[i].srcAccessMask;
+        mask.dstAccess |= memory[i].dstAccessMask;
+    }
+    mask.changesLayout = imageCount != 0 || bufferCount != 0;
+    events.push_back({Kind::Barrier, mask});
+    realBarrier(commands, source, destination, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
+}
+
+VKAPI_ATTR void VKAPI_CALL BeginPass(VkCommandBuffer commands, const VkRenderPassBeginInfo* info, VkSubpassContents contents) {
+    events.push_back({Kind::Begin, {}});
+    realBeginPass(commands, info, contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL BeginRendering(VkCommandBuffer commands, const VkRenderingInfoKHR* info) {
+    events.push_back({Kind::Begin, {}});
+    realBeginRendering(commands, info);
+}
+
+VKAPI_ATTR void VKAPI_CALL EndPass(VkCommandBuffer commands) {
+    events.push_back({Kind::End, {}});
+    realEndPass(commands);
+}
+
+VKAPI_ATTR void VKAPI_CALL EndRendering(VkCommandBuffer commands) {
+    events.push_back({Kind::End, {}});
+    realEndRendering(commands);
+}
+
+VKAPI_ATTR void VKAPI_CALL Draw(VkCommandBuffer commands, std::uint32_t vertices, std::uint32_t instances, std::uint32_t firstVertex, std::uint32_t firstInstance) {
+    events.push_back({Kind::Draw, {}});
+    realDraw(commands, vertices, instances, firstVertex, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL Fill(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint32_t value) {
+    events.push_back({value == DispatchValue ? Kind::Dispatch : Kind::Fill, {}});
+    realFill(commands, buffer, offset, bytes, value);
+}
+
+template<typename TFunction>
+PFN_vkVoidFunction Wrap(VkDevice device, const char* name, TFunction& real, TFunction wrapper) {
+    real = reinterpret_cast<TFunction>(realProc(device, name));
+    return real == nullptr ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(wrapper);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice device, const char* name) {
+    const std::string_view wanted(name);
+    if (wanted == "vkCmdPipelineBarrier") return Wrap(device, name, realBarrier, &Barrier);
+    if (wanted == "vkCmdBeginRenderPass") return Wrap(device, name, realBeginPass, &BeginPass);
+    if (wanted == "vkCmdBeginRenderingKHR" || wanted == "vkCmdBeginRendering") return Wrap(device, name, realBeginRendering, &BeginRendering);
+    if (wanted == "vkCmdEndRenderPass") return Wrap(device, name, realEndPass, &EndPass);
+    if (wanted == "vkCmdEndRenderingKHR" || wanted == "vkCmdEndRendering") return Wrap(device, name, realEndRendering, &EndRendering);
+    if (wanted == "vkCmdDraw") return Wrap(device, name, realDraw, &Draw);
+    if (wanted == "vkCmdFillBuffer") return Wrap(device, name, realFill, &Fill);
+    return realProc(device, name);
+}
+
+constexpr BarrierMask PassEndNeeds{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+constexpr BarrierMask PassStartNeeds{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+
+constexpr BarrierMask DispatchNeeds{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+
+bool CoveredBetween(std::size_t first, std::size_t before, const BarrierMask& needed) {
+    for (std::size_t i = first; i < before; ++i) {
+        auto mask = events[i].mask;
+        mask.changesLayout = false;
+        if (events[i].kind == Kind::Barrier && Covers(mask, needed)) return true;
+    }
+    return false;
+}
+
+void CheckOracle(const std::string& scenario) {
+    std::size_t afterCommand = 0;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        const auto kind = events[i].kind;
+        if (kind == Kind::Barrier) continue;
+        if (kind == Kind::Begin) Require(CoveredBetween(afterCommand, i, PassStartNeeds), scenario + ": a render pass began without a barrier after the previous command that orders earlier writes before it");
+        for (std::size_t end = 0; end < i; ++end) {
+            if (events[end].kind == Kind::End) Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
+            if (events[end].kind == Kind::Dispatch) Require(CoveredBetween(end + 1, i, DispatchNeeds), scenario + ": a command after a dispatch ran before its trailing barrier");
+        }
+        afterCommand = i + 1;
+    }
+}
+
+std::size_t BarriersAfterDispatch() {
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind != Kind::Dispatch) continue;
+        std::size_t next = i + 1;
+        while (next < events.size() && events[next].kind == Kind::Barrier) ++next;
+        return next - i - 1;
+    }
+    return 0;
+}
+
+std::size_t BarriersBetweenPasses() {
+    std::size_t most = 0;
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind != Kind::End) continue;
+        std::size_t count = 0;
+        std::size_t next = i + 1;
+        while (next < events.size() && events[next].kind == Kind::Barrier) {
+            ++count;
+            ++next;
+        }
+        if (next < events.size() && events[next].kind == Kind::Begin) most = std::max(most, count);
+    }
+    return most;
+}
+
+}
+
+void barrierFusionTests(const Device& device) {
+    auto context = device.GetContext();
+    context.functions = nullptr;
+    FusionTrace::realProc = context.deviceProc;
+    context.deviceProc = &FusionTrace::Proc;
+    Recorder recorder(context);
+    CoverPass cover(context);
+    DeviceBuffer scratch(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto fill = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, scratch.Handle(), 0, 256, 7); };
+    DeviceBuffer dispatched(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto dispatch = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::DispatchValue); };
+    const BarrierMask dispatchTrailing = FusionTrace::DispatchNeeds;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{0x10000, 0x20000}}};
+    const PassAccess writes{{}, range};
+    const PassAccess reads{range, {}};
+    const auto draw = [&](std::uint64_t key, const PassAccess& access, const std::function<void(VkCommandBuffer)>& between, std::function<void(VkCommandBuffer)> afterPass) {
+        const auto start = recorder.StartDrawPass(key, false, true, access);
+        if (!start.continued) {
+            recorder.PrepareSampleSlot();
+            if (between) between(start.commands);
+            if (start.barrier) recorder.RecordPassStartBarrier(start.commands);
+            cover.Begin(start.commands);
+        }
+        context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(start.commands, VK_PIPELINE_BIND_POINT_GRAPHICS, cover.Pipeline());
+        context.Function<PFN_vkCmdDraw>("vkCmdDraw")(start.commands, 3, 1, 0, 0);
+        recorder.LeaveRenderPassOpen(key, Recorder::NoTiming, true, access, std::move(afterPass));
+        return start;
+    };
+    const auto scenario = [&](const std::string& name, bool fusion, std::size_t pairBarriers, const std::function<void()>& body) {
+        RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierFusion, !fusion);
+        recorder.Submit();
+        recorder.Sync();
+        FusionTrace::events.clear();
+        body();
+        recorder.Submit();
+        recorder.Sync();
+        FusionTrace::CheckOracle(name);
+        if (pairBarriers != 0) Require(FusionTrace::BarriersBetweenPasses() == pairBarriers, name + ": " + std::to_string(FusionTrace::BarriersBetweenPasses()) + " barriers between a depth pass's end and the next pass's start, not " + std::to_string(pairBarriers));
+    };
+    for (const bool fusion : {true, false}) {
+        const std::size_t pair = fusion ? 1 : 2;
+        const std::string suffix = fusion ? " (fused)" : " (not fused)";
+        const auto before = Recorder::FusionCounts();
+        scenario("hazard break" + suffix, fusion, pair, [&] {
+            draw(1, writes, {}, {});
+            const auto start = draw(1, reads, {}, {});
+            Require(start.reason == PassBreak::ReadAfterWrite, "a read of a range the pass wrote did not break it as a read after write");
+        });
+        scenario("key break" + suffix, fusion, pair, [&] {
+            draw(2, PassAccess{}, {}, {});
+            const auto start = draw(3, PassAccess{}, {}, {});
+            Require(start.reason == PassBreak::Key, "a new pass key with no hazard did not break the pass as a key change");
+        });
+        const auto after = Recorder::FusionCounts();
+        Require(after.fused - before.fused == (fusion ? 2u : 0u), "the fused pass barriers were not counted");
+        Require(after.fencedKeyOnly - before.fencedKeyOnly == 1u, "the depth pass break without a hazard was not counted");
+    }
+    const auto settledBefore = Recorder::FusionCounts().settled;
+    scenario("command between the passes", true, 0, [&] {
+        draw(4, writes, {}, {});
+        draw(4, reads, [&](VkCommandBuffer) { fill(recorder.Commands()); }, {});
+    });
+    scenario("recording on the pass's buffer after settling", true, 0, [&] {
+        draw(5, writes, {}, {});
+        draw(5, reads, [&](VkCommandBuffer commands) {
+            recorder.SettlePassEnd();
+            fill(commands);
+        }, {});
+    });
+    scenario("work after the pass", true, 0, [&] {
+        draw(6, writes, {}, fill);
+        draw(6, reads, {}, {});
+    });
+    scenario("submit before the next pass begins", true, 0, [&] {
+        draw(7, writes, {}, {});
+        const auto start = recorder.StartDrawPass(7, false, true, reads);
+        Require(!start.continued && start.barrier, "a read after write continued the pass");
+    });
+    Require(Recorder::FusionCounts().settled - settledBefore == 3u, "an owed pass end recorded alone was not counted");
+    for (const bool fusion : {true, false}) {
+        const std::string suffix = fusion ? " (fused)" : " (not fused)";
+        const auto before = Recorder::FusionCounts();
+        scenario("dispatch then pass" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+            draw(8, PassAccess{}, {}, {});
+            Require(FusionTrace::BarriersAfterDispatch() == (fusion ? 1u : 2u), "dispatch then pass" + suffix + ": " + std::to_string(FusionTrace::BarriersAfterDispatch()) + " barriers between a dispatch and the next pass");
+        });
+        scenario("deferred dispatch then pass" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            const void* owner = &dispatched;
+            recorder.DeferDispatchBarrier(1, std::span(&owner, 1), {});
+            draw(9, PassAccess{}, {}, {});
+            Require(FusionTrace::BarriersAfterDispatch() == (fusion ? 1u : 2u), "deferred dispatch then pass" + suffix + ": " + std::to_string(FusionTrace::BarriersAfterDispatch()) + " barriers between a dispatch and the next pass");
+        });
+        scenario("dispatch then command" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+            fill(recorder.Commands());
+        });
+        scenario("dispatch then submit" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+        });
+        Require(Recorder::FusionCounts().trailingFused - before.trailingFused == (fusion ? 2u : 0u), "the trailing barriers fused into a pass start were not counted");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierFusion, false);
+    std::cout << "Barrier fusion tests passed\n";
+}
 
 void inPassSampleDumpTests(Recorder& recorder, const Context& context, const CoverPass& cover, std::uint64_t* words, std::uint64_t address, VkDeviceAddress target) {
     const auto samples = [&](std::uint64_t word) { return word & ~SampleReady; };
@@ -16457,6 +16703,12 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
+            return 0;
+        }
+
+        if (argc == 2 && std::string_view(argv[1]) == "--barrier-fusion-only") {
+            if (!device.Graphics()) return 77;
+            barrierFusionTests(device);
             return 0;
         }
 
