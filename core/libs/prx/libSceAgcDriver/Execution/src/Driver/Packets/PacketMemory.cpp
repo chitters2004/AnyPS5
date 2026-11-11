@@ -523,7 +523,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
             commitLabel(queue, address, bytes, interrupt);
         }, std::move(writes), address, std::move(stored));
     };
-    if (queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
+    if (queue == 0 && !DrawFinisher::Sequenced() && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
         DrawFinisher::Pending held;
         held.unknown = false;
         held.writes = std::move(writes);
