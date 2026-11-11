@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -37,6 +38,9 @@ bool DispatchItemsEnabled() {
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
+enum class NonCandidate : std::size_t { Ahead, Disabled, Indirect, Labels, CopyKernel, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(NonCandidate::Count)> NonCandidateNames{"resolved ahead", "items off", "indirect", "deferred labels", "copy kernel"};
+std::array<ProfileCounter, static_cast<std::size_t>(NonCandidate::Count)> nonCandidateDrains{};
 std::atomic<std::uint64_t> itemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
 
@@ -56,7 +60,13 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+    std::string excluded;
+    for (std::size_t i = 0; i < NonCandidateNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", NonCandidateNames[i], static_cast<unsigned long long>(nonCandidateDrains[i].Sum()));
+        excluded += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s; drained as no candidate, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str(), excluded.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -157,7 +167,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            const auto reason = fromAhead ? NonCandidate::Ahead : !DispatchItemsEnabled() ? NonCandidate::Disabled : indirectArguments != 0 ? NonCandidate::Indirect : !deferredLabels().labels.empty() ? NonCandidate::Labels : NonCandidate::CopyKernel;
+            if (DrawPipeline::Queue0().Busy()) nonCandidateDrains[static_cast<std::size_t>(reason)].Add();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
