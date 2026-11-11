@@ -40,6 +40,9 @@ constexpr std::uint32_t Initial = 0x3f800000u;
 constexpr std::uint32_t First = 0x11111111u;
 constexpr std::uint32_t Second = 0x33333333u;
 constexpr std::size_t Rounds = 8;
+constexpr std::uint32_t TileR64KBX = 0x1b;
+constexpr std::uint32_t TiledSide = 128;
+constexpr std::size_t TiledBytes = TiledSide * TiledSide * 4u;
 
 alignas(256) constexpr std::array<std::uint32_t, 11> FirstCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, First, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 11> SecondCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Second, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
@@ -103,16 +106,27 @@ ShaderRecompiler::RecompileResult Compile(std::span<const std::uint32_t> code, s
     return ShaderRecompiler::Recompile(request);
 }
 
-std::vector<std::uint32_t> LinearImageUserData(std::uint64_t base) {
+struct Shape {
+    const char* name;
+    std::uint32_t tileMode;
+    std::uint32_t width;
+    std::uint32_t height;
+    std::size_t bytes;
+};
+
+constexpr Shape Linear{"linear", 0u, Width, Height, ImageBytes};
+constexpr Shape Tiled{"tiled 64 KiB", TileR64KBX, TiledSide, TiledSide, TiledBytes};
+
+std::vector<std::uint32_t> ImageUserData(std::uint64_t base, const Shape& shape) {
     std::vector<std::uint32_t> userData(12, 0u);
     userData[4] = static_cast<std::uint32_t>(base >> 8u);
-    userData[5] = static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format32UInt << 20u) | (((Width - 1u) & 3u) << 30u);
-    userData[6] = ((Width - 1u) >> 2u) | ((Height - 1u) << 14u);
-    userData[7] = 0xfacu | (Type2D << 28u);
+    userData[5] = static_cast<std::uint32_t>((base >> 40u) & 0xffu) | (Format32UInt << 20u) | (((shape.width - 1u) & 3u) << 30u);
+    userData[6] = ((shape.width - 1u) >> 2u) | ((shape.height - 1u) << 14u);
+    userData[7] = 0xfacu | (shape.tileMode << 20u) | (Type2D << 28u);
     return userData;
 }
 
-double Sweep(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t images, const std::vector<ShaderRecompiler::RecompileResult>& first, const std::vector<ShaderRecompiler::RecompileResult>& second) {
+double Sweep(AgcDriver::VulkanDevice& device, const GuestBlock& guest, const Shape& shape, std::size_t images, const std::vector<ShaderRecompiler::RecompileResult>& first, const std::vector<ShaderRecompiler::RecompileResult>& second) {
     std::vector<double> micros;
     for (std::size_t round = 0; round < Rounds; ++round) {
         const auto& programs = round % 2 == 0 ? first : second;
@@ -124,8 +138,9 @@ double Sweep(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size
         device.WaitIdle();
         const auto expected = round % 2 == 0 ? First : Second;
         for (std::size_t index = 0; index < images; ++index) {
-            const auto* words = guest.Words() + index * ImageBytes / 4u;
-            Require(words[0] == expected && words[100u * Width] == expected, "label store sweep: image " + std::to_string(index) + " of " + std::to_string(images) + " was not stored by the sweep in round " + std::to_string(round));
+            const auto* words = guest.Words() + index * shape.bytes / 4u;
+            const auto stored = std::count(words, words + shape.bytes / 4u, expected);
+            Require(stored == 2, "label store sweep: " + std::string(shape.name) + " image " + std::to_string(index) + " of " + std::to_string(images) + " holds " + std::to_string(stored) + " stored texels after the sweep in round " + std::to_string(round) + ", expected 2");
         }
     }
     std::sort(micros.begin(), micros.end());
@@ -139,15 +154,20 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock guest(AgcDriver::GuestMemory::WriteWatched());
-        std::vector<ShaderRecompiler::RecompileResult> first, second;
-        for (std::size_t index = 0; index < MaxImages; ++index) {
-            const auto userData = LinearImageUserData(guest.Address() + index * ImageBytes);
-            first.push_back(Compile(FirstCode, userData, device->Target()));
-            second.push_back(Compile(SecondCode, userData, device->Target()));
-        }
-        for (const std::size_t images : {std::size_t{1}, std::size_t{4}, std::size_t{16}, MaxImages}) {
-            const auto median = Sweep(*device, guest, images, first, second);
-            std::printf("label store sweep: %zu pending linear images, median %.1f us per sweep (%.1f us per image) over %zu rounds\n", images, median, median / static_cast<double>(images), Rounds);
+        for (const auto* shape : {&Linear, &Tiled}) {
+            std::fill(guest.Words(), guest.Words() + BlockBytes / 4u, Initial);
+            AgcDriver::GuestMemory::CollectWritesUncached(guest.Address(), BlockBytes);
+            std::vector<ShaderRecompiler::RecompileResult> first, second;
+            for (std::size_t index = 0; index < MaxImages; ++index) {
+                const auto userData = ImageUserData(guest.Address() + index * shape->bytes, *shape);
+                first.push_back(Compile(FirstCode, userData, device->Target()));
+                second.push_back(Compile(SecondCode, userData, device->Target()));
+            }
+            for (const std::size_t images : {std::size_t{1}, std::size_t{4}, std::size_t{16}, MaxImages}) {
+                const auto median = Sweep(*device, guest, *shape, images, first, second);
+                std::printf("label store sweep: %zu pending %s images, median %.1f us per sweep (%.1f us per image) over %zu rounds\n", images, shape->name, median, median / static_cast<double>(images), Rounds);
+            }
+            device->WaitIdle();
         }
         std::puts("label store sweep tests passed");
         return 0;
