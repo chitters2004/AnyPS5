@@ -2573,6 +2573,9 @@ void CheckThrowAfterConsume(bool released) {
     Require(before != 0, "the throwing consume fixture was not collected");
     Require(UnchangedSince(base, bytes, before), "the throwing consume fixture changed before its write");
     const auto invalidations = ConservativeInvalidationsForTest();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> subscribed{{{base, base + bytes}}};
+    const auto subscription = SubscribeWrites(subscribed);
+    const auto certificate = subscription != nullptr ? CertifySubscription(*subscription, 0) : WriteCertificate{};
     data[Block + 64] = 0x22;
     throwAfterConsume.store(true, std::memory_order_release);
     SetConsumedWalkHookForTest(&ThrowAfterConsume);
@@ -2587,6 +2590,7 @@ void CheckThrowAfterConsume(bool released) {
     Require(ConservativeInvalidationsForTest() == invalidations + 1, "a throw after a destructive collect did not invalidate conservatively");
     Require(!UnchangedSince(base, bytes, before), "a write consumed by a collect that then threw was lost");
     Require(CpuWroteSince(base + Block, 4096, before), "a CPU write consumed by a collect that then threw was lost");
+    Require(subscription == nullptr || !CertificateHolds(*subscription, certificate, 0), "a write-index certificate over a range whose consumed write was lost still held");
     const auto after = CollectWritesUncached(base, bytes);
     Require(UnchangedSince(base, bytes, after), "the conservative invalidation kept the range changed after a later collect");
 }
