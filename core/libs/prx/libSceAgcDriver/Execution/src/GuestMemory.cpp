@@ -575,6 +575,18 @@ public:
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
         AgcDriver::ProfilePrint_nid_no_patch("\n");
+#ifdef _WIN32
+        constexpr std::array<const char*, 9> mappingSites{"handlewrite", "handleread", "collect", "registry", "pin", "hostwrite", "owned", "zero", "other"};
+        std::array<std::uint64_t, mappingSites.size() * 3> mappingCounts{};
+        std::uint64_t frequency = 0;
+        if (GuestArena::GuestArenaMappingLockCounts_nid_no_patch(mappingCounts.data(), mappingCounts.size(), &frequency) == mappingCounts.size() && frequency != 0) {
+            AgcDriver::ProfilePrint_nid_no_patch("[winmap] mapping lock by site, acquisitions/contended/ms waited:");
+            for (std::size_t site = 0; site < mappingSites.size(); ++site) {
+                AgcDriver::ProfilePrint_nid_no_patch(" %s %llu/%llu/%.1f", mappingSites[site], static_cast<unsigned long long>(mappingCounts[site * 3]), static_cast<unsigned long long>(mappingCounts[site * 3 + 1]), static_cast<double>(mappingCounts[site * 3 + 2]) * 1000.0 / static_cast<double>(frequency));
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("\n");
+        }
+#endif
     }
 private:
     MemoryCounterKind kind;
