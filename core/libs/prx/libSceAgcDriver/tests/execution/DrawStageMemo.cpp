@@ -172,6 +172,16 @@ void KeysFollowEveryInput() {
     Expect(!(KeyOf(base, snapshot, 4) == reference), "the key ignores the code offset");
     Expect(!(KeyOf(base, snapshot, 0, 2) == reference), "the key ignores the device");
 
+    auto split = pixelParts.Request();
+    DrawStageKey separate;
+    const auto pixelInfo = *split.context.pixel;
+    split.context.pixel.reset();
+    Expect(BuildDrawStageKey(split, &pixelInfo, nullptr, snapshot, 0, 1, separate) && separate == pixelKey, "a key built from stage info passed beside the request differs from one built from the request");
+    auto vertexSplit = base.Request();
+    const auto vertexInfo = *vertexSplit.context.vertex;
+    vertexSplit.context.vertex.reset();
+    Expect(BuildDrawStageKey(vertexSplit, nullptr, &vertexInfo, snapshot, 0, 1, separate) && separate == reference, "a key built from vertex info passed beside the request differs from one built from the request");
+
     DrawStageKey refused;
     auto barycentric = base.Request();
     barycentric.graphics->meshBarycentrics = ShaderRecompiler::MeshBarycentricLayout{};
@@ -410,6 +420,10 @@ Step Measure(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, c
     step.counts = Since(before, driver.StageMemoCounts());
     const auto& c = step.counts;
     std::printf("%s: brightest %u; memo lookups %llu, absent %llu, proved %llu, compared %llu, stale %llu, inserts %llu, verified %llu; validated stages reused %llu\n", label, step.brightest, static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.absent), static_cast<unsigned long long>(c.proved), static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.stale), static_cast<unsigned long long>(c.inserts), static_cast<unsigned long long>(c.verified), static_cast<unsigned long long>(c.validatedReused));
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr && c.lookups != 0) {
+        const auto served = c.proved + c.compared;
+        std::printf("  lookup cost: %.2f us per served stage, %.2f us per missed lookup\n", served != 0 ? static_cast<double>(c.hitNanoseconds) / 1000.0 / static_cast<double>(served) : 0.0, c.lookups > served ? static_cast<double>(c.missNanoseconds) / 1000.0 / static_cast<double>(c.lookups - served) : 0.0);
+    }
     return step;
 }
 

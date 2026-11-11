@@ -65,7 +65,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     PerformanceTimer timing("Shader.DrawStage");
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
-    auto request = DrawStageRequest(program, pushOffset, graphics, pixel, vertexInfos[i], memory, linked, drawParameters, localDevice->Target(), meshBarycentrics);
+    auto request = DrawStageRequest(program, pushOffset, graphics, memory, linked, drawParameters, localDevice->Target(), meshBarycentrics);
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) request.context.pixel = pixel;
+    request.context.vertex = vertexInfos[i];
     bool linkedCode = false;
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = [&] {
