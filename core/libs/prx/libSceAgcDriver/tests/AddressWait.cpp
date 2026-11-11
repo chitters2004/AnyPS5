@@ -186,7 +186,10 @@ void BoundedQueue(Watchdog& watchdog) {
                 notEmpty.NotifyOne();
             }
             std::lock_guard lock(mutex);
-            if (--producersLeft == 0) notEmpty.NotifyAll();
+            if (--producersLeft == 0) {
+                notEmpty.NotifyAll();
+                drained.NotifyAll();
+            }
         });
     }
     for (int consumer = 0; consumer < Consumers; ++consumer) {
@@ -529,6 +532,7 @@ struct ColdWake {
     double medianNs;
     double p90Ns;
     double notifyNs;
+    double cpuNs;
     std::uint64_t rescues;
 };
 
@@ -541,6 +545,7 @@ ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
     std::uint64_t rescues = 0;
     latencies.reserve(static_cast<std::size_t>(rounds));
     notifies.reserve(static_cast<std::size_t>(rounds));
+    const auto cpuStart = ThreadsCpuSeconds();
     std::thread waiter([&] {
         for (int round = 1; round <= rounds; ++round) {
             armed.store(round, std::memory_order_release);
@@ -570,9 +575,10 @@ ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
         stalled = Clock::now() + 100ms;
     }
     waiter.join();
+    const auto cpu = (ThreadsCpuSeconds() - cpuStart) * 1e9 / rounds;
     std::ranges::sort(latencies);
     std::ranges::sort(notifies);
-    return {latencies[latencies.size() / 2], latencies[latencies.size() * 9 / 10], notifies[notifies.size() / 2], rescues};
+    return {latencies[latencies.size() / 2], latencies[latencies.size() * 9 / 10], notifies[notifies.size() / 2], cpu, rescues};
 }
 
 template<typename TWord, bool Native>
@@ -621,7 +627,7 @@ void Print(const char* what, const std::function<Measurement()>& measure) {
 }
 
 void PrintCold(const char* what, ColdWake value) {
-    std::printf("%-56s median %8.0f ns, p90 %8.0f ns, notifier %6.0f ns, %llu lost wakeups\n", what, value.medianNs, value.p90Ns, value.notifyNs, static_cast<unsigned long long>(value.rescues));
+    std::printf("%-56s median %8.0f ns, p90 %8.0f ns, notifier %6.0f ns, %8.0f ns CPU per round, %llu lost wakeups\n", what, value.medianNs, value.p90Ns, value.notifyNs, value.cpuNs, static_cast<unsigned long long>(value.rescues));
 }
 
 int Benchmark() {
