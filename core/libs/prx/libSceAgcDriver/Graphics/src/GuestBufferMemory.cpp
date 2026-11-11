@@ -5856,14 +5856,26 @@ struct ResidentRange {
     std::vector<std::byte> shadow;
     std::uint64_t syncGeneration = 0;
     std::uint64_t forgetStamp = 0;
+    std::uint64_t usedRecorder = 0;
+    std::uint64_t usedBatch = 0;
     bool boundInWindow = true;
 };
+
+struct ResidentHeat {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint32_t count = 0;
+};
+
+constexpr std::size_t ResidentHeatSlots = 256;
 
 struct ResidentRanges {
     std::mutex mutex;
     VkDevice device = VK_NULL_HANDLE;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
-    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
+    std::array<ResidentHeat, ResidentHeatSlots> heat{};
+    std::uint64_t armedRecorder = 0;
+    std::uint64_t armedBatch = 0;
     std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0;
     std::uint64_t kept = 0, refused = 0, discarded = 0, presents = 0;
     ResidentStatistics total;
@@ -5890,7 +5902,7 @@ void reportResidents(ResidentRanges& residents) {
     if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB, %.1f KiB per present over %llu presents) / %llu made, %llu invalidated by other stamps, %llu kept across their own copy-back, %llu refused for a copy-back that would store over CPU bytes, %llu dropped with a discarded batch\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, windowPresents != 0 ? residents.skippedBytes / 1024.0 / static_cast<double>(windowPresents) : 0.0, static_cast<unsigned long long>(windowPresents), static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.kept), static_cast<unsigned long long>(residents.refused), static_cast<unsigned long long>(residents.discarded));
     residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = 0;
     residents.kept = residents.refused = residents.discarded = 0;
-    residents.heat.clear();
+    residents.heat.fill({});
     for (auto it = residents.ranges.begin(); it != residents.ranges.end();) {
         if (it->second.boundInWindow) {
             it->second.boundInWindow = false;
@@ -5909,7 +5921,7 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
     std::lock_guard lock(residents.mutex);
     if (residents.device != context.device) {
         residents.ranges.clear();
-        residents.heat.clear();
+        residents.heat.fill({});
         residents.device = context.device;
     }
     reportResidents(residents);
@@ -5924,7 +5936,12 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
         }
         residents.ranges.erase(found);
     }
-    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
+    auto mix = begin * 0x9e3779b97f4a7c15ull + end;
+    mix = (mix ^ (mix >> 30u)) * 0xbf58476d1ce4e5b9ull;
+    mix = (mix ^ (mix >> 27u)) * 0x94d049bb133111ebull;
+    auto& heat = residents.heat[static_cast<std::size_t>((mix ^ (mix >> 31u)) % ResidentHeatSlots)];
+    if (heat.begin != begin || heat.end != end) heat = {begin, end, 0};
+    if (++heat.count < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
     auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(context, true));
     if (buffer == nullptr) return nullptr;
     residents.ranges[key] = ResidentRange{buffer, {}, 0, forget, true};
@@ -6023,16 +6040,34 @@ void residentRefused() {
     ++residents.total.refused;
 }
 
-void residentsDiscarded(const std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>>& used) {
+bool residentUsed(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, std::uint64_t recorder, std::uint64_t batch) {
     auto& residents = Residents();
     std::lock_guard lock(residents.mutex);
-    for (const auto& [key, buffer] : used) {
-        const auto found = residents.ranges.find(key);
-        if (found == residents.ranges.end() || found->second.buffer != buffer) continue;
-        residents.ranges.erase(found);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer) return false;
+    found->second.usedRecorder = recorder;
+    found->second.usedBatch = batch;
+    if (residents.armedRecorder == recorder && residents.armedBatch == batch) return false;
+    residents.armedRecorder = recorder;
+    residents.armedBatch = batch;
+    return true;
+}
+
+void residentsDiscarded(std::uint64_t recorder, std::uint64_t batch) {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    for (auto it = residents.ranges.begin(); it != residents.ranges.end();) {
+        if (it->second.usedRecorder != recorder || it->second.usedBatch != batch) {
+            ++it;
+            continue;
+        }
+        it = residents.ranges.erase(it);
         ++residents.discarded;
         ++residents.total.discarded;
     }
+    if (residents.armedRecorder != recorder || residents.armedBatch != batch) return;
+    residents.armedRecorder = 0;
+    residents.armedBatch = 0;
 }
 
 bool residentShadowed(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
@@ -6125,7 +6160,7 @@ void ClearResidentRanges(VkDevice device) {
     std::lock_guard lock(residents.mutex);
     if (residents.device != device) return;
     residents.ranges.clear();
-    residents.heat.clear();
+    residents.heat.fill({});
     residents.device = VK_NULL_HANDLE;
 }
 
@@ -6811,19 +6846,19 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
-    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>> used;
     struct DiscardUsed {
         Recorder& recorder;
-        std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>>& used;
+        std::uint64_t batch;
+        bool arm = false;
         ~DiscardUsed() {
-            if (used.empty()) return;
+            if (!arm) return;
             try {
-                recorder.OnDiscard([used = std::move(used)] { residentsDiscarded(used); });
+                recorder.OnDiscard([id = recorder.Id(), batch = batch] { residentsDiscarded(id, batch); });
             } catch (...) {
-                residentsDiscarded(used);
+                residentsDiscarded(recorder.Id(), batch);
             }
         }
-    } discardUsed{*recorder, used};
+    } discardUsed{*recorder, recorder->Submissions() + 1};
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
@@ -6845,7 +6880,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         region->residentSkipped = false;
         if (region->resident && region->deviceLocal) {
-            used.emplace_back(std::pair{region->begin, region->end}, region->buffer);
+            if (residentUsed(region->begin, region->end, region->buffer, recorder->Id(), discardUsed.batch)) discardUsed.arm = true;
             if (copyBackKeepsCpuBytes(*region, *recorder)) {
                 if (residentCurrent(region->begin, region->end, region->buffer)) {
                     region->residentSkipped = true;
