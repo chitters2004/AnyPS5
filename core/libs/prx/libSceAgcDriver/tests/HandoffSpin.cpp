@@ -184,15 +184,59 @@ void CheckAdaptation() {
         }
     }
     Require(spun == 2, "a site that stopped spinning did not probe once every " + std::to_string(HandoffSite::ProbeEvery) + " calls");
+    std::atomic<bool> polling{false};
     std::atomic<bool> released{false};
     std::thread releaser([&] {
-        std::this_thread::sleep_for(30us);
+        while (!polling.load(std::memory_order_acquire)) std::this_thread::yield();
         released.store(true, std::memory_order_release);
     });
-    HandoffSite catching{"catching", 10ms, true};
-    const auto caught = catching.Spin([&] { return released.load(std::memory_order_acquire); });
+    HandoffSite catching{"catching", 1s, true};
+    int polls = 0;
+    const auto caught = catching.Spin([&] {
+        if (++polls == 2) polling.store(true, std::memory_order_release);
+        return released.load(std::memory_order_acquire);
+    });
     releaser.join();
-    Require(caught.ready && catching.Window() < 10ms && catching.Window() >= HandoffSite::Floor, "a caught hand-off did not shrink the window from the cap");
+    Require(caught.ready && catching.Window() < 1s && catching.Window() >= HandoffSite::Floor, "a caught hand-off did not shrink the window from the cap");
+}
+
+void CheckConvergence() {
+    HandoffSite site{"converging", 1s, true};
+    const auto shortHandoff = [&] {
+        int polls = 0;
+        return site.Spin([&] { return ++polls >= 2; });
+    };
+    const auto longHandoff = [&] { return site.Spin([] { return false; }); };
+    const auto missesToStop = [](std::chrono::nanoseconds window) {
+        int bound = 1;
+        for (auto limit = window; limit >= HandoffSite::Floor; limit /= 2) ++bound;
+        return bound;
+    };
+    for (int cycle = 0; cycle < 3; ++cycle) {
+        for (int wait = 0; wait < 64; ++wait) Require(shortHandoff().ready, "a hand-off ready on the second poll was missed while hand-offs were short");
+        const auto learned = site.Window();
+        Require(learned >= HandoffSite::Floor && learned < 1s, "short hand-offs did not shrink the window from the cap");
+        const auto bound = missesToStop(learned);
+        int waits = 0;
+        while (site.Window() > 0ns) {
+            Require(!longHandoff().ready, "a hand-off that never arrived was reported as caught");
+            Require(++waits <= bound, "the window did not reach zero within " + std::to_string(bound) + " waits after hand-offs became long");
+        }
+        int spun = 0;
+        for (std::uint32_t wait = 0; wait < 2 * HandoffSite::ProbeEvery; ++wait) {
+            const auto result = longHandoff();
+            if (result.end != result.start) ++spun;
+            Require(site.Window() == 0ns, "a probe that missed restarted the spin");
+        }
+        Require(spun >= 1 && spun <= 2, "long hand-offs were not probed once every " + std::to_string(HandoffSite::ProbeEvery) + " waits");
+        waits = 0;
+        for (;;) {
+            ++waits;
+            if (shortHandoff().ready) break;
+            Require(waits <= static_cast<int>(HandoffSite::ProbeEvery), "a probe did not relearn short hand-offs within " + std::to_string(HandoffSite::ProbeEvery) + " waits");
+        }
+        Require(site.Window() >= HandoffSite::Floor, "a caught probe did not restart the spin");
+    }
 }
 
 void CheckRecursion() {
@@ -218,6 +262,7 @@ int main() {
         CheckRecursion();
         CheckHandoffSite();
         CheckAdaptation();
+        CheckConvergence();
         std::cout << "handoff spin tests passed\n";
         return 0;
     } catch (const std::exception& error) {
