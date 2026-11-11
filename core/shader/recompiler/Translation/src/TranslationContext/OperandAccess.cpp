@@ -741,6 +741,7 @@ void TranslationContext::writeRawU32(const RdnaOperand& operand, IrU32 value) {
                 if (shared) written = IrU32(ir.Emit(IrOpcode::DppUpdateU32, IrType::U32, {&ir.Constant(1u), &ir.Constant(0u), &ir.GetExec()}, flags));
             } else {
                 value = IrU32(ir.Select(ir.GetExec(), value.Value(), old));
+                if (nanFast) program.Metadata().nanSpeculationLaneWrites.push_back(&value.Value());
                 if (shared) written = IrU32(ir.Select(ir.GetExec(), ir.Constant(1u), ir.Constant(0u)));
             }
             if (shared) value = shareVectorWrite(operand, value, written, readByInstruction);

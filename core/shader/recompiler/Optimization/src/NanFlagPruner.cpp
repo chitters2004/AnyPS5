@@ -1,6 +1,7 @@
 #include "Optimization/NanFlagPruner.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -110,7 +111,7 @@ std::uint8_t Propagate(const IrValue& user, std::size_t argument, std::uint8_t l
     }
 }
 
-bool Reaches(IrValue& start, std::uint8_t lane, const std::unordered_map<const IrValue*, std::uint8_t>& kept) {
+bool Reaches(IrValue& start, std::uint8_t lane, const std::unordered_map<const IrValue*, std::uint8_t>& kept, const std::unordered_set<const IrValue*>& laneWrites) {
     std::vector<std::pair<IrValue*, std::uint8_t>> pending{{&start, lane}};
     std::unordered_map<const IrValue*, std::uint8_t> seen;
     std::size_t steps = 0;
@@ -129,7 +130,8 @@ bool Reaches(IrValue& start, std::uint8_t lane, const std::unordered_map<const I
             }
             for (std::size_t argument = 0; argument < user->ArgumentCount(); ++argument) {
                 if (user->Argument(argument) != value) continue;
-                const std::uint8_t next = Propagate(*user, argument, lanes);
+                const bool laneWrite = argument == 1u && user->ArgumentCount() == 3u && laneWrites.contains(user);
+                const std::uint8_t next = laneWrite ? lanes : Propagate(*user, argument, lanes);
                 if (next != 0u) pending.emplace_back(user, next);
             }
         }
@@ -142,8 +144,13 @@ bool Reaches(IrValue& start, std::uint8_t lane, const std::unordered_map<const I
 NanFlagPruneStats NanFlagPruner::Prune(IrProgram& program) const {
     NanFlagPruneStats stats;
     auto& checks = program.Metadata().nanSpeculationChecks;
-    if (checks.empty()) return stats;
+    if (checks.empty()) {
+        program.Metadata().nanSpeculationLaneWrites.clear();
+        return stats;
+    }
     IrBuilder builder(program);
+    const auto& writes = program.Metadata().nanSpeculationLaneWrites;
+    const std::unordered_set<const IrValue*> laneWrites(writes.begin(), writes.end());
     std::unordered_map<const IrValue*, std::uint8_t> kept;
     std::uint32_t region = checks.back().region;
     for (auto check = checks.rbegin(); check != checks.rend(); ++check) {
@@ -156,7 +163,7 @@ NanFlagPruneStats NanFlagPruner::Prune(IrProgram& program) const {
         if (condition == nullptr || condition->Parent() == nullptr || !condition->HasUses()) continue;
         bool covered = true;
         for (const std::uint8_t lane : {Low, High, Word}) {
-            if ((check->lanes & lane) != 0u && !Reaches(*value, lane, kept)) {
+            if ((check->lanes & lane) != 0u && !Reaches(*value, lane, kept, laneWrites)) {
                 covered = false;
                 break;
             }
@@ -169,6 +176,7 @@ NanFlagPruneStats NanFlagPruner::Prune(IrProgram& program) const {
         kept[value] |= check->lanes;
     }
     checks.clear();
+    program.Metadata().nanSpeculationLaneWrites.clear();
     return stats;
 }
 

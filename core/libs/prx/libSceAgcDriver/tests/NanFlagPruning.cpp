@@ -203,6 +203,21 @@ std::vector<Case> Cases() {
             b.prune();
             return !Removed(vc) && Removed(uc);
         }},
+        {"a lane write passes its new value but not the old one", [](Builder& b) {
+            auto& v = b.emit(IrOpcode::FPMul16x2, IrType::U32, {&b.unknown(), &b.unknown()});
+            auto& vc = b.check(v, Both);
+            auto& exec = b.emit(IrOpcode::IEqual32, IrType::Bool, {&b.unknown(), &b.constant(0u)});
+            auto& written = b.emit(IrOpcode::SelectU32, IrType::U32, {&exec, &v, &b.unknown()});
+            b.program.Metadata().nanSpeculationLaneWrites.push_back(&written);
+            b.check(Packed(b, written), Both);
+            auto& u = b.emit(IrOpcode::FPMul16x2, IrType::U32, {&b.unknown(), &b.unknown()});
+            auto& uc = b.check(u, Both);
+            auto& kept = b.emit(IrOpcode::SelectU32, IrType::U32, {&exec, &b.unknown(), &u});
+            b.program.Metadata().nanSpeculationLaneWrites.push_back(&kept);
+            b.check(Packed(b, kept), Both);
+            b.prune();
+            return Removed(vc) && !Removed(uc) && b.program.Metadata().nanSpeculationLaneWrites.empty();
+        }},
         {"a NaN check through an identity is pruned", [](Builder& b) {
             auto& v = b.emit(IrOpcode::FPMul16x2, IrType::U32, {&b.unknown(), &b.unknown()});
             auto& vc = b.check(v, Both);

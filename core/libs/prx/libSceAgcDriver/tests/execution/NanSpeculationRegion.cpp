@@ -215,6 +215,7 @@ struct PruneCase {
     std::uint32_t (*apply)(std::uint32_t);
     std::uint32_t checked;
     std::uint32_t a;
+    bool partialExec = false;
 };
 
 constexpr std::uint32_t PackedChecked = 0;
@@ -248,12 +249,15 @@ std::vector<PruneCase> PruneCases() {
         {"select zero", {0x020a0f04u}, [](std::uint32_t) { return 0u; }, PackedChecked, LowSignaling},
         {"word mask", {0x360a08ffu, 0x00ffffffu}, [](std::uint32_t v) { return v & 0x00ffffffu; }, WordChecked, WordSignaling},
         {"word copy", {0x7e0a0304u}, [](std::uint32_t v) { return v; }, WordChecked, WordSignaling},
+        {"copy under partial exec", {0x7e0a0304u}, [](std::uint32_t v) { return v; }, PackedChecked, LowSignaling, true},
     };
 }
 
 std::vector<std::uint32_t> PruneProgram(const PruneCase& test) {
     const bool word = test.checked == WordChecked;
-    std::vector<std::uint32_t> code{0x34140084u, 0x34160084u, 0xe03c1000u, 0x8001010au, 0xbf8c3f70u, 0x7e0e0280u, 0x7d8800c0u};
+    std::vector<std::uint32_t> code{0x34140084u, 0x34160084u, 0xe03c1000u, 0x8001010au, 0xbf8c3f70u};
+    if (test.partialExec) code.insert(code.end(), {0x7d8800b0u, 0xbe88246au});
+    code.insert(code.end(), {0x7e0e0280u, 0x7d8800c0u});
     if (word) code.push_back(0x10080501u);
     else code.insert(code.end(), {0xcc104004u, 0x18020501u});
     code.insert(code.end(), test.consumer.begin(), test.consumer.end());
@@ -322,7 +326,7 @@ std::size_t RunPruneCase(AgcDriver::VulkanDevice& device, const PruneCase& test,
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
     std::size_t failures = 0;
-    if (std::string(test.name) == "copy" && PackedNanTests(result.spirv.Words()) != 1u) {
+    if ((std::string(test.name) == "copy" || test.partialExec) && PackedNanTests(result.spirv.Words()) != 1u) {
         std::cerr << "nan flag pruning: a packed product read only by a checked packed sum kept its own NaN test (" << PackedNanTests(result.spirv.Words()) << " tests)\n";
         ++failures;
     }
@@ -341,7 +345,11 @@ std::size_t RunPruneCase(AgcDriver::VulkanDevice& device, const PruneCase& test,
     for (std::uint32_t lane = 0; lane < Threads; ++lane) {
         const auto* actual = &Outputs[lane * 4u];
         const std::uint32_t w = test.checked == LowChecked ? actual[2] & 0xffffu : actual[2];
-        if (actual[0] == v4 && actual[1] == v5 && w == v6) continue;
+        if (test.partialExec && lane >= 48u) {
+            if (actual[0] == 0xdeadbeefu && actual[1] == 0xdeadbeefu && actual[2] == 0xdeadbeefu) continue;
+        } else if (actual[0] == v4 && actual[1] == v5 && w == v6) {
+            continue;
+        }
         if (failures++ < 4u) std::cerr << "nan flag pruning: " << test.name << (ieee ? " IEEE 1" : " IEEE 0") << " lane " << lane << ": " << Hex(actual[0]) << " " << Hex(actual[1]) << " " << Hex(w) << ", expected " << Hex(v4) << " " << Hex(v5) << " " << Hex(v6) << '\n';
     }
     return failures;
