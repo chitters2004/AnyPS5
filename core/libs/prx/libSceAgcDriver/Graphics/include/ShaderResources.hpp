@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -810,6 +811,7 @@ private:
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
+    mutable GuardSetProof guardSetProof;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
