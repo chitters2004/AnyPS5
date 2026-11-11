@@ -1458,7 +1458,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         std::vector<std::shared_ptr<ShaderResources>> resources;
         SharedResourceCache().RemoveImage(image.get(), &resources);
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
-            if (image.use_count() > 1) recorder->KeepBytes(image.get(), static_cast<std::size_t>(heldBytes(*image)));
+            if (image.use_count() > 1) recorder->Retain(image.get(), static_cast<std::size_t>(heldBytes(*image)));
             for (auto& resource : resources) {
                 resource->KeepStorageImageBytes(*recorder);
                 recorder->Keep(std::move(resource));
@@ -1822,7 +1822,7 @@ ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler:
 
 void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
     const auto keep = [&](const std::shared_ptr<StorageTexture>& image) {
-        if (image != nullptr && !image->Cached()) recorder.KeepBytes(image.get(), static_cast<std::size_t>(image->BudgetBytes()));
+        if (image != nullptr && !image->Cached()) recorder.Retain(image.get(), static_cast<std::size_t>(image->BudgetBytes()));
     };
     for (const auto& image : storageTextures) keep(image);
     for (const auto& texture : textures) {
@@ -6800,7 +6800,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty() && !rebound) return {};
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    for (const auto& snapshot : result->snapshots) recorder.Retain(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
 }
 
