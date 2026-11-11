@@ -118,6 +118,8 @@ struct DrawRecipeOutcome {
     // APS5_PROFILE_DRAW: the proof's and the record's time.
     double proofUs = 0;
     double recordUs = 0;
+    std::uint32_t sharedBindingStages = 0;
+    std::uint32_t comparedBindingStages = 0;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and

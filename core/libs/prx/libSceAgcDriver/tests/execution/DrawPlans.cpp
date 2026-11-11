@@ -409,6 +409,8 @@ void PlannedSceneMatchesFullPath() {
     Report("I10 a scene", counts);
     ExpectNoHitsWhileOff(counts);
     if (PlansOn()) Expect(counts[DrawPlanCount::Hits] >= 4, "the scene's repeated plans were not served");
+    if (PlansOn()) Expect(counts[DrawPlanCount::SharedBindingStages] + counts[DrawPlanCount::ComparedBindingStages] == 2u * counts[DrawPlanCount::Hits], "a plan hit did not prove the binding words of each of its two stages");
+    std::printf("I10 binding words: %llu stages proved by the program's memo, %llu compared\n", static_cast<unsigned long long>(counts[DrawPlanCount::SharedBindingStages]), static_cast<unsigned long long>(counts[DrawPlanCount::ComparedBindingStages]));
     if (counts[DrawPlanCount::Hits] != 0 && counts[DrawPlanCount::FullDraws] != 0) std::printf("I10 committer time (APS5_PROFILE_DRAW): %.2f us per plan hit, %.2f us per full-path draw with a plan key\n", static_cast<double>(counts[DrawPlanCount::HitNanoseconds]) / static_cast<double>(counts[DrawPlanCount::Hits]) / 1000.0, static_cast<double>(counts[DrawPlanCount::FullNanoseconds]) / static_cast<double>(counts[DrawPlanCount::FullDraws]) / 1000.0);
     for (std::size_t index = 0; index < planned.size(); ++index) Expect(Pixels(planned[index]) == Pixels(full[index]), "target " + std::to_string(index) + " of the planned scene differs from the full path's");
     std::puts("draw plans: I10, a scene recorded with plans renders as the full path renders it");

@@ -348,6 +348,8 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
     const auto outcome = device->DrawFromPlan(graphics, draw, stages, snapshots, *plan, trace);
     if (outcome.recorded) {
         drawPlanCounters.Add(DrawPlanCount::Hits);
+        drawPlanCounters.Add(DrawPlanCount::SharedBindingStages, outcome.sharedBindingStages);
+        drawPlanCounters.Add(DrawPlanCount::ComparedBindingStages, outcome.comparedBindingStages);
         if (plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
         if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
         if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
