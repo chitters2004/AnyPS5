@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -1392,14 +1393,15 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         }
     } submitDue{*this, localDevice};
     recordLabelsForPacket(localDevice.get(), queue);
-    noteDrawWriters(stages, queue);
+    const Graphics::CommitPhaseDraw commitPhases;
+    Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueWriters, [&] { noteDrawWriters(stages, queue); });
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
+    if (built != nullptr) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor); });
 }
 
 }

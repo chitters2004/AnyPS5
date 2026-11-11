@@ -497,12 +497,11 @@ void Cost(const Layout& layout, std::uint32_t frames) {
     std::printf("village memory:%s\n", ResidentMemory().c_str());
 #endif
     if (!AgcDriver::Graphics::CommitPhasesEnabled()) return;
-    constexpr std::array<const char*, static_cast<std::size_t>(AgcDriver::Graphics::CommitPhase::Count)> phaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects"};
     const auto phases = AgcDriver::Graphics::ReadCommitPhases() - phasesBefore;
     std::string phaseList;
     for (std::size_t phase = 0; phase < phases.ns.size() && phases.draws != 0; ++phase) {
         if (phases.ns[phase] == 0) continue;
-        std::snprintf(text, sizeof(text), " %s %.2f", phaseNames[phase], static_cast<double>(phases.ns[phase]) / 1e3 / static_cast<double>(phases.draws));
+        std::snprintf(text, sizeof(text), " %s %.2f", AgcDriver::Graphics::CommitPhaseName(static_cast<AgcDriver::Graphics::CommitPhase>(phase)), static_cast<double>(phases.ns[phase]) / 1e3 / static_cast<double>(phases.draws));
         phaseList += text;
     }
     std::printf("village commit phases: %llu committed draws, us per draw:%s\n", static_cast<unsigned long long>(phases.draws), phaseList.c_str());
