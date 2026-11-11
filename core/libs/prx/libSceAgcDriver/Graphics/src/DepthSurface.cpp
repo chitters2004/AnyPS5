@@ -3,7 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
-#include "prx/libc/include/PrimedSharedMutex.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
@@ -214,8 +214,8 @@ struct DepthGuard {
     std::shared_ptr<std::atomic<bool>> hostEverWritten;
 };
 
-std::shared_mutex& depthGuardMutex() {
-    static PrimedSharedMutex mutex;
+NativeSharedMutex& depthGuardMutex() {
+    static NativeSharedMutex mutex;
     return mutex;
 }
 
