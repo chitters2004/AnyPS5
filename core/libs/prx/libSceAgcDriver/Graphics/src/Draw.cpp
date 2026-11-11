@@ -1687,7 +1687,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
     }
     CountCommit(vertex ? CommitCounter::InputVertexCopyFresh : CommitCounter::InputIndexCopyFresh);
-    copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return std::make_shared<Buffer>(context, bytes, vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT); });
+    copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return vertex ? std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, context.SnapshotProperties()) : std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT); });
     InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.buffer->Bytes(), alignment); });
     counted(DrawInputSource::Copied);
     return copy;
