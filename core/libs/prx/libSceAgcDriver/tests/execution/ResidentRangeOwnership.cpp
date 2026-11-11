@@ -99,6 +99,13 @@ std::string Counts(const ResidentStatistics& delta) {
     return "skipped " + std::to_string(delta.skipped) + ", copied " + std::to_string(delta.copied) + ", promoted " + std::to_string(delta.promoted) + ", invalidated " + std::to_string(delta.invalidated) + ", kept " + std::to_string(delta.kept) + ", refused " + std::to_string(delta.refused) + ", discarded " + std::to_string(delta.discarded);
 }
 
+bool IgnoringPageWrites = false;
+
+void CpuStore(std::uint8_t* at, std::uint8_t value, std::size_t length) {
+    std::memset(at, value, length);
+    if (IgnoringPageWrites) AgcDriver::GuestMemory::MarkWritten(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(at)), length);
+}
+
 class Harness {
 public:
     Harness(const Context& context, std::uint8_t* guest) : context(context), guest(guest) {}
@@ -195,7 +202,15 @@ int Run(AgcDriver::VulkanDevice& device) {
             return VulkanTestSkipped;
         }
     }
+    if (IgnoringPageWrites) AgcDriver::GuestMemory::IgnorePageWritesForTest(harness.Address(0), BlockBytes);
+    struct StopIgnoring {
+        ~StopIgnoring() { AgcDriver::GuestMemory::IgnorePageWritesForTest(0, 0); }
+    } stopIgnoring;
     const bool versioned = AgcDriver::GuestMemory::Watched(address, ElementBytes);
+    if (IgnoringPageWrites && !versioned) {
+        std::puts("resident range ownership: the guest block is not write-watched, so page writes cannot be ignored; skipped");
+        return VulkanTestSkipped;
+    }
     const bool wholeCopyBack = std::getenv("APS5_NO_CHANGED_COPY_BACK") != nullptr;
     const auto expectReuse = [&](const ResidentStatistics& delta, const std::string& what) {
         if (wholeCopyBack) Require(delta.skipped == 0 && delta.refused == 1 && delta.copied == 1, "resident range ownership: " + what + " skipped a copy-in although its whole copy-back would store over CPU bytes (" + Counts(delta) + ")");
@@ -209,7 +224,7 @@ int Run(AgcDriver::VulkanDevice& device) {
     expectReuse(delta, "an unchanged staging");
     std::printf("resident range ownership: the range is resident (%s write versions)\n", versioned ? "with" : "without");
 
-    delta = harness.Build({ElementOffset, ElementBytes, 0x2a2a2a2au, [&] { std::memset(guest + ElementOffset + 8192, 0x77, 64); }, false, false}, "a staging with a CPU store between record and execution");
+    delta = harness.Build({ElementOffset, ElementBytes, 0x2a2a2a2au, [&] { CpuStore(guest + ElementOffset + 8192, 0x77, 64); }, false, false}, "a staging with a CPU store between record and execution");
     ExpectBytes(guest + ElementOffset + 8192, 64, 0x77, "the CPU store made between the staging's record and its execution");
     ExpectBytes(guest + ElementOffset, FilledBytes, 0x2a, "the GPU write a CPU read follows");
     delta = harness.Build({}, "the staging after the CPU store");
@@ -218,6 +233,7 @@ int Run(AgcDriver::VulkanDevice& device) {
 
     delta = harness.Build({ElementOffset, ElementBytes, 0x3b3b3b3bu}, "a GPU write of the resident range");
     ExpectBytes(guest + ElementOffset, FilledBytes, 0x3b, "the resident range's GPU write");
+    if (versioned) Require(delta.kept >= 1, "resident range ownership: the range's own copy-back did not keep it in sync (" + Counts(delta) + ")");
     delta = harness.Build({}, "the staging after the range's own GPU write");
     expectReuse(delta, "the staging after the range's own GPU write");
     if (versioned && !wholeCopyBack) Require(delta.skipped == 1, "resident range ownership: a GPU-written range lost its residency to its own copy-back");
@@ -234,10 +250,10 @@ int Run(AgcDriver::VulkanDevice& device) {
     Require(delta.skipped == 0, "resident range ownership: the staging after an alias's write skipped the copy-in (" + Counts(delta) + ")");
     std::puts("resident range ownership: a resident range sees an overlapping alias's writes");
 
-    std::memset(guest + ElementOffset + 16384, 0x99, 64);
+    CpuStore(guest + ElementOffset + 16384, 0x99, 64);
     delta = harness.Build({ElementOffset, ElementBytes, std::nullopt, {}, true, false}, "a staging whose submit fails");
     Require(delta.discarded == 1, "resident range ownership: the failed submit did not drop the resident range (" + Counts(delta) + ")");
-    std::memset(guest + ElementOffset + 20480, 0x9a, 64);
+    CpuStore(guest + ElementOffset + 20480, 0x9a, 64);
     delta = harness.Build({ElementOffset, ElementBytes, std::nullopt, {}, true, false}, "a second staging whose submit fails in the batch the first left open");
     Require(delta.discarded == 1, "resident range ownership: the second failed submit in a row did not drop the resident range (" + Counts(delta) + ")");
     delta = harness.Build({}, "the staging after the failed submit");
@@ -255,8 +271,9 @@ int Run(AgcDriver::VulkanDevice& device) {
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        IgnoringPageWrites = argc == 2 && std::string(argv[1]) == "--ignore-page-writes";
 #ifdef _WIN32
         _putenv_s("APS5_NO_ADAPTIVE_STAGING", "1");
 #else
