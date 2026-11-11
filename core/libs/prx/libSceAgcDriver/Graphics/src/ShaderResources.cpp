@@ -2984,14 +2984,13 @@ struct TableKeyHash {
 };
 
 template<typename TVisitor>
-void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
-    Require(shader.program != nullptr, "missing compiled shader");
-    const auto& program = *shader.program;
-    visit(dataWords ? 1u : 0u);
-    visit(static_cast<std::uint32_t>(shader.stage));
-    visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
-    visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
-    visit(static_cast<std::uint32_t>(program.bindings.size()));
+void VisitBindingShape(const ShaderRecompiler::DescriptorBinding& binding, const TVisitor& visit) {
+    for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+}
+
+template<typename TVisitor>
+void VisitBindingContentKey(const ShaderRecompiler::DescriptorBinding& binding, bool dataWords, bool movableBuffers, const TVisitor& visit) {
+    VisitBindingShape(binding, visit);
     const auto packBits = [&](const ShaderRecompiler::ElementFlags& bits) {
         visit(static_cast<std::uint32_t>(bits.size()));
         std::uint32_t word = 0;
@@ -3003,56 +3002,77 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
             }
         }
     };
-    for (const auto& binding : program.bindings) {
-        for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
-        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.guestDescriptor.size() > CompactTableKeyWords) {
-            TableKeyHash hash;
-            hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
-            hash.bytes(binding.imageSamplers.data(), binding.imageSamplers.size() * sizeof(binding.imageSamplers[0]));
-            hash.bytes(binding.imageShapes.data(), binding.imageShapes.size() * sizeof(binding.imageShapes[0]));
-            for (const auto* set : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) hash.bits(*set);
-            const auto first = hash.a();
-            const auto second = hash.b();
-            for (const auto word : {0xc0de7ab1u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
-            continue;
-        }
-        if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
-            for (std::uint32_t element = 0; element < binding.count; ++element) {
-                const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
-                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
-                const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
-                if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
-                else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
-            }
-        } else if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap && binding.guestDescriptor.size() > CompactTableKeyWords) {
-            TableKeyHash hash;
-            hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
-            const auto first = hash.a();
-            const auto second = hash.b();
-            for (const auto word : {0xc0de7ab2u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
-        } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
-            for (const auto word : binding.guestDescriptor) visit(word);
-        }
-        packBits(binding.imageWritten);
-        packBits(binding.samplerDepthCompare);
-        packBits(binding.imageDepthCompare);
-        packBits(binding.imageAtomic);
-        packBits(binding.samplerUnnormalized);
-        packBits(binding.samplerIntegerBorder);
-        packBits(binding.samplerCoordinatesIgnored);
-        packBits(binding.imageUnnormalized);
-        packBits(binding.imageUnnormalizedBaseLevel);
-        // Read-only elements are bound without a write set: an object built for one written set
-        // must not serve a build with another (the variant implies it, this makes it explicit).
-        packBits(binding.bufferWritten);
-        visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
-        for (const auto sampler : binding.imageSamplers) {
-            visit(static_cast<std::uint32_t>(sampler));
-            visit(static_cast<std::uint32_t>(sampler >> 32u));
-        }
-        visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
-        for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
+    if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.guestDescriptor.size() > CompactTableKeyWords) {
+        TableKeyHash hash;
+        hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
+        hash.bytes(binding.imageSamplers.data(), binding.imageSamplers.size() * sizeof(binding.imageSamplers[0]));
+        hash.bytes(binding.imageShapes.data(), binding.imageShapes.size() * sizeof(binding.imageShapes[0]));
+        for (const auto* set : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) hash.bits(*set);
+        const auto first = hash.a();
+        const auto second = hash.b();
+        for (const auto word : {0xc0de7ab1u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
+        return;
     }
+    if (movableBuffers && binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers && binding.guestDescriptor.size() == static_cast<std::size_t>(binding.count) * 4u) {
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
+            const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+            const bool empty = words[2] == 0 || (words[0] == 0 && (words[1] & 0xffffu) == 0);
+            if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
+            else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
+        }
+    } else if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap && binding.guestDescriptor.size() > CompactTableKeyWords) {
+        TableKeyHash hash;
+        hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
+        const auto first = hash.a();
+        const auto second = hash.b();
+        for (const auto word : {0xc0de7ab2u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
+    } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
+        for (const auto word : binding.guestDescriptor) visit(word);
+    }
+    packBits(binding.imageWritten);
+    packBits(binding.samplerDepthCompare);
+    packBits(binding.imageDepthCompare);
+    packBits(binding.imageAtomic);
+    packBits(binding.samplerUnnormalized);
+    packBits(binding.samplerIntegerBorder);
+    packBits(binding.samplerCoordinatesIgnored);
+    packBits(binding.imageUnnormalized);
+    packBits(binding.imageUnnormalizedBaseLevel);
+    // Read-only elements are bound without a write set: an object built for one written set
+    // must not serve a build with another (the variant implies it, this makes it explicit).
+    packBits(binding.bufferWritten);
+    visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
+    for (const auto sampler : binding.imageSamplers) {
+        visit(static_cast<std::uint32_t>(sampler));
+        visit(static_cast<std::uint32_t>(sampler >> 32u));
+    }
+    visit(static_cast<std::uint32_t>(binding.imageShapes.size()));
+    for (const auto shape : binding.imageShapes) visit(static_cast<std::uint32_t>(shape));
+}
+
+template<typename TVisitor>
+void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit, std::span<const std::uint32_t> skip = {}) {
+    Require(shader.program != nullptr, "missing compiled shader");
+    const auto& program = *shader.program;
+    visit(dataWords ? 1u : 0u);
+    visit(static_cast<std::uint32_t>(shader.stage));
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId()));
+    visit(static_cast<std::uint32_t>(program.PipelineVariantId() >> 32u));
+    visit(static_cast<std::uint32_t>(program.bindings.size()));
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        if (std::ranges::binary_search(skip, static_cast<std::uint32_t>(index))) VisitBindingShape(program.bindings[index], visit);
+        else VisitBindingContentKey(program.bindings[index], dataWords, movableBuffers, visit);
+    }
+}
+
+void ShaderResources::AppendStaticContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> skip, std::vector<std::uint32_t>& key) {
+    VisitContentKey(shader, dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); }, skip);
+}
+
+void ShaderResources::AppendBindingContentKey(const CompiledShader& shader, std::uint32_t binding, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key) {
+    Require(shader.program != nullptr && binding < shader.program->bindings.size(), "a content key segment names a binding the program does not have");
+    VisitBindingContentKey(shader.program->bindings[binding], dataWords, movableBuffers, [&](std::uint32_t word) { key.push_back(word); });
 }
 
 std::vector<std::uint32_t> ShaderResources::ContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers) {

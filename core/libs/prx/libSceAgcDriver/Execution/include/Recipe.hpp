@@ -69,6 +69,11 @@ enum class RecipeOutcome { Recorded, Rebuild };
 // push constant block, the state with the unwritten outputs masked, the fragment outputs and the
 // pipeline stages. Built at the end of a recorded, cacheable, reusable, non-indirect draw and
 // attached to the draw entry's matched stage variants; immutable.
+struct PlanStageWords {
+    std::shared_ptr<const std::vector<std::uint32_t>> fixed;
+    std::vector<std::uint32_t> patched;
+};
+
 struct DrawRecipe {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<Graphics::ShaderResources> templateRef;
@@ -86,7 +91,8 @@ struct DrawRecipe {
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
     VkExtent2D renderExtent{};
-    std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> bindingWords;
+    std::vector<PlanStageWords> bindingWords;
+    std::vector<std::vector<std::uint32_t>> verifyWords;
     bool servable = true;
     bool plannable = true;
     std::uint32_t movedBases = 0;

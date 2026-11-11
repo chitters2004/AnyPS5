@@ -136,6 +136,18 @@ bool DrawPlanShadow();
 bool DrawPlans();
 bool VerifyDrawPlans();
 void SetDrawPlansForTest(int enabled);
+struct StageKeyMemoCounts {
+    std::uint64_t staticHits = 0;
+    std::uint64_t staticFills = 0;
+    std::uint64_t staticLosses = 0;
+    std::uint64_t patchedSegments = 0;
+    std::uint64_t layoutSplitMisses = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t resultHits = 0;
+    std::uint64_t resultWalks = 0;
+};
+StageKeyMemoCounts StageKeyMemoCounters();
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StageStaticKeys(const CompiledShader& shader);
 std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is

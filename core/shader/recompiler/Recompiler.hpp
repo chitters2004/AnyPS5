@@ -972,9 +972,30 @@ struct ResultKeyMemo {
     }
 };
 
+template<typename TValue, typename TBuild>
+std::shared_ptr<const TValue> PublishOnce(AtomicSharedPtr<const TValue>& slot, const TBuild& build, bool* published = nullptr) {
+    if (auto current = slot.load(std::memory_order_acquire)) return current;
+    std::shared_ptr<const TValue> made = std::make_shared<const TValue>(build());
+    std::shared_ptr<const TValue> expected;
+    const bool won = slot.compare_exchange_strong(expected, made, std::memory_order_acq_rel);
+    if (published != nullptr) *published = won;
+    return won ? made : expected;
+}
+
+struct ResultKeyShape {
+    struct Static {
+        std::vector<std::uint32_t> drawWords;
+        std::vector<std::uint32_t> planWords;
+        bool operator==(const Static&) const = default;
+    };
+    std::vector<std::uint32_t> patchedBindings;
+    mutable AtomicSharedPtr<const Static> words;
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     ResultKeyMemo planKeyMemo;
+    std::shared_ptr<const ResultKeyShape> keyShape;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;

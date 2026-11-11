@@ -2016,6 +2016,15 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     } else {
         if (masking) patch = std::make_shared<MemoPatch>();
         result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, patch.get(), &substitutes));
+        if (patch != nullptr && patch->valid) {
+            auto shape = std::make_shared<ResultKeyShape>();
+            for (const auto& [binding, resources] : patch->buffers) shape->patchedBindings.push_back(binding);
+            if (!patch->userWords.empty() && !patch->pushData) shape->patchedBindings.push_back(patch->shaderData);
+            if (patch->flattenedSrt != MemoPatch::NoBinding) shape->patchedBindings.push_back(patch->flattenedSrt);
+            std::sort(shape->patchedBindings.begin(), shape->patchedBindings.end());
+            shape->patchedBindings.erase(std::unique(shape->patchedBindings.begin(), shape->patchedBindings.end()), shape->patchedBindings.end());
+            result->keyShape = std::move(shape);
+        }
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
