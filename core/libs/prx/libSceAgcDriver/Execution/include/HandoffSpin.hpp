@@ -52,6 +52,50 @@ void LockSpinning(TMutex& mutex, std::chrono::nanoseconds window) {
     mutex.lock();
 }
 
+struct HandoffSpin {
+    bool waited = false;
+    bool ready = true;
+    std::chrono::steady_clock::time_point start{};
+    std::chrono::steady_clock::time_point end{};
+};
+
+class HandoffSite {
+public:
+    HandoffSite(const char* name, std::chrono::nanoseconds cap) : name(name), cap(cap) {}
+    HandoffSite(const HandoffSite&) = delete;
+    HandoffSite& operator=(const HandoffSite&) = delete;
+
+    const char* Name() const noexcept { return name; }
+    std::chrono::nanoseconds Window() const noexcept { return cap; }
+
+    template<typename TReady>
+    HandoffSpin Spin(TReady&& ready) {
+        if (ready()) return {};
+        const auto window = Window();
+        const auto start = std::chrono::steady_clock::now();
+        if (window.count() <= 0) return {true, false, start, start};
+        const auto deadline = start + window;
+        auto now = start;
+        do {
+            SpinPause();
+            if (ready()) return {true, true, start, std::chrono::steady_clock::now()};
+            now = std::chrono::steady_clock::now();
+        } while (now < deadline);
+        return {true, false, start, now};
+    }
+
+private:
+    const char* name;
+    std::chrono::nanoseconds cap;
+};
+
+template<typename TMutex>
+HandoffSpin LockSpinning(TMutex& mutex, HandoffSite& site) {
+    const auto spin = site.Spin([&] { return mutex.try_lock(); });
+    if (!spin.ready) mutex.lock();
+    return spin;
+}
+
 }
 
 #endif

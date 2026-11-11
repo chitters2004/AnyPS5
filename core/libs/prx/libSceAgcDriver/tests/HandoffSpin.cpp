@@ -13,6 +13,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using AgcDriver::HandoffSite;
 using AgcDriver::HandoffSpinWindowFor;
 using AgcDriver::LockSpinning;
 using AgcDriver::SpinUntil;
@@ -104,6 +105,39 @@ void CheckBlockingFallback() {
     Require(afterRelease, "a spin that outlasted its window did not wait for the holder");
 }
 
+void CheckHandoffSite() {
+    HandoffSite site{"test", 3ms};
+    Require(std::string(site.Name()) == "test" && site.Window() == 3ms, "a site did not keep its name and window");
+    const auto immediate = site.Spin([] { return true; });
+    Require(!immediate.waited && immediate.ready, "a condition that already held was counted as a wait");
+    int calls = 0;
+    const auto caught = site.Spin([&] { return ++calls == 4; });
+    Require(caught.waited && caught.ready && calls == 4 && caught.end >= caught.start, "a condition that held within the window was not reported as caught");
+    const auto missed = site.Spin([] { return false; });
+    Require(missed.waited && !missed.ready && missed.end - missed.start >= 3ms, "a condition that never held was not reported as missed after the window");
+    HandoffSite off{"off", 0ns};
+    calls = 0;
+    const auto blocked = off.Spin([&] { return ++calls > 1; });
+    Require(blocked.waited && !blocked.ready && calls == 1 && blocked.start == blocked.end, "a zero window spun or evaluated the condition more than once");
+    std::mutex mutex;
+    std::atomic<bool> held{false};
+    std::thread holder([&] {
+        mutex.lock();
+        held.store(true);
+        std::this_thread::sleep_for(20ms);
+        mutex.unlock();
+    });
+    while (!held.load()) std::this_thread::yield();
+    HandoffSite lockSite{"lock", 100us};
+    const auto locked = LockSpinning(mutex, lockSite);
+    mutex.unlock();
+    holder.join();
+    Require(locked.waited && !locked.ready, "a lock held past the window was not reported as a miss");
+    const auto free = LockSpinning(mutex, lockSite);
+    mutex.unlock();
+    Require(!free.waited && free.ready, "a free lock was reported as a wait");
+}
+
 void CheckRecursion() {
     std::recursive_mutex mutex;
     LockSpinning(mutex, 100us);
@@ -125,6 +159,7 @@ int main() {
         Contend<std::recursive_mutex>(150us, "recursive mutex");
         CheckBlockingFallback();
         CheckRecursion();
+        CheckHandoffSite();
         std::cout << "handoff spin tests passed\n";
         return 0;
     } catch (const std::exception& error) {

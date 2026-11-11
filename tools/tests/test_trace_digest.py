@@ -449,6 +449,27 @@ class TraceDigestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trace_digest.validate_interval(first)
 
+    def test_handoff_spin_interval_sites_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["handoff_spin"] = {"drain": {"hits": 120, "misses": 40, "spin_ms_per_frame": 2.5, "block_ms_per_frame": 9.0},
+                                 "committer": {"hits": 3000, "misses": 2, "spin_ms_per_frame": 0.75, "block_ms_per_frame": 0.0}}
+        second["handoff_spin"] = {"drain": {"hits": 0, "misses": 7, "spin_ms_per_frame": 0.0, "block_ms_per_frame": 1.25}}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["handoff_spin"], first["handoff_spin"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | committer | 3000 | 2 | 0.75 | 0.00 |", text)
+        self.assertIn("| 1 | drain | 120 | 40 | 2.50 | 9.00 |", text)
+        self.assertIn("| 2 | committer | 0 | 0 | 0.00 | 0.00 |", text)
+        self.assertIn("| 2 | drain | 0 | 7 | 0.00 | 1.25 |", text)
+        self.assertNotIn("hand-off site", trace_digest.markdown_intervals(trace_digest.digest_intervals([interval_line(0.0, 30.0, 20.0, 5.0)])))
+        for bad in ({"drain": {"misses": -1}}, {"drain": {"hits": 1.5}}, {"drain": 3}, []):
+            first["handoff_spin"] = bad
+            with self.assertRaises(ValueError):
+                trace_digest.validate_interval(first)
+
     def test_empty_summary_jsonl_files_remain_valid(self):
         path = self.trace.with_name("aps5-summary.jsonl")
         for text in ("", "\n \t\r\n"):

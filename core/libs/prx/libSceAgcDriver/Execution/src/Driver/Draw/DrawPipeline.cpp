@@ -170,6 +170,30 @@ std::string DrawFinisher::DrainText() {
     return text;
 }
 
+namespace {
+
+HandoffSite& FinisherSite() {
+    static HandoffSite site{"finisher", HandoffSpinWindow()};
+    return site;
+}
+
+HandoffSite& FinisherDrainSite() {
+    static HandoffSite site{"finisher_drain", HandoffSpinWindow() * 2};
+    return site;
+}
+
+HandoffSite& CommitterSite() {
+    static HandoffSite site{"committer", HandoffSpinWindow()};
+    return site;
+}
+
+HandoffSite& DrainSite() {
+    static HandoffSite site{"drain", HandoffSpinWindow() * 2};
+    return site;
+}
+
+}
+
 bool DrawFinisher::OnFinisherThread() {
     return finisherThread;
 }
@@ -210,13 +234,15 @@ void DrawFinisher::run() {
     bool failed = false;
     for (;;) {
         if (job == nullptr) {
-            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+            const auto spin = FinisherSite().Spin([&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             sleeping = true;
             wake.Wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
+            lock.unlock();
+            PerformanceTrace::Handoff(FinisherSite(), spin);
         }
         std::exception_ptr error;
         try {
@@ -248,9 +274,10 @@ void DrawFinisher::Settle() {
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
+    const auto spin = FinisherDrainSite().Spin([&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.Wait(lock, [&] { return jobs.empty(); });
+    PerformanceTrace::Handoff(FinisherDrainSite(), spin);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -444,7 +471,7 @@ void DrawPipeline::run() {
     bool isDraw = false;
     for (;;) {
         if (!taken) {
-            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+            const auto spin = CommitterSite().Spin([&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.Wait(lock, [&] { return !items.empty() || closing; });
@@ -452,6 +479,8 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            lock.unlock();
+            PerformanceTrace::Handoff(CommitterSite(), spin);
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -526,11 +555,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
+    const auto spin = DrainSite().Spin([&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.Wait(lock, [&] { return items.empty(); });
     --idleWaiters;
+    PerformanceTrace::Handoff(DrainSite(), spin);
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
