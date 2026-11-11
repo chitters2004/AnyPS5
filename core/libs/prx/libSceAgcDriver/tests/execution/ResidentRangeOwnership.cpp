@@ -237,6 +237,9 @@ int Run(AgcDriver::VulkanDevice& device) {
     std::memset(guest + ElementOffset + 16384, 0x99, 64);
     delta = harness.Build({ElementOffset, ElementBytes, std::nullopt, {}, true, false}, "a staging whose submit fails");
     Require(delta.discarded == 1, "resident range ownership: the failed submit did not drop the resident range (" + Counts(delta) + ")");
+    std::memset(guest + ElementOffset + 20480, 0x9a, 64);
+    delta = harness.Build({ElementOffset, ElementBytes, std::nullopt, {}, true, false}, "a second staging whose submit fails in the batch the first left open");
+    Require(delta.discarded == 1, "resident range ownership: the second failed submit in a row did not drop the resident range (" + Counts(delta) + ")");
     delta = harness.Build({}, "the staging after the failed submit");
     Require(delta.skipped == 0, "resident range ownership: the staging after a failed submit skipped the copy-in (" + Counts(delta) + ")");
     std::puts("resident range ownership: a failed submit gives up the range's residency");
