@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -86,7 +87,7 @@ private:
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
 
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     AddressCondition wake;
     AddressCondition idle;
     std::deque<Item> items;
@@ -157,7 +158,7 @@ private:
     DrawFinisher() = default;
     void run();
     inline static std::atomic<std::size_t> outstanding{0};
-    std::mutex mutex;
+    AgcDriver::Mutex mutex;
     AddressCondition wake;
     AddressCondition idle;
     std::deque<Job> jobs;

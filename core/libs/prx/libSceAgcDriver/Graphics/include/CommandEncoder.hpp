@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_COMMANDENCODER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_COMMANDENCODER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <atomic>
 #include <cstddef>
@@ -58,7 +59,7 @@ public:
     }
     bool Behind(VkCommandBuffer commands) const { return commands == recent.load(std::memory_order_relaxed) && executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire); }
     std::byte* Append(Run run, std::size_t bytes);
-    std::mutex& PoolMutex() { return poolMutex; }
+    AgcDriver::Mutex& PoolMutex() { return poolMutex; }
     const DeviceFunctions& Real() const { return real; }
     struct Statistics {
         std::uint64_t posts = 0;
@@ -111,7 +112,7 @@ private:
     std::atomic<VkCommandBuffer> recent{VK_NULL_HANDLE};
     Recording* recording = nullptr;
     Chunk* filling = nullptr;
-    std::mutex queueMutex;
+    AgcDriver::Mutex queueMutex;
     Chunk* head = nullptr;
     Chunk* tail = nullptr;
     Chunk* spare = nullptr;
@@ -120,7 +121,7 @@ private:
     std::atomic<bool> sleeping{false};
     std::atomic<std::uint32_t> awaiting{0};
     std::atomic<bool> stopping{false};
-    std::mutex poolMutex;
+    AgcDriver::Mutex poolMutex;
     std::thread worker;
     std::atomic<std::thread::id> owner{};
     std::atomic<std::uint64_t> postCount{0};

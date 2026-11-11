@@ -2013,7 +2013,7 @@ void Recorder::ensureOpen() {
             allocation.commandBufferCount = 1;
             {
                 quiesce();
-                std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<std::mutex>();
+                std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
                 Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
             }
             batch->pool = allocation.commandPool;
@@ -5050,7 +5050,7 @@ void Recorder::release(Batch& batch) noexcept {
     batch.foldedSamples.clear();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (batch.commands != VK_NULL_HANDLE) {
-        std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<std::mutex>();
+        std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, batch.pool != VK_NULL_HANDLE ? batch.pool : context.pool, 1, &batch.commands);
         if (profile) commandBuffersFreed.fetch_add(1, std::memory_order_relaxed);
     }
