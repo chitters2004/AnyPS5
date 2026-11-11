@@ -55,6 +55,7 @@ using AgcDriver::DriverDetail::DriverTestAccess;
 using AgcDriver::DriverDetail::DrawStageKey;
 using AgcDriver::DriverDetail::DrawStageMemo;
 using AgcDriver::DriverDetail::DrawStageMemoCounts;
+using MemoCount = AgcDriver::DriverDetail::DrawStageMemoCount;
 using AgcDriver::DriverDetail::DrawStageRecord;
 using AgcDriver::DriverDetail::DrawStageSpans;
 using AgcDriver::DriverDetail::ShaderSnapshot;
@@ -414,7 +415,9 @@ struct Step {
 };
 
 DrawStageMemoCounts Since(const DrawStageMemoCounts& before, const DrawStageMemoCounts& after) {
-    return {after.lookups - before.lookups, after.refused - before.refused, after.absent - before.absent, after.proved - before.proved, after.compared - before.compared, after.stale - before.stale, after.inserts - before.inserts, after.evictions - before.evictions, after.skipped - before.skipped, after.verified - before.verified, after.hitNanoseconds - before.hitNanoseconds, after.missNanoseconds - before.missNanoseconds, after.validatedReused - before.validatedReused};
+    DrawStageMemoCounts since;
+    for (std::size_t kind = 0; kind < AgcDriver::DriverDetail::DrawStageMemoCountKinds; ++kind) since.values[kind] = after.values[kind] - before.values[kind];
+    return since;
 }
 
 Step Measure(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, const char* label, bool constantPixel = false) {
@@ -424,16 +427,16 @@ Step Measure(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, c
     step.brightest = Draw(scene, vertexCode, table, constantPixel);
     step.counts = Since(before, driver.StageMemoCounts());
     const auto& c = step.counts;
-    std::printf("%s: brightest %u; memo lookups %llu, absent %llu, proved %llu, compared %llu, stale %llu, inserts %llu, verified %llu; validated stages reused %llu\n", label, step.brightest, static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.absent), static_cast<unsigned long long>(c.proved), static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.stale), static_cast<unsigned long long>(c.inserts), static_cast<unsigned long long>(c.verified), static_cast<unsigned long long>(c.validatedReused));
-    if (std::getenv("APS5_PROFILE_DRAW") != nullptr && c.lookups != 0) {
-        const auto served = c.proved + c.compared;
-        std::printf("  lookup cost: %.2f us per served stage, %.2f us per missed lookup\n", served != 0 ? static_cast<double>(c.hitNanoseconds) / 1000.0 / static_cast<double>(served) : 0.0, c.lookups > served ? static_cast<double>(c.missNanoseconds) / 1000.0 / static_cast<double>(c.lookups - served) : 0.0);
+    std::printf("%s: brightest %u; memo lookups %llu, absent %llu, proved %llu, compared %llu, stale %llu, inserts %llu, verified %llu; validated stages reused %llu\n", label, step.brightest, static_cast<unsigned long long>(c[MemoCount::Lookups]), static_cast<unsigned long long>(c[MemoCount::Absent]), static_cast<unsigned long long>(c[MemoCount::Proved]), static_cast<unsigned long long>(c[MemoCount::Compared]), static_cast<unsigned long long>(c[MemoCount::Stale]), static_cast<unsigned long long>(c[MemoCount::Inserts]), static_cast<unsigned long long>(c[MemoCount::Verified]), static_cast<unsigned long long>(c[MemoCount::ValidatedReused]));
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr && c[MemoCount::Lookups] != 0) {
+        const auto served = c[MemoCount::Proved] + c[MemoCount::Compared];
+        std::printf("  lookup cost: %.2f us per served stage, %.2f us per missed lookup\n", served != 0 ? static_cast<double>(c[MemoCount::HitNanoseconds]) / 1000.0 / static_cast<double>(served) : 0.0, c[MemoCount::Lookups] > served ? static_cast<double>(c[MemoCount::MissNanoseconds]) / 1000.0 / static_cast<double>(c[MemoCount::Lookups] - served) : 0.0);
     }
     return step;
 }
 
 std::uint64_t Hits(const Step& step) {
-    return step.counts.proved + step.counts.compared;
+    return step.counts.Served();
 }
 
 AgcDriver::DriverDetail::Driver& driver() {
@@ -467,15 +470,21 @@ void DrawsReuseAndInvalidateTheirStages() {
     const auto fourth = Measure(scene, VertexCode.data(), TableOffset, "fourth draw, nothing written");
     for (const auto* step : {&first, &second, &third, &fourth}) Expect(step->brightest == 255u, "a draw with a valid descriptor table did not draw");
     if (memo) {
-        Expect(Hits(first) == 0 && first.counts.inserts == 0, "a stage seen once was memoized or served");
-        Expect(Hits(second) == 0 && second.counts.inserts == 1, "a stage seen twice was not memoized exactly once");
-        Expect(Hits(third) == 1 && third.counts.stale == 0, "the third draw of an unchanged stage was not served from the memo");
-        Expect(Hits(fourth) == 1 && fourth.counts.stale == 0, "the fourth draw of an unchanged stage was not served from the memo");
-        if (stampable) Expect(fourth.counts.proved == 1, "a stage whose memory no write touched was compared again instead of proved by its write stamps");
-        else Expect(fourth.counts.compared == 1, "a stage whose memory is not write-watched was not compared");
-        if (verify) Expect(third.counts.verified == 1 && fourth.counts.verified == 1, "a memo hit was not verified against its full build");
+        Expect(Hits(first) == 0 && first.counts[MemoCount::Inserts] == 0, "a stage seen once was memoized or served");
+        Expect(Hits(second) == 0 && second.counts[MemoCount::Inserts] == 1, "a stage seen twice was not memoized exactly once");
+        Expect(first.counts[MemoCount::AbsentAdmitted] == 0 && second.counts[MemoCount::AbsentAdmitted] == 1, "the admitted misses were not counted on the second sighting alone");
+        for (const auto* step : {&first, &second, &third, &fourth}) {
+            Expect(step->counts[MemoCount::FragmentLookups] == 1 && step->counts[MemoCount::FragmentServed] == 0, "a draw with its own pixel shader copy did not count one fragment lookup and no fragment serve");
+            Expect(step->counts[MemoCount::DrawMisses] == 1 && step->counts[MemoCount::ReusedMisses] == 0, "a draw-cache miss with a freshly built pixel stage was not counted as a miss without every stage reused");
+        }
+        Expect(third.counts[MemoCount::Compared] == 0 || third.counts[MemoCount::ComparedBytes] >= 16, "a compared stage counted no compared bytes");
+        Expect(Hits(third) == 1 && third.counts[MemoCount::Stale] == 0, "the third draw of an unchanged stage was not served from the memo");
+        Expect(Hits(fourth) == 1 && fourth.counts[MemoCount::Stale] == 0, "the fourth draw of an unchanged stage was not served from the memo");
+        if (stampable) Expect(fourth.counts[MemoCount::Proved] == 1, "a stage whose memory no write touched was compared again instead of proved by its write stamps");
+        else Expect(fourth.counts[MemoCount::Compared] == 1, "a stage whose memory is not write-watched was not compared");
+        if (verify) Expect(third.counts[MemoCount::Verified] == 1 && fourth.counts[MemoCount::Verified] == 1, "a memo hit was not verified against its full build");
     } else {
-        Expect(first.counts.lookups + second.counts.lookups + third.counts.lookups + fourth.counts.lookups == 0, "the memo was consulted while switched off");
+        Expect(first.counts[MemoCount::Lookups] + second.counts[MemoCount::Lookups] + third.counts[MemoCount::Lookups] + fourth.counts[MemoCount::Lookups] == 0, "the memo was consulted while switched off");
     }
 
     WriteTable(scene.tables, TableOffset, scene.vertices, false);
@@ -484,15 +493,15 @@ void DrawsReuseAndInvalidateTheirStages() {
     Expect(cleared.brightest != 255u, "the draw after the guest cleared a descriptor still bound the memoized descriptor");
     Expect(clearedAgain.brightest != 255u, "the second draw after the guest cleared a descriptor bound the old descriptor");
     if (memo) {
-        Expect(cleared.counts.stale == 1 && Hits(cleared) == 0, "the memo did not drop the stage whose descriptor memory changed");
-        Expect(cleared.counts.inserts == 1, "the rebuilt stage was not memoized again");
+        Expect(cleared.counts[MemoCount::Stale] == 1 && Hits(cleared) == 0, "the memo did not drop the stage whose descriptor memory changed");
+        Expect(cleared.counts[MemoCount::Inserts] == 1, "the rebuilt stage was not memoized again");
         Expect(Hits(clearedAgain) == 1, "the rebuilt stage was not served on its next draw");
     }
 
     WriteTable(scene.tables, TableOffset, scene.vertices, true);
     const auto restored = Measure(scene, VertexCode.data(), TableOffset, "after the guest restored the descriptor");
     Expect(restored.brightest == 255u, "the draw after the guest restored the descriptor bound the cleared descriptor");
-    if (memo) Expect(restored.counts.stale == 1 && Hits(restored) == 0, "the memo served a stage across a guest write that restored a descriptor");
+    if (memo) Expect(restored.counts[MemoCount::Stale] == 1 && Hits(restored) == 0, "the memo served a stage across a guest write that restored a descriptor");
 
     const auto settled = Measure(scene, VertexCode.data(), TableOffset, "the restored table drawn again");
     WriteTable(scene.tables, TableOffset, scene.vertices, true);
@@ -500,17 +509,17 @@ void DrawsReuseAndInvalidateTheirStages() {
     Expect(settled.brightest == 255u && rewritten.brightest == 255u, "an unchanged or identically rewritten table did not draw");
     if (memo) {
         Expect(Hits(settled) == 1, "the restored stage was not served on its next draw");
-        Expect(rewritten.counts.stale == 0 && Hits(rewritten) == 1, "a stage whose memory was rewritten with the same bytes was not served");
-        Expect(rewritten.counts.compared == 1 && rewritten.counts.proved == 0, "a stage whose memory was written was proved by write stamps instead of compared");
+        Expect(rewritten.counts[MemoCount::Stale] == 0 && Hits(rewritten) == 1, "a stage whose memory was rewritten with the same bytes was not served");
+        Expect(rewritten.counts[MemoCount::Compared] == 1 && rewritten.counts[MemoCount::Proved] == 0, "a stage whose memory was written was proved by write stamps instead of compared");
     }
 
     const auto otherUserData = Measure(scene, VertexCode.data(), SecondTableOffset, "the same table contents through another table address in user data");
     Expect(otherUserData.brightest == 255u, "the draw through the second table did not draw");
-    if (memo) Expect(Hits(otherUserData) == 0 && otherUserData.counts.stale == 0, "a stage with other user data was served another user data's build");
+    if (memo) Expect(Hits(otherUserData) == 0 && otherUserData.counts[MemoCount::Stale] == 0, "a stage with other user data was served another user data's build");
 
     const auto otherProgram = Measure(scene, SecondVertexCode.data(), TableOffset, "the same vertex code registered at another address");
     Expect(otherProgram.brightest == 255u, "the draw with the second vertex program did not draw");
-    if (memo) Expect(Hits(otherProgram) == 0 && otherProgram.counts.stale == 0, "a stage of another registered program was served the first program's build");
+    if (memo) Expect(Hits(otherProgram) == 0 && otherProgram.counts[MemoCount::Stale] == 0, "a stage of another registered program was served the first program's build");
     std::puts("draw stages repeat from the memo, and a guest write under a memoized stage rebuilds it");
 
     Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
@@ -530,8 +539,8 @@ void DrawsReuseAndInvalidateTheirStages() {
     const bool fragmentMissed = missed.misses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawMiss::FragmentDiffering)] > entries.misses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawMiss::FragmentDiffering)];
     std::printf("the draw cache %s on the fragment stage alone\n", fragmentMissed ? "missed" : "did not miss");
     if (std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") != nullptr) Expect(fragmentMissed, "without stage data hits, a changed constant did not make the draw cache miss on the fragment stage, so this case does not exercise a partial miss");
-    if (fragmentMissed && !verify) Expect(partial.counts.validatedReused == 1, "the vertex stage the draw cache had validated before the fragment stage missed was built again");
-    if (!fragmentMissed || verify) Expect(partial.counts.validatedReused == 0, "a stage was reused as validated without a partial draw-cache miss");
+    if (fragmentMissed && !verify) Expect(partial.counts[MemoCount::ValidatedReused] == 1, "the vertex stage the draw cache had validated before the fragment stage missed was built again");
+    if (!fragmentMissed || verify) Expect(partial.counts[MemoCount::ValidatedReused] == 0, "a stage was reused as validated without a partial draw-cache miss");
     std::puts("a draw that misses the draw cache on its fragment stage reuses the vertex stage the lookup validated");
 }
 
