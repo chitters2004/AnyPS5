@@ -2057,6 +2057,20 @@ bool sharedCollectMemo() {
     return shared;
 }
 
+std::atomic<bool> ignoredWritesSet{false};
+std::atomic<std::uint64_t> ignoredWritesBegin{0};
+std::atomic<std::uint64_t> ignoredWritesEnd{0};
+
+struct IgnoredWrites {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    IgnoredWrites() {
+        if (!ignoredWritesSet.load(std::memory_order_relaxed)) return;
+        begin = ignoredWritesBegin.load(std::memory_order_acquire);
+        end = ignoredWritesEnd.load(std::memory_order_acquire);
+    }
+};
+
 struct StampRuns {
     WriteTracker& tracker;
     StampKind kind;
@@ -2068,6 +2082,7 @@ struct StampRuns {
     ~StampRuns() {
         if (std::uncaught_exceptions() > unwinding) tracker.invalidateAll();
     }
+    IgnoredWrites ignored{};
 };
 
 std::atomic<void (*)()> consumedWalkHook{nullptr};
@@ -2132,6 +2147,11 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& runs = *static_cast<StampRuns*>(context);
     auto& tracker = runs.tracker;
     if (end <= begin) return;
+    if (runs.ignored.end != 0 && begin < runs.ignored.end && runs.ignored.begin < end) {
+        if (begin < runs.ignored.begin) stampWrittenRun(context, begin, static_cast<std::uintptr_t>(runs.ignored.begin));
+        if (runs.ignored.end < end) stampWrittenRun(context, static_cast<std::uintptr_t>(runs.ignored.end), end);
+        return;
+    }
     ++runs.stamped;
     if (runs.window != nullptr) runs.windowRuns.emplace_back(begin, end);
     else {
@@ -3093,6 +3113,15 @@ void SetReleasedWalksForTest(bool released) {
 #else
     static_cast<void>(released);
 #endif
+}
+
+void IgnorePageWritesForTest(std::uint64_t address, std::size_t bytes) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    ignoredWritesSet.store(false, std::memory_order_relaxed);
+    ignoredWritesBegin.store(address, std::memory_order_release);
+    ignoredWritesEnd.store(bytes == 0 ? 0 : address + bytes, std::memory_order_release);
+    if (bytes != 0) ignoredWritesSet.store(true, std::memory_order_relaxed);
 }
 
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {

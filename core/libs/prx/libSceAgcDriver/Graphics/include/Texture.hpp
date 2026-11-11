@@ -519,6 +519,13 @@ public:
     static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
     static bool UploadRefreshProofs();
+    struct SyncedBorrowCounts {
+        std::uint64_t borrows = 0;
+        std::uint64_t units = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t rollBacks = 0;
+    };
+    static SyncedBorrowCounts SyncedBorrows();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();
@@ -722,6 +729,11 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    bool sameShape(const StorageTexture& other) const;
+    std::shared_ptr<StorageTexture> syncedAlias(const std::vector<bool>& wanted, std::vector<bool>& lent) const;
+    void rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units, bool uploaded);
+    void armRefreshRollBack(const std::vector<std::uint64_t>& before, bool uploaded);
+    static void noteSyncedBorrow(std::size_t units, std::uint64_t bytes);
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
@@ -829,6 +841,7 @@ private:
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
     UnitFlags borrowedUnits;
+    std::uint64_t forgetSeen = 0;
     std::vector<std::pair<std::weak_ptr<StorageTexture>, std::uint64_t>> handedOver;
     std::vector<bool> handedUnits;
     std::vector<std::shared_ptr<StorageTexture>> adoptedSources;
