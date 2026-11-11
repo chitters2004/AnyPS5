@@ -2448,6 +2448,20 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(mergedCount));
         mergedLine += text;
     }
+    {
+        static Recorder::RingStatistics reported{};
+        const auto ring = Recorder::RingCounts();
+        const auto delta = [](std::uint64_t now, std::uint64_t& last) { return static_cast<unsigned long long>(now - std::exchange(last, now)); };
+        const auto bytes = delta(ring.bytes, reported.bytes);
+        const auto slices = delta(ring.slices, reported.slices);
+        const auto chunks = delta(ring.chunks, reported.chunks);
+        const auto recycled = delta(ring.recycled, reported.recycled);
+        const auto hostPlaced = delta(ring.hostPlacedBytes, reported.hostPlacedBytes);
+        const auto offSwitch = delta(ring.fallbacks[0], reported.fallbacks[0]);
+        const auto noBar = delta(ring.fallbacks[1], reported.fallbacks[1]);
+        const auto cpuRead = delta(ring.fallbacks[2], reported.fallbacks[2]);
+        AgcDriver::ProfilePrint_nid_no_patch("[bar-ring] (10 s) %.1f MiB in %llu CPU-sourced copy-in slices through the BAR ring (%.1f MiB of them host-placed), %llu chunks allocated, %llu recycled; fallbacks: switch %llu, no BAR %llu, CPU read-back %llu\n", bytes / 1048576.0, slices, hostPlaced / 1048576.0, chunks, recycled, offSwitch, noBar, cpuRead);
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
     std::vector<std::pair<std::uint64_t, std::uint64_t>> masks;
     for (auto& slot : maskSlots) {
@@ -3543,6 +3557,75 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
+}
+
+namespace {
+
+struct RingCounters {
+    std::atomic<std::uint64_t> bytes{0}, slices{0}, chunks{0}, recycled{0}, hostPlacedBytes{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::RingFallback::Count)> fallbacks{};
+};
+
+RingCounters& ringCounters() {
+    static RingCounters counters;
+    return counters;
+}
+
+}
+
+void Recorder::NoteRingFallback(RingFallback cause) {
+    ringCounters().fallbacks[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+}
+
+Recorder::RingStatistics Recorder::RingCounts() {
+    auto& counters = ringCounters();
+    RingStatistics statistics{counters.bytes.load(std::memory_order_relaxed), counters.slices.load(std::memory_order_relaxed), counters.chunks.load(std::memory_order_relaxed), counters.recycled.load(std::memory_order_relaxed), counters.hostPlacedBytes.load(std::memory_order_relaxed), {}};
+    for (std::size_t i = 0; i < statistics.fallbacks.size(); ++i) statistics.fallbacks[i] = counters.fallbacks[i].load(std::memory_order_relaxed);
+    return statistics;
+}
+
+std::optional<Recorder::UploadSlice> Recorder::UploadRing(std::size_t bytes) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoBarRing)) {
+        NoteRingFallback(RingFallback::Switch);
+        return std::nullopt;
+    }
+    if (SnapshotMemoryProperties(context.memory, false) != MappedDeviceProperties) {
+        NoteRingFallback(RingFallback::NoBar);
+        return std::nullopt;
+    }
+    ensureOpen();
+    auto& counters = ringCounters();
+    constexpr VkDeviceSize alignment = 16;
+    auto offset = (uploadRingUsed + alignment - 1) & ~(alignment - 1);
+    if (uploadRing == nullptr || offset + bytes > uploadRing->Bytes().size()) {
+        if (uploadRing != nullptr) uploadRingRetired.emplace_back(std::move(uploadRing), uploadRingSerial);
+        const auto completed = CompletedThrough();
+        while (uploadRing == nullptr && !uploadRingRetired.empty() && uploadRingRetired.front().second <= completed) {
+            auto candidate = std::move(uploadRingRetired.front().first);
+            uploadRingRetired.pop_front();
+            if (candidate->Bytes().size() < bytes) continue;
+            uploadRing = std::move(candidate);
+            counters.recycled.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (uploadRing == nullptr) {
+            uploadRing = std::make_shared<Buffer>(context, std::max(UploadRingChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, MappedDeviceProperties);
+            counters.chunks.fetch_add(1, std::memory_order_relaxed);
+        }
+        while (uploadRingRetired.size() > UploadRingRetired) uploadRingRetired.pop_front();
+        offset = 0;
+        uploadRingKept = 0;
+    }
+    const auto serial = OpenSerial();
+    if (uploadRingKept != serial) {
+        Keep(uploadRing);
+        uploadRingKept = serial;
+    }
+    uploadRingUsed = offset + bytes;
+    uploadRingSerial = serial;
+    counters.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    counters.slices.fetch_add(1, std::memory_order_relaxed);
+    if ((uploadRing->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) counters.hostPlacedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return UploadSlice{uploadRing, offset, uploadRing->Bytes().data() + offset};
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {

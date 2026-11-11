@@ -165,6 +165,15 @@ inline VkMemoryPropertyFlags SnapshotMemoryProperties(const VkPhysicalDeviceMemo
     return HostBufferProperties;
 }
 
+inline std::optional<std::uint32_t> BarUploadMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t mask) {
+    constexpr VkDeviceSize ResizableBarBytes = VkDeviceSize{4} << 30u;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto& type = memory.memoryTypes[i];
+        if ((mask & (1u << i)) != 0 && (type.propertyFlags & MappedDeviceProperties) == MappedDeviceProperties && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return i;
+    }
+    return std::nullopt;
+}
+
 struct Context {
     VkDevice device;
     VkPhysicalDevice physical;

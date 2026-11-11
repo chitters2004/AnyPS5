@@ -6899,14 +6899,24 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         const bool pendingWriter = recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes));
         const bool writable = WritesOverlap(address, static_cast<std::size_t>(bytes));
         std::shared_ptr<Buffer> inputSnapshot;
+        bool snapshotted = false;
         auto copySource = region->copySource;
         auto copyOffset = region->begin - region->copySourceBase;
         if (!pendingWriter && !writable) {
-            inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
-            copySource = inputSnapshot->Handle();
-            copyOffset = 0;
-            recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
+            const bool readBack = capture && bytes == 32;
+            if (readBack) Recorder::NoteRingFallback(Recorder::RingFallback::CpuRead);
+            if (const auto slice = readBack ? std::nullopt : recorder->UploadRing(static_cast<std::size_t>(bytes))) {
+                std::memcpy(slice->bytes, reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+                copySource = slice->buffer->Handle();
+                copyOffset = slice->offset;
+            } else {
+                inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+                copySource = inputSnapshot->Handle();
+                copyOffset = 0;
+                recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
+            }
+            snapshotted = true;
             CaptureTrace::Log("copy-input-snapshot batch=%llu address=%llx bytes=%llu", batch, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
         }
         if (capture && bytes == 32) {
@@ -6936,7 +6946,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (!snapshotted) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         region->snapshot.clear();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
         if (profile) {
