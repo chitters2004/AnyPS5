@@ -30,7 +30,7 @@ void Driver::verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffse
     }
     if (run != variant.runs.size()) fail("the read set", position, run);
     if (result->variantId != patched.variantId) fail("the variant", 0, 0);
-    if (result->bindings.size() != patched.bindings.size() || result->pushConstants != patched.pushConstants) fail("the bindings", 0, 0);
+    if (result->bindings.size() != patched.bindings.size() || Graphics::PushBytes(*result, nullptr) != Graphics::PushBytes(patched, nullptr)) fail("the bindings", 0, 0);
     for (std::size_t b = 0; b < result->bindings.size(); ++b) {
         const auto& fresh = result->bindings[b];
         const auto& reused = patched.bindings[b];

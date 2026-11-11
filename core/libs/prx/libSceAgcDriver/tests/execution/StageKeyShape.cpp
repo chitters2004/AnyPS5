@@ -160,6 +160,27 @@ void BenchIdentity() {
     std::printf("bench identity, 24 bindings: computed %.1f ns, memoized %.1f ns per call, thread CPU (%llu)\n", computedNs, memoNs, static_cast<unsigned long long>(sink & 1u));
 }
 
+void BenchPushShare(const char* name, std::uint32_t staticBufferElements) {
+    auto donor = Shaped(staticBufferElements, 1);
+    donor.pushConstants.assign(64, std::byte{0x5a});
+    constexpr int Draws = 20000;
+    std::uint64_t sink = 0;
+    const auto copyStart = ThreadMicroseconds();
+    for (int draw = 0; draw < Draws; ++draw) {
+        auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(donor);
+        copy->pushConstants[0] = static_cast<std::byte>(draw);
+        sink += static_cast<std::uint64_t>(copy->pushConstants[0]);
+    }
+    const auto copyUs = (ThreadMicroseconds() - copyStart) / Draws;
+    const auto shareStart = ThreadMicroseconds();
+    for (int draw = 0; draw < Draws; ++draw) {
+        auto push = std::make_shared<const std::vector<std::byte>>(donor.pushConstants);
+        sink += static_cast<std::uint64_t>((*push)[1]);
+    }
+    const auto shareUs = (ThreadMicroseconds() - shareStart) / Draws;
+    std::printf("bench push share, %s: patched copy of the donor %.3f us, shared donor with its own push bytes %.3f us per stage, thread CPU (%llu)\n", name, copyUs, shareUs, static_cast<unsigned long long>(sink & 1u));
+}
+
 void Bench(const char* name, std::uint32_t staticBufferElements, std::uint32_t patchedBufferElements) {
     using AgcDriver::Graphics::ShaderResources;
     constexpr int Draws = 4000;
@@ -200,6 +221,8 @@ int main(int argc, char** argv) {
             Bench("Village-like (2000-element static buffer table, 1-element patched buffer)", 2000, 1);
             Bench("Village-like worst case (2000-element patched buffer table)", 0, 2000);
             BenchIdentity();
+            BenchPushShare("GTA-like (7 bindings)", 0);
+            BenchPushShare("Village-like (2000-element buffer table)", 2000);
             return 0;
         }
         FirstFillRaces();

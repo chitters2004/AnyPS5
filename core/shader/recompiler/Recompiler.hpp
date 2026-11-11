@@ -985,6 +985,7 @@ struct IdentityMemo {
 };
 
 [[nodiscard]] bool VerifyIdentityMemo();
+[[nodiscard]] std::uint64_t SharedPushDonorStages();
 
 template<typename TValue, typename TBuild>
 std::shared_ptr<const TValue> PublishOnce(AtomicSharedPtr<const TValue>& slot, const TBuild& build, bool* published = nullptr) {

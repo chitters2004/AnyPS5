@@ -157,6 +157,7 @@ struct DrawTail {
     std::vector<Graphics::CompiledShader> stages;
     std::uint32_t pushCursorBytes = 0;
     std::vector<const ShaderRecompiler::RecompileResult*> programResults;
+    std::vector<const std::vector<std::byte>*> programPush;
     std::vector<StageCapture> stageCaptures;
     std::vector<std::shared_ptr<DispatchVariant>> matched;
     std::vector<std::vector<ShaderRecompiler::MemoryRegion>> matchedRegions;
@@ -632,6 +633,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
 
     auto& programResults = tail.programResults;
     programResults.assign(programs.size(), nullptr);
+    tail.programPush.assign(programs.size(), nullptr);
 
     auto& stageCaptures = tail.stageCaptures;
     stageCaptures.resize(programs.size());
@@ -819,6 +821,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& stages = tail.stages;
     auto& pushCursorBytes = tail.pushCursorBytes;
     auto& programResults = tail.programResults;
+    auto& programPush = tail.programPush;
     auto& stageCaptures = tail.stageCaptures;
     auto& matched = tail.matched;
     auto& matchedRegions = tail.matchedRegions;
@@ -888,7 +891,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
-        const char* what = runs != kept.runs ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
+        const char* what = runs != kept.runs ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : Graphics::PushBytes(compiled, stageCaptures[i].push.get()) != Graphics::PushBytes(*kept.compiled, kept.push.get()) ? "push constants" : nullptr;
         ++dataVerified;
         if (what == nullptr) return;
         char message[320];
@@ -904,7 +907,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto& fresh = *stageCaptures[i].compiled;
         const auto& patched = *hit.compiled;
         const bool sameBindings = fresh.bindings.size() == patched.bindings.size() && std::equal(fresh.bindings.begin(), fresh.bindings.end(), patched.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
-        const char* what = runs != kept.runs ? "runs" : words != hit.words ? "words" : fresh.variantId != patched.variantId ? "variant" : fresh.pushConstants != patched.pushConstants ? "push constants" : !sameBindings ? "bindings" : nullptr;
+        const char* what = runs != kept.runs ? "runs" : words != hit.words ? "words" : fresh.variantId != patched.variantId ? "variant" : Graphics::PushBytes(fresh, stageCaptures[i].push.get()) != Graphics::PushBytes(patched, nullptr) ? "push constants" : !sameBindings ? "bindings" : nullptr;
         ++stageDataVerified;
         if (what == nullptr) return;
         char message[256];
@@ -921,7 +924,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
-        const char* what = DrawStageMismatch(kept, runs, words, *stageCaptures[i].compiled);
+        const char* what = DrawStageMismatch(kept, runs, words, *stageCaptures[i].compiled, stageCaptures[i].push.get());
         if (what == nullptr && (vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)))) what = "vertex stage info";
         drawStageMemoCounters.Add(DrawStageMemoCount::Verified);
         if (what == nullptr) return;
@@ -937,6 +940,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (drawHit) {
 
             programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                programPush[i] = stageData[i].compiled != nullptr ? nullptr : matched[i]->push.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes; });
@@ -946,6 +950,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                programPush[i] = stageData[i].compiled != nullptr ? nullptr : matched[i]->push.get();
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
@@ -960,6 +965,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 if (validated) {
                     reused[i] = true;
                     programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                programPush[i] = stageData[i].compiled != nullptr ? nullptr : matched[i]->push.get();
                     memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                     drawStageMemoCounters.Add(DrawStageMemoCount::ValidatedReused);
                 } else {
@@ -971,11 +977,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         appendEntryRegions(*matched[i], matchedRegions[i]);
                         reused[i] = true;
                         programResults[i] = matched[i]->compiled.get();
+                        programPush[i] = matched[i]->push.get();
                         memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                     } else {
                         compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
                         if (!rejected.empty()) return DrawVerdict::Rejected;
                         programResults[i] = compiledStages.back().get();
+                        programPush[i] = stageCaptures[i].push.get();
                         if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
                         if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
                         if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
@@ -995,7 +1003,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         try {
             const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
             require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
-            stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, stageCaptures[i].registeredViews.get()});
+            stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, stageCaptures[i].registeredViews.get(), programPush[i]});
             pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
         } catch (...) {
             TraceMaterializationFailure(trace.token, submission, packetOffset, "push-constant-validation", completedSubdraws, std::current_exception());
@@ -1103,7 +1111,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             compiledStages.push_back(materializeDrawStage(0, pushOffsets[0], queue, submission, packetOffset, traceToken, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
             if (!rejected.empty()) return DrawVerdict::Rejected;
             programResults[0] = compiledStages.back().get();
+            programPush[0] = stageCaptures[0].push.get();
             stages[0].program = programResults[0];
+            stages[0].push = programPush[0];
             stages[0].registeredImageViews = stageCaptures[0].registeredViews.get();
             require(programResults[0]->pushConstants.size() == pushBytes && programResults[0]->parameterExports == exports, "pairing the mesh program with its pixel shader changed the push constants or the parameter exports the pixel shader was built for");
         }
@@ -1157,11 +1167,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (programResults[i] == nullptr) continue;
             resultIndex[i] = results.size();
-            results.push_back(ShaderRecompiler::RecompileResult(*programResults[i]));
+            results.push_back(Graphics::CopyCompiled(*programResults[i], programPush[i]));
             for (auto& stage : stages) {
-                if (stage.program == programResults[i]) stage.program = &results[resultIndex[i]];
+                if (stage.program != programResults[i]) continue;
+                stage.program = &results[resultIndex[i]];
+                stage.push = nullptr;
             }
             programResults[i] = &results[resultIndex[i]];
+            programPush[i] = nullptr;
         }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
@@ -1215,13 +1228,13 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             for (const auto& [slot, value] : slots) patchForwardedWord(result, slot, value);
             return true;
         };
-        const auto verifyForwardedWords = [&](std::size_t programIndex, const ShaderRecompiler::RecompileResult& forwarded, const ShaderRecompiler::RecompileResult& fresh) {
+        const auto verifyForwardedWords = [&](std::size_t programIndex, const ShaderRecompiler::RecompileResult& forwarded, const ShaderRecompiler::RecompileResult& fresh, const std::vector<std::byte>* freshPush) {
             const bool sameBindings = forwarded.bindings.size() == fresh.bindings.size() && std::equal(forwarded.bindings.begin(), forwarded.bindings.end(), fresh.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
             std::uint64_t walked = 0;
             for (const auto& word : recordWords) {
                 if (word.program == programIndex && word.index < ShaderRecompiler::SrtUserDataUse::TrackedWords) walked |= (stageCaptures[programIndex].userDataUse.asBase | stageCaptures[programIndex].userDataUse.asValue) >> word.index & 1u;
             }
-            const char* what = forwarded.variantId != fresh.variantId ? "variant" : forwarded.pushConstants != fresh.pushConstants ? "push constants" : !sameBindings ? "bindings" : forwarded.shaderDataUserWords != fresh.shaderDataUserWords ? "forwarded words" : walked != 0 ? "walked user word" : nullptr;
+            const char* what = forwarded.variantId != fresh.variantId ? "variant" : Graphics::PushBytes(forwarded, nullptr) != Graphics::PushBytes(fresh, freshPush) ? "push constants" : !sameBindings ? "bindings" : forwarded.shaderDataUserWords != fresh.shaderDataUserWords ? "forwarded words" : walked != 0 ? "walked user word" : nullptr;
             ++wordsVerified;
             if (what == nullptr) return;
             char message[256];
@@ -1281,11 +1294,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     const auto fresh = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
                     for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
                     if (!rejected.empty()) return DrawVerdict::Rejected;
-                    verifyForwardedWords(programIndex, result, *fresh);
+                    verifyForwardedWords(programIndex, result, *fresh, stageCaptures[programIndex].push.get());
                     continue;
                 }
                 if (pushWord) wordsRefused += static_cast<std::uint64_t>(std::count_if(recordWords.begin(), recordWords.end(), [&](const RecordWord& word) { return word.program == programIndex; }));
-                result = *materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                const auto materialized = materializeDrawStage(programIndex, pushOffsets[programIndex], queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, programs[programIndex].binary.stage == Stage::TessellationControl || programs[programIndex].binary.stage == Stage::TessellationEvaluation ? direct : drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics);
+                result = Graphics::CopyCompiled(*materialized, stageCaptures[programIndex].push.get());
                 for (auto& stage : stages) if (stage.program == &result) stage.registeredImageViews = stageCaptures[programIndex].registeredViews.get();
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 require(result.pushConstants.size() == pushBytes, "patched program changed its push constant layout");

@@ -38,7 +38,7 @@ void Driver::appendEntryRegions(const DispatchVariant& variant, std::vector<Shad
 }
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::patchDataWords(const DispatchVariant& variant, const std::vector<std::uint32_t>& words) {
-    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(Graphics::CopyCompiled(*variant.compiled, variant.push.get()));
     patched->keyShape = nullptr;
     auto& descriptor = patched->bindings[variant.flatBinding].guestDescriptor;
     for (std::size_t k = 0; k < variant.dataPositions.size(); ++k) {

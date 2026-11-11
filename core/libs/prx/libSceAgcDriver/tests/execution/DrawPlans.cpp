@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -583,6 +585,30 @@ void PlansRefuseTemplatesWithOtherSetLayouts() {
     std::puts("draw plans: I7c, a template whose set layouts differ from the plan's is never served by the plan");
 }
 
+void SharedPushDonorsDrawTheirOwnPush() {
+    namespace Graphics = AgcDriver::Graphics;
+    const bool before = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SharePushDonor);
+    const std::array<float, 4> colours{0.3125f, 0.4375f, 0.5625f, 0.6875f};
+    const auto render = [&](bool share, std::array<GuestBlock, 4>& targets) {
+        Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::SharePushDonor, share);
+        for (std::size_t index = 0; index < targets.size(); ++index) Draw(targets[index], {.colour = colours[index]});
+    };
+    std::array<GuestBlock, 4> shared;
+    std::array<GuestBlock, 4> copied;
+    const auto sharedBefore = ShaderRecompiler::SharedPushDonorStages();
+    render(true, shared);
+    const auto sharedStages = ShaderRecompiler::SharedPushDonorStages() - sharedBefore;
+    render(false, copied);
+    Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::SharePushDonor, before);
+    for (std::size_t index = 0; index < shared.size(); ++index) {
+        Expect(Drawn(Pixels(shared[index])), "a draw with a shared push donor drew nothing");
+        Expect(Pixels(shared[index]) == Pixels(copied[index]), "the draw of colour " + std::to_string(index) + " with a shared push donor differs from the draw with a patched copy");
+        if (index != 0) Expect(Pixels(shared[index]) != Pixels(shared[0]), "draws of different colours with a shared push donor drew the same pixels: the stage read the donor's push data");
+    }
+    if (std::getenv("APS5_NO_DRAW_DATA_HITS") != nullptr && std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") != nullptr && std::getenv("APS5_NO_MASKED_RESULT_MEMO") == nullptr && std::getenv("APS5_NO_RESULT_MEMO") == nullptr) Expect(sharedStages != 0, "no draw stage shared its push donor");
+    std::printf("draw plans: %llu stages shared their push donor and drew their own colours, as patched copies do\n", static_cast<unsigned long long>(sharedStages));
+}
+
 void PlannedSceneMatchesFullPath() {
     const std::vector<std::pair<std::size_t, Look>> scene{
         {0, {.colour = 1.0f}}, {0, {.colour = 1.0f}}, {0, {.colour = 0.5f}}, {1, {.colour = 0.25f}}, {1, {.colour = 0.75f, .scale = 24.0f}},
@@ -692,6 +718,7 @@ int main(int argc, char** argv) {
         ReboundPlansStayOffTheExactPath();
         PlansRefuseTemplatesWithOtherSetLayouts();
         PlannedSceneMatchesFullPath();
+        SharedPushDonorsDrawTheirOwnPush();
         const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();
         std::printf("stage key memo: %llu static hits, %llu static fills, %llu patched segments; unshaped: %llu per-result memo hits, %llu full walks\n", static_cast<unsigned long long>(keys.staticHits), static_cast<unsigned long long>(keys.staticFills), static_cast<unsigned long long>(keys.patchedSegments), static_cast<unsigned long long>(keys.resultHits), static_cast<unsigned long long>(keys.resultWalks));
         AgcDriverShutdown_nid_postfix();
