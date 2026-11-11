@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
@@ -4247,12 +4248,26 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
+        const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        const auto countsBefore = ShaderResources::DrawBindingCounts();
         auto first = resources.PrepareDrawBindings(snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto second = resources.PrepareDrawBindings(snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
+        auto third = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(third != nullptr && third->snapshots.size() == 1, "unchanged draw input was not bound a third time");
+        const auto countsAfter = ShaderResources::DrawBindingCounts();
+        const auto sameSlot = [](const ShaderResources::DrawBindings& left, const ShaderResources::DrawBindings& right) { return left.snapshots[0].buffer == right.snapshots[0].buffer && left.snapshots[0].offset == right.snapshots[0].offset && left.snapshots[0].bytes == right.snapshots[0].bytes; };
+        const std::uint64_t expectedDiffer = (sameSlot(*first, *second) ? 0u : 1u) + (sameSlot(*second, *third) ? 0u : 1u);
+        if (profiled) {
+            Require(countsAfter.calls == countsBefore.calls + 3 && countsAfter.visited == countsBefore.visited + 3 && countsAfter.setsWritten == countsBefore.setsWritten + 3, "three bindings of one draw input were not counted as three calls visiting one allocation each");
+            Require(countsAfter.repeated == countsBefore.repeated + 2, "the second and third bindings in one batch were not counted as repeats");
+            Require(countsAfter.slotsDiffer - countsBefore.slotsDiffer == expectedDiffer && countsAfter.identical - countsBefore.identical == 2 - expectedDiffer, "the repeats' differing slots do not match the snapshots the bindings returned");
+        } else {
+            Require(countsAfter.calls == countsBefore.calls && countsAfter.visited == countsBefore.visited, "draw bindings were counted without APS5_PROFILE_DRAW");
+        }
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
@@ -4269,13 +4284,20 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         snapshotLifetime = first;
         first.reset();
         second.reset();
+        third.reset();
         Require(!snapshotLifetime.expired(), "draw snapshot was released before its GPU batch");
         snapshotRecorder.Sync();
         const auto contents = downloaded->Bytes();
         Require(std::all_of(contents.begin(), contents.begin() + elementBytes, [](std::byte value) { return value == std::byte{0x11}; }), "first draw observed overwritten input");
         Require(std::all_of(contents.begin() + elementBytes, contents.end(), [](std::byte value) { return value == std::byte{0x22}; }), "second draw observed overwritten input");
         snapshotRecorder.NotePendingWrite(element, elementBytes);
+        const auto pendingBefore = ShaderResources::DrawBindingCounts();
         Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
+        const auto pendingAfter = ShaderResources::DrawBindingCounts();
+        if (profiled) Require(pendingAfter.pendingWrite == pendingBefore.pendingWrite + 1 && pendingAfter.setsWritten == pendingBefore.setsWritten && pendingAfter.calls == pendingBefore.calls + 1, "a draw input behind a pending GPU write was not counted as skipped for it");
+        resources.MarkReboundForTest();
+        const auto rebound = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebound != nullptr && rebound->snapshots.empty() && rebound->allocation.set != VK_NULL_HANDLE, "a rebound draw with no snapshot did not get its own descriptor set");
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
@@ -13657,6 +13679,296 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
     std::cout << "slice dirty marking: ok\n";
 }
 
+void compiledBindingsTests(const Device& device) {
+    Require(ShaderResources::CompiledBindingsEnabled(), "compiled bindings tests run with APS5_COMPILED_BINDINGS or APS5_VERIFY_COMPILED_BINDINGS");
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: compiled bindings not tested\n";
+        std::exit(77);
+    }
+    constexpr std::size_t bytes = 262144;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: compiled bindings not tested\n";
+        std::exit(77);
+    }
+    const auto descriptorWords = [](std::uint64_t base, std::uint32_t size) { return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) & 0xffffu, size, 0x31000000u}; };
+    std::mt19937_64 random(0x5eed0c0bull);
+    const auto below = [&](std::uint64_t limit) { return limit == 0 ? std::uint64_t{0} : random() % limit; };
+    const std::array<std::uint32_t, 8> wordValues{1, 2, 3, 4, 5, 6, 7, 8};
+    std::size_t decisionsCompared = 0;
+    for (std::size_t trial = 0; trial < 48; ++trial) {
+        ShaderRecompiler::RecompileResult program;
+        program.pushConstants.resize(64);
+        const auto bindingCount = 1 + below(3);
+        std::size_t elements = 0;
+        for (std::uint32_t index = 0; index < bindingCount; ++index) {
+            ShaderRecompiler::DescriptorBinding binding;
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            binding.descriptorSet = 0;
+            binding.binding = index;
+            binding.count = static_cast<std::uint32_t>(1 + below(5));
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const std::array<std::uint64_t, 3> alignments{1, 4, 256};
+                const auto offset = 4096 + below(bytes - 32768) / alignments[trial % alignments.size()] * alignments[trial % alignments.size()];
+                const auto size = static_cast<std::uint32_t>(4 + below(12288));
+                const auto words = descriptorWords(address + offset, size);
+                binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+                binding.bufferWritten.push_back(below(4) == 0);
+            }
+            elements += binding.count;
+            program.bindings.push_back(binding);
+        }
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, compute);
+        Require(resources.BindingsCompiled(), "a completed template's bindings were not compiled");
+        for (std::size_t round = 0; round < 64; ++round) {
+            std::vector<ShaderResources::MovedBuffer> moved;
+            const auto count = below(7);
+            for (std::size_t entry = 0; entry < count; ++entry) {
+                const auto allocation = static_cast<std::size_t>(below(elements + 3));
+                if (below(3) == 0) moved.push_back({allocation, 0, 4 * (1 + below(wordValues.size())), std::span<const std::uint32_t>(wordValues.data(), 1 + below(wordValues.size()))});
+                else moved.push_back({allocation, address + 4096 + below(bytes - 32768), static_cast<std::size_t>(below(12288)), {}});
+            }
+            std::string difference;
+            Require(resources.CompareBindingDecisionsForTest(moved, below(4) == 0, difference), "compiled binding decisions differ from the per-draw walk: " + difference);
+            ++decisionsCompared;
+        }
+    }
+    constexpr std::size_t inputBytes = 8192;
+    const auto first = address + 16384;
+    const auto second = address + 65536;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 2;
+    for (const auto base : {first, second}) {
+        const auto words = descriptorWords(base, inputBytes);
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+        binding.bufferWritten.push_back(false);
+    }
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    {
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        const auto sameSlots = [](const ShaderResources::DrawBindings& left, const ShaderResources::DrawBindings& right) {
+            return left.snapshots.size() == right.snapshots.size() && std::equal(left.snapshots.begin(), left.snapshots.end(), right.snapshots.begin(), [](const auto& a, const auto& b) { return a.buffer == b.buffer && a.offset == b.offset && a.bytes == b.bytes; });
+        };
+        const auto before = ShaderResources::DrawBindingReuseCounts();
+        const auto drawn = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(drawn != nullptr && drawn->snapshots.size() == 2 && drawn->allocation.set != VK_NULL_HANDLE, "the first draw did not snapshot both inputs");
+        const auto repeated = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(repeated != nullptr && sameSlots(*drawn, *repeated), "an unchanged input was snapshotted again into a different slot");
+        Require(repeated == drawn, "a draw in the same batch with the same template and snapshots did not reuse the set");
+        const auto heldSet = drawn->allocation.set;
+        const auto heldBuffer = drawn->snapshots[0].buffer;
+        const auto heldOffset = drawn->snapshots[0].offset;
+        std::memset(reinterpret_cast<void*>(first), 0x22, inputBytes);
+        AgcDriver::GuestMemory::MarkWritten(first, inputBytes);
+        const auto changed = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(changed != nullptr && changed != drawn && changed->allocation.set != heldSet, "a draw with a changed snapshot reused the set of the draw before it");
+        Require(drawn->allocation.set == heldSet && drawn->snapshots[0].buffer == heldBuffer && drawn->snapshots[0].offset == heldOffset, "a set already bound by an earlier draw was rewritten in place");
+        Require(!sameSlots(*drawn, *changed), "a changed input kept its old snapshot slot");
+        const auto again = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(again == changed, "an unchanged draw after a changed one did not reuse the changed set");
+        resources.NoteBindingsChangedForTest();
+        const auto rebuilt = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebuilt != nullptr && rebuilt != changed && rebuilt->allocation.set != changed->allocation.set, "a set written before the template's descriptors changed was reused");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == rebuilt, "the draw after a template change did not reuse the set written after it");
+        const std::array<std::uint32_t, 4> overrideWords{9, 10, 11, 12};
+        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, sizeof(overrideWords), overrideWords}}};
+        const auto overridden = resources.PrepareDrawBindings(snapshotRecorder, moved);
+        const auto overriddenAgain = resources.PrepareDrawBindings(snapshotRecorder, moved);
+        Require(overridden != nullptr && overriddenAgain != nullptr && overridden != overriddenAgain && overridden != rebuilt, "a draw whose input words were uploaded reused a set");
+        const auto lastOfBatch = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(lastOfBatch != nullptr && lastOfBatch != overriddenAgain, "a plain draw after an uploaded one reused the uploaded one's set");
+        const auto lastSet = lastOfBatch->allocation.set;
+        snapshotRecorder.Submit();
+        const auto nextBatch = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(nextBatch != nullptr && nextBatch != lastOfBatch && nextBatch->allocation.set != lastSet, "a set kept by a submitted batch was reused by the next batch");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nextBatch, "the second draw of a new batch did not reuse the first one's set");
+        const auto after = ShaderResources::DrawBindingReuseCounts();
+        Require(after.first - before.first == 1, "the template's first draw was not counted as first");
+        Require(after.reused - before.reused == 4, "reused sets were not counted");
+        Require(after.slotChanged - before.slotChanged >= 2, "draws with changed snapshots were not counted as slot changes");
+        Require(after.generation - before.generation == 1, "the draw after a template change was not counted as a generation miss");
+        Require(after.overrideWords - before.overrideWords >= 1, "a draw with uploaded words was not counted as an override miss");
+        Require(after.newBatch - before.newBatch == 1, "the first draw of a new batch was not counted as a new batch");
+        Require(after.fresh - before.fresh == 7, "fresh sets were not counted");
+        Require(after.legacy == before.legacy, "a compiled template took the per-draw walk");
+        snapshotRecorder.Sync();
+    }
+    {
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        snapshotRecorder.NotePendingWrite(first, inputBytes);
+        snapshotRecorder.NotePendingWrite(second, inputBytes);
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "a draw with every input behind a pending write was given a set");
+        resources.MarkReboundForTest();
+        const auto rebound = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebound != nullptr && rebound->snapshots.empty() && rebound->allocation.set != VK_NULL_HANDLE, "a rebound draw with no snapshot did not get its own set");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == rebound, "a second rebound draw with no snapshot did not reuse the set");
+        snapshotRecorder.Sync();
+    }
+    std::cout << "compiled bindings: " << decisionsCompared << " randomized decision walks matched the per-draw walk\n";
+}
+
+void markRepeatTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 128;
+    constexpr std::uint32_t slices = 4;
+    constexpr std::size_t sliceBytes = 65536;
+    constexpr std::size_t bytes = slices * sliceBytes;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: repeated mark effects not tested\n";
+        return;
+    }
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block, address, bytes};
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.depthOrLastArray = slices - 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    auto flat = resource;
+    flat.dimension = TextureDimension::k2D;
+    flat.depthOrLastArray = 0;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.imageLayers == slices && geometry.guestBytes == bytes, "the repeated mark image does not hold four 64 KiB slices");
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        auto alias = StorageTexture::Create(context, detiler, flat, 0);
+        const auto units = image->TrackedUnits();
+        Require(units == slices, "the repeated mark image tracks " + std::to_string(units) + " units, not one per slice");
+        static_cast<void>(recorder.Commands());
+        recorder.Keep(image);
+        recorder.Keep(alias);
+        const auto lastDimension = [&] {
+            const auto record = StorageTexture::LastWrite(address);
+            Require(record.has_value(), "no layout write is recorded at the images' address");
+            Require(record->width == side && record->tileMode == TextureTileMode::kLinear && record->format == 56, "the recorded layout write lost the images' shape");
+            return record->dimension;
+        };
+        std::atomic<bool> reading{true};
+        std::atomic<std::uint64_t> foreignRecords{0};
+        std::thread reader([&] {
+            while (reading.load(std::memory_order_acquire)) {
+                const auto record = StorageTexture::LastWrite(address);
+                if (record.has_value() && (record->width != side || (record->dimension != TextureDimension::k2DArray && record->dimension != TextureDimension::k2D))) foreignRecords.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        struct StopReader {
+            std::atomic<bool>& reading;
+            std::thread& reader;
+            ~StopReader() {
+                reading.store(false, std::memory_order_release);
+                reader.join();
+            }
+        } stopReader{reading, reader};
+        image->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write is not the recorded layout");
+        const auto layoutSkips = StorageTexture::LayoutStoreSkips();
+        image->MarkSliceDirty(1);
+        Require(lastDimension() == TextureDimension::k2DArray, "a repeated write of the array image changed the recorded layout");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a repeated write of the array image stored its layout again");
+        alias->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2D, "the alias's write after the array image's is not the recorded layout");
+        image->MarkSliceDirty(2);
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write after the alias's left the alias's layout recorded");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a write after another image's was skipped as a repeat");
+        Require(foreignRecords.load(std::memory_order_relaxed) == 0, "a concurrent reader saw a layout no image at the address wrote");
+        std::vector<std::uint64_t> expected(units);
+        for (std::uint32_t unit = 0; unit < units; ++unit) expected[unit] = image->PendingSinceForTest(unit);
+        const auto mark = [&](std::uint32_t first, std::uint32_t count, bool advance, const std::string& what) {
+            if (advance) AgcDriver::GuestMemory::AdvanceTrackerGenerationForTest(AgcDriver::GuestMemory::TrackerGeneration() + 100);
+            const auto before = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto skips = StorageTexture::PendingSinceSkips();
+            image->MarkSliceDirty(first, count);
+            const auto after = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto since = image->PendingSinceForTest(first);
+            Require(since >= before && since <= after, what + ": the marked unit's pending-since generation " + std::to_string(since) + " is not the generation of its mark");
+            for (std::uint32_t unit = first; unit < first + count; ++unit) expected[unit] = since;
+            for (std::uint32_t unit = 0; unit < units; ++unit) {
+                Require(image->PendingSinceForTest(unit) == expected[unit], what + ": unit " + std::to_string(unit) + " holds pending-since generation " + std::to_string(image->PendingSinceForTest(unit)) + ", not " + std::to_string(expected[unit]));
+            }
+            return StorageTexture::PendingSinceSkips() - skips;
+        };
+        mark(0, units, true, "a whole mark at a new generation");
+        const auto held = expected[1];
+        const bool heldBefore = AgcDriver::GuestMemory::TrackerGeneration() == held;
+        const auto repeatSkips = mark(1, 2, false, "a repeated mark inside the whole mark");
+        Require(heldBefore && AgcDriver::GuestMemory::TrackerGeneration() == held, "the tracker generation moved under a repeated mark: the skip is not exercised");
+        Require(repeatSkips == 1, "a repeated mark at the same generation walked its units again");
+        mark(2, 1, true, "a one-unit mark at a new generation");
+        const auto outsideSkips = mark(0, 1, false, "a mark of a unit outside the newest mark at the same generation");
+        mark(1, 1, false, "a mark between the two newest marks");
+        mark(0, 3, false, "a mark covering the joined marks");
+        mark(3, 1, false, "a mark of the last unit");
+        mark(0, units, true, "a whole mark at a later generation");
+        Require(outsideSkips == 0, "a mark of a unit no mark at its generation covered was skipped");
+        image->WriteBack();
+        alias->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    recorder.Sync();
+    std::cout << "repeated mark effects: ok\n";
+}
+
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -13693,6 +14005,16 @@ void atomicViewTests(const Device& device, Recorder& recorder) {
         Require(atomic != VK_NULL_HANDLE && atomic == image->AtomicView(0, false), "atomic storage views are not reused");
         Require((atomic == image->View(0)) == (format == 20u), "only a 32_UINT storage image serves atomics through its own view");
     }
+}
+
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        GpuMutex().unlock();
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+        GpuMutex().lock();
+    }
+    return condition();
 }
 
 bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool imported) {
@@ -13853,6 +14175,50 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
     vertex.vertexAttributes = {attributeFor(address, 0, 0)};
     Draw(context, consumer, triangle, shaders);
     WaitForOptimizedPipelines(context.device);
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    std::shared_ptr<const AgcDriver::DrawRecipe> retained;
+    Draw(context, consumer, triangle, shaders, {}, &retained);
+    Require(retained != nullptr && retained->targets.size() == 1, "target retention draw did not produce a recipe");
+    WaitForOptimizedPipelines(context.device);
+    SharedResourceCache().Clear();
+    ClearCachedTextures(context.device);
+    Require(!retained->targets.front().expired(), "recorded target expired after cache eviction before completion");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Require(EventuallyTrue([&] { return retained->targets.front().expired(); }), "completion did not release the recorded target owner");
+    if (imported) {
+        const auto argumentsAddress = address + 2 * unit;
+        const std::array<std::uint32_t, 4> arguments{3, 1, 0, 0};
+        AgcDriver::GuestMemory::Write(argumentsAddress, std::as_bytes(std::span(arguments)));
+        vertex.vertexAttributes = {attributeFor(argumentsAddress + 256, 16, 0)};
+        vertex.vertexAttributes[0].resource.fields[2] = 3;
+        auto indirect = triangle;
+        indirect.indirect.emplace();
+        indirect.indirect->arguments = argumentsAddress;
+        indirect.indirect->opcode = 0x24;
+        indirect.indirect->recordBytes = 16;
+        indirect.indirect->stride = 16;
+        indirect.indirect->count = 1;
+        auto pool = GetBufferPool(context);
+        const auto usage = BufferPool::Usage(VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        const auto availableScratch = [&] {
+            auto allocation = pool->Take(sizeof(arguments), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            if (!allocation) allocation = pool->Take(sizeof(arguments), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr, true);
+            const bool available = allocation.has_value();
+            if (allocation) pool->Put(*allocation);
+            return available;
+        };
+        Require(!availableScratch(), "scratch retention fixture already had an idle indirect scratch");
+        Draw(context, consumer, indirect, shaders);
+        Require(!availableScratch(), "GPU indirect scratch recycled before completion");
+        const auto read = recorder.DescribePendingRead(argumentsAddress, sizeof(arguments));
+        Require(read && read->kind == Recorder::ReadKind::Indirect, "scratch retention draw did not use GPU indirect arguments");
+        recorder.Submit();
+        recorder.Sync();
+        Require(EventuallyTrue(availableScratch), "GPU indirect scratch survived completion");
+    }
+
     std::cout << "Vertex range and pending color producer tests passed (" << (imported ? "imported" : "copied") << ")\n";
     return true;
 }
@@ -15854,6 +16220,18 @@ int main(int argc, char** argv) {
             sliceDirtyTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-read-only") {
+            resourceReadTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--compiled-bindings-only") {
+            compiledBindingsTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {
+            markRepeatTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-present-only") {
             RunResidentPresentTests(device.GetContext());
             return 0;
@@ -16138,6 +16516,7 @@ int main(int argc, char** argv) {
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         sliceDirtyTests(device, recorder);
+        markRepeatTests(device, recorder);
         storeRunTests(device, recorder);
         queuedWriteGroupTests();
         remappedImportTests(device);

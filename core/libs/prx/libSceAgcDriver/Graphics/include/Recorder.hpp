@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -107,6 +108,7 @@ public:
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
+    std::uint64_t BatchEpoch() const { return retentionEpoch; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
@@ -114,7 +116,27 @@ public:
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
     void KeepThroughHold(std::shared_ptr<void> object);
-    void KeepBytes(const void* owner, std::size_t bytes);
+    void ReserveRetention(std::size_t additional);
+    template<typename T>
+    void Retain(const std::shared_ptr<T>& object) {
+        if (object == nullptr) return;
+        if (open == nullptr) ensureOpen();
+        prepareRetention();
+        const auto mask = retention.size() - 1;
+        auto index = retentionHash(object.get()) & mask;
+        while (retention[index].epoch == retentionEpoch) {
+            const auto& kept = open->kept[retention[index].index];
+            if (kept.get() == object.get() && !kept.owner_before(object) && !object.owner_before(kept)) return;
+            index = (index + 1) & mask;
+        }
+        const auto keptIndex = open->kept.size();
+        open->kept.push_back(object);
+        retention[index] = {object.get(), retentionEpoch, keptIndex};
+        ++retentionCount;
+    }
+
+    void Retain(const void* owner, std::size_t bytes);
+    static std::uint64_t RetainedByteRepeats();
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
     static constexpr VkPipelineStageFlags UploadScratchReuseStages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -216,6 +238,7 @@ public:
     struct ReadStatistics {
         std::uint64_t noted, queries, staleIgnored;
         std::array<std::uint64_t, static_cast<std::size_t>(ReadKind::Count)> hits;
+        std::uint64_t repeated;
     };
     static ReadStatistics ReadCounts();
     // Whether the OPEN (unsubmitted) batch writes the range: a wait on such a range must submit it.
@@ -624,7 +647,6 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
-        std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
@@ -847,7 +869,10 @@ private:
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
-    void ensureOpen();
+    void ensureOpen() {
+        if (open == nullptr || assertGpuLock) beginBatch();
+    }
+    void beginBatch();
     void flushDeferredDispatch();
     bool runConflict(std::span<const RunAccess> accesses) const;
     bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) const;
@@ -915,6 +940,7 @@ private:
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
+    const bool assertGpuLock;
     // Every access holds the table mutex (Recorder.cpp): the recorded entries are mutated under
     // GuestMemory::GpuMutex as well, the queued ones (NoteQueuedLabel) under the table mutex alone.
     // Ordered, so a range (a noted write, PendingLabelIn) finds its dwords by lower_bound.
@@ -931,6 +957,86 @@ private:
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
     std::unique_ptr<Batch> open;
+    struct RetentionSlot {
+        const void* object = nullptr;
+        std::uint64_t epoch = 0;
+        std::size_t index = 0;
+    };
+    std::vector<RetentionSlot> retention;
+    std::size_t retentionCount = 0;
+    std::uint64_t retentionEpoch = 0;
+    void prepareRetention(std::size_t additional = 1);
+    static std::size_t retentionHash(const void* object) {
+        return static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(object) >> 4u) * 0x9e3779b97f4a7c15ull >> 32u);
+    }
+    template<typename TKey, typename THash>
+    class BatchKeySet {
+    public:
+        bool Insert(const TKey& key, std::uint64_t epoch) {
+            if ((count + 1) * 2 > slots.size()) grow(epoch);
+            const auto mask = slots.size() - 1;
+            auto index = THash{}(key) & mask;
+            while (slots[index].epoch == epoch) {
+                if (slots[index].key == key) return false;
+                index = (index + 1) & mask;
+            }
+            slots[index] = {key, epoch};
+            ++count;
+            return true;
+        }
+        void Reset() { count = 0; }
+        void Clear() {
+            for (auto& slot : slots) slot = {};
+            count = 0;
+        }
+
+    private:
+        struct Slot {
+            TKey key{};
+            std::uint64_t epoch = 0;
+        };
+        std::vector<Slot> slots;
+        std::size_t count = 0;
+        void grow(std::uint64_t epoch) {
+            std::vector<Slot> grown(std::max<std::size_t>(64, slots.size() * 2));
+            const auto mask = grown.size() - 1;
+            for (const auto& slot : slots) {
+                if (slot.epoch != epoch) continue;
+                auto index = THash{}(slot.key) & mask;
+                while (grown[index].epoch == epoch) index = (index + 1) & mask;
+                grown[index] = slot;
+            }
+            slots.swap(grown);
+        }
+    };
+    struct OwnerHash {
+        std::size_t operator()(const void* owner) const { return retentionHash(owner); }
+    };
+    struct ReadKey {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        ReadKind kind = ReadKind::Count;
+        bool operator==(const ReadKey&) const = default;
+    };
+    struct ReadKeyHash {
+        std::size_t operator()(const ReadKey& key) const {
+            const auto mixed = (key.begin ^ (key.end * 0xff51afd7ed558ccdull) ^ (static_cast<std::uint64_t>(key.kind) << 56u)) * 0x9e3779b97f4a7c15ull;
+            return static_cast<std::size_t>(mixed >> 32u);
+        }
+    };
+    BatchKeySet<const void*, OwnerHash> retainedByteOwners;
+    BatchKeySet<ReadKey, ReadKeyHash> notedReadKeys;
+    struct ReadListKey {
+        const void* list = nullptr;
+        ReadKind kind = ReadKind::Count;
+        bool operator==(const ReadListKey&) const = default;
+    };
+    struct ReadListKeyHash {
+        std::size_t operator()(const ReadListKey& key) const { return retentionHash(key.list) ^ static_cast<std::size_t>(key.kind); }
+    };
+    BatchKeySet<ReadListKey, ReadListKeyHash> notedReadLists;
+    void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
+
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
