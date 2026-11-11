@@ -391,6 +391,10 @@ bool& DrawPipeline::Active() {
     return active;
 }
 
+bool DrawPipeline::SeesQueuedWrites() {
+    return Active() || DrawFinisher::OnFinisherThread();
+}
+
 std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     static std::atomic<std::uint64_t> token{1};
     return token;

@@ -65,7 +65,7 @@ namespace AgcDriver::DriverDetail {
 
 std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address, const std::shared_ptr<const ShaderSnapshot>& retained) {
     const auto drain = [](std::uint64_t first, std::size_t bytes) {
-        if (!DrawPipeline::Active()) return;
+        if (!DrawPipeline::SeesQueuedWrites()) return;
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.Overlaps(first, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
     };
