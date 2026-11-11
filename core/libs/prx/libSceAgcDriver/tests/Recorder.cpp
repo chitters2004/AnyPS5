@@ -136,6 +136,25 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+struct ReadOnlyImportWatch {
+    const Context& context;
+    ImportWatch decided;
+    bool forced = false;
+
+    explicit ReadOnlyImportWatch(const Context& watching) : context(watching), decided(PrepareImportWatch(watching)) {
+        if (decided == ImportWatch::Watch || watching.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) return;
+        const auto probe = ProbeImportWriteProtection(watching);
+        if (probe.failure != nullptr || probe.writtenAtImport != 0 || probe.writtenAfterSubmit != 0) return;
+        SetImportWatch(watching, ImportWatch::Watch);
+        forced = true;
+    }
+    ~ReadOnlyImportWatch() {
+        if (forced) SetImportWatch(context, decided);
+    }
+    ReadOnlyImportWatch(const ReadOnlyImportWatch&) = delete;
+    ReadOnlyImportWatch& operator=(const ReadOnlyImportWatch&) = delete;
+};
+
 bool collectMappingHistoryTests() {
     constexpr std::size_t bytes = 131072;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
@@ -5132,6 +5151,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
         return;
     }
+    const ReadOnlyImportWatch watch(context);
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
@@ -5219,6 +5239,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
 void drawSnapshotPatchTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t bytes = 4 * 65536;
+    const ReadOnlyImportWatch watch(context);
     std::unique_lock gpu(GpuMutex());
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
@@ -6064,6 +6085,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
         std::cout << "host imports or write watching unavailable: in-place draw inputs not tested\n";
         return;
     }
+    const ReadOnlyImportWatch watch(context);
     struct Release {
         void* block;
         ~Release() { ReleaseWatched(block, bytes); }
