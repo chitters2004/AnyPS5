@@ -455,6 +455,25 @@ class TraceDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "encoder.windows_per_post"):
             trace_digest.validate_interval(first)
 
+    def test_encoder_submit_settles_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"posts": 130, "submit": {"async": 130, "async_per_frame": 13.0, "settle_waits": 4, "settle_wait_ms_per_frame": 0.5, "present_settle_waits": 10, "present_settle_wait_ms_per_frame": 1.25}}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 130 | 13.0 | 4 | 0.50 | 10 | 1.25 |", text)
+        self.assertIn("| 2 | 0 | 0.0 | 0 | 0.00 | 0 | 0.00 |", text)
+        self.assertNotIn("async submits", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"submit": {"settle_waits": -1}}
+        with self.assertRaisesRegex(ValueError, "encoder.submit.settle_waits"):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"submit": []}
+        with self.assertRaisesRegex(ValueError, "encoder.submit must"):
+            trace_digest.validate_interval(first)
+
     def test_handoff_spin_interval_sites_are_preserved(self):
         first = interval_line(0.0, 30.0, 20.0, 5.0)
         second = interval_line(30.0, 60.0, 20.0, 5.0)

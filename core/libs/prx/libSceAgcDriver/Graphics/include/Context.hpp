@@ -153,6 +153,8 @@ struct DeviceFunctions {
 std::uint64_t& DeviceProcLookups();
 void BeforeCommandLookup(VkDevice device);
 bool QueueAccessEnabled();
+bool QueueSubmitsPosted() noexcept;
+void SettleQueueSubmits(VkDevice device, bool present);
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
@@ -425,8 +427,10 @@ struct Context {
 class QueueAccess {
 public:
     enum class Queues : std::uint8_t { Main, All };
-    explicit QueueAccess(const Context& context, Queues queues = Queues::Main) {
+    enum class Settle : std::uint8_t { Other, Present };
+    explicit QueueAccess(const Context& context, Queues queues = Queues::Main, Settle site = Settle::Other) {
         if (!QueueAccessEnabled()) return;
+        if (QueueSubmitsPosted()) SettleQueueSubmits(context.device, site == Settle::Present);
         if (context.mainQueueMutex != nullptr) main = std::unique_lock(*context.mainQueueMutex);
         if (queues != Queues::All) return;
         if (context.sparseQueueMutex != nullptr) sparse = std::unique_lock(*context.sparseQueueMutex);

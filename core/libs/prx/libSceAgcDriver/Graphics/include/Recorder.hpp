@@ -415,6 +415,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void FailNextAsyncSubmitsForTest(unsigned count);
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -678,6 +679,8 @@ private:
         std::uint64_t traceId = 0;
         bool submitted = false;
         bool guestWork = false;
+        bool confirmed = false;
+        std::unique_ptr<CommandEncoder::SubmitRequest> request;
         std::atomic<bool> submitStarted{false};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
@@ -896,6 +899,17 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void dispatchAsync(std::unique_ptr<Batch>& batch, const std::string& tokens);
+    static void asyncSubmitSettled(void* owner, const CommandEncoder::SubmitRequest& request, CommandEncoder::SubmitRequest::State state) noexcept;
+    void noteConfirmed(Batch& batch);
+    void confirmReady();
+    void confirmThrough(std::uint64_t serial);
+    [[noreturn]] void failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRequest::State state);
+    bool asyncSubmitFailed(std::uint64_t serial);
+    std::atomic<std::uint64_t> asyncDispatched{0};
+    std::atomic<std::uint64_t> asyncSettled{0};
+    std::atomic<std::uint64_t> asyncFailedFrom{~std::uint64_t{0}};
+    std::atomic<std::uint32_t> asyncWaiters{0};
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);

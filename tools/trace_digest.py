@@ -501,6 +501,15 @@ def validate_interval(record):
     causes = encoder.get("posts_by_cause", {})
     if not isinstance(causes, dict) or any(not isinstance(name, str) or type(value) is not int or value < 0 for name, value in causes.items()):
         raise ValueError("encoder.posts_by_cause must map causes to non-negative integers")
+    submit = encoder.get("submit", {})
+    if not isinstance(submit, dict):
+        raise ValueError("encoder.submit must be an object")
+    for name in ("async", "settle_waits", "present_settle_waits"):
+        if name in submit and (type(submit[name]) is not int or submit[name] < 0):
+            raise ValueError(f"encoder.submit.{name} must be a non-negative integer")
+    for name in ("async_per_frame", "settle_wait_ms_per_frame", "present_settle_wait_ms_per_frame"):
+        if name in submit:
+            interval_number(submit[name], f"encoder.submit.{name}")
     sites = record.get("handoff_spin", {})
     if not isinstance(sites, dict):
         raise ValueError("handoff_spin must be an object")
@@ -572,6 +581,11 @@ def markdown_intervals(result):
             encoder = row["encoder"] or {}
             causes = ", ".join(f"{name} {count}" for name, count in sorted((encoder.get("posts_by_cause") or {}).items())) or "-"
             lines.append(f"| {index} | {encoder.get('posts', 0)} | {encoder.get('commands', 0)} | {encoder.get('waits', 0)} | {encoder.get('wait_ms_per_frame', 0.0):.2f} | {encoder.get('posts_per_frame', 0.0):.1f} | {encoder.get('windows_per_post', 0.0):.2f} | {encoder.get('cpu_ms_per_frame', 0.0):.2f} | {table_cell(causes)} |")
+    if any(row["encoder"] and row["encoder"].get("submit") for row in rows):
+        lines += ["", "| # | async submits | submits/frame | settle waits | settle ms/frame | present settle waits | present settle ms/frame |", "|---|---|---|---|---|---|---|"]
+        for index, row in enumerate(rows, 1):
+            submit = (row["encoder"] or {}).get("submit") or {}
+            lines.append(f"| {index} | {submit.get('async', 0)} | {submit.get('async_per_frame', 0.0):.1f} | {submit.get('settle_waits', 0)} | {submit.get('settle_wait_ms_per_frame', 0.0):.2f} | {submit.get('present_settle_waits', 0)} | {submit.get('present_settle_wait_ms_per_frame', 0.0):.2f} |")
     spin_sites = sorted({site for row in rows for site in (row["handoff_spin"] or {})})
     if spin_sites:
         lines += ["", "| # | hand-off site | hits | misses | spin ms/frame | block ms/frame |", "|---|---|---|---|---|---|"]

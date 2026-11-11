@@ -573,6 +573,7 @@ bool ProcTable() {
 // under this mutex takes the GPU mutex (no lock-order cycle).
 AgcDriver::Mutex labelTableMutex;
 std::atomic<unsigned> injectedSubmitFailures{0};
+std::atomic<unsigned> injectedAsyncSubmitFailures{0};
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -4304,6 +4305,163 @@ void Recorder::FailNextSubmitsForTest(unsigned count) {
     injectedSubmitFailures.store(count, std::memory_order_relaxed);
 }
 
+void Recorder::FailNextAsyncSubmitsForTest(unsigned count) {
+    injectedAsyncSubmitFailures.store(count, std::memory_order_relaxed);
+}
+
+namespace {
+
+template<typename TTokens>
+std::string TraceTokens(const TTokens& drawTraceTokens) {
+    std::string tokens = "[";
+    for (std::size_t i = 0; i < drawTraceTokens.size(); ++i) {
+        if (i > 0) tokens += ",";
+        tokens += std::to_string(drawTraceTokens[i]);
+    }
+    tokens += "]";
+    return tokens;
+}
+
+}
+
+void Recorder::dispatchAsync(std::unique_ptr<Batch>& batch, const std::string& tokens) {
+    auto request = std::make_unique<CommandEncoder::SubmitRequest>();
+    const std::uint64_t serial = submissions + 1;
+    if (CheckpointMarkersEnabled() && batch->queue == 0 && batch->predictedSerial != 0) {
+        Require(batch->predictedSerial == serial, "Recorder::Submit submit serial mismatch");
+        try {
+            if (const auto snapshot = GuestBufferMemory::TrySnapshotAddressSpace(); snapshot.has_value()) AgcDriver::SubmissionSnapshots::DeviceSnapshots().NoteSubmit(serial, snapshot->first, snapshot->second, AgcDriver::SubmitBracket{serial, CompletedThrough(), batch->firstToken, batch->lastToken});
+        } catch (...) {
+        }
+    }
+    CaptureTrace::Log("submit batch=%llu tokens=%s", static_cast<unsigned long long>(serial), tokens.c_str());
+    request->commands = batch->commands;
+    request->queue = context.queue;
+    request->fence = batch->fence;
+    request->timeline = timeline;
+    request->serial = serial;
+    request->endCommandBuffer = function(endCommandBuffer, "vkEndCommandBuffer");
+    request->queueSubmit = function(queueSubmit, "vkQueueSubmit");
+    request->queueMutex = context.mainQueueMutex;
+    request->recording = &batch->recording;
+    request->settled = &Recorder::asyncSubmitSettled;
+    request->owner = this;
+    if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
+    if (injectedAsyncSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedAsyncSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) request->injectFailure = true;
+    if (timeline != VK_NULL_HANDLE && !progressWatcher) {
+        progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
+                                                            context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
+    }
+    DestroyDeferredAtIdle(context);
+    request->hold = std::exchange(submitHold, VK_NULL_HANDLE);
+    request->holdValue = submitHoldValue;
+    batch->submitStarted.store(true, std::memory_order_release);
+    batch->request = std::move(request);
+    batch->submitted = true;
+    batch->serial = ++submissions;
+    batch->submittedAt = std::chrono::steady_clock::now();
+    asyncDispatched.store(batch->serial, std::memory_order_release);
+    encoder->PostSubmit(*batch->request);
+    inFlight.push_back(std::move(batch));
+    inFlightKeptBytes += inFlight.back()->keptBytes;
+    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+}
+
+void Recorder::asyncSubmitSettled(void* owner, const CommandEncoder::SubmitRequest& request, CommandEncoder::SubmitRequest::State state) noexcept {
+    auto& recorder = *static_cast<Recorder*>(owner);
+    if (state == CommandEncoder::SubmitRequest::State::Submitted) {
+        {
+            std::lock_guard lock(recorder.completedMutex);
+            recorder.newestSubmitted = request.serial;
+            recorder.newestSubmittedAt = request.SubmittedAt();
+        }
+        if (recorder.progressWatcher) recorder.progressWatcher->Submitted(request.serial);
+    } else {
+        auto failed = recorder.asyncFailedFrom.load(std::memory_order_relaxed);
+        while (request.serial < failed && !recorder.asyncFailedFrom.compare_exchange_weak(failed, request.serial, std::memory_order_release, std::memory_order_relaxed)) {
+        }
+    }
+    recorder.asyncSettled.store(request.serial, std::memory_order_seq_cst);
+    if (recorder.asyncWaiters.load(std::memory_order_seq_cst) != 0) AgcDriver::AddressWakeAll(recorder.asyncSettled);
+}
+
+void Recorder::noteConfirmed(Batch& batch) {
+    const auto& request = *batch.request;
+    batch.confirmed = true;
+    batch.submittedAt = request.SubmittedAt();
+    if (batch.guestWork) LibcRunReportMilestone_nid_no_patch(2);
+    CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch.serial), TraceTokens(batch.drawTraceTokens).c_str());
+    if (DrawProfiled()) {
+        const auto us = std::chrono::duration<double, std::micro>(request.SubmittedAt() - request.SubmitStart()).count();
+        ++submitCount;
+        submitUs += us;
+        submitMaxUs = std::max(submitMaxUs, us);
+        if (auto* frame = PerformanceContext::Current()) frame->Add(frame->Get("Recorder", "submit"), request.SubmittedAt() - request.SubmitStart());
+    }
+}
+
+void Recorder::confirmReady() {
+    for (auto& batch : inFlight) {
+        if (batch->request == nullptr || batch->confirmed) continue;
+        if (batch->request->Current() != CommandEncoder::SubmitRequest::State::Submitted) return;
+        noteConfirmed(*batch);
+    }
+}
+
+void Recorder::confirmThrough(std::uint64_t serial) {
+    for (std::size_t index = 0; index < inFlight.size() && inFlight[index]->serial <= serial; ++index) {
+        auto& batch = *inFlight[index];
+        if (batch.request == nullptr || batch.confirmed) continue;
+        const auto state = batch.request->Wait();
+        if (state == CommandEncoder::SubmitRequest::State::Submitted) {
+            noteConfirmed(batch);
+            continue;
+        }
+        while (inFlight.size() > index + 1) {
+            auto later = std::move(inFlight.back());
+            inFlight.pop_back();
+            inFlightKeptBytes -= later->keptBytes;
+            discard(std::move(later));
+        }
+        auto failed = std::move(inFlight.back());
+        inFlight.pop_back();
+        inFlightKeptBytes -= failed->keptBytes;
+        failAsync(std::move(failed), state);
+    }
+}
+
+void Recorder::failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRequest::State state) {
+    while (!inFlight.empty() && inFlight.back()->serial > failed->serial) {
+        auto later = std::move(inFlight.back());
+        inFlight.pop_back();
+        inFlightKeptBytes -= later->keptBytes;
+        discard(std::move(later));
+    }
+    const auto serial = failed->serial;
+    const auto result = failed->request->Result();
+    const auto error = failed->request->Error();
+    discard(std::move(failed));
+    if (state == CommandEncoder::SubmitRequest::State::NotSubmitted) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: an earlier submit on its queue failed");
+    if (result == VK_ERROR_DEVICE_LOST) {
+        const QueueAccess access(context, QueueAccess::Queues::All);
+        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    }
+    if (error) std::rethrow_exception(error);
+    Check(result, "vkQueueSubmit recorder");
+    throw std::logic_error("AGC graphics: an async submit failed without a result");
+}
+
+bool Recorder::asyncSubmitFailed(std::uint64_t serial) {
+    if (serial > asyncDispatched.load(std::memory_order_acquire)) return false;
+    if (asyncSettled.load(std::memory_order_acquire) < serial) {
+        asyncWaiters.fetch_add(1, std::memory_order_seq_cst);
+        for (auto seen = asyncSettled.load(std::memory_order_seq_cst); seen < serial; seen = asyncSettled.load(std::memory_order_seq_cst)) AgcDriver::AddressWait(asyncSettled, seen);
+        asyncWaiters.fetch_sub(1, std::memory_order_relaxed);
+    }
+    return asyncFailedFrom.load(std::memory_order_acquire) <= serial;
+}
+
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
@@ -4315,6 +4473,8 @@ void Recorder::Submit() {
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (encoder != nullptr && encoder->OpenOnThisThread()) throw std::logic_error("AGC graphics: a batch was submitted inside an encoding window");
+    confirmReady();
+    const bool async = encoder != nullptr && CommandEncoder::SubmitsAsync();
     struct DiscardUnsubmitted {
         Recorder& recorder;
         std::unique_ptr<Batch>& batch;
@@ -4323,7 +4483,7 @@ void Recorder::Submit() {
         }
     };
     if (encoder != nullptr) {
-        encoder->Quiesce();
+        if (!async) encoder->Quiesce();
         if (open->recording.Failed()) {
             auto failed = std::move(open);
             const DiscardUnsubmitted discardFailed{*this, failed};
@@ -4356,6 +4516,11 @@ void Recorder::Submit() {
     }
     auto batch = std::move(open);
     const DiscardUnsubmitted discardUnsubmitted{*this, batch};
+    if (async) {
+        batch->recording.Finish();
+        dispatchAsync(batch, TraceTokens(batch->drawTraceTokens));
+        return;
+    }
     if (encoder != nullptr) {
         encoder->FinishBatch();
         batch->recording.Finish();
@@ -4374,12 +4539,7 @@ void Recorder::Submit() {
         } catch (...) {
         }
     }
-    std::string tokensStr = "[";
-    for (std::size_t i = 0; i < batch->drawTraceTokens.size(); ++i) {
-        if (i > 0) tokensStr += ",";
-        tokensStr += std::to_string(batch->drawTraceTokens[i]);
-    }
-    tokensStr += "]";
+    const std::string tokensStr = TraceTokens(batch->drawTraceTokens);
     CaptureTrace::Log("submit batch=%llu tokens=%s", static_cast<unsigned long long>(serial), tokensStr.c_str());
     VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
     const VkSemaphore hold = std::exchange(submitHold, VK_NULL_HANDLE);
@@ -4493,6 +4653,7 @@ VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphore
 void Recorder::WaitSerial(std::uint64_t serial) {
     PerformanceTimer frameTiming("Recorder.WaitSerial");
     if (timeline == VK_NULL_HANDLE || serial == 0) return;
+    if (asyncSubmitFailed(serial)) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
@@ -4507,6 +4668,7 @@ void Recorder::WaitSerial(std::uint64_t serial) {
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
+    if (asyncSubmitFailed(serial)) throw std::runtime_error("AGC graphics: recorded batch " + std::to_string(serial) + " was not submitted: a submit on its queue failed");
     const UnlockedWaiter waiter{id};
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
     wait.semaphoreCount = 1;
@@ -4702,6 +4864,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     announcedSource = 4;
     announcedSite = nullptr;
     if (targetSerial == 0) return true;
+    confirmThrough(targetSerial);
     if (unsignaled(targetSerial)) ++hookRealWaits;
     // Everything the wait needs is copied out: the recorder may be torn down while the mutex is
     // released (its destructor completes every batch and waits for the semaphore to be left, see
@@ -4832,6 +4995,14 @@ bool Recorder::Reap() {
 }
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
+    if (batch->request != nullptr && !batch->confirmed) {
+        const auto state = batch->request->Wait();
+        if (state != CommandEncoder::SubmitRequest::State::Submitted) {
+            inFlightKeptBytes -= batch->keptBytes;
+            failAsync(std::move(batch), state);
+        }
+        noteConfirmed(*batch);
+    }
     inFlightKeptBytes -= batch->keptBytes;
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
@@ -4994,6 +5165,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    if (batch->request != nullptr) static_cast<void>(batch->request->Wait());
     if (encoder != nullptr) encoder->Quiesce();
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);

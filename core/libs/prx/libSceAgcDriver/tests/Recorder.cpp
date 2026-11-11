@@ -11878,6 +11878,64 @@ void encodedSegmentFailureTest(const Device& device) {
     Require(recorder.SamplesTotal() == base, "the occlusion segment of a batch whose replay failed was read");
 }
 
+bool asyncSubmitTests(const Device& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto& context = device.GetContext();
+    DeviceFunctions table{};
+    FillDeviceFunctions(context, table);
+    Recorder recorder(context, false, &table, context.queueFamily);
+    if (!recorder.Encodes()) return false;
+    RuntimeSwitches::Assign(RuntimeSwitch::EncoderAsyncSubmit, true);
+    Require(CommandEncoder::SubmitsAsync(), "APS5_ENCODER_ASYNC_SUBMIT did not take effect with APS5_QUEUE_ACCESS set");
+    const auto work = [&] {
+        const auto commands = recorder.Commands();
+        const Recorder::EncodingWindow window(recorder);
+        const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+        table.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+    };
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::microseconds(200)); });
+    const auto before = recorder.EncoderCounts();
+    constexpr std::uint64_t batches = 20;
+    std::uint64_t last = 0;
+    for (std::uint64_t i = 0; i < batches; ++i) {
+        work();
+        last = recorder.SubmitAndEpoch();
+        Require(last != 0, "an async submit returned no serial");
+        if (i % 5 == 4) recorder.WaitSerial(last);
+    }
+    recorder.Sync();
+    const auto submitted = recorder.EncoderCounts();
+    Require(submitted.submits - before.submits == batches, "the encoder submitted " + std::to_string(submitted.submits - before.submits) + " of " + std::to_string(batches) + " batches");
+    Require(recorder.NewestSubmitted() == last, "the newest submitted serial is " + std::to_string(recorder.NewestSubmitted()) + ", not the last async submit " + std::to_string(last));
+    Recorder::FailNextAsyncSubmitsForTest(1u);
+    work();
+    const auto failed = recorder.SubmitAndEpoch();
+    Recorder::FailNextAsyncSubmitsForTest(0u);
+    work();
+    recorder.Submit();
+    const auto error = [](const std::function<void()>& wait) {
+        try {
+            wait();
+        } catch (const std::exception& thrown) {
+            return std::string(thrown.what());
+        }
+        return std::string();
+    };
+    const auto synced = error([&] { recorder.Sync(); });
+    Require(synced.find("injected failure") != std::string::npos, "a sync after a failed async submit returned '" + synced + "'");
+    Require(recorder.NewestSubmitted() < failed, "a failed async submit was confirmed as submitted");
+    work();
+    recorder.Submit();
+    const auto after = error([&] { recorder.Sync(); });
+    Require(after.find("was not submitted") != std::string::npos, "a batch after a failed async submit returned '" + after + "' instead of being refused");
+    const auto failures = recorder.EncoderCounts().submitFailures - before.submitFailures;
+    Require(failures == 3, "the encoder counted " + std::to_string(failures) + " async submit failures, not the failed one and the two after it");
+    CommandEncoder::SetDelayForTesting({});
+    RuntimeSwitches::Assign(RuntimeSwitch::EncoderAsyncSubmit, false);
+    return true;
+}
+
 bool encodedSegmentTests(const Device& device) {
     const auto& context = device.GetContext();
     DeviceFunctions table{};
@@ -16252,6 +16310,14 @@ int main(int argc, char** argv) {
             }
             sampleDumpTests(device, recorder);
             std::cout << "Occlusion counter dump tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--async-submit-only") {
+            if (!asyncSubmitTests(device)) {
+                std::cout << "skipped, commands are recorded inline\n";
+                return 77;
+            }
+            std::cout << "Async submit tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--encoded-segments-only") {

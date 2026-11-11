@@ -533,6 +533,9 @@ public:
     static constexpr char EncoderWaitScope[] = "Encoder.wait";
     static constexpr char EncoderWindowScope[] = "Encoder.windows";
     static constexpr char EncoderCpuScope[] = "Encoder.cpu_us";
+    static constexpr char EncoderSubmitScope[] = "Encoder.submit";
+    static constexpr char EncoderSettleScope[] = "Encoder.settle";
+    static constexpr char EncoderSettlePresentScope[] = "Encoder.settle.present";
     static constexpr char EncoderPostWindowScope[] = "Encoder.post.window";
     static constexpr char EncoderPostFullScope[] = "Encoder.post.full";
     static constexpr char EncoderPostRecordingScope[] = "Encoder.post.recording";
@@ -704,6 +707,8 @@ public:
         std::uint64_t encoderWaits = 0;
         std::uint64_t encoderWindows = 0;
         std::uint64_t encoderCpuUs = 0;
+        std::uint64_t encoderSubmits = 0;
+        std::pair<std::uint64_t, Clock::duration> encoderSettle{}, encoderPresentSettle{};
         std::map<std::string, std::uint64_t> encoderCauses;
         Clock::duration encoderWait{};
         struct SpinSite {
@@ -739,6 +744,12 @@ public:
                 else if (total.stage == nullptr && scope == EncoderCommandScope) encoderCommands += total.count;
                 else if (total.stage == nullptr && scope == EncoderWindowScope) encoderWindows += total.count;
                 else if (total.stage == nullptr && scope == EncoderCpuScope) encoderCpuUs += total.count;
+                else if (total.stage == nullptr && scope == EncoderSubmitScope) encoderSubmits += total.count;
+                else if (total.stage == nullptr && (scope == EncoderSettleScope || scope == EncoderSettlePresentScope)) {
+                    auto& settle = scope == EncoderSettlePresentScope ? encoderPresentSettle : encoderSettle;
+                    settle.first += total.count;
+                    settle.second += total.length;
+                }
                 else if (total.stage == nullptr && scope.starts_with("Encoder.post.")) encoderCauses[std::string(scope.substr(13))] += total.count;
                 else if (total.stage == nullptr && scope == EncoderWaitScope) {
                     encoderWaits += total.count;
@@ -790,7 +801,12 @@ public:
             AppendString(output, cause);
             output += ':' + std::to_string(count);
         }
-        output += "}}";
+        output += '}';
+        if (encoderSubmits != 0 || encoderSettle.first != 0 || encoderPresentSettle.first != 0) {
+            output += ",\"submit\":{\"async\":" + std::to_string(encoderSubmits) + ",\"async_per_frame\":" + number(static_cast<double>(encoderSubmits) * perPresent) + ",\"settle_waits\":" + std::to_string(encoderSettle.first) + ",\"settle_wait_ms_per_frame\":" + number(milliseconds(encoderSettle.second) * perPresent);
+            output += ",\"present_settle_waits\":" + std::to_string(encoderPresentSettle.first) + ",\"present_settle_wait_ms_per_frame\":" + number(milliseconds(encoderPresentSettle.second) * perPresent) + '}';
+        }
+        output += '}';
         output += ",\"handoff_spin\":{";
         bool firstSite = true;
         for (const auto& [name, site] : spinSites) {

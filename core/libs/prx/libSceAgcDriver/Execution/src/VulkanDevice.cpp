@@ -1158,6 +1158,7 @@ struct VulkanDevice::State {
             std::unique_lock<std::mutex> settleQueueLock;
             std::unique_lock<std::mutex> presentQueueLock;
             if (Graphics::QueueAccessEnabled()) {
+                if (Graphics::QueueSubmitsPosted()) Graphics::SettleQueueSubmits(device, false);
                 mainQueueLock = std::unique_lock(mainQueueMutex);
                 sparseQueueLock = std::unique_lock(sparseQueueMutex);
                 settleQueueLock = std::unique_lock(settleQueueMutex);
@@ -4457,7 +4458,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
     {
         std::unique_lock<AgcDriver::Mutex> mainQueueLock;
-        if (Graphics::QueueAccessEnabled()) mainQueueLock = std::unique_lock(state->mainQueueMutex);
+        if (Graphics::QueueAccessEnabled()) {
+            if (Graphics::QueueSubmitsPosted()) Graphics::SettleQueueSubmits(state->device, true);
+            mainQueueLock = std::unique_lock(state->mainQueueMutex);
+        }
         check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
     }
     const auto submittedAt = std::chrono::steady_clock::now();
@@ -4597,7 +4601,10 @@ void VulkanDevice::QueuePresent() {
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     std::unique_lock<AgcDriver::Mutex> mainQueueLock;
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
-    else if (Graphics::QueueAccessEnabled()) mainQueueLock = std::unique_lock(state->mainQueueMutex);
+    else if (Graphics::QueueAccessEnabled()) {
+        if (Graphics::QueueSubmitsPosted()) Graphics::SettleQueueSubmits(state->device, true);
+        mainQueueLock = std::unique_lock(state->mainQueueMutex);
+    }
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR) state->extent = {0, 0};
     else if (presented != VK_SUBOPTIMAL_KHR) check(presented, "vkQueuePresentKHR");
