@@ -5536,6 +5536,17 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     return RecipeOutcome::Recorded;
 }
 
+Graphics::DrawRecipeOutcome VulkanDevice::DrawFromPlan(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const DrawTraceContext* trace) {
+    PerformanceTimer timing("Vulkan.DrawFromPlan");
+    if (plan.device != state->device) {
+        Graphics::DrawRecipeOutcome outcome;
+        outcome.miss = Graphics::DrawRecipeMiss::ObjectsGone;
+        return outcome;
+    }
+    const auto context = graphicsContext();
+    return Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, plan, trace, Graphics::DrawRecipeUse::Plan);
+}
+
 std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> surfaces) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Presyncs();

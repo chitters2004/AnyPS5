@@ -108,7 +108,8 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
 // resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Instance, Count };
+enum class DrawRecipeUse : std::uint8_t { Exact, Plan };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -124,10 +125,13 @@ struct DrawRecipeOutcome {
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr, DrawRecipeUse use = DrawRecipeUse::Exact);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
 bool DrawPlanShadow();
+bool DrawPlans();
+bool VerifyDrawPlans();
+void SetDrawPlansForTest(int enabled);
 std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is

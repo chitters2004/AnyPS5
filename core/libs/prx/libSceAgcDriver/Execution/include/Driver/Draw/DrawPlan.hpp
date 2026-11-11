@@ -20,13 +20,11 @@ namespace AgcDriver::DriverDetail {
 
 struct DrawPlanKey {
     std::vector<std::uint64_t> words;
-    std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::uint64_t hash = 0;
     bool Matches(const DrawPlanKey& other) const;
-    bool Expired() const;
 };
 
-std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const std::shared_ptr<DispatchVariant>> stages, const Graphics::State& state, const Pm4::DrawParameters& draw);
+std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::CompiledShader> stages, const Graphics::State& state, const Pm4::DrawParameters& draw);
 void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words);
 
 enum class DrawPlanCount : std::size_t {
@@ -48,6 +46,21 @@ enum class DrawPlanCount : std::size_t {
     MovedBases,
     Unservable,
     Evictions,
+    Replaced,
+    PlanLookups,
+    Hits,
+    MissAbsent,
+    MissUnservable,
+    MissNotRecordable,
+    MissTargetGone,
+    MissTemplateGone,
+    MissObjectsGone,
+    MissProof,
+    MissInstance,
+    Verified,
+    HitNanoseconds,
+    FullDraws,
+    FullNanoseconds,
     Count
 };
 

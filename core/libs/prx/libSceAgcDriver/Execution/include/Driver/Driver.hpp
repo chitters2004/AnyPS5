@@ -242,6 +242,9 @@ private:
     static std::atomic<void (*)()>& drawStageCompareHook();
     static std::size_t drawPlanEntries();
     void shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const std::shared_ptr<const DrawRecipe>& drawn);
+    bool serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const DrawPlanKey& key, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const VulkanDevice::DrawTraceContext* trace, std::shared_ptr<const DrawRecipe>& attachable);
+    static std::chrono::steady_clock::time_point fullPlanDrawStart(const DrawPlanKey* key);
+    void countFullPlanDraw(std::chrono::steady_clock::time_point start);
     static bool drawStageMemoEnabled();
     static bool verifyDrawStageMemo();
     static std::size_t drawStageMemoEntries();

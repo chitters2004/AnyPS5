@@ -1404,6 +1404,27 @@ bool DrawPlanShadow() {
 
 namespace {
 
+std::atomic<int> drawPlansForTest{-1};
+
+}
+
+bool DrawPlans() {
+    static const bool plans = std::getenv("APS5_DRAW_PLANS") != nullptr;
+    const auto forced = drawPlansForTest.load(std::memory_order_relaxed);
+    return forced < 0 ? plans : forced != 0;
+}
+
+bool VerifyDrawPlans() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr;
+    return verify;
+}
+
+void SetDrawPlansForTest(int enabled) {
+    drawPlansForTest.store(enabled, std::memory_order_relaxed);
+}
+
+namespace {
+
 std::shared_ptr<const DrawRecipe>& DrawPlanShadowSlot() {
     thread_local std::shared_ptr<const DrawRecipe>* slot = nullptr;
     return ShaderRecompiler::ThreadOwned(slot);
@@ -1416,7 +1437,7 @@ std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "instance"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -3829,6 +3850,10 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
+            recipe->renderExtent = state.renderExtent;
+            if (DrawPlans()) {
+                for (const auto& shader : shaders) ShaderResources::AppendContentKey(shader, true, false, recipe->bindingWords);
+            }
             if (servable) *recipeOut = std::move(recipe);
             else DrawPlanShadowSlot() = std::move(recipe);
         }
@@ -4234,7 +4259,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     keepHeldSpace(prepared);
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+namespace {
+
+void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& plan, const ShaderResources& resources, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
+    DrawOutcome scratch;
+    DrawTimer scratchTimer(false);
+    const auto full = planDraw(context, state, draw, shaders, nullptr, scratch, scratchTimer);
+    const auto sameBinding = [](const VkVertexInputBindingDescription& a, const VkVertexInputBindingDescription& b) { return a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
+    const auto& layout = full.VertexLayout();
+    Require(!full.nothing && full.fragmentOutputs == plan.fragmentOutputs && full.shaderStages == plan.shaderStages && std::ranges::equal(layout.bindings, plan.vertexInput.bindings, sameBinding) && std::ranges::equal(layout.attributes, plan.vertexInput.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLANS: the plan's fragment outputs, pipeline stages or vertex input differ from the full path's");
+    Require(full.keyed && full.contentKey == plan.key, "APS5_VERIFY_DRAW_PLANS: the plan's resource template key differs from the full path's");
+    Require(PushConstantStages(shaders) == plan.pushStages, "APS5_VERIFY_DRAW_PLANS: the plan's push constant stages differ from the full path's");
+    const auto masked = maskedState(state, full.fragmentOutputs);
+    const auto sameMask = [](const VkPipelineColorBlendAttachmentState& a, const VkPipelineColorBlendAttachmentState& b) { return a.colorWriteMask == b.colorWriteMask; };
+    Require(masked.has_value() == plan.masked.has_value() && (!masked.has_value() || std::ranges::equal(masked->blends, plan.masked->blends, sameMask)), "APS5_VERIFY_DRAW_PLANS: the plan's masked outputs differ from the full path's");
+    const State& pipelineState = masked.has_value() ? *masked : state;
+    Require(CachedPipeline(context, pipelineState, layout, resources.SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL) == pipeline, "APS5_VERIFY_DRAW_PLANS: the plan's pipeline differs from the pipeline store's for the draw");
+    for (std::size_t index = 0; index < targets.size(); ++index) Require(CachedStorageSurface(context, SurfaceForTarget(state.colors[index])) == targets[index], "APS5_VERIFY_DRAW_PLANS: the plan's render target differs from the storage cache's for the draw");
+}
+
+}
+
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawRecipeUse use) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     static_cast<void>(snapshots);
@@ -4261,6 +4308,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
+    const bool planned = use == DrawRecipeUse::Plan;
+    if (planned) {
+        if (recipe.bindingWords.empty() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return miss(DrawRecipeMiss::Instance);
+        thread_local std::vector<std::uint32_t>* wordsSlot = nullptr;
+        auto& words = ShaderRecompiler::ThreadOwned(wordsSlot);
+        words.clear();
+        for (const auto& shader : shaders) ShaderResources::AppendContentKey(shader, true, false, words);
+        if (words != recipe.bindingWords) return miss(DrawRecipeMiss::Instance);
+        ValidateVertexAddresses(shaders.front().program->vertexAttributes);
+    }
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
     if (plan.nothing) inputs.nothing = true;
@@ -4281,7 +4338,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
-        if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        if (stored == nullptr) return miss(DrawRecipeMiss::TargetGone);
+        const auto surface = SurfaceForTarget(state.colors[index]);
+        if (planned && !StorageImageCachedFor(context, stored.get(), surface)) return miss(StorageImageCached(context, stored.get()) ? DrawRecipeMiss::Instance : DrawRecipeMiss::TargetGone);
+        if ((!planned && !StorageImageCached(context, stored.get())) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh();
@@ -4289,13 +4349,15 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         });
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
+        const auto& color = state.colors[index];
+        if (planned && resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index]) return miss(DrawRecipeMiss::Instance);
         targets.push_back(std::move(resident));
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
         const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
         timer.phase(PhaseReadTarget);
-        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+        if (recipe.targetViews.back() != depthView) return miss(planned ? DrawRecipeMiss::Instance : DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
@@ -4328,7 +4390,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // same objects), so AcquireFramebuffer only runs when the list evicted it.
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
-    auto framebuffer = recipe.framebuffer.lock();
+    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, recipe, *resources, pipeline, targets);
+    const bool sameExtent = recipe.renderExtent.width == state.renderExtent.width && recipe.renderExtent.height == state.renderExtent.height;
+    auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
@@ -4361,7 +4425,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         ++stats.recipeHits;
     }
     timing.Mark("draw_and_resource_release");
-    reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
+    reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, planned ? " recorded from plan" : " recorded from recipe");
     result.recorded = true;
     return result;
 }
