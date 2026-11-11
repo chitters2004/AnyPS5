@@ -43,6 +43,7 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
+alignas(256) constexpr std::array<std::uint32_t, 8> LoadingPixelCode{0xe0300000u, 0x80000000u, 0xbf8c3f70u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> PixelCode{0x7e000200u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u, 0xbf810000u, 0xbf810000u, 0xbf810000u};
 constexpr std::size_t BlockBytes = 65536;
 constexpr std::uint32_t List = 4;
@@ -55,6 +56,7 @@ struct Header {
 
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
+alignas(8) Header LoadingPixelHeader{};
 
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -101,6 +103,8 @@ private:
 };
 
 struct Look {
+    const GuestBlock* colourBuffer = nullptr;
+    std::uint32_t colourStride = 0;
     float colour = 1.0f;
     float scale = 32.0f;
     std::uint32_t primitive = List;
@@ -116,7 +120,8 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 void Draw(const GuestBlock& target, const Look& look) {
     const auto color = target.At(0);
     const auto vertex = reinterpret_cast<std::uintptr_t>(TriangleVertexCode.data());
-    const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(look.colourBuffer != nullptr ? LoadingPixelCode.data() : PixelCode.data());
+    const auto loaded = look.colourBuffer != nullptr ? look.colourBuffer->At(0) : 0u;
     constexpr std::uint32_t ConstantColour = 13u;
     const std::uint32_t blendControl = look.blended ? (1u << 30u) | ConstantColour : 0u;
     const auto constant = std::bit_cast<std::uint32_t>(look.blendConstant);
@@ -152,6 +157,9 @@ void Draw(const GuestBlock& target, const Look& look) {
     Append(commands, 0x79, {0x242, look.primitive});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
     for (const auto& [offset, value] : shader) Append(commands, 0x76, {offset, value});
+    if (look.colourBuffer != nullptr) {
+        for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x00b, 4u << 1u}, {0x00c, static_cast<std::uint32_t>(loaded)}, {0x00d, static_cast<std::uint32_t>((loaded >> 32u) & 0xffffu) | (look.colourStride << 16u)}, {0x00e, 4u}, {0x00f, 0x31016facu}}) Append(commands, 0x76, {offset, value});
+    }
     Append(commands, 0x2d, {3, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw plans: the draw submission failed");
@@ -388,6 +396,41 @@ void PlanHitsSeeGuestWrites() {
     std::puts("draw plans: I9, a plan hit reads its target as the guest left it and its writes reach guest memory");
 }
 
+void ReboundPlansStayOffTheExactPath() {
+    const auto run = [&](const GuestBlock& target, bool planned) {
+        GuestBlock first;
+        GuestBlock moved;
+        const float dim = 0.25f;
+        const float bright = 0.75f;
+        std::memcpy(first.Bytes(0), &dim, sizeof(dim));
+        std::memcpy(moved.Bytes(0), &bright, sizeof(bright));
+        const std::unique_ptr<FullPath> fullPath = planned ? nullptr : std::make_unique<FullPath>();
+        const auto before = Counts();
+        Draw(target, {.colourBuffer = &first});
+        Draw(target, {.colourBuffer = &first});
+        Draw(target, {.colourBuffer = &moved, .scale = 16.0f});
+        static_cast<void>(Pixels(target));
+        Draw(target, {.colourBuffer = &first});
+        for (int repeat = 0; repeat < 3; ++repeat) Draw(target, {.colourBuffer = &moved, .scale = 16.0f});
+        const auto beforeStride = Counts();
+        Draw(target, {.colourBuffer = &moved, .colourStride = 4u, .scale = 8.0f});
+        const auto stride = Since(beforeStride);
+        if (planned && PlansOn()) Expect(stride[DrawPlanCount::Hits] == 0 && stride[DrawPlanCount::MissInstance] == 1, "a moved colour buffer whose descriptor also changed its stride was not refused as another instance");
+        return Since(before);
+    };
+    GuestBlock planned;
+    GuestBlock reference;
+    const auto counts = run(planned, true);
+    static_cast<void>(run(reference, false));
+    Report("I7b a moved read-only colour buffer", counts);
+    std::printf("I7b rebound: %llu hits rebound %llu buffers, %llu moves refused\n", static_cast<unsigned long long>(counts[DrawPlanCount::RebasedHits]), static_cast<unsigned long long>(counts[DrawPlanCount::RebasedBuffers]), static_cast<unsigned long long>(counts[DrawPlanCount::MissMoved] + counts[DrawPlanCount::MissPatchedData]));
+    ExpectNoHitsWhileOff(counts);
+    if (PlansOn()) Expect(counts[DrawPlanCount::RebasedHits] >= 1, "no plan hit rebound the moved colour buffer");
+    const auto plannedPixels = Pixels(planned);
+    Expect(plannedPixels == Pixels(reference), "draws whose colour buffer moved, served by plans and then by their draw keys, render differently from the full path");
+    std::puts("draw plans: I7b, a rebound plan hit is never kept as its draw key's exact recipe");
+}
+
 void PlannedSceneMatchesFullPath() {
     const std::vector<std::pair<std::size_t, Look>> scene{
         {0, {.colour = 1.0f}}, {0, {.colour = 1.0f}}, {0, {.colour = 0.5f}}, {1, {.colour = 0.25f}}, {1, {.colour = 0.75f, .scale = 24.0f}},
@@ -427,10 +470,12 @@ int main() {
         PlanKeysCoverThePipelineKey();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+        Register(LoadingPixelHeader, LoadingPixelCode.data(), sizeof(LoadingPixelCode), 1);
         PlansFollowPipelineState();
         PlansBindTheirOwnTargets();
         PlanRowsFollowTheDraw();
         PlanHitsSeeGuestWrites();
+        ReboundPlansStayOffTheExactPath();
         PlannedSceneMatchesFullPath();
         AgcDriverShutdown_nid_postfix();
         return 0;

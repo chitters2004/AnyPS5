@@ -108,7 +108,7 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
 // resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Instance, Count };
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Instance, Moved, Count };
 enum class DrawRecipeUse : std::uint8_t { Exact, Plan };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
@@ -120,6 +120,8 @@ struct DrawRecipeOutcome {
     double recordUs = 0;
     std::uint32_t sharedBindingStages = 0;
     std::uint32_t comparedBindingStages = 0;
+    std::uint32_t movedBuffers = 0;
+    bool patchedData = false;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and

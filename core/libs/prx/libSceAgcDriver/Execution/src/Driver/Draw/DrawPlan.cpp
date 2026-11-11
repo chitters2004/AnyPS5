@@ -326,7 +326,7 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
     if (differences.maskedState) drawPlanCounters.Add(DrawPlanCount::MaskedState);
     drawPlanCounters.Add(differences.sameInstance ? DrawPlanCount::SameInstance : DrawPlanCount::InstanceDiffers);
     if (differences.passDiffers) drawPlanCounters.Add(DrawPlanCount::PassDiffersSameInstance);
-    if (drawn->servable && (!plan->servable || !differences.sameInstance)) {
+    if (drawn->plannable && (!plan->plannable || !differences.sameInstance || (drawn->servable && !plan->servable))) {
         drawPlanCounters.Add(DrawPlanCount::Replaced);
         insert();
     }
@@ -340,7 +340,7 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         drawPlanCounters.Add(DrawPlanCount::MissAbsent);
         return false;
     }
-    if (!plan->servable) {
+    if (!plan->plannable) {
         drawPlanCounters.Add(DrawPlanCount::MissUnservable);
         return false;
     }
@@ -350,7 +350,11 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         drawPlanCounters.Add(DrawPlanCount::Hits);
         drawPlanCounters.Add(DrawPlanCount::SharedBindingStages, outcome.sharedBindingStages);
         drawPlanCounters.Add(DrawPlanCount::ComparedBindingStages, outcome.comparedBindingStages);
-        if (plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
+        if (outcome.movedBuffers != 0) {
+            drawPlanCounters.Add(DrawPlanCount::RebasedHits);
+            drawPlanCounters.Add(DrawPlanCount::RebasedBuffers, outcome.movedBuffers);
+        }
+        if (plan->servable && outcome.movedBuffers == 0 && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
         if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
         if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         return true;
@@ -361,6 +365,7 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         case Graphics::DrawRecipeMiss::TemplateGone: drawPlanCounters.Add(DrawPlanCount::MissTemplateGone); break;
         case Graphics::DrawRecipeMiss::Proof: drawPlanCounters.Add(DrawPlanCount::MissProof); break;
         case Graphics::DrawRecipeMiss::Instance: drawPlanCounters.Add(DrawPlanCount::MissInstance); break;
+        case Graphics::DrawRecipeMiss::Moved: drawPlanCounters.Add(outcome.patchedData ? DrawPlanCount::MissPatchedData : DrawPlanCount::MissMoved); break;
         default: drawPlanCounters.Add(DrawPlanCount::MissObjectsGone); break;
     }
     return false;

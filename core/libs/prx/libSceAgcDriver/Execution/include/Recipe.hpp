@@ -88,6 +88,7 @@ struct DrawRecipe {
     VkExtent2D renderExtent{};
     std::vector<std::shared_ptr<const std::vector<std::uint32_t>>> bindingWords;
     bool servable = true;
+    bool plannable = true;
     std::uint32_t movedBases = 0;
 };
 
