@@ -4108,17 +4108,20 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
     auto timing = Recorder::NoTiming;
+    const bool runnable = recorder != nullptr && direct && seeds.empty() && padding.copies.empty() && holeCopies.empty() && Recorder::WriteBackRuns();
+    const std::array<Recorder::RunAccess, 2> runAccesses{Recorder::RunAccess{reinterpret_cast<std::uint64_t>(image), reinterpret_cast<std::uint64_t>(image) + 1, Recorder::RunAccessImage}, Recorder::RunAccess{firstStored, lastStored, Recorder::RunAccessWritten}};
+    bool inRun = false;
     if (recorder != nullptr) {
         recorder->FlushKeyStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
         recorder->FlushStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
-        commands = recorder->Commands(&covered);
+        commands = runnable ? recorder->RunCommands(Recorder::WriteBackRunKey, this, runAccesses, inRun, &covered) : recorder->Commands(&covered);
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
         if (linear) recorder->Keep(linear, linear->Size());
         if (tiledScratch) recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
         for (const auto& slab : padding.slabs) recorder->Keep(slab);
         if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
-        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, (direct ? 3 : 4) - (tiledScratch ? 0 : 1));
+        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, (direct ? 3 : 4) - (tiledScratch ? 0 : 1) - (runnable ? 1 : 0) - (inRun ? 1 : 0));
         if (Recorder::BarrierValidate()) {
             const std::pair<VkImage, bool> read{image, false};
             std::vector<std::pair<std::uint64_t, std::uint64_t>> seedReads;
@@ -4171,7 +4174,8 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
         toRead.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         const BarrierMask ready{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, importReady.srcAccessMask | toRead.srcAccessMask, importReady.dstAccessMask | toRead.dstAccessMask, toRead.oldLayout != toRead.newLayout, toRead.srcQueueFamilyIndex != toRead.dstQueueFamilyIndex};
-        const bool ordered = recorder != nullptr && seeds.empty() && padding.copies.empty() && holeCopies.empty() && Recorder::ElideCovered(Recorder::CommandClass::StorageWriteBack, ready, covered);
+        const bool ordered = inRun || (recorder != nullptr && seeds.empty() && padding.copies.empty() && holeCopies.empty() && Recorder::ElideCovered(Recorder::CommandClass::StorageWriteBack, ready, covered));
+        if (inRun) Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
         if (!ordered) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toRead);
         for (std::size_t i = 0; i < windows.size(); ++i) {
             const auto& window = windows[i];
@@ -4231,12 +4235,17 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     // merges its leading barrier.
     constexpr VkAccessFlags storedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, storedAccess};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, direct ? 0u : 1u, &backToGeneral);
+    if (!runnable) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, direct ? 0u : 1u, &backToGeneral);
     if (batch) {
         batch->SubmitAndWait();
     } else {
         recorder->EndGpuTiming(timing, storedBytes);
-        recorder->MarkCovered(storedAccess);
+        if (runnable) {
+            const void* owner = this;
+            recorder->DeferDispatchBarrier(Recorder::WriteBackRunKey, std::span(&owner, 1), runAccesses, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        } else {
+            recorder->MarkCovered(storedAccess);
+        }
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
         if (!imported.empty()) recorder->NotePendingWrites(imported);

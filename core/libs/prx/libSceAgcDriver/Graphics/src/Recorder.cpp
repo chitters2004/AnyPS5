@@ -537,6 +537,7 @@ std::atomic<std::uint64_t> passesFused{0};
 std::atomic<std::uint64_t> passEndsSettled{0};
 std::atomic<std::uint64_t> fencedKeyOnlyBreaks{0};
 std::atomic<std::uint64_t> trailingsFused{0};
+std::atomic<std::uint64_t> writeBackJoins{0};
 constexpr BarrierMask LabelLeadingBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
@@ -1710,6 +1711,14 @@ std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
     return order.queueKey;
 }
 
+bool Recorder::WriteBackRuns() {
+    return MergeBarriers() && !RuntimeSwitches::Set(RuntimeSwitch::NoWriteBackRuns);
+}
+
+std::uint64_t Recorder::WriteBackJoins() {
+    return writeBackJoins.load(std::memory_order_relaxed);
+}
+
 Recorder::OverlapStatistics Recorder::OverlapCounts() {
     return OverlapStatistics{overlapDeferred.load(std::memory_order_relaxed), overlapJoined.load(std::memory_order_relaxed), overlapFlushed.load(std::memory_order_relaxed)};
 }
@@ -1724,7 +1733,7 @@ void Recorder::flushDeferredDispatch() {
     auto after = std::move(open->afterRun);
     open->afterRun.clear();
     constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    const BarrierMask trailing{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess};
+    const BarrierMask trailing{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | std::exchange(open->deferredStages, 0u), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | std::exchange(open->deferredAccess, 0u), dispatchedAccess};
     if (owe) {
         oweBarrier(trailing, CommandClass::DispatchTrailing, false);
     } else {
@@ -1767,6 +1776,7 @@ VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner,
     SettlePassEnd();
     inRun = joinsRun(queueKey, std::span(&owner, 1), accesses);
     if (!inRun) return Commands(coveredAccess);
+    if (queueKey == WriteBackRunKey) writeBackJoins.fetch_add(1, std::memory_order_relaxed);
     if (coveredAccess != nullptr) *coveredAccess = 0;
     return open->commands;
 }
@@ -1792,17 +1802,21 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
     return open->commands;
 }
 
-void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) {
+void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkPipelineStageFlags extraStages, VkAccessFlags extraAccess) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
     if (open->deferredDispatchQueue == 0) {
         open->deferredRun.clear();
         open->runAccess.clear();
+        open->deferredStages = 0;
+        open->deferredAccess = 0;
     } else {
         overlapJoined.fetch_add(1, std::memory_order_relaxed);
     }
     open->deferredRun.insert(open->deferredRun.end(), owners.begin(), owners.end());
     open->runAccess.insert(open->runAccess.end(), accesses.begin(), accesses.end());
     open->deferredDispatchQueue = queueKey;
+    open->deferredStages |= extraStages;
+    open->deferredAccess |= extraAccess;
     open->coveredAccess = 0;
     overlapDeferred.fetch_add(1, std::memory_order_relaxed);
 }
@@ -2431,7 +2445,10 @@ void reportBarriers() {
     const auto settled = passEndsSettled.exchange(0, std::memory_order_relaxed);
     const auto keyOnly = fencedKeyOnlyBreaks.exchange(0, std::memory_order_relaxed);
     const auto trailing = trailingsFused.exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s; pass end and start fused %llu, owed barriers recorded alone %llu, fenced key-only pass breaks %llu, trailing barriers fused into a pass start %llu\n", maskLine.c_str(), static_cast<unsigned long long>(fused), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(keyOnly), static_cast<unsigned long long>(trailing));
+    static std::uint64_t reportedJoins = 0;
+    const auto joins = writeBackJoins.load(std::memory_order_relaxed);
+    const auto newJoins = joins - std::exchange(reportedJoins, joins);
+    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s; pass end and start fused %llu, owed barriers recorded alone %llu, fenced key-only pass breaks %llu, trailing barriers fused into a pass start %llu, storage write-backs joined to a run %llu\n", maskLine.c_str(), static_cast<unsigned long long>(fused), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(keyOnly), static_cast<unsigned long long>(trailing), static_cast<unsigned long long>(newJoins));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
