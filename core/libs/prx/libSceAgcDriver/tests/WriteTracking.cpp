@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -2550,6 +2551,40 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+void RunMemoHitBench(int threads) {
+    constexpr std::size_t Hits = 2000000;
+    const auto lanes = static_cast<std::size_t>(threads);
+    void* memory = AllocateWatched(lanes * Block);
+    std::memset(memory, 0x5a, lanes * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, lanes * Block) != 0, "the memo bench region was not collected");
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<double> nanoseconds(lanes, 0.0);
+    std::vector<std::thread> pool;
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        pool.emplace_back([&, lane] {
+            const auto address = base + lane * Block;
+            BumpCollectEpoch();
+            Require(CollectWrites(address, 256) != 0, "the memo bench lane was not collected");
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            std::uint64_t sink = 0;
+            const auto begin = std::chrono::steady_clock::now();
+            for (std::size_t hit = 0; hit < Hits; ++hit) sink += CollectWrites(address + (hit % 16) * 256, 256);
+            const auto end = std::chrono::steady_clock::now();
+            Require(sink != 0, "the memo bench lane returned no generation");
+            nanoseconds[lane] = std::chrono::duration<double, std::nano>(end - begin).count() / static_cast<double>(Hits);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != threads) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : pool) thread.join();
+    double total = 0;
+    for (const auto value : nanoseconds) total += value;
+    std::printf("memo hits, %d threads: %.1f ns per hit per thread\n", threads, total / static_cast<double>(lanes));
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2560,6 +2595,10 @@ int main(int argc, char** argv) {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
+            RunMemoHitBench(std::stoi(argv[2]));
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
             SetObservationServiceForTest(false);

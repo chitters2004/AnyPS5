@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
@@ -605,7 +606,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
     while (current < serial && !slot.compare_exchange_weak(current, serial, std::memory_order_release, std::memory_order_relaxed)) {}
 }
 std::atomic<std::uint64_t> forgetBytes{0};
-std::atomic<std::uint64_t> collectMemoHits{0};
+ProfileCounter collectMemoHits;
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -620,7 +621,7 @@ std::atomic<std::uint64_t> claimWaits{0};
 std::atomic<std::uint64_t> claimWaitNanoseconds{0};
 std::atomic<std::uint64_t> unlockedWalks{0};
 std::atomic<std::uint64_t> fallbackWalks{0};
-std::atomic<std::uint64_t> observedProofs{0};
+ProfileCounter observedProofs;
 std::atomic<std::uint64_t> refusedGeneration{0};
 std::atomic<std::uint64_t> fallbackNanoseconds{0};
 std::atomic<std::uint64_t> serviceSweeps{0};
@@ -851,10 +852,10 @@ public:
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.Sum()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" unlocked walks %llu claim waits %llu (%.2f ms)", static_cast<unsigned long long>(unlockedWalks.load()), static_cast<unsigned long long>(claimWaits.load()), claimWaitNanoseconds.load() / 1e6);
-        AgcDriver::ProfilePrint_nid_no_patch(" | observed proofs %llu", static_cast<unsigned long long>(observedProofs.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" | observed proofs %llu", static_cast<unsigned long long>(observedProofs.Sum()));
         AgcDriver::ProfilePrint_nid_no_patch(" | epoch service sweeps %llu runs %llu walks %llu skipped %llu (%.2f ms), fallback walks %llu (%.2f ms)", static_cast<unsigned long long>(serviceSweeps.load()), static_cast<unsigned long long>(serviceRuns.load()), static_cast<unsigned long long>(serviceWalks.load()), static_cast<unsigned long long>(serviceSkips.load()), serviceNanoseconds.load() / 1e6, static_cast<unsigned long long>(fallbackWalks.load()), fallbackNanoseconds.load() / 1e6);
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -2509,7 +2510,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std
     const bool shared = memoized && collectMemoEnabled() && (service || HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0);
     if (shared && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
         if (service) return {Status::Complete, 0};
-        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        collectMemoHits.Add();
         noteObservedUse(tracker, first, stop);
         return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
@@ -2560,7 +2561,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std
         }
         lock.WaitForClaims();
     }
-    if (runs.empty()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+    if (runs.empty()) collectMemoHits.Add();
     std::optional<TimedAccess> timed;
     if (!runs.empty()) timed.emplace(CounterCollect, bytes);
     std::size_t done = 0;
@@ -3223,7 +3224,7 @@ bool UnchangedSinceObserved(std::uint64_t address, std::size_t bytes, std::uint6
     const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
     static const bool disabled = std::getenv("APS5_NO_OBSERVED_PROOFS") != nullptr;
     if (!disabled && stop > first && epoch != 0 && collectMemoEnabled() && refusedGeneration.load(std::memory_order_acquire) <= generation && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()) && tracker.observedStampsAtMost(first, stop, generation)) {
-        observedProofs.fetch_add(1, std::memory_order_relaxed);
+        observedProofs.Add();
         return true;
     }
     return UnchangedSince(address, bytes, generation);
@@ -3519,7 +3520,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
-        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        collectMemoHits.Add();
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
