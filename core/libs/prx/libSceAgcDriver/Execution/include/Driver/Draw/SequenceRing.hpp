@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_SEQUENCERING_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_SEQUENCERING_HPP
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -32,6 +33,13 @@ public:
         std::chrono::nanoseconds spin{};
         void (*pause)() = nullptr;
         std::function<void()> preparerStart;
+        bool timed = false;
+    };
+    static constexpr std::size_t Tags = 32;
+    struct Residency {
+        std::uint64_t items = 0;
+        std::uint64_t totalNs = 0;
+        std::uint64_t longestNs = 0;
     };
     struct Counters {
         std::uint64_t pushed = 0;
@@ -39,6 +47,7 @@ public:
         std::uint64_t fullWaits = 0;
         std::uint64_t fullWaitNs = 0;
         std::uint64_t preparerSleeps = 0;
+        std::array<Residency, Tags> residency{};
     };
 
     explicit SequenceRing(Options options);
@@ -46,7 +55,7 @@ public:
     SequenceRing(const SequenceRing&) = delete;
     SequenceRing& operator=(const SequenceRing&) = delete;
 
-    std::uint64_t Push(Work work, Held held, bool holdsGpuLock = false);
+    std::uint64_t Push(Work work, Held held, bool holdsGpuLock = false, std::uint8_t tag = 0);
     std::uint64_t Bypass();
     void Drain();
     void Settle();
@@ -78,6 +87,13 @@ private:
         std::uint64_t sequence = 0;
         Work work;
         Held held;
+        std::uint8_t tag = 0;
+        std::chrono::steady_clock::time_point pushedAt{};
+    };
+    struct ResidencyCounters {
+        std::atomic<std::uint64_t> items{0};
+        std::atomic<std::uint64_t> totalNs{0};
+        std::atomic<std::uint64_t> longestNs{0};
     };
     void claimProducer();
     void run();
@@ -107,6 +123,7 @@ private:
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullWaitNs{0};
     std::atomic<std::uint64_t> preparerSleeps{0};
+    std::array<ResidencyCounters, Tags> residency{};
 };
 
 }
