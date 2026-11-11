@@ -50,6 +50,7 @@ public:
     std::uint64_t Bypass();
     void Drain();
     void Settle();
+    void RethrowFailure();
     void Stop();
     void Reclaim();
 
@@ -81,7 +82,6 @@ private:
     void claimProducer();
     void run();
     void waitPrepared(std::uint64_t count);
-    void rethrowFailure();
 
     std::vector<Slot> slots;
     std::uint64_t mask = 0;
