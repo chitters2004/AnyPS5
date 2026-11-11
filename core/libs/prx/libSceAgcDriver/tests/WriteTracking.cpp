@@ -2562,6 +2562,7 @@ int main(int argc, char** argv) {
             return 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
+            SetObservationServiceForTest(false);
             CheckGenerationWrap();
             std::cout << "generation wrap test passed\n";
             return 0;

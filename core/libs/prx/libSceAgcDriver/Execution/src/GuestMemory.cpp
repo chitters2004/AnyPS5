@@ -334,6 +334,13 @@ std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::atomic<std::uint64_t> claimWaits{0};
 std::atomic<std::uint64_t> claimWaitNanoseconds{0};
 std::atomic<std::uint64_t> unlockedWalks{0};
+std::atomic<std::uint64_t> fallbackWalks{0};
+std::atomic<std::uint64_t> fallbackNanoseconds{0};
+std::atomic<std::uint64_t> serviceSweeps{0};
+std::atomic<std::uint64_t> serviceRuns{0};
+std::atomic<std::uint64_t> serviceWalks{0};
+std::atomic<std::uint64_t> serviceSkips{0};
+std::atomic<std::uint64_t> serviceNanoseconds{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -560,6 +567,7 @@ public:
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" unlocked walks %llu claim waits %llu (%.2f ms)", static_cast<unsigned long long>(unlockedWalks.load()), static_cast<unsigned long long>(claimWaits.load()), claimWaitNanoseconds.load() / 1e6);
+        AgcDriver::ProfilePrint_nid_no_patch(" | epoch service sweeps %llu runs %llu walks %llu skipped %llu (%.2f ms), fallback walks %llu (%.2f ms)", static_cast<unsigned long long>(serviceSweeps.load()), static_cast<unsigned long long>(serviceRuns.load()), static_cast<unsigned long long>(serviceWalks.load()), static_cast<unsigned long long>(serviceSkips.load()), serviceNanoseconds.load() / 1e6, static_cast<unsigned long long>(fallbackWalks.load()), fallbackNanoseconds.load() / 1e6);
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -1327,6 +1335,7 @@ struct WriteTracker {
     struct ObservationLeaf {
         std::array<std::atomic<std::uint64_t>, LeafBlocks> ticks{};
         std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> coarse{};
+        std::array<std::atomic<std::uint32_t>, LeafBlocks> noted{};
     };
     std::unique_ptr<std::atomic<ObservationLeaf*>[]> observationLeaves;
     std::size_t observationLeafCount = 0;
@@ -1401,6 +1410,12 @@ struct WriteTracker {
 #else
         return stop <= LeafCount * LeafBlocks * WriteBlockBytes;
 #endif
+    }
+
+    std::atomic<std::uint32_t>* notedSlot(std::uint64_t block) const {
+        if (block / LeafBlocks >= observationLeafCount) return nullptr;
+        auto* leaf = observationLeaves[block / LeafBlocks].load(std::memory_order_acquire);
+        return leaf != nullptr ? &leaf->noted[block % LeafBlocks] : nullptr;
     }
 
     std::uint64_t observedTick(std::uint64_t block) const {
@@ -1810,8 +1825,8 @@ struct WriteTracker {
 };
 
 WriteTracker& Tracker() {
-    static WriteTracker tracker;
-    return tracker;
+    static auto* tracker = new WriteTracker;
+    return *tracker;
 }
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
@@ -2077,6 +2092,58 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
+struct ObservationService {
+    static constexpr std::size_t RingEntries = std::size_t{1} << 15;
+    static constexpr std::uint64_t ChunkBytes = std::uint64_t{64} * WriteBlockBytes;
+    struct Entry {
+        std::atomic<std::uint64_t> sequence{0};
+        std::atomic<std::uint64_t> first{0};
+        std::atomic<std::uint64_t> stop{0};
+    };
+    std::unique_ptr<Entry[]> ring = std::make_unique<Entry[]>(RingEntries);
+    std::atomic<std::uint64_t> next{0};
+    std::atomic<std::uint32_t> period{1};
+    std::atomic<std::uint64_t> requested{0};
+    std::atomic<std::uint64_t> handled{0};
+    std::atomic<bool> enabled{std::getenv("APS5_NO_EPOCH_SERVICE") == nullptr};
+    std::once_flag started;
+
+    void Push(std::uint64_t first, std::uint64_t stop) {
+        const auto index = next.fetch_add(1, std::memory_order_relaxed);
+        auto& entry = ring[index % RingEntries];
+        entry.sequence.store(0, std::memory_order_release);
+        entry.first.store(first, std::memory_order_release);
+        entry.stop.store(stop, std::memory_order_release);
+        entry.sequence.store(index + 1, std::memory_order_release);
+    }
+
+    bool Read(std::uint64_t index, std::uint64_t& first, std::uint64_t& stop) const {
+        const auto& entry = ring[index % RingEntries];
+        if (entry.sequence.load(std::memory_order_acquire) != index + 1) return false;
+        first = entry.first.load(std::memory_order_acquire);
+        stop = entry.stop.load(std::memory_order_acquire);
+        return entry.sequence.load(std::memory_order_acquire) == index + 1 && first < stop;
+    }
+};
+
+ObservationService& Service() {
+    static auto* service = new ObservationService;
+    return *service;
+}
+
+thread_local bool onServiceThread = false;
+
+void noteObservedUse(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    auto& service = Service();
+    if (onServiceThread || !service.enabled.load(std::memory_order_relaxed)) return;
+    auto* slot = tracker.notedSlot(tracker.blockOf(first));
+    if (slot == nullptr) return;
+    const auto period = service.period.load(std::memory_order_relaxed);
+    if (slot->load(std::memory_order_relaxed) == period) return;
+    slot->store(period, std::memory_order_relaxed);
+    service.Push(first, stop);
+}
+
 bool singlePassCollect() {
 #ifdef _WIN32
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
@@ -2117,7 +2184,7 @@ bool collectUnlocked(UnlockedWalk& walk, std::uint64_t first, std::uint64_t stop
 #endif
 }
 
-Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
+Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std::uint64_t serviceEpoch = 0) {
     using Status = Observation::Status;
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {Status::Uncovered, 0};
     auto& tracker = Tracker();
@@ -2125,12 +2192,16 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     if (stop <= first) return {Status::Uncovered, 0};
-    const auto epoch = currentCollectEpoch();
-    const bool shared = memoized && collectMemoEnabled() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
+    const bool service = serviceEpoch != 0;
+    const auto epoch = service ? serviceEpoch : currentCollectEpoch();
+    const bool shared = memoized && collectMemoEnabled() && (service || HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0);
     if (shared && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
+        if (service) return {Status::Complete, 0};
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        noteObservedUse(tracker, first, stop);
         return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
+    const auto missStart = std::chrono::steady_clock::now();
     TrackerLock lock(tracker, TrackerLock::Settle::Range);
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return {Status::Uncovered, 0};
@@ -2171,6 +2242,10 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
             if (open) addRun(from, lastBlock);
         }
         if (std::none_of(runs.begin(), runs.end(), [&](const Run& run) { return tracker.claimedOver(run.first, run.stop, self); })) break;
+        if (service) {
+            serviceSkips.fetch_add(1, std::memory_order_relaxed);
+            return {Status::Failed, 0};
+        }
         lock.WaitForClaims();
     }
     if (runs.empty()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
@@ -2212,6 +2287,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
                     complete = collectUnlocked(walk, run.first, run.stop);
                 }
                 unlockedWalks.fetch_add(1, std::memory_order_relaxed);
+                (service ? serviceWalks : fallbackWalks).fetch_add(1, std::memory_order_relaxed);
                 if (!complete) {
 #ifdef _WIN32
                     status = Status::Refused;
@@ -2256,8 +2332,59 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         const auto end = tracker.blockOf(runs[index].stop);
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
+    if (!service && done != 0) fallbackNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - missStart).count()), std::memory_order_relaxed);
     if (status != Status::Complete) return {status, 0};
+    if (shared) noteObservedUse(tracker, first, stop);
     return {Status::Complete, generation};
+}
+
+void serviceLoop() {
+    onServiceThread = true;
+    auto& service = Service();
+    std::uint64_t cursor = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    for (;;) {
+        service.requested.wait(service.handled.load(std::memory_order_acquire), std::memory_order_acquire);
+        const auto request = service.requested.load(std::memory_order_acquire);
+        const auto epoch = lastBumpedEpoch.load(std::memory_order_acquire);
+        observationPoint(4);
+        const auto to = service.next.load(std::memory_order_acquire);
+        service.period.fetch_add(1, std::memory_order_relaxed);
+        runs.clear();
+        for (auto index = std::max(cursor, to > ObservationService::RingEntries ? to - ObservationService::RingEntries : 0); index < to; ++index) {
+            std::uint64_t first = 0;
+            std::uint64_t stop = 0;
+            if (service.Read(index, first, stop)) runs.emplace_back(first, stop);
+        }
+        cursor = to;
+        const auto start = std::chrono::steady_clock::now();
+        if (service.enabled.load(std::memory_order_acquire)) {
+            for (const auto& [first, stop] : runs) {
+                for (auto at = first; at < stop;) {
+                    const auto end = std::min(stop, (at / ObservationService::ChunkBytes + 1) * ObservationService::ChunkBytes);
+                    try {
+                        observe(at, static_cast<std::size_t>(end - at), true, epoch);
+                    } catch (...) {
+                        serviceSkips.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    at = end;
+                }
+            }
+            serviceRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+        }
+        serviceSweeps.fetch_add(1, std::memory_order_relaxed);
+        serviceNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        service.handled.store(request, std::memory_order_release);
+        service.handled.notify_all();
+    }
+}
+
+void requestSweep() {
+    auto& service = Service();
+    if (!service.enabled.load(std::memory_order_relaxed)) return;
+    std::call_once(service.started, [] { std::thread(serviceLoop).detach(); });
+    service.requested.fetch_add(1, std::memory_order_release);
+    service.requested.notify_one();
 }
 
 }
@@ -2356,7 +2483,29 @@ std::uint64_t BumpCollectEpoch() {
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    requestSweep();
     return epoch;
+}
+
+void SetObservationServiceForTest(bool enabled) {
+    Service().enabled.store(enabled, std::memory_order_release);
+}
+
+void DrainObservationServiceForTest() {
+    auto& service = Service();
+    for (;;) {
+        const auto handled = service.handled.load(std::memory_order_acquire);
+        if (handled == service.requested.load(std::memory_order_acquire)) return;
+        service.handled.wait(handled, std::memory_order_acquire);
+    }
+}
+
+bool OnObservationServiceThread() {
+    return onServiceThread;
+}
+
+ObservationServiceCounts ObservationServiceCounted() {
+    return {serviceSweeps.load(std::memory_order_relaxed), serviceWalks.load(std::memory_order_relaxed), fallbackWalks.load(std::memory_order_relaxed)};
 }
 
 void AdoptCollectEpoch(std::uint64_t epoch) {
