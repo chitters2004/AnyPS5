@@ -3216,7 +3216,7 @@ void RunMemoHitBench(int threads) {
     std::printf("memo hits, %d threads: %.1f ns per hit per thread\n", threads, total / static_cast<double>(lanes));
 }
 
-void RunContentionBench(int collectors, bool overlapping) {
+void RunContentionBench(int collectors, bool overlapping, bool writing) {
     constexpr std::size_t RangeBlocks = 4;
     constexpr int Rounds = 20000;
     const auto lanes = static_cast<std::size_t>(collectors) + 1;
@@ -3235,7 +3235,7 @@ void RunContentionBench(int collectors, bool overlapping) {
             const auto address = reinterpret_cast<std::uint64_t>(range);
             while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
             for (std::uint64_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
-                range[(round % (RangeBlocks * Block / 4096)) * 4096] = static_cast<std::uint8_t>(round);
+                if (writing) range[(round % (RangeBlocks * Block / 4096)) * 4096] = static_cast<std::uint8_t>(round);
                 static_cast<void>(CollectWritesUncached(address, RangeBlocks * Block));
                 collected.fetch_add(1, std::memory_order_relaxed);
             }
@@ -3264,7 +3264,7 @@ void RunContentionBench(int collectors, bool overlapping) {
     for (auto& thread : pool) thread.join();
     const auto query = Summarize(queries);
     const auto walk = Summarize(walks);
-    std::printf("contention bench: %d collectors%s; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f written collects/s\n", collectors, overlapping ? " sharing the committer's range" : "", Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
+    std::printf("contention bench: %d %s collectors%s; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f collects/s\n", collectors, writing ? "writing" : "clean", overlapping ? " sharing the committer's range" : "", Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
 }
 
 #ifdef _WIN32
@@ -3475,8 +3475,9 @@ int main(int argc, char** argv) {
             RunMemoHitBench(std::stoi(argv[2]));
             return 0;
         }
-        if ((argc == 3 || argc == 4) && std::string_view(argv[1]) == "--contention-bench") {
-            RunContentionBench(std::stoi(argv[2]), argc == 4 && std::string_view(argv[3]) == "overlap");
+        if (argc >= 3 && argc <= 5 && std::string_view(argv[1]) == "--contention-bench") {
+            const auto option = [&](std::string_view name) { return (argc >= 4 && std::string_view(argv[3]) == name) || (argc == 5 && std::string_view(argv[4]) == name); };
+            RunContentionBench(std::stoi(argv[2]), option("overlap"), !option("clean"));
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
