@@ -85,6 +85,17 @@ enum class CommitPhase : std::uint8_t {
     RecordRecipe,
     RecordStores,
     RecordPassKey,
+    RecordBeginContinue,
+    RecordBeginProxies,
+    RecordBeginBarriers,
+    RecordBeginLds,
+    RecordBeginArguments,
+    RecordBeginOrder,
+    RecordBeginStaged,
+    RecordBeginPipeline,
+    RecordBeginBind,
+    RecordBeginDynamic,
+    RecordBeginLibrary,
     Count
 };
 
