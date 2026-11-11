@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <bit>
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -7,6 +8,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -562,6 +564,27 @@ std::atomic<std::uint64_t> writeBacksOverLabels{0};
 // Completion labels that entered the pending count at a write-back (see NoteWrittenBack).
 std::atomic<std::uint64_t> completionLabelsCountedLate{0};
 std::atomic<std::uint64_t> workSinceSubmit{0};
+thread_local Recorder::SubmitCause announcedSubmitCause = Recorder::SubmitCause::Other;
+Recorder::BatchStatistics batchStatistics;
+Recorder::BatchStatistics batchReported;
+std::chrono::steady_clock::time_point batchReportedAt{};
+constexpr std::array<const char*, static_cast<std::size_t>(Recorder::SubmitCause::Count)> SubmitCauseNames{"other", "label deadline", "work cap", "packet flush", "submission end", "suspend", "label flush", "wait", "interrupt", "present", "idle", "kept bytes", "sync idle", "sync pending write", "sync recorded store", "sync address-based", "sync other"};
+constexpr std::array<const char*, Recorder::BatchBuckets> BatchBucketNames{"0", "1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"};
+
+void noteBatch(Recorder::SubmitCause cause, std::uint64_t draws, std::uint64_t passes, std::uint64_t work) {
+    batchStatistics.Add(cause, draws, passes, work);
+    const auto now = std::chrono::steady_clock::now();
+    if (batchReportedAt == std::chrono::steady_clock::time_point{}) {
+        batchReportedAt = now;
+        return;
+    }
+    if (now - batchReportedAt < std::chrono::seconds(10)) return;
+    batchReportedAt = now;
+    const auto window = Recorder::BatchWindow(batchStatistics, batchReported);
+    batchReported = batchStatistics;
+    batchStatistics.maxima = {};
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", Recorder::FormatBatchReport(window).c_str());
+}
 
 // APS5_COUNT_ALL_COMPLETION_LABELS=1: a completion label also stored on the GPU counts as pending
 // from its registration, as before (see Recorder::AfterCompletions).
@@ -2016,6 +2039,78 @@ bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t addre
     return AgcDriver::Graphics::SnapshotOverlaps(snapshot, address, bytes);
 }
 
+void Recorder::BatchStatistics::Add(SubmitCause cause, std::uint64_t draws, std::uint64_t passes, std::uint64_t work) {
+    ++batches;
+    ++causes[static_cast<std::size_t>(cause)];
+    const std::array<std::uint64_t, 3> values{draws, passes, work};
+    for (std::size_t metric = 0; metric < values.size(); ++metric) {
+        totals[metric] += values[metric];
+        maxima[metric] = std::max(maxima[metric], values[metric]);
+        ++histograms[metric][BatchBucket(values[metric])];
+    }
+}
+
+Recorder::SubmitCauseScope::SubmitCauseScope(SubmitCause cause) : previous(std::exchange(announcedSubmitCause, cause)) {}
+
+Recorder::SubmitCauseScope::~SubmitCauseScope() {
+    announcedSubmitCause = previous;
+}
+
+Recorder::SubmitCause Recorder::AnnouncedSubmitCause() {
+    return announcedSubmitCause;
+}
+
+Recorder::SubmitCause Recorder::SyncSubmitCause(int source) {
+    if (source < 0 || source > 3) return SubmitCause::SyncOther;
+    return static_cast<SubmitCause>(static_cast<unsigned>(SubmitCause::SyncIdle) + static_cast<unsigned>(source));
+}
+
+const char* Recorder::SubmitCauseName(SubmitCause cause) {
+    return SubmitCauseNames[static_cast<std::size_t>(cause)];
+}
+
+std::size_t Recorder::BatchBucket(std::uint64_t count) {
+    return std::min<std::size_t>(static_cast<std::size_t>(std::bit_width(count)), BatchBuckets - 1);
+}
+
+Recorder::BatchStatistics Recorder::BatchCounts() {
+    return batchStatistics;
+}
+
+Recorder::BatchStatistics Recorder::BatchWindow(const BatchStatistics& later, const BatchStatistics& earlier) {
+    BatchStatistics window;
+    window.batches = later.batches - earlier.batches;
+    for (std::size_t cause = 0; cause < window.causes.size(); ++cause) window.causes[cause] = later.causes[cause] - earlier.causes[cause];
+    for (std::size_t metric = 0; metric < window.totals.size(); ++metric) {
+        window.totals[metric] = later.totals[metric] - earlier.totals[metric];
+        window.maxima[metric] = later.maxima[metric];
+        for (std::size_t bucket = 0; bucket < BatchBuckets; ++bucket) window.histograms[metric][bucket] = later.histograms[metric][bucket] - earlier.histograms[metric][bucket];
+    }
+    return window;
+}
+
+std::string Recorder::FormatBatchReport(const BatchStatistics& window) {
+    constexpr std::array<const char*, 3> metricNames{"draws", "passes", "work items"};
+    char text[160];
+    std::snprintf(text, sizeof(text), "[parallel-batches] (10 s) %llu batches", static_cast<unsigned long long>(window.batches));
+    std::string report = text;
+    for (std::size_t metric = 0; metric < metricNames.size(); ++metric) {
+        const double mean = window.batches != 0 ? static_cast<double>(window.totals[metric]) / static_cast<double>(window.batches) : 0.0;
+        std::snprintf(text, sizeof(text), "; %s per batch: mean %.2f, max %llu, histogram", metricNames[metric], mean, static_cast<unsigned long long>(window.maxima[metric]));
+        report += text;
+        for (std::size_t bucket = 0; bucket < BatchBuckets; ++bucket) {
+            std::snprintf(text, sizeof(text), " %s:%llu", BatchBucketNames[bucket], static_cast<unsigned long long>(window.histograms[metric][bucket]));
+            report += text;
+        }
+    }
+    report += "; closed by:";
+    for (std::size_t cause = 0; cause < window.causes.size(); ++cause) {
+        std::snprintf(text, sizeof(text), "%s %s %llu", cause == 0 ? "" : ",", SubmitCauseNames[cause], static_cast<unsigned long long>(window.causes[cause]));
+        report += text;
+    }
+    return report;
+}
+
 void Recorder::CountSync(int source, const void* site) {
     if (source < 0 || source >= 5) return;
     ++syncCounts[source];
@@ -2061,10 +2156,12 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     holdOwed = !forced;
     ensureOpen();
     flushDeferredDispatch();
+    ++open->draws;
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto reason = !pass.open ? pass.closedBy : forced ? PassBreak::Forced : PassBreak::Segment;
         const auto commands = Commands();
+        ++open->passes;
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true, reason};
@@ -2081,6 +2178,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     }
     endOpenRenderPass(reason, !merge && !fuse);
     const auto commands = Commands();
+    ++open->passes;
     if (fuse) oweBarrier(PassEndBarrier, CommandClass::Draw, true);
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
@@ -3716,7 +3814,10 @@ std::uint64_t Recorder::RetainedByteRepeats() {
 
 void Recorder::BoundKeptBytes() {
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
-    if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
+    if (open != nullptr && open->keptBytes >= KeptBytesBudget) {
+        const SubmitCauseScope cause(SubmitCause::KeptBytes);
+        Submit();
+    }
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
     while (!inFlight.empty() && inFlightKeptBytes > 2 * KeptBytesBudget) {
         auto batch = std::move(inFlight.front());
@@ -4848,10 +4949,11 @@ void Recorder::Submit() {
     // call returns (outside the mutex), so a submit by another thread in between leaves a stale
     // count behind, and the callers that act on it would otherwise take the mutex for nothing at
     // every packet or submission end until a real batch is next submitted.
-    if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
+    const auto work = activeRecorder == this ? workSinceSubmit.exchange(0, std::memory_order_relaxed) : 0;
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (CommitPhasesEnabled()) noteBatch(announcedSubmitCause, open->draws, open->passes, work);
     flushDeferredDispatch();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
@@ -5057,7 +5159,10 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    Submit();
+    {
+        const SubmitCauseScope cause(SyncSubmitCause(source));
+        Submit();
+    }
     // Counted only when something is waited for: an idle recorder's Sync is free and would only
     // swamp the site table with the callers that check nothing first.
     const auto previousSite = inFlight.empty() ? activeSyncSite : BeginSyncSite(source, site != nullptr ? site : __builtin_return_address(0));
@@ -5208,6 +5313,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     // SyncThrough disabled everything is the target as well.
     std::uint64_t targetSerial = 0;
     if (!SyncThroughEnabled() || (open != nullptr && overlaps(*open, address, end))) {
+        const SubmitCauseScope cause(SyncSubmitCause(source));
         Submit();
         targetSerial = submissions;
     } else {

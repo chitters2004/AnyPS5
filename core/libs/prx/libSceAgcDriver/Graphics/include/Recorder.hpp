@@ -637,6 +637,52 @@ public:
     // return address of the Sync/SyncThrough call itself is taken, so an unannounced sync still
     // names its real caller.
     static void CountSync(int source, const void* site = nullptr);
+    enum class SubmitCause : std::uint8_t {
+        Other,
+        LabelDeadline,
+        WorkCap,
+        PacketFlush,
+        SubmissionEnd,
+        Suspend,
+        LabelFlush,
+        Wait,
+        Interrupt,
+        Present,
+        Idle,
+        KeptBytes,
+        SyncIdle,
+        SyncPendingWrite,
+        SyncRecordedStore,
+        SyncAddressBased,
+        SyncOther,
+        Count
+    };
+    static constexpr std::size_t BatchBuckets = 8;
+    struct BatchStatistics {
+        std::uint64_t batches = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(SubmitCause::Count)> causes{};
+        std::array<std::uint64_t, 3> totals{};
+        std::array<std::uint64_t, 3> maxima{};
+        std::array<std::array<std::uint64_t, BatchBuckets>, 3> histograms{};
+        void Add(SubmitCause cause, std::uint64_t draws, std::uint64_t passes, std::uint64_t work);
+    };
+    class SubmitCauseScope {
+    public:
+        explicit SubmitCauseScope(SubmitCause cause);
+        ~SubmitCauseScope();
+        SubmitCauseScope(const SubmitCauseScope&) = delete;
+        SubmitCauseScope& operator=(const SubmitCauseScope&) = delete;
+
+    private:
+        SubmitCause previous;
+    };
+    static SubmitCause AnnouncedSubmitCause();
+    static SubmitCause SyncSubmitCause(int source);
+    static const char* SubmitCauseName(SubmitCause cause);
+    static std::size_t BatchBucket(std::uint64_t count);
+    static BatchStatistics BatchCounts();
+    static BatchStatistics BatchWindow(const BatchStatistics& later, const BatchStatistics& earlier);
+    static std::string FormatBatchReport(const BatchStatistics& window);
     // Names only the site for the sync or drain this thread makes next (its source stays as
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
@@ -806,6 +852,8 @@ private:
         AgcDriver::FaultToken lastToken = 0;
         std::uint64_t traceId = 0;
         bool submitted = false;
+        std::uint32_t draws = 0;
+        std::uint32_t passes = 0;
         bool guestWork = false;
         std::atomic<bool> submitStarted{false};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
