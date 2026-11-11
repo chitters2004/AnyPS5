@@ -259,6 +259,7 @@ public:
     void Sync();
     void CountSamples();
     bool CountingSamples() const { return countingSamples; }
+    bool ChangedCopyRefused() const { return changedCopyState < 0; }
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
     bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0);
     std::uint64_t SamplesTotal();

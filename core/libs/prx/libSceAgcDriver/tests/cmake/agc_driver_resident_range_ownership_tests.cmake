@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    set_tests_properties(agc_driver_resident_range_ownership PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_driver_resident_range_ownership_whole_copy_back COMMAND agc_driver_resident_range_ownership_tests)
+    set_tests_properties(agc_driver_resident_range_ownership_whole_copy_back PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_CHANGED_COPY_BACK=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_resident_range_ownership_whole_copy_back PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
