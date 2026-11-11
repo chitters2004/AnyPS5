@@ -4979,6 +4979,10 @@ std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhe
     return Graphics::PrepareDrawInputsAhead(graphicsContext(), graphics, draw, shaders, epoch);
 }
 
+std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawResourcesAhead(std::shared_ptr<Graphics::PreparedDrawInputs> job, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t epoch) const {
+    return Graphics::PrepareDrawResourcesAhead(std::move(job), graphicsContext(), graphics, draw, shaders, snapshots, epoch);
+}
+
 namespace {
 
 // The resource cache serves dispatches unless disabled; Revalidate proves a hit by texture identity,

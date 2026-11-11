@@ -28,9 +28,16 @@ struct DrawVertexFetches {
 DrawVertexFetches PlanDrawVertexFetches(std::optional<std::pair<std::uint64_t, std::uint64_t>> colorTarget, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, const VertexInputLayout& layout, std::uint32_t maxIndex);
 
 class PreparedDrawInputs;
+class ShaderResources;
 
 std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t epoch = 0);
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
+std::shared_ptr<PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<PreparedDrawInputs> job, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t epoch = 0);
+void SubmitPreparedDrawResources(const std::shared_ptr<PreparedDrawInputs>& job, std::shared_ptr<const void> pin);
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit);
+std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& context, bool deviceStaging);
+void CountPreparedDrawResourcesVerified(bool differed);
+std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>* spare);
 
 class PreparedDrawInputsScope {
 public:
@@ -90,6 +97,32 @@ struct PreparedDrawInputCounts {
 };
 
 PreparedDrawInputCounts PreparedDrawInputCounters();
+
+struct PreparedUploadCounts {
+    std::uint64_t requests = 0;
+    std::uint64_t notReady = 0;
+    std::uint64_t waited = 0;
+    std::uint64_t stageAPrepared = 0;
+    std::uint64_t stageAAdopted = 0;
+    std::uint64_t stageAStale = 0;
+    std::uint64_t stageAStaleStaging = 0;
+    std::uint64_t stageAUnused = 0;
+    std::uint64_t stageAPredictedHit = 0;
+    std::uint64_t stageARefused = 0;
+    std::uint64_t stageAFailed = 0;
+    std::uint64_t stageAUnpinned = 0;
+    std::uint64_t stageAVerifyDiffered = 0;
+    std::uint64_t regionsPrepared = 0;
+    std::uint64_t regionsAdopted = 0;
+    std::uint64_t regionsReprepared = 0;
+    std::uint64_t regionsUnused = 0;
+    std::uint64_t regionsRefused = 0;
+    std::array<std::uint64_t, PreparedRefusalCount> regionsRefusedBy{};
+    std::uint64_t regionSpareReused = 0;
+    std::uint64_t regionVerifyDiffered = 0;
+};
+
+PreparedUploadCounts PreparedUploadCounters();
 void SetDrawInputPreparers(unsigned count);
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared));
 void HoldDrawInputPreparers(bool held);

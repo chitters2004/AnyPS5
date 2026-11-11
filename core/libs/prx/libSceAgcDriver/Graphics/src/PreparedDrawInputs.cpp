@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -82,6 +84,7 @@ struct PreparedRange {
     std::uint64_t forget = 0;
     std::uint32_t derived = 0;
     std::shared_ptr<Buffer> buffer;
+    VkBufferUsageFlags usage = 0;
     bool consumed = false;
 };
 
@@ -221,6 +224,47 @@ VkBufferUsageFlags usageOf(Recorder::SnapshotUse use) {
     return use == Recorder::SnapshotUse::Vertex || use == Recorder::SnapshotUse::PaddedVertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 }
 
+struct UploadCounters {
+    std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> notReady{0};
+    std::atomic<std::uint64_t> waited{0};
+    std::atomic<std::uint64_t> stageAPrepared{0};
+    std::atomic<std::uint64_t> stageAAdopted{0};
+    std::atomic<std::uint64_t> stageAStale{0};
+    std::atomic<std::uint64_t> stageAStaleStaging{0};
+    std::atomic<std::uint64_t> stageAUnused{0};
+    std::atomic<std::uint64_t> stageAPredictedHit{0};
+    std::atomic<std::uint64_t> stageARefused{0};
+    std::atomic<std::uint64_t> stageAFailed{0};
+    std::atomic<std::uint64_t> stageAUnpinned{0};
+    std::atomic<std::uint64_t> stageANanoseconds{0};
+    std::atomic<std::uint64_t> stageAVerifyDiffered{0};
+    std::atomic<std::uint64_t> regionsPrepared{0};
+    std::atomic<std::uint64_t> regionsAdopted{0};
+    std::atomic<std::uint64_t> regionsReprepared{0};
+    std::atomic<std::uint64_t> regionsUnused{0};
+    std::atomic<std::uint64_t> regionsRefused{0};
+    std::array<std::atomic<std::uint64_t>, PreparedRefusalCount> regionsRefusedBy{};
+    std::atomic<std::uint64_t> regionBytesAdopted{0};
+    std::atomic<std::uint64_t> regionCheckNanoseconds{0};
+    std::atomic<std::uint64_t> regionCollectNanoseconds{0};
+    std::atomic<std::uint64_t> regionSpareReused{0};
+    std::atomic<std::uint64_t> regionVerifyDiffered{0};
+};
+
+UploadCounters& uploadCounters() {
+    static UploadCounters values;
+    return values;
+}
+
+void countedUpload(std::atomic<std::uint64_t>& total, const char* scope, std::uint64_t amount = 1) {
+    if (amount == 0) return;
+    total.fetch_add(amount, std::memory_order_relaxed);
+    PerformanceTrace::CountOwnedDraw(scope, amount);
+}
+
+constexpr std::array<const char*, PreparedRefusalCount> RegionRefusalNames{"UploadPrep.regions_refused_size", "UploadPrep.regions_refused_inaccessible", "UploadPrep.regions_refused_forget", "UploadPrep.regions_refused_pending", "UploadPrep.regions_refused_unwatched", "UploadPrep.regions_refused_snapshot_changed", "UploadPrep.regions_refused_failed"};
+
 enum class StagingRole : std::size_t { Preparer, Committer };
 
 struct StagingCost {
@@ -252,16 +296,14 @@ void countStaging(StagingRole role, const StagingCost& cost) {
 
 }
 
-class PreparedDrawInputs {
+class PreparedWork {
 public:
+    explicit PreparedWork(const Context& context) : context(context) {}
+    virtual ~PreparedWork() = default;
+    PreparedWork(const PreparedWork&) = delete;
+    PreparedWork& operator=(const PreparedWork&) = delete;
+
     Context context;
-    Pm4::DrawParameters draw{};
-    std::vector<ShaderRecompiler::VertexAttribute> attributes;
-    std::shared_ptr<const VertexInputLayout> layout;
-    std::optional<std::pair<std::uint64_t, std::uint64_t>> colorTarget;
-    std::optional<std::uint32_t> zeroFetchFrom;
-    Recorder::SnapshotUse indexUse = Recorder::SnapshotUse::Index16;
-    bool skipRestart = false;
     std::uint64_t epoch = 0;
     bool followedEpoch = false;
     std::uint64_t collectNanoseconds = 0;
@@ -274,39 +316,12 @@ public:
     bool cancelled = false;
     bool waited = false;
 
-    explicit PreparedDrawInputs(const Context& context) : context(context) {}
+    virtual void Run() = 0;
 
-    void Prepare() {
-        ranges.reserve(attributes.size() + 1u);
-        std::uint32_t maxIndex = 0;
-        if (draw.indexed) {
-            const auto bytes = static_cast<std::size_t>(draw.indexCount) * draw.indexSize;
-            const auto index = copyRange(draw.indexAddress, bytes, indexUse, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, bytes);
-            if (!index) return;
-            auto& range = ranges[*index];
-            const auto highest = HighestDrawIndex(range.buffer->Bytes().first(bytes), draw.indexSize, skipRestart);
-            range.derived = skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
-            if (!highest) return;
-            if (zeroFetchFrom) {
-                const auto limit = *zeroFetchFrom > draw.firstVertex ? *zeroFetchFrom - draw.firstVertex : 0u;
-                if (*highest >= limit && *highest - limit >= ZeroFetchSlack) return;
-            }
-            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return;
-            maxIndex = *highest + draw.firstVertex;
-        } else {
-            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return;
-            maxIndex = draw.firstVertex + draw.indexCount - 1u;
-        }
-        if (attributes.empty() || layout == nullptr) return;
-        const auto planned = PlanDrawVertexFetches(colorTarget, draw, attributes, *layout, maxIndex);
-        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(copyRange(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, static_cast<std::size_t>(end - begin)));
-        for (const auto solo : planned.soloFetches) {
-            const auto& fetch = planned.fetches[solo];
-            const auto bytes = static_cast<std::size_t>(fetch.end - fetch.begin);
-            const auto readable = ZeroPaddedReadableBytes(fetch.begin, planned.fetchValid[solo], fetch.stride);
-            if (readable == 0 || readable > std::numeric_limits<std::uint32_t>::max()) continue;
-            if (const auto index = copyRange(fetch.begin, bytes, Recorder::SnapshotUse::PaddedVertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, readable)) ranges[*index].derived = static_cast<std::uint32_t>(readable);
-        }
+    virtual void Fail() {
+        ranges.clear();
+        ++refusedRanges;
+        ++refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
     }
 
     void Settle() {
@@ -331,35 +346,8 @@ public:
         }
     }
 
-    void Finish() {
-        Settle();
-        std::uint64_t unusedRanges = 0;
-        std::uint64_t preparedRanges = 0;
-        std::uint64_t returned = 0;
-        if (!cancelled) {
-            for (auto& range : ranges) {
-                ++preparedRanges;
-                if (!range.consumed) ++unusedRanges;
-                if (returnStashed(context.device, range.bytes, usageOf(range.use), range.buffer)) ++returned;
-            }
-        }
-        auto& total = counters();
-        counted(total.requests, "DrawInputPrep.requests");
-        counted(total.prepared, "DrawInputPrep.prepared", preparedRanges);
-        counted(total.refused, "DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
-        for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) counted(total.refusedBy[reason], RefusalNames[reason], refusedBy[reason]);
-        counted(total.unused, "DrawInputPrep.unused", unusedRanges);
-        counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
-        counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
-        counted(total.epochFollows, "DrawInputPrep.epoch_follows", !cancelled && followedEpoch ? 1 : 0);
-        if (!cancelled && collectNanoseconds != 0) counted(total.collectNanoseconds, "DrawInputPrep.collect_ns", collectNanoseconds);
-        if (!cancelled) countStaging(StagingRole::Preparer, staging);
-        if (returned != 0) counted(total.stashReturned, "DrawInputPrep.stash_returned", returned);
-    }
-
-private:
+protected:
     std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
-        counters().ranges.fetch_add(1, std::memory_order_relaxed);
         const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
             ++refusedRanges;
             ++refusedBy[static_cast<std::size_t>(reason)];
@@ -372,6 +360,7 @@ private:
         range.bytes = bytes;
         range.readable = readable;
         range.use = use;
+        range.usage = usage;
         range.forget = GuestMemory::ForgetSerial();
         if ((range.forget & 1u) != 0) return refuse(PreparedRefusal::Forget);
         range.registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -399,7 +388,171 @@ private:
         ranges.push_back(std::move(range));
         return ranges.size() - 1u;
     }
+
+    std::array<std::uint64_t, 3> releaseRanges() {
+        std::array<std::uint64_t, 3> counts{};
+        if (cancelled) return counts;
+        for (auto& range : ranges) {
+            ++counts[0];
+            if (!range.consumed) ++counts[1];
+            if (returnStashed(context.device, range.bytes, range.usage, range.buffer)) ++counts[2];
+        }
+        return counts;
+    }
 };
+
+enum class StageAOutcome : std::uint8_t { None, PredictedHit, Refused, Failed, Unpinned };
+
+class PreparedDrawResources final : public PreparedWork {
+public:
+    using PreparedWork::PreparedWork;
+
+    std::weak_ptr<const void> pin;
+    const State* drawState = nullptr;
+    Pm4::DrawParameters draw{};
+    std::span<const CompiledShader> shaders;
+    std::span<const GuestMemorySnapshot> snapshots;
+    bool stageAWanted = false;
+    bool regionsWanted = false;
+    std::shared_ptr<ShaderResources> stageA;
+    StageAOutcome outcome = StageAOutcome::None;
+    std::uint64_t stageANanoseconds = 0;
+    bool offered = false;
+
+    void Run() override {
+        const auto pinned = pin.lock();
+        if (pinned == nullptr) {
+            outcome = StageAOutcome::Unpinned;
+            return;
+        }
+        const GuestMemory::DeviceLockForbiddenScope forbidden;
+        const bool timed = DrawInputSourcesTimed();
+        const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        try {
+            bool predictedHit = false;
+            stageA = PrepareDrawResourcesOffDevice(context, *drawState, draw, shaders, snapshots, predictedHit);
+            if (predictedHit) outcome = StageAOutcome::PredictedHit;
+        } catch (const OffDeviceRefusal&) {
+            stageA.reset();
+            outcome = StageAOutcome::Refused;
+        }
+        if (timed) stageANanoseconds = nanosecondsSince(start);
+        if (!regionsWanted || stageA == nullptr) return;
+        for (const auto& [begin, end] : stageA->OffDeviceCopies()) static_cast<void>(copyRange(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Storage, RegionCopyUsage(false), static_cast<std::size_t>(end - begin)));
+        if (!stageAWanted) stageA.reset();
+    }
+
+    void Fail() override {
+        stageA.reset();
+        outcome = StageAOutcome::Failed;
+        PreparedWork::Fail();
+    }
+
+    void Finish();
+};
+
+class PreparedDrawInputs final : public PreparedWork {
+public:
+    using PreparedWork::PreparedWork;
+
+    Pm4::DrawParameters draw{};
+    std::vector<ShaderRecompiler::VertexAttribute> attributes;
+    std::shared_ptr<const VertexInputLayout> layout;
+    std::optional<std::pair<std::uint64_t, std::uint64_t>> colorTarget;
+    std::optional<std::uint32_t> zeroFetchFrom;
+    Recorder::SnapshotUse indexUse = Recorder::SnapshotUse::Index16;
+    bool skipRestart = false;
+    bool inputsRequested = false;
+    std::shared_ptr<PreparedDrawResources> resources;
+
+    void Run() override {
+        ranges.reserve(attributes.size() + 1u);
+        std::uint32_t maxIndex = 0;
+        if (draw.indexed) {
+            const auto bytes = static_cast<std::size_t>(draw.indexCount) * draw.indexSize;
+            const auto index = countedCopy(draw.indexAddress, bytes, indexUse, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, bytes);
+            if (!index) return;
+            auto& range = ranges[*index];
+            const auto highest = HighestDrawIndex(range.buffer->Bytes().first(bytes), draw.indexSize, skipRestart);
+            range.derived = skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
+            if (!highest) return;
+            if (zeroFetchFrom) {
+                const auto limit = *zeroFetchFrom > draw.firstVertex ? *zeroFetchFrom - draw.firstVertex : 0u;
+                if (*highest >= limit && *highest - limit >= ZeroFetchSlack) return;
+            }
+            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - *highest) return;
+            maxIndex = *highest + draw.firstVertex;
+        } else {
+            if (draw.firstVertex > std::numeric_limits<std::uint32_t>::max() - (draw.indexCount - 1u)) return;
+            maxIndex = draw.firstVertex + draw.indexCount - 1u;
+        }
+        if (attributes.empty() || layout == nullptr) return;
+        const auto planned = PlanDrawVertexFetches(colorTarget, draw, attributes, *layout, maxIndex);
+        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(countedCopy(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, static_cast<std::size_t>(end - begin)));
+        for (const auto solo : planned.soloFetches) {
+            const auto& fetch = planned.fetches[solo];
+            const auto bytes = static_cast<std::size_t>(fetch.end - fetch.begin);
+            const auto readable = ZeroPaddedReadableBytes(fetch.begin, planned.fetchValid[solo], fetch.stride);
+            if (readable == 0 || readable > std::numeric_limits<std::uint32_t>::max()) continue;
+            if (const auto index = countedCopy(fetch.begin, bytes, Recorder::SnapshotUse::PaddedVertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, readable)) ranges[*index].derived = static_cast<std::uint32_t>(readable);
+        }
+    }
+
+    void Finish() {
+        if (inputsRequested) {
+            Settle();
+            const auto [preparedRanges, unusedRanges, returned] = releaseRanges();
+            auto& total = counters();
+            counted(total.requests, "DrawInputPrep.requests");
+            counted(total.prepared, "DrawInputPrep.prepared", preparedRanges);
+            counted(total.refused, "DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
+            for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) counted(total.refusedBy[reason], RefusalNames[reason], refusedBy[reason]);
+            counted(total.unused, "DrawInputPrep.unused", unusedRanges);
+            counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
+            counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
+            counted(total.epochFollows, "DrawInputPrep.epoch_follows", !cancelled && followedEpoch ? 1 : 0);
+            if (!cancelled && collectNanoseconds != 0) counted(total.collectNanoseconds, "DrawInputPrep.collect_ns", collectNanoseconds);
+            if (!cancelled) countStaging(StagingRole::Preparer, staging);
+            if (returned != 0) counted(total.stashReturned, "DrawInputPrep.stash_returned", returned);
+        }
+        if (resources != nullptr) resources->Finish();
+    }
+
+private:
+    std::optional<std::size_t> countedCopy(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
+        counters().ranges.fetch_add(1, std::memory_order_relaxed);
+        return copyRange(address, bytes, use, usage, readable);
+    }
+};
+
+void PreparedDrawResources::Finish() {
+    Settle();
+    const auto [preparedRegions, unusedRegions, returned] = releaseRanges();
+    auto& total = uploadCounters();
+    countedUpload(total.requests, "UploadPrep.requests");
+    if (cancelled) {
+        countedUpload(total.notReady, "UploadPrep.not_ready");
+        return;
+    }
+    countedUpload(total.waited, "UploadPrep.waited", waited ? 1 : 0);
+    if (stageAWanted) {
+        if (stageA != nullptr || offered) countedUpload(total.stageAPrepared, "UploadPrep.stage_a_prepared");
+        if (stageA != nullptr && !offered) countedUpload(total.stageAUnused, "UploadPrep.stage_a_unused");
+        countedUpload(total.stageAPredictedHit, "UploadPrep.stage_a_predicted_hit", outcome == StageAOutcome::PredictedHit ? 1 : 0);
+        countedUpload(total.stageARefused, "UploadPrep.stage_a_refused", outcome == StageAOutcome::Refused ? 1 : 0);
+        countedUpload(total.stageAFailed, "UploadPrep.stage_a_failed", outcome == StageAOutcome::Failed ? 1 : 0);
+        countedUpload(total.stageAUnpinned, "UploadPrep.stage_a_unpinned", outcome == StageAOutcome::Unpinned ? 1 : 0);
+        if (stageANanoseconds != 0) countedUpload(total.stageANanoseconds, "UploadPrep.stage_a_ns", stageANanoseconds);
+    }
+    countedUpload(total.regionsPrepared, "UploadPrep.regions_prepared", preparedRegions);
+    countedUpload(total.regionsUnused, "UploadPrep.regions_unused", unusedRegions);
+    countedUpload(total.regionsRefused, "UploadPrep.regions_refused", refusedRanges);
+    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) countedUpload(total.regionsRefusedBy[reason], RegionRefusalNames[reason], refusedBy[reason]);
+    if (collectNanoseconds != 0) countedUpload(total.regionCollectNanoseconds, "UploadPrep.region_collect_ns", collectNanoseconds);
+    countStaging(StagingRole::Preparer, staging);
+    if (returned != 0) counted(counters().stashReturned, "DrawInputPrep.stash_returned", returned);
+    stageA.reset();
+}
 
 namespace {
 
@@ -432,7 +585,7 @@ public:
         openStash(false);
     }
 
-    void Submit(const std::shared_ptr<PreparedDrawInputs>& job) {
+    void Submit(const std::shared_ptr<PreparedWork>& job) {
         {
             std::lock_guard lock(mutex);
             jobs.push_back(job);
@@ -461,7 +614,7 @@ private:
     void run(std::stop_token token) {
         std::uint64_t followed = 0;
         for (;;) {
-            std::shared_ptr<PreparedDrawInputs> job;
+            std::shared_ptr<PreparedWork> job;
             {
                 std::unique_lock lock(mutex);
                 if (!wake.wait(lock, token, [&] { return !jobs.empty() && !preparersHeld.load(std::memory_order_acquire); })) return;
@@ -481,11 +634,9 @@ private:
                     job->followedEpoch = true;
                     DriverDetail::DrawPipeline::FollowEpoch(job->epoch);
                 }
-                job->Prepare();
+                job->Run();
             } catch (...) {
-                job->ranges.clear();
-                ++job->refusedRanges;
-                ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
+                job->Fail();
             }
             job->state.store(JobState::Done, std::memory_order_release);
             job->state.notify_all();
@@ -496,7 +647,7 @@ private:
     static inline std::mutex creation;
     std::mutex mutex;
     std::condition_variable_any wake;
-    std::deque<std::weak_ptr<PreparedDrawInputs>> jobs;
+    std::deque<std::weak_ptr<PreparedWork>> jobs;
     std::vector<std::jthread> threads;
 };
 
@@ -542,6 +693,7 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
         job->indexUse = draw.indexSize == 2 ? (job->skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (job->skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         if (!state.stages.mesh && !attributes.empty()) job->zeroFetchFrom = ZeroFetchVertex(attributes);
     }
+    job->inputsRequested = true;
     preparers->Submit(job);
     if (timed) {
         const auto spent = nanosecondsSince(started);
@@ -552,6 +704,124 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
 
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared) {
     prepared.Await();
+    if (prepared.resources != nullptr) prepared.resources->Await();
+}
+
+std::shared_ptr<PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<PreparedDrawInputs> job, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t epoch) {
+    const bool stageAWanted = !RuntimeSwitches::Set(RuntimeSwitch::NoEarlyUploadPrepare);
+    const bool regionsWanted = !RuntimeSwitches::Set(RuntimeSwitch::NoEarlyRegionCopies) && GuestMemory::WriteWatched();
+    if ((!stageAWanted && !regionsWanted) || shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr; })) return job;
+    if (job != nullptr && job->context.device != context.device) return job;
+    if (Preparers::Get() == nullptr) return job;
+    if (job == nullptr) {
+        job = std::make_shared<PreparedDrawInputs>(context);
+        job->epoch = epoch;
+        job->state.store(JobState::Done, std::memory_order_release);
+    }
+    auto resources = std::make_shared<PreparedDrawResources>(context);
+    resources->epoch = epoch;
+    resources->drawState = &state;
+    resources->draw = draw;
+    resources->shaders = shaders;
+    resources->snapshots = snapshots;
+    resources->stageAWanted = stageAWanted;
+    resources->regionsWanted = regionsWanted;
+    job->resources = std::move(resources);
+    return job;
+}
+
+void SubmitPreparedDrawResources(const std::shared_ptr<PreparedDrawInputs>& job, std::shared_ptr<const void> pin) {
+    if (job == nullptr || job->resources == nullptr || job->resources->state.load(std::memory_order_acquire) != JobState::Queued) return;
+    auto* preparers = Preparers::Get();
+    if (preparers == nullptr) return;
+    job->resources->pin = pin;
+    preparers->Submit(job->resources);
+}
+
+std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& context, bool deviceStaging) {
+    auto* job = currentPrepared.get();
+    if (job == nullptr || job->resources == nullptr || job->context.device != context.device) return nullptr;
+    auto& resources = *job->resources;
+    resources.Settle();
+    if (resources.cancelled || !resources.stageAWanted || resources.offered) return nullptr;
+    resources.offered = true;
+    if (resources.stageA == nullptr) return nullptr;
+    auto& total = uploadCounters();
+    if (resources.stageA->PreparedStaging() != deviceStaging) {
+        resources.stageA.reset();
+        countedUpload(total.stageAStaleStaging, "UploadPrep.stage_a_stale_staging");
+        return nullptr;
+    }
+    if (!resources.stageA->PreparedDrawCurrent(deviceStaging)) {
+        resources.stageA.reset();
+        countedUpload(total.stageAStale, "UploadPrep.stage_a_stale");
+        return nullptr;
+    }
+    countedUpload(total.stageAAdopted, "UploadPrep.stage_a_adopted");
+    return std::move(resources.stageA);
+}
+
+void CountPreparedDrawResourcesVerified(bool differed) {
+    if (differed) countedUpload(uploadCounters().stageAVerifyDiffered, "UploadPrep.verify_stage_a_differed");
+}
+
+std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>* spare) {
+    auto* job = currentPrepared.get();
+    if (job == nullptr || job->resources == nullptr || job->context.device != context.device) return nullptr;
+    auto& resources = *job->resources;
+    resources.Settle();
+    if (resources.cancelled) return nullptr;
+    const auto found = std::find_if(resources.ranges.begin(), resources.ranges.end(), [&](const PreparedRange& range) { return !range.consumed && range.address == address && range.bytes == bytes && range.usage == usage; });
+    if (found == resources.ranges.end()) return nullptr;
+    found->consumed = true;
+    const bool timed = DrawInputSourcesTimed();
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    GuestMemory::FlushGpuWrites(address, bytes);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const bool valid = GuestMemory::CollectWrites(address, bytes) != 0 && PreparedInputStillValid(*found, recorder, registry);
+    auto& total = uploadCounters();
+    if (timed) countedUpload(total.regionCheckNanoseconds, "UploadPrep.region_check_ns", nanosecondsSince(start));
+    if (!valid) {
+        if (spare != nullptr && recycling()) {
+            *spare = std::move(found->buffer);
+            countedUpload(total.regionSpareReused, "UploadPrep.region_spare_reused");
+        }
+        found->buffer.reset();
+        countedUpload(total.regionsReprepared, "UploadPrep.regions_reprepared");
+        return nullptr;
+    }
+    countedUpload(total.regionsAdopted, "UploadPrep.regions_adopted");
+    countedUpload(total.regionBytesAdopted, "UploadPrep.region_bytes_adopted", bytes);
+    static const bool verify = std::getenv("APS5_VERIFY_EARLY_UPLOADS") != nullptr;
+    if (verify && std::memcmp(found->buffer->Bytes().data(), reinterpret_cast<const void*>(address), bytes) != 0) countedUpload(total.regionVerifyDiffered, "UploadPrep.verify_regions_differed");
+    return std::move(found->buffer);
+}
+
+PreparedUploadCounts PreparedUploadCounters() {
+    auto& total = uploadCounters();
+    PreparedUploadCounts counts;
+    counts.requests = total.requests.load(std::memory_order_relaxed);
+    counts.notReady = total.notReady.load(std::memory_order_relaxed);
+    counts.waited = total.waited.load(std::memory_order_relaxed);
+    counts.stageAPrepared = total.stageAPrepared.load(std::memory_order_relaxed);
+    counts.stageAAdopted = total.stageAAdopted.load(std::memory_order_relaxed);
+    counts.stageAStale = total.stageAStale.load(std::memory_order_relaxed);
+    counts.stageAStaleStaging = total.stageAStaleStaging.load(std::memory_order_relaxed);
+    counts.stageAUnused = total.stageAUnused.load(std::memory_order_relaxed);
+    counts.stageAPredictedHit = total.stageAPredictedHit.load(std::memory_order_relaxed);
+    counts.stageARefused = total.stageARefused.load(std::memory_order_relaxed);
+    counts.stageAFailed = total.stageAFailed.load(std::memory_order_relaxed);
+    counts.stageAUnpinned = total.stageAUnpinned.load(std::memory_order_relaxed);
+    counts.stageAVerifyDiffered = total.stageAVerifyDiffered.load(std::memory_order_relaxed);
+    counts.regionsPrepared = total.regionsPrepared.load(std::memory_order_relaxed);
+    counts.regionsAdopted = total.regionsAdopted.load(std::memory_order_relaxed);
+    counts.regionsReprepared = total.regionsReprepared.load(std::memory_order_relaxed);
+    counts.regionsUnused = total.regionsUnused.load(std::memory_order_relaxed);
+    counts.regionsRefused = total.regionsRefused.load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.regionsRefusedBy[reason] = total.regionsRefusedBy[reason].load(std::memory_order_relaxed);
+    counts.regionSpareReused = total.regionSpareReused.load(std::memory_order_relaxed);
+    counts.regionVerifyDiffered = total.regionVerifyDiffered.load(std::memory_order_relaxed);
+    return counts;
 }
 
 PreparedDrawInputsScope::PreparedDrawInputsScope(std::shared_ptr<PreparedDrawInputs> prepared) : prepared(std::move(prepared)), previous(std::exchange(currentPrepared, this->prepared)) {

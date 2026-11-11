@@ -34,6 +34,8 @@ enum class RuntimeSwitch : std::size_t {
     PartialDrains,
     PlanAttachments,
     NoDrawInputRecycling,
+    NoEarlyUploadPrepare,
+    NoEarlyRegionCopies,
     Count,
 };
 

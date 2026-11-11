@@ -2403,6 +2403,26 @@ bool drawStagingEnabled() {
     return !disabled;
 }
 
+std::atomic<bool> lastDrawDeviceStaging{true};
+
+bool verifyEarlyUploads() {
+    static const bool verify = std::getenv("APS5_VERIFY_EARLY_UPLOADS") != nullptr;
+    return verify;
+}
+
+std::shared_ptr<ShaderResources> adoptedOrBuilt(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool deviceStaging) {
+    lastDrawDeviceStaging.store(deviceStaging, std::memory_order_relaxed);
+    if (auto prepared = AdoptPreparedDrawResources(context, deviceStaging)) {
+        if (verifyEarlyUploads()) {
+            const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging, ShaderResources::PreparedOffDevice{});
+            CountPreparedDrawResourcesVerified(fresh.RegionSignature() != prepared->RegionSignature() || fresh.OffDeviceCopies() != prepared->OffDeviceCopies());
+        }
+        prepared->CompleteDraw(shaders);
+        return prepared;
+    }
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging);
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
@@ -2503,7 +2523,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         CountCommit(CommitCounter::ResolveBuilds);
-        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled()); });
+        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return adoptedOrBuilt(context, state, draw, shaders, snapshots, indexBytes, recordable && drawStagingEnabled()); });
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -5352,6 +5372,20 @@ VkDrawCounts TakeVkDrawCounts() {
     counts.indirect = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Indirect)].exchange(0, std::memory_order_relaxed);
     counts.mesh = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Mesh)].exchange(0, std::memory_order_relaxed);
     return counts;
+}
+
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit) {
+    predictedHit = false;
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    const bool keyed = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (keyed && SharedResourceCache().Peek(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, nullptr)) != nullptr) {
+        predictedHit = true;
+        return nullptr;
+    }
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, lastDrawDeviceStaging.load(std::memory_order_relaxed), ShaderResources::PreparedOffDevice{});
 }
 
 }
