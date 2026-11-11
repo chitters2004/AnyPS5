@@ -153,6 +153,7 @@ public:
     SequenceRing& Ring();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
+    void Enqueue(Job job, Pending held, std::uint8_t tag);
     std::uint64_t Bypass();
     DrawPipeline::QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
     void Drain();

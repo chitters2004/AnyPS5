@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <mutex>
@@ -186,6 +187,24 @@ void IdleDrainRethrowsAFailedPreparation() {
     DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
 }
 
+void ResidencyIsCountedByKind() {
+    if (!DrawFinisher::Sequenced() || std::getenv("APS5_PIPELINE_STATS") == nullptr) return;
+    static_cast<void>(DrawFinisher::Get().Ring().TakeCounters());
+    Log log;
+    Gate gate;
+    gate.Close();
+    Draw(log, 0, &gate);
+    Forward(log, Kind::EndOfPipe, 1, Base + 0x40, Bytes(3));
+    Forward(log, Kind::DmaWrite, 2, Base + 0x5000);
+    gate.Open();
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    const auto counters = DrawFinisher::Get().Ring().TakeCounters();
+    const auto tagOf = [](Kind kind) { return 1 + static_cast<std::size_t>(kind); };
+    Require(counters.residency[0].items == 1, "the held draw's residency was not counted as a preparation");
+    Require(counters.residency[tagOf(Kind::EndOfPipe)].items == 1 && counters.residency[tagOf(Kind::DmaWrite)].items == 1, "forwarded items' residency was not counted by commit kind");
+    Require(log.committed == log.expected, "items committed out of order while timed");
+}
+
 void FullRingHoldsTheProducer() {
     if (!DrawFinisher::Sequenced()) return;
     Log log;
@@ -253,6 +272,7 @@ int main() {
         ReadsDoNotWaitInTheRing();
         FailedPrepareReachesTheWorker();
         IdleDrainRethrowsAFailedPreparation();
+        ResidencyIsCountedByKind();
         FullRingHoldsTheProducer();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;
