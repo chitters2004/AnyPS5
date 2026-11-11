@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    set_tests_properties(agc_driver_synced_alias_borrow PROPERTIES TIMEOUT 60)
+endif()
+if(BUILD_TESTING AND NOT WIN32)
+    add_test(NAME agc_driver_synced_alias_borrow_watched COMMAND agc_driver_synced_alias_borrow_tests)
+    set_tests_properties(agc_driver_synced_alias_borrow_watched PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+endif()

@@ -144,6 +144,7 @@ std::atomic<std::uint64_t> queuedReadHeld{0};
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+std::atomic<std::uint64_t> syncedBorrows{0}, syncedUnits{0}, syncedBytes{0}, syncedRollBacks{0};
 std::atomic<std::uint64_t> refreshesProvedPendingKeys{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> guestSnapshots{0};
@@ -1671,6 +1672,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
+    texture->forgetSeen = GuestMemory::ForgetSerial();
     uploadReason = "first";
     texture->upload();
     texture->defaultMip = mipLevel;
@@ -2534,6 +2536,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     bool keysChanged = false;
     bool cpuWrote = false;
     bool direct = false;
+    std::shared_ptr<StorageTexture> lender;
     DccKeys keys = uploadedKeys;
     {
         const auto equalsOriginal = [&] {
@@ -2652,6 +2655,24 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
                 borrowedUnits.clear();
             }
         }
+        if (alias == nullptr && direct && !scoped && !unchanged && !keysChanged && !compared && !orderedSkipped) {
+            std::vector<bool> wanted(trackedLayers, false);
+            bool wantsAny = false;
+            for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                if (!changed[unit] || layerPending[unit]) continue;
+                wanted[unit] = true;
+                wantsAny = true;
+            }
+            std::vector<bool> lent;
+            if (wantsAny) lender = syncedAlias(wanted, lent);
+            if (lender != nullptr) {
+                borrowed = std::move(lent);
+                anyBorrowed = true;
+                for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                    if (borrowed[unit]) changed[unit] = false;
+                }
+            }
+        }
     }
     if (orderedSkipped) {
         changed.assign(trackedLayers, true);
@@ -2757,14 +2778,22 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     }
     if (anyBorrowed) {
         uploadReason = "alias";
-        borrowUnits(*alias, borrowed);
+        const auto lentBytes = borrowUnits(alias != nullptr ? *alias : *lender, borrowed);
+        std::vector<std::array<std::uint64_t, 3>> previous;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) {
+                if (lender != nullptr) previous.push_back({unit, currentFor(unit), layerGeneration[unit]});
                 layerGeneration[unit] = currentFor(unit);
                 forgetUnwatchHash(unit, 1);
             }
         }
         refreshGeneration();
+        if (lender != nullptr) {
+            noteSyncedBorrow(previous.size(), lentBytes);
+            if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) recorder->OnDiscard([weak = weak_from_this(), previous = std::move(previous)] {
+                if (auto self = weak.lock()) self->rollBackSyncedBorrow(previous);
+            });
+        }
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
@@ -6746,16 +6775,102 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         }
     }
     for (const auto& candidate : candidates) {
-        const auto& mine = descriptor;
-        const auto& theirs = candidate->descriptor;
-        // The same texels under another format of the same size: the device copy moves them bit
-        // for bit, as the guest bytes would.
-        const auto oneSlice = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0); };
-        const bool sameDimension = mine.dimension == theirs.dimension || (oneSlice(mine) && oneSlice(theirs));
-        const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && sameDimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
-        if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
+        if (sameShape(*candidate) && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
+}
+
+bool StorageTexture::sameShape(const StorageTexture& other) const {
+    const auto& mine = descriptor;
+    const auto& theirs = other.descriptor;
+    // The same texels under another format of the same size: the device copy moves them bit
+    // for bit, as the guest bytes would.
+    const auto oneSlice = [](const GuestTextureResource& resource) { return resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0); };
+    const bool sameDimension = mine.dimension == theirs.dimension || (oneSlice(mine) && oneSlice(theirs));
+    return mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && sameDimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == other.geometry.imageLayers && geometry.imageDepth == other.geometry.imageDepth && trackedLayers == other.trackedLayers;
+}
+
+std::shared_ptr<StorageTexture> StorageTexture::syncedAlias(const std::vector<bool>& wanted, std::vector<bool>& lent) const {
+    static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr || std::getenv("APS5_NO_SYNCED_ALIAS_BORROW") != nullptr;
+    if (disabled || !blockUnits || wanted.size() != trackedLayers) return nullptr;
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+            if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
+        }
+    }
+    if (candidates.empty()) return nullptr;
+    const auto forget = GuestMemory::ForgetStamp(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    std::shared_ptr<StorageTexture> best;
+    std::size_t bestUnits = 0;
+    std::vector<std::uint8_t> stamped(trackedLayers);
+    for (const auto& candidate : candidates) {
+        if (!sameShape(*candidate) || !candidate->Cached() || candidate->uploadedKeys != DccKeys::Uncompressed || candidate->Device() != context.device || forget > candidate->forgetSeen) continue;
+        if (candidate->layerGeneration.size() != trackedLayers || candidate->layerPending.size() != trackedLayers) continue;
+        std::fill(stamped.begin(), stamped.end(), GuestMemory::BlockWritten);
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), candidate->layerGeneration, stamped)) continue;
+        std::vector<bool> units(trackedLayers, false);
+        std::size_t count = 0;
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (!wanted[unit] || candidate->layerPending[unit] || candidate->layerGeneration[unit] == 0 || stamped[unit] != GuestMemory::BlockUnchanged) continue;
+            if (unit < candidate->layerBehind.size() && candidate->layerBehind[unit]) continue;
+            const auto begin = layerBegin(unit);
+            if (const auto kept = candidate->keptAtUnwatch.lower_bound(begin); kept != candidate->keptAtUnwatch.end() && kept->first < begin + layerBytes(unit)) continue;
+            units[unit] = true;
+            ++count;
+        }
+        if (count <= bestUnits) continue;
+        bestUnits = count;
+        best = candidate;
+        lent = std::move(units);
+    }
+    return best;
+}
+
+void StorageTexture::rollBackSyncedBorrow(std::span<const std::array<std::uint64_t, 3>> units) {
+    bool rolledBack = false;
+    for (const auto& [unit, set, previous] : units) {
+        if (unit >= trackedLayers || layerGeneration[static_cast<std::size_t>(unit)] != set) continue;
+        layerGeneration[static_cast<std::size_t>(unit)] = previous;
+        forgetBorrowed(static_cast<std::uint32_t>(unit), 1);
+        rolledBack = true;
+    }
+    if (!rolledBack) return;
+    refreshGeneration();
+    refreshProof = {};
+    provedEpoch.store(0, std::memory_order_relaxed);
+    ++version;
+    syncedRollBacks.fetch_add(1, std::memory_order_relaxed);
+    BumpPendingSerial();
+}
+
+StorageTexture::SyncedBorrowCounts StorageTexture::SyncedBorrows() {
+    return {syncedBorrows.load(std::memory_order_relaxed), syncedUnits.load(std::memory_order_relaxed), syncedBytes.load(std::memory_order_relaxed), syncedRollBacks.load(std::memory_order_relaxed)};
+}
+
+void StorageTexture::noteSyncedBorrow(std::size_t units, std::uint64_t bytes) {
+    syncedBorrows.fetch_add(1, std::memory_order_relaxed);
+    syncedUnits.fetch_add(units, std::memory_order_relaxed);
+    syncedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    if (!LookupOutcomes::Profiled()) return;
+    static AgcDriver::Mutex mutex;
+    static auto reported = std::chrono::steady_clock::now();
+    static SyncedBorrowCounts last{};
+    static std::uint64_t lastPresents = 0;
+    std::lock_guard lock(mutex);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    const auto counts = SyncedBorrows();
+    const auto presents = Recorder::Presents();
+    const auto windowPresents = presents - lastPresents;
+    const auto windowBytes = counts.bytes - last.bytes;
+    AgcDriver::ProfilePrint_nid_no_patch("[native-kept] (10 s) %llu refreshes took %llu units (%.1f MiB) from an in-sync alias image on the device instead of a guest import upload, %.1f KiB per present over %llu presents, %llu rolled back by discarded batches\n", static_cast<unsigned long long>(counts.borrows - last.borrows), static_cast<unsigned long long>(counts.units - last.units), windowBytes / 1048576.0, windowPresents != 0 ? windowBytes / 1024.0 / static_cast<double>(windowPresents) : 0.0, static_cast<unsigned long long>(windowPresents), static_cast<unsigned long long>(counts.rollBacks - last.rollBacks));
+    last = counts;
+    lastPresents = presents;
 }
 
 void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
