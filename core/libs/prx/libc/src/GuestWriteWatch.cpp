@@ -125,6 +125,10 @@ public:
         _mappingSerial.fetch_add(1, std::memory_order_acq_rel);
         link(first, first + bytes, second);
         link(second, second + bytes, first);
+        for (const auto view : {first, second}) {
+            remove(_fresh, view, view + bytes);
+            insert(_fresh, view, view + bytes);
+        }
         return true;
     }
 
