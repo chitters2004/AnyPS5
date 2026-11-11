@@ -749,8 +749,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
+            static const bool profileDraws = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            const auto started = profileDraws ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             try {
                 if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+            } catch (const RefusedDraw& refused) {
+                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
+                if (profileDraws) Graphics::CountDrawSkip(Graphics::DrawSkip::Thrown, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
+                ReportRefusedDraw(refused);
             } catch (const std::exception& error) {
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
