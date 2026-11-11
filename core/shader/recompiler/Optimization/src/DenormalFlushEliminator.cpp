@@ -1,4 +1,5 @@
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <unordered_map>
 
@@ -227,6 +228,120 @@ private:
     std::unordered_map<const IrValue*, bool> known;
 };
 
+}
+
+class SampledFlushImages::State {
+public:
+    State(const IrProgram& program, bool hostFlushesArithmetic) : program(program), denormalFree(hostFlushesArithmetic) {}
+
+    std::optional<std::vector<std::uint32_t>> Images(const IrValue* value) {
+        value = value->Resolve();
+        if (const auto found = known.find(value); found != known.end()) return found->second;
+        known.emplace(value, std::nullopt);
+        auto result = compute(*value);
+        known[value] = result;
+        return result;
+    }
+
+private:
+    static std::optional<std::vector<std::uint32_t>> merged(std::optional<std::vector<std::uint32_t>> lhs, const std::optional<std::vector<std::uint32_t>>& rhs) {
+        if (!lhs.has_value() || !rhs.has_value()) return std::nullopt;
+        for (const auto image : *rhs) {
+            if (std::find(lhs->begin(), lhs->end(), image) == lhs->end()) lhs->push_back(image);
+        }
+        return lhs;
+    }
+
+    std::optional<std::vector<std::uint32_t>> texels(const IrValue& image) {
+        if (image.Opcode() != IrOpcode::ImageSampleRaw && image.Opcode() != IrOpcode::ImageGatherRaw && image.Opcode() != IrOpcode::ImageRead) return std::nullopt;
+        const auto index = image.Flags<MemoryFlags>().index;
+        const auto& memoryInfo = program.Resources().memoryInfo;
+        if (index >= memoryInfo.size()) return std::nullopt;
+        const auto& memory = memoryInfo[index];
+        if (memory.kind != ResourceKind::Image || memory.dataBits != 32u || memory.d16 || memory.imageR128 || memory.imagePacked || (memory.imageSampleFlags & RdnaImageSampleFlagCompare) != 0u) return std::nullopt;
+        const auto& images = program.Info().images;
+        if (memory.resource >= images.size()) return std::nullopt;
+        const auto& resource = images[memory.resource];
+        if (resource.table != NoTable || resource.numericClass != IrTextureNumericClass::Float || resource.depthBits || resource.packed) return std::nullopt;
+        return std::vector<std::uint32_t>{memory.resource};
+    }
+
+    std::optional<std::vector<std::uint32_t>> compute(const IrValue& value) {
+        if (denormalFree.Contains(&value)) return std::vector<std::uint32_t>{};
+        switch (value.Opcode()) {
+            case IrOpcode::BitCastU32F32:
+            case IrOpcode::BitCastF32U32:
+            case IrOpcode::FPAbs32:
+            case IrOpcode::FPNeg32:
+                return value.ArgumentCount() == 1u ? Images(value.Argument(0)) : std::nullopt;
+            case IrOpcode::BitwiseAnd32:
+                if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseAnd32, 0x7fffffffu)) return Images(operand);
+                return std::nullopt;
+            case IrOpcode::BitwiseXor32:
+                if (const IrValue* operand = maskedOperand(&value, IrOpcode::BitwiseXor32, 0x80000000u)) return Images(operand);
+                return std::nullopt;
+            case IrOpcode::SelectU32:
+            case IrOpcode::SelectF32:
+                if (value.ArgumentCount() != 3u) return std::nullopt;
+                return merged(Images(value.Argument(1)), Images(value.Argument(2)));
+            case IrOpcode::Phi: {
+                std::optional<std::vector<std::uint32_t>> result = std::vector<std::uint32_t>{};
+                for (std::size_t index = 0; index < value.ArgumentCount() && result.has_value(); ++index) result = merged(std::move(result), Images(value.Argument(index)));
+                return result;
+            }
+            case IrOpcode::CompositeExtractU32x4: {
+                if (value.ArgumentCount() != 2u) return std::nullopt;
+                const IrValue* component = value.Argument(1)->Resolve();
+                if (!component->HasImmediate() || component->ImmediateU32() >= 4u) return std::nullopt;
+                const IrValue* composite = value.Argument(0)->Resolve();
+                if (composite->Opcode() == IrOpcode::CompositeConstructU32x4 && composite->ArgumentCount() == 4u) return Images(composite->Argument(component->ImmediateU32()));
+                return texels(*composite);
+            }
+            default:
+                return std::nullopt;
+        }
+    }
+
+    const IrProgram& program;
+    DenormalFreeValues denormalFree;
+    std::unordered_map<const IrValue*, std::optional<std::vector<std::uint32_t>>> known;
+};
+
+SampledFlushImages::SampledFlushImages(const IrProgram& program, bool hostFlushesArithmetic) : state(std::make_unique<State>(program, hostFlushesArithmetic)) {}
+
+SampledFlushImages::~SampledFlushImages() = default;
+
+const IrValue* SampledFlushImages::FlushSource(const IrValue& flush) {
+    return flushedSource(flush);
+}
+
+std::optional<std::vector<std::uint32_t>> SampledFlushImages::Of(const IrValue& flush) {
+    const IrValue* source = flushedSource(flush);
+    if (source == nullptr) return std::nullopt;
+    auto images = state->Images(source);
+    if (!images.has_value() || images->empty()) return std::nullopt;
+    std::sort(images->begin(), images->end());
+    return images;
+}
+
+std::uint32_t DenormalFlushEliminator::MarkSampledFlushImages(IrProgram& program, bool hostFlushesArithmetic) const {
+    std::vector<std::uint32_t> candidates;
+    {
+        SampledFlushImages tracker(program, hostFlushesArithmetic);
+        for (auto* block : program.BlockOrder()) {
+            for (auto* inst : block->Instructions()) {
+                if (!inst->HasUses()) continue;
+                const auto images = tracker.Of(*inst);
+                if (!images.has_value()) continue;
+                for (const auto image : *images) {
+                    if (std::find(candidates.begin(), candidates.end(), image) == candidates.end()) candidates.push_back(image);
+                }
+            }
+        }
+    }
+    auto& images = program.Info().images;
+    for (const auto image : candidates) images.at(image).denormalFreeCandidate = true;
+    return static_cast<std::uint32_t>(candidates.size());
 }
 
 DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& program, bool hostFlushesArithmetic) const {

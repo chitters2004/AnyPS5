@@ -4,10 +4,12 @@
 #include "SpirvBackend/SpirvModule.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
+#include "Optimization/DenormalFlushEliminator.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -117,6 +119,7 @@ struct SpirvEmitterState {
     bool exactRobustLoads = false;
     bool float32FlushToZero = false;
     bool float32DenormPreserve = false;
+    std::unique_ptr<SampledFlushImages> sampledFlushImages;
     bool fusedExactArithmetic = false;
     bool meshBarycentricPixel = false;
     bool meshBarycentricVertex = false;

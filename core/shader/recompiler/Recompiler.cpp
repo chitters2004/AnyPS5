@@ -633,6 +633,7 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
 
     constexpr ShaderInfoCollector shaderInfoCollector;
     shaderInfoCollector.Collect(program, inputInfo);
+    static_cast<void>(DenormalFlushEliminator{}.MarkSampledFlushImages(program, HardwareFloat32Flush(request)));
 }
 
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {

@@ -1,5 +1,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/DescriptorBindingBuilder.hpp"
+#include "PipelineSpecialization.hpp"
 #include "Recompiler.hpp"
 #include <array>
 #include <cstddef>
@@ -657,6 +659,108 @@ int main() {
             }
         }
         return true;
+    });
+
+    passed &= run("flushes of sampled, gathered and loaded texels mark their images, other flushes do not", [] {
+        Builder b;
+        const auto image = [&](IrTextureNumericClass numericClass, std::uint32_t table) {
+            ImageResource resource;
+            resource.resourceClass = ImageResourceClass::Sampled;
+            resource.numericClass = numericClass;
+            resource.table = table;
+            b.program.Info().images.push_back(resource);
+        };
+        image(IrTextureNumericClass::Float, NoTable);
+        image(IrTextureNumericClass::Float, NoTable);
+        image(IrTextureNumericClass::Float, NoTable);
+        image(IrTextureNumericClass::Uint, NoTable);
+        image(IrTextureNumericClass::Float, 0u);
+        image(IrTextureNumericClass::Float, NoTable);
+        image(IrTextureNumericClass::Float, NoTable);
+        const auto texels = [&](IrOpcode opcode, std::uint32_t resource, std::uint32_t dataBits, std::uint32_t sampleFlags) -> IrValue& {
+            MemoryInfo memory;
+            memory.kind = ResourceKind::Image;
+            memory.resource = resource;
+            memory.dataBits = dataBits;
+            memory.imageSampleFlags = sampleFlags;
+            auto& memoryInfo = b.program.Resources().memoryInfo;
+            memoryInfo.push_back(memory);
+            auto& created = b.emit(opcode, IrType::U32x4, {});
+            created.SetFlags(MemoryFlags{static_cast<std::uint32_t>(memoryInfo.size() - 1u), 0u});
+            return created;
+        };
+        const auto component = [&](IrValue& vector, std::uint32_t index) -> IrValue& { return b.emit(IrOpcode::CompositeExtractU32x4, IrType::U32, {&vector, &b.constant(index)}); };
+        auto& condition = b.emit(IrOpcode::ULessThan32, IrType::Bool, {&b.unknown(), &b.constant(16u)});
+        auto& sampled = component(texels(IrOpcode::ImageSampleRaw, 0u, 32u, 0u), 1u);
+        IrValue* marked[] = {
+            &b.flush(sampled),
+            &b.flush(b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &b.flush(b.unknown()), &b.emit(IrOpcode::BitwiseXor32, IrType::U32, {&component(texels(IrOpcode::ImageGatherRaw, 1u, 32u, 0u), 0u), &b.constant(0x80000000u)})})),
+            &b.flush(b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&component(texels(IrOpcode::ImageRead, 2u, 32u, 0u), 3u), &b.constant(0x7fffffffu)})),
+        };
+        IrValue* unmarked[] = {
+            &b.flush(component(texels(IrOpcode::ImageSampleRaw, 3u, 32u, 0u), 0u)),
+            &b.flush(component(texels(IrOpcode::ImageSampleRaw, 4u, 32u, 0u), 0u)),
+            &b.flush(component(texels(IrOpcode::ImageSampleRaw, 5u, 32u, RdnaImageSampleFlagCompare), 0u)),
+            &b.flush(component(texels(IrOpcode::ImageSampleRaw, 6u, 16u, 0u), 0u)),
+            &b.flush(b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &sampled, &b.unknown()})),
+            &b.flush(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(IrOpcode::FPAdd32, IrType::F32, {&b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&sampled}), &b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&sampled})})})),
+        };
+        for (auto* flush : marked) b.keep(*flush);
+        for (auto* flush : unmarked) b.keep(*flush);
+        const auto count = DenormalFlushEliminator{}.MarkSampledFlushImages(b.program, false);
+        SampledFlushImages tracker(b.program, false);
+        bool valid = count == 3u;
+        for (std::uint32_t index = 0; index < b.program.Info().images.size(); ++index) valid &= b.program.Info().images[index].denormalFreeCandidate == (index < 3u);
+        const std::uint32_t expected[] = {0u, 1u, 2u};
+        for (std::size_t index = 0; index < 3u; ++index) {
+            const auto images = tracker.Of(*marked[index]);
+            valid &= images.has_value() && images->size() == 1u && images->front() == expected[index];
+        }
+        for (auto* flush : unmarked) valid &= !tracker.Of(*flush).has_value();
+        return valid;
+    });
+
+    passed &= run("a candidate image gets a denormal-free flag only for a normalized format under point filtering, other images get none", [] {
+        const auto flags = [](std::uint32_t format, std::uint32_t xyFilters, std::uint32_t anisotropy) {
+            ShaderInfo info;
+            ImageResource image;
+            image.resourceClass = ImageResourceClass::Sampled;
+            image.numericClass = IrTextureNumericClass::Float;
+            image.dimension = RdnaImageDimension::Dim2D;
+            info.images = {image, image};
+            info.images[0].denormalFreeCandidate = true;
+            info.runtimeImageModes = {{image}, {image}};
+            info.samplers.push_back(SamplerResource{});
+            info.sampledPairs.push_back(SampledResourcePair{0u, 0u});
+            info.sampledPairs.push_back(SampledResourcePair{1u, 0u});
+            ResourceSnapshot snapshot;
+            DescriptorValue texture;
+            texture.dwords = {0x00001000u, format << 20u, 0x0001c007u, 0x90000facu, 0u, 0u, 0u, 0u};
+            texture.dwordCount = 8u;
+            texture.availableDwordMask = 0xffu;
+            snapshot.images = {texture, texture};
+            DescriptorValue sampler;
+            sampler.dwords = {0x00000092u | (anisotropy << 9u), 0x00fff000u, xyFilters << 20u, 0u};
+            sampler.dwordCount = 4u;
+            sampler.availableDwordMask = 0xfu;
+            snapshot.samplers = {sampler};
+            const auto plan = DescriptorBindingBuilder{}.Prepare(IrBindingLayout{}, info, IrShaderStage::Compute, snapshot);
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> found;
+            for (const auto& constant : plan.specialization) {
+                if (constant.id >= PipelineSpecialization::DenormalFreeImageBase && constant.id < PipelineSpecialization::DenormalFreeImageBase + ShaderInfo::MaxImages) found.emplace_back(constant.id - PipelineSpecialization::DenormalFreeImageBase, constant.value);
+            }
+            return found;
+        };
+        using Flags = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+        const bool point = flags(56u, 0u, 0u) == Flags{{0u, 1u}};
+        const bool snorm = flags(57u, 0u, 0u) == Flags{{0u, 1u}};
+        const bool float32 = flags(22u, 0u, 0u) == Flags{{0u, 0u}};
+        const bool float16 = flags(13u, 0u, 0u) == Flags{{0u, 0u}};
+        const bool bilinear = flags(56u, 5u, 0u) == Flags{{0u, 0u}};
+        const bool magnified = flags(56u, 1u, 0u) == Flags{{0u, 0u}};
+        const bool anisotropic = flags(56u, 0u, 2u) == Flags{{0u, 0u}};
+        if (!(point && snorm && float32 && float16 && bilinear && magnified && anisotropic)) std::fprintf(stderr, "  point %d snorm %d float32 %d float16 %d bilinear %d magnified %d anisotropic %d\n", point, snorm, float32, float16, bilinear, magnified, anisotropic);
+        return point && snorm && float32 && float16 && bilinear && magnified && anisotropic;
     });
 
     return passed ? 0 : 1;

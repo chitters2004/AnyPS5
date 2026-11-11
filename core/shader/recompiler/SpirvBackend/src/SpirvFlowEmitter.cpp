@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -288,6 +289,22 @@ void Invoke(TReturn (*emit)(TContext&, TArguments...), SpirvValueEmitContext& ct
             ctx.Define(inst, call());
         }
     }(std::index_sequence_for<TArguments...>{});
+}
+
+std::uint32_t EmitFlushSelectU32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    const auto flushed = EmitSelectU32(state, arg0, arg1, arg2);
+    if (state.registrationModules || SampledFlushImages::FlushSource(inst) == nullptr) return flushed;
+    if (std::ranges::none_of(state.program.Info().images, [](const ImageResource& image) { return image.denormalFreeCandidate; })) return flushed;
+    if (state.sampledFlushImages == nullptr) state.sampledFlushImages = std::make_unique<SampledFlushImages>(state.program, state.float32FlushToZero);
+    const auto images = state.sampledFlushImages->Of(inst);
+    if (!images.has_value()) return flushed;
+    std::uint32_t denormalFree = 0u;
+    for (const auto image : *images) {
+        const auto flag = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::DenormalFreeImageBase + image, 0u);
+        const auto set = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
+        denormalFree = denormalFree == 0u ? set : Binary(state, spv::OpLogicalAnd, TypeBool(state), denormalFree, set);
+    }
+    return Select(state, TypeU32(state), denormalFree, arg2, flushed);
 }
 
 void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
@@ -715,7 +732,7 @@ void EmitDirectInstruction(SpirvValueEmitContext& ctx, const IrValue& inst) {
         case IrOpcode::Sendmsg: return Invoke(EmitSendmsg, ctx, inst);
         case IrOpcode::TtraceData: return Invoke(EmitTtraceData, ctx, inst);
         case IrOpcode::InstPrefetch: return Invoke(EmitInstPrefetch, ctx, inst);
-        case IrOpcode::SelectU32: return Invoke(EmitSelectU32, ctx, inst);
+        case IrOpcode::SelectU32: return Invoke(EmitFlushSelectU32, ctx, inst);
         default: ctx.Fail(inst, "has no direct SPIR-V emitter");
     }
 }

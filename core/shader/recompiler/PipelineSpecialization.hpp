@@ -24,6 +24,7 @@ inline constexpr std::uint32_t ImageComponentBase = 65536u;
 inline constexpr std::uint32_t ImageComponentBits = 2u;
 inline constexpr std::uint32_t NormalizedImageBase = 65664u;
 inline constexpr std::uint32_t ImageNormalizedValues = 1u << (4u * ImageComponentBits);
+inline constexpr std::uint32_t DenormalFreeImageBase = 65792u;
 enum class ImageComponentConstant : std::uint32_t { None, Zero, IntegerOne, FloatOne };
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;

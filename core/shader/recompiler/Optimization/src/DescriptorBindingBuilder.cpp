@@ -31,6 +31,7 @@ static_assert(PipelineSpecialization::SamplerLodBiasBase + ShaderInfo::MaxSample
 static_assert(PipelineSpecialization::FmaskFormatBase + ShaderInfo::MaxImages <= PipelineSpecialization::VolumeGatherBase);
 static_assert(PipelineSpecialization::VolumeGatherBase + ShaderInfo::MaxImages <= PipelineSpecialization::ImageComponentBase);
 static_assert(PipelineSpecialization::ImageComponentBase + ShaderInfo::MaxImages <= PipelineSpecialization::NormalizedImageBase);
+static_assert(PipelineSpecialization::NormalizedImageBase + ShaderInfo::MaxImages <= PipelineSpecialization::DenormalFreeImageBase);
 
 namespace {
 
@@ -110,6 +111,29 @@ std::uint32_t SampledImageFlags(const ShaderInfo& info, const ResourceSnapshot& 
         }
     }
     return sampled ? components : 0u;
+}
+
+std::uint32_t DenormalFreeTexels(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::size_t index, const ImageResource& mode) {
+    if (mode.resourceClass != ImageResourceClass::Sampled && mode.resourceClass != ImageResourceClass::Storage) return 0u;
+    if (mode.numericClass != IrTextureNumericClass::Float || mode.packed || mode.r128 || mode.depthCompare || mode.depthBits || mode.depthUnorm16 || mode.srgbDecode || mode.volumeGather || mode.targetMerge) return 0u;
+    if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.byElements != 0u || mode.byComponents != 0u || mode.conversionFormat != IrBufferFormat::Invalid || mode.packedFormat != IrBufferFormat::Invalid) return 0u;
+    const auto& descriptor = snapshot.images.at(index);
+    if (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u) return 0u;
+    const auto code = (descriptor.dwords[1] >> 20u) & 0x1ffu;
+    if (code < 1u || code > 77u) return 0u;
+    const auto type = GetFormatInfo(static_cast<IrBufferFormat>(code)).type;
+    if (type != SpirvFormatComponentType::Unorm && type != SpirvFormatComponentType::Snorm) return 0u;
+    constexpr std::uint32_t PointFilter = 0u;
+    constexpr std::uint32_t PointMipFilter = 1u;
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.image != index) continue;
+        if (info.samplers.at(pair.sampler).table != NoTable) return 0u;
+        const auto& sampler = snapshot.samplers.at(pair.sampler).dwords;
+        if (((sampler[0] >> 9u) & 0x7u) != 0u) return 0u;
+        if (((sampler[2] >> 20u) & 0x3u) != PointFilter || ((sampler[2] >> 22u) & 0x3u) != PointFilter || ((sampler[2] >> 26u) & 0x3u) > PointMipFilter) return 0u;
+        if (((sampler[3] >> 30u) & 0x3u) == 3u) return 0u;
+    }
+    return 1u;
 }
 
 DescriptorKind PhysicalKindFor(DescriptorBindingKind kind) {
@@ -565,6 +589,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             const auto flags = SampledImageFlags(info, snapshot, index, mode);
             plan.specialization.push_back({PipelineSpecialization::ImageComponentBase + index, flags & ~PipelineSpecialization::ImageNormalizedValues});
             plan.specialization.push_back({PipelineSpecialization::NormalizedImageBase + index, (flags & PipelineSpecialization::ImageNormalizedValues) != 0u ? 1u : 0u});
+            if (info.images[index].denormalFreeCandidate && !registrationModules) plan.specialization.push_back({PipelineSpecialization::DenormalFreeImageBase + index, DenormalFreeTexels(info, snapshot, index, mode)});
         }
         if (info.images[index].mipMode != ImageMipMode::DynamicStorage) continue;
         const auto word = snapshot.images.at(index).dwords[3];
