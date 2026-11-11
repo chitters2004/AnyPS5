@@ -14,6 +14,7 @@ enum class RuntimeSwitch : std::size_t {
     NoBarrierBatch,
     NoBarrierFusion,
     NoWriteBackRuns,
+    NoGuardSetProof,
     NoGuardSpans,
     NoOwnedDrawInputs,
     HandwrittenPlanState,
@@ -21,6 +22,7 @@ enum class RuntimeSwitch : std::size_t {
     NoEarlyDrawInputs,
     NoEmptyFetchSkip,
     NoSharedVertexLayout,
+    CertifiedProofs,
     Count,
 };
 

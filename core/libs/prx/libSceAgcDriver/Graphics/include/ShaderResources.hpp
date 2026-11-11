@@ -3,8 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
@@ -25,7 +27,6 @@
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
-namespace AgcDriver::GuestMemory { struct WriteSubscription; }
 
 namespace AgcDriver::Graphics {
 
@@ -44,6 +45,26 @@ struct WriteIndexOutcomes {
     std::uint64_t builds = 0;
 };
 WriteIndexOutcomes WriteIndexOutcomesCounted();
+enum class CertifiedMiss : std::size_t { Uncertified, Sweep, Subscription, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
+enum class CertifyRefusal : std::size_t { Unsubscribed, PerElementTextures, ComparedTextures, ComparedTables, DepthCopies, StorageImages, PendingMoved, DepthSurfacesMoved, Count };
+enum class UncertifiedCause : std::size_t { NeverProved, Refused, Voided, ProofFailed, NotCertifying, ViewsStale, Count };
+struct CertifiedProofOutcomes {
+    std::uint64_t proved = 0;
+    std::uint64_t swept = 0;
+    std::uint64_t issued = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t disagreed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(UncertifiedCause::Count)> uncertified{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> uncertifiedRefused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> uncertifiedVoided{};
+    std::uint64_t epochServed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
+    std::uint64_t proofMissUnattributed = 0;
+};
+CertifiedProofOutcomes CertifiedProofOutcomesCounted();
+bool CertifiedProofs();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
@@ -810,6 +831,7 @@ private:
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
+    mutable GuardSetProof guardSetProof;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
@@ -848,6 +870,21 @@ private:
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    ProofFailure proveImports();
+    ProofFailure recordStaging();
+    std::optional<bool> certifiedRevalidate(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::optional<CertifyRefusal> certifyRefusal() const;
+    GuestMemory::WriteCertificate certificate;
+    std::uint64_t certifiedEpoch = 0;
+    std::uint64_t certifiedPending = 0;
+    std::uint64_t certifiedDepth = 0;
+    bool certified = false;
+    UncertifiedCause uncertifiedCause = UncertifiedCause::NeverProved;
+    CertifyRefusal uncertifiedRefusal = CertifyRefusal::Count;
+    CertifiedMiss uncertifiedMiss = CertifiedMiss::Count;
+    bool epochServed = false;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> certifiedBreaks{};
+    void noteUncertified(UncertifiedCause cause, CertifyRefusal refusal = CertifyRefusal::Count, CertifiedMiss miss = CertifiedMiss::Count);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     bool importsReconcilable = false;

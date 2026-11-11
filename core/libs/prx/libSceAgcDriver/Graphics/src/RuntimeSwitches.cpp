@@ -22,6 +22,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BARRIER_BATCH",
     "APS5_NO_BARRIER_FUSION",
     "APS5_NO_WRITE_BACK_RUNS",
+    "APS5_NO_GUARD_SET_PROOF",
     "APS5_NO_GUARD_SPANS",
     "APS5_NO_OWNED_DRAW_INPUTS",
     "APS5_HANDWRITTEN_PLAN_STATE",
@@ -29,6 +30,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_EARLY_DRAW_INPUTS",
     "APS5_NO_EMPTY_FETCH_SKIP",
     "APS5_NO_SHARED_VERTEX_LAYOUT",
+    "APS5_CERTIFIED_PROOFS",
 };
 
 struct SwitchValues {
@@ -38,6 +40,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_BARRIER_BATCH") != nullptr,
             std::getenv("APS5_NO_BARRIER_FUSION") != nullptr,
             std::getenv("APS5_NO_WRITE_BACK_RUNS") != nullptr,
+            std::getenv("APS5_NO_GUARD_SET_PROOF") != nullptr,
             std::getenv("APS5_NO_GUARD_SPANS") != nullptr,
             std::getenv("APS5_NO_OWNED_DRAW_INPUTS") != nullptr,
             std::getenv("APS5_HANDWRITTEN_PLAN_STATE") != nullptr,
@@ -45,6 +48,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_EARLY_DRAW_INPUTS") != nullptr,
             std::getenv("APS5_NO_EMPTY_FETCH_SKIP") != nullptr,
             std::getenv("APS5_NO_SHARED_VERTEX_LAYOUT") != nullptr,
+            std::getenv("APS5_CERTIFIED_PROOFS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
