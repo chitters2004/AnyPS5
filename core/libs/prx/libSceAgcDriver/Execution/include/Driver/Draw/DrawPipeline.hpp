@@ -1,10 +1,10 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -87,8 +87,8 @@ private:
     void countWrites(const std::vector<Range>& writes, bool added);
 
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable idle;
+    AddressCondition wake;
+    AddressCondition idle;
     std::deque<Item> items;
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
@@ -158,8 +158,8 @@ private:
     void run();
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable idle;
+    AddressCondition wake;
+    AddressCondition idle;
     std::deque<Job> jobs;
     std::deque<Pending> pending;
     std::vector<Job> ran;
