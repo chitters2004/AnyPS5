@@ -187,6 +187,9 @@ Observation Observe(std::uint64_t address, std::size_t bytes);
 void SetObservationHookForTest(void (*hook)(int point));
 void SetObservationServiceForTest(bool enabled);
 void DrainObservationServiceForTest();
+void SetConsumeStampHookForTest(void (*hook)());
+void SetConsumeCapacityForTest(std::size_t runs);
+std::uint64_t ConsumeCompactionsForTest();
 bool OnObservationServiceThread();
 struct ObservationServiceCounts {
     std::uint64_t sweeps = 0;

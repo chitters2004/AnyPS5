@@ -2292,6 +2292,57 @@ struct StampRuns {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> windowRuns;
 };
 
+std::atomic<std::uint64_t> consumeCompactions{0};
+std::atomic<std::size_t> consumeCapacityForTest{0};
+
+struct ConsumedRuns {
+    static constexpr std::size_t Capacity = 256;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, Capacity> runs{};
+    std::size_t count = 0;
+    std::size_t limit = Capacity;
+
+    ConsumedRuns() {
+        const auto forced = consumeCapacityForTest.load(std::memory_order_acquire);
+        if (forced != 0) limit = std::clamp<std::size_t>(forced, 2, Capacity);
+    }
+
+    void Add(std::uint64_t begin, std::uint64_t end) noexcept {
+        if (end <= begin) return;
+        if (count != 0 && runs[count - 1].second >= begin && runs[count - 1].first <= end) {
+            runs[count - 1] = {std::min(runs[count - 1].first, begin), std::max(runs[count - 1].second, end)};
+            return;
+        }
+        if (count == limit) compact();
+        runs[count++] = {begin, end};
+    }
+
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> Runs() const noexcept {
+        return {runs.data(), count};
+    }
+
+private:
+    void compact() noexcept {
+        consumeCompactions.fetch_add(1, std::memory_order_relaxed);
+        std::sort(runs.begin(), runs.begin() + static_cast<std::ptrdiff_t>(count));
+        for (std::uint64_t gap = 0; count >= limit; gap = gap == 0 ? WritePageBytes : std::min<std::uint64_t>(gap * 2, std::uint64_t{1} << 62)) {
+            std::size_t kept = 0;
+            for (std::size_t index = 0; index < count; ++index) {
+                if (kept != 0 && runs[index].first <= runs[kept - 1].second + gap) runs[kept - 1].second = std::max(runs[kept - 1].second, runs[index].second);
+                else runs[kept++] = runs[index];
+            }
+            count = kept;
+        }
+    }
+};
+
+#ifndef _WIN32
+void recordConsumedRun(void* context, std::uintptr_t begin, std::uintptr_t end) noexcept {
+    static_cast<ConsumedRuns*>(context)->Add(begin, end);
+}
+#endif
+
+std::atomic<void (*)()> consumeStampHook{nullptr};
+
 void noteWrittenRun(StampRuns& runs, std::uintptr_t begin, std::uintptr_t end, std::uint64_t generation) {
     if (runs.kind != StampKind::Driver) runs.tracker.noteCpuStore(begin, end, generation);
     else runs.tracker.noteWalkStore(begin, end, generation);
@@ -2312,6 +2363,29 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
 #endif
 }
+
+#ifndef _WIN32
+void stampConsumedRuns(StampRuns& runs, std::span<const std::pair<std::uint64_t, std::uint64_t>> consumed) {
+    std::size_t next = 0;
+    try {
+        for (; next < consumed.size(); ++next) {
+            if (const auto hook = consumeStampHook.load(std::memory_order_acquire)) hook();
+            stampWrittenRun(&runs, static_cast<std::uintptr_t>(consumed[next].first), static_cast<std::uintptr_t>(consumed[next].second));
+        }
+    } catch (...) {
+        auto& tracker = runs.tracker;
+        ++tracker.generation;
+        const auto generation = tracker.generation.load(std::memory_order_relaxed);
+        for (; next < consumed.size(); ++next) {
+            for (auto block = tracker.blockOf(consumed[next].first); block <= tracker.blockOf(consumed[next].second - 1); ++block) {
+                tracker.cpuPages.erase(block);
+                tracker.stamp(block, generation, StampKind::Cpu);
+            }
+        }
+        throw;
+    }
+}
+#endif
 
 void stampWindowRuns(StampRuns& runs) {
     const auto pages = PagesOf(runs.windowRuns);
@@ -2392,7 +2466,9 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #else
     const auto dirtyRuns = collectDirtyRuns.load(std::memory_order_relaxed);
     const auto collect = armedOnly ? &GuestWriteWatch::GuestWriteWatchCollectArmed_nid_postfix : &GuestWriteWatch::GuestWriteWatchCollect_nid_postfix;
-    const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &stampWrittenRun, &runs);
+    ConsumedRuns consumed;
+    const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &recordConsumedRun, &consumed);
+    stampConsumedRuns(runs, consumed.Runs());
     if (collectDirtyRuns.load(std::memory_order_relaxed) != dirtyRuns) collectDirty.fetch_add(1, std::memory_order_relaxed);
 #endif
     if (window != nullptr) stampWindowRuns(runs);
@@ -2975,6 +3051,18 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
 
 bool UnwatchWritesProven() {
     return unwatchWritesProven;
+}
+
+void SetConsumeStampHookForTest(void (*hook)()) {
+    consumeStampHook.store(hook, std::memory_order_release);
+}
+
+void SetConsumeCapacityForTest(std::size_t runs) {
+    consumeCapacityForTest.store(runs, std::memory_order_release);
+}
+
+std::uint64_t ConsumeCompactionsForTest() {
+    return consumeCompactions.load(std::memory_order_relaxed);
 }
 
 void SetImportWalkFailureForTest(int walk, std::uint64_t span) {

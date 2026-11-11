@@ -2772,6 +2772,73 @@ void CheckMappingChanges() {
 }
 #endif
 
+#if defined(__linux__)
+std::atomic<int> stampCallsBeforeThrow{0};
+
+void ThrowWhileStamping() {
+    if (stampCallsBeforeThrow.fetch_sub(1, std::memory_order_acq_rel) == 1) throw std::runtime_error("the consume stamp hook threw");
+}
+
+void CheckThrowWhileStamping(int throwAt) {
+    Require(WriteIndexEnabled(), "the lossless consume test needs APS5_TABLE_INDEX=1");
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the throwing stamp fixture was not collected");
+    const std::pair<std::uint64_t, std::uint64_t> range{base, base + bytes};
+    const auto subscription = SubscribeWrites(std::span(&range, 1));
+    constexpr std::uint32_t domains = WriteDomainBit(WriteDomain::Proof) | WriteDomainBit(WriteDomain::Unwatch) | WriteDomainBit(WriteDomain::Mapping);
+    const auto certificate = CertifySubscription(*subscription, domains);
+    const auto subscribedAt = SubscriptionGeneration(*subscription);
+    Require(CertificateHolds(*subscription, certificate, domains), "a fresh certificate does not hold");
+    data[Block + 64] = 0x22;
+    data[3 * Block + 64] = 0x33;
+    stampCallsBeforeThrow.store(throwAt, std::memory_order_release);
+    SetConsumeStampHookForTest(&ThrowWhileStamping);
+    bool threw = false;
+    try {
+        static_cast<void>(CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    SetConsumeStampHookForTest(nullptr);
+    Require(threw, "the collect did not reach the throwing stamp hook");
+    for (const auto written : {base + Block, base + 3 * Block}) {
+        Require(!UnchangedSince(written, 4096, before), "a write consumed by a collect whose stamping threw reads as unchanged");
+        Require(CpuWroteSince(written, 4096, before), "a write consumed by a collect whose stamping threw is not a CPU write");
+    }
+    Require(SubscriptionGeneration(*subscription) > subscribedAt, "a write consumed by a collect whose stamping threw did not bump the subscription over it");
+    Require(!CertificateHolds(*subscription, certificate, domains), "a certificate over a write consumed by a collect whose stamping threw still holds");
+    const auto after = CollectWritesUncached(base, bytes);
+    Require(UnchangedSince(base, bytes, after), "the range stayed changed after a later clean collect");
+}
+
+void CheckConsumeCompaction() {
+    constexpr std::size_t bytes = 4 * Block;
+    constexpr std::size_t page = 4096;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the compaction fixture was not collected");
+    std::vector<std::uint64_t> written;
+    for (std::size_t offset = 0; offset < bytes; offset += 3 * page) {
+        data[offset + 8] = 0x44;
+        written.push_back(base + offset);
+    }
+    const auto compactions = ConsumeCompactionsForTest();
+    SetConsumeCapacityForTest(4);
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    SetConsumeCapacityForTest(0);
+    Require(ConsumeCompactionsForTest() > compactions, "the scattered writes did not overflow the consumed runs");
+    for (const auto address : written) Require(CpuWroteSince(address, page, before), "a written page was dropped when the consumed runs were compacted");
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2786,6 +2853,18 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
             RunMemoHitBench(std::stoi(argv[2]));
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lossless-consume") {
+#if defined(__linux__)
+            CheckThrowWhileStamping(1);
+            CheckThrowWhileStamping(2);
+            CheckConsumeCompaction();
+            std::cout << "lossless consume tests passed\n";
+            return 0;
+#else
+            std::cout << "the Linux walk under the tracker lock is what this covers: skipped\n";
+            return 77;
+#endif
         }
         if (argc == 2 && std::string_view(argv[1]) == "--mapping-changes") {
 #if defined(__linux__)
