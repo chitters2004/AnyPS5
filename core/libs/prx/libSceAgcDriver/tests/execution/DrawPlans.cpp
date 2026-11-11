@@ -26,6 +26,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -43,6 +44,8 @@ using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DrawPlanCount;
 using AgcDriver::DriverDetail::DrawPlanCounts;
 using AgcDriver::DriverDetail::DrawPlanCountKinds;
+constexpr std::size_t PlanSignatureSetLimitForTest = AgcDriver::DriverDetail::PlanSignatureSetLimit;
+constexpr std::size_t PlanLookupDistanceBucketsForTest = AgcDriver::DriverDetail::PlanLookupDistanceBuckets;
 
 alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -458,6 +461,19 @@ void PlansBindTheirOwnTargets() {
     ExpectNoHitsWhileOff(counts);
     Expect(counts[DrawPlanCount::Hits] == 0, "a draw into another render target was served the plan's target");
     if (PlansOn()) Expect(counts[DrawPlanCount::MissInstance] == 1, "a draw into another render target was not refused as another instance");
+    const auto sum = [&](DrawPlanCount base, std::size_t buckets, std::uint8_t bit) {
+        std::uint64_t total = 0;
+        for (std::size_t offset = 0; offset < buckets; ++offset) {
+            if (bit == 0 || (offset & bit) != 0) total += counts.values[static_cast<std::size_t>(base) + offset];
+        }
+        return total;
+    };
+    if (PlansOn() && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        Expect(sum(DrawPlanCount::ReplacementSignatureSets, PlanSignatureSetLimitForTest + 1u, 0) >= 1, "the full path's replacement of the plan for another target was not counted by signature set");
+        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchTarget) == 1, "the another-instance miss into another render target was not counted with a target surface mismatch");
+        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchShape | AgcDriver::Graphics::PlanMismatchTemplate | AgcDriver::Graphics::PlanMismatchDepth) == 0, "the another-instance miss into another render target counted a shape, template or depth mismatch");
+        Expect(sum(DrawPlanCount::LookupDistances, PlanLookupDistanceBucketsForTest, 0) >= 1, "repeated plan lookups were not counted by lookup distance");
+    }
     Expect(Pixels(firstPlanned) == Pixels(firstFull), "the plan's own target differs from the full path's");
     Expect(Pixels(secondPlanned) == Pixels(secondFull), "the other target differs from the full path's");
     std::puts("draw plans: I7, a plan binds only the target the full path would bind");

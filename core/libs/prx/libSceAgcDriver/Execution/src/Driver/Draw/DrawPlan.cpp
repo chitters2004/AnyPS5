@@ -384,23 +384,62 @@ DrawPlanIndex::Order::iterator DrawPlanIndex::locate(const DrawPlanKey& key) {
     return order.end();
 }
 
-std::shared_ptr<const DrawRecipe> DrawPlanIndex::Find(const DrawPlanKey& key) {
+namespace {
+
+std::uint64_t PlanSignature(const DrawRecipe& decisions) {
+    std::uint64_t hash = 0x243f6a8885a308d3ull ^ decisions.targetViews.size() ^ (static_cast<std::uint64_t>(decisions.hasDepth) << 63u);
+    for (const auto view : decisions.targetViews) {
+        hash = (hash ^ reinterpret_cast<std::uint64_t>(view)) * 0xff51afd7ed558ccdull;
+        hash ^= hash >> 32u;
+    }
+    return hash;
+}
+
+std::size_t LookupDistanceBucket(std::uint64_t distance) {
+    return std::min<std::size_t>(static_cast<std::size_t>(std::bit_width(distance)) - 1u, PlanLookupDistanceBuckets - 1u);
+}
+
+bool ProfileDrawPlans() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void AddCount(DrawPlanCounters* counters, DrawPlanCount base, std::size_t offset) {
+    counters->values[static_cast<std::size_t>(base) + offset].fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
+std::shared_ptr<const DrawRecipe> DrawPlanIndex::Find(const DrawPlanKey& key, DrawPlanCounters* counters) {
     std::lock_guard lock(mutex);
     const auto found = locate(key);
+    if (counters != nullptr) ++lookups;
     if (found == order.end()) return nullptr;
+    if (counters != nullptr) {
+        if (found->lastLookup != 0) AddCount(counters, DrawPlanCount::LookupDistances, LookupDistanceBucket(lookups - found->lastLookup));
+        found->lastLookup = lookups;
+    }
     order.splice(order.begin(), order, found);
     return found->decisions;
 }
 
-std::size_t DrawPlanIndex::Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions) {
+std::size_t DrawPlanIndex::Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions, DrawPlanCounters* counters) {
     std::lock_guard lock(mutex);
+    const auto signature = counters != nullptr ? PlanSignature(*decisions) : 0u;
     const auto found = locate(*key);
+    if (found != order.end() && counters != nullptr) {
+        const auto known = std::min(found->signatureCount, PlanSignatureSetLimit);
+        const bool seen = std::find(found->signatures.begin(), found->signatures.begin() + static_cast<std::ptrdiff_t>(known), signature) != found->signatures.begin() + static_cast<std::ptrdiff_t>(known);
+        if (!seen) found->signatures[found->signatureCount++ % PlanSignatureSetLimit] = signature;
+        AddCount(counters, DrawPlanCount::ReplacementSignatureSets, std::min(found->signatureCount, PlanSignatureSetLimit + 1u) - 1u);
+        if (seen) AddCount(counters, DrawPlanCount::ReplacementReturns, 0);
+    }
     if (found != order.end()) {
         found->decisions = std::move(decisions);
         order.splice(order.begin(), order, found);
         return 0;
     }
-    order.push_front({key, std::move(decisions)});
+    order.push_front({key, std::move(decisions), lookups, {signature}, counters != nullptr ? 1u : 0u});
     index.emplace(key->hash, order.begin());
     std::size_t evicted = 0;
     while (order.size() > capacity || (!order.empty() && order.back().decisions->pipeline.expired())) {
@@ -445,7 +484,7 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
     drawPlanCounters.Add(DrawPlanCount::MovedBases, drawn->movedBases);
     const auto plan = drawPlans.Find(*key);
     const auto insert = [&] {
-        const auto evicted = drawPlans.Insert(key, drawn);
+        const auto evicted = drawPlans.Insert(key, drawn, ProfileDrawPlans() ? &drawPlanCounters : nullptr);
         if (evicted != 0) drawPlanCounters.Add(DrawPlanCount::Evictions, evicted);
     };
     if (plan == nullptr || plan->pipeline.expired()) {
@@ -474,7 +513,7 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
 bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const DrawPlanKey& key, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const VulkanDevice::DrawTraceContext* trace, std::shared_ptr<const DrawRecipe>& attachable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     drawPlanCounters.Add(DrawPlanCount::PlanLookups);
-    const auto plan = Graphics::InCommitPhase(Graphics::CommitPhase::PlanHitFind, [&] { return drawPlans.Find(key); });
+    const auto plan = Graphics::InCommitPhase(Graphics::CommitPhase::PlanHitFind, [&] { return drawPlans.Find(key, profile ? &drawPlanCounters : nullptr); });
     if (plan == nullptr) {
         drawPlanCounters.Add(DrawPlanCount::MissAbsent);
         return false;
@@ -506,6 +545,7 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         case Graphics::DrawRecipeMiss::Proof: drawPlanCounters.Add(DrawPlanCount::MissProof); break;
         case Graphics::DrawRecipeMiss::Instance:
             drawPlanCounters.Add(DrawPlanCount::MissInstance);
+            if (outcome.instanceMismatches != 0) AddCount(&drawPlanCounters, DrawPlanCount::InstanceMismatchSets, outcome.instanceMismatches);
             switch (outcome.instance) {
                 case Graphics::DrawPlanInstance::Shape: drawPlanCounters.Add(DrawPlanCount::InstanceShape); break;
                 case Graphics::DrawPlanInstance::Template: drawPlanCounters.Add(DrawPlanCount::InstanceTemplate); break;

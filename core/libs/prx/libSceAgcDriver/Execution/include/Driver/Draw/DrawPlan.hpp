@@ -80,8 +80,15 @@ enum class DrawPlanCount : std::size_t {
     InstanceView,
     InstanceDepth,
     TemplateInstanceHits,
+    InstanceMismatchSets,
+    LookupDistances = InstanceMismatchSets + 32,
+    ReplacementSignatureSets = LookupDistances + 12,
+    ReplacementReturns = ReplacementSignatureSets + 9,
     Count
 };
+
+inline constexpr std::size_t PlanLookupDistanceBuckets = 12;
+inline constexpr std::size_t PlanSignatureSetLimit = 8;
 
 inline constexpr std::size_t DrawPlanCountKinds = static_cast<std::size_t>(DrawPlanCount::Count);
 
@@ -117,20 +124,24 @@ public:
     DrawPlanIndex(const DrawPlanIndex&) = delete;
     DrawPlanIndex& operator=(const DrawPlanIndex&) = delete;
 
-    std::shared_ptr<const DrawRecipe> Find(const DrawPlanKey& key);
-    std::size_t Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions);
+    std::shared_ptr<const DrawRecipe> Find(const DrawPlanKey& key, DrawPlanCounters* counters = nullptr);
+    std::size_t Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions, DrawPlanCounters* counters = nullptr);
     std::size_t Size();
 
 private:
     struct Entry {
         std::shared_ptr<const DrawPlanKey> key;
         std::shared_ptr<const DrawRecipe> decisions;
+        std::uint64_t lastLookup = 0;
+        std::array<std::uint64_t, PlanSignatureSetLimit> signatures{};
+        std::size_t signatureCount = 0;
     };
     using Order = std::list<Entry>;
     Order::iterator locate(const DrawPlanKey& key);
 
     AgcDriver::Mutex mutex;
     std::size_t capacity;
+    std::uint64_t lookups = 0;
     Order order;
     std::unordered_multimap<std::uint64_t, Order::iterator> index;
 };

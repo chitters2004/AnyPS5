@@ -80,6 +80,8 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
+enum class StorageImageMatch : std::uint8_t { Gone, Other, Same };
+StorageImageMatch MatchStorageImage(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 
@@ -842,6 +844,7 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Peek(const Key& key) const;
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

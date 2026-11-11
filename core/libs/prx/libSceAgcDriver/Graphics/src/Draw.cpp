@@ -458,6 +458,18 @@ std::optional<std::uint8_t> overwrittenStencil(const State& state) {
     return static_cast<std::uint8_t>(state.stencilFront.reference);
 }
 
+std::array<std::uint32_t, 5> TargetViewInputs(const ColorTarget& color) {
+    return {static_cast<std::uint32_t>(color.format), color.mip, color.depthSlice, color.layers, color.arraySlice};
+}
+
+std::array<std::uint64_t, 12> DepthViewInputs(const State& state) {
+    if (!state.depth) return {};
+    const auto& depth = *state.depth;
+    const auto overwritten = overwrittenStencil(state);
+    return {depth.address, depth.stencilAddress, static_cast<std::uint64_t>(depth.format), depth.extent.width, depth.extent.height, depth.samples, depth.firstSlice, depth.lastSlice, static_cast<std::uint64_t>(state.depthWrite) | static_cast<std::uint64_t>(state.stencilTest) << 1u | static_cast<std::uint64_t>(writesStencilTarget(state)) << 2u, overwritten.has_value() ? 0x100u | *overwritten : 0u, depth.htileAddress, depth.pipeBankXor};
+}
+
+
 std::size_t colorKeyCount(const ColorTarget& color, std::size_t bytes) {
     if (color.mipCount != 1 || color.depth != 1 || !color.dccPipeAligned) return DccKeyBytes(bytes);
     return DccKeyCount(ColorTextureTileMode(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, bytes);
@@ -4033,6 +4045,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->framebuffer = framebuffer;
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
             recipe->targetViews = targetViews;
+            for (const auto& color : state.colors) recipe->targetViewInputs.push_back(TargetViewInputs(color));
+            recipe->depthViewInputs = DepthViewInputs(state);
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
             recipe->vertexInput = inputs.VertexLayout();
             recipe->pushStages = PushConstantStages(shaders);
@@ -4467,6 +4481,40 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 
 namespace {
 
+std::uint8_t PlanInstanceMismatches(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe) {
+    std::uint8_t mismatches = 0;
+    const bool shape = recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; });
+    if (shape) mismatches |= PlanMismatchShape;
+    if (!shape) {
+        bool rebinds = recipe.movedBases != 0;
+        for (std::size_t index = 0; index < shaders.size(); ++index) {
+            const auto words = PlanStageWordsOf(shaders[index]);
+            const auto& planned = recipe.bindingWords[index];
+            if (!((words.fixed == planned.fixed || *words.fixed == *planned.fixed) && words.patched == planned.patched)) rebinds = true;
+        }
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        if (rebinds) {
+            const auto key = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+            if (key != recipe.key) {
+                const auto candidate = DrawPlanTemplates() ? SharedResourceCache().Peek(key) : nullptr;
+                if (candidate == nullptr || !candidate->Reusable() || candidate->SpaceReuse()) {
+                    mismatches |= PlanMismatchTemplate;
+                } else {
+                    const auto layouts = candidate->SetLayouts();
+                    if (layouts.split != recipe.splitSets || !std::ranges::equal(layouts.mainKey, recipe.mainSetKey) || !std::ranges::equal(layouts.fragmentKey, recipe.fragmentSetKey)) mismatches |= PlanMismatchTemplate;
+                }
+            }
+        }
+    }
+    for (std::size_t index = 0; index < std::min(recipe.targets.size(), state.colors.size()); ++index) {
+        const auto stored = recipe.targets[index].lock();
+        if (stored != nullptr && MatchStorageImage(context, stored.get(), SurfaceForTarget(state.colors[index])) == StorageImageMatch::Other) mismatches |= PlanMismatchTarget;
+        if (index < recipe.targetViewInputs.size() && TargetViewInputs(state.colors[index]) != recipe.targetViewInputs[index]) mismatches |= PlanMismatchView;
+    }
+    if (recipe.hasDepth && state.depth && DepthViewInputs(state) != recipe.depthViewInputs) mismatches |= PlanMismatchDepth;
+    return mismatches;
+}
+
 void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const ResourceCache::Key& key, bool templateInstance, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
     DrawOutcome scratch;
     DrawTimer scratchTimer(false);
@@ -4526,6 +4574,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     std::shared_ptr<ShaderResources> instanceTemplate;
     const auto instanceMiss = [&](DrawPlanInstance reason) {
         result.instance = reason;
+        if (profile) result.instanceMismatches = PlanInstanceMismatches(context, state, draw, shaders, recipe);
         return miss(DrawRecipeMiss::Instance);
     };
     if (planned) {

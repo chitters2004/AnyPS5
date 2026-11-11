@@ -1712,6 +1712,15 @@ bool StorageImageCached(const Context& context, const StorageTexture* image) {
     return true;
 }
 
+StorageImageMatch MatchStorageImage(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed) {
+    const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findStorageByImage(cache, context.device, image);
+    if (it == cache.entries.end()) return StorageImageMatch::Gone;
+    return it->key == key ? StorageImageMatch::Same : StorageImageMatch::Other;
+}
+
 bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed) {
     const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
     auto& cache = StorageTextures();
@@ -4701,6 +4710,12 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
     return false;
 }
 
+}
+
+std::shared_ptr<ShaderResources> ResourceCache::Peek(const Key& key) const {
+    std::lock_guard lock(mutex);
+    const auto found = index.find(key);
+    return found != index.end() ? found->second->second : nullptr;
 }
 
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
