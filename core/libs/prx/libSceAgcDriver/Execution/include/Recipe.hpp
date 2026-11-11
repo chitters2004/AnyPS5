@@ -85,6 +85,8 @@ struct DrawRecipe {
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    VkExtent2D renderExtent{};
+    std::vector<std::uint32_t> bindingWords;
     bool servable = true;
     std::uint32_t movedBases = 0;
 };

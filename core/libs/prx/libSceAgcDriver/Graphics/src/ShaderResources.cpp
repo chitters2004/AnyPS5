@@ -1711,6 +1711,16 @@ bool StorageImageCached(const Context& context, const StorageTexture* image) {
     return true;
 }
 
+bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed) {
+    const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findStorageByImage(cache, context.device, image);
+    if (it == cache.entries.end() || !(it->key == key)) return false;
+    cache.entries.splice(cache.entries.begin(), cache.entries, it);
+    return true;
+}
+
 namespace {
 
 // StorageImageCached for several images under one acquisition of the cache mutex.

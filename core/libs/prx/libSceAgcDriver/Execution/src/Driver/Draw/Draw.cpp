@@ -1347,11 +1347,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
     std::shared_ptr<const DrawPlanKey> planKey;
-    if (Graphics::DrawPlanShadow() && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && stages.size() == programs.size()) {
-        std::vector<std::shared_ptr<DispatchVariant>> planStages(programs.size());
-        for (std::size_t i = 0; i < programs.size(); ++i) planStages[i] = drawHit ? (matched[i] != nullptr && matched[i]->donor != nullptr ? matched[i]->donor : matched[i]) : reused[i] ? matched[i] : fresh[i];
-        planKey = BuildDrawPlanKey(planStages, graphics, drawParameters);
-    }
+    if ((Graphics::DrawPlanShadow() || Graphics::DrawPlans()) && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry) planKey = BuildDrawPlanKey(stages, graphics, drawParameters);
     const auto recipeDonor = drawHit && entry != nullptr ? entry->donor : nullptr;
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
@@ -1415,9 +1411,18 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
+    std::shared_ptr<const DrawRecipe> served;
+    if (planKey != nullptr && Graphics::DrawPlans() && serveDrawPlan(localDevice, *planKey, graphics, drawParameters, stages, snapshots, tracePtr, served)) {
+        if (served != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor);
+        phaseTiming.Phase(DrawRowGraphics);
+        timing.Mark("draw_and_resource_release");
+        return drawn();
+    }
     std::shared_ptr<const DrawRecipe> built;
     if (planKey != nullptr) static_cast<void>(Graphics::TakeDrawPlanShadowDecision());
+    const auto fullStart = fullPlanDrawStart(planKey.get());
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() && planKey == nullptr ? nullptr : &built, tracePtr, tail.shapeKey);
+    countFullPlanDraw(fullStart);
     phaseTiming.Phase(DrawRowGraphics);
     if (planKey != nullptr) shadowDrawPlan(planKey, built != nullptr ? built : Graphics::TakeDrawPlanShadowDecision());
     if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
@@ -1443,9 +1448,16 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
+    std::shared_ptr<const DrawRecipe> served;
+    if (planKey != nullptr && Graphics::DrawPlans() && serveDrawPlan(localDevice, *planKey, graphics, drawParameters, stages, snapshots, tracePtr, served)) {
+        if (served != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor);
+        return;
+    }
     std::shared_ptr<const DrawRecipe> built;
     if (planKey != nullptr) static_cast<void>(Graphics::TakeDrawPlanShadowDecision());
+    const auto fullStart = fullPlanDrawStart(planKey.get());
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() && planKey == nullptr ? nullptr : &built, tracePtr, shape);
+    countFullPlanDraw(fullStart);
     if (planKey != nullptr) shadowDrawPlan(planKey, built != nullptr ? built : Graphics::TakeDrawPlanShadowDecision());
     if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
 }

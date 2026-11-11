@@ -79,6 +79,7 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
+bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 

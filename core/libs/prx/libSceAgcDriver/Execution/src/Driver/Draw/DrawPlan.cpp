@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 
@@ -150,6 +151,10 @@ void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uin
     write(state.depthCompare);
     write(state.stencilFront);
     write(state.stencilBack);
+    write(state.stencilFront.reference);
+    write(state.stencilBack.reference);
+    write(state.depthBiasClamp != 0.0f);
+    write(state.blendConstants);
     write(state.stencilReplayReference.has_value());
     write(state.hasColorTarget);
     if (state.hasColorTarget) write(state.color);
@@ -184,14 +189,18 @@ void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uin
     write(state.quadSampleMask);
 }
 
-std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const std::shared_ptr<DispatchVariant>> stages, const Graphics::State& state, const Pm4::DrawParameters& draw) {
-    if (stages.empty() || std::any_of(stages.begin(), stages.end(), [](const std::shared_ptr<DispatchVariant>& stage) { return stage == nullptr; })) return nullptr;
+std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::CompiledShader> stages, const Graphics::State& state, const Pm4::DrawParameters& draw) {
+    if (stages.empty() || std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr || stage.program->PipelineVariantId() == 0; })) return nullptr;
     auto key = std::make_shared<DrawPlanKey>();
     key->words.reserve(160);
     key->words.push_back(stages.size());
     for (const auto& stage : stages) {
-        key->words.push_back(reinterpret_cast<std::uintptr_t>(stage.get()));
-        key->stages.emplace_back(stage);
+        const auto& program = *stage.program;
+        for (const std::uint64_t word : {static_cast<std::uint64_t>(stage.stage), program.variantId, program.specializationId, std::uint64_t{stage.pushConstantOffset}, std::uint64_t{program.pushConstants.size()}, std::uint64_t{program.bdaAbiVersion}, std::uint64_t{program.vertexAttributes.size()}}) key->words.push_back(word);
+        for (const auto& attribute : program.vertexAttributes) {
+            const auto& fields = attribute.resource.fields;
+            for (const std::uint64_t word : {std::uint64_t{attribute.location}, std::uint64_t{attribute.components}, std::uint64_t{attribute.fetchIndex}, std::uint64_t{attribute.formatComponents}, std::uint64_t{fields[1] >> 16u}, std::uint64_t{fields[3]}, std::uint64_t{Graphics::NullVertexDescriptor(attribute)}}) key->words.push_back(word);
+        }
     }
     AppendDrawPlanStateWords(state, key->words);
     key->words.push_back(draw.indexed);
@@ -202,15 +211,7 @@ std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const std::shared_
 }
 
 bool DrawPlanKey::Matches(const DrawPlanKey& other) const {
-    if (hash != other.hash || words != other.words || stages.size() != other.stages.size()) return false;
-    for (std::size_t i = 0; i < stages.size(); ++i) {
-        if (stages[i].owner_before(other.stages[i]) || other.stages[i].owner_before(stages[i])) return false;
-    }
-    return true;
-}
-
-bool DrawPlanKey::Expired() const {
-    return std::any_of(stages.begin(), stages.end(), [](const std::weak_ptr<const DispatchVariant>& stage) { return stage.expired(); });
+    return hash == other.hash && words == other.words;
 }
 
 DrawPlanCounts DrawPlanCounters::Load() const {
@@ -263,7 +264,7 @@ std::size_t DrawPlanIndex::Insert(const std::shared_ptr<const DrawPlanKey>& key,
     order.push_front({key, std::move(decisions)});
     index.emplace(key->hash, order.begin());
     std::size_t evicted = 0;
-    while (order.size() > capacity || (!order.empty() && order.back().key->Expired())) {
+    while (order.size() > capacity || (!order.empty() && order.back().decisions->pipeline.expired())) {
         const auto victim = std::prev(order.end());
         const auto [first, last] = index.equal_range(victim->key->hash);
         for (auto it = first; it != last; ++it) {
@@ -304,10 +305,13 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
     if (!drawn->servable) drawPlanCounters.Add(DrawPlanCount::Unservable);
     drawPlanCounters.Add(DrawPlanCount::MovedBases, drawn->movedBases);
     const auto plan = drawPlans.Find(*key);
-    if (plan == nullptr || plan->pipeline.expired()) {
-        drawPlanCounters.Add(DrawPlanCount::Absent);
+    const auto insert = [&] {
         const auto evicted = drawPlans.Insert(key, drawn);
         if (evicted != 0) drawPlanCounters.Add(DrawPlanCount::Evictions, evicted);
+    };
+    if (plan == nullptr || plan->pipeline.expired()) {
+        drawPlanCounters.Add(DrawPlanCount::Absent);
+        insert();
         return;
     }
     drawPlanCounters.Add(DrawPlanCount::Present);
@@ -322,6 +326,53 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
     if (differences.maskedState) drawPlanCounters.Add(DrawPlanCount::MaskedState);
     drawPlanCounters.Add(differences.sameInstance ? DrawPlanCount::SameInstance : DrawPlanCount::InstanceDiffers);
     if (differences.passDiffers) drawPlanCounters.Add(DrawPlanCount::PassDiffersSameInstance);
+    if (drawn->servable && (!plan->servable || !differences.sameInstance)) {
+        drawPlanCounters.Add(DrawPlanCount::Replaced);
+        insert();
+    }
+}
+
+bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const DrawPlanKey& key, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const VulkanDevice::DrawTraceContext* trace, std::shared_ptr<const DrawRecipe>& attachable) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    drawPlanCounters.Add(DrawPlanCount::PlanLookups);
+    const auto plan = drawPlans.Find(key);
+    if (plan == nullptr) {
+        drawPlanCounters.Add(DrawPlanCount::MissAbsent);
+        return false;
+    }
+    if (!plan->servable) {
+        drawPlanCounters.Add(DrawPlanCount::MissUnservable);
+        return false;
+    }
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto outcome = device->DrawFromPlan(graphics, draw, stages, snapshots, *plan, trace);
+    if (outcome.recorded) {
+        drawPlanCounters.Add(DrawPlanCount::Hits);
+        if (plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
+        if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
+        if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        return true;
+    }
+    switch (outcome.miss) {
+        case Graphics::DrawRecipeMiss::NotRecordable: drawPlanCounters.Add(DrawPlanCount::MissNotRecordable); break;
+        case Graphics::DrawRecipeMiss::TargetGone: drawPlanCounters.Add(DrawPlanCount::MissTargetGone); break;
+        case Graphics::DrawRecipeMiss::TemplateGone: drawPlanCounters.Add(DrawPlanCount::MissTemplateGone); break;
+        case Graphics::DrawRecipeMiss::Proof: drawPlanCounters.Add(DrawPlanCount::MissProof); break;
+        case Graphics::DrawRecipeMiss::Instance: drawPlanCounters.Add(DrawPlanCount::MissInstance); break;
+        default: drawPlanCounters.Add(DrawPlanCount::MissObjectsGone); break;
+    }
+    return false;
+}
+
+std::chrono::steady_clock::time_point Driver::fullPlanDrawStart(const DrawPlanKey* key) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return key != nullptr && profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+void Driver::countFullPlanDraw(std::chrono::steady_clock::time_point start) {
+    if (start == std::chrono::steady_clock::time_point{}) return;
+    drawPlanCounters.Add(DrawPlanCount::FullDraws);
+    drawPlanCounters.Add(DrawPlanCount::FullNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
 }
 
 }

@@ -173,24 +173,24 @@ void PlansFollowTheirKey() {
     GuestBlock FirstTarget;
     GuestBlock SecondTarget;
     const auto first = Measure(FirstTarget, List, "first draw");
-    const auto second = Measure(FirstTarget, List, "second draw, stages built and admitted");
+    const auto second = Measure(FirstTarget, List, "second draw");
     const auto third = Measure(FirstTarget, List, "third draw, a draw-cache hit");
     const auto otherTarget = Measure(SecondTarget, List, "the same draw into another render target");
     const auto strip = Measure(FirstTarget, Strip, "the same stages as a triangle strip");
     const auto stripAgain = Measure(FirstTarget, Strip, "the triangle strip again");
     for (const auto* step : {&first, &second, &third, &otherTarget, &strip, &stripAgain}) Expect(Mismatches(*step) == 0, "a plan's stored decisions differ from what the full path chose for a draw with the same plan key");
-    if (!AgcDriver::Graphics::DrawPlanShadow()) {
+    if (!AgcDriver::Graphics::DrawPlanShadow() && !AgcDriver::Graphics::DrawPlans()) {
         Expect(first[DrawPlanCount::Lookups] + second[DrawPlanCount::Lookups] + third[DrawPlanCount::Lookups] + otherTarget[DrawPlanCount::Lookups] + strip[DrawPlanCount::Lookups] == 0, "the shadow ran while switched off");
         std::puts("draw plan shadow: off, nothing looked up");
         return;
     }
-    Expect(first[DrawPlanCount::Lookups] == 0, "a draw whose stages have no kept variant built a plan key");
-    Expect(second[DrawPlanCount::Absent] == 1, "the first draw with kept variants did not insert a plan");
+    Expect(first[DrawPlanCount::Absent] == 1, "the first draw did not insert a plan");
+    Expect(second[DrawPlanCount::Lookups] == 0 || (second[DrawPlanCount::Present] == 1 && second[DrawPlanCount::Agreed] == 1 && second[DrawPlanCount::SameInstance] == 1), "a repeated draw did not find and agree with its plan on the same instance");
     Expect(third[DrawPlanCount::Lookups] == 0 || (third[DrawPlanCount::Present] == 1 && third[DrawPlanCount::Agreed] == 1 && third[DrawPlanCount::SameInstance] == 1), "a repeated draw that its exact-key recipe did not serve did not find and agree with its plan on the same instance");
     Expect(otherTarget[DrawPlanCount::Present] == 1 && otherTarget[DrawPlanCount::Agreed] == 1 && otherTarget[DrawPlanCount::InstanceDiffers] == 1, "a draw into another render target did not share the plan as another instance");
     Expect(strip[DrawPlanCount::Absent] == 1 && strip[DrawPlanCount::Present] == 0, "a draw with another topology shared the triangle list's plan");
-    Expect(stripAgain[DrawPlanCount::Present] == 1 && stripAgain[DrawPlanCount::Agreed] == 1, "the triangle strip did not find its own plan");
-    std::puts("draw plan shadow: plans follow the stage variants and the pipeline-shaping state, and render targets are instances");
+    Expect(stripAgain[DrawPlanCount::Lookups] == 0 || (stripAgain[DrawPlanCount::Present] == 1 && stripAgain[DrawPlanCount::Agreed] == 1), "the triangle strip did not find its own plan");
+    std::puts("draw plan shadow: plans follow the compiled stages and the pipeline-shaping state, and render targets are instances");
 }
 
 }
