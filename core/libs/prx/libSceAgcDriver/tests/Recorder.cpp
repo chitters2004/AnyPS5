@@ -14022,6 +14022,35 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         Require(lastDimension() == TextureDimension::k2DArray, "the array image's write after the alias's left the alias's layout recorded");
         Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a write after another image's was skipped as a repeat");
         Require(foreignRecords.load(std::memory_order_relaxed) == 0, "a concurrent reader saw a layout no image at the address wrote");
+        std::vector<std::uint64_t> expected(units);
+        for (std::uint32_t unit = 0; unit < units; ++unit) expected[unit] = image->PendingSinceForTest(unit);
+        const auto mark = [&](std::uint32_t first, std::uint32_t count, bool advance, const std::string& what) {
+            if (advance) AgcDriver::GuestMemory::AdvanceTrackerGenerationForTest(AgcDriver::GuestMemory::TrackerGeneration() + 100);
+            const auto before = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto skips = StorageTexture::PendingSinceSkips();
+            image->MarkSliceDirty(first, count);
+            const auto after = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto since = image->PendingSinceForTest(first);
+            Require(since >= before && since <= after, what + ": the marked unit's pending-since generation " + std::to_string(since) + " is not the generation of its mark");
+            for (std::uint32_t unit = first; unit < first + count; ++unit) expected[unit] = since;
+            for (std::uint32_t unit = 0; unit < units; ++unit) {
+                Require(image->PendingSinceForTest(unit) == expected[unit], what + ": unit " + std::to_string(unit) + " holds pending-since generation " + std::to_string(image->PendingSinceForTest(unit)) + ", not " + std::to_string(expected[unit]));
+            }
+            return StorageTexture::PendingSinceSkips() - skips;
+        };
+        mark(0, units, true, "a whole mark at a new generation");
+        const auto held = expected[1];
+        const bool heldBefore = AgcDriver::GuestMemory::TrackerGeneration() == held;
+        const auto repeatSkips = mark(1, 2, false, "a repeated mark inside the whole mark");
+        Require(heldBefore && AgcDriver::GuestMemory::TrackerGeneration() == held, "the tracker generation moved under a repeated mark: the skip is not exercised");
+        Require(repeatSkips == 1, "a repeated mark at the same generation walked its units again");
+        mark(2, 1, true, "a one-unit mark at a new generation");
+        const auto outsideSkips = mark(0, 1, false, "a mark of a unit outside the newest mark at the same generation");
+        mark(1, 1, false, "a mark between the two newest marks");
+        mark(0, 3, false, "a mark covering the joined marks");
+        mark(3, 1, false, "a mark of the last unit");
+        mark(0, units, true, "a whole mark at a later generation");
+        Require(outsideSkips == 0, "a mark of a unit no mark at its generation covered was skipped");
         image->WriteBack();
         alias->WriteBack();
         recorder.Submit();
