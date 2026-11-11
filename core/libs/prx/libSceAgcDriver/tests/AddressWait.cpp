@@ -23,6 +23,9 @@
 #else
 #include <time.h>
 #endif
+#if defined(__x86_64__) || defined(_M_X64)
+#include <x86intrin.h>
+#endif
 
 namespace {
 
@@ -336,12 +339,31 @@ void StopTokenWait(Watchdog& watchdog) {
     }
 }
 
+std::uint64_t Stamp() {
+#if defined(__x86_64__) || defined(_M_X64)
+    return __rdtsc();
+#else
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count());
+#endif
+}
+
+double NsPerStamp() {
+    static const double ratio = [] {
+        const auto start = Clock::now();
+        const auto first = Stamp();
+        std::this_thread::sleep_for(50ms);
+        const auto last = Stamp();
+        const auto elapsed = std::chrono::duration<double, std::nano>(Clock::now() - start).count();
+        return elapsed / static_cast<double>(last - first);
+    }();
+    return ratio;
+}
+
 double ThreadsCpuSeconds() {
 #ifdef _WIN32
-    FILETIME creation, exit, kernel, user;
-    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) return 0;
-    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
-    return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+    ULONG64 cycles = 0;
+    if (!QueryProcessCycleTime(GetCurrentProcess(), &cycles)) return 0;
+    return static_cast<double>(cycles) * NsPerStamp() / 1e9;
 #else
     timespec time{};
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &time);
@@ -359,6 +381,15 @@ struct StandardWord {
 struct NativeWord {
     template<typename TWord>
     static void Wait(std::atomic<TWord>& word, TWord old) { AddressWait(word, old); }
+    template<typename TWord>
+    static void Wake(std::atomic<TWord>& word) { AddressWakeAll(word); }
+};
+
+struct SleepingWord {
+    template<typename TWord>
+    static void Wait(std::atomic<TWord>& word, TWord old) {
+        if (word.load(std::memory_order_relaxed) == old) AgcDriver::AddressWaitDetail::Wait(word, old);
+    }
     template<typename TWord>
     static void Wake(std::atomic<TWord>& word) { AddressWakeAll(word); }
 };
@@ -504,7 +535,7 @@ struct ColdWake {
 template<typename TWait, typename TNotify>
 ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
     std::atomic<int> armed{0};
-    std::atomic<std::int64_t> sentAt{0};
+    std::atomic<std::uint64_t> sentAt{0};
     std::vector<double> latencies;
     std::vector<double> notifies;
     std::uint64_t rescues = 0;
@@ -514,8 +545,8 @@ ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
         for (int round = 1; round <= rounds; ++round) {
             armed.store(round, std::memory_order_release);
             wait(round);
-            const auto now = Clock::now().time_since_epoch().count();
-            latencies.push_back(static_cast<double>(now - sentAt.load(std::memory_order_acquire)));
+            const auto now = Stamp();
+            latencies.push_back(static_cast<double>(static_cast<std::int64_t>(now - sentAt.load(std::memory_order_acquire))) * NsPerStamp());
         }
         armed.store(rounds + 1, std::memory_order_release);
     });
@@ -527,10 +558,10 @@ ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
             stalled = Clock::now() + 100ms;
         }
         std::this_thread::sleep_for(200us);
-        const auto sent = Clock::now();
-        sentAt.store(sent.time_since_epoch().count(), std::memory_order_release);
+        const auto sent = Stamp();
+        sentAt.store(sent, std::memory_order_release);
         notify(round);
-        notifies.push_back(std::chrono::duration<double, std::nano>(Clock::now() - sent).count());
+        notifies.push_back(static_cast<double>(Stamp() - sent) * NsPerStamp());
     }
     for (auto stalled = Clock::now() + 100ms; armed.load(std::memory_order_acquire) != rounds + 1; std::this_thread::yield()) {
         if (Clock::now() < stalled) continue;
@@ -539,8 +570,6 @@ ColdWake ColdWakes(int rounds, TWait wait, TNotify notify) {
         stalled = Clock::now() + 100ms;
     }
     waiter.join();
-    const auto ratio = static_cast<double>(Clock::period::num) * 1e9 / static_cast<double>(Clock::period::den);
-    for (auto& latency : latencies) latency *= ratio;
     std::ranges::sort(latencies);
     std::ranges::sort(notifies);
     return {latencies[latencies.size() / 2], latencies[latencies.size() * 9 / 10], notifies[notifies.size() / 2], rescues};
@@ -551,7 +580,7 @@ ColdWake ColdWordWakes(int rounds) {
     std::atomic<TWord> word{0};
     return ColdWakes(rounds, [&](int round) {
         for (auto seen = word.load(std::memory_order_acquire); seen != static_cast<TWord>(round); seen = word.load(std::memory_order_acquire)) {
-            if constexpr (Native) AddressWait(word, seen);
+            if constexpr (Native) SleepingWord::Wait(word, seen);
             else word.wait(seen, std::memory_order_acquire);
         }
     }, [&](int round) {
@@ -598,7 +627,14 @@ void PrintCold(const char* what, ColdWake value) {
 int Benchmark() {
     constexpr int Rounds = 20000;
     constexpr int ColdRounds = 2000;
-    std::printf("native address waits: %s\n", AgcDriver::NativeAddressWait() ? "yes" : "no, std::atomic fallback");
+    std::printf("native address waits: %s; timestamps %.3f ns per tick (TSC on x86-64), CPU from %s\n", AgcDriver::NativeAddressWait() ? "yes" : "no, std::atomic fallback", NsPerStamp(),
+#ifdef _WIN32
+        "QueryProcessCycleTime"
+#else
+        "CLOCK_PROCESS_CPUTIME_ID"
+#endif
+    );
+    std::printf("cold wakes: the native rows sleep without the 64-pause spin; the waiter is blocked for 200 us, so a spin could not finish them anyway\n");
     std::printf("wake latency of a sleeping waiter (waiter blocked for 200 us before each wake):\n");
     PrintCold("  std::atomic<uint32_t> wait/notify_one", ColdWordWakes<std::uint32_t, false>(ColdRounds));
     PrintCold("  native 32-bit wait/wake one", ColdWordWakes<std::uint32_t, true>(ColdRounds));
@@ -609,10 +645,13 @@ int Benchmark() {
     std::printf("ping-pong between two blocking threads, per hand-off:\n");
     Print("  std::atomic<uint32_t> wait/notify_all", [] { return HandoffWords<StandardWord, std::uint32_t>(Rounds, 0); });
     Print("  native 32-bit wait/wake all", [] { return HandoffWords<NativeWord, std::uint32_t>(Rounds, 0); });
+    Print("  native 32-bit, sleep only (no 64-pause spin)", [] { return HandoffWords<SleepingWord, std::uint32_t>(Rounds, 0); });
     Print("  std::atomic<uint64_t> wait/notify_all", [] { return HandoffWords<StandardWord, std::uint64_t>(Rounds, 0); });
     Print("  native 64-bit wait/wake all", [] { return HandoffWords<NativeWord, std::uint64_t>(Rounds, 0); });
+    Print("  native 64-bit, sleep only (no 64-pause spin)", [] { return HandoffWords<SleepingWord, std::uint64_t>(Rounds, 0); });
     Print("  std::atomic<uint64_t>, 32 idle waiters on other words", [] { return HandoffWords<StandardWord, std::uint64_t>(Rounds, 32); });
     Print("  native 64-bit, 32 idle waiters on other words", [] { return HandoffWords<NativeWord, std::uint64_t>(Rounds, 32); });
+    Print("  native 64-bit sleep only, 32 idle waiters", [] { return HandoffWords<SleepingWord, std::uint64_t>(Rounds, 32); });
     Print("  std::condition_variable + std::mutex", [] { return HandoffConditions<std::condition_variable, std::mutex>(Rounds); });
     Print("  AddressCondition + std::mutex", [] { return HandoffConditions<AddressCondition, std::mutex>(Rounds); });
     std::printf("notify with no waiter, per call:\n");
