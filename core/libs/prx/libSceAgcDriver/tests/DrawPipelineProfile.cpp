@@ -54,6 +54,11 @@ public:
     StderrCapture(const StderrCapture&) = delete;
     StderrCapture& operator=(const StderrCapture&) = delete;
 
+    std::string Text() const {
+        std::ifstream file(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    }
+
     std::string ReadReport() const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
@@ -108,6 +113,9 @@ void TestReport() {
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    const auto text = capture.Text();
+    const auto idle = text.find("[committer-idle] (10 s): ");
+    Check(idle != std::string::npos && text.find(" while the finisher held work (", idle) != std::string::npos && text.find(" while it was idle (", idle) != std::string::npos, "the committer idle counters were not reported");
 }
 
 }
