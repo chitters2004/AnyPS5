@@ -354,6 +354,16 @@ void DrawFinisher::Drain() {
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
+void DrawFinisher::RethrowFailure() {
+    if (OnFinisherThread()) return;
+    if (Sequenced()) {
+        ring->RethrowFailure();
+        return;
+    }
+    std::lock_guard lock(mutex);
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+}
+
 void DrawFinisher::ReleaseRan() {
     if (Sequenced()) {
         ring->Reclaim();
@@ -663,7 +673,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
-    if (!Busy()) return;
+    else DrawFinisher::Get().RethrowFailure();
+    if (!Busy()) {
+        std::lock_guard lock(mutex);
+        rethrowFailure();
+        return;
+    }
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);

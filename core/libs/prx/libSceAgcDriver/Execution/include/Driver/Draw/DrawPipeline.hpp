@@ -158,6 +158,7 @@ public:
     void Drain();
     void Settle();
     void ReleaseRan();
+    void RethrowFailure();
 
 private:
     DrawFinisher() = default;
