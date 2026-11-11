@@ -502,6 +502,7 @@ private:
     DrawStageMemoCounters drawStageMemoCounters;
     DrawPlanIndex drawPlans{drawPlanEntries()};
     DrawPlanCounters drawPlanCounters;
+    DrawPlanCounts drawPlanReported;
 
     AgcDriver::Mutex driverPhasesMutex;
     std::array<DriverPhaseTotals, DispatchClassCount> driverPhaseTotals{};

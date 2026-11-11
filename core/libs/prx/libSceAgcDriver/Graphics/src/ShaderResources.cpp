@@ -3039,8 +3039,6 @@ void VisitBindingContentKey(const ShaderRecompiler::DescriptorBinding& binding, 
     packBits(binding.samplerCoordinatesIgnored);
     packBits(binding.imageUnnormalized);
     packBits(binding.imageUnnormalizedBaseLevel);
-    // Read-only elements are bound without a write set: an object built for one written set
-    // must not serve a build with another (the variant implies it, this makes it explicit).
     packBits(binding.bufferWritten);
     visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
     for (const auto sampler : binding.imageSamplers) {
