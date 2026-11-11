@@ -19,6 +19,10 @@ DIAGNOSTIC = re.compile(r"\b(VUID-[A-Za-z0-9_-]+|SYNC-HAZARD-[A-Za-z0-9_-]+)")
 MESSAGE = re.compile(r"Validation (?:Error|Warning):|(?:VUID-|SYNC-HAZARD-)[\w-]+\s*\((?:ERROR|WARNING)\s*/")
 MISSING_LAYER = "was not found but was requested by env var VK_INSTANCE_LAYERS"
 INSERTED_LAYER = 'Insert instance layer "VK_LAYER_KHRONOS_validation"'
+INSERTED_LIBRARY = re.compile(re.escape(INSERTED_LAYER) + r" \((.*)\)\s*$")
+VALIDATION_LAYER = "VK_LAYER_KHRONOS_validation"
+MINIMUM_LAYER_VERSION = "1.4.363"
+CANARY_VUID = "VUID-VkBufferCreateInfo-size-00912"
 
 if os.name == "nt":
     import ctypes
@@ -49,6 +53,121 @@ if os.name == "nt":
 
 class GateError(Exception):
     pass
+
+
+def version(text):
+    if not isinstance(text, str) or not re.fullmatch(r"\d+\.\d+\.\d+", text):
+        raise GateError(f"layer version {text!r} is not MAJOR.MINOR.PATCH")
+    return tuple(int(part) for part in text.split("."))
+
+
+def layer_manifest(log):
+    lines = log.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().split()[-1:] != [VALIDATION_LAYER] or "LAYER:" not in line:
+            continue
+        for following in lines[index + 1:index + 4]:
+            _, found, path = following.partition("Manifest:")
+            if found and path.strip():
+                return Path(path.strip())
+    raise GateError(f"the loader log names no manifest for {VALIDATION_LAYER}")
+
+
+def layer_record(manifest, minimum):
+    try:
+        document = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise GateError(f"{manifest}: unreadable validation layer manifest: {error}") from error
+    entries = document.get("layers") or [document.get("layer")] if isinstance(document, dict) else []
+    entry = next((item for item in entries if isinstance(item, dict) and item.get("name") == VALIDATION_LAYER), None)
+    if entry is None:
+        raise GateError(f"{manifest}: the manifest does not describe {VALIDATION_LAYER}")
+    record = {"manifest": str(manifest), "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
+              "api_version": entry.get("api_version"), "implementation_version": entry.get("implementation_version"),
+              "minimum_api_version": minimum}
+    if version(record["api_version"]) < version(minimum):
+        raise GateError(f"{manifest}: {VALIDATION_LAYER} {record['api_version']} is older than the minimum {minimum}")
+    return record
+
+
+def canary():
+    import ctypes
+    library = {"nt": "vulkan-1.dll"}.get(os.name, "libvulkan.1.dylib" if sys.platform == "darwin" else "libvulkan.so.1")
+    try:
+        vulkan = (ctypes.WinDLL if os.name == "nt" else ctypes.CDLL)(library)
+    except OSError as error:
+        print(f"canary: cannot load {library}: {error}", flush=True)
+        return 3
+    pointer, handle, u32 = ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint32
+
+    class ApplicationInfo(ctypes.Structure):
+        _fields_ = [("sType", u32), ("pNext", pointer), ("name", ctypes.c_char_p), ("version", u32),
+                    ("engine", ctypes.c_char_p), ("engineVersion", u32), ("apiVersion", u32)]
+
+    class InstanceInfo(ctypes.Structure):
+        _fields_ = [("sType", u32), ("pNext", pointer), ("flags", u32), ("application", ctypes.POINTER(ApplicationInfo)),
+                    ("layerCount", u32), ("layers", pointer), ("extensionCount", u32), ("extensions", pointer)]
+
+    class QueueInfo(ctypes.Structure):
+        _fields_ = [("sType", u32), ("pNext", pointer), ("flags", u32), ("family", u32), ("count", u32),
+                    ("priorities", ctypes.POINTER(ctypes.c_float))]
+
+    class DeviceInfo(ctypes.Structure):
+        _fields_ = [("sType", u32), ("pNext", pointer), ("flags", u32), ("queueCount", u32), ("queues", ctypes.POINTER(QueueInfo)),
+                    ("layerCount", u32), ("layers", pointer), ("extensionCount", u32), ("extensions", pointer), ("features", pointer)]
+
+    class BufferInfo(ctypes.Structure):
+        _fields_ = [("sType", u32), ("pNext", pointer), ("flags", u32), ("size", ctypes.c_uint64), ("usage", u32),
+                    ("sharing", u32), ("familyCount", u32), ("families", pointer)]
+
+    application = ApplicationInfo(0, None, b"validation canary", 1, b"validation canary", 1, (1 << 22) | (1 << 12))
+    instance = pointer()
+    result = vulkan.vkCreateInstance(ctypes.byref(InstanceInfo(1, None, 0, ctypes.pointer(application), 0, None, 0, None)), None, ctypes.byref(instance))
+    if result:
+        print(f"canary: vkCreateInstance returned {result}", flush=True)
+        return 4
+    try:
+        count = u32(1)
+        physical = pointer()
+        vulkan.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), ctypes.byref(physical))
+        if not count.value or not physical.value:
+            print("canary: no physical device", flush=True)
+            return 5
+        priority = ctypes.c_float(1.0)
+        queue = QueueInfo(2, None, 0, 0, 1, ctypes.pointer(priority))
+        device = pointer()
+        result = vulkan.vkCreateDevice(physical, ctypes.byref(DeviceInfo(3, None, 0, 1, ctypes.pointer(queue), 0, None, 0, None, None)), None, ctypes.byref(device))
+        if result:
+            print(f"canary: vkCreateDevice returned {result}", flush=True)
+            return 5
+        try:
+            buffer = handle()
+            result = vulkan.vkCreateBuffer(device, ctypes.byref(BufferInfo(12, None, 0, 0, 1, 0, 0, None)), None, ctypes.byref(buffer))
+            print(f"canary: zero-size vkCreateBuffer returned {result}", flush=True)
+            if result == 0 and buffer.value:
+                vulkan.vkDestroyBuffer(device, buffer, None)
+        finally:
+            vulkan.vkDestroyDevice(device, None)
+    finally:
+        vulkan.vkDestroyInstance(instance, None)
+    return 0
+
+
+def check_layer(output, environment, timeout, minimum):
+    log = output / "layer-canary.log"
+    code = run([sys.executable, str(Path(__file__).resolve()), "--canary"], log, environment, timeout)
+    text = log.read_text(encoding="utf-8", errors="replace")
+    if code:
+        raise GateError(f"the validation layer canary exited with {code}; see {log}")
+    if MISSING_LAYER in text or INSERTED_LAYER not in text:
+        raise GateError(f"the validation layer canary ran without {VALIDATION_LAYER}; see {log}")
+    if not any(MESSAGE.search(line) and CANARY_VUID in line for line in text.splitlines()):
+        raise GateError(f"the validation layer did not report {CANARY_VUID} for the canary; see {log}")
+    record = layer_record(layer_manifest(text), minimum)
+    match = next(filter(None, map(INSERTED_LIBRARY.search, text.splitlines())), None)
+    record["library"] = match[1] if match else None
+    record["canary"] = CANARY_VUID
+    return record
 
 
 def positive(value):
@@ -188,7 +307,7 @@ def check_timeouts(tests, limit):
                     raise GateError(f"{test['name']}: TIMEOUT must be positive and at most {limit} seconds")
 
 
-def parse_report(path, expected):
+def parse_report(path, expected, library=None):
     root = ET.parse(path).getroot()
     if root.tag not in ("testsuite", "testsuites"):
         raise GateError(f"{path}: expected JUnit testsuite or testsuites")
@@ -200,6 +319,7 @@ def parse_report(path, expected):
         messages = collections.Counter()
         missing = []
         inserted = False
+        libraries = set()
         for channel in ("system-out", "system-err"):
             for line in (case.findtext(channel) or "").splitlines():
                 if MESSAGE.search(line):
@@ -207,12 +327,17 @@ def parse_report(path, expected):
                 if MISSING_LAYER in line:
                     missing.append(line)
                 inserted = inserted or INSERTED_LAYER in line
+                match = INSERTED_LIBRARY.search(line)
+                if match:
+                    libraries.add(match[1])
         failed = (case.find("failure") is not None or case.find("error") is not None
                   or case.find("skipped") is not None or case.get("status") in ("disabled", "notrun"))
         if failed or missing or not inserted:
             problems.append(name)
+        if library is not None and libraries - {library}:
+            problems.append(name)
         results[name] = {"diagnostics": dict(messages), "missing_layers": missing, "layer_inserted": inserted,
-                         "failed_or_skipped": failed}
+                         "layer_libraries": sorted(libraries), "failed_or_skipped": failed}
     if set(results) != set(expected):
         problems.append("test coverage differs: missing=" + repr(sorted(set(expected) - set(results)))
                         + " extra=" + repr(sorted(set(results) - set(expected))))
@@ -255,9 +380,15 @@ def main(argv=None):
     parser.add_argument("--runtime", action="append", default=[], help="build-relative runtime file/directory to hash before and after tests")
     parser.add_argument("--cmake", default="cmake")
     parser.add_argument("--ctest", default="ctest")
+    parser.add_argument("--minimum-layer-version", default=MINIMUM_LAYER_VERSION,
+                        help="minimum api_version of the VK_LAYER_KHRONOS_validation manifest the loader inserts")
+    if argv is None and sys.argv[1:] == ["--canary"]:
+        return canary()
     args = parser.parse_args(argv)
     if args.repeat <= 0:
         parser.error("--repeat must be positive")
+    if not re.fullmatch(r"\d+\.\d+\.\d+", args.minimum_layer_version):
+        parser.error("--minimum-layer-version must be MAJOR.MINOR.PATCH")
     if args.test_timeout > 30:
         parser.error("--test-timeout must be at most 30 seconds")
     if any(not re.fullmatch(r"-D[A-Za-z_][A-Za-z0-9_]*(?::[A-Z]+)?=.*", value) for value in args.cmake_arg):
@@ -277,6 +408,8 @@ def main(argv=None):
         created = True
         environment = {**os.environ, **FORCED, "ANYPS5_GPU": args.gpu}
         report["environment"] = {key: environment[key] for key in (*FORCED, *PUBLIC_ENV) if key in environment}
+        report["layer"] = check_layer(output, environment, args.timeout, args.minimum_layer_version)
+        save(output, report)
         report["options"] = {"targets": args.target, "tests": args.tests, "repeat": args.repeat,
                              "cmake_args": args.cmake_arg, "runtime": args.runtime}
         listings, hashes, contexts = {}, {}, {}
@@ -339,7 +472,7 @@ def main(argv=None):
                            "--test-output-size-passed", "0", "--test-output-size-failed", "0",
                            "--timeout", str(args.test_timeout), "--output-junit", str(junit)]
                 code = run(command, directory / f"iteration-{iteration}.log", environment, args.timeout)
-                tests, problems = parse_report(junit, names)
+                tests, problems = parse_report(junit, names, report["layer"]["library"])
                 report["iterations"].append({"side": side, "iteration": iteration, "command": command,
                                               "returncode": code, "tests": tests, "problems": problems})
                 save(output, report)

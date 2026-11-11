@@ -489,6 +489,10 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py SetupTests)
         add_test(NAME vulkan_validation_gate_commands COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py CommandTests)
+        add_test(NAME vulkan_validation_gate_layer_versions COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py LayerVersionTests)
+        add_test(NAME vulkan_validation_gate_canary COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_vulkan_validation_gate.py CanaryTests)
         add_test(NAME stubgen COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_stubgen.py)
         set(debt_split_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_debt_split.py")

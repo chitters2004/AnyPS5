@@ -118,6 +118,144 @@ class ReportTests(unittest.TestCase):
                     self.assertNotEqual(before, gate.artifact_hashes(build, tests, []))
 
 
+LOADER_LOG = """[Vulkan Loader] INFO | LAYER:      Insert instance layer "VK_LAYER_KHRONOS_validation" ({library})
+[Vulkan Loader] LAYER:                VK_LAYER_KHRONOS_validation
+[Vulkan Loader] LAYER:                        Manifest: {manifest}
+[Vulkan Loader] LAYER:                        Library:  {library}
+"""
+
+
+class LayerVersionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+
+    def manifest(self, api_version, name="VK_LAYER_KHRONOS_validation", array=False):
+        layer = {"name": name, "type": "GLOBAL", "library_path": "libVkLayer_khronos_validation.so",
+                 "api_version": api_version, "implementation_version": "1"}
+        path = self.root / ("array.json" if array else "VkLayer_khronos_validation.json")
+        path.write_text(json.dumps({"file_format_version": "1.2.0", **({"layers": [layer]} if array else {"layer": layer})}), encoding="utf-8")
+        return path
+
+    def test_manifest_versions_below_the_minimum_are_refused(self):
+        for api_version in ("1.3.275", "1.4.362", "0.9.999"):
+            with self.subTest(api_version=api_version), self.assertRaisesRegex(gate.GateError, "older than the minimum 1.4.363"):
+                gate.layer_record(self.manifest(api_version), "1.4.363")
+
+    def test_manifest_versions_at_or_above_the_minimum_are_recorded(self):
+        for api_version in ("1.4.363", "1.4.364", "1.5.0", "2.0.0"):
+            with self.subTest(api_version=api_version):
+                record = gate.layer_record(self.manifest(api_version), "1.4.363")
+                self.assertEqual(record["api_version"], api_version)
+                self.assertEqual(record["minimum_api_version"], "1.4.363")
+                self.assertEqual(len(record["manifest_sha256"]), 64)
+        self.assertEqual(gate.layer_record(self.manifest("1.4.363", array=True), "1.4.363")["api_version"], "1.4.363")
+
+    def test_missing_or_unusable_manifests_are_refused(self):
+        with self.assertRaisesRegex(gate.GateError, "unreadable validation layer manifest"):
+            gate.layer_record(self.root / "missing.json", "1.4.363")
+        broken = self.root / "broken.json"
+        broken.write_text("{", encoding="utf-8")
+        with self.assertRaisesRegex(gate.GateError, "unreadable validation layer manifest"):
+            gate.layer_record(broken, "1.4.363")
+        with self.assertRaisesRegex(gate.GateError, "does not describe"):
+            gate.layer_record(self.manifest("1.4.363", name="VK_LAYER_OTHER"), "1.4.363")
+        for api_version in ("1.4", "1.4.363.1", None, "v1.4.363"):
+            with self.subTest(api_version=api_version), self.assertRaisesRegex(gate.GateError, "MAJOR.MINOR.PATCH"):
+                gate.layer_record(self.manifest(api_version), "1.4.363")
+
+    def test_the_manifest_comes_from_the_loader_log(self):
+        manifest = self.manifest("1.4.363")
+        log = LOADER_LOG.format(library="/layers/libVkLayer_khronos_validation.so", manifest=manifest)
+        self.assertEqual(gate.layer_manifest(log), manifest)
+        with self.assertRaisesRegex(gate.GateError, "names no manifest"):
+            gate.layer_manifest(log.replace("Manifest:", "Manifesto"))
+        with self.assertRaisesRegex(gate.GateError, "names no manifest"):
+            gate.layer_manifest("")
+
+    def check(self, log, code=0, minimum="1.4.363"):
+        def run(command, path, environment, timeout):
+            self.assertEqual(command[-1], "--canary")
+            path.write_text(log, encoding="utf-8")
+            return code
+
+        with unittest.mock.patch.object(gate, "run", run):
+            return gate.check_layer(self.root, {}, 10, minimum)
+
+    def test_the_canary_must_be_reported_by_the_inserted_layer(self):
+        manifest = self.manifest("1.4.363")
+        loader = LOADER_LOG.format(library="/layers/libVkLayer_khronos_validation.so", manifest=manifest)
+        reported = "Validation Error: [ " + gate.CANARY_VUID + " ] | MessageID = 0x0 | vkCreateBuffer(): size is zero.\n"
+        record = self.check(loader + reported)
+        self.assertEqual(record["library"], "/layers/libVkLayer_khronos_validation.so")
+        self.assertEqual(record["canary"], gate.CANARY_VUID)
+        self.assertEqual(self.check(loader + gate.CANARY_VUID + "(ERROR / SPEC): msgNum: 1 - size is zero\n")["api_version"], "1.4.363")
+        for log, code, reason in ((loader + "canary: zero-size vkCreateBuffer returned 0\n", 0, "did not report"),
+                                  (loader + "environment: " + gate.CANARY_VUID + "\n", 0, "did not report"),
+                                  ("Layer VK_LAYER_KHRONOS_validation " + gate.MISSING_LAYER + "\n" + reported, 0, "ran without"),
+                                  (reported, 0, "ran without"),
+                                  (loader + reported, 5, "exited with 5")):
+            with self.subTest(reason=reason), self.assertRaisesRegex(gate.GateError, reason):
+                self.check(log, code)
+        with self.assertRaisesRegex(gate.GateError, "older than the minimum 1.4.364"):
+            self.check(loader + reported, minimum="1.4.364")
+
+    def test_tests_must_insert_the_layer_the_canary_checked(self):
+        def report(library):
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "junit.xml"
+                path.write_text('<testsuite><testcase name="probe"><system-err>' + gate.INSERTED_LAYER + " (" + library
+                                + ")</system-err></testcase></testsuite>", encoding="utf-8")
+                return gate.parse_report(path, {"probe"}, "/checked/libVkLayer_khronos_validation.so")
+
+        tests, problems = report("/checked/libVkLayer_khronos_validation.so")
+        self.assertEqual(problems, [])
+        self.assertEqual(tests["probe"]["layer_libraries"], ["/checked/libVkLayer_khronos_validation.so"])
+        self.assertEqual(report("/other/libVkLayer_khronos_validation.so")[1], ["probe"])
+
+    def test_a_malformed_minimum_is_refused_before_output_creation(self):
+        output = self.root / "evidence"
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            gate.main(["--baseline", ".", "0" * 40, "--candidate", ".", "0" * 40, "--output", str(output), "--target", "t",
+                       "--tests", ".*", "--gpu", "g", "--minimum-layer-version", "1.4"])
+        self.assertEqual(raised.exception.code, 2)
+        self.assertFalse(output.exists())
+
+
+class CanaryTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.environment = {**os.environ, **gate.FORCED}
+        probe = {key: value for key, value in os.environ.items() if key != "VK_INSTANCE_LAYERS"}
+        command = [sys.executable, str(Path(gate.__file__).resolve()), "--canary"]
+        if subprocess.run(command, env=probe, capture_output=True, timeout=120).returncode:
+            self.skipTest("no Vulkan loader or device")
+        try:
+            gate.check_layer(self.root, self.environment, 120, "0.0.0")
+        except gate.GateError as error:
+            self.skipTest("no working validation layer: " + str(error))
+
+    def test_the_installed_layer_reports_the_canary(self):
+        record = gate.check_layer(self.root, self.environment, 120, "0.0.0")
+        self.assertEqual(record["canary"], gate.CANARY_VUID)
+        self.assertTrue(Path(record["manifest"]).is_file())
+
+    def test_an_absent_layer_fails_the_canary(self):
+        empty = self.root / "no-layers"
+        empty.mkdir()
+        environment = {**self.environment, "VK_LAYER_PATH": str(empty), "VK_ADD_LAYER_PATH": ""}
+        with self.assertRaisesRegex(gate.GateError, "ran without"):
+            gate.check_layer(self.root, environment, 120, "0.0.0")
+
+    def test_a_silenced_layer_fails_the_canary(self):
+        environment = {**self.environment, "VK_LAYER_MESSAGE_ID_FILTER": gate.CANARY_VUID}
+        with self.assertRaisesRegex(gate.GateError, "did not report"):
+            gate.check_layer(self.root, environment, 120, "0.0.0")
+
+
 @unittest.skipUnless(shutil.which("cmake") and shutil.which("ninja") and shutil.which("ctest"), "requires CMake, Ninja and CTest")
 class FixtureTests(unittest.TestCase):
     def setUp(self):
@@ -165,7 +303,9 @@ class FixtureTests(unittest.TestCase):
         output = self.root / "evidence"
         arguments = ["--baseline", str(baseline[0]), baseline[1], "--candidate", str(candidate[0]), candidate[1],
                      "--output", str(output), "--target", "fixture", "--tests", ".*", "--gpu", "fixture", *extra]
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+        layer = {"manifest": "fixture.json", "api_version": gate.MINIMUM_LAYER_VERSION, "library": "fixture", "canary": gate.CANARY_VUID}
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()), \
+                unittest.mock.patch.object(gate, "check_layer", getattr(self, "check_layer", lambda *_: layer)):
             code = gate.main(arguments)
         report = json.loads((output / "report.json").read_text()) if (output / "report.json").is_file() else None
         return code, report
@@ -254,6 +394,23 @@ class LayerTests(FixtureTests):
         message = "Layer VK_LAYER_KHRONOS_validation was not found but was requested by env var VK_INSTANCE_LAYERS"
         code, report = self.execute(self.source("base"), self.source("head", message), "--repeat", "1")
         self.assertEqual(code, 1, report)
+
+    def test_a_failed_layer_check_stops_before_building(self):
+        def check_layer(*_):
+            raise gate.GateError("the validation layer did not report the canary")
+
+        self.check_layer = check_layer
+        code, report = self.execute(self.source("base"), self.source("head"), "--repeat", "1")
+        self.assertEqual(code, 2, report)
+        self.assertIn("canary", report["error"])
+        self.assertEqual(report["builds"], {})
+        self.assertEqual(report["iterations"], [])
+
+    def test_the_checked_layer_is_recorded(self):
+        code, report = self.execute(self.source("base"), self.source("head"), "--repeat", "1")
+        self.assertEqual(code, 0, report)
+        self.assertEqual(report["layer"]["api_version"], gate.MINIMUM_LAYER_VERSION)
+        self.assertEqual(report["layer"]["canary"], gate.CANARY_VUID)
 
     def test_ctest_success_without_layer_insertion_is_a_gate_failure(self):
         code, report = self.execute(self.source("base"), self.source("head", layer=False), "--repeat", "1")
