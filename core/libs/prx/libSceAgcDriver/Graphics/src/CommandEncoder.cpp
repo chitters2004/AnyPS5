@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadCpuTime.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -32,6 +34,17 @@ HandoffSite& IdleSite() {
 HandoffSite& AwaitSite() {
     static HandoffSite site{"encoder_await", HandoffSpinWindow()};
     return site;
+}
+
+const char* PostCauseScope(CommandEncoder::PostCause cause) {
+    switch (cause) {
+        case CommandEncoder::PostCause::Window: return TraceFormat::EncoderPostWindowScope;
+        case CommandEncoder::PostCause::Full: return TraceFormat::EncoderPostFullScope;
+        case CommandEncoder::PostCause::Recording: return TraceFormat::EncoderPostRecordingScope;
+        case CommandEncoder::PostCause::Await: return TraceFormat::EncoderPostAwaitScope;
+        case CommandEncoder::PostCause::Foreign: return TraceFormat::EncoderPostForeignScope;
+        default: return TraceFormat::EncoderPostBatchEndScope;
+    }
 }
 constexpr std::size_t RecordAlign = 16;
 
@@ -474,6 +487,10 @@ void installAt(std::size_t slot, DeviceFunctions& table, std::index_sequence<S..
 
 }
 
+bool CommandEncoder::PostsChunks() {
+    return RuntimeSwitches::Set(RuntimeSwitch::EncoderPostChunks);
+}
+
 bool CommandEncoder::Enabled() {
     static const bool enabled = [] {
         const char* inline_ = std::getenv("APS5_RECORD_INLINE");
@@ -518,11 +535,13 @@ CommandEncoder::CommandEncoder(VkDevice device, DeviceFunctions& table, std::siz
 CommandEncoder::~CommandEncoder() {
     Quiesce();
     stopping.store(true, std::memory_order_seq_cst);
+    enqueue(&stopMark);
     posted.fetch_add(1, std::memory_order_seq_cst);
     AddressWakeAll(posted);
     worker.join();
     delete filling;
-    for (auto* chunk = spare; chunk != nullptr;) delete std::exchange(chunk, chunk->next);
+    for (auto* chunk = ownSpares; chunk != nullptr;) delete std::exchange(chunk, chunk->next.load(std::memory_order_relaxed));
+    for (auto* chunk = spares.exchange(nullptr, std::memory_order_acquire); chunk != nullptr;) delete std::exchange(chunk, chunk->next.load(std::memory_order_relaxed));
     std::lock_guard lock(slotMutex());
     table = real;
     slots()[slot].encoder.store(nullptr, std::memory_order_release);
@@ -553,14 +572,17 @@ void CommandEncoder::RefuseForeignProducer() {
 }
 
 void CommandEncoder::Close() {
-    post();
+    if (filling != nullptr) ++filling->windows;
     const auto closed = windows.back().commands;
     windows.pop_back();
     if (windows.empty()) {
         target.store(VK_NULL_HANDLE, std::memory_order_relaxed);
         recording = nullptr;
+        if (PostsChunks()) park();
+        else post(PostCause::Window);
         return;
     }
+    post(PostCause::Window);
     if (windows.back().commands != closed) await();
     recording = windows.back().recording;
     recent.store(windows.back().commands, std::memory_order_relaxed);
@@ -569,24 +591,26 @@ void CommandEncoder::Close() {
 
 std::byte* CommandEncoder::Append(Run run, std::size_t bytes) {
     const auto need = RecordHeader + aligned(bytes);
-    if (filling != nullptr && (filling->recording != recording || filling->used + need > filling->bytes.size())) post();
+    if (filling == nullptr) reclaim();
+    if (filling != nullptr && filling->records != 0) {
+        if (filling->recording != recording || filling->target != target.load(std::memory_order_relaxed)) post(PostCause::Recording);
+        else if (filling->used + need > filling->bytes.size()) post(PostCause::Full);
+    }
+    if (filling != nullptr && filling->records == 0 && filling->bytes.size() < need) giveSpare(std::exchange(filling, nullptr));
     if (filling == nullptr) {
-        {
-            std::lock_guard lock(queueMutex);
-            if (spare != nullptr) filling = std::exchange(spare, spare->next);
-        }
+        filling = takeSpare();
         if (filling == nullptr) filling = new Chunk;
         try {
             if (filling->bytes.size() < std::max(ChunkBytes, need)) filling->bytes.resize(std::max(ChunkBytes, need));
         } catch (...) {
-            auto* chunk = std::exchange(filling, nullptr);
-            std::lock_guard lock(queueMutex);
-            chunk->next = std::exchange(spare, chunk);
+            giveSpare(std::exchange(filling, nullptr));
             throw;
         }
+    }
+    if (filling->records == 0) {
         filling->used = 0;
-        filling->records = 0;
-        filling->next = nullptr;
+        filling->windows = 0;
+        filling->next.store(nullptr, std::memory_order_relaxed);
         filling->target = target.load(std::memory_order_relaxed);
         filling->recording = recording;
     }
@@ -597,29 +621,114 @@ std::byte* CommandEncoder::Append(Run run, std::size_t bytes) {
     return at + RecordHeader;
 }
 
-void CommandEncoder::post() noexcept {
-    if (filling == nullptr || filling->records == 0) return;
-    const auto records = filling->records;
+void CommandEncoder::enqueue(Chunk* chunk) noexcept {
+    chunk->next.store(nullptr, std::memory_order_relaxed);
+    auto* previous = tail.exchange(chunk, std::memory_order_acq_rel);
+    previous->next.store(chunk, std::memory_order_release);
+}
+
+CommandEncoder::Chunk* CommandEncoder::dequeue() noexcept {
+    auto* first = head;
+    auto* next = first->next.load(std::memory_order_acquire);
+    if (first == &stub) {
+        if (next == nullptr) return nullptr;
+        head = next;
+        first = next;
+        next = next->next.load(std::memory_order_acquire);
+    }
+    if (next != nullptr) {
+        head = next;
+        return first;
+    }
+    if (tail.load(std::memory_order_acquire) != first) return nullptr;
+    enqueue(&stub);
+    next = first->next.load(std::memory_order_acquire);
+    if (next == nullptr) return nullptr;
+    head = next;
+    return first;
+}
+
+CommandEncoder::Chunk* CommandEncoder::takeSpare() noexcept {
+    if (ownSpares == nullptr) ownSpares = spares.exchange(nullptr, std::memory_order_acquire);
+    if (ownSpares == nullptr) return nullptr;
+    return std::exchange(ownSpares, ownSpares->next.load(std::memory_order_relaxed));
+}
+
+void CommandEncoder::giveSpare(Chunk* chunk) noexcept {
+    auto* top = spares.load(std::memory_order_relaxed);
+    do {
+        chunk->next.store(top, std::memory_order_relaxed);
+    } while (!spares.compare_exchange_weak(top, chunk, std::memory_order_release, std::memory_order_relaxed));
+}
+
+void CommandEncoder::publish(Chunk* chunk, PostCause cause) noexcept {
+    const auto records = chunk->records;
     commandCount.fetch_add(records, std::memory_order_relaxed);
     postCount.fetch_add(1, std::memory_order_relaxed);
+    windowCount.fetch_add(chunk->windows, std::memory_order_relaxed);
+    postsBy[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
     if (PerformanceTrace::Recording()) {
         if (auto* thread = PerformanceTrace::Thread()) {
             thread->Count(TraceFormat::EncoderPostScope);
             thread->Count(TraceFormat::EncoderCommandScope, records);
+            thread->Count(TraceFormat::EncoderWindowScope, chunk->windows);
+            thread->Count(PostCauseScope(cause));
         }
     }
-    {
-        std::lock_guard lock(queueMutex);
-        auto* chunk = std::exchange(filling, nullptr);
-        (tail != nullptr ? tail->next : head) = chunk;
-        tail = chunk;
-    }
+    enqueue(chunk);
     posted.fetch_add(1, std::memory_order_seq_cst);
     if (sleeping.load(std::memory_order_seq_cst)) AddressWakeOne(posted);
 }
 
+void CommandEncoder::park() noexcept {
+    if (filling == nullptr || filling->records == 0) return;
+    parked.store(std::exchange(filling, nullptr), std::memory_order_release);
+}
+
+void CommandEncoder::reclaim() noexcept {
+    for (;;) {
+        auto* chunk = parked.load(std::memory_order_acquire);
+        if (chunk == nullptr) return;
+        if (chunk == &busyMark) {
+            SpinPause();
+            continue;
+        }
+        if (parked.compare_exchange_weak(chunk, nullptr, std::memory_order_acquire, std::memory_order_relaxed)) {
+            filling = chunk;
+            return;
+        }
+    }
+}
+
+void CommandEncoder::flushParked() noexcept {
+    const auto cause = owner.load(std::memory_order_relaxed) == std::this_thread::get_id() ? PostCause::Await : PostCause::Foreign;
+    for (;;) {
+        auto* chunk = parked.load(std::memory_order_acquire);
+        if (chunk == nullptr) return;
+        if (chunk == &busyMark) {
+            SpinPause();
+            continue;
+        }
+        if (!parked.compare_exchange_weak(chunk, &busyMark, std::memory_order_acquire, std::memory_order_relaxed)) continue;
+        publish(chunk, cause);
+        parked.store(nullptr, std::memory_order_release);
+        return;
+    }
+}
+
+void CommandEncoder::post(PostCause cause) noexcept {
+    if (filling == nullptr) reclaim();
+    if (filling == nullptr || filling->records == 0) return;
+    publish(std::exchange(filling, nullptr), cause);
+}
+
 void CommandEncoder::Quiesce() noexcept {
-    post();
+    post(PostCause::Await);
+    await();
+}
+
+void CommandEncoder::FinishBatch() noexcept {
+    post(PostCause::BatchEnd);
     await();
 }
 
@@ -629,6 +738,7 @@ bool CommandEncoder::Direct() noexcept {
 }
 
 void CommandEncoder::Settle() noexcept {
+    flushParked();
     await();
 }
 
@@ -666,9 +776,21 @@ void CommandEncoder::execute(Chunk& chunk) {
 }
 
 void CommandEncoder::run() {
+    PerformanceTrace::BindThread("command encoder");
     std::uint64_t taken = 0;
+    auto cpuMark = ThisThreadCpuTime();
+    const auto reportCpu = [&] {
+        if (!PerformanceTrace::Recording()) return;
+        auto* thread = PerformanceTrace::Thread();
+        if (thread == nullptr) return;
+        const auto used = std::chrono::duration_cast<std::chrono::microseconds>(ThisThreadCpuTime() - cpuMark);
+        if (used.count() <= 0) return;
+        cpuMark += used;
+        thread->Count(TraceFormat::EncoderCpuScope, static_cast<std::uint64_t>(used.count()));
+    };
     for (;;) {
         if (posted.load(std::memory_order_acquire) == taken) {
+            reportCpu();
             const auto spin = IdleSite().Spin([&] { return posted.load(std::memory_order_acquire) != taken; });
             if (!spin.ready) {
                 sleeping.store(true, std::memory_order_seq_cst);
@@ -678,18 +800,15 @@ void CommandEncoder::run() {
             PerformanceTrace::Handoff(IdleSite(), spin);
             continue;
         }
-        Chunk* chunk = nullptr;
-        {
-            std::lock_guard lock(queueMutex);
-            if (head != nullptr) {
-                chunk = std::exchange(head, head->next);
-                if (head == nullptr) tail = nullptr;
-            }
+        auto* chunk = dequeue();
+        if (chunk == nullptr) {
+            SpinPause();
+            continue;
         }
         ++taken;
-        if (chunk == nullptr) {
-            if (stopping.load(std::memory_order_acquire)) return;
-            continue;
+        if (chunk == &stopMark) {
+            reportCpu();
+            return;
         }
         auto& recording = *chunk->recording;
         if (!recording.failed.load(std::memory_order_relaxed)) {
@@ -700,17 +819,17 @@ void CommandEncoder::run() {
                 recording.failed.store(true, std::memory_order_release);
             }
         }
-        {
-            std::lock_guard lock(queueMutex);
-            chunk->next = std::exchange(spare, chunk);
-        }
+        chunk->records = 0;
+        giveSpare(chunk);
         executed.fetch_add(1, std::memory_order_seq_cst);
         if (awaiting.load(std::memory_order_seq_cst) != 0) AddressWakeAll(executed);
     }
 }
 
 CommandEncoder::Statistics CommandEncoder::Counts() const {
-    return {postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed)};
+    Statistics counts{postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), windowCount.load(std::memory_order_relaxed), {}};
+    for (std::size_t index = 0; index < counts.postsBy.size(); ++index) counts.postsBy[index] = postsBy[index].load(std::memory_order_relaxed);
+    return counts;
 }
 
 void CommandEncoder::SetDelayForTesting(std::function<void()> delay) {

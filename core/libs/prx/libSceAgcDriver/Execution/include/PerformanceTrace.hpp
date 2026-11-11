@@ -531,6 +531,14 @@ public:
     static constexpr char EncoderPostScope[] = "Encoder.post";
     static constexpr char EncoderCommandScope[] = "Encoder.command";
     static constexpr char EncoderWaitScope[] = "Encoder.wait";
+    static constexpr char EncoderWindowScope[] = "Encoder.windows";
+    static constexpr char EncoderCpuScope[] = "Encoder.cpu_us";
+    static constexpr char EncoderPostWindowScope[] = "Encoder.post.window";
+    static constexpr char EncoderPostFullScope[] = "Encoder.post.full";
+    static constexpr char EncoderPostRecordingScope[] = "Encoder.post.recording";
+    static constexpr char EncoderPostAwaitScope[] = "Encoder.post.await";
+    static constexpr char EncoderPostForeignScope[] = "Encoder.post.foreign";
+    static constexpr char EncoderPostBatchEndScope[] = "Encoder.post.batch_end";
     static constexpr char SpinHitScope[] = "Spin.hit";
     static constexpr char SpinMissScope[] = "Spin.miss";
     static constexpr char SpinBlockScope[] = "Spin.block";
@@ -694,6 +702,9 @@ public:
         std::uint64_t encoderPosts = 0;
         std::uint64_t encoderCommands = 0;
         std::uint64_t encoderWaits = 0;
+        std::uint64_t encoderWindows = 0;
+        std::uint64_t encoderCpuUs = 0;
+        std::map<std::string, std::uint64_t> encoderCauses;
         Clock::duration encoderWait{};
         struct SpinSite {
             std::uint64_t hits = 0;
@@ -726,6 +737,9 @@ public:
                 if (total.stage == nullptr && std::find(WorkerBusyScopes.begin(), WorkerBusyScopes.end(), scope) != WorkerBusyScopes.end()) busy += total.length;
                 if (total.stage == nullptr && scope == EncoderPostScope) encoderPosts += total.count;
                 else if (total.stage == nullptr && scope == EncoderCommandScope) encoderCommands += total.count;
+                else if (total.stage == nullptr && scope == EncoderWindowScope) encoderWindows += total.count;
+                else if (total.stage == nullptr && scope == EncoderCpuScope) encoderCpuUs += total.count;
+                else if (total.stage == nullptr && scope.starts_with("Encoder.post.")) encoderCauses[std::string(scope.substr(13))] += total.count;
                 else if (total.stage == nullptr && scope == EncoderWaitScope) {
                     encoderWaits += total.count;
                     encoderWait += total.length;
@@ -767,7 +781,16 @@ public:
             output += ':' + std::to_string(value);
         }
         output += '}';
-        output += ",\"encoder\":{\"posts\":" + std::to_string(encoderPosts) + ",\"commands\":" + std::to_string(encoderCommands) + ",\"waits\":" + std::to_string(encoderWaits) + ",\"wait_ms_per_frame\":" + number(milliseconds(encoderWait) * perPresent) + '}';
+        output += ",\"encoder\":{\"posts\":" + std::to_string(encoderPosts) + ",\"commands\":" + std::to_string(encoderCommands) + ",\"waits\":" + std::to_string(encoderWaits) + ",\"wait_ms_per_frame\":" + number(milliseconds(encoderWait) * perPresent);
+        output += ",\"windows\":" + std::to_string(encoderWindows) + ",\"posts_per_frame\":" + number(static_cast<double>(encoderPosts) * perPresent) + ",\"waits_per_frame\":" + number(static_cast<double>(encoderWaits) * perPresent) + ",\"windows_per_post\":" + number(encoderPosts != 0 ? static_cast<double>(encoderWindows) / static_cast<double>(encoderPosts) : 0.0) + ",\"cpu_ms_per_frame\":" + number(static_cast<double>(encoderCpuUs) / 1000.0 * perPresent) + ",\"posts_by_cause\":{";
+        bool firstCause = true;
+        for (const auto& [cause, count] : encoderCauses) {
+            if (!firstCause) output += ',';
+            firstCause = false;
+            AppendString(output, cause);
+            output += ':' + std::to_string(count);
+        }
+        output += "}}";
         output += ",\"handoff_spin\":{";
         bool firstSite = true;
         for (const auto& [name, site] : spinSites) {

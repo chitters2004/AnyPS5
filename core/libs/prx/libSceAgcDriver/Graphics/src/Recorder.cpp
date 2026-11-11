@@ -4357,7 +4357,7 @@ void Recorder::Submit() {
     auto batch = std::move(open);
     const DiscardUnsubmitted discardUnsubmitted{*this, batch};
     if (encoder != nullptr) {
-        encoder->Quiesce();
+        encoder->FinishBatch();
         batch->recording.Finish();
     }
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");

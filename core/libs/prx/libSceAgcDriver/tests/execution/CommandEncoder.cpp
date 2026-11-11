@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/tests/AllocationFailure.hpp"
 #include <algorithm>
 #include <atomic>
@@ -1175,33 +1176,99 @@ void SparsePostsAndWaitsNeverLoseAWake() {
     Compare({{commands, expected}}, "sparse posts with owner and foreign waits");
 }
 
+std::uint64_t PostsBy(const CommandEncoder::Statistics& counts, CommandEncoder::PostCause cause) {
+    return counts.postsBy[static_cast<std::size_t>(cause)];
+}
+
+void ChunkPostingBatchesWindows() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x56);
+    const auto commands = Handle<VkCommandBuffer>(0x1900);
+    constexpr std::uint32_t Windows = 200;
+    std::vector<std::string> expected;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        for (std::uint32_t index = 0; index < Windows; ++index) {
+            PostOne(encoder, table, commands, index);
+            expected.push_back("draw " + std::to_string(index) + " 1 0 0");
+        }
+        const auto parked = encoder.Counts();
+        Require(Recorded(commands) == 0 && parked.posts == 0, "a closed window was posted while posting by chunks: " + std::to_string(parked.posts) + " posts, " + std::to_string(Recorded(commands)) + " commands recorded");
+        encoder.FinishBatch();
+        const auto counts = encoder.Counts();
+        Require(counts.posts == 1 && counts.windows == Windows && PostsBy(counts, CommandEncoder::PostCause::BatchEnd) == 1, "posting by chunks took " + std::to_string(counts.posts) + " posts for " + std::to_string(counts.windows) + " of " + std::to_string(Windows) + " windows instead of one at the batch end");
+    }
+    Compare({{commands, expected}}, "windows posted by chunks");
+}
+
+void ForeignFlushesKeepTheOwnersOrder() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x57);
+    const auto commands = Handle<VkCommandBuffer>(0x1a00);
+    std::vector<std::string> expected;
+    std::uint64_t foreignPosts = 0;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        std::atomic<bool> stop{false};
+        std::thread foreign([&] {
+            while (!stop.load(std::memory_order_relaxed)) AgcDriver::Graphics::BeforeCommandLookup(device);
+        });
+        std::mt19937 random(13);
+        for (std::uint32_t index = 0; index < 20000; ++index) {
+            PostOne(encoder, table, commands, index);
+            expected.push_back("draw " + std::to_string(index) + " 1 0 0");
+            if (random() % 64 == 0) encoder.Quiesce();
+        }
+        stop.store(true, std::memory_order_relaxed);
+        foreign.join();
+        encoder.Quiesce();
+        foreignPosts = PostsBy(encoder.Counts(), CommandEncoder::PostCause::Foreign);
+    }
+    Compare({{commands, expected}}, "parked chunks flushed by a foreign thread");
+    Require(foreignPosts != 0, "no foreign thread flushed a parked chunk, so the race was not exercised");
+}
+
+void RunAll(bool chunks) {
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::EncoderPostChunks, chunks);
+    for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
+    OtherThreadsRecordDirectlyWhileAWindowIsOpen();
+    HookDuringUnencodedOpsWaits();
+    EveryCommandOfTheTableIsInterposed();
+    NestedWindowKeepsOrder();
+    LargeRecordsSpanChunks();
+    TransfersAndQueriesInAWindowNeverWait();
+    PackedRecordsSkipAFailedRecording();
+    QueriesKeepOrderWithTheirRecording();
+    UnwindingSettlesQueuedRecording();
+    OwnersOutliveTheUnwindDrain();
+    ForeignThreadCannotProduceIntoAnOpenWindow();
+    ForeignLookupWhileAWindowIsOpenProceeds();
+    RawCallAfterLookupKeepsOrder();
+    FailedReplayStaysWithItsRecording();
+    FinishCarriesAnUnreportedFailure();
+    DirectCallsSkipAFailedRecording();
+    AppendFailureKeepsTheWindow();
+    DevicesPastTheSlotsRecordInline();
+    PostingNeverAllocates();
+    ReplayFailureNeedsNoAllocation();
+    EncoderSleepsBetweenFrequentPosts();
+    if (!chunks) EncoderKeepsUpWithoutAWait();
+    ParkedEncoderWakesForEveryWait();
+    SparsePostsAndWaitsNeverLoseAWake();
+    if (chunks) {
+    ChunkPostingBatchesWindows();
+    ForeignFlushesKeepTheOwnersOrder();
+    }
+}
+
 int main() {
     try {
-        for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
-        OtherThreadsRecordDirectlyWhileAWindowIsOpen();
-        HookDuringUnencodedOpsWaits();
-        EveryCommandOfTheTableIsInterposed();
-        NestedWindowKeepsOrder();
-        LargeRecordsSpanChunks();
-        TransfersAndQueriesInAWindowNeverWait();
-        PackedRecordsSkipAFailedRecording();
-        QueriesKeepOrderWithTheirRecording();
-        UnwindingSettlesQueuedRecording();
-        OwnersOutliveTheUnwindDrain();
-        ForeignThreadCannotProduceIntoAnOpenWindow();
-        ForeignLookupWhileAWindowIsOpenProceeds();
-        RawCallAfterLookupKeepsOrder();
-        FailedReplayStaysWithItsRecording();
-        FinishCarriesAnUnreportedFailure();
-        DirectCallsSkipAFailedRecording();
-        AppendFailureKeepsTheWindow();
-        DevicesPastTheSlotsRecordInline();
-        PostingNeverAllocates();
-        ReplayFailureNeedsNoAllocation();
-        EncoderSleepsBetweenFrequentPosts();
-        EncoderKeepsUpWithoutAWait();
-        ParkedEncoderWakesForEveryWait();
-        SparsePostsAndWaitsNeverLoseAWake();
+        RunAll(false);
+        RunAll(true);
         std::cout << "command encoder tests passed\n";
         return 0;
     } catch (const std::exception& error) {

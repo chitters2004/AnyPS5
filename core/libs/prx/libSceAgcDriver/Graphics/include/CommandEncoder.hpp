@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -39,7 +40,9 @@ public:
         std::atomic<bool> failed{false};
         bool reported = false;
     };
+    enum class PostCause : std::size_t { Window, Full, Recording, Await, Foreign, BatchEnd, Count };
     static bool Enabled();
+    static bool PostsChunks();
     static constexpr std::size_t Slots = 4;
     static std::unique_ptr<CommandEncoder> Attach(VkDevice device, DeviceFunctions& table);
     ~CommandEncoder();
@@ -48,6 +51,7 @@ public:
     void Open(VkCommandBuffer commands, Recording& recording);
     void Close();
     void Quiesce() noexcept;
+    void FinishBatch() noexcept;
     bool Direct() noexcept;
     void Settle() noexcept;
     [[noreturn]] static void RefuseForeignProducer();
@@ -57,7 +61,7 @@ public:
         if (owner.load(std::memory_order_relaxed) != std::this_thread::get_id()) RefuseForeignProducer();
         return true;
     }
-    bool Behind(VkCommandBuffer commands) const { return commands == recent.load(std::memory_order_relaxed) && executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire); }
+    bool Behind(VkCommandBuffer commands) const { return commands == recent.load(std::memory_order_relaxed) && (parked.load(std::memory_order_acquire) != nullptr || executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire)); }
     std::byte* Append(Run run, std::size_t bytes);
     AgcDriver::Mutex& PoolMutex() { return poolMutex; }
     const DeviceFunctions& Real() const { return real; }
@@ -67,6 +71,8 @@ public:
         std::uint64_t waits = 0;
         std::uint64_t waitNs = 0;
         std::uint64_t encodeNs = 0;
+        std::uint64_t windows = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(PostCause::Count)> postsBy{};
     };
     Statistics Counts() const;
     static void SetDelayForTesting(std::function<void()> delay);
@@ -89,9 +95,10 @@ private:
         std::vector<std::byte> bytes;
         std::size_t used = 0;
         std::size_t records = 0;
+        std::size_t windows = 0;
         VkCommandBuffer target = VK_NULL_HANDLE;
         Recording* recording = nullptr;
-        Chunk* next = nullptr;
+        std::atomic<Chunk*> next{nullptr};
     };
     struct Window {
         VkCommandBuffer commands;
@@ -99,7 +106,15 @@ private:
     };
     CommandEncoder(VkDevice device, DeviceFunctions& table, std::size_t slot);
     static std::size_t claim();
-    void post() noexcept;
+    void post(PostCause cause) noexcept;
+    void enqueue(Chunk* chunk) noexcept;
+    Chunk* dequeue() noexcept;
+    void publish(Chunk* chunk, PostCause cause) noexcept;
+    void park() noexcept;
+    void reclaim() noexcept;
+    void flushParked() noexcept;
+    Chunk* takeSpare() noexcept;
+    void giveSpare(Chunk* chunk) noexcept;
     void run();
     void execute(Chunk& chunk);
     void await() noexcept;
@@ -112,10 +127,14 @@ private:
     std::atomic<VkCommandBuffer> recent{VK_NULL_HANDLE};
     Recording* recording = nullptr;
     Chunk* filling = nullptr;
-    AgcDriver::Mutex queueMutex;
-    Chunk* head = nullptr;
-    Chunk* tail = nullptr;
-    Chunk* spare = nullptr;
+    Chunk stub;
+    Chunk stopMark;
+    Chunk busyMark;
+    std::atomic<Chunk*> tail{&stub};
+    Chunk* head = &stub;
+    std::atomic<Chunk*> parked{nullptr};
+    std::atomic<Chunk*> spares{nullptr};
+    Chunk* ownSpares = nullptr;
     std::atomic<std::uint64_t> posted{0};
     std::atomic<std::uint64_t> executed{0};
     std::atomic<bool> sleeping{false};
@@ -129,6 +148,8 @@ private:
     std::atomic<std::uint64_t> waitCount{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> encodeNs{0};
+    std::atomic<std::uint64_t> windowCount{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PostCause::Count)> postsBy{};
 };
 
 }

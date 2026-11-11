@@ -492,11 +492,15 @@ def validate_interval(record):
     encoder = record.get("encoder", {})
     if not isinstance(encoder, dict):
         raise ValueError("encoder must be an object")
-    for name in ("posts", "commands", "waits"):
+    for name in ("posts", "commands", "waits", "windows", "submits"):
         if name in encoder and (type(encoder[name]) is not int or encoder[name] < 0):
             raise ValueError(f"encoder.{name} must be a non-negative integer")
-    if "wait_ms_per_frame" in encoder:
-        interval_number(encoder["wait_ms_per_frame"], "encoder.wait_ms_per_frame")
+    for name in ("wait_ms_per_frame", "posts_per_frame", "waits_per_frame", "windows_per_post", "cpu_ms_per_frame"):
+        if name in encoder:
+            interval_number(encoder[name], f"encoder.{name}")
+    causes = encoder.get("posts_by_cause", {})
+    if not isinstance(causes, dict) or any(not isinstance(name, str) or type(value) is not int or value < 0 for name, value in causes.items()):
+        raise ValueError("encoder.posts_by_cause must map causes to non-negative integers")
     sites = record.get("handoff_spin", {})
     if not isinstance(sites, dict):
         raise ValueError("handoff_spin must be an object")
@@ -563,10 +567,11 @@ def markdown_intervals(result):
         for index, row in enumerate(rows, 1):
             lines.append(f"| {index} | " + " | ".join(str(row["owned_draw_counts"].get(name, 0)) if row["owned_draw_counts"] is not None else "-" for name in count_names) + " |")
     if any(row["encoder"] and row["encoder"].get("posts") for row in rows):
-        lines += ["", "| # | encoder posts | commands | waits | wait ms/frame |", "|---|---|---|---|---|"]
+        lines += ["", "| # | encoder posts | commands | waits | wait ms/frame | posts/frame | windows/post | encoder cpu ms/frame | posts by cause |", "|---|---|---|---|---|---|---|---|---|"]
         for index, row in enumerate(rows, 1):
             encoder = row["encoder"] or {}
-            lines.append(f"| {index} | {encoder.get('posts', 0)} | {encoder.get('commands', 0)} | {encoder.get('waits', 0)} | {encoder.get('wait_ms_per_frame', 0.0):.2f} |")
+            causes = ", ".join(f"{name} {count}" for name, count in sorted((encoder.get("posts_by_cause") or {}).items())) or "-"
+            lines.append(f"| {index} | {encoder.get('posts', 0)} | {encoder.get('commands', 0)} | {encoder.get('waits', 0)} | {encoder.get('wait_ms_per_frame', 0.0):.2f} | {encoder.get('posts_per_frame', 0.0):.1f} | {encoder.get('windows_per_post', 0.0):.2f} | {encoder.get('cpu_ms_per_frame', 0.0):.2f} | {table_cell(causes)} |")
     spin_sites = sorted({site for row in rows for site in (row["handoff_spin"] or {})})
     if spin_sites:
         lines += ["", "| # | hand-off site | hits | misses | spin ms/frame | block ms/frame |", "|---|---|---|---|---|---|"]

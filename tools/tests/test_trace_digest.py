@@ -436,17 +436,23 @@ class TraceDigestTests(unittest.TestCase):
     def test_encoder_interval_counts_are_preserved(self):
         first = interval_line(0.0, 30.0, 20.0, 5.0)
         second = interval_line(30.0, 60.0, 20.0, 5.0)
-        first["encoder"] = {"posts": 3100, "commands": 84000, "waits": 23, "wait_ms_per_frame": 0.25}
+        first["encoder"] = {"posts": 3100, "commands": 84000, "waits": 23, "wait_ms_per_frame": 0.25, "windows": 3100, "posts_per_frame": 31.0, "waits_per_frame": 0.23, "windows_per_post": 1.0, "cpu_ms_per_frame": 2.5, "posts_by_cause": {"window": 3000, "batch_end": 100}}
         for line in (first, second):
             trace_digest.validate_interval(line)
         result = trace_digest.digest_intervals([first, second])
         self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
         text = trace_digest.markdown_intervals(result)
-        self.assertIn("| 1 | 3100 | 84000 | 23 | 0.25 |", text)
-        self.assertIn("| 2 | 0 | 0 | 0 | 0.00 |", text)
+        self.assertIn("| 1 | 3100 | 84000 | 23 | 0.25 | 31.0 | 1.00 | 2.50 | batch_end 100, window 3000 |", text)
+        self.assertIn("| 2 | 0 | 0 | 0 | 0.00 | 0.0 | 0.00 | 0.00 | - |", text)
         self.assertNotIn("encoder posts", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
         first["encoder"] = {"waits": -1}
         with self.assertRaises(ValueError):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"posts_by_cause": {"full": -2}}
+        with self.assertRaisesRegex(ValueError, "encoder.posts_by_cause"):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"windows_per_post": "many"}
+        with self.assertRaisesRegex(ValueError, "encoder.windows_per_post"):
             trace_digest.validate_interval(first)
 
     def test_handoff_spin_interval_sites_are_preserved(self):
