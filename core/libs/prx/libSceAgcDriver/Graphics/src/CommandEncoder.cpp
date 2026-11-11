@@ -931,7 +931,11 @@ void CommandEncoder::execute(Chunk& chunk) {
             at += record.bytes;
         }
     }
-    encodeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    const auto end = std::chrono::steady_clock::now();
+    encodeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
+    if (PerformanceTrace::Recording()) {
+        if (auto* thread = PerformanceTrace::Thread()) thread->Add(TraceFormat::EncodeScope, nullptr, start, end);
+    }
 }
 
 void CommandEncoder::run() {
@@ -952,6 +956,9 @@ void CommandEncoder::run() {
         if (posted.load(std::memory_order_acquire) == taken) {
             reportCpu();
             const auto spin = IdleSite().Spin([&] { return posted.load(std::memory_order_acquire) != taken; });
+            if (spin.start != spin.end && PerformanceTrace::Recording()) {
+                if (auto* thread = PerformanceTrace::Thread()) thread->Add(TraceFormat::EncoderSpinScope, nullptr, spin.start, spin.end);
+            }
             if (!spin.ready) {
                 sleeping.store(true, std::memory_order_seq_cst);
                 if (posted.load(std::memory_order_seq_cst) == taken) AddressWait(posted, taken);

@@ -29,6 +29,9 @@ window captures in the same file are skipped."""
 RAMP = "._:-=+*#%@"
 
 
+ENCODER_FIELDS = ("tickets_per_frame", "encode_ms_per_frame", "spin_ms_per_frame", "submit_waits_per_frame", "submit_wait_ms_per_frame")
+
+
 def is_wait(name):
     return "wait" in name.lower()
 
@@ -495,7 +498,7 @@ def validate_interval(record):
     for name in ("posts", "commands", "waits", "windows", "submits"):
         if name in encoder and (type(encoder[name]) is not int or encoder[name] < 0):
             raise ValueError(f"encoder.{name} must be a non-negative integer")
-    for name in ("wait_ms_per_frame", "posts_per_frame", "waits_per_frame", "windows_per_post", "cpu_ms_per_frame"):
+    for name in ("wait_ms_per_frame", "posts_per_frame", "waits_per_frame", "windows_per_post", "cpu_ms_per_frame") + ENCODER_FIELDS:
         if name in encoder:
             interval_number(encoder[name], f"encoder.{name}")
     causes = encoder.get("posts_by_cause", {})
@@ -581,6 +584,11 @@ def markdown_intervals(result):
             encoder = row["encoder"] or {}
             causes = ", ".join(f"{name} {count}" for name, count in sorted((encoder.get("posts_by_cause") or {}).items())) or "-"
             lines.append(f"| {index} | {encoder.get('posts', 0)} | {encoder.get('commands', 0)} | {encoder.get('waits', 0)} | {encoder.get('wait_ms_per_frame', 0.0):.2f} | {encoder.get('posts_per_frame', 0.0):.1f} | {encoder.get('windows_per_post', 0.0):.2f} | {encoder.get('cpu_ms_per_frame', 0.0):.2f} | {table_cell(causes)} |")
+    if any(row["encoder"] and any(row["encoder"].get(name) for name in ENCODER_FIELDS) for row in rows):
+        lines += ["", "| # | tickets/frame | encode ms/frame | spin ms/frame | submit waits/frame | submit wait ms/frame |", "|---|---|---|---|---|---|"]
+        for index, row in enumerate(rows, 1):
+            encoder = row["encoder"] or {}
+            lines.append(f"| {index} | " + " | ".join(f"{encoder.get(name, 0.0):.2f}" for name in ENCODER_FIELDS) + " |")
     if any(row["encoder"] and row["encoder"].get("submit") for row in rows):
         lines += ["", "| # | async submits | submits/frame | settle waits | settle ms/frame | present settle waits | present settle ms/frame |", "|---|---|---|---|---|---|---|"]
         for index, row in enumerate(rows, 1):

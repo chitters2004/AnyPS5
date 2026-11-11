@@ -534,6 +534,9 @@ public:
     static constexpr char EncoderWindowScope[] = "Encoder.windows";
     static constexpr char EncoderCpuScope[] = "Encoder.cpu_us";
     static constexpr char EncoderSubmitScope[] = "Encoder.submit";
+    static constexpr char EncodeScope[] = "Graphics.Encode";
+    static constexpr char EncoderSpinScope[] = "Encoder.spin";
+    static constexpr char SubmitWaitScope[] = "Submitter.wait";
     static constexpr char EncoderSettleScope[] = "Encoder.settle";
     static constexpr char EncoderSettlePresentScope[] = "Encoder.settle.present";
     static constexpr char EncoderPostWindowScope[] = "Encoder.post.window";
@@ -708,6 +711,8 @@ public:
         std::uint64_t encoderWindows = 0;
         std::uint64_t encoderCpuUs = 0;
         std::uint64_t encoderSubmits = 0;
+        std::uint64_t tickets = 0, submitWaits = 0;
+        Clock::duration encode{}, encoderSpin{}, submitWait{};
         std::pair<std::uint64_t, Clock::duration> encoderSettle{}, encoderPresentSettle{};
         std::map<std::string, std::uint64_t> encoderCauses;
         Clock::duration encoderWait{};
@@ -745,6 +750,15 @@ public:
                 else if (total.stage == nullptr && scope == EncoderWindowScope) encoderWindows += total.count;
                 else if (total.stage == nullptr && scope == EncoderCpuScope) encoderCpuUs += total.count;
                 else if (total.stage == nullptr && scope == EncoderSubmitScope) encoderSubmits += total.count;
+                else if (total.stage == nullptr && scope == EncodeScope) {
+                    tickets += total.count;
+                    encode += total.length;
+                } else if (total.stage == nullptr && scope == EncoderSpinScope) {
+                    encoderSpin += total.length;
+                } else if (total.stage == nullptr && scope == SubmitWaitScope) {
+                    submitWaits += total.count;
+                    submitWait += total.length;
+                }
                 else if (total.stage == nullptr && (scope == EncoderSettleScope || scope == EncoderSettlePresentScope)) {
                     auto& settle = scope == EncoderSettlePresentScope ? encoderPresentSettle : encoderSettle;
                     settle.first += total.count;
@@ -793,7 +807,8 @@ public:
         }
         output += '}';
         output += ",\"encoder\":{\"posts\":" + std::to_string(encoderPosts) + ",\"commands\":" + std::to_string(encoderCommands) + ",\"waits\":" + std::to_string(encoderWaits) + ",\"wait_ms_per_frame\":" + number(milliseconds(encoderWait) * perPresent);
-        output += ",\"windows\":" + std::to_string(encoderWindows) + ",\"posts_per_frame\":" + number(static_cast<double>(encoderPosts) * perPresent) + ",\"waits_per_frame\":" + number(static_cast<double>(encoderWaits) * perPresent) + ",\"windows_per_post\":" + number(encoderPosts != 0 ? static_cast<double>(encoderWindows) / static_cast<double>(encoderPosts) : 0.0) + ",\"cpu_ms_per_frame\":" + number(static_cast<double>(encoderCpuUs) / 1000.0 * perPresent) + ",\"posts_by_cause\":{";
+        output += ",\"windows\":" + std::to_string(encoderWindows) + ",\"posts_per_frame\":" + number(static_cast<double>(encoderPosts) * perPresent) + ",\"waits_per_frame\":" + number(static_cast<double>(encoderWaits) * perPresent) + ",\"windows_per_post\":" + number(encoderPosts != 0 ? static_cast<double>(encoderWindows) / static_cast<double>(encoderPosts) : 0.0) + ",\"cpu_ms_per_frame\":" + number(static_cast<double>(encoderCpuUs) / 1000.0 * perPresent);
+        output += ",\"tickets_per_frame\":" + number(static_cast<double>(tickets) * perPresent) + ",\"encode_ms_per_frame\":" + number(milliseconds(encode) * perPresent) + ",\"spin_ms_per_frame\":" + number(milliseconds(encoderSpin) * perPresent) + ",\"submit_waits_per_frame\":" + number(static_cast<double>(submitWaits) * perPresent) + ",\"submit_wait_ms_per_frame\":" + number(milliseconds(submitWait) * perPresent) + ",\"posts_by_cause\":{";
         bool firstCause = true;
         for (const auto& [cause, count] : encoderCauses) {
             if (!firstCause) output += ',';

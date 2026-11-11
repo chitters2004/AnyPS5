@@ -354,13 +354,13 @@ void SummaryFields() {
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":35.000},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000,\"Driver.Packet.draw\":5.000,\"Driver.Present\":3.000,\"Driver.Present.inflight_wait\":2.000,\"Driver.Completion\":1.000},"
-        "\"owned_draw_counts\":{},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},"
+        "\"owned_draw_counts\":{},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"tickets_per_frame\":0.000,\"encode_ms_per_frame\":0.000,\"spin_ms_per_frame\":0.000,\"submit_waits_per_frame\":0.000,\"submit_wait_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},"
         "\"trace_dropped\":false,\"trace\":\"aps5-trace-abc-7.json.gz\"}\n";
     Check(line == expected, "summary line changed");
     auto unboundSummary = summary;
     unboundSummary.ownedDrawUnbound = 3;
     const auto unboundLine = TraceFormat::Summary(unboundSummary, threads, presents);
-    Check(unboundLine.find("\"owned_draw_counts\":{\"OwnedDraw.unbound\":3},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},\"trace_dropped\":true") != std::string::npos, "unbound draw counts were not marked as incomplete");
+    Check(unboundLine.find("\"owned_draw_counts\":{\"OwnedDraw.unbound\":3},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"tickets_per_frame\":0.000,\"encode_ms_per_frame\":0.000,\"spin_ms_per_frame\":0.000,\"submit_waits_per_frame\":0.000,\"submit_wait_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},\"trace_dropped\":true") != std::string::npos, "unbound draw counts were not marked as incomplete");
     auto encoded = threads;
     encoded[0].totals.push_back({"Encoder.post", nullptr, {}, 3});
     encoded[1].totals.push_back({"Encoder.post", nullptr, {}, 2});
@@ -371,9 +371,14 @@ void SummaryFields() {
     encoded[0].totals.push_back({"Encoder.cpu_us", nullptr, {}, 4000});
     encoded[0].totals.push_back({"Encoder.post.window", nullptr, {}, 3});
     encoded[1].totals.push_back({"Encoder.post.batch_end", nullptr, {}, 2});
+    encoded[0].totals.push_back({"Graphics.Encode", nullptr, milliseconds(3), 4});
+    encoded[1].totals.push_back({"Graphics.Encode", nullptr, milliseconds(1), 2});
+    encoded[0].totals.push_back({"Encoder.spin", nullptr, milliseconds(1), 5});
+    encoded[1].totals.push_back({"Submitter.wait", nullptr, milliseconds(2), 2});
     const auto encodedLine = TraceFormat::Summary(summary, encoded, presents);
-    Check(encodedLine.find("\"encoder\":{\"posts\":5,\"commands\":40,\"waits\":4,\"wait_ms_per_frame\":3.000,\"windows\":40,\"posts_per_frame\":2.500,\"waits_per_frame\":2.000,\"windows_per_post\":8.000,\"cpu_ms_per_frame\":2.000,\"posts_by_cause\":{\"batch_end\":2,\"window\":3}}") != std::string::npos, "encoder posts, commands, waits, windows, CPU and post causes were not summed across threads");
+    Check(encodedLine.find("\"encoder\":{\"posts\":5,\"commands\":40,\"waits\":4,\"wait_ms_per_frame\":3.000,\"windows\":40,\"posts_per_frame\":2.500,\"waits_per_frame\":2.000,\"windows_per_post\":8.000,\"cpu_ms_per_frame\":2.000,\"tickets_per_frame\":3.000,\"encode_ms_per_frame\":2.000,\"spin_ms_per_frame\":0.500,\"submit_waits_per_frame\":1.000,\"submit_wait_ms_per_frame\":1.000,\"posts_by_cause\":{\"batch_end\":2,\"window\":3}}") != std::string::npos, "encoder posts, commands, waits, windows, CPU and post causes were not summed across threads");
     Check(encodedLine.find("Encoder.") == std::string::npos, "encoder scopes were listed as phases");
+    Check(encodedLine.find("Graphics.Encode") == std::string::npos && encodedLine.find("Submitter.") == std::string::npos, "encode and submitter scopes were listed as phases");
     auto spun = threads;
     spun[0].totals.push_back({"Spin.hit", "drain", milliseconds(2), 30});
     spun[1].totals.push_back({"Spin.hit", "drain", milliseconds(2), 10});
@@ -499,7 +504,7 @@ void IntervalSummaryFields() {
         "\"frame_ms\":{\"p50\":24.000,\"p90\":24.000,\"p99\":24.000,\"max\":24.000},\"gpu_busy_ms_per_present\":10.000,"
         "\"worker_busy_pct\":{\"queue worker 0x0\":30.000},"
         "\"top_phases_ms_per_frame\":{\"Driver.Packet\":6.000},"
-        "\"owned_draw_counts\":{},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},\"trace_dropped\":false,\"trace\":\"\"}\n";
+        "\"owned_draw_counts\":{},\"encoder\":{\"posts\":0,\"commands\":0,\"waits\":0,\"wait_ms_per_frame\":0.000,\"windows\":0,\"posts_per_frame\":0.000,\"waits_per_frame\":0.000,\"windows_per_post\":0.000,\"cpu_ms_per_frame\":0.000,\"tickets_per_frame\":0.000,\"encode_ms_per_frame\":0.000,\"spin_ms_per_frame\":0.000,\"submit_waits_per_frame\":0.000,\"submit_wait_ms_per_frame\":0.000,\"posts_by_cause\":{}},\"handoff_spin\":{},\"trace_dropped\":false,\"trace\":\"\"}\n";
     Check(line == expected, "interval summary line changed");
 }
 

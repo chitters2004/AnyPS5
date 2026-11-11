@@ -455,6 +455,22 @@ class TraceDigestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "encoder.windows_per_post"):
             trace_digest.validate_interval(first)
 
+    def test_encoder_ticket_fields_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"tickets_per_frame": 130.0, "encode_ms_per_frame": 6.5, "spin_ms_per_frame": 0.25, "submit_waits_per_frame": 0.0, "submit_wait_ms_per_frame": 0.0}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 130.00 | 6.50 | 0.25 | 0.00 | 0.00 |", text)
+        self.assertIn("| 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |", text)
+        self.assertNotIn("tickets/frame", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"encode_ms_per_frame": "slow"}
+        with self.assertRaisesRegex(ValueError, "encoder.encode_ms_per_frame"):
+            trace_digest.validate_interval(first)
+
     def test_encoder_submit_settles_are_preserved(self):
         first = interval_line(0.0, 30.0, 20.0, 5.0)
         second = interval_line(30.0, 60.0, 20.0, 5.0)
