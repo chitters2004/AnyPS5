@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -262,6 +264,22 @@ void FailedPrepareReachesTheWorker() {
 
 }
 
+void DriverThreadsAreNamed() {
+#ifdef __linux__
+    bool committer = false;
+    bool finisher = false;
+    for (const auto& task : std::filesystem::directory_iterator("/proc/self/task")) {
+        std::ifstream comm(task.path() / "comm");
+        std::string name;
+        std::getline(comm, name);
+        committer = committer || name == "draw-commit";
+        finisher = finisher || name == "draw-finish";
+    }
+    Require(committer, "the draw committer thread is not named draw-commit");
+    Require(finisher, "the draw finisher thread is not named draw-finish");
+#endif
+}
+
 int main() {
     try {
         if (DrawPipeline::Depth() == 0) return 77;
@@ -274,6 +292,7 @@ int main() {
         IdleDrainRethrowsAFailedPreparation();
         ResidencyIsCountedByKind();
         FullRingHoldsTheProducer();
+        DriverThreadsAreNamed();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;
     } catch (const std::exception& error) {

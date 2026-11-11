@@ -391,7 +391,7 @@ std::vector<std::pair<pid_t, std::string>> DriverThreads() {
             std::ifstream comm(std::string("/proc/self/task/") + entry->d_name + "/comm");
             std::string name;
             std::getline(comm, name);
-            if (name.rfind("qworker 0x0", 0) == 0 || name.rfind("draw-commit", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
+            if (name.rfind("qworker 0x0", 0) == 0 || name.rfind("draw-commit", 0) == 0 || name.rfind("draw-finish", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
         }
         closedir(tasks);
     }
