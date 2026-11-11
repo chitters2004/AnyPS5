@@ -110,6 +110,7 @@ std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
 struct WriteIndexStats {
+    std::uint64_t calls = 0;
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
     std::uint64_t bumps = 0;
