@@ -1549,7 +1549,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         std::vector<std::shared_ptr<ShaderResources>> resources;
         SharedResourceCache().RemoveImage(image.get(), &resources);
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
-            if (image.use_count() > 1) recorder->KeepBytes(image.get(), static_cast<std::size_t>(heldBytes(*image)));
+            if (image.use_count() > 1) recorder->Retain(image.get(), static_cast<std::size_t>(heldBytes(*image)));
             for (auto& resource : resources) {
                 resource->KeepStorageImageBytes(*recorder);
                 recorder->Keep(std::move(resource));
@@ -1923,7 +1923,7 @@ ShaderResources::ShaderResources(const Context& context, const ShaderRecompiler:
 
 void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
     const auto keep = [&](const std::shared_ptr<StorageTexture>& image) {
-        if (image != nullptr && !image->Cached()) recorder.KeepBytes(image.get(), static_cast<std::size_t>(image->BudgetBytes()));
+        if (image != nullptr && !image->Cached()) recorder.Retain(image.get(), static_cast<std::size_t>(image->BudgetBytes()));
     };
     for (const auto& image : storageTextures) keep(image);
     for (const auto& texture : textures) {
@@ -2324,7 +2324,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     for (const auto& shader : shaders) if (shader.registeredImageViews != nullptr) registeredImageViews.insert(registeredImageViews.end(), shader.registeredImageViews->begin(), shader.registeredImageViews->end());
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource capture");
     PerformanceTimer frameTiming("Resources.Prepare");
-    const auto stageStart = std::chrono::steady_clock::now();
+    const auto stageStart = BuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     phaseStart = stageStart;
     if (BuildProfiled()) {
         auto& profile = ThreadBuilds();
@@ -2733,7 +2733,7 @@ void ShaderResources::buildComplete() {
     BuildLookups lookups;
     Require(!completed, "cannot update a published descriptor heap");
     Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed after resource preparation");
-    const auto stageStart = std::chrono::steady_clock::now();
+    const auto stageStart = BuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     phaseStart = stageStart;
     try {
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
@@ -2903,6 +2903,7 @@ void ShaderResources::buildComplete() {
         }
         timing.descriptorsMs += phase(BuildPhase::Descriptors);
         noteReusable();
+        compileBindings();
         completed = true;
         if (BuildProfiled()) {
             timing.completeMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - stageStart).count();
@@ -2947,6 +2948,8 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
+std::atomic<std::uint64_t> inPlaceReadReuses{0};
+std::atomic<std::uint64_t> effectsProbed{0}, effectsRepeated{0}, effectsIdentical{0};
 thread_local bool indexProof = false;
 
 }
@@ -3006,6 +3009,368 @@ void ShaderResources::noteReusable() {
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::InPlaceReadReuses() {
+    return inPlaceReadReuses.load(std::memory_order_relaxed);
+}
+
+struct ShaderResources::BindingInputs {
+    struct Slot {
+        std::size_t allocation = 0;
+        const void* buffer = nullptr;
+        VkDeviceSize offset = 0;
+        std::size_t bytes = 0;
+        bool operator==(const Slot&) const = default;
+    };
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::vector<Slot> slots;
+};
+
+namespace {
+
+std::array<std::atomic<std::uint64_t>, sizeof(ShaderResources::BindingCounts) / sizeof(std::uint64_t)> bindingCounters{};
+
+bool DrawBindingsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+}
+
+ShaderResources::BindingCounts ShaderResources::DrawBindingCounts() {
+    std::array<std::uint64_t, sizeof(BindingCounts) / sizeof(std::uint64_t)> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) values[index] = bindingCounters[index].load(std::memory_order_relaxed);
+    BindingCounts counts{};
+    std::memcpy(&counts, values.data(), sizeof(counts));
+    return counts;
+}
+
+struct ShaderResources::CompiledBindings {
+    struct Candidate {
+        std::size_t allocation = 0;
+        std::uint64_t begin = 0;
+        std::size_t bytes = 0;
+    };
+    std::vector<Candidate> candidates;
+    std::array<bool, 2> described{};
+    std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+    std::array<std::optional<std::uint32_t>, 2> variable;
+};
+
+struct ShaderResources::BindingReuse {
+    struct Slot {
+        std::size_t allocation = 0;
+        const Buffer* buffer = nullptr;
+        VkDeviceSize offset = 0;
+        std::size_t bytes = 0;
+        bool operator==(const Slot&) const = default;
+    };
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::uint64_t generation = 0;
+    bool faulted = false;
+    VkDescriptorBufferInfo fault{};
+    std::vector<Slot> slots;
+    std::weak_ptr<DrawBindings> bindings;
+};
+
+namespace {
+
+enum ReuseCounter : std::size_t {
+    ReuseReused,
+    ReuseFresh,
+    ReuseLegacy,
+    ReuseFirst,
+    ReuseNewBatch,
+    ReuseGeneration,
+    ReuseFaultRecord,
+    ReuseOverrideWords,
+    ReuseSlotChanged,
+    ReuseExpired,
+    ReuseNanoseconds,
+};
+
+std::array<std::atomic<std::uint64_t>, sizeof(ShaderResources::BindingReuseCounts) / sizeof(std::uint64_t)> reuseCounters{};
+
+void countReuse(ReuseCounter counter, std::uint64_t amount = 1) {
+    auto& value = reuseCounters[counter];
+    value.store(value.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+bool VerifyCompiledBindings() {
+    static const bool verify = std::getenv("APS5_VERIFY_COMPILED_BINDINGS") != nullptr;
+    return verify;
+}
+
+bool SameBufferInfo(const VkDescriptorBufferInfo& left, const VkDescriptorBufferInfo& right) {
+    return left.buffer == right.buffer && left.offset == right.offset && left.range == right.range;
+}
+
+[[noreturn]] void CompiledBindingsDiffer(const std::string& difference) {
+    std::fprintf(stderr, "[draw-bindings] compiled bindings differ from the per-draw path: %s%c", difference.c_str(), 10);
+    std::fflush(stderr);
+    std::abort();
+}
+
+}
+
+ShaderResources::BindingReuseCounts ShaderResources::DrawBindingReuseCounts() {
+    std::array<std::uint64_t, sizeof(BindingReuseCounts) / sizeof(std::uint64_t)> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) values[index] = reuseCounters[index].load(std::memory_order_relaxed);
+    BindingReuseCounts counts{};
+    std::memcpy(&counts, values.data(), sizeof(counts));
+    return counts;
+}
+
+bool ShaderResources::CompiledBindingsEnabled() {
+    static const bool enabled = std::getenv("APS5_COMPILED_BINDINGS") != nullptr || VerifyCompiledBindings();
+    return enabled;
+}
+
+void ShaderResources::noteBindingsChanged() const {
+    ++bindingGeneration;
+}
+
+void ShaderResources::describeDrawSets(std::array<bool, 2>& described, std::array<std::vector<VkDescriptorPoolSize>, 2>& sizes, std::array<std::optional<std::uint32_t>, 2>& variable) const {
+    described = {};
+    for (auto& set : sizes) set.clear();
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        described[set] = true;
+        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        if (count == 0) continue;
+        auto& setSizes = sizes[set];
+        const auto held = std::find_if(setSizes.begin(), setSizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (held != setSizes.end()) held->descriptorCount += count;
+        else setSizes.push_back({binding.layout.descriptorType, count});
+    }
+    for (auto& set : sizes) std::sort(set.begin(), set.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    for (std::size_t set = 0; set < variable.size(); ++set) variable[set] = tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
+}
+
+void ShaderResources::compileBindings() {
+    if (!CompiledBindingsEnabled()) return;
+    auto compiled = std::make_unique<CompiledBindings>();
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+        compiled->candidates.push_back({index, item.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(item.size, item.adjustment))});
+    }
+    describeDrawSets(compiled->described, compiled->sizes, compiled->variable);
+    compiledBindings = std::move(compiled);
+    noteBindingsChanged();
+}
+
+void ShaderResources::decideBindingsLegacy(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const {
+    decisions.clear();
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (override != moved.end()) {
+            if (!override->words.empty()) decisions.push_back({index, &*override, 0, override->size, true});
+            else decisions.push_back({index, &*override, override->address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(override->size, item.adjustment)), false});
+            continue;
+        }
+        if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+        decisions.push_back({index, nullptr, item.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(item.size, item.adjustment)), false});
+    }
+}
+
+void ShaderResources::decideBindingsCompiled(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const {
+    decisions.clear();
+    thread_local std::vector<const MovedBuffer*>* overridesSlot = nullptr;
+    auto& overrides = ShaderRecompiler::ThreadOwned(overridesSlot);
+    overrides.clear();
+    for (const auto& entry : moved) {
+        if (entry.allocation >= allocations.size()) continue;
+        overrides.push_back(&entry);
+        for (auto place = overrides.end() - 1; place != overrides.begin() && (*(place - 1))->allocation > (*place)->allocation; --place) std::iter_swap(place - 1, place);
+    }
+    const auto& candidates = compiledBindings->candidates;
+    auto candidate = candidates.begin();
+    const auto candidatesEnd = movedOnly ? candidates.begin() : candidates.end();
+    auto override = overrides.begin();
+    while (candidate != candidatesEnd || override != overrides.end()) {
+        if (override != overrides.end() && (candidate == candidatesEnd || (*override)->allocation <= candidate->allocation)) {
+            const auto& entry = **override;
+            const auto index = entry.allocation;
+            if (!entry.words.empty()) decisions.push_back({index, &entry, 0, entry.size, true});
+            else decisions.push_back({index, &entry, entry.address - allocations[index].adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, allocations[index].adjustment)), false});
+            while (override != overrides.end() && (*override)->allocation == index) ++override;
+            if (candidate != candidatesEnd && candidate->allocation == index) ++candidate;
+            continue;
+        }
+        decisions.push_back({candidate->allocation, nullptr, candidate->begin, candidate->bytes, false});
+        ++candidate;
+    }
+}
+
+std::string ShaderResources::bindingDecisionDifference(std::span<const BindingDecision> compiled, std::span<const BindingDecision> legacy) const {
+    const auto describe = [](const char* field, std::size_t position, std::uint64_t compiledValue, std::uint64_t legacyValue) {
+        return std::string("decisions[") + std::to_string(position) + "]." + field + " compiled " + std::to_string(compiledValue) + " per-draw " + std::to_string(legacyValue);
+    };
+    const auto shared = std::min(compiled.size(), legacy.size());
+    for (std::size_t position = 0; position < shared; ++position) {
+        const auto& left = compiled[position];
+        const auto& right = legacy[position];
+        if (left.allocation != right.allocation) return describe("allocation", position, left.allocation, right.allocation);
+        if (left.override != right.override) return describe("override", position, reinterpret_cast<std::uintptr_t>(left.override), reinterpret_cast<std::uintptr_t>(right.override));
+        if (left.words != right.words) return describe("words", position, left.words, right.words);
+        if (left.begin != right.begin) return describe("begin", position, left.begin, right.begin);
+        if (left.bytes != right.bytes) return describe("bytes", position, left.bytes, right.bytes);
+    }
+    if (compiled.size() != legacy.size()) return std::string("decisions.size compiled ") + std::to_string(compiled.size()) + " per-draw " + std::to_string(legacy.size());
+    if (compiledBindings == nullptr) return {};
+    std::array<bool, 2> described{};
+    std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+    std::array<std::optional<std::uint32_t>, 2> variable;
+    describeDrawSets(described, sizes, variable);
+    for (std::size_t set = 0; set < sizes.size(); ++set) {
+        if (described[set] != compiledBindings->described[set]) return std::string("described[") + std::to_string(set) + "]";
+        if (variable[set] != compiledBindings->variable[set]) return std::string("variable[") + std::to_string(set) + "]";
+        if (sizes[set].size() != compiledBindings->sizes[set].size()) return std::string("sizes[") + std::to_string(set) + "].size";
+        for (std::size_t entry = 0; entry < sizes[set].size(); ++entry) {
+            if (sizes[set][entry].type != compiledBindings->sizes[set][entry].type) return std::string("sizes[") + std::to_string(set) + "][" + std::to_string(entry) + "].type";
+            if (sizes[set][entry].descriptorCount != compiledBindings->sizes[set][entry].descriptorCount) return std::string("sizes[") + std::to_string(set) + "][" + std::to_string(entry) + "].descriptorCount";
+        }
+    }
+    return {};
+}
+
+bool ShaderResources::CompareBindingDecisionsForTest(std::span<const MovedBuffer> moved, bool movedOnly, std::string& difference) const {
+    Require(compiledBindings != nullptr, "the template's bindings were not compiled");
+    std::vector<BindingDecision> compiled;
+    std::vector<BindingDecision> legacy;
+    decideBindingsCompiled(moved, movedOnly, compiled);
+    decideBindingsLegacy(moved, movedOnly, legacy);
+    difference = bindingDecisionDifference(compiled, legacy);
+    return difference.empty();
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::reuseDrawBindings(const Recorder& recorder, const DrawBindings& candidate, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool words) const {
+    GuestMemory::AssertGpuLockHeld("ShaderResources::PrepareDrawBindings");
+    if (bindingReuse == nullptr) {
+        countReuse(ReuseFirst);
+        return {};
+    }
+    const auto& previous = *bindingReuse;
+    const auto batch = recorder.Recording() ? recorder.BatchEpoch() : 0;
+    if (previous.recorder != &recorder || batch == 0 || previous.batch != batch) {
+        countReuse(ReuseNewBatch);
+        return {};
+    }
+    if (previous.generation != bindingGeneration) {
+        countReuse(ReuseGeneration);
+        return {};
+    }
+    if (previous.faulted != (faultRecord != nullptr) || (faultRecord != nullptr && !SameBufferInfo(previous.fault, faultRecord->Fault()))) {
+        countReuse(ReuseFaultRecord);
+        return {};
+    }
+    if (words) {
+        countReuse(ReuseOverrideWords);
+        return {};
+    }
+    bool same = previous.slots.size() == selected.size();
+    for (std::size_t index = 0; same && index < selected.size(); ++index) {
+        const auto& snapshot = candidate.snapshots[index];
+        same = previous.slots[index] == BindingReuse::Slot{selected[index], snapshot.buffer.get(), snapshot.offset, snapshot.bytes};
+    }
+    if (!same) {
+        countReuse(ReuseSlotChanged);
+        return {};
+    }
+    auto reused = previous.bindings.lock();
+    if (reused == nullptr) countReuse(ReuseExpired);
+    return reused;
+}
+
+void ShaderResources::rememberDrawBindings(const Recorder& recorder, const std::shared_ptr<DrawBindings>& bindings, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+    if (bindingReuse == nullptr) bindingReuse = std::make_unique<BindingReuse>();
+    auto& reuse = *bindingReuse;
+    reuse.recorder = &recorder;
+    reuse.batch = recorder.Recording() ? recorder.BatchEpoch() : 0;
+    reuse.generation = bindingGeneration;
+    reuse.faulted = faultRecord != nullptr;
+    reuse.fault = faultRecord != nullptr ? faultRecord->Fault() : VkDescriptorBufferInfo{};
+    reuse.slots.clear();
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = bindings->snapshots[index];
+        reuse.slots.push_back({selected[index], snapshot.buffer.get(), snapshot.offset, snapshot.bytes});
+    }
+    reuse.bindings = bindings;
+}
+
+void ShaderResources::verifyReusedBindings(const DrawBindings& reused, DrawBindings& fresh, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+    writeDrawSets(fresh, selected, faultRecord, true);
+    const auto field = [](const char* name, std::size_t index, const char* member) { return std::string(name) + "[" + std::to_string(index) + "]." + member; };
+    if (reused.layout != fresh.layout) CompiledBindingsDiffer("layout");
+    if (reused.fragmentLayout != fresh.fragmentLayout) CompiledBindingsDiffer("fragmentLayout");
+    if ((reused.allocation.set == VK_NULL_HANDLE) != (fresh.allocation.set == VK_NULL_HANDLE)) CompiledBindingsDiffer("allocation.set");
+    if ((reused.fragmentAllocation.set == VK_NULL_HANDLE) != (fresh.fragmentAllocation.set == VK_NULL_HANDLE)) CompiledBindingsDiffer("fragmentAllocation.set");
+    if (reused.writtenBuffers.size() != fresh.writtenBuffers.size()) CompiledBindingsDiffer("writtenBuffers.size");
+    for (std::size_t index = 0; index < fresh.writtenBuffers.size(); ++index) {
+        const auto& left = reused.writtenBuffers[index];
+        const auto& right = fresh.writtenBuffers[index];
+        if (left.buffer != right.buffer) CompiledBindingsDiffer(field("writtenBuffers", index, "buffer"));
+        if (left.offset != right.offset) CompiledBindingsDiffer(field("writtenBuffers", index, "offset"));
+        if (left.range != right.range) CompiledBindingsDiffer(field("writtenBuffers", index, "range"));
+    }
+    if (reused.writtenImages.size() != fresh.writtenImages.size()) CompiledBindingsDiffer("writtenImages.size");
+    for (std::size_t index = 0; index < fresh.writtenImages.size(); ++index) {
+        const auto& left = reused.writtenImages[index];
+        const auto& right = fresh.writtenImages[index];
+        if (left.sampler != right.sampler) CompiledBindingsDiffer(field("writtenImages", index, "sampler"));
+        if (left.imageView != right.imageView) CompiledBindingsDiffer(field("writtenImages", index, "imageView"));
+        if (left.imageLayout != right.imageLayout) CompiledBindingsDiffer(field("writtenImages", index, "imageLayout"));
+    }
+}
+
+struct ShaderResources::EffectInputs {
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    const void* space = nullptr;
+    Recorder::ReadKind kind = Recorder::ReadKind::Count;
+    std::vector<std::pair<const void*, bool>> images;
+    bool operator==(const EffectInputs&) const = default;
+};
+
+namespace {
+
+Recorder::ReadKind InPlaceReadKind(bool lease, bool usesBda, bool bdaReadOnly) {
+    static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
+    return !lease ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+}
+
+}
+
+ShaderResources::EffectRepeats ShaderResources::EffectRepeatCounts() {
+    return {effectsProbed.load(std::memory_order_relaxed), effectsRepeated.load(std::memory_order_relaxed), effectsIdentical.load(std::memory_order_relaxed)};
+}
+
+void ShaderResources::ProbeEffectRepeat(const Recorder& recorder) {
+    auto current = std::make_unique<EffectInputs>();
+    current->recorder = &recorder;
+    current->batch = recorder.BatchEpoch();
+    const auto space = guestMemory.SplitInPlaceReads(current->reads);
+    if (space == nullptr) guestMemory.InPlaceReads(current->reads);
+    current->space = space.get();
+    current->kind = InPlaceReadKind(guestMemory.HoldsLease(), usesBda, bdaReadOnly);
+    const auto image = [&](const std::shared_ptr<StorageTexture>& texture) {
+        if (texture != nullptr) current->images.emplace_back(texture.get(), texture->Cached());
+    };
+    for (const auto& texture : storageTextures) image(texture);
+    for (const auto& texture : textures) {
+        if (texture != nullptr) image(texture->SharedStorageSource());
+    }
+    const bool repeated = effectInputs != nullptr && effectInputs->recorder == current->recorder && effectInputs->batch == current->batch;
+    effectsProbed.fetch_add(1, std::memory_order_relaxed);
+    if (repeated) effectsRepeated.fetch_add(1, std::memory_order_relaxed);
+    if (repeated && *effectInputs == *current) effectsIdentical.fetch_add(1, std::memory_order_relaxed);
+    effectInputs = std::move(current);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -4232,6 +4597,7 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
             descriptorImages[entry->position] = {VK_NULL_HANDLE, view, current->Layout()};
         }
         rebound = true;
+        noteBindingsChanged();
         countIndex(IndexRebound);
     }
     const auto& log = lookupLog();
@@ -6694,6 +7060,7 @@ void ShaderResources::release() noexcept {
     _layout = VK_NULL_HANDLE;
     fragment = {};
     tableWrites = {};
+    noteBindingsChanged();
 }
 
 std::uint32_t ShaderResources::setOf(const Binding& binding) const {
@@ -6897,27 +7264,60 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         if (elements.has_value()) context.descriptorCache->NoteTableDraw(*elements);
     }
+    const bool profiled = DrawBindingsProfiled();
+    const auto started = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    BindingCounts tally;
+    if (profiled) tally = {};
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     guestMemory.InPlaceReads(reads);
+    thread_local std::vector<BindingDecision>* decisionsSlot = nullptr;
+    auto& decisions = ShaderRecompiler::ThreadOwned(decisionsSlot);
+    const bool compiled = compiledBindings != nullptr;
+    if (compiled) {
+        decideBindingsCompiled(moved, movedOnly, decisions);
+        if (VerifyCompiledBindings()) {
+            thread_local std::vector<BindingDecision>* legacySlot = nullptr;
+            auto& legacy = ShaderRecompiler::ThreadOwned(legacySlot);
+            decideBindingsLegacy(moved, movedOnly, legacy);
+            if (const auto difference = bindingDecisionDifference(decisions, legacy); !difference.empty()) CompiledBindingsDiffer(difference);
+        }
+    } else {
+        decideBindingsLegacy(moved, movedOnly, decisions);
+        countReuse(ReuseLegacy);
+    }
+    const auto finish = [&] {
+        if (profiled) countReuse(ReuseNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+    };
+    if (profiled) {
+        tally.visited = allocations.size();
+        tally.written = allocations.size() - decisions.size();
+        for (const auto& decision : decisions) tally.overrides += decision.override != nullptr ? 1 : 0;
+    }
+    bool words = false;
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
-    auto result = std::make_shared<DrawBindings>();
+    std::shared_ptr<DrawBindings> result;
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
-        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
+        if (result == nullptr) {
+            result = std::make_shared<DrawBindings>();
+            result->snapshots.reserve(allocations.size());
+        }
         result->snapshots.push_back(std::move(snapshot));
     };
-    for (std::size_t index = 0; index < allocations.size(); ++index) {
+    for (const auto& decision : decisions) {
+        const auto index = decision.allocation;
         const auto& item = allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        if (override != moved.end() && !override->words.empty()) {
+        const auto* override = decision.override;
+        if (decision.words) {
+            words = true;
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
@@ -6927,19 +7327,23 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             keep({0, std::move(slice.buffer), slice.offset, override->size});
             continue;
         }
-        std::uint64_t address = item.address;
-        std::size_t size = item.size;
-        if (override != moved.end()) {
-            address = override->address;
-            size = override->size;
-        } else {
-            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+        if (override == nullptr) {
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!direct) {
+                if (profiled) ++tally.notDirect;
+                continue;
+            }
+            if (recorder.PendingWriteOverlaps(item.address, item.size)) {
+                if (profiled) ++tally.pendingWrite;
+                continue;
+            }
         }
-        const auto begin = address - item.adjustment;
-        const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        const auto begin = decision.begin;
+        const auto bytes = decision.bytes;
+        if (override == nullptr && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
+            if (profiled) ++tally.overBudget;
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
@@ -6957,8 +7361,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        if (profiled && buffer != nullptr) ++tally.unwritten;
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            if (profiled && uploaded) ++tally.uploaded;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
@@ -6967,6 +7373,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                if (profiled) ++(buffer != nullptr ? tally.reused : tally.created);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
@@ -6981,32 +7388,76 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty() && !rebound) return {};
-    writeDrawSets(*result, selected, faultRecord);
+    if (selected.empty() && !rebound) {
+        if (profiled) noteDrawBindings(recorder, tally, selected, nullptr, false);
+        finish();
+        return {};
+    }
+    if (result == nullptr) result = std::make_shared<DrawBindings>();
+    if (compiled) {
+        if (auto reused = reuseDrawBindings(recorder, *result, selected, faultRecord, words)) {
+            if (VerifyCompiledBindings()) verifyReusedBindings(*reused, *result, selected, faultRecord);
+            countReuse(ReuseReused);
+            if (profiled) noteDrawBindings(recorder, tally, selected, reused.get(), false);
+            finish();
+            return reused;
+        }
+    }
+    writeDrawSets(*result, selected, faultRecord, VerifyCompiledBindings());
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    if (compiled) {
+        rememberDrawBindings(recorder, result, selected, faultRecord);
+        countReuse(ReuseFresh);
+    }
+    if (profiled) noteDrawBindings(recorder, tally, selected, result.get(), true);
+    for (const auto& snapshot : result->snapshots) recorder.Retain(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    finish();
     return result;
 }
 
-void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
-    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
-    for (auto& sizes : counts) sizes.clear();
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        described[set] = true;
-        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-        if (count == 0) continue;
-        auto& sizes = counts[set];
-        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
-        if (held != sizes.end()) held->descriptorCount += count;
-        else sizes.push_back({binding.layout.descriptorType, count});
+void ShaderResources::noteDrawBindings(const Recorder& recorder, BindingCounts tally, std::span<const std::size_t> selected, const DrawBindings* result, bool written) const {
+    tally.calls = 1;
+    tally.setsWritten = written ? 1 : 0;
+    if (bindingInputs == nullptr) bindingInputs = std::make_unique<BindingInputs>();
+    auto& inputs = *bindingInputs;
+    thread_local std::vector<BindingInputs::Slot>* currentSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(currentSlot);
+    current.clear();
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result->snapshots[index];
+        current.push_back({selected[index], snapshot.buffer.get(), snapshot.offset, snapshot.bytes});
     }
-    for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
-    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
-    const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
+    const auto batch = recorder.Recording() ? recorder.BatchEpoch() : 0;
+    if (batch != 0 && inputs.recorder == &recorder && inputs.batch == batch) {
+        tally.repeated = 1;
+        const auto shared = std::min(current.size(), inputs.slots.size());
+        std::size_t differ = std::max(current.size(), inputs.slots.size()) - shared;
+        for (std::size_t index = 0; index < shared; ++index) differ += current[index] == inputs.slots[index] ? 0 : 1;
+        tally.slotsDiffer = differ;
+        tally.identical = differ == 0 ? 1 : 0;
+    }
+    inputs.recorder = &recorder;
+    inputs.batch = batch;
+    inputs.slots.assign(current.begin(), current.end());
+    std::array<std::uint64_t, sizeof(BindingCounts) / sizeof(std::uint64_t)> values{};
+    std::memcpy(values.data(), &tally, sizeof(tally));
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (values[index] != 0) bindingCounters[index].fetch_add(values[index], std::memory_order_relaxed);
+    }
+}
+
+void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool capture) const {
+    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    thread_local CompiledBindings* describedSlot = nullptr;
+    const CompiledBindings* compiled = compiledBindings.get();
+    if (compiled == nullptr) {
+        auto& fresh = ShaderRecompiler::ThreadOwned(describedSlot);
+        describeDrawSets(fresh.described, fresh.sizes, fresh.variable);
+        compiled = &fresh;
+    }
+    const auto& described = compiled->described;
+    const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(compiled->sizes[set]); };
+    const auto variableOf = [&](std::size_t set) { return compiled->variable[set]; };
     result.cache = context.descriptorCache;
     if (described[0] || splitSets) {
         result.allocation = result.cache->AllocateRewritten(_layout, sizesOf(0), updateAfterBind, variableOf(0));
@@ -7049,6 +7500,10 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    if (capture) {
+        result.writtenBuffers.assign(buffers.begin(), buffers.end());
+        result.writtenImages.assign(descriptorImages.begin(), descriptorImages.end());
+    }
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -7092,6 +7547,7 @@ void ShaderResources::prepareFaultSlot() const {
     const auto* recorder = Recorder::Active();
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
     if (!bda->TakeFaultSlot(context)) return;
+    noteBindingsChanged();
     std::vector<VkWriteDescriptorSet> writes;
     writes.reserve(faultDescriptors.size());
     for (const auto& fault : faultDescriptors) {
@@ -7155,14 +7611,19 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
-    static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
-    const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
-    if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+    const auto kind = InPlaceReadKind(guestMemory.HoldsLease(), usesBda, bdaReadOnly);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
+    auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
+    auto reads = std::move(ownedReads);
+    const auto capacity = reads.capacity();
+    if (auto space = guestMemory.SplitInPlaceReads(reads)) {
+        recorder.NotePendingReadList(std::move(space), kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        guestMemory.InPlaceReads(reads);
     }
+    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.store(inPlaceReadReuses.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    recorder.NotePendingReads(reads, kind);
+    ownedReads = std::move(reads);
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -7247,13 +7708,18 @@ void ShaderResources::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
+    StorageImages(images);
+    return images;
+}
+
+void ShaderResources::StorageImages(std::vector<std::pair<VkImage, bool>>& out) const {
+    out.clear();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
-        if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
+        if (storageTextures[index] != nullptr) out.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
-        if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
+        if (texture != nullptr && texture->StorageSource() != nullptr) out.emplace_back(texture->StorageSource()->Image(), false);
     }
-    return images;
 }
 
 bool ShaderResources::HasCachedStorageImages() const {

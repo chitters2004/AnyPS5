@@ -1,3 +1,4 @@
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -13,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
@@ -603,7 +605,8 @@ bool KeyStoresEach() {
 std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
-std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0};
+std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0}, readsRepeated{0};
+std::atomic<std::uint64_t> retainedByteRepeats{0};
 std::atomic<std::uint64_t> readHits[ReadKinds]{};
 
 bool ReadTrackingEnabled() {
@@ -1341,7 +1344,7 @@ struct Recorder::ProgressWatcher {
     }
 };
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), assertGpuLock(GuestMemory::GpuLockAssertsEnabled()) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -1965,7 +1968,7 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Recorder::ensureOpen() {
+void Recorder::beginBatch() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
@@ -1994,6 +1997,17 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        retentionCount = 0;
+        retainedByteOwners.Reset();
+        notedReadKeys.Reset();
+        notedReadLists.Reset();
+        if (++retentionEpoch == 0) {
+            for (auto& slot : retention) slot = {};
+            retainedByteOwners.Clear();
+            notedReadKeys.Clear();
+            notedReadLists.Clear();
+            ++retentionEpoch;
+        }
         open->predictedSerial = submissions + 1;
         try {
             if (open->queue == 0) WriteCheckpointSerial(context, open->commands, open->predictedSerial, open->queue);
@@ -3226,6 +3240,36 @@ std::shared_ptr<DeviceBuffer> Recorder::UploadScratchBuffer(UploadScratch kind, 
     return scratch;
 }
 
+void Recorder::ReserveRetention(std::size_t additional) {
+    ensureOpen();
+    if (additional > open->kept.max_size() - open->kept.size()) throw std::length_error("recorded owner count exceeds the batch capacity");
+    prepareRetention(additional);
+    const auto needed = open->kept.size() + additional;
+    if (needed <= open->kept.capacity()) return;
+    const auto grown = open->kept.capacity() <= open->kept.max_size() / 2 ? open->kept.capacity() * 2 : open->kept.max_size();
+    open->kept.reserve(std::max(needed, grown));
+}
+
+void Recorder::prepareRetention(std::size_t additional) {
+    if (additional > retention.max_size() / 2 - retentionCount) throw std::length_error("recorded owner lookup exceeds the batch capacity");
+    const auto needed = (retentionCount + additional) * 2;
+    if (needed <= retention.size()) return;
+    auto capacity = std::max<std::size_t>(64, retention.size());
+    while (capacity < needed) {
+        if (capacity > retention.max_size() / 2) throw std::length_error("recorded owner lookup exceeds the batch capacity");
+        capacity *= 2;
+    }
+    std::vector<RetentionSlot> grown(capacity);
+    const auto mask = grown.size() - 1;
+    for (const auto& slot : retention) {
+        if (slot.epoch != retentionEpoch) continue;
+        auto index = retentionHash(slot.object) & mask;
+        while (grown[index].epoch == retentionEpoch) index = (index + 1) & mask;
+        grown[index] = slot;
+    }
+    retention.swap(grown);
+}
+
 void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     ensureOpen();
     open->kept.push_back(std::move(object));
@@ -3246,10 +3290,15 @@ void Recorder::dropStaleHoldKept() {
     if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
 }
 
-void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
+void Recorder::Retain(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
-    if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    if (retainedByteOwners.Insert(owner, retentionEpoch)) open->keptBytes += bytes;
+    else retainedByteRepeats.store(retainedByteRepeats.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+}
+
+std::uint64_t Recorder::RetainedByteRepeats() {
+    return retainedByteRepeats.load(std::memory_order_relaxed);
 }
 
 void Recorder::BoundKeptBytes() {
@@ -3852,8 +3901,8 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
-    open->reads.push_back({address, address + bytes, kind});
-    readsNoted.fetch_add(1, std::memory_order_relaxed);
+    noteRead(address, address + bytes, kind);
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
@@ -3861,9 +3910,16 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
-        if (end > begin) open->reads.push_back({begin, end, kind});
+        if (end > begin) noteRead(begin, end, kind);
     }
-    readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges.size(), std::memory_order_relaxed);
+}
+
+void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
+    open->reads.push_back({begin, end, kind});
+    if (FlipReadCheck() || notedReadKeys.Insert({begin, end, kind}, retentionEpoch)) return;
+    open->reads.pop_back();
+    readsRepeated.store(readsRepeated.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
@@ -3881,11 +3937,10 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
         return;
     }
     ensureOpen();
-    readsNoted.fetch_add(ranges->size(), std::memory_order_relaxed);
-    for (const auto& note : open->readLists) {
-        if (note.ranges == ranges && note.kind == kind) return;
-    }
+    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges->size(), std::memory_order_relaxed);
+    const ReadListKey key{ranges.get(), kind};
     open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+    if (!notedReadLists.Insert(key, retentionEpoch)) open->readLists.pop_back();
 }
 
 std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only) {
@@ -3960,7 +4015,7 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}};
+    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}, readsRepeated.load(std::memory_order_relaxed)};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].load(std::memory_order_relaxed);
     return counts;
 }
@@ -4817,6 +4872,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us; command buffers freed at batch release %llu, fences kept for reuse %llu\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs, static_cast<unsigned long long>(commandBuffersFreed.load()), static_cast<unsigned long long>(fencesKept.load()));
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu, address-based read-only %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.hits[7]), static_cast<unsigned long long>(reads.staleIgnored));
+                    const auto effects = ShaderResources::EffectRepeatCounts();
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] repeated batch effects skipped: %llu reads already noted, %llu byte owners already retained, %llu layout stores, %llu pending-since loops, %llu in-place read lists filled without allocating; recorded resources (APS5_PROFILE_DRAW): %llu probed, %llu again in their batch, %llu of those with unchanged effect inputs\n", static_cast<unsigned long long>(reads.repeated), static_cast<unsigned long long>(RetainedByteRepeats()), static_cast<unsigned long long>(StorageTexture::LayoutStoreSkips()), static_cast<unsigned long long>(StorageTexture::PendingSinceSkips()), static_cast<unsigned long long>(ShaderResources::InPlaceReadReuses()), static_cast<unsigned long long>(effects.probed), static_cast<unsigned long long>(effects.repeated), static_cast<unsigned long long>(effects.identical));
+                    const auto bindings = ShaderResources::DrawBindingCounts();
+                    const auto perCall = [&](std::uint64_t value) { return bindings.calls != 0 ? static_cast<double>(value) / static_cast<double>(bindings.calls) : 0.0; };
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] draw bindings (APS5_PROFILE_DRAW): %llu calls, per call %.2f allocations visited (skipped: %.2f written, %.2f not in place, %.2f pending write, %.2f over budget), %.2f moved overrides, snapshots %.2f unwritten / %.2f uploaded / %.2f reused / %.2f new, %.2f sets written; %llu calls again in their batch, %llu with an identical binding set, %.2f slots differing per repeated call\n", static_cast<unsigned long long>(bindings.calls), perCall(bindings.visited), perCall(bindings.written), perCall(bindings.notDirect), perCall(bindings.pendingWrite), perCall(bindings.overBudget), perCall(bindings.overrides), perCall(bindings.unwritten), perCall(bindings.uploaded), perCall(bindings.reused), perCall(bindings.created), perCall(bindings.setsWritten), static_cast<unsigned long long>(bindings.repeated), static_cast<unsigned long long>(bindings.identical), bindings.repeated != 0 ? static_cast<double>(bindings.slotsDiffer) / static_cast<double>(bindings.repeated) : 0.0);
+                    const auto reuse = ShaderResources::DrawBindingReuseCounts();
+                    const auto prepared = reuse.reused + reuse.fresh + reuse.legacy;
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] draw binding sets (APS5_COMPILED_BINDINGS): %llu reused, %llu fresh, %llu per-draw walk; fresh because: %llu first, %llu new batch, %llu template changed, %llu fault slot, %llu override words, %llu slot changed, %llu released; %.3f us per call in the bindings phase\n", static_cast<unsigned long long>(reuse.reused), static_cast<unsigned long long>(reuse.fresh), static_cast<unsigned long long>(reuse.legacy), static_cast<unsigned long long>(reuse.first), static_cast<unsigned long long>(reuse.newBatch), static_cast<unsigned long long>(reuse.generation), static_cast<unsigned long long>(reuse.faultRecord), static_cast<unsigned long long>(reuse.overrideWords), static_cast<unsigned long long>(reuse.slotChanged), static_cast<unsigned long long>(reuse.expired), prepared != 0 ? static_cast<double>(reuse.nanoseconds) / 1000.0 / static_cast<double>(prepared) : 0.0);
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
