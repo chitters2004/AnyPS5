@@ -2786,6 +2786,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
+        if (UploadRefreshProofs() && !scoped && layerBehind.empty() && !anyBorrowed && current != 0 && generation >= current) takeRefreshProof(alias != nullptr);
     } else {
         uploadedKeys = keys;
     }
@@ -2860,6 +2861,11 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     const auto serial = PendingSerial();
     if (otherPendingOverlaps()) return;
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+}
+
+bool StorageTexture::UploadRefreshProofs() {
+    static const bool enabled = std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr;
+    return enabled;
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

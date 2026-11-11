@@ -517,6 +517,7 @@ public:
     static std::uint64_t PaddingSeedCopies();
     static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
+    static bool UploadRefreshProofs();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();

@@ -662,6 +662,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_UPLOAD_REFRESH_PROOF` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | makes a storage image's refresh that uploaded the whole image take a refresh proof, so the next refresh in the same collect epoch is proved instead of compared again |
 | `APS5_USB_STORAGE_PASSTHROUGH` | presence | `core/libs/prx/libSceUsbStorage/src/HostVolumes.cpp` |  | passes the FAT and exFAT volumes the host mounted from USB mass-storage devices through to the guest, read-only where the host mounted them read-only; unset, no host volume is scanned and the guest sees no USB storage device |
 
 ### libSceVideoOut
