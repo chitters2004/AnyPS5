@@ -236,7 +236,7 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
             require(count == 2, "a REWIND packet must be two dwords");
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
             submission.commands.push_back(header);
-            submission.commands.push_back(std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(guest + cursor + 1)).load(std::memory_order_acquire));
+            submission.commands.push_back(guest[cursor + 1]);
             cursor += count;
             submission.rewindTail = guest + cursor;
             submission.rewindWords = words - cursor;
