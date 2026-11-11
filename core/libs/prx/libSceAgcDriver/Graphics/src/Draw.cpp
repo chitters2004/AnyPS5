@@ -1462,6 +1462,13 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             copy.reused = true;
             return copy;
         }
+        if (RuntimeSwitches::Set(RuntimeSwitch::ObservedInputReuse)) {
+            copy.buffer = recorder->ObservedDrawSnapshot(address, bytes, use, &copy.derived);
+            if (copy.buffer != nullptr) {
+                copy.reused = true;
+                return copy;
+            }
+        }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived);

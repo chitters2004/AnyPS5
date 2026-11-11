@@ -3274,6 +3274,19 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     pool.bytes -= std::get<2>(entry->first);
     pool.recency.erase(entry->second.recent);
     drawSnapshots.erase(entry);
+    ++drawSnapshotsVersion;
+}
+
+std::map<Recorder::DrawSnapshotKey, Recorder::DrawSnapshot>::iterator Recorder::drawSnapshotAtLeast(const DrawSnapshotKey& key) {
+    if (drawSnapshotProbe.version == drawSnapshotsVersion && drawSnapshotProbe.key == key) return drawSnapshotProbe.at;
+    const auto at = drawSnapshots.lower_bound(key);
+    drawSnapshotProbe = {key, at, drawSnapshotsVersion};
+    return at;
+}
+
+std::map<Recorder::DrawSnapshotKey, Recorder::DrawSnapshot>::iterator Recorder::drawSnapshotExact(const DrawSnapshotKey& key) {
+    const auto at = drawSnapshotAtLeast(key);
+    return at != drawSnapshots.end() && at->first == key ? at : drawSnapshots.end();
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
@@ -3314,7 +3327,7 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {
-    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    auto found = use == SnapshotUse::Vertex ? drawSnapshotAtLeast({address, use, bytes}) : drawSnapshotExact({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
         if (use != SnapshotUse::Storage || offset == nullptr) return {};
         return containingDrawSnapshot(address, bytes, offset);
@@ -3333,6 +3346,18 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
         }
         found->second.generation = generation;
     }
+    auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+    recency.splice(recency.end(), recency, found->second.recent);
+    if (derived != nullptr) *derived = found->second.derived;
+    return found->second.buffer;
+}
+
+std::shared_ptr<Buffer> Recorder::ObservedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
+    const auto found = use == SnapshotUse::Vertex ? drawSnapshotAtLeast({address, use, bytes}) : drawSnapshotExact({address, use, bytes});
+    if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use || !found->second.owned.words.empty()) return {};
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return {};
+    const auto guestBytes = use == SnapshotUse::PaddedVertex ? static_cast<std::size_t>(found->second.derived) : bytes;
+    if (!GuestMemory::ObservedUnchangedSince(address, guestBytes, found->second.generation)) return {};
     auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
     recency.splice(recency.end(), recency, found->second.recent);
     if (derived != nullptr) *derived = found->second.derived;
@@ -3430,6 +3455,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
     const DrawSnapshotKey key{address, use, bytes};
     pool.recency.push_back(key);
     try {
+        ++drawSnapshotsVersion;
         drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived});
     } catch (...) {
         pool.recency.pop_back();
@@ -3478,7 +3504,7 @@ bool Recorder::ownedDrawInputHolds(std::uint64_t address, std::size_t bytes, con
 std::shared_ptr<Buffer> Recorder::ReusableOwnedDrawInput(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived) {
     GuestMemory::AssertGpuLockHeld("reuse owned draw input");
     Require(use != SnapshotUse::Storage, "an owned draw input is a vertex or index buffer");
-    const auto found = drawSnapshots.find({address, use, bytes});
+    const auto found = drawSnapshotExact({address, use, bytes});
     if (found == drawSnapshots.end() || found->second.owned.words.empty()) return {};
     if (!ownedDrawInputHolds(address, bytes, found->second.owned)) {
         OwnedDrawTraceCount("OwnedDraw.invalidated");

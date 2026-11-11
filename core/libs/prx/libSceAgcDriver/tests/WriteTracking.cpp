@@ -2916,6 +2916,152 @@ void RunMappingBench(int collectors, int spinners) {
 }
 #endif
 
+void CheckObservedUnchanged() {
+    constexpr std::size_t page = 4096;
+    void* memory = AllocateWatched(3 * Block);
+    std::memset(memory, 0x11, 3 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    BumpCollectEpoch();
+    const auto collected = CollectWrites(base, 2 * Block);
+    Require(collected != 0, "the observed fixture was not collected");
+    Require(ObservedUnchangedSince(base, page, collected), "a range observed in this epoch and unchanged was not proved");
+    Require(!ObservedUnchangedSince(base + 2 * Block, page, TrackerGeneration()), "a range never observed in this epoch was proved unchanged");
+    const auto marked = MarkWritten(base + 64, 64);
+    Require(marked != 0, "the driver write was not stamped");
+    Require(!ObservedUnchangedSince(base, page, collected), "a driver write after the observation was hidden");
+    Require(ObservedUnchangedSince(base + Block, page, collected), "an untouched block beside a driver write was not proved");
+    BumpCollectEpoch();
+    Require(!ObservedUnchangedSince(base + Block, page, collected), "a range observed only in an earlier epoch was proved unchanged");
+}
+
+void RunInputCheckBench(int threads) {
+    constexpr std::size_t Checks = 2000000;
+    const auto lanes = static_cast<std::size_t>(threads);
+    void* memory = AllocateWatched(lanes * Block);
+    std::memset(memory, 0x5a, lanes * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, lanes * Block) != 0, "the input check bench region was not collected");
+    std::vector<double> collectThenProve(lanes, 0.0);
+    std::vector<double> observedOnly(lanes, 0.0);
+    std::atomic<bool> start{false};
+    std::vector<std::thread> pool;
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        pool.emplace_back([&, lane] {
+            const auto address = base + lane * Block;
+            BumpCollectEpoch();
+            const auto generation = CollectWrites(address, Block);
+            Require(generation != 0, "the input check bench lane was not collected");
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            std::uint64_t proved = 0;
+            auto begin = std::chrono::steady_clock::now();
+            for (std::size_t check = 0; check < Checks; ++check) {
+                const auto input = address + (check % 16) * 4096;
+                proved += CollectWrites(input, 4096) != 0 && UnchangedSinceObserved(input, 4096, generation);
+            }
+            auto end = std::chrono::steady_clock::now();
+            collectThenProve[lane] = std::chrono::duration<double, std::nano>(end - begin).count() / Checks;
+            begin = std::chrono::steady_clock::now();
+            for (std::size_t check = 0; check < Checks; ++check) proved += ObservedUnchangedSince(address + (check % 16) * 4096, 4096, generation);
+            end = std::chrono::steady_clock::now();
+            observedOnly[lane] = std::chrono::duration<double, std::nano>(end - begin).count() / Checks;
+            Require(proved == 2 * Checks, "an unchanged observed input was not proved");
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : pool) thread.join();
+    double before = 0;
+    double after = 0;
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        before += collectThenProve[lane];
+        after += observedOnly[lane];
+    }
+    std::printf("input checks, %d threads: collect then observed proof %.1f ns, observed proof alone %.1f ns per input per thread\n", threads, before / threads, after / threads);
+}
+
+thread_local int threadWalks = 0;
+
+void CountThreadWalk(int point) {
+    if (point == 1) ++threadWalks;
+}
+
+void CheckPreparerObservesInputs() {
+    constexpr std::size_t page = 4096;
+    void* memory = AllocateWatched(4 * Block);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, 4 * Block) != 0, "the preparer fixture was not collected");
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> inputs{{base, base + Block}, {base + 2 * Block + 256, base + 2 * Block + 4096}};
+    std::uint64_t epoch = 0;
+    bool observed = false;
+    bool refusedOther = false;
+    std::thread preparer([&] {
+        epoch = BumpCollectEpoch();
+        refusedOther = !ObserveForEpoch(inputs, epoch + 1000);
+        data[2 * Block + 512] = 0x22;
+        observed = ObserveForEpoch(inputs, epoch);
+    });
+    preparer.join();
+    Require(epoch != 0 && observed, "the preparer did not observe the inputs in its own epoch");
+    Require(refusedOther, "the preparer observed for an epoch it is not in");
+    SetObservationHookForTest(&CountThreadWalk);
+    int walks = -1;
+    bool answered = false;
+    bool written = false;
+    std::thread committer([&] {
+        AdoptCollectEpoch(epoch);
+        threadWalks = 0;
+        const auto before = TrackerGeneration();
+        answered = CollectWrites(base + 1024, 2048) != 0 && CollectWrites(base + 2 * Block + 256, 3840) != 0;
+        written = !UnchangedSince(base + 2 * Block + 512, 4, before - 1);
+        walks = threadWalks;
+    });
+    committer.join();
+    int freshWalks = -1;
+    bool freshWritten = false;
+    std::thread later([&] {
+        const auto since = TrackerGeneration();
+        data[3 * Block + 64] = 0x33;
+        BumpCollectEpoch();
+        threadWalks = 0;
+        freshWritten = CollectWrites(base + 3 * Block, page) != 0 && !UnchangedSince(base + 3 * Block + 64, 4, since);
+        freshWalks = threadWalks;
+    });
+    later.join();
+    SetObservationHookForTest(nullptr);
+    Require(answered, "a committer in the preparer's epoch did not answer its input collects");
+    Require(walks == 0, "a committer in the preparer's epoch walked inputs the preparer observed");
+    Require(written, "a write the preparer's observation collected was not seen by the committer");
+    Require(freshWalks > 0 && freshWritten, "a range not observed in a new epoch was not walked, or its write was missed");
+}
+
+void RunInputCollectBench(int inputs) {
+    constexpr int Rounds = 20000;
+    const auto bytes = static_cast<std::size_t>(inputs) * Block;
+    void* memory = AllocateWatched(bytes);
+    std::memset(memory, 0x5a, bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, bytes) != 0, "the input collect bench region was not collected");
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (int input = 0; input < inputs; ++input) ranges.emplace_back(base + static_cast<std::uint64_t>(input) * Block, base + static_cast<std::uint64_t>(input) * Block + 4096);
+    double hit = 0;
+    double miss = 0;
+    std::uint64_t answered = 0;
+    for (int round = 0; round < Rounds; ++round) {
+        BumpCollectEpoch();
+        auto begin = std::chrono::steady_clock::now();
+        for (const auto& [first, stop] : ranges) answered += CollectWrites(first, static_cast<std::size_t>(stop - first)) != 0;
+        auto end = std::chrono::steady_clock::now();
+        miss += std::chrono::duration<double, std::nano>(end - begin).count();
+        begin = std::chrono::steady_clock::now();
+        for (const auto& [first, stop] : ranges) answered += CollectWrites(first, static_cast<std::size_t>(stop - first)) != 0;
+        end = std::chrono::steady_clock::now();
+        hit += std::chrono::duration<double, std::nano>(end - begin).count();
+    }
+    Require(answered == 2ull * Rounds * static_cast<std::uint64_t>(inputs), "an input collect was not answered");
+    std::printf("committer input collects, %d inputs per draw: miss (walk) %.1f ns, hit (observed in the epoch) %.1f ns per input\n", inputs, miss / Rounds / inputs, hit / Rounds / inputs);
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2926,6 +3072,24 @@ int main(int argc, char** argv) {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--preparer-observes") {
+            CheckPreparerObservesInputs();
+            std::cout << "preparer observation tests passed\n";
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--input-collect-bench") {
+            RunInputCollectBench(std::stoi(argv[2]));
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--observed-inputs") {
+            CheckObservedUnchanged();
+            std::cout << "observed input tests passed\n";
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--input-check-bench") {
+            RunInputCheckBench(std::stoi(argv[2]));
+            return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
             RunMemoHitBench(std::stoi(argv[2]));
