@@ -4295,6 +4295,9 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
         const auto pendingAfter = ShaderResources::DrawBindingCounts();
         if (profiled) Require(pendingAfter.pendingWrite == pendingBefore.pendingWrite + 1 && pendingAfter.setsWritten == pendingBefore.setsWritten && pendingAfter.calls == pendingBefore.calls + 1, "a draw input behind a pending GPU write was not counted as skipped for it");
+        resources.MarkReboundForTest();
+        const auto rebound = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebound != nullptr && rebound->snapshots.empty() && rebound->allocation.set != VK_NULL_HANDLE, "a rebound draw with no snapshot did not get its own descriptor set");
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");

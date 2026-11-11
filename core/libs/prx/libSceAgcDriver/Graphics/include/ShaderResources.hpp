@@ -344,6 +344,7 @@ public:
         std::uint64_t calls, visited, written, notDirect, pendingWrite, overBudget, overrides, unwritten, uploaded, reused, created, setsWritten, repeated, identical, slotsDiffer;
     };
     static BindingCounts DrawBindingCounts();
+    void MarkReboundForTest() { rebound = true; }
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();

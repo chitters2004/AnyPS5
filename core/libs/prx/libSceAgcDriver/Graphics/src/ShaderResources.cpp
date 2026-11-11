@@ -6905,6 +6905,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (profiled) noteDrawBindings(recorder, tally, selected, nullptr, false);
         return {};
     }
+    if (result == nullptr) result = std::make_shared<DrawBindings>();
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
     if (profiled) noteDrawBindings(recorder, tally, selected, result.get(), true);
