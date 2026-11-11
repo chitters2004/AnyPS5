@@ -4444,7 +4444,7 @@ namespace {
 struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
-    std::uint64_t serial = 0;
+    std::atomic<std::uint64_t> serial{0};
 };
 
 WriteRecords& LayoutWrites() {
@@ -4465,6 +4465,7 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
+std::atomic<std::uint64_t> layoutStoresSkipped{0};
 }
 
 void StorageTexture::NoteFlip() {
@@ -4475,13 +4476,21 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
 }
 
+std::uint64_t StorageTexture::LayoutStoreSkips() {
+    return layoutStoresSkipped.load(std::memory_order_relaxed);
+}
+
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    {
-        auto& records = LayoutWrites();
+    if (auto& records = LayoutWrites(); layoutSerial == 0 || records.serial.load(std::memory_order_acquire) != layoutSerial) {
         std::lock_guard lock(records.mutex);
         if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        const auto serial = records.serial.load(std::memory_order_relaxed) + 1;
+        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, serial};
+        records.serial.store(serial, std::memory_order_release);
+        layoutSerial = serial;
+    } else {
+        layoutStoresSkipped.fetch_add(1, std::memory_order_relaxed);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));

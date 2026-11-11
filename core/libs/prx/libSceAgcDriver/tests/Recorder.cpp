@@ -13926,6 +13926,112 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
     std::cout << "slice dirty marking: ok\n";
 }
 
+void markRepeatTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 128;
+    constexpr std::uint32_t slices = 4;
+    constexpr std::size_t sliceBytes = 65536;
+    constexpr std::size_t bytes = slices * sliceBytes;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: repeated mark effects not tested\n";
+        return;
+    }
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block, address, bytes};
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.depthOrLastArray = slices - 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    auto flat = resource;
+    flat.dimension = TextureDimension::k2D;
+    flat.depthOrLastArray = 0;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.imageLayers == slices && geometry.guestBytes == bytes, "the repeated mark image does not hold four 64 KiB slices");
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        auto alias = StorageTexture::Create(context, detiler, flat, 0);
+        const auto units = image->TrackedUnits();
+        Require(units == slices, "the repeated mark image tracks " + std::to_string(units) + " units, not one per slice");
+        static_cast<void>(recorder.Commands());
+        recorder.Keep(image);
+        recorder.Keep(alias);
+        const auto lastDimension = [&] {
+            const auto record = StorageTexture::LastWrite(address);
+            Require(record.has_value(), "no layout write is recorded at the images' address");
+            Require(record->width == side && record->tileMode == TextureTileMode::kLinear && record->format == 56, "the recorded layout write lost the images' shape");
+            return record->dimension;
+        };
+        std::atomic<bool> reading{true};
+        std::atomic<std::uint64_t> foreignRecords{0};
+        std::thread reader([&] {
+            while (reading.load(std::memory_order_acquire)) {
+                const auto record = StorageTexture::LastWrite(address);
+                if (record.has_value() && (record->width != side || (record->dimension != TextureDimension::k2DArray && record->dimension != TextureDimension::k2D))) foreignRecords.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        struct StopReader {
+            std::atomic<bool>& reading;
+            std::thread& reader;
+            ~StopReader() {
+                reading.store(false, std::memory_order_release);
+                reader.join();
+            }
+        } stopReader{reading, reader};
+        image->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write is not the recorded layout");
+        const auto layoutSkips = StorageTexture::LayoutStoreSkips();
+        image->MarkSliceDirty(1);
+        Require(lastDimension() == TextureDimension::k2DArray, "a repeated write of the array image changed the recorded layout");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a repeated write of the array image stored its layout again");
+        alias->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2D, "the alias's write after the array image's is not the recorded layout");
+        image->MarkSliceDirty(2);
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write after the alias's left the alias's layout recorded");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a write after another image's was skipped as a repeat");
+        Require(foreignRecords.load(std::memory_order_relaxed) == 0, "a concurrent reader saw a layout no image at the address wrote");
+        image->WriteBack();
+        alias->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    recorder.Sync();
+    std::cout << "repeated mark effects: ok\n";
+}
+
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -16123,6 +16229,10 @@ int main(int argc, char** argv) {
             sliceDirtyTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {
+            markRepeatTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-present-only") {
             RunResidentPresentTests(device.GetContext());
             return 0;
@@ -16409,6 +16519,7 @@ int main(int argc, char** argv) {
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         sliceDirtyTests(device, recorder);
+        markRepeatTests(device, recorder);
         storeRunTests(device, recorder);
         queuedWriteGroupTests();
         remappedImportTests(device);

@@ -523,6 +523,7 @@ public:
     static std::uint64_t UntrackedCompares();
     static std::uint64_t GuestSnapshots();
     static std::uint64_t OccasionalLabelStores();
+    static std::uint64_t LayoutStoreSkips();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
@@ -805,6 +806,7 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> layerPendingSince;
+    std::uint64_t layoutSerial = 0;
     std::vector<std::uint64_t> completionKept;
     UnitFlags layerPending;
     std::vector<bool> layerBehind;
