@@ -298,6 +298,20 @@ bool EmptyIndirectSkip() {
     return enabled;
 }
 
+void noteDbClear(const QueueState& queue, const Graphics::State& graphics, const std::vector<DrawProgram>& programs) {
+    if (!graphics.rectList || !graphics.depth) return;
+    const auto read = [&](std::uint32_t offset) {
+        const auto found = queue.context.find(offset);
+        return found == queue.context.end() ? 0u : found->second;
+    };
+    const auto renderControl = read(0x000u);
+    const bool depth = (renderControl & 1u) != 0;
+    const bool stencil = (renderControl & 2u) != 0 && (read(0x011u) & 1u) != 0;
+    if (!depth && !stencil) return;
+    const auto blocker = DrawPipeline::DbClearBlockerOf(stencil, graphics.stencilTest, Graphics::PartialSampleMask(graphics), graphics.renderLayers > 1 || graphics.layerExports != 0);
+    DrawPipeline::NoteDbClear(depth, stencil, blocker, programs.empty() ? 0 : programs.front().binary.codeAddress);
+}
+
 struct CpuIndirectProgramsStorage {};
 
 std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
@@ -526,6 +540,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (const auto& patch : userPatches) writablePrograms[patch.program].userData[patch.index] = patch.value;
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
+    noteDbClear(queue, graphics, programs);
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();

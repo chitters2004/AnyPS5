@@ -45,6 +45,9 @@ public:
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
+    enum class DbClearBlocker : std::uint8_t { StencilTest, SampleMask, Layered, Unproven, Count };
+    static DbClearBlocker DbClearBlockerOf(bool stencilClear, bool stencilTest, bool partialSampleMask, bool layered);
+    static void NoteDbClear(bool depth, bool stencil, DbClearBlocker blocker, std::uint64_t vertexProgram);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();

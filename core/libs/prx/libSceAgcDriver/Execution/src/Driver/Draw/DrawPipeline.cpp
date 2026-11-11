@@ -8,6 +8,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
+#include <vector>
+#include <mutex>
+#include <map>
 #include <array>
 #include <limits>
 #include <string>
@@ -31,6 +34,22 @@ std::atomic<std::uint64_t> drawKeysSameAsPrevious{0};
 std::atomic<std::uint64_t> drawKeysSeenRecently{0};
 std::atomic<std::uint64_t> drawShapesSameAsPrevious{0};
 std::atomic<std::uint64_t> drawShapesSeenRecently{0};
+
+struct DbClearCounts {
+    std::mutex mutex;
+    std::uint64_t depth = 0;
+    std::uint64_t stencil = 0;
+    std::uint64_t both = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawPipeline::DbClearBlocker::Count)> blockers{};
+    std::map<std::uint64_t, std::uint64_t> vertexPrograms;
+};
+
+DbClearCounts& DbClears() {
+    static DbClearCounts counts;
+    return counts;
+}
+
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DbClearBlocker::Count)> DbClearBlockerNames{"stencil test on a depth-only clear", "partial sample mask", "layered target", "rectangle not proven"};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
@@ -311,6 +330,21 @@ void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> wr
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
 }
 
+DrawPipeline::DbClearBlocker DrawPipeline::DbClearBlockerOf(bool stencilClear, bool stencilTest, bool partialSampleMask, bool layered) {
+    if (!stencilClear && stencilTest) return DbClearBlocker::StencilTest;
+    if (partialSampleMask) return DbClearBlocker::SampleMask;
+    if (layered) return DbClearBlocker::Layered;
+    return DbClearBlocker::Unproven;
+}
+
+void DrawPipeline::NoteDbClear(bool depth, bool stencil, DbClearBlocker blocker, std::uint64_t vertexProgram) {
+    auto& counts = DbClears();
+    std::lock_guard lock(counts.mutex);
+    ++(depth && stencil ? counts.both : depth ? counts.depth : counts.stencil);
+    ++counts.blockers[static_cast<std::size_t>(blocker)];
+    ++counts.vertexPrograms[vertexProgram];
+}
+
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
     constexpr std::size_t RecentSlots = 4096;
     thread_local std::array<std::uint64_t, RecentSlots> recent{};
@@ -423,6 +457,28 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
+    {
+        auto& counts = DbClears();
+        std::lock_guard lock(counts.mutex);
+        std::string blockers;
+        for (std::size_t index = 0; index < counts.blockers.size(); ++index) {
+            char item[96];
+            std::snprintf(item, sizeof(item), "%s %s %llu", index == 0 ? "" : ",", DbClearBlockerNames[index], static_cast<unsigned long long>(counts.blockers[index]));
+            blockers += item;
+        }
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> programs(counts.vertexPrograms.begin(), counts.vertexPrograms.end());
+        std::sort(programs.begin(), programs.end(), [](const auto& left, const auto& right) { return left.second > right.second || (left.second == right.second && left.first < right.first); });
+        std::string programText;
+        for (std::size_t index = 0; index < programs.size() && index < 4; ++index) {
+            char item[64];
+            std::snprintf(item, sizeof(item), " 0x%llx x%llu", static_cast<unsigned long long>(programs[index].first), static_cast<unsigned long long>(programs[index].second));
+            programText += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[dbclear] (10 s): %llu rect-list draws with a DB_RENDER_CONTROL clear (depth %llu, stencil %llu, both %llu); first blocker of a native clear:%s; vertex programs:%s\n", static_cast<unsigned long long>(counts.depth + counts.stencil + counts.both), static_cast<unsigned long long>(counts.depth), static_cast<unsigned long long>(counts.stencil), static_cast<unsigned long long>(counts.both), blockers.c_str(), programText.empty() ? " none" : programText.c_str());
+        counts.depth = counts.stencil = counts.both = 0;
+        counts.blockers = {};
+        counts.vertexPrograms.clear();
+    }
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
