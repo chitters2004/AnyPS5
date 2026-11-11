@@ -432,7 +432,6 @@ public:
         TextureTileMode tileMode;
         TextureDimension dimension;
         std::uint32_t format;
-        std::uint64_t serial;
     };
     static std::optional<WriteRecord> LastWrite(std::uint64_t address);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage

@@ -4444,7 +4444,6 @@ namespace {
 struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
-    std::uint64_t serial = 0;
     std::array<std::atomic<std::uint64_t>, 256> stripes{};
     std::atomic<std::uint64_t> clears{0};
 };
@@ -4506,7 +4505,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
             records.byAddress.clear();
             records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
         }
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format};
         auto& stripe = LayoutStripe(records, descriptor.baseAddress);
         layoutStripeSerial = stripe.load(std::memory_order_relaxed) + 1;
         stripe.store(layoutStripeSerial, std::memory_order_release);
