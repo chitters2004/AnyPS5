@@ -53,6 +53,9 @@ constexpr std::uint32_t Untouched = 0xdeadbeefu;
 constexpr std::uint32_t Written = 0x12345678u;
 constexpr std::uint32_t Rewritten = 0x0badcafeu;
 constexpr std::uint32_t WrittenAgain = 0x600dd00du;
+constexpr std::uint32_t PaddedWidth = 24;
+constexpr std::size_t PaddedOffset = 0x20000;
+constexpr std::size_t PaddedLabelOffset = 0x8300;
 
 alignas(256) constexpr std::array<std::uint32_t, 24> StoreCode{
     0x4a500081, 0xd5690014, 0x0201ff28, 0x9e3779b1, 0x4a2a28ff, 0x7f4a7c15, 0x4a2c28ff, 0xfe94f82a,
@@ -107,15 +110,15 @@ std::uint32_t Data(std::uint32_t tid, std::uint32_t index) {
     return (tid + 1u) * 0x9e3779b1u + index * 0x7f4a7c15u;
 }
 
-AgcDriver::Graphics::TileMipLayout Layout() {
-    return AgcDriver::Graphics::ComputeMipLayout(AgcDriver::Graphics::TextureTileMode::kLinear, Format8888Uint, Width, Height, 1).front();
+AgcDriver::Graphics::TileMipLayout Layout(std::uint32_t width = Width) {
+    return AgcDriver::Graphics::ComputeMipLayout(AgcDriver::Graphics::TextureTileMode::kLinear, Format8888Uint, width, Height, 1).front();
 }
 
-std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t>& initial) {
-    const auto mip = Layout();
+std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t>& initial, std::uint32_t width = Width) {
+    const auto mip = Layout(width);
     auto bytes = initial;
     constexpr std::array<std::uint32_t, 4> Dmasks{0xfu, 0x5u, 0xau, 0x8u};
-    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+    for (std::uint32_t tid = 0; tid < width; ++tid) {
         for (std::uint32_t row = 0; row < Dmasks.size(); ++row) {
             std::array<std::uint32_t, 4> words{};
             std::uint32_t next = 0;
@@ -128,12 +131,12 @@ std::vector<std::uint8_t> Expected(const std::vector<std::uint8_t>& initial) {
     return bytes;
 }
 
-std::array<std::uint32_t, 16> UserData(const void* texels) {
+std::array<std::uint32_t, 16> UserData(const void* texels, std::uint32_t width = Width) {
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels));
     std::array<std::uint32_t, 16> data{};
     data[4] = static_cast<std::uint32_t>(address >> 8u);
-    data[5] = static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format8888Uint << 20u) | (((Width - 1u) & 3u) << 30u);
-    data[6] = ((Width - 1u) >> 2u) | ((Height - 1u) << 14u);
+    data[5] = static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format8888Uint << 20u) | (((width - 1u) & 3u) << 30u);
+    data[6] = ((width - 1u) >> 2u) | ((Height - 1u) << 14u);
     data[7] = IdentitySwizzle | (Type2D << 28u);
     return data;
 }
@@ -191,19 +194,24 @@ void SubmitAndWait(std::vector<std::uint32_t> words, std::uint32_t* label, const
     }
 }
 
-void ReadAfterLabel(std::uint8_t* block) {
-    auto* texels = block;
-    auto* label = reinterpret_cast<std::uint32_t*>(block + LabelOffset);
-    const auto mip = Layout();
+void ReadAfterLabel(std::uint8_t* block, std::uint32_t width = Width, std::size_t texelOffset = 0, std::size_t labelOffset = LabelOffset) {
+    auto* texels = block + texelOffset;
+    auto* label = reinterpret_cast<std::uint32_t*>(block + labelOffset);
+    const auto mip = Layout(width);
     const auto bytes = static_cast<std::size_t>(mip.tiledOffset + mip.pitchBytes * Height);
     std::vector<std::uint8_t> initial(bytes);
     for (std::size_t index = 0; index < initial.size(); ++index) initial[index] = static_cast<std::uint8_t>(0x80u + 37u * index + 11u * (index >> 4u));
     std::memcpy(texels, initial.data(), initial.size());
-    const auto userData = UserData(texels);
-    SubmitAndWait(Commands(StoreCode, Threads, userData, label), label, "linear readback label");
-    const auto expected = Expected(initial);
+    const auto userData = UserData(texels, width);
+    const auto direct = AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks();
+    SubmitAndWait(Commands(StoreCode, width, userData, label), label, "linear readback label");
+    std::printf("linear readback label: width %u, pitch %u bytes, %llu direct linear write-backs\n", width, mip.pitchBytes, static_cast<unsigned long long>(AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks() - direct));
+    const auto expected = Expected(initial, width);
     for (std::uint32_t row = 0; row < Height; ++row) {
-        for (std::uint32_t x = 0; x < Width; ++x) {
+        for (auto offset = mip.tiledOffset + static_cast<std::uint64_t>(row) * mip.pitchBytes + static_cast<std::uint64_t>(width) * TexelBytes; offset < mip.tiledOffset + static_cast<std::uint64_t>(row + 1u) * mip.pitchBytes; ++offset) {
+            Require(texels[offset] == initial[offset], "linear readback label: padding byte " + std::to_string(offset - mip.tiledOffset - static_cast<std::uint64_t>(row) * mip.pitchBytes) + " of row " + std::to_string(row) + " beyond the texels of a " + std::to_string(width) + "-wide image lost its guest value");
+        }
+        for (std::uint32_t x = 0; x < width; ++x) {
             const auto offset = mip.tiledOffset + static_cast<std::uint64_t>(row) * mip.pitchBytes + static_cast<std::uint64_t>(x) * TexelBytes;
             std::uint32_t actual = 0;
             std::uint32_t wanted = 0;
@@ -268,6 +276,7 @@ int main() {
         }
         GuestBlock block;
         ReadAfterLabel(block.Data());
+        ReadAfterLabel(block.Data(), PaddedWidth, PaddedOffset, PaddedLabelOffset);
         ReadTiledAfterLabel(block.Data());
         ReadOccasionalAfterLabel(block.Data());
         AgcDriverWaitIdle_nid_postfix();

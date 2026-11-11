@@ -138,6 +138,7 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
 std::atomic<std::uint64_t> flushWaits{0}, stampedWaitsSkipped{0}, labelStoreSweeps{0}, labelStoreImages{0}, labelStoreNanos{0};
 std::atomic<std::uint64_t> flushWaitNanos{0}, flushWriteBackNanos{0}, flushPublishNanos{0};
+std::atomic<std::uint64_t> directLinearWriteBacks{0}, retiledWriteBacks{0};
 
 std::chrono::steady_clock::time_point chargeNanos(std::atomic<std::uint64_t>& counter, std::chrono::steady_clock::time_point since) {
     const auto now = std::chrono::steady_clock::now();
@@ -207,7 +208,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
-    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; flushes that waited for a writer %llu, that skipped only writers stamped when recorded %llu; readback stores before labels: %llu sweeps stored %llu images in %.1f ms; storing flushes spent %.1f ms waiting, %.1f ms writing back, %.1f ms publishing; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), take(flushWaits), take(stampedWaitsSkipped), take(labelStoreSweeps), take(labelStoreImages), take(labelStoreNanos) / 1e6, take(flushWaitNanos) / 1e6, take(flushWriteBackNanos) / 1e6, take(flushPublishNanos) / 1e6, static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; flushes that waited for a writer %llu, that skipped only writers stamped when recorded %llu; readback stores before labels: %llu sweeps stored %llu images in %.1f ms; storing flushes spent %.1f ms waiting, %.1f ms writing back, %.1f ms publishing; write-backs into imports copied straight from the image %llu, through the retiler %llu (cumulative); refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), take(flushWaits), take(stampedWaitsSkipped), take(labelStoreSweeps), take(labelStoreImages), take(labelStoreNanos) / 1e6, take(flushWaitNanos) / 1e6, take(flushWriteBackNanos) / 1e6, take(flushPublishNanos) / 1e6, static_cast<unsigned long long>(directLinearWriteBacks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(retiledWriteBacks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -6623,6 +6624,79 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
     return cpu[0] == 0;
 }
 
+bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::span<const ImportSegment> segments, std::span<const std::uint32_t> saveUnits, std::uint64_t firstStored, std::uint64_t lastStored, bool drawn) {
+    static const bool enabled = std::getenv("APS5_NO_DIRECT_LINEAR_WRITE_BACK") == nullptr;
+    auto* recorder = recorderFor(context);
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    if (!enabled || recorder == nullptr || descriptor.tileMode != TextureTileMode::kLinear || geometry.thick || elementBytes == 0 || BlockWidth(descriptor.format) != 1) return false;
+    if (std::any_of(mips.begin(), mips.end(), [](const TileMipLayout& mip) { return mip.tail; })) return false;
+    if (!saveUnits.empty() || segments.size() != 1 || segments.front().begin > firstStored || segments.front().end < lastStored) return false;
+    if (keep.size() != 1 || keep.front().first != firstStored || keep.front().second != lastStored) return false;
+    const auto& import = *segments.front().import;
+    const auto* storedLayers = trackedLayers == arrayLayers && trackedLayers > 1 ? &layers : nullptr;
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+        if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
+        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            if (!geometry.HasLayer(level, layer)) continue;
+            const auto& mip = mips[level];
+            const auto width = std::max(descriptor.width >> level, 1u);
+            const auto offset = HostImportOffset(import, descriptor.baseAddress) + geometry.GuestOffset(layer, mip);
+            if (mip.pitchBytes % elementBytes != 0 || mip.pitchBytes / elementBytes < width || offset % elementBytes != 0 || offset % 4 != 0) return false;
+            VkBufferImageCopy region{};
+            region.bufferOffset = offset;
+            region.bufferRowLength = mip.pitchBytes / elementBytes;
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
+            region.imageOffset = {0, 0, geometry.CopyDepth(layer)};
+            region.imageExtent = {width, std::max(descriptor.height >> level, 1u), 1u};
+            regions.push_back(region);
+        }
+    }
+    if (regions.empty()) return false;
+    recorder->FlushKeyStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    recorder->FlushStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+    const auto commands = recorder->Commands();
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+    if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
+    Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, 2);
+    if (Recorder::BarrierValidate()) {
+        const std::pair<VkImage, bool> read{image, false};
+        recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{{}, keep, std::span(&read, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    toSource.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    toSource.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    toSource.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    toSource.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toSource.image = image;
+    toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toSource);
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, import.buffer, static_cast<std::uint32_t>(regions.size()), regions.data());
+    VkImageMemoryBarrier backToGeneral = toSource;
+    backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
+    std::uint64_t storedBytes = 0;
+    for (const auto& [from, to] : keep) storedBytes += to - from;
+    recorder->EndGpuTiming(timing, storedBytes);
+    recorder->MarkShaderReadsCovered();
+    const std::array stamped{std::pair{firstStored, lastStored}};
+    recorder->NoteStampedWrites(stamped);
+    countStorageWriteBack(storedBytes, true, drawn);
+    directLinearWriteBacks.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::uint64_t StorageTexture::DirectLinearWriteBacks() {
+    return directLinearWriteBacks.load(std::memory_order_relaxed);
+}
+
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -6884,6 +6958,17 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // keep a neighbour's shadowed results in the rest of their bytes, which reach the import
         // first (this write-back's stamps then make those units stale).
         PublishShadow(firstStored, static_cast<std::size_t>(lastStored - firstStored), PublishScope::PartialUnits, PublishReason::Upload);
+        if (writeBackLinearDirect(layers, keep, segments, saveUnits, firstStored, lastStored, drawn.drawn)) {
+            forgetStored();
+            traceKeyStore("linear write-back", descriptor, guestBytes);
+            if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
+            uploadedKeys = DccKeys::Uncompressed;
+            for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
+            settle(true);
+            ++Profile().storageDirectWriteBacks;
+            return;
+        }
+        retiledWriteBacks.fetch_add(1, std::memory_order_relaxed);
         // The surface lives in host-imported memory: the retiler writes into device scratch and the
         // untouched blocks are copied into the imported bytes in place, recorded behind the work that
         // produced the image; nothing crosses to the CPU.
