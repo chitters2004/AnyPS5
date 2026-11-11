@@ -59,6 +59,7 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
     bool reused = false;
+    bool prepared = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
