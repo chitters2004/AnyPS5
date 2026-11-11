@@ -32,6 +32,7 @@ enum class RuntimeSwitch : std::size_t {
     RefreshExitEpochStamp,
     NoDepthRepeatFind,
     PartialDrains,
+    PlanAttachments,
     Count,
 };
 

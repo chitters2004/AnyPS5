@@ -562,7 +562,8 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
             drawPlanCounters.Add(DrawPlanCount::RebasedBuffers, outcome.movedBuffers);
         }
         if (outcome.templateInstance) drawPlanCounters.Add(DrawPlanCount::TemplateInstanceHits);
-        if (plan->servable && outcome.movedBuffers == 0 && !outcome.templateInstance && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
+        if (outcome.ownAttachments) drawPlanCounters.Add(DrawPlanCount::OwnAttachmentHits);
+        if (plan->servable && outcome.movedBuffers == 0 && !outcome.templateInstance && !outcome.ownAttachments && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
         if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
         if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         return true;
@@ -574,6 +575,7 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         case Graphics::DrawRecipeMiss::Proof: drawPlanCounters.Add(DrawPlanCount::MissProof); break;
         case Graphics::DrawRecipeMiss::Instance:
             drawPlanCounters.Add(DrawPlanCount::MissInstance);
+            if (outcome.handedTargets) drawPlanCounters.Add(DrawPlanCount::HandedTargets);
             if (outcome.instanceMismatches != 0) AddCount(&drawPlanCounters, DrawPlanCount::InstanceMismatchSets, outcome.instanceMismatches);
             switch (outcome.instance) {
                 case Graphics::DrawPlanInstance::Shape: drawPlanCounters.Add(DrawPlanCount::InstanceShape); break;

@@ -490,8 +490,10 @@ void PlansBindTheirOwnTargets() {
     }
     Report("I7 another render target", counts);
     ExpectNoHitsWhileOff(counts);
-    Expect(counts[DrawPlanCount::Hits] == 0, "a draw into another render target was served the plan's target");
-    if (PlansOn()) Expect(counts[DrawPlanCount::MissInstance] == 1, "a draw into another render target was not refused as another instance");
+    const bool ownAttachments = PlansOn() && std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    if (!ownAttachments) Expect(counts[DrawPlanCount::Hits] == 0, "a draw into another render target was served the plan's target");
+    if (PlansOn() && !ownAttachments) Expect(counts[DrawPlanCount::MissInstance] == 1, "a draw into another render target was not refused as another instance");
+    if (ownAttachments) Expect(counts[DrawPlanCount::Hits] == 1 && counts[DrawPlanCount::OwnAttachmentHits] == 1, "a draw into another render target was not served its plan with its own attachments");
     const auto sum = [&](DrawPlanCount base, std::size_t buckets, std::uint8_t bit) {
         std::uint64_t total = 0;
         for (std::size_t offset = 0; offset < buckets; ++offset) {
@@ -500,9 +502,11 @@ void PlansBindTheirOwnTargets() {
         return total;
     };
     if (PlansOn() && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
-        Expect(sum(DrawPlanCount::ReplacementSignatureSets, PlanSignatureSetLimitForTest + 1u, 0) >= 1, "the full path's replacement of the plan for another target was not counted by signature set");
-        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchTarget) == 1, "the another-instance miss into another render target was not counted with a target surface mismatch");
-        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchShape | AgcDriver::Graphics::PlanMismatchTemplate | AgcDriver::Graphics::PlanMismatchDepth) == 0, "the another-instance miss into another render target counted a shape, template or depth mismatch");
+        if (!ownAttachments) Expect(sum(DrawPlanCount::ReplacementSignatureSets, PlanSignatureSetLimitForTest + 1u, 0) >= 1, "the full path's replacement of the plan for another target was not counted by signature set");
+        if (!ownAttachments) Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchTarget) == 1, "the another-instance miss into another render target was not counted with a target surface mismatch");
+        const bool trimmed = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        const auto unexpected = static_cast<std::uint8_t>(AgcDriver::Graphics::PlanMismatchShape | AgcDriver::Graphics::PlanMismatchDepth | (trimmed ? AgcDriver::Graphics::PlanMismatchTemplate : 0u));
+        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, unexpected) == 0, trimmed ? "the another-instance miss into another render target counted a shape, template or depth mismatch" : "the another-instance miss into another render target counted a shape or depth mismatch");
         Expect(sum(DrawPlanCount::LookupDistances, PlanLookupDistanceBucketsForTest, 0) >= 1, "repeated plan lookups were not counted by lookup distance");
     }
     Expect(Pixels(firstPlanned) == Pixels(firstFull), "the plan's own target differs from the full path's");
@@ -711,7 +715,8 @@ void PlannedSceneMatchesFullPath() {
     if (counts[DrawPlanCount::Hits] != 0 && counts[DrawPlanCount::FullDraws] != 0) std::printf("I10 committer time (APS5_PROFILE_DRAW): %.2f us per plan hit, %.2f us per full-path draw with a plan key\n", static_cast<double>(counts[DrawPlanCount::HitNanoseconds]) / static_cast<double>(counts[DrawPlanCount::Hits]) / 1000.0, static_cast<double>(counts[DrawPlanCount::FullNanoseconds]) / static_cast<double>(counts[DrawPlanCount::FullDraws]) / 1000.0);
     if (Graphics::CommitPhasesEnabled() && counts[DrawPlanCount::Hits] != 0) {
         const auto phaseUs = [&](Graphics::CommitPhase phase) { return static_cast<double>(phases.ns[static_cast<std::size_t>(phase)]) / 1e3 / static_cast<double>(counts[DrawPlanCount::Hits]); };
-        for (const auto phase : {Graphics::CommitPhase::PlanHitFind, Graphics::CommitPhase::PlanHitWords, Graphics::CommitPhase::PlanHitInstance, Graphics::CommitPhase::PlanHitTargets}) Expect(phases.ns[static_cast<std::size_t>(phase)] != 0, std::string("the plan hits charged no time to ") + Graphics::CommitPhaseName(phase));
+        const auto targetsPhase = std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr ? Graphics::CommitPhase::Targets : Graphics::CommitPhase::PlanHitTargets;
+        for (const auto phase : {Graphics::CommitPhase::PlanHitFind, Graphics::CommitPhase::PlanHitWords, Graphics::CommitPhase::PlanHitInstance, targetsPhase}) Expect(phases.ns[static_cast<std::size_t>(phase)] != 0, std::string("the plan hits charged no time to ") + Graphics::CommitPhaseName(phase));
         std::printf("I10 plan hit phases (APS5_PROFILE_COMMIT), us per hit: find %.2f words %.2f instance %.2f targets %.2f rebind %.2f\n", phaseUs(Graphics::CommitPhase::PlanHitFind), phaseUs(Graphics::CommitPhase::PlanHitWords), phaseUs(Graphics::CommitPhase::PlanHitInstance), phaseUs(Graphics::CommitPhase::PlanHitTargets), phaseUs(Graphics::CommitPhase::PlanHitRebind));
         const auto kindDraws = [&](Graphics::CommitDrawKind kind) { return phases.kindDraws[static_cast<std::size_t>(kind)]; };
         const auto kindUs = [&](Graphics::CommitDrawKind kind) {

@@ -17,8 +17,10 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_plans_profile PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLANS=1;APS5_VERIFY_DRAW_PLANS=1;APS5_PROFILE_DRAW=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     add_test(NAME agc_driver_draw_plans_untrimmed COMMAND agc_driver_draw_plans_tests)
     set_tests_properties(agc_driver_draw_plans_untrimmed PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLANS=1;APS5_VERIFY_DRAW_PLANS=1;APS5_NO_DRAW_KEY_TRIM=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_draw_plans_attachments COMMAND agc_driver_draw_plans_tests)
+    set_tests_properties(agc_driver_draw_plans_attachments PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLANS=1;APS5_VERIFY_DRAW_PLANS=1;APS5_PLAN_ATTACHMENTS=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_plans_off agc_driver_draw_plans_on agc_driver_draw_plans_verify agc_driver_draw_plans_pipeline agc_driver_draw_plans_no_templates agc_driver_draw_plans_commit_phases agc_driver_draw_plans_share_push agc_driver_draw_plans_profile agc_driver_draw_plans_untrimmed PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_plans_off agc_driver_draw_plans_on agc_driver_draw_plans_verify agc_driver_draw_plans_pipeline agc_driver_draw_plans_no_templates agc_driver_draw_plans_commit_phases agc_driver_draw_plans_share_push agc_driver_draw_plans_profile agc_driver_draw_plans_untrimmed agc_driver_draw_plans_attachments PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

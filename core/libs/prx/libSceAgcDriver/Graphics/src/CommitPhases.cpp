@@ -45,8 +45,8 @@ ProfileCounter keyMemoHitCount;
 ProfileCounter keyMemoMissCount;
 std::array<ProfileCounter, static_cast<std::size_t>(CommitCounter::Count)> counterValues{};
 std::array<ProfileCounter, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
-std::array<std::atomic<std::uint64_t>, KindCount> kindDrawCount{};
-std::array<std::array<std::atomic<std::uint64_t>, PhaseCount>, KindCount> kindPhaseNs{};
+std::array<ProfileCounter, KindCount> kindDrawCount{};
+std::array<std::array<ProfileCounter, PhaseCount>, KindCount> kindPhaseNs{};
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
 CommitPhaseTotals reported;
@@ -222,8 +222,8 @@ CommitPhaseTotals ReadCommitPhases() {
     for (std::size_t counter = 0; counter < totals.counters.size(); ++counter) totals.counters[counter] = counterValues[counter].Sum();
     for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].Sum();
     for (std::size_t kind = 0; kind < KindCount; ++kind) {
-        totals.kindDraws[kind] = kindDrawCount[kind].load(std::memory_order_relaxed);
-        for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.kindNs[kind][phase] = kindPhaseNs[kind][phase].load(std::memory_order_relaxed);
+        totals.kindDraws[kind] = kindDrawCount[kind].Sum();
+        for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.kindNs[kind][phase] = kindPhaseNs[kind][phase].Sum();
     }
     return totals;
 }
@@ -270,9 +270,9 @@ CommitPhaseDraw::~CommitPhaseDraw() {
     phases.active = false;
     drawCount.Add(1);
     const auto kind = static_cast<std::size_t>(phases.kind);
-    kindDrawCount[kind].fetch_add(1, std::memory_order_relaxed);
+    kindDrawCount[kind].Add(1);
     for (std::size_t phase = 0; phase < PhaseCount; ++phase) {
-        if (phases.drawNs[phase] != 0) kindPhaseNs[kind][phase].fetch_add(phases.drawNs[phase], std::memory_order_relaxed);
+        if (phases.drawNs[phase] != 0) kindPhaseNs[kind][phase].Add(phases.drawNs[phase]);
     }
     reportDue(now);
 }
