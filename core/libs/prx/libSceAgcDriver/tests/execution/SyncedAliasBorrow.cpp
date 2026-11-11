@@ -169,7 +169,8 @@ void CheckMatchesGuest(const Fixture& fixture, const StorageTexture& texture, st
 void Fill(StorageTexture& texture, std::uint32_t bits, const std::string& what) {
     const std::array<std::uint32_t, 4> pattern{bits, bits, bits, bits};
     const char* refusal = nullptr;
-    Require(texture.FillClear(pattern, StorageTexture::WholeImage, refusal), "synced alias borrow: " + what + ": the GPU fill was refused (" + std::string(refusal != nullptr ? refusal : "no reason") + ")");
+    const bool filled = texture.FillClear(pattern, StorageTexture::WholeImage, refusal);
+    Require(filled, "synced alias borrow: " + what + ": the GPU fill was refused (" + std::string(refusal != nullptr ? refusal : "no reason") + ")");
     Require(texture.Dirty(), "synced alias borrow: " + what + ": the GPU fill left no pending results");
 }
 
@@ -285,6 +286,12 @@ int Run(AgcDriver::VulkanDevice& device) {
     uints->SetCached(false);
     std::puts("synced alias borrow: an image over memory forgotten since it read it lends nothing");
 
+    const char* forced = std::getenv("APS5_WRITE_WATCH_IMPORTS");
+    if (forced != nullptr && std::strcmp(forced, "watch") == 0) {
+        std::puts("synced alias borrow: with the write watch forced on by APS5_WRITE_WATCH_IMPORTS, this device's GPU stores into the import are collected as CPU stores; the GPU-store cases run where imports stay watched on their own");
+    } else {
+        GpuStores(fixture, units);
+    }
     const auto fresh = Cached(fixture, Format32UInt);
     const auto lender = Cached(fixture, Format32Float);
     Write(fixture, 0, bytes, 0x66);
@@ -314,12 +321,6 @@ int Run(AgcDriver::VulkanDevice& device) {
     lender->SetCached(false);
     std::puts("synced alias borrow: a discarded borrow gives its units back to guest memory");
 
-    const char* forced = std::getenv("APS5_WRITE_WATCH_IMPORTS");
-    if (forced != nullptr && std::strcmp(forced, "watch") == 0) {
-        std::puts("synced alias borrow: GPU stores into a write-watch forced on by APS5_WRITE_WATCH_IMPORTS would fault on this device; the GPU-store cases run where imports stay watched on their own");
-    } else {
-        GpuStores(fixture, units);
-    }
     std::puts("synced alias borrow tests passed");
     return 0;
 }
