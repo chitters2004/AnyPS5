@@ -82,32 +82,13 @@ public:
         AggregateFields::HashLeaves(vertex, *this);
     }
 
-    void operator()(const ShaderRecompiler::ShaderComputeStageInfo& compute) {
-        (*this)(compute.numThreads);
-        (*this)(compute.ldsSizeDwords);
-        (*this)(compute.groupIdEnable);
-        (*this)(compute.tgSizeEnable);
-        (*this)(compute.threadIdComponentCount);
-        (*this)(compute.partialThreads);
-        (*this)(compute.scratchDwords);
-        (*this)(compute.granulatedVgprCount);
-        (*this)(compute.sharedVgprBlocks);
-    }
+    void operator()(const ShaderRecompiler::ShaderComputeStageInfo& compute) { AggregateFields::HashLeaves(compute, *this); }
 
-    void operator()(const ShaderRecompiler::ShaderFloatMode& mode) {
-        (*this)(mode.floatMode);
-        for (const auto value : {mode.dx10Clamp, mode.ieeeMode, mode.fp16Overflow}) (*this)(value);
-    }
+    void operator()(const ShaderRecompiler::ShaderFloatMode& mode) { AggregateFields::HashLeaves(mode, *this); }
 
-    void operator()(const ShaderRecompiler::MeshConfiguration& mesh) {
-        for (const auto value : {mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize, mesh.outputPrimitiveSize}) (*this)(value);
-    }
+    void operator()(const ShaderRecompiler::MeshConfiguration& mesh) { AggregateFields::HashLeaves(mesh, *this); }
 
-    void operator()(const ShaderRecompiler::TessellationConfiguration& tessellation) {
-        for (const auto value : {tessellation.inputControlPoints, tessellation.outputControlPoints, tessellation.domain, tessellation.partitioning, tessellation.outputTopology, tessellation.patchesPerGroup, tessellation.primitiveGroupSize}) (*this)(value);
-        (*this)(tessellation.breakAtInstance);
-        (*this)(tessellation.mergedHull);
-    }
+    void operator()(const ShaderRecompiler::TessellationConfiguration& tessellation) { AggregateFields::HashLeaves(tessellation, *this); }
 
     template<typename TValue>
     void operator()(const std::optional<TValue>& value) {

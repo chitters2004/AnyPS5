@@ -76,6 +76,7 @@ struct RequestParts {
     std::vector<std::uint32_t> userData{0x1000u, 0x2u, 0x3u, 0x4u};
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
     std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
+    std::optional<ShaderRecompiler::ShaderComputeStageInfo> compute;
     std::array<std::uint32_t, 4> memoryWords{1u, 2u, 3u, 4u};
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
@@ -92,7 +93,7 @@ struct RequestParts {
     ShaderRecompiler::RecompileRequest Request() const {
         ShaderRecompiler::RecompileRequest request{
             {stage, 0x10000u, code, 0x20000u, header},
-            {waveSize, 8u, userData, std::nullopt, pixel, vertex, memory, floatMode},
+            {waveSize, 8u, userData, compute, pixel, vertex, memory, floatMode},
             ShaderRecompiler::SpirvTarget{},
             {0u, 0u, pushOffset, pushSize},
             ShaderRecompiler::GraphicsCompileContext{8u, linked, mesh, tessellation, draw, std::nullopt}
@@ -140,6 +141,24 @@ void StageInfoKeysFollowEveryField() {
         parts.vertex = vertex;
         Expect(!(KeyOf(parts, snapshot) == vertexKey), "the key ignores vertex stage info member " + path);
     });
+    std::size_t contextLeaves = 0;
+    const auto walkContext = [&](const char* what, auto member) {
+        RequestParts parts = vertexParts;
+        auto& slot = parts.*member;
+        slot.emplace();
+        const auto key = KeyOf(parts, snapshot);
+        contextLeaves += AggregateFields::ForEachMutation(*slot, [&](const auto& value, const std::string& path) {
+            auto changed = parts;
+            changed.*member = value;
+            Expect(!(KeyOf(changed, snapshot) == key), std::string("the key ignores ") + what + " member " + path);
+        });
+    };
+    walkContext("compute stage info", &RequestParts::compute);
+    walkContext("float mode", &RequestParts::floatMode);
+    walkContext("mesh configuration", &RequestParts::mesh);
+    walkContext("tessellation configuration", &RequestParts::tessellation);
+    Expect(contextLeaves > 20, "the field walk reached too few compute, float mode, mesh and tessellation leaves");
+    std::printf("draw stage keys change with each of %zu compute, float mode, mesh and tessellation leaves\n", contextLeaves);
     Expect(pixelLeaves > AggregateFields::FieldCount<ShaderRecompiler::ShaderPixelStageInfo>() && vertexLeaves > AggregateFields::FieldCount<ShaderRecompiler::ShaderVertexStageInfo>(), "the field walk reached fewer leaves than the stage infos have members");
     std::printf("draw stage keys change with each of %zu pixel and %zu vertex stage info leaves\n", pixelLeaves, vertexLeaves);
 }
