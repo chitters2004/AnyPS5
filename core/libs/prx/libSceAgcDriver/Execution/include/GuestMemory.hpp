@@ -100,7 +100,7 @@ std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
 std::uint64_t DomainVersion(WriteDomain domain);
 WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
 void SetWriteBackingResolver(WriteBackingResolver resolver);
