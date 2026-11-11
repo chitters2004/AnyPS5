@@ -553,6 +553,17 @@ target_include_directories(libSceAgcDriver INTERFACE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
 
+add_library(agc_address_wait STATIC ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AddressWait.cpp)
+target_include_directories(agc_address_wait PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_address_wait PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    target_link_libraries(agc_address_wait PUBLIC synchronization)
+endif()
+if(MINGW)
+    target_link_options(agc_address_wait INTERFACE LINKER:--exclude-libs,$<TARGET_FILE_NAME:agc_address_wait>)
+endif()
+target_link_libraries(libSceAgcDriver PUBLIC agc_address_wait)
+
 target_link_libraries(libSceAgcDriver PRIVATE
         shader_recompiler_agc_driver
         decoder_png
@@ -590,7 +601,7 @@ if(MINGW AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 if(WIN32)
-    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
+    set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Lifecycle.cpp ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AddressWait.cpp PROPERTIES COMPILE_DEFINITIONS _WIN32_WINNT=0x0602)
 endif()
 
 foreach(runtimeLinkFlag IN ITEMS -static-libgcc -static-libstdc++ -static)
@@ -1112,3 +1123,13 @@ if(BUILD_TESTING)
 endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
+
+if(WIN32)
+    get_directory_property(agcTargets BUILDSYSTEM_TARGETS)
+    foreach(agcTarget IN LISTS agcTargets)
+        get_target_property(agcTargetType ${agcTarget} TYPE)
+        if(agcTargetType MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY|STATIC_LIBRARY|OBJECT_LIBRARY)$")
+            target_link_libraries(${agcTarget} PRIVATE synchronization)
+        endif()
+    endforeach()
+endif()

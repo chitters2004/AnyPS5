@@ -1,0 +1,12 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_address_wait_tests tests/AddressWait.cpp)
+    target_include_directories(agc_address_wait_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_address_wait_tests PRIVATE libc agc_address_wait)
+    configure_windows_unwind(agc_address_wait_tests)
+    add_test(NAME agc_address_wait COMMAND agc_address_wait_tests)
+    set_tests_properties(agc_address_wait PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_address_wait PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
