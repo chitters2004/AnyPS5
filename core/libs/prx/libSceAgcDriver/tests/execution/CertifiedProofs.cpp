@@ -226,6 +226,9 @@ struct Outcome {
 
     std::uint64_t Missed(CertifiedMiss miss) const { return counts.missed[static_cast<std::size_t>(miss)]; }
     std::uint64_t Refused(CertifyRefusal refusal) const { return counts.refused[static_cast<std::size_t>(refusal)]; }
+    std::uint64_t Uncertified(AgcDriver::Graphics::UncertifiedCause cause) const { return counts.uncertified[static_cast<std::size_t>(cause)]; }
+    std::uint64_t UncertifiedRefused(CertifyRefusal refusal) const { return counts.uncertifiedRefused[static_cast<std::size_t>(refusal)]; }
+    std::uint64_t ProofSource(GuestMemory::ProofBreak source) const { return counts.proofMissSources[static_cast<std::size_t>(source)]; }
 
     std::string Describe() const {
         constexpr std::array<const char*, static_cast<std::size_t>(CertifiedMiss::Count)> misses{"uncertified", "sweep", "subscription", "proof", "unwatch", "mapping", "pending", "depth-surfaces", "cpu-writers", "audit", "imports"};
@@ -236,6 +239,12 @@ struct Outcome {
         }
         for (std::size_t i = 0; i < refusals.size(); ++i) {
             if (counts.refused[i] != 0) text += ", refused " + std::string(refusals[i]) + " " + std::to_string(counts.refused[i]);
+        }
+        for (std::size_t i = 0; i < counts.uncertified.size(); ++i) {
+            if (counts.uncertified[i] != 0) text += ", uncertified cause " + std::to_string(i) + " " + std::to_string(counts.uncertified[i]);
+        }
+        for (std::size_t i = 0; i < counts.proofMissSources.size(); ++i) {
+            if (counts.proofMissSources[i] != 0) text += ", proof miss source " + std::string(GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i))) + " " + std::to_string(counts.proofMissSources[i]);
         }
         return text;
     }
@@ -250,6 +259,12 @@ AgcDriver::Graphics::CertifiedProofOutcomes Since(const AgcDriver::Graphics::Cer
     delta.disagreed = after.disagreed - before.disagreed;
     for (std::size_t i = 0; i < delta.missed.size(); ++i) delta.missed[i] = after.missed[i] - before.missed[i];
     for (std::size_t i = 0; i < delta.refused.size(); ++i) delta.refused[i] = after.refused[i] - before.refused[i];
+    for (std::size_t i = 0; i < delta.uncertified.size(); ++i) delta.uncertified[i] = after.uncertified[i] - before.uncertified[i];
+    for (std::size_t i = 0; i < delta.uncertifiedRefused.size(); ++i) delta.uncertifiedRefused[i] = after.uncertifiedRefused[i] - before.uncertifiedRefused[i];
+    for (std::size_t i = 0; i < delta.uncertifiedVoided.size(); ++i) delta.uncertifiedVoided[i] = after.uncertifiedVoided[i] - before.uncertifiedVoided[i];
+    delta.epochServed = after.epochServed - before.epochServed;
+    for (std::size_t i = 0; i < delta.proofMissSources.size(); ++i) delta.proofMissSources[i] = after.proofMissSources[i] - before.proofMissSources[i];
+    delta.proofMissUnattributed = after.proofMissUnattributed - before.proofMissUnattributed;
     return delta;
 }
 
@@ -401,6 +416,28 @@ void UnwatchRange(AgcDriver::VulkanDevice& device) {
     Fill(scene.Texels(Key), 0.0f);
     outcome = Draw(device, scene);
     Require(outcome.counts.proved == 0 && outcome.brightest == 0u, "unwatch: a write next to the unwatched texture was missed (" + outcome.Describe() + ")");
+    Require(outcome.Uncertified(AgcDriver::Graphics::UncertifiedCause::Refused) == 1 && outcome.UncertifiedRefused(CertifyRefusal::ComparedTextures) == 1, "unwatch: the use after a refusal was not counted as uncertified for compared textures (" + outcome.Describe() + ")");
+}
+
+void Causes(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::UncertifiedCause;
+    auto& scene = NewScene();
+    Build(device, scene);
+    std::uint64_t neverProved = 0;
+    Outcome outcome;
+    for (int round = 0; round < 6; ++round) {
+        outcome = Draw(device, scene, true, false);
+        neverProved += outcome.Uncertified(UncertifiedCause::NeverProved);
+        if (outcome.counts.proved == 1) break;
+    }
+    Require(outcome.counts.proved == 1 && neverProved == 1, "causes: a new template's first proof was not counted once as never proved (" + std::to_string(neverProved) + "; " + outcome.Describe() + ")");
+    GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.Texels(Other)), TexelWidth * TexelHeight * 4u);
+    outcome = Draw(device, scene);
+    RequireMissed(outcome, "causes", 255u);
+    if (GuestMemory::ProofBreaksCounted() && outcome.Missed(CertifiedMiss::Proof) == 1) Require(outcome.ProofSource(GuestMemory::ProofBreak::MarkWritten) == 1 && outcome.counts.proofMissUnattributed == 0, "causes: a proof miss after a driver store was not attributed to mark-written (" + outcome.Describe() + ")");
+    if (GuestMemory::ProofBreaksCounted()) Require(outcome.Missed(CertifiedMiss::Proof) == 1, "causes: a driver store did not void the certificate through the proof domain (" + outcome.Describe() + ")");
+    Require(outcome.Uncertified(UncertifiedCause::Voided) == 0 && outcome.Uncertified(UncertifiedCause::NeverProved) == 0, "causes: a certified template was counted as uncertified (" + outcome.Describe() + ")");
+    Settle(device, scene, "causes (after)");
 }
 
 void Mapping(AgcDriver::VulkanDevice& device) {
@@ -496,7 +533,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 12> cases{{{"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 13> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
