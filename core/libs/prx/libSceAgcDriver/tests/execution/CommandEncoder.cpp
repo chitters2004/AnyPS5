@@ -19,6 +19,15 @@
 #include <thread>
 #include <type_traits>
 #include <vector>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#endif
 
 namespace {
 
@@ -966,6 +975,206 @@ void QueriesKeepOrderWithTheirRecording() {
     Compare(expected, "queries around nested windows of two recordings");
 }
 
+class EncoderThreadClock {
+public:
+    EncoderThreadClock() = default;
+    EncoderThreadClock(const EncoderThreadClock&) = delete;
+    EncoderThreadClock& operator=(const EncoderThreadClock&) = delete;
+    ~EncoderThreadClock() {
+#ifdef _WIN32
+        if (handle != nullptr) CloseHandle(handle);
+#endif
+    }
+    void Capture() {
+        if (captured.load(std::memory_order_acquire)) return;
+#ifdef _WIN32
+        handle = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+        if (handle == nullptr) return;
+#else
+        if (pthread_getcpuclockid(pthread_self(), &clock) != 0) return;
+#endif
+        captured.store(true, std::memory_order_release);
+    }
+    bool Captured() const { return captured.load(std::memory_order_acquire); }
+    std::chrono::nanoseconds Used() const {
+#ifdef _WIN32
+        FILETIME created{};
+        FILETIME exited{};
+        FILETIME kernel{};
+        FILETIME user{};
+        Require(GetThreadTimes(handle, &created, &exited, &kernel, &user) != 0, "the encoder thread's CPU time could not be read");
+        const auto ticks = [](FILETIME time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
+        return std::chrono::nanoseconds((ticks(kernel) + ticks(user)) * 100u);
+#else
+        timespec at{};
+        Require(clock_gettime(clock, &at) == 0, "the encoder thread's CPU time could not be read");
+        return std::chrono::seconds(at.tv_sec) + std::chrono::nanoseconds(at.tv_nsec);
+#endif
+    }
+
+private:
+#ifdef _WIN32
+    HANDLE handle = nullptr;
+#else
+    clockid_t clock{};
+#endif
+    std::atomic<bool> captured{false};
+};
+
+void PostOne(CommandEncoder& encoder, DeviceFunctions& table, VkCommandBuffer commands, std::uint32_t index) {
+    encoder.Open(commands, RecordingOf(commands));
+    table.cmdDraw(commands, index, 1, 0, 0);
+    encoder.Close();
+}
+
+void BusyFor(std::chrono::nanoseconds span) {
+    const auto until = std::chrono::steady_clock::now() + span;
+    while (std::chrono::steady_clock::now() < until) {}
+}
+
+void EncoderSleepsBetweenFrequentPosts() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x52);
+    const auto commands = Handle<VkCommandBuffer>(0x1500);
+    EncoderThreadClock clock;
+    CommandEncoder::SetDelayForTesting([&] { clock.Capture(); });
+    std::uint32_t posts = 0;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        PostOne(encoder, table, commands, posts++);
+        encoder.Quiesce();
+        Require(clock.Captured(), "the encoder thread's clock was not captured");
+        const auto used = clock.Used();
+        const auto start = std::chrono::steady_clock::now();
+        while (std::chrono::steady_clock::now() - start < std::chrono::milliseconds(400)) {
+            PostOne(encoder, table, commands, posts++);
+            BusyFor(std::chrono::microseconds(30));
+        }
+        const auto wall = std::chrono::steady_clock::now() - start;
+        const auto spent = clock.Used() - used;
+        encoder.Quiesce();
+        Require(spent * 2 < wall, "the encoder thread used " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(spent).count()) + " ms of CPU in " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(wall).count()) + " ms while a chunk was posted every 30 us");
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Require(Recorded(commands) == posts, "the encoder recorded " + std::to_string(Recorded(commands)) + " of " + std::to_string(posts) + " frequently posted commands");
+}
+
+void EncoderKeepsUpWithoutAWait() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x53);
+    const auto commands = Handle<VkCommandBuffer>(0x1600);
+    constexpr std::uint32_t Posts = 64;
+    constexpr std::uint32_t LongestLag = 16;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        PostOne(encoder, table, commands, 0);
+        encoder.Quiesce();
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        for (std::uint32_t index = 1; index <= Posts; ++index) {
+            PostOne(encoder, table, commands, index);
+            BusyFor(std::chrono::microseconds(30));
+        }
+        const auto start = std::chrono::steady_clock::now();
+        while (Recorded(commands) <= Posts - LongestLag && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Require(Recorded(commands) > Posts - LongestLag, "the parked encoder recorded " + std::to_string(Recorded(commands) - 1) + " of " + std::to_string(Posts) + " chunks posted after it parked without a wait, leaving at least " + std::to_string(LongestLag) + " behind");
+        encoder.Quiesce();
+    }
+    Require(Recorded(commands) == Posts + 1, "the encoder recorded " + std::to_string(Recorded(commands)) + " of " + std::to_string(Posts + 1) + " commands after the final wait");
+}
+
+void ParkedEncoderWakesForEveryWait() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x55);
+    const auto commands = Handle<VkCommandBuffer>(0x1800);
+    std::uint32_t posts = 0;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto parkOne = [&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            PostOne(encoder, table, commands, posts++);
+        };
+        parkOne();
+        encoder.Quiesce();
+        Require(Recorded(commands) == posts, "an owner wait on a parked encoder returned before its chunk was recorded");
+        parkOne();
+        std::thread foreign([&] { AgcDriver::Graphics::BeforeCommandLookup(device); });
+        foreign.join();
+        Require(Recorded(commands) == posts, "a foreign lookup on a parked encoder returned before the posted chunk was recorded");
+        parkOne();
+    }
+    Require(Recorded(commands) == posts, "destroying a parked encoder left " + std::to_string(posts - Recorded(commands)) + " posted chunks unrecorded");
+}
+
+void SparsePostsAndWaitsNeverLoseAWake() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x54);
+    const auto commands = Handle<VkCommandBuffer>(0x1700);
+    std::atomic<std::uint64_t> progress{0};
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&] {
+        auto seen = progress.load();
+        auto since = std::chrono::steady_clock::now();
+        while (!finished.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const auto now = progress.load();
+            if (now != seen) {
+                seen = now;
+                since = std::chrono::steady_clock::now();
+            } else if (std::chrono::steady_clock::now() - since > std::chrono::seconds(20)) {
+                std::cerr << "a wait on the encoder made no progress for 20 s after " << now << " steps: a wake-up was lost\n";
+                std::_Exit(1);
+            }
+        }
+    });
+    std::vector<std::string> expected;
+    std::string failure;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        std::atomic<bool> stop{false};
+        std::thread foreign([&] {
+            std::mt19937 random(11);
+            while (!stop.load()) {
+                AgcDriver::Graphics::BeforeCommandLookup(device);
+                progress.fetch_add(1);
+                if (random() % 2 == 0) std::this_thread::yield();
+                else BusyFor(std::chrono::microseconds(random() % 50));
+            }
+        });
+        std::mt19937 random(7);
+        for (std::uint32_t index = 0; index < 6000; ++index) {
+            PostOne(encoder, table, commands, index);
+            expected.push_back("draw " + std::to_string(index) + " 1 0 0");
+            const auto pause = random() % 4;
+            if (pause == 1) std::this_thread::yield();
+            if (pause == 2) BusyFor(std::chrono::microseconds(random() % 40));
+            if (pause == 3) std::this_thread::sleep_for(std::chrono::microseconds(random() % 100));
+            if (random() % 8 == 0) {
+                encoder.Quiesce();
+                if (Recorded(commands) != index + 1) {
+                    failure = "a wait returned with " + std::to_string(Recorded(commands)) + " of " + std::to_string(index + 1) + " posted commands recorded";
+                    break;
+                }
+            }
+            progress.fetch_add(1);
+        }
+        encoder.Quiesce();
+        stop.store(true);
+        foreign.join();
+    }
+    finished.store(true);
+    watchdog.join();
+    Require(failure.empty(), failure);
+    Compare({{commands, expected}}, "sparse posts with owner and foreign waits");
+}
+
 int main() {
     try {
         for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
@@ -989,6 +1198,10 @@ int main() {
         DevicesPastTheSlotsRecordInline();
         PostingNeverAllocates();
         ReplayFailureNeedsNoAllocation();
+        EncoderSleepsBetweenFrequentPosts();
+        EncoderKeepsUpWithoutAWait();
+        ParkedEncoderWakesForEveryWait();
+        SparsePostsAndWaitsNeverLoseAWake();
         std::cout << "command encoder tests passed\n";
         return 0;
     } catch (const std::exception& error) {

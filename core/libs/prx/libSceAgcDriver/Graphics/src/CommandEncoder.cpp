@@ -17,6 +17,22 @@ namespace AgcDriver::Graphics {
 namespace {
 
 constexpr std::size_t ChunkBytes = 64 * 1024;
+constexpr long long LongestIdleSpinUs = 10000;
+
+std::chrono::nanoseconds EncoderIdleSpinFor(const char* configured) {
+    if (configured == nullptr) return std::chrono::nanoseconds::zero();
+    return std::chrono::microseconds(std::clamp<long long>(std::strtoll(configured, nullptr, 10), 0, LongestIdleSpinUs));
+}
+
+HandoffSite& IdleSite() {
+    static HandoffSite site{"encoder_idle", EncoderIdleSpinFor(std::getenv("APS5_ENCODER_IDLE_SPIN_US"))};
+    return site;
+}
+
+HandoffSite& AwaitSite() {
+    static HandoffSite site{"encoder_await", HandoffSpinWindow()};
+    return site;
+}
 constexpr std::size_t RecordAlign = 16;
 
 struct Record {
@@ -489,7 +505,8 @@ std::unique_ptr<CommandEncoder> CommandEncoder::Attach(VkDevice device, DeviceFu
 }
 
 CommandEncoder::CommandEncoder(VkDevice device, DeviceFunctions& table, std::size_t slot) : table(table), real(table), device(device), slot(slot) {
-    static_cast<void>(HandoffSpinWindow());
+    static_cast<void>(IdleSite());
+    static_cast<void>(AwaitSite());
     worker = std::thread([this] { run(); });
     std::lock_guard lock(slotMutex());
     slots()[slot].real = real;
@@ -619,11 +636,13 @@ void CommandEncoder::await() noexcept {
     const auto through = posted.load(std::memory_order_acquire);
     if (executed.load(std::memory_order_acquire) >= through) return;
     const auto start = std::chrono::steady_clock::now();
-    if (!SpinUntil(HandoffSpinWindow(), [&] { return executed.load(std::memory_order_acquire) >= through; })) {
+    const auto spin = AwaitSite().Spin([&] { return executed.load(std::memory_order_acquire) >= through; });
+    if (!spin.ready) {
         awaiting.fetch_add(1, std::memory_order_seq_cst);
         for (auto seen = executed.load(std::memory_order_seq_cst); seen < through; seen = executed.load(std::memory_order_seq_cst)) AddressWait(executed, seen);
         awaiting.fetch_sub(1, std::memory_order_relaxed);
     }
+    PerformanceTrace::Handoff(AwaitSite(), spin);
     const auto end = std::chrono::steady_clock::now();
     waitCount.fetch_add(1, std::memory_order_relaxed);
     waitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count()), std::memory_order_relaxed);
@@ -650,11 +669,13 @@ void CommandEncoder::run() {
     std::uint64_t taken = 0;
     for (;;) {
         if (posted.load(std::memory_order_acquire) == taken) {
-            if (!SpinUntil(HandoffSpinWindow(), [&] { return posted.load(std::memory_order_acquire) != taken; })) {
+            const auto spin = IdleSite().Spin([&] { return posted.load(std::memory_order_acquire) != taken; });
+            if (!spin.ready) {
                 sleeping.store(true, std::memory_order_seq_cst);
                 if (posted.load(std::memory_order_seq_cst) == taken) AddressWait(posted, taken);
                 sleeping.store(false, std::memory_order_relaxed);
             }
+            PerformanceTrace::Handoff(IdleSite(), spin);
             continue;
         }
         Chunk* chunk = nullptr;
