@@ -199,9 +199,15 @@ void SequenceRing::run() {
             try {
                 slot.work();
             } catch (...) {
-                std::lock_guard lock(failureMutex);
-                if (failure == nullptr) failure = std::current_exception();
-                failed.store(true, std::memory_order_release);
+                const auto error = std::current_exception();
+                bool first = false;
+                {
+                    std::lock_guard lock(failureMutex);
+                    first = failure == nullptr;
+                    if (first) failure = error;
+                    failed.store(true, std::memory_order_release);
+                }
+                if (first && options.failed) options.failed(error);
             }
             runningSequence = 0;
         }
