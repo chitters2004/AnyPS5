@@ -3,10 +3,10 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from check_conventions import SHARED_MUTEX
+from check_conventions import CPP, NATIVE_SHARED_MUTEX, SHARED_MUTEX, cpp_text
 
 
 class SharedMutexPatternTests(unittest.TestCase):
@@ -19,6 +19,8 @@ class SharedMutexPatternTests(unittest.TestCase):
             ("pthread_rwlock_t lock = PTHREAD_RWLOCK_INITIALIZER;", "pthread_rwlock_t"),
             ("pthread_rwlock_rdlock(&lock);", "pthread_rwlock_rdlock("),
             ("pthread_rwlock_init (&lock, nullptr);", "pthread_rwlock_init ("),
+            ("std :: shared_mutex mutex;", "std :: shared_mutex"),
+            ("std::  shared_timed_mutex mutex;", "std::  shared_timed_mutex"),
         ):
             with self.subTest(line=line):
                 self.assertEqual(SHARED_MUTEX.search(line).group(0), match)
@@ -35,6 +37,23 @@ class SharedMutexPatternTests(unittest.TestCase):
         ):
             with self.subTest(line=line):
                 self.assertIsNone(SHARED_MUTEX.search(line))
+
+
+class RepositoryTests(unittest.TestCase):
+    def test_core_has_no_host_reader_writer_lock(self):
+        root = Path(__file__).resolve().parents[2]
+        listed = subprocess.run(["git", "ls-files", "-z", "core"], cwd=root, capture_output=True, check=True).stdout.decode().split("\0")
+        found = []
+        for path in listed:
+            parts = PurePosixPath(path)
+            if not path or parts.suffix not in CPP or "tests" in parts.parts or path == NATIVE_SHARED_MUTEX:
+                continue
+            text = cpp_text((root / path).read_text(encoding="utf-8", errors="replace"))
+            for number, line in enumerate(text.split("\n"), 1):
+                match = SHARED_MUTEX.search(line)
+                if match:
+                    found.append(f"{path}:{number}: {match.group(0)}")
+        self.assertEqual(found, [])
 
 
 class SharedMutexCheckTests(unittest.TestCase):
