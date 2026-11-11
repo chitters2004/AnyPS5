@@ -28,6 +28,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include <algorithm>
@@ -2478,8 +2479,7 @@ std::uint64_t refreshThreadTag() {
 }
 
 bool StorageTexture::RefreshExitEpochStamps() {
-    static const bool enabled = std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr;
-    return enabled;
+    return RuntimeSwitches::Set(RuntimeSwitch::RefreshExitEpochStamp);
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
@@ -2974,8 +2974,7 @@ void StorageTexture::takeRefreshProof(bool aliased) {
 }
 
 bool StorageTexture::UploadRefreshProofs() {
-    static const bool enabled = std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr;
-    return enabled;
+    return RuntimeSwitches::Set(RuntimeSwitch::UploadRefreshProof);
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

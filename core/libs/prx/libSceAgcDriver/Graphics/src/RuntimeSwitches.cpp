@@ -20,6 +20,11 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BARRIER_BATCH",
     "APS5_NO_GUARD_SPANS",
     "APS5_NO_OWNED_DRAW_INPUTS",
+    "APS5_NO_TARGET_MEMO",
+    "APS5_FOLLOW_OLDER_EPOCH_TOKENS",
+    "APS5_UPLOAD_REFRESH_PROOF",
+    "APS5_REFRESH_EXIT_EPOCH_STAMP",
+    "APS5_NO_DEPTH_REPEAT_FIND",
 };
 
 struct SwitchValues {
@@ -29,6 +34,11 @@ struct SwitchValues {
             std::getenv("APS5_NO_BARRIER_BATCH") != nullptr,
             std::getenv("APS5_NO_GUARD_SPANS") != nullptr,
             std::getenv("APS5_NO_OWNED_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_NO_TARGET_MEMO") != nullptr,
+            std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr,
+            std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr,
+            std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr,
+            std::getenv("APS5_NO_DEPTH_REPEAT_FIND") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

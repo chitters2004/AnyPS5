@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -130,6 +131,8 @@ void TestFollowEpochForwardOnly() {
     std::uint64_t afterOlder = 0;
     std::uint64_t afterSame = 0;
     std::uint64_t afterNewer = 0;
+    std::uint64_t mintedBackward = 0;
+    std::uint64_t beforeBackward = 0;
     std::thread committer([&] {
         DrawPipeline::FollowEpoch(1000);
         followed = AgcDriver::GuestMemory::CollectEpoch();
@@ -139,8 +142,14 @@ void TestFollowEpochForwardOnly() {
         afterSame = AgcDriver::GuestMemory::CollectEpoch();
         DrawPipeline::FollowEpoch(1001);
         afterNewer = AgcDriver::GuestMemory::CollectEpoch();
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FollowOlderEpochTokens, true);
+        beforeBackward = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1000);
+        mintedBackward = AgcDriver::GuestMemory::CollectEpoch();
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::FollowOlderEpochTokens, false);
     });
     committer.join();
+    Check(mintedBackward != beforeBackward, "an older epoch token did not take a new collect epoch with APS5_FOLLOW_OLDER_EPOCH_TOKENS flipped on at run time");
     Check(followed != 0, "following an epoch token left the committing thread without a collect epoch");
     Check(afterOlder == followed && afterSame == followed, "a token older than the one already followed took a new collect epoch");
     Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");

@@ -3318,8 +3318,8 @@ bool VerifyTargetMemo() {
 }
 
 bool TargetMemoEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_TARGET_MEMO") == nullptr && std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr;
-    return enabled && ShaderResources::EpochProofs();
+    static const bool cached = std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr;
+    return cached && !RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemo) && ShaderResources::EpochProofs();
 }
 
 struct TargetProof {

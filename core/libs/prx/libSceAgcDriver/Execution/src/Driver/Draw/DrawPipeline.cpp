@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -455,7 +456,7 @@ std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
 
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
-    static const bool backwardFollows = std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr;
+    const bool backwardFollows = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::FollowOlderEpochTokens);
     if (followed == token) return;
     const bool backward = token < followed;
     if (backward && !backwardFollows) {

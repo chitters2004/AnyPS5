@@ -3490,7 +3490,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
     phase(CommitPhase::TargetsDepthFind);
-    static const bool repeatFind = std::getenv("APS5_NO_DEPTH_REPEAT_FIND") == nullptr;
+    const bool repeatFind = !RuntimeSwitches::Set(RuntimeSwitch::NoDepthRepeatFind);
     DepthSurface* surface = nullptr;
     if (repeatFind && drawnDepth != nullptr && drawnDepth->active->load(std::memory_order_acquire) && drawnDepth->context.device == context.device && sameSurface(drawnDepth->target, target)) {
         surface = drawnDepth;
