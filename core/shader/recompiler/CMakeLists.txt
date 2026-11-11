@@ -276,6 +276,8 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest
             RecompileResult
+            ResultKeyShape
+            PublishOnce
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate

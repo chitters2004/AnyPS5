@@ -79,6 +79,7 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
+bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 
@@ -257,6 +258,15 @@ public:
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
+    struct BoundBuffer {
+        ShaderRecompiler::DescriptorRole role;
+        bool guest;
+        std::uint64_t address;
+        std::size_t size;
+        std::vector<std::uint32_t> words;
+        bool operator==(const BoundBuffer&) const = default;
+    };
+    std::vector<BoundBuffer> BoundBuffers(std::span<const MovedBuffer> moved = {}) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -333,6 +343,8 @@ public:
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static void AppendStaticContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> skip, std::vector<std::uint32_t>& key);
+    static void AppendBindingContentKey(const CompiledShader& shader, std::uint32_t binding, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a

@@ -916,6 +916,19 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::size_t> resultIndex(programs.size(), 0);
+    std::vector<std::shared_ptr<DrawStageRecord>> memoPending(programs.size());
+    const auto verifyMemoStage = [&](std::size_t i, const DispatchVariant& kept) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        std::vector<std::uint32_t> words;
+        freshRuns(i, runs, words);
+        const char* what = DrawStageMismatch(kept, runs, words, *stageCaptures[i].compiled);
+        if (what == nullptr && (vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)))) what = "vertex stage info";
+        drawStageMemoCounters.Add(DrawStageMemoCount::Verified);
+        if (what == nullptr) return;
+        char message[256];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_STAGE_MEMO: stage %zu (program 0x%llx) of a draw stage memo hit differs from its full build in its %s", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what);
+        throw std::runtime_error(message);
+    };
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -943,11 +956,31 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         break;
                     }
                 }
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
-                if (!rejected.empty()) return DrawVerdict::Rejected;
-                programResults[i] = compiledStages.back().get();
-                if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
-                if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                const bool validated = matched[i] != nullptr && !verifyHit && !verifyDrawDataHits() && !verifyDrawStageMemo() && tail.relocatedDecode == decode && candidate == dataCandidates[i].end() && matched[i]->pushOffset == pushCursorBytes;
+                if (validated) {
+                    reused[i] = true;
+                    programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
+                    memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                    drawStageMemoCounters.Add(DrawStageMemoCount::ValidatedReused);
+                } else {
+                    const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
+                    if (memoHit != nullptr && !verifyDrawStageMemo()) {
+                        matched[i] = memoHit->variant;
+                        stageCaptures[i].registeredViews = matched[i]->registeredViews;
+                        matchedRegions[i].clear();
+                        appendEntryRegions(*matched[i], matchedRegions[i]);
+                        reused[i] = true;
+                        programResults[i] = matched[i]->compiled.get();
+                        memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                    } else {
+                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                        if (!rejected.empty()) return DrawVerdict::Rejected;
+                        programResults[i] = compiledStages.back().get();
+                        if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
+                        if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                        if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                    }
+                }
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
@@ -970,6 +1003,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (!drawHit && stageEntries) {
+        drawStageMemoCounters.Add(DrawStageMemoCount::DrawMisses);
+        bool everyStageReused = true;
+        for (std::size_t i = 0; i < programs.size(); ++i) everyStageReused = everyStageReused && (roles[i] == Role::GeometryBack || reused[i]);
+        if (everyStageReused) drawStageMemoCounters.Add(DrawStageMemoCount::ReusedMisses);
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
@@ -1001,7 +1040,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, &memoPending);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1309,6 +1348,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? (matched[i] != nullptr && matched[i]->donor != nullptr ? matched[i]->donor : matched[i]) : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
+    std::shared_ptr<const DrawPlanKey> planKey;
+    if ((Graphics::DrawPlanShadow() || Graphics::DrawPlans()) && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry) planKey = BuildDrawPlanKey(stages, graphics, drawParameters);
     const auto recipeDonor = drawHit && entry != nullptr ? entry->donor : nullptr;
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
@@ -1342,10 +1383,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, planKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, planKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
@@ -1372,15 +1413,26 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
+    std::shared_ptr<const DrawRecipe> served;
+    if (planKey != nullptr && Graphics::DrawPlans() && serveDrawPlan(localDevice, *planKey, graphics, drawParameters, stages, snapshots, tracePtr, served)) {
+        if (served != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor);
+        phaseTiming.Phase(DrawRowGraphics);
+        timing.Mark("draw_and_resource_release");
+        return drawn();
+    }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
+    if (planKey != nullptr) static_cast<void>(Graphics::TakeDrawPlanShadowDecision());
+    const auto fullStart = fullPlanDrawStart(planKey.get());
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() && planKey == nullptr ? nullptr : &built, tracePtr, tail.shapeKey);
+    countFullPlanDraw(fullStart);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
+    if (planKey != nullptr) shadowDrawPlan(planKey, built != nullptr ? built : Graphics::TakeDrawPlanShadowDecision());
+    if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, const std::shared_ptr<const DrawPlanKey>& planKey) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -1399,9 +1451,18 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
+    std::shared_ptr<const DrawRecipe> served;
+    if (planKey != nullptr && Graphics::DrawPlans() && serveDrawPlan(localDevice, *planKey, graphics, drawParameters, stages, snapshots, tracePtr, served)) {
+        if (served != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor);
+        return;
+    }
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
-    if (built != nullptr) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor); });
+    if (planKey != nullptr) static_cast<void>(Graphics::TakeDrawPlanShadowDecision());
+    const auto fullStart = fullPlanDrawStart(planKey.get());
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() && planKey == nullptr ? nullptr : &built, tracePtr, shape);
+    countFullPlanDraw(fullStart);
+    if (planKey != nullptr) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { shadowDrawPlan(planKey, built != nullptr ? built : Graphics::TakeDrawPlanShadowDecision()); });
+    if (built != nullptr && !recipeStages.empty()) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor); });
 }
 
 }
