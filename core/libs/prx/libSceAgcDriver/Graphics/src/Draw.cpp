@@ -3804,70 +3804,31 @@ const char* targetObligation(const Context& context, const State& state, std::sp
     return repeatedDepth ? DepthTargetObligation(context, *state.depth, state.depthWrite) : nullptr;
 }
 
-bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
-    auto*& recipeOut = prepared.recipeOut;
-    auto& stencilReferences = prepared.stencilReferences;
-    for (const auto& shader : shaders) {
-        if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
-            Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage");
-            stencilReferences = shader.program->stencilReferences;
-        }
-    }
-    if (!stencilReferences.empty()) {
-        Require(!draw.indirect && !state.primitiveRestart && !state.rectList && !state.quadList && !state.stages.mesh && !state.stages.tessellation && state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "stencil replay supports direct triangle lists without restart, mesh or tessellation");
-        Require(!state.depthBiasPerFace && !ShadersWriteMemory(shaders), "stencil replay refuses face splits and shader memory writes");
-        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReplaySafe && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
-        if (stencilReferences.size() == 256u) {
-            static std::once_flag unbounded;
-            std::call_once(unbounded, [] { APS5_LOG_CHARS_OUT("Stencil replay: a draw replays all 256 stencil reference values because its pixel shader's export is not bounded, recording 256 passes per triangle and instance"); });
-        }
-        for (const auto& shader : shaders) {
-            if (shader.stage != ShaderRecompiler::ShaderStage::Vertex) continue;
-            Require((shader.program->hostSubgroupSize == 1u || shader.program->hostSubgroupSize == context.subgroup.subgroupSize) && shader.program->spirv.size() >= 5u && shader.program->spirv[1] >= 0x00010000u && shader.program->spirv[1] < 0x00010600u, "stencil replay vertex subgroup contract differs from the physical device");
-        }
-        Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
-        Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
-        recipeOut = nullptr;
-    }
-    if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
-    if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    auto& timing = prepared.timing.emplace("Graphics.Draw");
-    // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    auto& timer = prepared.timer;
-    timer = DrawTimer(profile);
-    // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
-    // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
-    // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
-    // totals must not carry.
-    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
-    auto& outcome = prepared.outcome;
-    auto& built = prepared.built;
-    // The thread's GPU waits so far: the difference at the report, less the draw's own syncs
-    // (`ownWaitedMs`, sampled around them), is what this draw waited for through the flush hook
-    // (nested in the draw's hold, see DrawOutcome::hookWaitUs).
-    const auto waitedBefore = prepared.waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
-    auto& ownWaitedMs = prepared.ownWaitedMs;
-    const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
-    auto& inputs = prepared.inputs;
-    BeginCommitPhase(CommitPhase::Plan);
-    prepared.plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
-    const auto& plan = prepared.plan;
-    if (plan.nothing) return false;
-    BeginCommitPhase(CommitPhase::Inputs);
-    inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
-    if (inputs.nothing) {
-        if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
-        return false;
-    }
-    BeginCommitPhase(CommitPhase::Targets);
-    if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
-    const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
-    const auto indexBytes = inputs.indexBytes;
-    const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
-    auto& targets = prepared.targets;
+struct ResolvedTargets {
+    std::vector<TargetBinding>& targets;
+    std::vector<VkImageView>& views;
+    VkImageView depthView = VK_NULL_HANDLE;
+    TargetProof proof{};
+    bool repeatedColors = false;
+    bool repeatedDepth = false;
+    bool planRecordable = false;
+};
+
+enum class TargetResolution { Repeated, Resolved, ResolvedWithCopies };
+
+bool TargetsPlanRecordable(const State& state, int dumpLimit) {
+    if (dumpLimit != 0 || (state.depth && state.depth->samples != 1u)) return false;
+    return std::ranges::none_of(state.colors, [&](const ColorTarget& color) {
+        const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
+        return color.samples > 1 || color.staged || color.fmaskAddress != 0 || (color.tileMode == ColorTileMode::Linear && color.dccAddress == 0 && !fullScissor);
+    });
+}
+
+TargetResolution ResolveDrawTargets(const Context& context, const State& state, std::uint64_t shape, int dumpLimit, DrawOutcome& outcome, DrawTimer& timer, bool profile, ResolvedTargets& resolved) {
+    resolved.planRecordable = TargetsPlanRecordable(state, dumpLimit);
+    auto& targets = resolved.targets;
+    auto& targetViews = resolved.views;
     targets.resize(state.colors.size());
-    auto& targetViews = prepared.targetViews;
     static_cast<void>(ownsTargetMemo(ThreadTargetMemo()));
     const auto targetProof = currentTargetProof(context);
     auto admissionProof = targetProof;
@@ -3938,7 +3899,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                         return resident;
                     }
                     const auto surface = SurfaceForTarget(color);
-                    auto resident = RepeatStorageSurface(context, surface, shapeTarget(context, prepared.shape, index));
+                    auto resident = RepeatStorageSurface(context, surface, shapeTarget(context, shape, index));
                     if (resident != nullptr && VerifyShapeMemo()) {
                         Require(CachedStorageSurface(context, surface) == resident, "APS5_VERIFY_SHAPE_MEMO: the shape memo's resident target differs from the storage cache's");
                         noteShapeMemoVerified(false);
@@ -4066,6 +4027,80 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (admissionProof == preparedProof) {
         if (!unchanged) rememberTargets(state, targets, targetViews, preparedProof);
     } else ThreadTargetMemo().Invalidate();
+    resolved.depthView = state.depth ? depthView : VK_NULL_HANDLE;
+    resolved.proof = preparedProof;
+    resolved.repeatedColors = repeatedColors;
+    resolved.repeatedDepth = repeatedDepth;
+    if (repeatedColors && (!state.depth || repeatedDepth)) return TargetResolution::Repeated;
+    const bool copies = std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr && !binding.multisampled; });
+    return copies ? TargetResolution::ResolvedWithCopies : TargetResolution::Resolved;
+}
+
+bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
+    auto*& recipeOut = prepared.recipeOut;
+    auto& stencilReferences = prepared.stencilReferences;
+    for (const auto& shader : shaders) {
+        if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {
+            Require(shader.stage == ShaderRecompiler::ShaderStage::Fragment && stencilReferences.empty(), "stencil replay requires exactly one fragment stage");
+            stencilReferences = shader.program->stencilReferences;
+        }
+    }
+    if (!stencilReferences.empty()) {
+        Require(!draw.indirect && !state.primitiveRestart && !state.rectList && !state.quadList && !state.stages.mesh && !state.stages.tessellation && state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "stencil replay supports direct triangle lists without restart, mesh or tessellation");
+        Require(!state.depthBiasPerFace && !ShadersWriteMemory(shaders), "stencil replay refuses face splits and shader memory writes");
+        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReplaySafe && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
+        if (stencilReferences.size() == 256u) {
+            static std::once_flag unbounded;
+            std::call_once(unbounded, [] { APS5_LOG_CHARS_OUT("Stencil replay: a draw replays all 256 stencil reference values because its pixel shader's export is not bounded, recording 256 passes per triangle and instance"); });
+        }
+        for (const auto& shader : shaders) {
+            if (shader.stage != ShaderRecompiler::ShaderStage::Vertex) continue;
+            Require((shader.program->hostSubgroupSize == 1u || shader.program->hostSubgroupSize == context.subgroup.subgroupSize) && shader.program->spirv.size() >= 5u && shader.program->spirv[1] >= 0x00010000u && shader.program->spirv[1] < 0x00010600u, "stencil replay vertex subgroup contract differs from the physical device");
+        }
+        Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
+        Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
+        recipeOut = nullptr;
+    }
+    if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
+    if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
+    auto& timing = prepared.timing.emplace("Graphics.Draw");
+    // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& timer = prepared.timer;
+    timer = DrawTimer(profile);
+    // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
+    // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
+    // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
+    // totals must not carry.
+    static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
+    auto& outcome = prepared.outcome;
+    auto& built = prepared.built;
+    // The thread's GPU waits so far: the difference at the report, less the draw's own syncs
+    // (`ownWaitedMs`, sampled around them), is what this draw waited for through the flush hook
+    // (nested in the draw's hold, see DrawOutcome::hookWaitUs).
+    const auto waitedBefore = prepared.waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+    auto& ownWaitedMs = prepared.ownWaitedMs;
+    const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
+    auto& inputs = prepared.inputs;
+    BeginCommitPhase(CommitPhase::Plan);
+    prepared.plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    const auto& plan = prepared.plan;
+    if (plan.nothing) return false;
+    BeginCommitPhase(CommitPhase::Inputs);
+    inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
+    if (inputs.nothing) {
+        if (VerifyDrawPlan()) requireDrawPlanRepeats(context, state, draw, shaders, plan);
+        return false;
+    }
+    BeginCommitPhase(CommitPhase::Targets);
+    if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
+    const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
+    const auto indexBytes = inputs.indexBytes;
+    const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
+    auto& targets = prepared.targets;
+    auto& targetViews = prepared.targetViews;
+    ResolvedTargets resolvedTargets{targets, targetViews};
+    static_cast<void>(ResolveDrawTargets(context, state, prepared.shape, dumpLimit, outcome, timer, profile, resolvedTargets));
     timer.phase(PhasePrepare);
     BeginCommitPhase(CommitPhase::ResolveSetup);
     const bool recordDraws = RecordDraws();
