@@ -248,6 +248,57 @@ void FlagOutsideTheLock(Watchdog& watchdog) {
     answerer.join();
 }
 
+void NotifyBetweenCheckAndSleep(Watchdog& watchdog) {
+    watchdog.Phase("notify between the predicate and the sleep");
+    std::mutex mutex;
+    AddressCondition changed;
+    std::atomic<bool> flag{false};
+    for (int round = 0; round < 1000; ++round) {
+        flag.store(false, std::memory_order_relaxed);
+        int checks = 0;
+        std::unique_lock lock(mutex);
+        changed.Wait(lock, [&] {
+            if (flag.load(std::memory_order_acquire)) return true;
+            if (++checks == 2) {
+                flag.store(true, std::memory_order_release);
+                changed.NotifyAll();
+            }
+            return false;
+        });
+        Require(flag.load(std::memory_order_acquire), "a wait returned before its predicate held");
+    }
+}
+
+void BroadcastWakesEveryWaiter(Watchdog& watchdog) {
+    watchdog.Phase("broadcast to every sleeping waiter");
+    constexpr int Waiters = 8;
+    for (int round = 0; round < 20; ++round) {
+        std::mutex mutex;
+        AddressCondition changed;
+        bool open = false;
+        std::atomic<int> waiting{0};
+        std::atomic<int> woken{0};
+        std::vector<std::thread> threads;
+        for (int index = 0; index < Waiters; ++index) {
+            threads.emplace_back([&] {
+                std::unique_lock lock(mutex);
+                waiting.fetch_add(1, std::memory_order_relaxed);
+                changed.Wait(lock, [&] { return open; });
+                woken.fetch_add(1, std::memory_order_relaxed);
+            });
+        }
+        while (waiting.load(std::memory_order_relaxed) != Waiters) std::this_thread::yield();
+        std::this_thread::sleep_for(5ms);
+        {
+            std::lock_guard lock(mutex);
+            open = true;
+        }
+        changed.NotifyAll();
+        for (auto& thread : threads) thread.join();
+        Require(woken.load() == Waiters, "a broadcast did not wake every waiter");
+    }
+}
+
 void MutexContention(Watchdog& watchdog) {
     watchdog.Phase("driver mutex under contention");
     constexpr int Workers = 6;
@@ -683,6 +734,8 @@ int main(int argc, char** argv) {
         EncoderHandoff(watchdog);
         BoundedQueue(watchdog);
         FlagOutsideTheLock(watchdog);
+        NotifyBetweenCheckAndSleep(watchdog);
+        BroadcastWakesEveryWaiter(watchdog);
         MutexContention(watchdog);
         TimedWaits(watchdog);
         StopTokenWait(watchdog);
