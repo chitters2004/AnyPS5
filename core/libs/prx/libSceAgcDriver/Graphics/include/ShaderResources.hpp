@@ -46,6 +46,7 @@ struct WriteIndexOutcomes {
 WriteIndexOutcomes WriteIndexOutcomesCounted();
 enum class CertifiedMiss : std::size_t { Uncertified, Sweep, Subscription, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
 enum class CertifyRefusal : std::size_t { Unsubscribed, PerElementTextures, ComparedTextures, ComparedTables, DepthCopies, StorageImages, PendingMoved, DepthSurfacesMoved, Count };
+enum class UncertifiedCause : std::size_t { NeverProved, Refused, Voided, ProofFailed, NotCertifying, ViewsStale, Count };
 struct CertifiedProofOutcomes {
     std::uint64_t proved = 0;
     std::uint64_t swept = 0;
@@ -54,6 +55,12 @@ struct CertifiedProofOutcomes {
     std::uint64_t disagreed = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
     std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(UncertifiedCause::Count)> uncertified{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> uncertifiedRefused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> uncertifiedVoided{};
+    std::uint64_t epochServed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
+    std::uint64_t proofMissUnattributed = 0;
 };
 CertifiedProofOutcomes CertifiedProofOutcomesCounted();
 bool CertifiedProofs();
@@ -784,6 +791,12 @@ private:
     std::uint64_t certifiedPending = 0;
     std::uint64_t certifiedDepth = 0;
     bool certified = false;
+    UncertifiedCause uncertifiedCause = UncertifiedCause::NeverProved;
+    CertifyRefusal uncertifiedRefusal = CertifyRefusal::Count;
+    CertifiedMiss uncertifiedMiss = CertifiedMiss::Count;
+    bool epochServed = false;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> certifiedBreaks{};
+    void noteUncertified(UncertifiedCause cause, CertifyRefusal refusal = CertifyRefusal::Count, CertifiedMiss miss = CertifiedMiss::Count);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     bool importsReconcilable = false;

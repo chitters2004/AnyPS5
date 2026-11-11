@@ -2464,14 +2464,33 @@ std::uint64_t CollectEpochBumps() {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 thread_local bool proofThread = false;
+const bool proofBreaksCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
+constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakNames{"unlabelled", "own-store", "mark-written", "gpu-lock", "write-changed", "write-changed-if-held", "completion-store", "completion-action", "written-back", "copied-writer", "pipeline-commit", "resource-writes"};
+}
+
+const char* ProofBreakName(ProofBreak source) {
+    const auto index = static_cast<std::size_t>(source);
+    return index < ProofBreakNames.size() ? ProofBreakNames[index] : "invalid";
+}
+
+bool ProofBreaksCounted() {
+    return proofBreaksCounted;
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakCounts() {
+    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = proofBreaks[i].load(std::memory_order_relaxed);
+    return counts;
 }
 
 std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (proofBreaksCounted) proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void MarkProofThread() {
@@ -2863,7 +2882,7 @@ void SetOwnStoreCompare(bool compare) {
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, const std::function<std::pair<std::uint64_t, std::uint64_t>(std::span<std::byte>)>& store, bool complete = true) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(GuestMemory::ProofBreak::OwnStore);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2930,7 +2949,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    BreakProofs();
+    BreakProofs(GuestMemory::ProofBreak::MarkWritten);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;
@@ -3324,7 +3343,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(GuestMemory::ProofBreak::GpuLock);
     }
 }
 
@@ -3910,7 +3929,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(GuestMemory::ProofBreak::WriteChanged);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3975,7 +3994,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(GuestMemory::ProofBreak::WriteChangedIfHeld);
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());
