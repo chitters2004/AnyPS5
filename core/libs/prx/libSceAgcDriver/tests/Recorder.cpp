@@ -9737,11 +9737,11 @@ void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool f
     std::cout << "Storage upload lifetime" << (failView ? " after view failure" : " after caller release") << ": passed\n";
 }
 
-void refreshProofTests(const Device& device, Recorder& recorder) {
+bool refreshProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: refresh proofs not tested\n";
-        return;
+        return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
@@ -9750,7 +9750,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
         std::cout << "no write watching: refresh proofs not tested\n";
-        return;
+        return false;
     }
     auto* texels = static_cast<std::uint8_t*>(block);
     auto* keys = texels + surfaceBytes;
@@ -9775,7 +9775,7 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
         std::cout << "no watched host import: refresh proofs not tested\n";
-        return;
+        return false;
     }
     TextureDetiler detiler(base);
     auto context = base;
@@ -9831,6 +9831,15 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         expectFull("a CPU write of the surface was answered from the proof");
         settle();
         expectProved("the proof was not taken again after a CPU write");
+        if (StorageTexture::UploadRefreshProofs()) {
+            texels[0] = 0x22;
+            expectFull("a CPU write before an upload's proof was answered from the previous proof");
+            expectProved("the refresh after an upload was not answered from the proof the upload took");
+            texels[0] = 0x33;
+            expectFull("a CPU write after an upload's proof was answered from it");
+            expectProved("the refresh after a second upload was not answered from its proof");
+            std::cout << "Upload refresh proofs: passed\n";
+        }
         AgcDriver::GuestMemory::MarkWritten(address + 65536, 4096);
         expectFull("a driver store into the surface was answered from the proof");
         settle();
@@ -9855,9 +9864,20 @@ void refreshProofTests(const Device& device, Recorder& recorder) {
         Require(proved() == before, "a new image of the surface was answered from another image's proof");
         std::memset(keys, 0x00, keyCount);
         expectFull("a fast clear of the keys was answered from the proof");
+        if (StorageTexture::UploadRefreshProofs() && StorageTexture::RefreshExitEpochStamps()) {
+            std::memset(keys, 0xff, keyCount);
+            texels[0] = 0x44;
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            expectFull("a CPU write before the collect epoch was answered from the proof");
+            const auto epochHits = StorageTexture::epochRefreshes.load();
+            expectProved("the refresh after an upload stamped with the epoch was not proved");
+            Require(StorageTexture::epochRefreshes.load() == epochHits + 1, "the refresh after an upload stamped with the epoch was not answered from the epoch");
+            std::cout << "Refresh exit epoch stamps: passed\n";
+        }
         recorder.Sync();
     }
     recorder.Sync();
+    return true;
 }
 
 bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
@@ -12775,7 +12795,12 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     TextureCache cache(context);
     context.textureCache = &cache;
     const DepthTarget target{address, 0, {side, side}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
-    Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "the depth surface has no view");
+    const auto targetView = DepthSurfaceView(context, target);
+    Require(targetView != VK_NULL_HANDLE, "the depth surface has no view");
+    Require(RepeatDepthSurfaceView(context, target, false, false) == targetView, "the proved depth surface did not repeat its view");
+    auto differentTarget = target;
+    differentTarget.address += bytes;
+    Require(RepeatDepthSurfaceView(context, differentTarget, false, false) == VK_NULL_HANDLE, "a different depth identity repeated the old view");
     ShaderRecompiler::RecompileResult program;
     ShaderRecompiler::DescriptorBinding binding;
     binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
@@ -15037,11 +15062,17 @@ void pipelineLibraryTests(const Device& device) {
     const auto beforeSlots = counters().built;
     ShaderRecompiler::RecompileResult otherVertex = vertex;
     otherVertex.spirv[2] ^= 1u;
-    std::array slotted{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}};
+    ShaderRecompiler::RecompileResult slottedFragment = fragment;
+    slottedFragment.spirv[2] ^= 2u;
+    std::array slotted{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &slottedFragment, PipelinePushSlotBytes}};
     static_cast<void>(CachedPipeline(context, state, input, resources, slotted, VK_IMAGE_LAYOUT_GENERAL));
     slotted.front().program = &otherVertex;
     static_cast<void>(CachedPipeline(context, state, input, resources, slotted, VK_IMAGE_LAYOUT_GENERAL));
     Require(counters().built[2] == beforeSlots[2] + 1u && counters().built[1] == beforeSlots[1] + 1u, "a pixel shader in its fixed slot built its library again for another vertex shader");
+    const auto afterSlots = counters().built;
+    slotted.back().program = &fragment;
+    static_cast<void>(CachedPipeline(context, state, input, resources, slotted, VK_IMAGE_LAYOUT_GENERAL));
+    Require(counters().built == afterSlots, "a pixel shader without push constants built its libraries again at its fixed slot");
     fragment.spirv[2] ^= 1u;
     static_cast<void>(lookup());
     Require(counters().built == std::array<std::uint64_t, 4>{2, 2, 3, 2}, "a new pixel shader rebuilt more than the fragment shader library");
@@ -15901,6 +15932,13 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bda-shadowed-results-only") {
             return addressShadowTests(device, recorder) ? 0 : 77;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--refresh-proof-only") {
+            if (!StorageTexture::UploadRefreshProofs()) {
+                std::cout << "skipped, APS5_UPLOAD_REFRESH_PROOF is unset\n";
+                return 77;
+            }
+            return refreshProofTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--completion-store-shadow-only") {
             return completionStoreShadowTests(device, recorder) ? 0 : 77;
         }
@@ -16106,7 +16144,7 @@ int main(int argc, char** argv) {
         closeRaceTests(device, recorder);
         keyProofTests(device, recorder);
         targetKeyProofTests(device, recorder);
-        refreshProofTests(device, recorder);
+        static_cast<void>(refreshProofTests(device, recorder));
         resourceReadTests(device, recorder);
         readWrittenStagingTests(device, recorder);
         bdaStagingTests(device, recorder);

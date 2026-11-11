@@ -71,8 +71,8 @@ struct OwnedImage {
 
 class Texture {
 public:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool layerRows = false, const VkClearColorValue* clear = nullptr);
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, bool layerRows = false);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool layerRows = false, const VkClearColorValue* clear = nullptr, std::optional<std::span<const std::uint32_t>> packedSlabs = std::nullopt);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::shared_ptr<Buffer> staging, bool depthCompare = false, bool layerRows = false, std::optional<std::span<const std::uint32_t>> packedSlabs = std::nullopt);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
@@ -135,7 +135,7 @@ public:
     void MarkReleased() { released.store(true, std::memory_order_release); }
 
 private:
-    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, bool layerRows, const VkClearColorValue* clear);
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, std::shared_ptr<Buffer> staging, bool depthCompare, bool layerRows, const VkClearColorValue* clear, std::optional<std::span<const std::uint32_t>> packedSlabs);
     void release() noexcept;
     bool refreshBlockCopy();
     bool refreshSrgbExpand();
@@ -355,6 +355,9 @@ public:
     // as it was, and one that finds it unchanged since an earlier read knows the registry is what
     // it was then.
     static std::uint64_t PendingSerial();
+    static std::uint64_t OwnPendingMoves();
+    static std::uint64_t OwnRefreshWork();
+    static void NoteRefreshWork();
     // One registry scan for several ranges (the fast Revalidate): each query's `overlaps` receives
     // whether an image other than `except` has results pending, or is being stored right now, over
     // [begin, end), and `found` the image FindPending would return for the range (null: none);
@@ -415,6 +418,10 @@ public:
     static bool OrderedFlushArmedForTest();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
+    void NoteUsed() const {
+        if (!usedUnlisted.load(std::memory_order_relaxed)) usedUnlisted.store(true, std::memory_order_relaxed);
+    }
+    bool TakeUsed() const { return usedUnlisted.load(std::memory_order_relaxed) && usedUnlisted.exchange(false, std::memory_order_relaxed); }
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }
@@ -517,6 +524,9 @@ public:
     static std::uint64_t PaddingSeedCopies();
     static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
+    const char* RefreshObligation(std::uint32_t first = 0, std::uint32_t count = 0) const;
+    static bool UploadRefreshProofs();
+    static bool RefreshExitEpochStamps();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();
@@ -532,6 +542,7 @@ public:
 private:
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> missedEpoch{0};
+    std::atomic<std::uint64_t> provedThread{0};
     std::atomic<std::uint64_t> slowEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};
@@ -685,6 +696,7 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
+    std::pair<std::uint32_t, std::uint32_t> refreshUnits(std::uint32_t first, std::uint32_t count) const;
     bool refreshProved(CommitCounter& refused);
     bool keysReplacedByClear() const;
     void takeRefreshProof(bool aliased);
@@ -873,6 +885,7 @@ private:
     std::atomic<bool> cached{false};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
+    mutable std::atomic<bool> usedUnlisted{false};
     // Hook skips of this image since FlushPending last listed it (AccessKeptByCpu), the read site
     // of the last one (a GuestMemory::ReadSite), and the first pending layer under its access with
     // the version and layer generation seen: a listing counts a flush after a skip only while that

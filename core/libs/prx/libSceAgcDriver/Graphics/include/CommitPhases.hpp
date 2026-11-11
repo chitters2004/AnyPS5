@@ -51,6 +51,10 @@ enum class CommitPhase : std::uint8_t {
     TargetsDepthFind,
     TargetsDepthSync,
     TargetsDepthStale,
+    TargetsLookupPure,
+    TargetsLookupGuards,
+    TargetsLookupCache,
+    TargetsMemo,
     PlanHitFind,
     PlanHitWords,
     PlanHitInstance,
@@ -106,6 +110,31 @@ enum class CommitCounter : std::uint8_t {
     TargetMissFirstInEpoch,
     TargetSlowAgainInEpoch,
     EpochFollowsSkipped,
+    DepthFoundRepeated,
+    TargetEpochNeverStamped,
+    TargetEpochOtherThread,
+    TargetEpochThisThread,
+    TargetEpochExitStamps,
+    TargetMemoAccept,
+    TargetMemoAcceptWithDepthMiss,
+    TargetMemoInvalid,
+    TargetMemoDescriptor,
+    TargetMemoResident,
+    TargetMemoDepthOverlap,
+    TargetMemoEpoch,
+    TargetMemoProofs,
+    TargetMemoPending,
+    TargetMemoUnwatch,
+    TargetMemoAllocations,
+    TargetMemoSurfaces,
+    TargetMemoReleased,
+    TargetMemoClaims,
+    TargetMemoRecorder,
+    TargetMemoDevice,
+    TargetMemoMetadata,
+    TargetMemoPostDepthInvalidated,
+    TargetMemoDepthFallback,
+    TargetMemoAvoidedRefreshLookups,
     Count
 };
 
@@ -139,6 +168,7 @@ struct CommitPhaseTotals {
 
 bool CommitPhasesEnabled();
 const char* CommitPhaseName(CommitPhase phase);
+const char* CommitPhaseGroup(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
