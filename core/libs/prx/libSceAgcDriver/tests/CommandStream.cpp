@@ -74,6 +74,7 @@ using namespace AgcDriver::Graphics;
     X(PushConstants) \
     X(PushDescriptorSetKHR) \
     X(ResolveImage) \
+    X(SetColorWriteMaskEXT) \
     X(SetScissor) \
     X(SetViewport) \
     X(UpdateBuffer)
@@ -420,6 +421,14 @@ VKAPI_ATTR void VKAPI_CALL stubResolveImage(VkCommandBuffer commands, VkImage so
     record(std::move(line));
 }
 
+VKAPI_ATTR void VKAPI_CALL stubSetColorWriteMaskEXT(VkCommandBuffer commands, std::uint32_t first, std::uint32_t count, const VkColorComponentFlags* masks) {
+    auto line = begin(SetColorWriteMaskEXTName, commands);
+    bytes(line, first);
+    bytes(line, count);
+    items(line, masks, count);
+    record(std::move(line));
+}
+
 VKAPI_ATTR void VKAPI_CALL stubSetScissor(VkCommandBuffer commands, std::uint32_t first, std::uint32_t count, const VkRect2D* scissors) {
     auto line = begin(SetScissorName, commands);
     bytes(line, first);
@@ -549,6 +558,7 @@ struct Data {
     std::array<VkImageCopy, 2> imageCopies;
     std::array<VkImageResolve, 2> resolves;
     std::array<VkViewport, 2> viewports;
+    std::array<VkColorComponentFlags, 3> colorWriteMasks;
     std::array<VkRect2D, 2> scissors;
 };
 
@@ -605,6 +615,7 @@ void makeData(Data& data, std::vector<unsigned char>& large) {
     fill(data.resolves);
     data.viewports = {{{0.0f, 0.0f, 1920.0f, 1080.0f, 0.0f, 1.0f}, {16.0f, 32.0f, 64.0f, 128.0f, 0.25f, 0.75f}}};
     fill(data.scissors);
+    data.colorWriteMasks = {{VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_B_BIT, 0, VK_COLOR_COMPONENT_A_BIT}};
     large.resize(65536);
     pattern(large.data(), large.size(), seed);
 }
@@ -661,6 +672,7 @@ void recordAll(VkCommandBuffer commands, const Functions& f, const Data& d, cons
     f.cmdSetDepthTestEnableEXT(commands, VK_TRUE);
     f.cmdSetDepthWriteEnableEXT(commands, VK_FALSE);
     f.cmdSetFrontFaceEXT(commands, VK_FRONT_FACE_CLOCKWISE);
+    f.cmdSetColorWriteMaskEXT(commands, 1, 3, d.colorWriteMasks.data());
     f.cmdSetScissor(commands, 0, 2, d.scissors.data());
     f.cmdSetStencilCompareMask(commands, VK_STENCIL_FACE_FRONT_BIT, 0x0f);
     f.cmdSetStencilOpEXT(commands, VK_STENCIL_FACE_FRONT_AND_BACK, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_INCREMENT_AND_CLAMP, VK_COMPARE_OP_EQUAL);

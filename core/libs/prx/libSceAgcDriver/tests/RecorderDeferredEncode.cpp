@@ -1040,6 +1040,7 @@ void KeptOwnersOutliveTheirEncode() {
             }
             fixture.device.changed.notify_all();
             Reported([&] { recorder.Sync(); });
+            recorder.FlushDeferredReleases();
             Expect(destroyed.load() && watched.expired(), "a kept object outlived its retired batch");
             Expect(failing || submissionsAtDestruction == 1, "a kept object was released before its batch was submitted");
         }

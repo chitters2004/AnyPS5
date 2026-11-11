@@ -49,6 +49,7 @@
     X(ResetQueryPool) \
     X(ResolveImage) \
     X(SetCheckpointNV) \
+    X(SetColorWriteMaskEXT) \
     X(SetCullModeEXT) \
     X(SetDepthBias) \
     X(SetDepthBounds) \
@@ -292,6 +293,9 @@ void copyArguments(CommandStream& stream, ArgumentsOf<Op>& arguments) {
     } else if constexpr (Op == CommandOp::SetScissor || Op == CommandOp::SetViewport) {
         auto& [first, count, values] = arguments;
         values = copy(stream, values, count);
+    } else if constexpr (Op == CommandOp::SetColorWriteMaskEXT) {
+        auto& [first, count, masks] = arguments;
+        masks = copy(stream, masks, count);
     } else if constexpr (Op == CommandOp::UpdateBuffer) {
         auto& [buffer, offset, size, data] = arguments;
         data = copyBytes(stream, data, static_cast<std::size_t>(size));
