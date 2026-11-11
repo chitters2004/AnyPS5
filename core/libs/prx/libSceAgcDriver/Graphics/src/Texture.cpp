@@ -4305,14 +4305,6 @@ void StorageTexture::forgetDrawn() {
     pending.drawnCount.store(pending.drawn.size(), std::memory_order_release);
 }
 
-void StorageTexture::noteStore(std::uint64_t note) {
-    if (note == 0) return;
-    auto& pending = Pending();
-    std::lock_guard lock(pending.mutex);
-    storeNotes.push_back(note);
-    if (storeNotes.size() > 8) storeNotes.erase(storeNotes.begin());
-}
-
 StorageTexture::DrawnArea StorageTexture::drawnArea() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
@@ -4451,8 +4443,8 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     }
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
-    recorder->NotePendingWrite(hullBegin, hullBytes);
-    noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
+    const std::array hull{std::pair{hullBegin, hullBegin + hullBytes}};
+    recorder->NoteStampedWrites(hull);
     return storedBytes;
 }
 
@@ -4587,7 +4579,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
-    std::vector<std::uint64_t> ownNotes;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -4631,9 +4622,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
         if (!flush.empty()) BumpPendingSerial();
-        for (const auto& texture : flush) {
-            if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
-        }
     }
     if (flush.empty()) {
         if (drawnHold.owns_lock()) drawnHold.unlock();
@@ -4660,7 +4648,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    if (!ownNotes.empty() && (flush.size() != 1 || std::any_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return ExistingHostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) == nullptr; }))) ownNotes.clear();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !Recorder::InCompletion()) {
         try {
             static const bool wholeRange = std::getenv("APS5_FLUSH_WAIT_WHOLE_RANGE") != nullptr;
@@ -4689,7 +4676,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 }
                 for (const auto& [begin, end] : stored) {
                     if (writer == active.OpenSerial()) break;
-                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes, true));
+                    writer = std::max(writer, active.UnstampedWriterSerial(begin, static_cast<std::size_t>(end - begin)));
                 }
                 return writer;
             };
@@ -6980,7 +6967,6 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->MarkShaderReadsCovered();
             const std::array stamped{std::pair{firstStored, lastStored}};
             recorder->NoteStampedWrites(stamped);
-            if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
         countStorageWriteBack(storedBytes, true, drawn.drawn);
         if (profile) Profile().storageGpu += timer.lap();

@@ -3358,6 +3358,7 @@ void Recorder::StampNote(std::uint64_t note) {
 bool Recorder::UnfinishedStampedBlocks(std::uint64_t spanBegin, std::span<std::uint8_t> blocks) const {
     constexpr std::uint64_t block = 65536;
     const auto spanEnd = spanBegin + blocks.size() * block;
+    if (published != nullptr && !SnapshotOverlaps(published.get(), spanBegin, static_cast<std::size_t>(spanEnd - spanBegin))) return false;
     bool any = false;
     const auto mark = [&](const Batch& batch) {
         for (std::size_t index = 0; index < batch.writes.size(); ++index) {
@@ -3464,16 +3465,14 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     return 0;
 }
 
-std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes, bool skipStamped) const {
-    if (exceptNotes.empty() && !skipStamped) return PendingWriterSerial(address, bytes);
+std::uint64_t Recorder::UnstampedWriterSerial(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return 0;
     const auto end = address + bytes;
     const auto writes = [&](const Batch& batch) {
         for (std::size_t index = 0; index < batch.writes.size(); ++index) {
             const auto& [begin, finish] = batch.writes[index];
             if (address >= finish || begin >= end) continue;
-            if (skipStamped && index < batch.writeStamped.size() && batch.writeStamped[index] != 0) continue;
-            if (index < batch.writeNotes.size() && std::find(exceptNotes.begin(), exceptNotes.end(), batch.writeNotes[index]) != exceptNotes.end()) continue;
+            if (index < batch.writeStamped.size() && batch.writeStamped[index] != 0) continue;
             return true;
         }
         return readOverlap(batch, address, end, ReadKind::AddressBased).has_value();

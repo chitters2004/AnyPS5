@@ -648,7 +648,6 @@ private:
     std::uint64_t storeDrawnRect(const DrawnArea& area, std::span<const ImportSegment> segments, std::span<const std::pair<std::uint64_t, std::uint64_t>> stores, const std::vector<std::uint32_t>& saveUnits);
     void addDrawnRect(DrawnRect rect);
     void forgetDrawn();
-    void noteStore(std::uint64_t note);
     // Per-layer validity (thin array surfaces whose layers are 64 KiB-aligned guest slices; every
     // other surface is one tracked layer): a layer's generation is the write generation its guest
     // bytes were last known to match the image at, and a pending layer holds results (a clear, a
@@ -829,7 +828,6 @@ private:
     bool drawingTarget = false;
     bool pendingFromOthers = false;
     std::vector<DrawnRect> drawnRects;
-    std::vector<std::uint64_t> storeNotes;
     std::uint64_t writtenFlip = 0;
     std::atomic<bool> writtenOccasionally{false};
     std::uint64_t version = 0;

@@ -252,6 +252,7 @@ bool StoreUncompressedOnGpu(const Context& context, Recorder& recorder, std::uin
     recorder.QueueKeyStore(import->buffer, first, last, std::move(seed), begin, begin + count);
     recorder.NotePendingFill(begin, count, 0xff);
     GuestMemory::MarkWritten(begin, count);
+    recorder.StampNote(recorder.LastWriteNote(begin, count));
     // After the note: an unlocked memo lookup drops an entry the snapshot does not cover yet. The
     // entry is kept only for the active recorder (the one the flush hook and the lookups consult).
     {
