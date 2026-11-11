@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vulkan/vulkan.h>
 #include "prx/libc/include/PrimedSharedMutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -151,6 +152,7 @@ struct DeviceFunctions {
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
 void BeforeCommandLookup(VkDevice device);
+bool QueueAccessEnabled();
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
@@ -199,6 +201,8 @@ struct Context {
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
+    AgcDriver::Mutex* mainQueueMutex = nullptr;
+    std::mutex* presentQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
     RenderCache* renderCache = nullptr;
@@ -416,6 +420,27 @@ struct Context {
         if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
         return HostMemoryType(mask);
     }
+};
+
+class QueueAccess {
+public:
+    enum class Queues : std::uint8_t { Main, All };
+    explicit QueueAccess(const Context& context, Queues queues = Queues::Main) {
+        if (!QueueAccessEnabled()) return;
+        if (context.mainQueueMutex != nullptr) main = std::unique_lock(*context.mainQueueMutex);
+        if (queues != Queues::All) return;
+        if (context.sparseQueueMutex != nullptr) sparse = std::unique_lock(*context.sparseQueueMutex);
+        if (context.settleQueueMutex != nullptr) settle = std::unique_lock(*context.settleQueueMutex);
+        if (context.presentQueueMutex != nullptr) present = std::unique_lock(*context.presentQueueMutex);
+    }
+    QueueAccess(const QueueAccess&) = delete;
+    QueueAccess& operator=(const QueueAccess&) = delete;
+
+private:
+    std::unique_lock<AgcDriver::Mutex> main;
+    std::unique_lock<std::mutex> sparse;
+    std::unique_lock<std::mutex> settle;
+    std::unique_lock<std::mutex> present;
 };
 
 inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {

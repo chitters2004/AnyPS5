@@ -1232,6 +1232,40 @@ void ForeignFlushesKeepTheOwnersOrder() {
     Require(foreignPosts != 0, "no foreign thread flushed a parked chunk, so the race was not exercised");
 }
 
+void QueueAccessLocksTheQueuesItCovers() {
+    Require(AgcDriver::Graphics::QueueAccessEnabled(), "APS5_QUEUE_ACCESS did not enable queue access");
+    AgcDriver::Mutex main;
+    std::mutex sparse;
+    std::mutex settle;
+    std::mutex present;
+    AgcDriver::Graphics::Context context{};
+    context.mainQueueMutex = &main;
+    context.sparseQueueMutex = &sparse;
+    context.settleQueueMutex = &settle;
+    context.presentQueueMutex = &present;
+    const auto held = [&](auto& mutex) {
+        std::atomic<bool> locked{false};
+        std::thread probe([&] {
+            if (mutex.try_lock()) {
+                mutex.unlock();
+                return;
+            }
+            locked.store(true);
+        });
+        probe.join();
+        return locked.load();
+    };
+    {
+        const AgcDriver::Graphics::QueueAccess access(context);
+        Require(held(main) && !held(sparse) && !held(settle) && !held(present), "main queue access did not hold exactly the main queue");
+    }
+    {
+        const AgcDriver::Graphics::QueueAccess access(context, AgcDriver::Graphics::QueueAccess::Queues::All);
+        Require(held(main) && held(sparse) && held(settle) && held(present), "access to every queue left a queue unlocked");
+    }
+    Require(!held(main) && !held(sparse) && !held(settle) && !held(present), "queue access kept a queue locked after it ended");
+}
+
 void RunAll(bool chunks) {
     AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::EncoderPostChunks, chunks);
     for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
@@ -1267,6 +1301,12 @@ void RunAll(bool chunks) {
 
 int main() {
     try {
+#ifdef _WIN32
+        _putenv_s("APS5_QUEUE_ACCESS", "1");
+#else
+        setenv("APS5_QUEUE_ACCESS", "1", 1);
+#endif
+        QueueAccessLocksTheQueuesItCovers();
         RunAll(false);
         RunAll(true);
         std::cout << "command encoder tests passed\n";

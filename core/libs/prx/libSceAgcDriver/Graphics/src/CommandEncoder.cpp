@@ -487,6 +487,11 @@ void installAt(std::size_t slot, DeviceFunctions& table, std::index_sequence<S..
 
 }
 
+bool QueueAccessEnabled() {
+    static const bool enabled = std::getenv("APS5_QUEUE_ACCESS") != nullptr;
+    return enabled;
+}
+
 bool CommandEncoder::PostsChunks() {
     return RuntimeSwitches::Set(RuntimeSwitch::EncoderPostChunks);
 }

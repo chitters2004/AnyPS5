@@ -657,6 +657,7 @@ struct VulkanDevice::State {
     std::mutex settleQueueMutex;
     VkQueue presentQueue = VK_NULL_HANDLE;
     std::mutex presentQueueMutex;
+    AgcDriver::Mutex mainQueueMutex;
     bool memoryBudget = false;
     bool depthRangeUnrestricted = false;
     bool samplerAnisotropy = false;
@@ -1152,6 +1153,16 @@ struct VulkanDevice::State {
             device = VK_NULL_HANDLE;
         }
         if (device != VK_NULL_HANDLE) {
+            std::unique_lock<AgcDriver::Mutex> mainQueueLock;
+            std::unique_lock<std::mutex> sparseQueueLock;
+            std::unique_lock<std::mutex> settleQueueLock;
+            std::unique_lock<std::mutex> presentQueueLock;
+            if (Graphics::QueueAccessEnabled()) {
+                mainQueueLock = std::unique_lock(mainQueueMutex);
+                sparseQueueLock = std::unique_lock(sparseQueueMutex);
+                settleQueueLock = std::unique_lock(settleQueueMutex);
+                presentQueueLock = std::unique_lock(presentQueueMutex);
+            }
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -2943,8 +2954,10 @@ void VulkanDevice::WaitIdle() {
         if (!state->recorder->Idle()) Graphics::Recorder::CountSync(0, __builtin_return_address(0));
         state->recorder->Sync();
     }
+    std::optional<Graphics::QueueAccess> allQueues;
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
-    if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+    if (Graphics::QueueAccessEnabled()) allQueues.emplace(graphicsContext(), Graphics::QueueAccess::Queues::All);
+    else if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
     check(state->DeviceFunction<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(state->device), "vkDeviceWaitIdle");
     Graphics::CheckPixelFunctionLds(graphicsContext());
     APS5_LOG_CHARS_OUT_DEBUG("VulkanDevice::WaitIdle complete");
@@ -4442,7 +4455,11 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    {
+        std::unique_lock<AgcDriver::Mutex> mainQueueLock;
+        if (Graphics::QueueAccessEnabled()) mainQueueLock = std::unique_lock(state->mainQueueMutex);
+        check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    }
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");
@@ -4578,7 +4595,9 @@ void VulkanDevice::QueuePresent() {
     present.pSwapchains = &state->swapchain;
     present.pImageIndices = &index;
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
+    std::unique_lock<AgcDriver::Mutex> mainQueueLock;
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+    else if (Graphics::QueueAccessEnabled()) mainQueueLock = std::unique_lock(state->mainQueueMutex);
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
     if (presented == VK_ERROR_OUT_OF_DATE_KHR) state->extent = {0, 0};
     else if (presented != VK_SUBOPTIMAL_KHR) check(presented, "vkQueuePresentKHR");
@@ -4805,6 +4824,8 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.settlePool = state->settlePool;
     context.settleFamily = state->settleFamily;
     context.settleQueueMutex = &state->settleQueueMutex;
+    context.mainQueueMutex = &state->mainQueueMutex;
+    context.presentQueueMutex = &state->presentQueueMutex;
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.vertexInputs = state->vertexInputs.get();
