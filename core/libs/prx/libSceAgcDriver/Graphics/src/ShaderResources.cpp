@@ -32,6 +32,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -1990,8 +1991,8 @@ void ShaderResources::forgetDeferredInputs() {
 void ShaderResources::build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
     buildPrepare(shaders, target, colorAttachments, indexAddress, indexBytes);
     buildComplete();
-    if (!GuestMemory::WriteIndexEnabled()) return;
-    countIndex(IndexBuilds);
+    if (!GuestMemory::WriteIndexEnabled() && !CertifiedProofs()) return;
+    if (GuestMemory::WriteIndexEnabled()) countIndex(IndexBuilds);
     subscribeBuilt(shaders);
 }
 
@@ -3407,6 +3408,8 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
+void reportCertifiedProofs();
+
 void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
@@ -3445,6 +3448,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         profile.refusedSurfaces.clear();
     }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
+    if (CertifiedProofs()) reportCertifiedProofs();
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
@@ -4015,6 +4019,96 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 
 namespace {
 
+constexpr std::uint32_t CertifiedDomains = GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Proof) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Unwatch) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping);
+constexpr std::array<const char*, static_cast<std::size_t>(CertifiedMiss::Count)> CertifiedMissNames{"uncertified", "sweep", "subscription", "proof", "unwatch", "mapping", "pending", "depth-surfaces", "cpu-writers", "audit", "imports"};
+constexpr std::array<const char*, static_cast<std::size_t>(CertifyRefusal::Count)> CertifyRefusalNames{"unsubscribed", "per-element-textures", "compared-textures", "compared-tables", "depth-copies", "storage-images", "pending-moved", "depth-surfaces-moved"};
+
+struct CertifiedCounts {
+    std::atomic<std::uint64_t> proved{0};
+    std::atomic<std::uint64_t> swept{0};
+    std::atomic<std::uint64_t> issued{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> disagreed{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+};
+
+CertifiedCounts& Certified() {
+    static CertifiedCounts counts;
+    return counts;
+}
+
+void countCertifiedMiss(CertifiedMiss miss) {
+    Certified().missed[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+}
+
+CertifiedMiss domainMiss(const GuestMemory::WriteCertificate& certificate) {
+    for (const auto domain : {GuestMemory::WriteDomain::Mapping, GuestMemory::WriteDomain::Unwatch, GuestMemory::WriteDomain::Proof}) {
+        if ((CertifiedDomains & GuestMemory::WriteDomainBit(domain)) == 0 || GuestMemory::DomainVersion(domain) == certificate.domains[static_cast<std::size_t>(domain)]) continue;
+        return domain == GuestMemory::WriteDomain::Proof ? CertifiedMiss::Proof : domain == GuestMemory::WriteDomain::Unwatch ? CertifiedMiss::Unwatch : CertifiedMiss::Mapping;
+    }
+    return CertifiedMiss::Subscription;
+}
+
+void reportCertifiedProofs() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    static CertifiedProofOutcomes reported;
+    static GuestMemory::WriteIndexStats reportedIndex;
+    static std::uint64_t reportedFlips = 0;
+    const auto now = CertifiedProofOutcomesCounted();
+    const auto counted = GuestMemory::WriteIndexCounted();
+    const auto since = [](std::uint64_t current, std::uint64_t previous) { return current >= previous ? current - previous : current; };
+    GuestMemory::WriteIndexStats index;
+    index.calls = since(counted.calls, reportedIndex.calls);
+    index.bumps = since(counted.bumps, reportedIndex.bumps);
+    index.lookupNanoseconds = since(counted.lookupNanoseconds, reportedIndex.lookupNanoseconds);
+    reportedIndex = counted;
+    const auto flips = StorageTexture::FlipCount();
+    const auto frames = flips - reportedFlips;
+    const auto list = [](const auto& current, const auto& previous, const auto& names) {
+        std::string text;
+        for (std::size_t i = 0; i < names.size(); ++i) {
+            if (current[i] == previous[i]) continue;
+            text += " " + std::string(names[i]) + " " + std::to_string(current[i] - previous[i]);
+        }
+        return text;
+    };
+    const auto misses = list(now.missed, reported.missed, CertifiedMissNames);
+    const auto refusals = list(now.refused, reported.refused, CertifyRefusalNames);
+    const auto perFrame = [&](std::uint64_t count) { return frames == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(frames); };
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified proofs (10 s): %llu proved (%llu after a sweep), %llu certificates issued; misses:%s; refused:%s; verify: %llu checked, %llu disagreed; index bumps: %llu calls touching %llu subscriptions over %llu frames, %.1f calls and %.1f subscriptions per frame, %.1f ms\n", static_cast<unsigned long long>(now.proved - reported.proved), static_cast<unsigned long long>(now.swept - reported.swept), static_cast<unsigned long long>(now.issued - reported.issued), misses.c_str(), refusals.c_str(), static_cast<unsigned long long>(now.verified - reported.verified), static_cast<unsigned long long>(now.disagreed - reported.disagreed), static_cast<unsigned long long>(index.calls), static_cast<unsigned long long>(index.bumps), static_cast<unsigned long long>(frames), perFrame(index.calls), perFrame(index.bumps), static_cast<double>(index.lookupNanoseconds) / 1e6);
+    reported = now;
+    reportedFlips = flips;
+}
+
+}
+
+bool CertifiedProofs() {
+    return RuntimeSwitches::Set(RuntimeSwitch::CertifiedProofs);
+}
+
+CertifiedProofOutcomes CertifiedProofOutcomesCounted() {
+    auto& counts = Certified();
+    CertifiedProofOutcomes outcomes;
+    outcomes.proved = counts.proved.load(std::memory_order_relaxed);
+    outcomes.swept = counts.swept.load(std::memory_order_relaxed);
+    outcomes.issued = counts.issued.load(std::memory_order_relaxed);
+    outcomes.verified = counts.verified.load(std::memory_order_relaxed);
+    outcomes.disagreed = counts.disagreed.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.missed.size(); ++i) outcomes.missed[i] = counts.missed[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.refused.size(); ++i) outcomes.refused[i] = counts.refused[i].load(std::memory_order_relaxed);
+    return outcomes;
+}
+
+namespace {
+
 constexpr std::size_t TableSpanElement = std::numeric_limits<std::size_t>::max();
 
 bool IndexBroken(const char* part) {
@@ -4332,6 +4426,9 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (CertifiedProofs()) {
+        if (const auto proved = certifiedRevalidate(shaders, report); proved.has_value()) return *proved;
+    }
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
@@ -4398,6 +4495,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // Loaded before any check (the memo rule of fastRevalidate): kept as the memo only when the
     // registry did not move through the whole proof, flushes of this call included.
     const auto serialBefore = StorageTexture::PendingSerial();
+    certified = false;
+    const bool certifying = CertifiedProofs() && EpochRevalidate() && !noFast;
+    if (certifying && writeSubscription == nullptr) subscribeIndex(shaders);
+    const auto* certifiedSubscription = certifying ? writeSubscription.get() : nullptr;
+    const auto depthBefore = DepthSurfacesSerial();
+    const auto issued = certifiedSubscription != nullptr ? GuestMemory::CertifySubscription(*certifiedSubscription, CertifiedDomains) : GuestMemory::WriteCertificate{};
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -4588,6 +4691,118 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // epoch gate the flush runs only for regions one registry scan finds pending images over (none
     // while the serial is the memo's), and the serial loop only while the import table's identity
     // moved since the last proof (a retire bumps its epoch, a registry change its generation).
+    if (const auto failure = proveImports(); failure != ProofFailure::None) return finish(fast, false, failure);
+    // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
+    // from their imports anew for this use, after the flushes above and before the work is
+    // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
+    if (const auto failure = recordStaging(); failure != ProofFailure::None) return finish(fast, false, failure);
+    pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
+    if (indexBaseline != 0) {
+        noteIndexProof(indexBaseline, serialBefore);
+        for (auto& [address, copy] : comparedTableSpans) {
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), copy.size())) std::memcpy(copy.data(), reinterpret_cast<const void*>(address), copy.size());
+            else copy.clear();
+        }
+        comparedTableSpans.erase(std::remove_if(comparedTableSpans.begin(), comparedTableSpans.end(), [](const auto& span) { return span.second.empty(); }), comparedTableSpans.end());
+    }
+    if (writeSubscription != nullptr) {
+        for (const auto index : depthCopyTextures) textures[index]->RefreshDepthCopy();
+    } else {
+        for (const auto& texture : textures) {
+            if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
+        }
+    }
+    if (certifiedSubscription != nullptr) {
+        auto refusal = certifiedSubscription == writeSubscription.get() ? certifyRefusal() : std::optional(CertifyRefusal::Unsubscribed);
+        if (!refusal.has_value() && StorageTexture::PendingSerial() != serialBefore) refusal = CertifyRefusal::PendingMoved;
+        if (!refusal.has_value() && DepthSurfacesSerial() != depthBefore) refusal = CertifyRefusal::DepthSurfacesMoved;
+        if (refusal.has_value()) {
+            Certified().refused[static_cast<std::size_t>(*refusal)].fetch_add(1, std::memory_order_relaxed);
+        } else {
+            certificate = issued;
+            certifiedPending = serialBefore;
+            certifiedDepth = depthBefore;
+            certifiedEpoch = 0;
+            certified = true;
+            Certified().issued.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return finish(fast, true);
+}
+
+std::optional<CertifyRefusal> ShaderResources::certifyRefusal() const {
+    if (writeSubscription == nullptr) return CertifyRefusal::Unsubscribed;
+    if (!storageTextures.empty()) return CertifyRefusal::StorageImages;
+    if (!comparedTableSpans.empty()) return CertifyRefusal::ComparedTables;
+    if (validatedTextures.size() < textures.size()) return CertifyRefusal::PerElementTextures;
+    std::vector<std::uint64_t> blocks(textures.size(), 0);
+    for (const auto& [block, element] : subscribedBlocks) {
+        if (element < blocks.size()) ++blocks[element];
+    }
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (textures[i] == nullptr) return CertifyRefusal::PerElementTextures;
+        if (textures[i]->IsDepthCopy()) return CertifyRefusal::DepthCopies;
+        const auto& surface = validatedTextures[i];
+        const auto begin = surface.resource.baseAddress;
+        if (!surface.valid || surface.depth || surface.bytes == 0 || surface.source != nullptr || surface.resource.dccAddress != 0) return CertifyRefusal::PerElementTextures;
+        if (!GuestMemory::Watched(begin, static_cast<std::size_t>(surface.bytes))) return CertifyRefusal::ComparedTextures;
+        if (blocks[i] != GuestMemory::WriteBlockOf(begin + surface.bytes - 1) - GuestMemory::WriteBlockOf(begin) + 1) return CertifyRefusal::Unsubscribed;
+    }
+    return std::nullopt;
+}
+
+std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (!certified || writeSubscription == nullptr) {
+        countCertifiedMiss(CertifiedMiss::Uncertified);
+        return std::nullopt;
+    }
+    const auto miss = [&](CertifiedMiss reason) -> std::optional<bool> {
+        countCertifiedMiss(reason);
+        certified = false;
+        return std::nullopt;
+    };
+    if (DepthPlanesStale()) {
+        for (const auto& [begin, end] : GuestMemory::SubscriptionSpans(*writeSubscription)) {
+            if (!FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)).empty()) return miss(CertifiedMiss::DepthSurfaces);
+        }
+    }
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    const bool sweep = epoch == 0 || epoch != certifiedEpoch;
+    if (sweep && !GuestMemory::SweepSubscription(*writeSubscription)) return miss(CertifiedMiss::Sweep);
+    if (!GuestMemory::CertificateHolds(*writeSubscription, certificate, CertifiedDomains)) return miss(domainMiss(certificate));
+    if (StorageTexture::PendingSerial() != certifiedPending) return miss(CertifiedMiss::Pending);
+    if (DepthSurfacesSerial() != certifiedDepth) return miss(CertifiedMiss::DepthSurfaces);
+    if (AnyPendingCpuWrites(context)) return miss(CertifiedMiss::CpuWriters);
+    if (TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || (walkImportGeneration != HostImportSetGeneration() && ImportAuditAdmitted()))) return miss(CertifiedMiss::Audit);
+    certifiedEpoch = epoch;
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    thread_local std::uint64_t certifiedUses = 0;
+    if (verify && ++certifiedUses % 64u == 0u) {
+        Certified().verified.fetch_add(1, std::memory_order_relaxed);
+        const bool ok = revalidateFull(shaders, report);
+        if (!ok) {
+            Certified().disagreed.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr, "[rescache] APS5_VERIFY_DRAW_PIPELINE: a template whose certificate held failed its full proof (failure %zu)\n", report != nullptr ? static_cast<std::size_t>(report->failure) : static_cast<std::size_t>(ProofFailure::Count));
+        }
+        return ok;
+    }
+    const auto serial = StorageTexture::PendingSerial();
+    if (proveImports() != ProofFailure::None) return miss(CertifiedMiss::Imports);
+    if (const auto failure = recordStaging(); failure != ProofFailure::None) {
+        if (report != nullptr) *report = {ProofPath::Fast, failure};
+        certified = false;
+        return false;
+    }
+    pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serial ? serial : 0;
+    if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+    Certified().proved.fetch_add(1, std::memory_order_relaxed);
+    if (sweep) Certified().swept.fetch_add(1, std::memory_order_relaxed);
+    if (BuildProfiled()) reportCertifiedProofs();
+    return true;
+}
+
+ShaderResources::ProofFailure ShaderResources::proveImports() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto serialLoop = [&] {
         for (const auto& region : directRegions) {
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
@@ -4617,43 +4832,28 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
             if (profile) Revalidations().importSkips.fetch_add(1, std::memory_order_relaxed);
         } else {
-            if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
+            if (!serialLoop()) return ProofFailure::Imports;
             importsProof = HostImportsIdentity(context);
         }
     } else {
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
-        if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
+        if (!serialLoop()) return ProofFailure::Imports;
     }
-    // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
-    // from their imports anew for this use, after the flushes above and before the work is
-    // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
-    if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
+    return ProofFailure::None;
+}
+
+ShaderResources::ProofFailure ShaderResources::recordStaging() {
+    if (!guestMemory.StagingDecisionsCurrent()) return ProofFailure::Changed;
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {
             std::fprintf(stderr, "[resources] staging copies of a reused build failed: %s\n", error.what());
-            return finish(fast, false);
+            return ProofFailure::Other;
         }
     }
-    pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
-    if (indexBaseline != 0) {
-        noteIndexProof(indexBaseline, serialBefore);
-        for (auto& [address, copy] : comparedTableSpans) {
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), copy.size())) std::memcpy(copy.data(), reinterpret_cast<const void*>(address), copy.size());
-            else copy.clear();
-        }
-        comparedTableSpans.erase(std::remove_if(comparedTableSpans.begin(), comparedTableSpans.end(), [](const auto& span) { return span.second.empty(); }), comparedTableSpans.end());
-    }
-    if (writeSubscription != nullptr) {
-        for (const auto index : depthCopyTextures) textures[index]->RefreshDepthCopy();
-    } else {
-        for (const auto& texture : textures) {
-            if (texture != nullptr && texture->IsDepthCopy()) texture->RefreshDepthCopy();
-        }
-    }
-    return finish(fast, true);
+    return ProofFailure::None;
 }
 
 namespace {
