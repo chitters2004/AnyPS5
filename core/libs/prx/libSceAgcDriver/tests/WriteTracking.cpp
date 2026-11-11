@@ -2552,6 +2552,79 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+std::atomic<bool> throwAfterConsume{false};
+
+void ThrowAfterConsume() {
+    if (throwAfterConsume.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("the consume hook threw");
+}
+
+void CheckThrowAfterConsume(bool released) {
+#ifndef _WIN32
+    SetReleasedWalksForTest(released);
+#else
+    static_cast<void>(released);
+#endif
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the throwing consume fixture was not collected");
+    Require(UnchangedSince(base, bytes, before), "the throwing consume fixture changed before its write");
+    const auto invalidations = ConservativeInvalidationsForTest();
+    data[Block + 64] = 0x22;
+    throwAfterConsume.store(true, std::memory_order_release);
+    SetConsumedWalkHookForTest(&ThrowAfterConsume);
+    bool threw = false;
+    try {
+        static_cast<void>(CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    SetConsumedWalkHookForTest(nullptr);
+    Require(threw, "the collect did not reach the throwing consume hook");
+    Require(ConservativeInvalidationsForTest() == invalidations + 1, "a throw after a destructive collect did not invalidate conservatively");
+    Require(!UnchangedSince(base, bytes, before), "a write consumed by a collect that then threw was lost");
+    Require(CpuWroteSince(base + Block, 4096, before), "a CPU write consumed by a collect that then threw was lost");
+    const auto after = CollectWritesUncached(base, bytes);
+    Require(UnchangedSince(base, bytes, after), "the conservative invalidation kept the range changed after a later collect");
+}
+
+#ifndef _WIN32
+void CheckConsumeCompaction(bool released) {
+    SetReleasedWalksForTest(released);
+    constexpr std::size_t bytes = 4 * Block;
+    constexpr std::size_t page = 4096;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the compaction fixture was not collected");
+    std::vector<std::uint64_t> written;
+    for (std::size_t offset = 0; offset < bytes; offset += 3 * page) {
+        data[offset + 8] = 0x33;
+        written.push_back(base + offset);
+    }
+    const auto compactions = ConsumeCompactionsForTest();
+    SetConsumeCapacityForTest(4);
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    SetConsumeCapacityForTest(0);
+    Require(ConsumeCompactionsForTest() > compactions, "the scattered writes did not overflow the consumed runs");
+    for (const auto address : written) Require(CpuWroteSince(address, page, before), "a written page was dropped when the consumed runs were compacted");
+}
+#endif
+
+void CheckLosslessConsume() {
+    CheckThrowAfterConsume(true);
+#ifndef _WIN32
+    CheckThrowAfterConsume(false);
+    CheckConsumeCompaction(true);
+    CheckConsumeCompaction(false);
+#endif
+}
+
 struct WalkGate {
     std::atomic<bool> holdBeforeScan{false};
     std::atomic<bool> holdAfterScan{false};
@@ -3048,6 +3121,11 @@ int main(int argc, char** argv) {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lossless-consume") {
+            CheckLosslessConsume();
+            std::cout << "lossless consume tests passed\n";
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--released-walks") {
 #ifdef _WIN32
