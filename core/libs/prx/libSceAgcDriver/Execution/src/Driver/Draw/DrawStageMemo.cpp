@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KeyHash.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "ThreadOwned.hpp"
@@ -146,15 +147,6 @@ private:
     std::vector<std::uint64_t>& words;
 };
 
-std::uint64_t HashWords(std::span<const std::uint64_t> words) {
-    std::uint64_t hash = 0x9e3779b97f4a7c15ull ^ words.size();
-    for (const auto word : words) {
-        hash = (hash ^ word) * 0xff51afd7ed558ccdull;
-        hash ^= hash >> 32u;
-    }
-    return hash;
-}
-
 }
 
 ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, std::uint32_t pushOffset, const Graphics::State& graphics, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
@@ -217,7 +209,7 @@ bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const 
     write(ShaderRecompiler::DebugProbeActive());
     write(ShaderRecompiler::RayTracingStrict());
     write(ShaderRecompiler::RayTracingMiss());
-    key.hash = HashWords(key.words);
+    key.hash = HashKeyWords(key.words, 0x9e3779b97f4a7c15ull);
     return true;
 }
 

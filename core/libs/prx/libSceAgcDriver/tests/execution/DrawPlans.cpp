@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -537,7 +538,47 @@ void PlannedSceneMatchesFullPath() {
 
 }
 
-int main() {
+int BenchPlanKeys() {
+    namespace Graphics = AgcDriver::Graphics;
+    Graphics::State state{};
+    state.hasColorTarget = true;
+    state.colors.resize(1);
+    state.blends.resize(1);
+    state.depth.emplace();
+    std::array<ShaderRecompiler::RecompileResult, 2> programs{};
+    for (std::size_t stage = 0; stage < programs.size(); ++stage) {
+        auto& program = programs[stage];
+        program.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, static_cast<std::uint32_t>(stage)};
+        program.variantId = 0x51u + stage;
+        for (std::uint32_t binding = 0; binding < 24u; ++binding) {
+            ShaderRecompiler::DescriptorBinding entry{};
+            entry.kind = binding % 2u == 0u ? ShaderRecompiler::DescriptorKind::StorageBuffer : ShaderRecompiler::DescriptorKind::SampledImage;
+            entry.role = binding % 2u == 0u ? ShaderRecompiler::DescriptorRole::GuestBuffers : ShaderRecompiler::DescriptorRole::GuestImages;
+            entry.binding = binding;
+            entry.count = 1u;
+            program.bindings.push_back(entry);
+        }
+    }
+    const std::array<Graphics::CompiledShader, 2> stages{Graphics::CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &programs[0], 0u}, Graphics::CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &programs[1], 64u}};
+    const AgcDriver::Pm4::DrawParameters draw{};
+    constexpr std::size_t Keys = 200000;
+    std::uint64_t sink = 0;
+    std::size_t words = 0;
+    for (int round = 0; round < 3; ++round) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < Keys; ++i) {
+            const auto key = AgcDriver::DriverDetail::BuildDrawPlanKey(stages, state, draw);
+            sink += key->hash;
+            words = key->words.size();
+        }
+        const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Keys;
+        std::printf("bench plan keys: %.1f ns per key (%zu words, 2 stages of 24 bindings)\n", ns, words);
+    }
+    return sink == 0 ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") return BenchPlanKeys();
     try {
         {
             const auto device = OpenVulkanTestDevice();

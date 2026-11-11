@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPlan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KeyHash.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <algorithm>
@@ -125,15 +126,6 @@ private:
     std::vector<std::uint64_t>& words;
 };
 
-std::uint64_t HashPlanWords(std::span<const std::uint64_t> words) {
-    std::uint64_t hash = 0x6a09e667f3bcc909ull ^ words.size();
-    for (const auto word : words) {
-        hash = (hash ^ word) * 0xff51afd7ed558ccdull;
-        hash ^= hash >> 32u;
-    }
-    return hash;
-}
-
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -208,7 +200,7 @@ std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::Co
     key->words.push_back(draw.indexed);
     key->words.push_back(draw.indexed ? draw.indexSize : 0u);
     key->words.push_back(draw.indirect.has_value());
-    key->hash = HashPlanWords(key->words);
+    key->hash = HashKeyWords(key->words, 0x6a09e667f3bcc909ull);
     return key;
 }
 
