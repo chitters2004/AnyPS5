@@ -206,11 +206,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    Job* job = nullptr;
+    bool failed = false;
     for (;;) {
-        Job* job = nullptr;
-        bool failed = false;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (job == nullptr) {
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             sleeping = true;
             wake.Wait(lock, [&] { return !jobs.empty(); });
@@ -231,6 +231,8 @@ void DrawFinisher::run() {
             jobs.pop_front();
             pending.pop_front();
             outstanding.fetch_sub(1, std::memory_order_release);
+            job = jobs.empty() ? nullptr : &jobs.front();
+            failed = failure != nullptr;
         }
         idle.NotifyAll();
     }
@@ -437,11 +439,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    bool taken = false;
+    Commit* commit = nullptr;
+    bool isDraw = false;
     for (;;) {
-        Commit* commit = nullptr;
-        bool isDraw = false;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (!taken) {
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.Wait(lock, [&] { return !items.empty() || closing; });
@@ -485,6 +488,11 @@ void DrawPipeline::run() {
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
         const bool wakeIdle = idleWaiters != 0 && (items.empty() || items.size() <= resumeAt);
+        taken = !items.empty();
+        if (taken) {
+            commit = stopped ? nullptr : &items.front().commit;
+            isDraw = items.front().draw;
+        }
         lock.unlock();
         if (wakeIdle) idle.NotifyAll();
     }
