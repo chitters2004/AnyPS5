@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
@@ -26,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -43,6 +45,8 @@ using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DrawPlanCount;
 using AgcDriver::DriverDetail::DrawPlanCounts;
 using AgcDriver::DriverDetail::DrawPlanCountKinds;
+constexpr std::size_t PlanSignatureSetLimitForTest = AgcDriver::DriverDetail::PlanSignatureSetLimit;
+constexpr std::size_t PlanLookupDistanceBucketsForTest = AgcDriver::DriverDetail::PlanLookupDistanceBuckets;
 
 alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
@@ -115,6 +119,7 @@ struct Look {
     std::uint32_t primitive = List;
     bool blended = false;
     float blendConstant = 1.0f;
+    const GuestBlock* indices = nullptr;
 };
 
 void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
@@ -165,7 +170,13 @@ void Draw(const GuestBlock& target, const Look& look) {
     if (look.colourBuffer != nullptr) {
         for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x00b, 4u << 1u}, {0x00c, static_cast<std::uint32_t>(loaded)}, {0x00d, static_cast<std::uint32_t>((loaded >> 32u) & 0xffffu) | (look.colourStride << 16u)}, {0x00e, 4u}, {0x00f, 0x31016facu}}) Append(commands, 0x76, {offset, value});
     }
-    Append(commands, 0x2d, {3, 2});
+    if (look.indices != nullptr) {
+        const auto indices = look.indices->At(0);
+        Append(commands, 0x2a, {1});
+        Append(commands, 0x27, {3, static_cast<std::uint32_t>(indices), static_cast<std::uint32_t>(indices >> 32u), 3, 0});
+    } else {
+        Append(commands, 0x2d, {3, 2});
+    }
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw plans: the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -350,6 +361,41 @@ void PlanKeysCoverThePipelineKey() {
     std::printf("draw plans: the plan key follows all %zu of %zu state leaves and %zu leaf pairs that change the pipeline key (%zu refused by the pipeline key)\n", covered, leaves, pairs, refused);
 }
 
+void AbsentPlanKeysAreClassified() {
+    using AgcDriver::DriverDetail::DrawPlanAbsence;
+    using AgcDriver::DriverDetail::DrawPlanCounters;
+    using AgcDriver::DriverDetail::DrawPlanIndex;
+    using AgcDriver::DriverDetail::DrawPlanKey;
+    const auto owner = std::make_shared<int>(0);
+    const auto key = [](std::uint64_t word) {
+        auto made = std::make_shared<DrawPlanKey>();
+        made->words = {word};
+        made->hash = word * 0x9e3779b97f4a7c15ull;
+        return std::shared_ptr<const DrawPlanKey>(std::move(made));
+    };
+    const auto decisions = [&] {
+        auto plan = std::make_shared<AgcDriver::DrawRecipe>();
+        plan->pipeline = std::shared_ptr<AgcDriver::Graphics::Pipeline>(owner, static_cast<AgcDriver::Graphics::Pipeline*>(nullptr));
+        return std::shared_ptr<const AgcDriver::DrawRecipe>(std::move(plan));
+    };
+    DrawPlanCounters counters;
+    DrawPlanIndex index(1);
+    const auto first = key(1);
+    const auto second = key(2);
+    const auto undecided = key(3);
+    Expect(index.ClassifyAbsent(*first) == DrawPlanAbsence::New, "a key never inserted was not classified as new");
+    index.Insert(first, decisions(), &counters);
+    index.Insert(second, decisions(), &counters);
+    Expect(index.Find(*first) == nullptr && index.ClassifyAbsent(*first) == DrawPlanAbsence::Evicted, "a key the index evicted was not classified as evicted");
+    index.NoteUndecided(*undecided);
+    Expect(index.ClassifyAbsent(*undecided) == DrawPlanAbsence::Undecided, "a key seen without a decision was not classified as undecided");
+    index.NoteUndecided(*first);
+    Expect(index.ClassifyAbsent(*first) == DrawPlanAbsence::Evicted, "an evicted key seen later without a decision lost its eviction");
+    index.Insert(undecided, decisions(), &counters);
+    Expect(index.ClassifyAbsent(*second) == DrawPlanAbsence::Evicted && index.ClassifyAbsent(*first) == DrawPlanAbsence::Undecided, "the eviction ring kept more keys than the index holds");
+    std::puts("draw plans: absent plan keys are classified as evicted, seen without a decision, or new");
+}
+
 void PlanKeysFollowTheBindingShape() {
     namespace Graphics = AgcDriver::Graphics;
     ShaderRecompiler::RecompileResult program{};
@@ -446,6 +492,19 @@ void PlansBindTheirOwnTargets() {
     ExpectNoHitsWhileOff(counts);
     Expect(counts[DrawPlanCount::Hits] == 0, "a draw into another render target was served the plan's target");
     if (PlansOn()) Expect(counts[DrawPlanCount::MissInstance] == 1, "a draw into another render target was not refused as another instance");
+    const auto sum = [&](DrawPlanCount base, std::size_t buckets, std::uint8_t bit) {
+        std::uint64_t total = 0;
+        for (std::size_t offset = 0; offset < buckets; ++offset) {
+            if (bit == 0 || (offset & bit) != 0) total += counts.values[static_cast<std::size_t>(base) + offset];
+        }
+        return total;
+    };
+    if (PlansOn() && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        Expect(sum(DrawPlanCount::ReplacementSignatureSets, PlanSignatureSetLimitForTest + 1u, 0) >= 1, "the full path's replacement of the plan for another target was not counted by signature set");
+        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchTarget) == 1, "the another-instance miss into another render target was not counted with a target surface mismatch");
+        Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, AgcDriver::Graphics::PlanMismatchShape | AgcDriver::Graphics::PlanMismatchTemplate | AgcDriver::Graphics::PlanMismatchDepth) == 0, "the another-instance miss into another render target counted a shape, template or depth mismatch");
+        Expect(sum(DrawPlanCount::LookupDistances, PlanLookupDistanceBucketsForTest, 0) >= 1, "repeated plan lookups were not counted by lookup distance");
+    }
     Expect(Pixels(firstPlanned) == Pixels(firstFull), "the plan's own target differs from the full path's");
     Expect(Pixels(secondPlanned) == Pixels(secondFull), "the other target differs from the full path's");
     std::puts("draw plans: I7, a plan binds only the target the full path would bind");
@@ -566,9 +625,61 @@ void PlansRefuseTemplatesWithOtherSetLayouts() {
     const auto counts = run(planned, true);
     static_cast<void>(run(reference, false));
     Report("I7c a template with other set layouts", counts);
-    if (PlansOn()) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::TemplateInstanceHits] == 0 && counts[DrawPlanCount::InstanceTemplate] == 1, "a plan hit took a cached template whose set layouts differ from the plan's");
+    Expect(counts[DrawPlanCount::TemplateInstanceHits] == 0, "a plan hit took a cached template whose set layouts differ from the plan's");
+    if (PlansOn() && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::InstanceTemplate] == 1, "a plan hit took a cached template whose set layouts differ from the plan's");
     Expect(Pixels(planned) == Pixels(reference), "draws refused a template with other set layouts render differently from the full path");
     std::puts("draw plans: I7c, a template whose set layouts differ from the plan's is never served by the plan");
+}
+
+void SharedPushDonorsDrawTheirOwnPush() {
+    namespace Graphics = AgcDriver::Graphics;
+    const bool before = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SharePushDonor);
+    const std::array<float, 4> colours{0.3125f, 0.4375f, 0.5625f, 0.6875f};
+    const auto render = [&](bool share, std::array<GuestBlock, 4>& targets) {
+        Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::SharePushDonor, share);
+        for (std::size_t index = 0; index < targets.size(); ++index) Draw(targets[index], {.colour = colours[index]});
+    };
+    std::array<GuestBlock, 4> shared;
+    std::array<GuestBlock, 4> copied;
+    const auto sharedBefore = ShaderRecompiler::SharedPushDonorStages();
+    render(true, shared);
+    const auto sharedStages = ShaderRecompiler::SharedPushDonorStages() - sharedBefore;
+    render(false, copied);
+    Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::SharePushDonor, before);
+    for (std::size_t index = 0; index < shared.size(); ++index) {
+        Expect(Drawn(Pixels(shared[index])), "a draw with a shared push donor drew nothing");
+        Expect(Pixels(shared[index]) == Pixels(copied[index]), "the draw of colour " + std::to_string(index) + " with a shared push donor differs from the draw with a patched copy");
+        if (index != 0) Expect(Pixels(shared[index]) != Pixels(shared[0]), "draws of different colours with a shared push donor drew the same pixels: the stage read the donor's push data");
+    }
+    if (std::getenv("APS5_NO_DRAW_DATA_HITS") != nullptr && std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") != nullptr && std::getenv("APS5_NO_MASKED_RESULT_MEMO") == nullptr && std::getenv("APS5_NO_RESULT_MEMO") == nullptr) Expect(sharedStages != 0, "no draw stage shared its push donor");
+    std::printf("draw plans: %llu stages shared their push donor and drew their own colours, as patched copies do\n", static_cast<unsigned long long>(sharedStages));
+}
+
+void IndexedPlansFollowTheirIndexRange() {
+    GuestBlock firstIndices;
+    GuestBlock secondIndices;
+    const std::array<std::uint32_t, 3> order{0u, 1u, 2u};
+    for (const auto* block : {&firstIndices, &secondIndices}) std::memcpy(block->Bytes(0), order.data(), sizeof(order));
+    GuestBlock planned;
+    GuestBlock full;
+    const Look first{.colour = 0.375f, .indices = &firstIndices};
+    const Look second{.colour = 0.4375f, .indices = &secondIndices};
+    Draw(planned, first);
+    Draw(planned, first);
+    const auto counts = Measure(planned, second);
+    {
+        const FullPath fullPath;
+        Draw(full, first);
+        Draw(full, first);
+        Draw(full, second);
+    }
+    Report("I11 another index buffer", counts);
+    ExpectNoHitsWhileOff(counts);
+    const bool untrimmed = std::getenv("APS5_NO_DRAW_KEY_TRIM") != nullptr;
+    if (PlansOn() && !untrimmed) Expect(counts[DrawPlanCount::Hits] == 1, "an indexed draw that differs in its index buffer and push data was not served its plan");
+    if (PlansOn() && untrimmed) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::MissInstance] == 1, "with the index range in the resource key, a draw with another index buffer was served the plan's template");
+    Expect(Pixels(planned) == Pixels(full), "the indexed draws with plans differ from the full path's");
+    std::puts("draw plans: I11, a plan follows the draw's index range wherever the resource key holds it");
 }
 
 void PlannedSceneMatchesFullPath() {
@@ -669,6 +780,7 @@ int main(int argc, char** argv) {
         PlanStateLeavesAreHashedOrRuled();
         PlanStateWalkMatchesTheHandwrittenWriter();
         PlanKeysFollowTheBindingShape();
+        AbsentPlanKeysAreClassified();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         Register(LoadingPixelHeader, LoadingPixelCode.data(), sizeof(LoadingPixelCode), 1);
@@ -679,6 +791,8 @@ int main(int argc, char** argv) {
         ReboundPlansStayOffTheExactPath();
         PlansRefuseTemplatesWithOtherSetLayouts();
         PlannedSceneMatchesFullPath();
+        SharedPushDonorsDrawTheirOwnPush();
+        IndexedPlansFollowTheirIndexRange();
         const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();
         std::printf("stage key memo: %llu static hits, %llu static fills, %llu patched segments; unshaped: %llu per-result memo hits, %llu full walks\n", static_cast<unsigned long long>(keys.staticHits), static_cast<unsigned long long>(keys.staticFills), static_cast<unsigned long long>(keys.patchedSegments), static_cast<unsigned long long>(keys.resultHits), static_cast<unsigned long long>(keys.resultWalks));
         AgcDriverShutdown_nid_postfix();

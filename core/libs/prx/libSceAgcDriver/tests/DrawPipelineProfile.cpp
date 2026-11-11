@@ -63,12 +63,12 @@ public:
         return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     }
 
-    std::string ReadReport() const {
+    std::string ReadReport(std::string_view prefix = "[draw] pipelined ") const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
             std::ifstream file(path, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            const auto begin = text.find("[draw] pipelined ");
+            const auto begin = text.find(prefix);
             if (begin != std::string::npos) {
                 const auto end = text.find('\n', begin);
                 if (end != std::string::npos) return text.substr(begin, end - begin);
@@ -101,6 +101,10 @@ void TestReport() {
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
+        DrawPipeline::NoteDbClear(true, false, DrawPipeline::DbClearBlocker::Unproven, 0x410d900);
+        DrawPipeline::NoteDbClear(true, false, DrawPipeline::DbClearBlocker::StencilTest, 0x410d900);
+        DrawPipeline::NoteDbClear(true, true, DrawPipeline::DbClearBlocker::Unproven, 0x410d900);
+        DrawPipeline::NoteDbClear(false, true, DrawPipeline::DbClearBlocker::SampleMask, 0x2000);
         std::this_thread::sleep_until(reportAfter);
         pipeline.Enqueue([] {}, {}, 0, {}, {}, true);
     } catch (...) {
@@ -120,6 +124,20 @@ void TestReport() {
     const auto text = capture.Text();
     const auto idle = text.find("[committer-idle] (10 s): ");
     Check(idle != std::string::npos && text.find(" while the finisher held work (", idle) != std::string::npos && text.find(" while it was idle (", idle) != std::string::npos, "the committer idle counters were not reported");
+    const auto clears = capture.ReadReport("[dbclear] ");
+    std::cout << clears << '\n';
+    Check(clears == "[dbclear] (10 s): 4 rect-list draws with a DB_RENDER_CONTROL clear (depth 2, stencil 1, both 1); first blocker of a native clear: "
+                    "stencil test on a depth-only clear 1, partial sample mask 1, layered target 0, rectangle not proven 2; vertex programs: 0x410d900 x3 0x2000 x1", "the DB clear counters differ");
+}
+
+void TestDbClearBlockers() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using Blocker = DrawPipeline::DbClearBlocker;
+    Check(DrawPipeline::DbClearBlockerOf(false, true, true, true) == Blocker::StencilTest, "a depth-only clear under a stencil test is not blocked by the test first");
+    Check(DrawPipeline::DbClearBlockerOf(true, true, false, false) == Blocker::Unproven, "a stencil clear, which replaces the stencil test, was blocked by it");
+    Check(DrawPipeline::DbClearBlockerOf(false, false, true, true) == Blocker::SampleMask, "a partial sample mask is not the next blocker");
+    Check(DrawPipeline::DbClearBlockerOf(true, false, false, true) == Blocker::Layered, "a layered target is not a blocker");
+    Check(DrawPipeline::DbClearBlockerOf(false, false, false, false) == Blocker::Unproven, "an otherwise eligible clear is not waiting on the rectangle proof");
 }
 
 }
@@ -220,6 +238,7 @@ int main() {
     try {
         TestAppendedPhasesKeepTheirNames();
         TestFollowEpochForwardOnly();
+        TestDbClearBlockers();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";
         return 0;

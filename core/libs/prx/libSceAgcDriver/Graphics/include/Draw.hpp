@@ -131,8 +131,15 @@ struct DrawRecipeOutcome {
     std::uint32_t movedBuffers = 0;
     bool patchedData = false;
     DrawPlanInstance instance = DrawPlanInstance::None;
+    std::uint8_t instanceMismatches = 0;
     bool templateInstance = false;
 };
+
+inline constexpr std::uint8_t PlanMismatchShape = 1u;
+inline constexpr std::uint8_t PlanMismatchTemplate = 2u;
+inline constexpr std::uint8_t PlanMismatchTarget = 4u;
+inline constexpr std::uint8_t PlanMismatchView = 8u;
+inline constexpr std::uint8_t PlanMismatchDepth = 16u;
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
 // vertex work as Draw's, the resident-target proof on the stored images (Refresh while Cached()),

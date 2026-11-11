@@ -11,9 +11,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <list>
+#include <deque>
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -80,8 +82,20 @@ enum class DrawPlanCount : std::size_t {
     InstanceView,
     InstanceDepth,
     TemplateInstanceHits,
+    AbsentEvicted,
+    AbsentUndecided,
+    AbsentNew,
+    InstanceMismatchSets,
+    LookupDistances = InstanceMismatchSets + 32,
+    ReplacementSignatureSets = LookupDistances + 12,
+    ReplacementReturns = ReplacementSignatureSets + 9,
     Count
 };
+
+inline constexpr std::size_t PlanLookupDistanceBuckets = 12;
+inline constexpr std::size_t PlanSignatureSetLimit = 8;
+
+enum class DrawPlanAbsence : std::uint8_t { Evicted, Undecided, New };
 
 inline constexpr std::size_t DrawPlanCountKinds = static_cast<std::size_t>(DrawPlanCount::Count);
 
@@ -117,20 +131,33 @@ public:
     DrawPlanIndex(const DrawPlanIndex&) = delete;
     DrawPlanIndex& operator=(const DrawPlanIndex&) = delete;
 
-    std::shared_ptr<const DrawRecipe> Find(const DrawPlanKey& key);
-    std::size_t Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions);
+    std::shared_ptr<const DrawRecipe> Find(const DrawPlanKey& key, DrawPlanCounters* counters = nullptr);
+    std::size_t Insert(const std::shared_ptr<const DrawPlanKey>& key, std::shared_ptr<const DrawRecipe> decisions, DrawPlanCounters* counters = nullptr);
     std::size_t Size();
+    DrawPlanAbsence ClassifyAbsent(const DrawPlanKey& key);
+    void NoteUndecided(const DrawPlanKey& key);
 
 private:
+    struct HashRing {
+        std::deque<std::uint64_t> order;
+        std::unordered_set<std::uint64_t> hashes;
+        void Remember(std::uint64_t hash, std::size_t limit);
+    };
     struct Entry {
         std::shared_ptr<const DrawPlanKey> key;
         std::shared_ptr<const DrawRecipe> decisions;
+        std::uint64_t lastLookup = 0;
+        std::array<std::uint64_t, PlanSignatureSetLimit> signatures{};
+        std::size_t signatureCount = 0;
     };
     using Order = std::list<Entry>;
     Order::iterator locate(const DrawPlanKey& key);
 
     AgcDriver::Mutex mutex;
     std::size_t capacity;
+    std::uint64_t lookups = 0;
+    HashRing evicted;
+    HashRing undecided;
     Order order;
     std::unordered_multimap<std::uint64_t, Order::iterator> index;
 };

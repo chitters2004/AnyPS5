@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <cstdlib>
+#include <initializer_list>
+#include <string>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -93,6 +96,29 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
         for (std::size_t kind = 0; kind < DrawPlanCountKinds; ++kind) window.values[kind] = plans.values[kind] - drawPlanReported.values[kind];
         drawPlanReported = plans;
         append("[draw-plan] served (10 s): %llu lookups, %llu hits (%.1f%%), %llu full-path draws with a plan key; %.2f us per hit, %.2f us per full-path draw with a plan key (APS5_PROFILE_DRAW); missed: absent %llu, unservable %llu, another instance %llu, refused a move %llu, proof %llu, gone or not recordable %llu; another instance by cause: template %llu, target %llu, view %llu, depth %llu, shape %llu; %llu hits rebound buffers, %llu served another template from the resource cache\n", count(window[Plan::PlanLookups]), count(window[Plan::Hits]), 100.0 * ratio(window[Plan::Hits], window[Plan::PlanLookups]), count(window[Plan::FullDraws]), ratio(window[Plan::HitNanoseconds], window[Plan::Hits]) / 1000.0, ratio(window[Plan::FullNanoseconds], window[Plan::FullDraws]) / 1000.0, count(window[Plan::MissAbsent]), count(window[Plan::MissUnservable]), count(window[Plan::MissInstance]), count(window[Plan::MissMoved] + window[Plan::MissPatchedData]), count(window[Plan::MissProof]), count(window[Plan::MissTargetGone] + window[Plan::MissTemplateGone] + window[Plan::MissObjectsGone] + window[Plan::MissNotRecordable]), count(window[Plan::InstanceTemplate]), count(window[Plan::InstanceTarget]), count(window[Plan::InstanceView]), count(window[Plan::InstanceDepth]), count(window[Plan::InstanceShape]), count(window[Plan::RebasedHits]), count(window[Plan::TemplateInstanceHits]));
+        {
+            const auto at = [&](DrawPlanCount base, std::size_t offset) { return static_cast<unsigned long long>(window.values[static_cast<std::size_t>(base) + offset]); };
+            std::string sets;
+            for (std::size_t mask = 1; mask < 32; ++mask) {
+                if (at(Plan::InstanceMismatchSets, mask) == 0) continue;
+                std::string name;
+                for (const auto& [bit, letter] : std::initializer_list<std::pair<std::uint8_t, char>>{{Graphics::PlanMismatchShape, 'S'}, {Graphics::PlanMismatchTemplate, 'T'}, {Graphics::PlanMismatchTarget, 'G'}, {Graphics::PlanMismatchView, 'V'}, {Graphics::PlanMismatchDepth, 'D'}}) {
+                    if ((mask & bit) != 0) name += letter;
+                }
+                sets += " " + name + " " + std::to_string(at(Plan::InstanceMismatchSets, mask));
+            }
+            std::string distances;
+            for (std::size_t bucket = 0; bucket < PlanLookupDistanceBuckets; ++bucket) {
+                if (at(Plan::LookupDistances, bucket) == 0) continue;
+                distances += " " + std::to_string(1ull << bucket) + (bucket + 1 == PlanLookupDistanceBuckets ? "+" : "") + ":" + std::to_string(at(Plan::LookupDistances, bucket));
+            }
+            std::string replacements;
+            for (std::size_t size = 0; size <= PlanSignatureSetLimit; ++size) {
+                if (at(Plan::ReplacementSignatureSets, size) == 0) continue;
+                replacements += " " + std::to_string(size + 1) + (size == PlanSignatureSetLimit ? "+" : "") + ":" + std::to_string(at(Plan::ReplacementSignatureSets, size));
+            }
+            append("[draw-plan] instance detail (10 s, APS5_PROFILE_DRAW): another-instance misses by every check that differs (S shape, T template, G target surface, V target view, D depth view):%s; lookups by lookups since the key's previous lookup (bucket floor):%s; replacements by distinct instance signatures seen for the key (target and depth views):%s, %llu returning to a signature seen before; absent lookups: %llu for keys the index evicted, %llu for keys the full path saw without a decision, %llu for keys not seen before\n", sets.empty() ? " none" : sets.c_str(), distances.empty() ? " none" : distances.c_str(), replacements.empty() ? " none" : replacements.c_str(), at(Plan::ReplacementReturns, 0), at(Plan::AbsentEvicted, 0), at(Plan::AbsentUndecided, 0), at(Plan::AbsentNew, 0));
+        }
         append("[draw-plan] served (since start): %llu lookups, %llu hits; missed: absent %llu, unservable %llu, another instance %llu, target gone %llu, template gone %llu, objects gone %llu, proof %llu, not recordable %llu; %llu plans replaced by a newer instance or a servable decision; binding words proved by the program's memo %llu stages, compared %llu; %llu hits rebound %llu moved buffers, %llu refused a move (%llu over patched data); verify: %llu hits checked; %.2f us per hit, %.2f us per full-path draw with a plan key (APS5_PROFILE_DRAW)\n", count(plans[Plan::PlanLookups]), count(plans[Plan::Hits]), count(plans[Plan::MissAbsent]), count(plans[Plan::MissUnservable]), count(plans[Plan::MissInstance]), count(plans[Plan::MissTargetGone]), count(plans[Plan::MissTemplateGone]), count(plans[Plan::MissObjectsGone]), count(plans[Plan::MissProof]), count(plans[Plan::MissNotRecordable]), count(plans[Plan::Replaced]), count(plans[Plan::SharedBindingStages]), count(plans[Plan::ComparedBindingStages]), count(plans[Plan::RebasedHits]), count(plans[Plan::RebasedBuffers]), count(plans[Plan::MissMoved]) + count(plans[Plan::MissPatchedData]), count(plans[Plan::MissPatchedData]), count(plans[Plan::Verified]), ratio(plans[Plan::HitNanoseconds], plans[Plan::Hits]) / 1000.0, ratio(plans[Plan::FullNanoseconds], plans[Plan::FullDraws]) / 1000.0);
         append("[draw-plan] shadow (since start): %llu lookups, %llu without a decision, %llu absent (inserted), %llu present: %llu agreed, differing pipeline %llu, fragment outputs %llu, shader stages %llu, push stages %llu, depth %llu, vertex input %llu, masked state %llu; instance same %llu, differs %llu, pass key differing on the same instance %llu; %llu moved bases, %llu unservable decisions, %zu plans, %llu evicted\n", count(plans[Plan::Lookups]), count(plans[Plan::NoDecision]), count(plans[Plan::Absent]), count(plans[Plan::Present]), count(plans[Plan::Agreed]), count(plans[Plan::Pipeline]), count(plans[Plan::FragmentOutputs]), count(plans[Plan::ShaderStages]), count(plans[Plan::PushStages]), count(plans[Plan::HasDepth]), count(plans[Plan::VertexInput]), count(plans[Plan::MaskedState]), count(plans[Plan::SameInstance]), count(plans[Plan::InstanceDiffers]), count(plans[Plan::PassDiffersSameInstance]), count(plans[Plan::MovedBases]), count(plans[Plan::Unservable]), drawPlans.Size(), count(plans[Plan::Evictions]));
     }

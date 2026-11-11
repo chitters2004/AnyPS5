@@ -33,7 +33,7 @@ bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const 
 
 std::vector<std::pair<std::uint64_t, std::size_t>> DrawStageSpans(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
 
-const char* DrawStageMismatch(const DispatchVariant& kept, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, const ShaderRecompiler::RecompileResult& compiled);
+const char* DrawStageMismatch(const DispatchVariant& kept, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, const ShaderRecompiler::RecompileResult& compiled, const std::vector<std::byte>* compiledPush);
 
 struct DrawStageStamp {
     std::uint64_t generation = 0;

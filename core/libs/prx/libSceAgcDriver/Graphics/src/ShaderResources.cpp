@@ -1805,6 +1805,15 @@ bool StorageImageCached(const Context& context, const StorageTexture* image) {
     return true;
 }
 
+StorageImageMatch MatchStorageImage(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed) {
+    const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
+    auto& cache = StorageTextures();
+    std::lock_guard lock(cache.mutex);
+    const auto it = findStorageByImage(cache, context.device, image);
+    if (it == cache.entries.end()) return StorageImageMatch::Gone;
+    return it->key == key ? StorageImageMatch::Same : StorageImageMatch::Other;
+}
+
 bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed) {
     const StorageKey key{context.device, SurfaceKey(context, StorageSurface(context, viewed))};
     auto& cache = StorageTextures();
@@ -2493,7 +2502,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic, read, extent);
                         const bool classified = element < binding.bufferWritten.size() && element < binding.bufferRead.size() && element < binding.bufferAtomic.size();
                         allocations[index].writeOnly = classified && allocations[index].guest && allocations[index].written && binding.bufferWritten[element] && !read && !atomic;
-                        const auto& push = shader.program->pushConstants;
+                        const auto& push = PushBytes(shader);
                         const auto pushDataBytes = shader.program->stencilReferences.empty() ? push.size() : shader.program->stencilReferenceDword * sizeof(std::uint32_t);
                         if (pushDataBytes != 0u) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -5556,6 +5565,12 @@ bool ResourceCache::HashReuse() {
     return enabled;
 }
 
+std::shared_ptr<ShaderResources> ResourceCache::Peek(const Key& key) const {
+    std::lock_guard lock(mutex);
+    const auto found = index.find(KeyRef{&key, Hash(key)});
+    return found != index.end() ? found->second->second : nullptr;
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return Find(key, Hash(key));
 }
@@ -7787,7 +7802,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
                 if (profiled) ++(buffer != nullptr ? tally.reused : tally.created);
                 if (buffer == nullptr) {
-                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                    buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, context.SnapshotProperties());
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
