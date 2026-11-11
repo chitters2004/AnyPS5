@@ -64,6 +64,16 @@ enum class CommitPhase : std::uint8_t {
     TargetsLookupPure,
     TargetsLookupGuards,
     TargetsLookupCache,
+    InputsValidate,
+    InputsFlush,
+    InputsInPlace,
+    InputsReuse,
+    InputsArm,
+    InputsAlloc,
+    InputsKeep,
+    InputsIndexRange,
+    InputsExpand,
+    InputsLayout,
     Count
 };
 
@@ -131,6 +141,26 @@ enum class CommitCounter : std::uint8_t {
     TargetEpochOtherThread,
     TargetEpochThisThread,
     TargetEpochExitStamps,
+    InputDraws,
+    InputIndexed,
+    InputIndexInPlace,
+    InputIndexRangeKnown,
+    InputIndexExpanded,
+    InputIndexCompacted,
+    InputIndexClamped,
+    InputVertexRanges,
+    InputVertexInPlace,
+    InputVertexPadded,
+    InputVertexPaddedReused,
+    InputVertexZeroed,
+    InputIndexCopyFresh,
+    InputIndexCopySnapshot,
+    InputIndexCopyOwned,
+    InputIndexCopyArmed,
+    InputVertexCopyFresh,
+    InputVertexCopySnapshot,
+    InputVertexCopyOwned,
+    InputVertexCopyArmed,
     Count
 };
 
