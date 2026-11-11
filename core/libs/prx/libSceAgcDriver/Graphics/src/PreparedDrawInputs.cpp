@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -98,6 +99,8 @@ struct Counters {
     std::atomic<std::uint64_t> checkNanoseconds{0};
     std::atomic<std::uint64_t> verifyDiffered{0};
     std::atomic<std::uint64_t> requestNanoseconds{0};
+    std::atomic<std::uint64_t> epochFollows{0};
+    std::atomic<std::uint64_t> collectNanoseconds{0};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sources{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceBytes{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceNanoseconds{};
@@ -148,6 +151,9 @@ public:
     std::optional<std::uint32_t> zeroFetchFrom;
     Recorder::SnapshotUse indexUse = Recorder::SnapshotUse::Index16;
     bool skipRestart = false;
+    std::uint64_t epoch = 0;
+    bool followedEpoch = false;
+    std::uint64_t collectNanoseconds = 0;
     std::atomic<JobState> state{JobState::Queued};
     std::vector<PreparedRange> ranges;
     std::uint64_t refusedRanges = 0;
@@ -231,6 +237,8 @@ public:
         counted(total.unused, "DrawInputPrep.unused", unusedRanges);
         counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
         counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
+        counted(total.epochFollows, "DrawInputPrep.epoch_follows", !cancelled && followedEpoch ? 1 : 0);
+        if (!cancelled && collectNanoseconds != 0) counted(total.collectNanoseconds, "DrawInputPrep.collect_ns", collectNanoseconds);
     }
 
 private:
@@ -253,7 +261,10 @@ private:
         range.registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto pending = Recorder::PendingWriteSnapshot();
         if (Recorder::SnapshotOverlaps(pending.get(), address, readable)) return refuse(PreparedRefusal::Pending);
+        const bool timed = DrawInputSourcesTimed();
+        const auto collectStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         range.generation = GuestMemory::CollectWrites(address, readable);
+        if (timed) collectNanoseconds += nanosecondsSince(collectStart);
         if (range.generation == 0) return refuse(PreparedRefusal::Unwatched);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         range.buffer = std::make_shared<Buffer>(context, bytes, usage);
@@ -323,6 +334,7 @@ private:
     }
 
     void run(std::stop_token token) {
+        std::uint64_t followed = 0;
         for (;;) {
             std::shared_ptr<PreparedDrawInputs> job;
             {
@@ -336,6 +348,11 @@ private:
             if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) continue;
             job->state.notify_all();
             try {
+                if (job->epoch != 0 && job->epoch != followed) {
+                    followed = job->epoch;
+                    job->followedEpoch = true;
+                    DriverDetail::DrawPipeline::FollowEpoch(job->epoch);
+                }
                 job->Prepare();
             } catch (...) {
                 job->ranges.clear();
@@ -365,7 +382,7 @@ bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorde
 
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t epoch) {
     if (context.drawInputsInPlace || (draw.indirect && !draw.indexed) || (!draw.indirect && draw.instanceCount == 0) || draw.indexCount == 0 || state.quadList || RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return nullptr;
     if (shaders.empty() || shaders.front().program == nullptr || !GuestMemory::WriteWatched()) return nullptr;
     const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -379,6 +396,7 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
     const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto job = std::make_shared<PreparedDrawInputs>(context);
     job->draw = draw;
+    job->epoch = epoch;
     job->attributes.assign(attributes.begin(), attributes.end());
     if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) job->layout = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
@@ -484,6 +502,8 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     counts.checkNanoseconds = total.checkNanoseconds.load(std::memory_order_relaxed);
     counts.verifyDiffered = total.verifyDiffered.load(std::memory_order_relaxed);
     counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
+    counts.epochFollows = total.epochFollows.load(std::memory_order_relaxed);
+    counts.collectNanoseconds = total.collectNanoseconds.load(std::memory_order_relaxed);
     for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
         counts.sources[index] = total.sources[index].load(std::memory_order_relaxed);
         counts.sourceBytes[index] = total.sourceBytes[index].load(std::memory_order_relaxed);

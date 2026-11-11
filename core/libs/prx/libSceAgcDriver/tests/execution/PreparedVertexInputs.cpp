@@ -338,6 +338,19 @@ int main() {
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
         Require(again.adopted == 2 && again.covered, "prepared vertex inputs: an unchanged draw after the others did not adopt both copies");
+        const auto beforeEpochs = AgcDriver::Graphics::PreparedDrawInputCounters();
+        const auto epochState = DrawState();
+        const AgcDriver::Pm4::DrawParameters epochDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+        constexpr std::uint64_t firstEpoch = std::uint64_t{1} << 62u;
+        for (const auto epoch : {firstEpoch, firstEpoch, firstEpoch + 1u}) {
+            auto job = device->PrepareDrawInputsAhead(epochState, epochDraw, programs->shaders, epoch);
+            Require(job != nullptr, "prepared vertex inputs: a draw with a collect epoch was not prepared");
+            AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+            const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+        }
+        const auto afterEpochs = AgcDriver::Graphics::PreparedDrawInputCounters();
+        std::printf("three preparations in epochs E, E and E+1: %llu epoch follows\n", static_cast<unsigned long long>(afterEpochs.epochFollows - beforeEpochs.epochFollows));
+        Require(afterEpochs.epochFollows - beforeEpochs.epochFollows == 2, "prepared vertex inputs: the preparer did not follow each new collect epoch of its draws exactly once");
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
     } catch (const std::exception& error) {

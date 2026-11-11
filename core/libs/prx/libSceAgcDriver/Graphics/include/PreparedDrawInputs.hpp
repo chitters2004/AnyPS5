@@ -29,7 +29,7 @@ DrawVertexFetches PlanDrawVertexFetches(std::optional<std::pair<std::uint64_t, s
 
 class PreparedDrawInputs;
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t epoch = 0);
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
 
 class PreparedDrawInputsScope {
@@ -75,6 +75,8 @@ struct PreparedDrawInputCounts {
     std::uint64_t checkNanoseconds = 0;
     std::uint64_t verifyDiffered = 0;
     std::uint64_t requestNanoseconds = 0;
+    std::uint64_t epochFollows = 0;
+    std::uint64_t collectNanoseconds = 0;
     std::array<std::uint64_t, DrawInputSourceCount> sources{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceBytes{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceNanoseconds{};
