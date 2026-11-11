@@ -553,7 +553,9 @@ void resolveBetween(AgcDriver::VulkanDevice& device) {
     multisampled.coverageSamples = 4;
     const auto color = colorTarget();
     reset(device, color);
-    draw(device, multisampled, {.scissor = Right});
+    // Cover the whole multisampled target: llvmpipe leaves two of four samples of the pixel left of a
+    // scissor edge (texel 47 of 48) drawn, which Vulkan does not allow but this test does not exercise.
+    draw(device, multisampled);
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.WaitIdle();
@@ -569,7 +571,7 @@ void resolveBetween(AgcDriver::VulkanDevice& device) {
     std::cout << "resolve moved [" << fields << "]\n";
     if (fields.empty()) mustRepeat(device, color, "a draw after a resolve into its own image did not repeat");
     else mustLookUp(device, color, {}, "a draw after a resolve repeated its targets");
-    expect(device, color, [](std::uint32_t x) { return x < LeftWidth || x >= Width - LeftWidth ? Drawn : 0u; }, "a resolve between identical draws");
+    expect(device, color, [](std::uint32_t) { return Drawn; }, "a resolve between identical draws");
 }
 
 void committerMoved(AgcDriver::VulkanDevice& device) {
