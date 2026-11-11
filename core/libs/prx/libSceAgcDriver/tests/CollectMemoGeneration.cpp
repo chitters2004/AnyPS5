@@ -515,6 +515,7 @@ void CheckFailedRequestPublishesNothing() {
     Require(CollectWrites(address + Page, Page) != 0 && OsWalks() == before + 1, "a block of an incomplete request was answered without a walk");
 }
 
+#ifdef _WIN32
 void CheckCollectDoesNotWaitForAnotherWalk() {
     const auto other = Base + 102 * Block;
     const auto mine = Base + 104 * Block + 3 * Page;
@@ -597,6 +598,7 @@ void CheckTrackerGenerationWaitsForClaims() {
     }
     Require(UnchangedSince(page, Page, settled), "TrackerGeneration returned before a walk in progress stamped the writes it had consumed");
 }
+#endif
 
 void CheckAdoptedEpochReusesWalksAfterIt() {
     const auto address = Base + 112 * Block;
@@ -851,10 +853,12 @@ int main(int argc, char** argv) {
         CheckWaiterNeedingLaterTickWalks();
         CheckMappingChangeForcesWalk();
         CheckFailedRequestPublishesNothing();
+#ifdef _WIN32
         CheckCollectDoesNotWaitForAnotherWalk();
         CheckCollectOverClaimedBlockSeesItsStamps();
         CheckQueriesWaitForClaimedStamps();
         CheckTrackerGenerationWaitsForClaims();
+#endif
         CheckAdoptedEpochReusesWalksAfterIt();
         CheckAdoptingAnOlderEpochKeepsTheNewer();
         CheckServiceObservesUsedRunsAhead();

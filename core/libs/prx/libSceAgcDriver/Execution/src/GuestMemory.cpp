@@ -2144,12 +2144,12 @@ void noteObservedUse(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
     service.Push(first, stop);
 }
 
-bool singlePassCollect() {
+bool walksOutsideLock() {
 #ifdef _WIN32
     static const bool singlePass = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
     return singlePass;
 #else
-    return true;
+    return false;
 #endif
 }
 
@@ -2253,29 +2253,37 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std
     if (!runs.empty()) timed.emplace(CounterCollect, bytes);
     std::size_t done = 0;
     auto status = Status::Complete;
-    if (!singlePassCollect()) {
+    if (!walksOutsideLock()) {
         for (auto& run : runs) {
             bool complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
             if (!complete && (run.first < first || run.stop > stop)) {
                 run = {std::max(first, run.first), std::min(stop, run.stop), true};
                 complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
             }
+            (service ? serviceWalks : fallbackWalks).fetch_add(1, std::memory_order_relaxed);
             if (!complete) {
+#ifdef _WIN32
                 status = Status::Refused;
+#else
+                status = Status::Failed;
+#endif
                 break;
             }
             if (shared && run.exact) tracker.exactObservations[tracker.nextExactObservation++ % tracker.exactObservations.size()] = {run.first, run.stop, tick};
             ++done;
         }
     } else if (!runs.empty()) {
-        for (const auto& run : runs) tracker.claims.push_back({tracker.blockOf(run.first), tracker.blockOf(run.stop - 1), self});
         struct WalkSlot {};
         auto& walk = ThreadScratch<UnlockedWalk, WalkSlot>();
         walk.written.clear();
         std::uint64_t failedFirst = 0;
         std::uint64_t failedStop = 0;
         bool locked = true;
+        bool consuming = false;
         try {
+            tracker.claims.reserve(tracker.claims.size() + runs.size());
+            for (const auto& run : runs) tracker.claims.push_back({tracker.blockOf(run.first), tracker.blockOf(run.stop - 1), self});
+            consuming = true;
             lock.Suspend();
             locked = false;
             for (auto& run : runs) {
@@ -2307,6 +2315,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std
             StampRuns stamps{tracker, StampKind::Cpu};
             for (const auto& [begin, end] : walk.written) stampWrittenRun(&stamps, begin, end);
             if (stamps.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+            consuming = false;
 #ifdef _WIN32
             if (status != Status::Complete) noteRefusedWalk(tracker, failedFirst, failedStop);
 #else
@@ -2315,6 +2324,14 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized, std
 #endif
         } catch (...) {
             if (!locked) lock.Resume();
+            if (consuming) {
+                ++tracker.generation;
+                const auto generation = tracker.generation.load(std::memory_order_relaxed);
+                for (const auto& run : runs) {
+                    tracker.noteCpuStore(run.first, run.stop, generation);
+                    for (auto block = tracker.blockOf(run.first); block <= tracker.blockOf(run.stop - 1); ++block) tracker.stamp(block, generation, StampKind::Cpu);
+                }
+            }
             tracker.releaseClaims(self);
             throw;
         }
@@ -2343,37 +2360,49 @@ void serviceLoop() {
     auto& service = Service();
     std::uint64_t cursor = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> carried;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> fresh;
     for (;;) {
         service.requested.wait(service.handled.load(std::memory_order_acquire), std::memory_order_acquire);
         const auto request = service.requested.load(std::memory_order_acquire);
-        const auto epoch = lastBumpedEpoch.load(std::memory_order_acquire);
-        observationPoint(4);
-        const auto to = service.next.load(std::memory_order_acquire);
-        service.period.fetch_add(1, std::memory_order_relaxed);
-        runs.clear();
-        for (auto index = std::max(cursor, to > ObservationService::RingEntries ? to - ObservationService::RingEntries : 0); index < to; ++index) {
-            std::uint64_t first = 0;
-            std::uint64_t stop = 0;
-            if (service.Read(index, first, stop)) runs.emplace_back(first, stop);
-        }
-        cursor = to;
-        const auto start = std::chrono::steady_clock::now();
-        if (service.enabled.load(std::memory_order_acquire)) {
-            for (const auto& [first, stop] : runs) {
-                for (auto at = first; at < stop;) {
-                    const auto end = std::min(stop, (at / ObservationService::ChunkBytes + 1) * ObservationService::ChunkBytes);
-                    try {
-                        observe(at, static_cast<std::size_t>(end - at), true, epoch);
-                    } catch (...) {
-                        serviceSkips.fetch_add(1, std::memory_order_relaxed);
-                    }
-                    at = end;
-                }
+        try {
+            const auto epoch = lastBumpedEpoch.load(std::memory_order_acquire);
+            observationPoint(4);
+            const auto to = service.next.load(std::memory_order_acquire);
+            service.period.fetch_add(1, std::memory_order_relaxed);
+            fresh.clear();
+            for (auto index = std::max(cursor, to > ObservationService::RingEntries ? to - ObservationService::RingEntries : 0); index < to; ++index) {
+                std::uint64_t first = 0;
+                std::uint64_t stop = 0;
+                if (service.Read(index, first, stop)) fresh.emplace_back(first, stop);
             }
-            serviceRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+            cursor = to;
+            runs = carried;
+            std::sort(carried.begin(), carried.end());
+            for (const auto& run : fresh) {
+                if (!std::binary_search(carried.begin(), carried.end(), run)) runs.push_back(run);
+            }
+            carried.swap(fresh);
+            const auto start = std::chrono::steady_clock::now();
+            if (service.enabled.load(std::memory_order_acquire)) {
+                for (const auto& [first, stop] : runs) {
+                    for (auto at = first; at < stop;) {
+                        const auto end = std::min(stop, (at / ObservationService::ChunkBytes + 1) * ObservationService::ChunkBytes);
+                        try {
+                            observe(at, static_cast<std::size_t>(end - at), true, epoch);
+                        } catch (...) {
+                            serviceSkips.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        at = end;
+                    }
+                }
+                serviceRuns.fetch_add(runs.size(), std::memory_order_relaxed);
+            }
+            serviceSweeps.fetch_add(1, std::memory_order_relaxed);
+            serviceNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        } catch (...) {
+            serviceSkips.fetch_add(1, std::memory_order_relaxed);
         }
-        serviceSweeps.fetch_add(1, std::memory_order_relaxed);
-        serviceNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         service.handled.store(request, std::memory_order_release);
         service.handled.notify_all();
     }
