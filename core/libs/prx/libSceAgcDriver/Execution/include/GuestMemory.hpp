@@ -192,6 +192,8 @@ struct ProofBreakCounts {
 bool ProofBreaksCounted();
 void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
+bool ProofBreakSitesTracked();
+std::array<std::uint64_t, ProofBreakSiteCount> ProofBreakSiteTotals();
 void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t address = 0, std::uint64_t bytes = 0);
 struct ProofBreak {
     ProofBreakSite site = ProofBreakSite::Other;

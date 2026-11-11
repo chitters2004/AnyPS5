@@ -2561,6 +2561,7 @@ namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 thread_local bool proofThread = false;
 thread_local ProofBreakTrace* proofBreakTrace = nullptr;
+std::array<std::atomic<std::uint64_t>, ProofBreakSiteCount> proofBreakTotals{};
 }
 
 std::uint64_t ProofSerial() {
@@ -2609,6 +2610,17 @@ bool ProofBreaksCounted() {
     return counted;
 }
 
+bool ProofBreakSitesTracked() {
+    static const bool tracked = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return tracked;
+}
+
+std::array<std::uint64_t, ProofBreakSiteCount> ProofBreakSiteTotals() {
+    std::array<std::uint64_t, ProofBreakSiteCount> totals{};
+    for (std::size_t site = 0; site < ProofBreakSiteCount; ++site) totals[site] = proofBreakTotals[site].load(std::memory_order_relaxed);
+    return totals;
+}
+
 ProofBreakCounts TakeProofBreakCounts() {
     auto& counters = proofBreakCounters();
     ProofBreakCounts counts;
@@ -2622,6 +2634,7 @@ void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
     if (ProofBreaksCounted()) proofBreakCounters().sites[static_cast<std::size_t>(site)].Add();
+    if (ProofBreakSitesTracked()) proofBreakTotals[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, address, bytes});
 }
 
