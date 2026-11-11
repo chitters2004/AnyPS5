@@ -350,18 +350,6 @@ void PlanKeysCoverThePipelineKey() {
     std::printf("draw plans: the plan key follows all %zu of %zu state leaves and %zu leaf pairs that change the pipeline key (%zu refused by the pipeline key)\n", covered, leaves, pairs, refused);
 }
 
-void PlanHitPhasesKeepTheirNames() {
-    namespace Graphics = AgcDriver::Graphics;
-    const std::array<std::pair<Graphics::CommitPhase, std::string_view>, 5> phases{{
-        {Graphics::CommitPhase::PlanHitFind, "plan.hit.find"},
-        {Graphics::CommitPhase::PlanHitWords, "plan.hit.words"},
-        {Graphics::CommitPhase::PlanHitInstance, "plan.hit.instance"},
-        {Graphics::CommitPhase::PlanHitTargets, "plan.hit.targets"},
-        {Graphics::CommitPhase::PlanHitRebind, "plan.hit.rebind"},
-    }};
-    for (const auto& [phase, name] : phases) Expect(Graphics::CommitPhaseName(phase) == name, std::string("commit phase ") + std::string(name) + " is named " + Graphics::CommitPhaseName(phase) + ": the phase enum and its name table are out of order");
-}
-
 void PlanKeysFollowTheBindingShape() {
     namespace Graphics = AgcDriver::Graphics;
     ShaderRecompiler::RecompileResult program{};
@@ -681,7 +669,6 @@ int main(int argc, char** argv) {
         PlanStateLeavesAreHashedOrRuled();
         PlanStateWalkMatchesTheHandwrittenWriter();
         PlanKeysFollowTheBindingShape();
-        PlanHitPhasesKeepTheirNames();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         Register(LoadingPixelHeader, LoadingPixelCode.data(), sizeof(LoadingPixelCode), 1);

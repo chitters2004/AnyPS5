@@ -146,32 +146,79 @@ void TestFollowEpochForwardOnly() {
     Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");
 }
 
-void TestRingPhasesKeepTheirNames() {
+void TestAppendedPhasesKeepTheirNames() {
     using AgcDriver::Graphics::CommitPhase;
     struct Named {
         CommitPhase phase;
         std::string_view name;
         std::string_view group;
     };
-    const std::array<Named, 8> phases{{
+    const std::array<Named, 51> phases{{
         {CommitPhase::TargetsDepthClaims, "targets.depth.claims", "targets"},
         {CommitPhase::TargetsDepthClear, "targets.depth.clear", "targets"},
         {CommitPhase::TargetsDepthFind, "targets.depth.find", "targets"},
         {CommitPhase::TargetsDepthSync, "targets.depth.sync", "targets"},
         {CommitPhase::TargetsDepthStale, "targets.depth.stale", "targets"},
+        {CommitPhase::PlanHitFind, "plan.hit.find", "plan.hit"},
+        {CommitPhase::PlanHitWords, "plan.hit.words", "plan.hit"},
+        {CommitPhase::PlanHitInstance, "plan.hit.instance", "plan.hit"},
+        {CommitPhase::PlanHitTargets, "plan.hit.targets", "plan.hit"},
+        {CommitPhase::PlanHitRebind, "plan.hit.rebind", "plan.hit"},
+        {CommitPhase::ResolveSetup, "resolve.setup", "resolve"},
+        {CommitPhase::ResolveSpace, "resolve.space", "resolve"},
+        {CommitPhase::ResolveMoved, "resolve.moved", "resolve"},
+        {CommitPhase::ResolveBuild, "resolve.build", "resolve"},
+        {CommitPhase::ResolveEvict, "resolve.evict", "resolve"},
         {CommitPhase::TargetsLookupPure, "targets.lookup.pure", "targets"},
         {CommitPhase::TargetsLookupGuards, "targets.lookup.guards", "targets"},
         {CommitPhase::TargetsLookupCache, "targets.lookup.cache", "targets"},
+        {CommitPhase::InputsValidate, "inputs.validate", "inputs"},
+        {CommitPhase::InputsFlush, "inputs.flush", "inputs"},
+        {CommitPhase::InputsInPlace, "inputs.inplace", "inputs"},
+        {CommitPhase::InputsReuse, "inputs.reuse", "inputs"},
+        {CommitPhase::InputsArm, "inputs.arm", "inputs"},
+        {CommitPhase::InputsAlloc, "inputs.alloc", "inputs"},
+        {CommitPhase::InputsKeep, "inputs.keep", "inputs"},
+        {CommitPhase::InputsIndexRange, "inputs.indexrange", "inputs"},
+        {CommitPhase::InputsExpand, "inputs.expand", "inputs"},
+        {CommitPhase::InputsLayout, "inputs.layout", "inputs"},
+        {CommitPhase::RecordSetup, "record.setup", "record"},
+        {CommitPhase::RecordPass, "record.pass", "record"},
+        {CommitPhase::RecordBegin, "record.begin", "record"},
+        {CommitPhase::RecordBind, "record.bind", "record"},
+        {CommitPhase::RecordPush, "record.push", "record"},
+        {CommitPhase::RecordCommands, "record.commands", "record"},
+        {CommitPhase::RecordLeave, "record.leave", "record"},
+        {CommitPhase::RecordAfter, "record.after", "record"},
+        {CommitPhase::RecordRecipe, "record.recipe", "record"},
+        {CommitPhase::RecordStores, "record.stores", "record"},
+        {CommitPhase::RecordPassKey, "record.passkey", "record"},
+        {CommitPhase::RecordBeginContinue, "record.begin.continue", "record"},
+        {CommitPhase::RecordBeginProxies, "record.begin.proxies", "record"},
+        {CommitPhase::RecordBeginBarriers, "record.begin.barriers", "record"},
+        {CommitPhase::RecordBeginLds, "record.begin.lds", "record"},
+        {CommitPhase::RecordBeginArguments, "record.begin.arguments", "record"},
+        {CommitPhase::RecordBeginOrder, "record.begin.order", "record"},
+        {CommitPhase::RecordBeginStaged, "record.begin.staged", "record"},
+        {CommitPhase::RecordBeginPipeline, "record.begin.pipeline", "record"},
+        {CommitPhase::RecordBeginBind, "record.begin.bind", "record"},
+        {CommitPhase::RecordBeginDynamic, "record.begin.dynamic", "record"},
+        {CommitPhase::RecordBeginLibrary, "record.begin.library", "record"},
+        {CommitPhase::RevalidateCertified, "revalidate certified", "revalidate"},
     }};
-    for (const auto& entry : phases) {
+    const auto first = static_cast<std::size_t>(phases.front().phase);
+    for (std::size_t index = 0; index < phases.size(); ++index) {
+        const auto& entry = phases[index];
+        Check(static_cast<std::size_t>(entry.phase) == first + index, ("commit phase " + std::string(entry.name) + " is not in its appended position").c_str());
         Check(AgcDriver::Graphics::CommitPhaseName(entry.phase) == entry.name, ("commit phase " + std::string(entry.name) + " is named " + AgcDriver::Graphics::CommitPhaseName(entry.phase) + ": the phase enum and its name table are out of order").c_str());
         Check(AgcDriver::Graphics::CommitPhaseGroup(entry.phase) == entry.group, ("commit phase " + std::string(entry.name) + " is in group " + AgcDriver::Graphics::CommitPhaseGroup(entry.phase) + ": the phase enum and its group table are out of order").c_str());
     }
+    Check(static_cast<std::size_t>(phases.back().phase) + 1 == static_cast<std::size_t>(CommitPhase::Count), "an appended commit phase is missing from the name test");
 }
 
 int main() {
     try {
-        TestRingPhasesKeepTheirNames();
+        TestAppendedPhasesKeepTheirNames();
         TestFollowEpochForwardOnly();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";
