@@ -1293,7 +1293,7 @@ std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StaticKeys(const
     return published;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, bool shapes = true) {
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, std::size_t* hash, bool shapes = true) {
     ResourceCache::Key key;
     key.reserve(256);
     key.push_back(0xffffffffu);
@@ -1304,6 +1304,8 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     bool shaped = false;
+    std::optional<ResourceCache::DrawKeyHash> composed;
+    if (hash != nullptr) composed.emplace(std::span<const std::uint32_t>(key));
     for (const auto& shader : shaders) {
         const auto sizeAt = key.size();
         key.push_back(0u);
@@ -1311,6 +1313,7 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         const auto* shape = shapes ? KeyShapeOf(shader) : nullptr;
         auto words = shape == nullptr ? memo.load(std::memory_order_acquire) : nullptr;
         NoteCommitKeyMemo(shape != nullptr || words != nullptr);
+        std::uint64_t segment = 0;
         if (shape != nullptr) {
             const auto statics = StaticKeys(shader, *shape);
             key.insert(key.end(), statics->drawWords.begin(), statics->drawWords.end());
@@ -1318,15 +1321,20 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
             stageKeyMemoCounters().patchedSegments.fetch_add(shape->patchedBindings.size(), std::memory_order_relaxed);
             shaped = true;
         } else if (words != nullptr) {
-            key.insert(key.end(), words->begin(), words->end());
+            key.insert(key.end(), words->words.begin(), words->words.end());
+            segment = words->hash;
             stageKeyMemoCounters().resultHits.fetch_add(1, std::memory_order_relaxed);
         } else {
             stageKeyMemoCounters().resultWalks.fetch_add(1, std::memory_order_relaxed);
             ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
-            memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
+            const std::span<const std::uint32_t> appended(key.data() + sizeAt + 1u, key.size() - sizeAt - 1u);
+            segment = ResourceCache::SegmentHash(appended);
+            memo.store(std::make_shared<const ShaderRecompiler::ResultKeyWords>(ShaderRecompiler::ResultKeyWords{std::vector<std::uint32_t>(appended.begin(), appended.end()), segment}), std::memory_order_release);
         }
         key[sizeAt] = static_cast<std::uint32_t>(key.size() - sizeAt - 1u);
+        if (composed.has_value()) composed->Stage(key[sizeAt], segment != 0 ? segment : ResourceCache::SegmentHash(std::span<const std::uint32_t>(key.data() + sizeAt + 1u, key[sizeAt])));
     }
+    const auto tailAt = key.size();
     key.push_back(colorAttachments);
     if (ranges) {
         append64(target.address | target.pipeBankXor);
@@ -1337,11 +1345,12 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     if (shaped && VerifyKeyMemo()) {
         static AgcDriver::Mutex mutex;
         static std::map<ResourceCache::Key, ResourceCache::Key> seen;
-        auto full = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false);
+        auto full = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, nullptr, false);
         std::lock_guard lock(mutex);
-        Require(seen.emplace(key, std::move(full)).first->second == DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false), "APS5_VERIFY_KEY_MEMO: two draws share a split content key but not their full content key");
+        Require(seen.emplace(key, std::move(full)).first->second == DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, nullptr, false), "APS5_VERIFY_KEY_MEMO: two draws share a split content key but not their full content key");
         stageKeyMemoCounters().verified.fetch_add(1, std::memory_order_relaxed);
     }
+    if (composed.has_value()) *hash = composed->Finish(std::span<const std::uint32_t>(key).subspan(tailAt));
     return key;
 }
 
@@ -1797,6 +1806,7 @@ struct DrawPlan {
     bool candidate = false;
     bool keyed = false;
     ResourceCache::Key contentKey;
+    std::size_t contentHash = 0;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
@@ -1886,7 +1896,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        plan.contentKey = InCommitPhase(CommitPhase::PlanKey, [&] { return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey); });
+        plan.contentKey = InCommitPhase(CommitPhase::PlanKey, [&] { return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, ResourceCache::HashReuse() ? &plan.contentHash : nullptr); });
+        if (!ResourceCache::HashReuse()) plan.contentHash = ResourceCache::Hash(plan.contentKey);
         NoteCommitKey(plan.contentKey.size());
         timer.charge(PhaseLookup, keyStart);
     }
@@ -1906,7 +1917,7 @@ void requireDrawPlanRepeats(const Context& context, const State& state, const Pm
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
     const auto& layout = plan.VertexLayout();
     const auto& repeated = again.VertexLayout();
-    Require(again.nothing == plan.nothing && again.indexBytes == plan.indexBytes && again.fragmentOutputs == plan.fragmentOutputs && again.shaderStages == plan.shaderStages && again.meshGroups == plan.meshGroups && again.meshLayers == plan.meshLayers && again.meshLayerStride == plan.meshLayerStride && again.candidate == plan.candidate && again.keyed == plan.keyed && again.contentKey == plan.contentKey && std::ranges::equal(repeated.bindings, layout.bindings, sameBinding) && std::ranges::equal(repeated.attributes, layout.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLAN: the plan built after the draw's record-time work differs from the plan the draw used");
+    Require(again.nothing == plan.nothing && again.indexBytes == plan.indexBytes && again.fragmentOutputs == plan.fragmentOutputs && again.shaderStages == plan.shaderStages && again.meshGroups == plan.meshGroups && again.meshLayers == plan.meshLayers && again.meshLayerStride == plan.meshLayerStride && again.candidate == plan.candidate && again.keyed == plan.keyed && again.contentKey == plan.contentKey && (!plan.keyed || plan.contentHash == ResourceCache::Hash(plan.contentKey)) && std::ranges::equal(repeated.bindings, layout.bindings, sameBinding) && std::ranges::equal(repeated.attributes, layout.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLAN: the plan built after the draw's record-time work differs from the plan the draw used");
 }
 
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing) {
@@ -2259,6 +2270,7 @@ struct ResolvedResources {
     std::shared_ptr<ShaderResources> resources;
     std::vector<ShaderResources::MovedBuffer> moved;
     ResourceCache::Key contentKey;
+    std::size_t contentHash = 0;
     bool cacheable = false;
     const ShaderResources::BuildTiming* built = nullptr;
 };
@@ -2333,19 +2345,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     const bool candidate = recordable && plan.candidate;
     resolved.cacheable = recordable && plan.keyed;
-    const auto address = candidate && !ShaderResources::SpaceReuseDisabled() ? addressStages(shaders) : AddressStages::None;
+    const auto address = candidate && !ShaderResources::SpaceReuseDisabled() ? InCommitPhase(CommitPhase::ResolveSetup, [&] { return addressStages(shaders); }) : AddressStages::None;
+    CountCommit(CommitCounter::ResolveDraws);
+    if (address != AddressStages::None) CountCommit(CommitCounter::ResolveAddressStages);
     std::optional<AddressDrawReuse> reuse;
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
+        CountCommit(CommitCounter::ResolveCacheable);
         resolved.contentKey = plan.contentKey;
-        if (auto cached = InCommitPhase(CommitPhase::ResolveCache, [&] { return SharedResourceCache().Find(resolved.contentKey); })) {
+        resolved.contentHash = plan.contentHash;
+        if (auto cached = InCommitPhase(CommitPhase::ResolveCache, [&] { return SharedResourceCache().Find(resolved.contentKey, resolved.contentHash); })) {
+            CountCommit(CommitCounter::ResolveFound);
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
             bool spaceHeld = !cached->SpaceReuse();
             bool inUse = false;
             if (!spaceHeld) {
+                const CommitPhaseScope space(CommitPhase::ResolveSpace);
+                CountCommit(CommitCounter::ResolveSpaceChecks);
                 if (auto* active = Recorder::Active(); active != nullptr) {
                     GuestBufferMemory::ReleaseRetainedSpaces(active->Id(), active->CompletedThrough());
                     static_cast<void>(cached->ReleaseCompletedSpace(active->Id(), active->CompletedThrough()));
@@ -2375,12 +2394,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 const CommitPhaseScope revalidate(CommitPhase::Revalidate);
                 return cached->Revalidate(shaders);
             }();
+            if (valid) CountCommit(CommitCounter::ResolveValid);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+            if (valid && recorder != nullptr) moved = InCommitPhase(CommitPhase::ResolveMoved, [&] { return cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched); });
             if (moved.has_value()) {
+                CountCommit(CommitCounter::ResolveHits);
+                if (!moved->empty()) CountCommit(CommitCounter::ResolveMovedHits);
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
                 static_cast<void>(heldSpace.release());
@@ -2390,23 +2412,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
-                if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
+                if (valid && cached->SpaceReuse()) InCommitPhase(CommitPhase::ResolveEvict, [&] { static_cast<void>(cached->ReleaseSpace()); });
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                CountCommit(CommitCounter::ResolveInvalidated);
+                const CommitPhaseScope evict(CommitPhase::ResolveEvict);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
-                SharedResourceCache().Remove(resolved.contentKey);
+                SharedResourceCache().Remove(resolved.contentKey, resolved.contentHash);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         } else if (ProfileKeyShapes() && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return KeyShapeOf(shader) != nullptr; })) {
-            if (SharedResourceCache().Find(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, false)) != nullptr) stageKeyMemoCounters().layoutSplitMisses.fetch_add(1, std::memory_order_relaxed);
+            if (SharedResourceCache().Find(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, nullptr, false)) != nullptr) stageKeyMemoCounters().layoutSplitMisses.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
-        resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
+        CountCommit(CommitCounter::ResolveBuilds);
+        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled()); });
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -3674,10 +3699,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); }));
     }
     timer.phase(PhasePrepare);
-    BeginCommitPhase(CommitPhase::Resolve);
+    BeginCommitPhase(CommitPhase::ResolveSetup);
     const bool recordDraws = RecordDraws();
     auto* recorder = prepared.recorder = Recorder::Active();
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
+    BeginCommitPhase(CommitPhase::Resolve);
     auto& resolved = prepared.resolved;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, plan, outcome, timer);
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
@@ -3825,7 +3851,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resolved.contentHash, resources);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -4018,6 +4044,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->device = context.device;
             recipe->templateRef = resources;
             recipe->key = contentKey;
+            recipe->keyHash = resolved.contentHash;
             recipe->pipeline = pipeline;
             recipe->framebuffer = framebuffer;
             for (const auto& owner : owners) recipe->targets.emplace_back(owner);
@@ -4610,7 +4637,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }();
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
-        SharedResourceCache().Remove(*usedKey, resources.get());
+        SharedResourceCache().Remove(*usedKey, usedKey == &recipe.key && ResourceCache::HashReuse() ? recipe.keyHash : ResourceCache::Hash(*usedKey), resources.get());
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
         recorder->Keep(std::move(resources));
@@ -4630,7 +4657,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     BeginCommitPhase(CommitPhase::Classify);
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-    InCommitPhase(CommitPhase::ResolveCache, [&] { SharedResourceCache().Touch(*usedKey); });
+    InCommitPhase(CommitPhase::ResolveCache, [&] { SharedResourceCache().Touch(*usedKey, usedKey == &recipe.key && ResourceCache::HashReuse() ? recipe.keyHash : ResourceCache::Hash(*usedKey)); });
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();

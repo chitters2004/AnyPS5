@@ -56,6 +56,11 @@ enum class CommitPhase : std::uint8_t {
     PlanHitInstance,
     PlanHitTargets,
     PlanHitRebind,
+    ResolveSetup,
+    ResolveSpace,
+    ResolveMoved,
+    ResolveBuild,
+    ResolveEvict,
     Count
 };
 
@@ -107,6 +112,16 @@ enum class CommitCounter : std::uint8_t {
     TargetSlowAgainInEpoch,
     EpochFollowsSkipped,
     DepthFoundRepeated,
+    ResolveDraws,
+    ResolveCacheable,
+    ResolveFound,
+    ResolveSpaceChecks,
+    ResolveValid,
+    ResolveHits,
+    ResolveMovedHits,
+    ResolveBuilds,
+    ResolveInvalidated,
+    ResolveAddressStages,
     Count
 };
 

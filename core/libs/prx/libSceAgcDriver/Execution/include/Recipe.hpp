@@ -78,6 +78,7 @@ struct DrawRecipe {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<Graphics::ShaderResources> templateRef;
     Graphics::ResourceCache::Key key;
+    std::size_t keyHash = 0;
     std::weak_ptr<Graphics::Pipeline> pipeline;
     std::weak_ptr<Graphics::Framebuffer> framebuffer;
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;

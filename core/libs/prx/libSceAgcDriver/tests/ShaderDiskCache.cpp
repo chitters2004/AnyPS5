@@ -454,7 +454,7 @@ void verifyResultRoundTrip() {
     requireSameResult(result, decoded, "result round trip");
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
     auto memoized = result;
-    memoized.drawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(std::vector<std::uint32_t>{1u, 2u, 3u}));
+    memoized.drawKeyMemo.words.store(std::make_shared<const ShaderRecompiler::ResultKeyWords>(ShaderRecompiler::ResultKeyWords{{1u, 2u, 3u}, 0u}));
     std::vector<std::byte> memoizedBytes;
     ShaderDiskCache::EncodeResult(memoized, memoizedBytes);
     require(memoizedBytes == bytes, "the draw key memo was stored");
