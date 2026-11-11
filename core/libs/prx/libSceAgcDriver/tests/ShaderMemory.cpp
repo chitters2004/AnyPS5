@@ -46,6 +46,7 @@
 #include <map>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <span>
@@ -514,6 +515,67 @@ bool compileResultMemoPixel(std::uint32_t value) {
     bool hit = false;
     static_cast<void>(Recompile(request, *capture, &hit));
     return hit;
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> compileConcurrentPixel(std::uint32_t shader, std::uint32_t value, bool cached) {
+    using namespace ShaderRecompiler;
+    auto code = resultMemoPixelCode();
+    code.insert(code.begin(), 0xbf800000u | shader);
+    std::array<std::uint32_t, 1> color{value};
+    auto request = FrontendRequest(code, color);
+    request.shader.stage = ShaderStage::Fragment;
+    request.context.compute.reset();
+    request.context.pixel = ShaderPixelStageInfo{};
+    request.context.pixel->wave32 = true;
+    request.context.pixel->targetOutputMode[0] = 9u;
+    request.context.waveSize = 32u;
+    request.useCache = cached;
+    AgcDriver::ShaderMemory memory({});
+    const auto capture = memory.Capture(request);
+    const auto regions = memory.Regions();
+    request.context.memory = regions;
+    return Recompile(request, *capture);
+}
+
+void verifyConcurrentRecompile() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t Shaders = 6u;
+    constexpr std::uint32_t Values = 4u;
+    constexpr std::uint32_t Keys = Shaders * Values;
+    const auto threads = std::max(4u, std::thread::hardware_concurrency());
+    std::vector<std::shared_ptr<const RecompileResult>> results(static_cast<std::size_t>(threads) * Keys);
+    std::atomic<unsigned> ready{0u};
+    std::atomic<bool> go{false};
+    std::mutex failureMutex;
+    std::string failure;
+    std::vector<std::thread> workers;
+    for (unsigned thread = 0; thread < threads; ++thread) {
+        workers.emplace_back([&, thread] {
+            ready.fetch_add(1u);
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (std::uint32_t step = 0; step < Keys; ++step) {
+                const auto key = (step + thread * 5u) % Keys;
+                try {
+                    results[static_cast<std::size_t>(thread) * Keys + key] = compileConcurrentPixel(key / Values, key % Values + 1u, true);
+                } catch (const std::exception& error) {
+                    std::lock_guard lock(failureMutex);
+                    if (failure.empty()) failure = error.what();
+                }
+            }
+        });
+    }
+    while (ready.load() != threads) std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    require(failure.empty(), ("concurrent recompile: a compile failed: " + failure).c_str());
+    for (std::uint32_t key = 0; key < Keys; ++key) {
+        const auto reference = compileConcurrentPixel(key / Values, key % Values + 1u, false);
+        for (unsigned thread = 0; thread < threads; ++thread) {
+            const auto& result = results[static_cast<std::size_t>(thread) * Keys + key];
+            require(result != nullptr, "concurrent recompile: a compile returned no result");
+            verifyResult(*reference, *result);
+        }
+    }
 }
 
 void verifyResultMemoBudgetThreads() {
@@ -11971,6 +12033,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && (std::string_view(argv[1]) == "--region-merge" || std::string_view(argv[1]) == "--region-merge-bench")) {
             verifyRegionMerge(false, std::string_view(argv[1]) == "--region-merge-bench");
             verifyRegionMerge(true);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--concurrent-recompile") {
+            verifyConcurrentRecompile();
+            std::cout << "Shaders compiled at once on many threads match their uncached compiles\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget-threads") {
