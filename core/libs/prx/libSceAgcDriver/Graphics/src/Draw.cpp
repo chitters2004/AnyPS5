@@ -1503,6 +1503,16 @@ void SetDrawPlansForTest(int enabled) {
     drawPlansForTest.store(enabled, std::memory_order_relaxed);
 }
 
+namespace {
+
+std::atomic<std::uint32_t> drawPlanSetKeySalt{0};
+
+}
+
+void SetDrawPlanSetKeySaltForTest(std::uint32_t salt) {
+    drawPlanSetKeySalt.store(salt, std::memory_order_relaxed);
+}
+
 StageKeyMemoCounts StageKeyMemoCounters() {
     const auto& counters = stageKeyMemoCounters();
     return {counters.staticHits.load(std::memory_order_relaxed), counters.staticFills.load(std::memory_order_relaxed), counters.staticLosses.load(std::memory_order_relaxed), counters.patchedSegments.load(std::memory_order_relaxed), counters.layoutSplitMisses.load(std::memory_order_relaxed), counters.verified.load(std::memory_order_relaxed), counters.resultHits.load(std::memory_order_relaxed), counters.resultWalks.load(std::memory_order_relaxed)};
@@ -3982,6 +3992,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->mainSetKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
             recipe->fragmentSetKey.assign(layouts.fragmentKey.begin(), layouts.fragmentKey.end());
             recipe->splitSets = layouts.split;
+            if (const auto salt = drawPlanSetKeySalt.load(std::memory_order_relaxed); salt != 0) recipe->mainSetKey.push_back(salt);
             if (DrawPlans()) {
                 for (const auto& shader : shaders) {
                     recipe->bindingWords.push_back(PlanStageWordsOf(shader));

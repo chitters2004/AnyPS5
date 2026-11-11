@@ -140,6 +140,7 @@ bool DrawPlans();
 bool DrawPlanTemplates();
 bool VerifyDrawPlans();
 void SetDrawPlansForTest(int enabled);
+void SetDrawPlanSetKeySaltForTest(std::uint32_t salt);
 struct StageKeyMemoCounts {
     std::uint64_t staticHits = 0;
     std::uint64_t staticFills = 0;

@@ -438,6 +438,35 @@ void ReboundPlansStayOffTheExactPath() {
     std::puts("draw plans: I7b, a rebound plan hit is never kept as its draw key's exact recipe");
 }
 
+void PlansRefuseTemplatesWithOtherSetLayouts() {
+    GuestBlock planned;
+    GuestBlock reference;
+    const auto run = [&](const GuestBlock& target, bool usePlans) {
+        GuestBlock first;
+        GuestBlock moved;
+        const float dim = 0.25f;
+        const float bright = 0.75f;
+        std::memcpy(first.Bytes(0), &dim, sizeof(dim));
+        std::memcpy(moved.Bytes(0), &bright, sizeof(bright));
+        const std::unique_ptr<FullPath> fullPath = usePlans ? nullptr : std::make_unique<FullPath>();
+        AgcDriver::Graphics::SetDrawPlanSetKeySaltForTest(usePlans ? 0x5a17u : 0u);
+        Draw(target, {.colourBuffer = &first, .colour = 0.5f});
+        Draw(target, {.colourBuffer = &first, .colour = 0.5f});
+        Draw(target, {.colourBuffer = &moved, .colourStride = 8u, .scale = 8.0f});
+        const auto before = Counts();
+        Draw(target, {.colourBuffer = &moved, .scale = 16.0f});
+        const auto repeat = Since(before);
+        AgcDriver::Graphics::SetDrawPlanSetKeySaltForTest(0);
+        return repeat;
+    };
+    const auto counts = run(planned, true);
+    static_cast<void>(run(reference, false));
+    Report("I7c a template with other set layouts", counts);
+    if (PlansOn()) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::TemplateInstanceHits] == 0 && counts[DrawPlanCount::InstanceTemplate] == 1, "a plan hit took a cached template whose set layouts differ from the plan's");
+    Expect(Pixels(planned) == Pixels(reference), "draws refused a template with other set layouts render differently from the full path");
+    std::puts("draw plans: I7c, a template whose set layouts differ from the plan's is never served by the plan");
+}
+
 void PlannedSceneMatchesFullPath() {
     const std::vector<std::pair<std::size_t, Look>> scene{
         {0, {.colour = 1.0f}}, {0, {.colour = 1.0f}}, {0, {.colour = 0.5f}}, {1, {.colour = 0.25f}}, {1, {.colour = 0.75f, .scale = 24.0f}},
@@ -483,6 +512,7 @@ int main() {
         PlanRowsFollowTheDraw();
         PlanHitsSeeGuestWrites();
         ReboundPlansStayOffTheExactPath();
+        PlansRefuseTemplatesWithOtherSetLayouts();
         PlannedSceneMatchesFullPath();
         const auto keys = AgcDriver::Graphics::StageKeyMemoCounters();
         std::printf("stage key memo: %llu static hits, %llu static fills, %llu patched segments; unshaped: %llu per-result memo hits, %llu full walks\n", static_cast<unsigned long long>(keys.staticHits), static_cast<unsigned long long>(keys.staticFills), static_cast<unsigned long long>(keys.patchedSegments), static_cast<unsigned long long>(keys.resultHits), static_cast<unsigned long long>(keys.resultWalks));
