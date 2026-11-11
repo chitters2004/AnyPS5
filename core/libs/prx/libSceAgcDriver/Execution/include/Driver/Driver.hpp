@@ -19,12 +19,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
@@ -421,7 +421,7 @@ private:
 
     std::mutex mutex;
     AgcDriver::Mutex shutdownMutex;
-    std::condition_variable changed;
+    AddressCondition changed;
 
     std::map<std::uint32_t, QueueWorker> workers;
     std::atomic<std::uint64_t> frameSerial{0};

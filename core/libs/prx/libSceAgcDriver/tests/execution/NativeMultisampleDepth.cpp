@@ -82,7 +82,7 @@ struct DriverTestAccess {
         std::unique_lock lock(driver.mutex);
         const auto target = driver.accepted;
         ++driver.idleWaiters;
-        driver.changed.wait(lock, [&] { return driver.failure != nullptr || driver.stopping || driver.completed >= target; });
+        driver.changed.Wait(lock, [&] { return driver.failure != nullptr || driver.stopping || driver.completed >= target; });
         --driver.idleWaiters;
         driver.rethrowFailure();
         driver.checkStopping();

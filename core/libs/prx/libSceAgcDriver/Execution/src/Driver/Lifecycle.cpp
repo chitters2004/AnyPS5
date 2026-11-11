@@ -186,7 +186,7 @@ void Driver::stop() {
             worker.queued.store(0, std::memory_order_release);
         }
     }
-    changed.notify_all();
+    changed.NotifyAll();
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
@@ -266,7 +266,7 @@ void Driver::WaitIdle() {
         std::unique_lock lock(mutex);
         const auto target = accepted;
         ++idleWaiters;
-        changed.wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
+        changed.Wait(lock, [&] { return failure != nullptr || stopping || completed >= target; });
         --idleWaiters;
         rethrowFailure();
         checkStopping();
@@ -280,7 +280,7 @@ bool Driver::WaitIdleFor(std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex);
     const auto target = accepted;
     ++idleWaiters;
-    const bool idle = changed.wait_for(lock, timeout, [&] { return failure != nullptr || stopping || completed >= target; });
+    const bool idle = changed.WaitFor(lock, timeout, [&] { return failure != nullptr || stopping || completed >= target; });
     --idleWaiters;
     rethrowFailure();
     checkStopping();
@@ -300,7 +300,7 @@ bool Driver::WaitIdleUnlessTitleWaitsFor(std::chrono::milliseconds timeout) {
         });
     };
     ++idleWaiters;
-    while (!idle() && !titleWaits() && std::chrono::steady_clock::now() < deadline) changed.wait_for(lock, std::chrono::milliseconds(1));
+    while (!idle() && !titleWaits() && std::chrono::steady_clock::now() < deadline) changed.WaitFor(lock, std::chrono::milliseconds(1));
     --idleWaiters;
     rethrowFailure();
     checkStopping();
@@ -321,7 +321,7 @@ bool Driver::WaitSettledFor(std::chrono::milliseconds timeout) {
     };
     ++idleWaiters;
     bool done = settled();
-    while (!done && std::chrono::steady_clock::now() < deadline) done = changed.wait_for(lock, std::chrono::milliseconds(1), settled);
+    while (!done && std::chrono::steady_clock::now() < deadline) done = changed.WaitFor(lock, std::chrono::milliseconds(1), settled);
     --idleWaiters;
     rethrowFailure();
     checkStopping();
@@ -344,7 +344,7 @@ void Driver::ReleaseSettled() {
         std::lock_guard lock(mutex);
         captureHold.store(false, std::memory_order_relaxed);
     }
-    changed.notify_all();
+    changed.NotifyAll();
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
@@ -406,7 +406,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
         }
         if (first) PrintFailure(error);
     }
-    changed.notify_all();
+    changed.NotifyAll();
 }
 
 void Driver::rethrowFailure() const {

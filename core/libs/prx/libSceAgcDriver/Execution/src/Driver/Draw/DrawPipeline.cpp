@@ -190,7 +190,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    idle.Wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -201,7 +201,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             run();
         });
     }
-    if (sleeping) wake.notify_one();
+    if (sleeping) wake.NotifyOne();
 }
 
 void DrawFinisher::run() {
@@ -214,7 +214,7 @@ void DrawFinisher::run() {
         {
             std::unique_lock lock(mutex);
             sleeping = true;
-            wake.wait(lock, [&] { return !jobs.empty(); });
+            wake.Wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
@@ -231,7 +231,7 @@ void DrawFinisher::run() {
         jobs.pop_front();
         pending.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
-        idle.notify_all();
+        idle.NotifyAll();
     }
 }
 
@@ -239,7 +239,7 @@ void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
     std::unique_lock lock(mutex);
-    idle.wait(lock, [&] { return jobs.empty(); });
+    idle.Wait(lock, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
@@ -247,7 +247,7 @@ void DrawFinisher::Drain() {
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) idle.Wait(lock, [&] { return jobs.empty(); });
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -359,7 +359,7 @@ void DrawPipeline::enqueue(Item item) {
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= resumeAt; });
+        idle.Wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -380,7 +380,7 @@ void DrawPipeline::enqueue(Item item) {
     }
     if (committerWaiting) {
         ++wakes;
-        wake.notify_one();
+        wake.NotifyOne();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile && !stats) return;
@@ -443,7 +443,7 @@ void DrawPipeline::run() {
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty() || closing; });
+            wake.Wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
@@ -483,7 +483,7 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.NotifyAll();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -495,7 +495,7 @@ void DrawPipeline::Stop() {
         closing = true;
         committer = std::move(thread);
     }
-    wake.notify_all();
+    wake.NotifyAll();
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
     else committer.join();
@@ -518,7 +518,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    idle.Wait(lock, [&] { return items.empty(); });
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];

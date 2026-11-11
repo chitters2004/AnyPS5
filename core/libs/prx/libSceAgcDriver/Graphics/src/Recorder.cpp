@@ -34,7 +34,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -432,7 +432,7 @@ void DestroyDeferred(std::vector<DeferredBatch> releasing, bool onThread) {
 // before `mutex`; neither is ever taken by a kept object's destructor.
 struct ReleaseQueue {
     std::mutex mutex;
-    std::condition_variable wake;
+    AddressCondition wake;
     std::vector<DeferredBatch> items;
     std::thread thread;
     bool started = false;
@@ -452,7 +452,7 @@ void ReleaseThreadMain() {
     auto& queue = ReleaseThreadQueue();
     std::unique_lock lock(queue.mutex);
     for (;;) {
-        queue.wake.wait(lock, [&] { return !queue.items.empty() || queue.stop; });
+        queue.wake.Wait(lock, [&] { return !queue.items.empty() || queue.stop; });
         if (queue.items.empty()) return;
         auto items = std::move(queue.items);
         queue.items.clear();
@@ -475,7 +475,7 @@ void JoinReleaseThread() {
         queue.stop = true;
         worker = std::move(queue.thread);
     }
-    queue.wake.notify_all();
+    queue.wake.NotifyAll();
     worker.join();
     std::lock_guard lock(queue.mutex);
     queue.started = false;
@@ -527,7 +527,7 @@ void ReleaseDeferredKeeps() {
         DestroyDeferred(std::move(releasing), false);
         return;
     }
-    queue.wake.notify_one();
+    queue.wake.NotifyOne();
 }
 // Lock-free state of the active recorder's open batch, read by the queue workers between packets
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
@@ -1306,7 +1306,7 @@ struct Recorder::ProgressWatcher {
                 const auto token = wakes.load(std::memory_order_acquire);
                 if (stop.load(std::memory_order_acquire)) return;
                 if (submitted.load(std::memory_order_acquire) <= seen) {
-                    wakes.wait(token, std::memory_order_acquire);
+                    AgcDriver::AddressWait(wakes, token);
                     continue;
                 }
                 const std::uint64_t target = seen + 1;
@@ -1331,13 +1331,13 @@ struct Recorder::ProgressWatcher {
     void Submitted(std::uint64_t serial) {
         submitted.store(serial, std::memory_order_release);
         wakes.fetch_add(1, std::memory_order_release);
-        wakes.notify_one();
+        AgcDriver::AddressWakeOne(wakes);
     }
 
     ~ProgressWatcher() {
         stop.store(true, std::memory_order_release);
         wakes.fetch_add(1, std::memory_order_release);
-        wakes.notify_one();
+        AgcDriver::AddressWakeOne(wakes);
         thread.join();
     }
 };
