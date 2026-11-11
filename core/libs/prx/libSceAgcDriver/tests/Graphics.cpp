@@ -4,6 +4,7 @@
 #include "GraphicsTests.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -7502,6 +7503,35 @@ void unsetFormatStorageImageTests() {
     }
 }
 
+void recordPhaseNameTests() {
+    namespace Graphics = AgcDriver::Graphics;
+    const std::array<std::pair<Graphics::CommitPhase, std::string_view>, 22> phases{{
+        {Graphics::CommitPhase::RecordSetup, "record.setup"},
+        {Graphics::CommitPhase::RecordPass, "record.pass"},
+        {Graphics::CommitPhase::RecordBegin, "record.begin"},
+        {Graphics::CommitPhase::RecordBind, "record.bind"},
+        {Graphics::CommitPhase::RecordPush, "record.push"},
+        {Graphics::CommitPhase::RecordCommands, "record.commands"},
+        {Graphics::CommitPhase::RecordLeave, "record.leave"},
+        {Graphics::CommitPhase::RecordAfter, "record.after"},
+        {Graphics::CommitPhase::RecordRecipe, "record.recipe"},
+        {Graphics::CommitPhase::RecordStores, "record.stores"},
+        {Graphics::CommitPhase::RecordPassKey, "record.passkey"},
+        {Graphics::CommitPhase::RecordBeginContinue, "record.begin.continue"},
+        {Graphics::CommitPhase::RecordBeginProxies, "record.begin.proxies"},
+        {Graphics::CommitPhase::RecordBeginBarriers, "record.begin.barriers"},
+        {Graphics::CommitPhase::RecordBeginLds, "record.begin.lds"},
+        {Graphics::CommitPhase::RecordBeginArguments, "record.begin.arguments"},
+        {Graphics::CommitPhase::RecordBeginOrder, "record.begin.order"},
+        {Graphics::CommitPhase::RecordBeginStaged, "record.begin.staged"},
+        {Graphics::CommitPhase::RecordBeginPipeline, "record.begin.pipeline"},
+        {Graphics::CommitPhase::RecordBeginBind, "record.begin.bind"},
+        {Graphics::CommitPhase::RecordBeginDynamic, "record.begin.dynamic"},
+        {Graphics::CommitPhase::RecordBeginLibrary, "record.begin.library"},
+    }};
+    for (const auto& [phase, name] : phases) Require(Graphics::CommitPhaseName(phase) == name, std::string("commit phase ") + std::string(name) + " is named " + Graphics::CommitPhaseName(phase) + ": the phase enum and its name table are out of order");
+}
+
 void descriptorCacheTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -13648,6 +13678,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--fault-only-template-records") {
             faultOnlyTemplateRecordTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--record-phase-names") {
+            recordPhaseNameTests();
+            std::cout << "record phase name tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {

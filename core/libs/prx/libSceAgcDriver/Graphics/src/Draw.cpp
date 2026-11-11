@@ -2927,12 +2927,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
-        record.pipeline->Continue(commands, state, record.masked);
+        InCommitPhase(CommitPhase::RecordBeginContinue, [&] { record.pipeline->Continue(commands, state, record.masked); });
     } else {
+        BeginCommitPhase(CommitPhase::RecordBeginProxies);
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
             countBarrier(2);
         }
+        BeginCommitPhase(CommitPhase::RecordBeginBarriers);
         if (start.barrier) {
             const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
             context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
@@ -2943,8 +2945,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT);
             countBarrier(1);
         }
+        BeginCommitPhase(CommitPhase::RecordBeginLds);
         const auto pixelLdsSubgroup = PixelFunctionLdsSubgroup(shaders);
         if (pixelLdsSubgroup != 0u) PreparePixelFunctionLds(context, commands, pixelLdsSubgroup);
+        BeginCommitPhase(CommitPhase::RecordBeginArguments);
         if (captured) {
             recordCaptureBarrier(context, commands);
             countBarrier(1);
@@ -2958,13 +2962,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
+        BeginCommitPhase(CommitPhase::RecordBeginOrder);
         if (!record.reordered.empty()) {
             std::vector<std::shared_ptr<void>> kept;
             RecordSampleOrder(context, commands, record.reorderPass, record.reordered, true, kept);
             for (auto& object : kept) recorder->Keep(std::move(object));
         }
+        BeginCommitPhase(CommitPhase::RecordBeginStaged);
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
+        BeginCommitPhase(CommitPhase::RecordBeginPipeline);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, record.masked);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
