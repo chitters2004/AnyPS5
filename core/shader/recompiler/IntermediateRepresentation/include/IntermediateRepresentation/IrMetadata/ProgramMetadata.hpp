@@ -12,6 +12,19 @@
 
 namespace ShaderRecompiler {
 
+enum NanCheckLanes : std::uint8_t {
+    NanCheckLowHalf = 1u,
+    NanCheckHighHalf = 2u,
+    NanCheckWord = 4u,
+};
+
+struct NanSpeculationCheck {
+    IrValue* condition = nullptr;
+    IrValue* value = nullptr;
+    std::uint8_t lanes = 0;
+    std::uint32_t region = 0;
+};
+
 struct IrProgramMetadata {
     FailureKind cfgFailureKind = FailureKind::None;
     std::string failureReason;
@@ -25,6 +38,7 @@ struct IrProgramMetadata {
     bool barycentricBuiltinsUnnormalized = false;
     bool invalidatesCaches = false;
     std::vector<IrValue*> dynamicReads;
+    std::vector<NanSpeculationCheck> nanSpeculationChecks;
     bool shaderInfoComplete = false;
     IrBindingLayout bindings;
     bool bindingLayoutComplete = false;

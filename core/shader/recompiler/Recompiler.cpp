@@ -43,6 +43,7 @@
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/include/Optimization/NanFlagPruner.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
@@ -317,6 +318,11 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         ResolveControlFlowIdentities(program);
         deadCodeEliminator.RemoveIdentities(program);
         deadCodeEliminator.Eliminate(program);
+        if (NanFlagPruner{}.Prune(program).removedChecks != 0u) {
+            constantFolder.Fold(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
+        }
         dumpIr("fold");
 
         const auto readLaneStats = readLaneEliminator.Eliminate(program, translateOptions.waveSize);

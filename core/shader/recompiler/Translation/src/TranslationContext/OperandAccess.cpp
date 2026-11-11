@@ -368,7 +368,7 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct, bool multiplication) {
     if (!ExactF32Arithmetic()) return result;
     if (nanFast) {
-        noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}));
+        noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}), *result, NanCheckWord);
         return result;
     }
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
@@ -393,7 +393,7 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result) {
     if (!ExactF32Arithmetic()) return result;
     if (nanFast) {
-        noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}));
+        noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}), *result, NanCheckWord);
         return result;
     }
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
@@ -423,8 +423,9 @@ IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*>
     return ir.LogicalOr(invalidProduct, *noNan);
 }
 
-void TranslationContext::noteNan(IrValue& condition) {
+void TranslationContext::noteNan(IrValue& condition, IrValue& value, std::uint8_t lanes) {
     nanSeen = nanSeen == nullptr ? &condition : &ir.LogicalOr(*nanSeen, condition);
+    program.Metadata().nanSpeculationChecks.push_back({&condition, &value, lanes, nanRegion});
 }
 
 IrU1 TranslationContext::anyHalfNan(IrU32 word) {

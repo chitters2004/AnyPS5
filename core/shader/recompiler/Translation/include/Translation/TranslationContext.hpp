@@ -30,6 +30,7 @@ public:
     [[nodiscard]] IrValue* TakeNanSeen() {
         IrValue* seen = nanSeen;
         nanSeen = nullptr;
+        ++nanRegion;
         return seen;
     }
     void SwitchBlock(IrBlock& next) { ir.SetInsertionPoint(next); }
@@ -118,7 +119,7 @@ private:
     IrF32 flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* product, IrValue* addend = nullptr, bool afterRounding = true);
     IrU32 quietNan32(IrU32 bits);
     IrU32 quietNan16(IrU32 bits);
-    void noteNan(IrValue& condition);
+    void noteNan(IrValue& condition, IrValue& value, std::uint8_t lanes);
     IrU1 anyHalfNan(IrU32 word);
     IrValue* nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct = nullptr, bool multiplication = false);
     IrValue* propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result);
@@ -439,6 +440,7 @@ private:
     bool execHighInactive = false;
     bool nanFast = false;
     IrValue* nanSeen = nullptr;
+    std::uint32_t nanRegion = 0;
 };
 
 // Debug aid: APS5_PROBE=<pc hex>:<vgpr>[:<shift>] copies VGPR <vgpr> into v255 right after the
