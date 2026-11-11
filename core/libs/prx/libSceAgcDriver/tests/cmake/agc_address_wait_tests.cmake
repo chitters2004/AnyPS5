@@ -1,5 +1,5 @@
 if(BUILD_TESTING)
-    add_test_executable(agc_address_wait_tests tests/AddressWait.cpp)
+    add_test_executable(agc_address_wait_tests tests/AddressWait.cpp Execution/src/AddressWait.cpp)
     target_include_directories(agc_address_wait_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_address_wait_tests PRIVATE libc)
     configure_windows_unwind(agc_address_wait_tests)
