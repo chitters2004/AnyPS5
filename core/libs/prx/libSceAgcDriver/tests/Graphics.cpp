@@ -13663,11 +13663,6 @@ int main(int argc, char** argv) {
             stencilReferenceUnusedTests();
             return 0;
         }
-        if (argc == 2 && std::string_view(argv[1]) == "--prepared-surfaces") {
-            if (!RunPreparedSurfaceTests()) return 77;
-            std::cout << "prepared surface tests passed\n";
-            return 0;
-        }
         if (argc == 2 && std::string_view(argv[1]) == "--command-batch-fence-failure") {
             commandBatchFenceFailureTests();
             return 0;

@@ -41,7 +41,6 @@
 #include "ImageTableAbi.hpp"
 #include <cstring>
 #include <tuple>
-#include <type_traits>
 #include <limits>
 #include <list>
 #include <map>
@@ -1845,55 +1844,6 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
     return !MetadataMoved(image, resource);
 }
 
-bool PreparedTargets() {
-    static const bool enabled = std::getenv("APS5_PREPARED_TARGETS") != nullptr;
-    return enabled;
-}
-
-bool VerifyPreparedTargets() {
-    static const bool enabled = std::getenv("APS5_VERIFY_PREPARED_TARGETS") != nullptr;
-    return enabled;
-}
-
-PreparedViewedSurface PrepareViewedSurface(const GuestTextureResource& requested, std::uint32_t maxArrayLayers) {
-    static_assert(sizeof(GuestTextureResource) == 112, "the prepared surface key compares every field of a resource");
-    const auto fields = [](const GuestTextureResource& r) { return std::tie(r.baseAddress, r.width, r.height, r.depthOrLastArray, r.baseArray, r.mipCount, r.baseLevel, r.tileMode, r.dimension, r.format, r.dstSelX, r.dstSelY, r.dstSelZ, r.dstSelW, r.pipeBankXor, r.bcSwizzle, r.lastLevel, r.dccAddress, r.dccAlphaOnMsb, r.dccPipeAligned, r.iterate256, r.minLod, r.allocatedMipCount, r.samples, r.gcnPitch, r.gcnPow2Pad, r.gcnLinearGeneral, r.linearPitch, r.fmaskCmaskAddress); };
-    const auto same = [&](const GuestTextureResource& a, const GuestTextureResource& b) { return fields(a) == fields(b); };
-    struct Entry {
-        GuestTextureResource requested{};
-        std::uint32_t maxArrayLayers = 0;
-        bool valid = false;
-        PreparedViewedSurface prepared;
-    };
-    const auto compute = [&] {
-        PreparedViewedSurface prepared;
-        prepared.viewed = ArrayLayerWindow(requested, maxArrayLayers);
-        prepared.viewedBytes = DescribeSurface(prepared.viewed).guestBytes;
-        return prepared;
-    };
-    if (!PreparedTargets()) return compute();
-    thread_local std::array<Entry, 4> entries{};
-    thread_local std::size_t next = 0;
-    for (auto& entry : entries) {
-        if (!entry.valid || entry.maxArrayLayers != maxArrayLayers || !same(entry.requested, requested)) continue;
-        CountCommit(CommitCounter::PreparedSurfaceHits);
-        auto prepared = entry.prepared;
-        prepared.repeated = true;
-        if (VerifyPreparedTargets()) {
-            const auto fresh = compute();
-            Require(same(fresh.viewed, prepared.viewed) && fresh.viewedBytes == prepared.viewedBytes, "APS5_VERIFY_PREPARED_TARGETS: a prepared colour surface differs from the one computed for the draw");
-        }
-        return prepared;
-    }
-    CountCommit(CommitCounter::PreparedSurfaceMisses);
-    auto& entry = entries[next++ % entries.size()];
-    entry.requested = requested;
-    entry.maxArrayLayers = maxArrayLayers;
-    entry.prepared = compute();
-    entry.valid = true;
-    return entry.prepared;
-}
-
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
@@ -1902,10 +1852,9 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
         if (phased) BeginCommitPhase(next);
     };
     phase(CommitPhase::TargetsLookupPure);
-    const auto prepared = PrepareViewedSurface(requested, context.limits.maxImageArrayLayers);
-    const auto& viewed = prepared.viewed;
+    const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
-    const auto viewedBytes = prepared.viewedBytes;
+    const auto viewedBytes = DescribeSurface(viewed).guestBytes;
     phase(CommitPhase::TargetsLookupGuards);
     RequireNoMultisampleTarget(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), "a storage image access");
     if (DepthSurfaceStorage(context, {}, viewed, 0) != nullptr) return nullptr;
