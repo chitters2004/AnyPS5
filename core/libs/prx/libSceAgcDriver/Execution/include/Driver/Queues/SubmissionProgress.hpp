@@ -2,7 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_QUEUES_SUBMISSIONPROGRESS_HPP
 
 #include <chrono>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -23,18 +23,18 @@ public:
             result = {std::move(device), epoch};
             ready = true;
         }
-        changed.notify_one();
+        changed.NotifyOne();
     }
 
     Ready WaitUntil(Clock::time_point deadline) {
         std::unique_lock lock(mutex);
-        if (!changed.wait_until(lock, deadline, [&] { return ready; })) return {};
+        if (!changed.WaitUntil(lock, deadline, [&] { return ready; })) return {};
         return result;
     }
 
 private:
     std::mutex mutex;
-    std::condition_variable changed;
+    AddressCondition changed;
     Ready result;
     bool ready = false;
 };
