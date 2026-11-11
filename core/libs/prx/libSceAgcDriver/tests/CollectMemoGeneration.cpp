@@ -285,6 +285,7 @@ struct Pause {
     bool reached = false;
     bool released = false;
     bool timedOut = false;
+    std::atomic<bool> service{false};
     std::atomic<std::size_t> walks{0};
 };
 
@@ -298,7 +299,8 @@ thread_local bool PauseThisThread = false;
 void Hook(int point) {
     auto& pause = PauseState();
     if (point == 1) pause.walks.fetch_add(1);
-    if (!PauseThisThread || point != pause.point) return;
+    const bool mine = PauseThisThread || (pause.service.load() && OnObservationServiceThread());
+    if (!mine || point != pause.point) return;
     std::unique_lock lock(pause.mutex);
     pause.reached = true;
     pause.changed.notify_all();
@@ -627,6 +629,103 @@ void CheckAdoptingAnOlderEpochKeepsTheNewer() {
     Require(!UnchangedSince(address & ~(Page - 1), Page, observed), "adopting an older epoch let a walk made before the newer ordering point hide a store");
 }
 
+class ServicePause {
+public:
+    explicit ServicePause(int point) {
+        auto& pause = PauseState();
+        const std::lock_guard lock(pause.mutex);
+        pause.point = point;
+        pause.service = true;
+        pause.reached = false;
+        pause.released = false;
+        pause.timedOut = false;
+    }
+    bool Reached() {
+        auto& pause = PauseState();
+        std::unique_lock lock(pause.mutex);
+        return pause.changed.wait_for(lock, Patience, [&] { return pause.reached; });
+    }
+    void Release() {
+        auto& pause = PauseState();
+        {
+            const std::lock_guard lock(pause.mutex);
+            pause.released = true;
+            pause.service = false;
+        }
+        pause.changed.notify_all();
+    }
+    ~ServicePause() {
+        Release();
+    }
+};
+
+void CheckServiceObservesUsedRunsAhead() {
+    SetObservationServiceForTest(true);
+    const auto address = Base + 116 * Block;
+    const auto page = address + Block + 4 * Page;
+    std::thread first([&] {
+        BumpCollectEpoch();
+        Require(CollectWrites(address, 2 * Block) != 0, "the first epoch's collect failed");
+    });
+    first.join();
+    DrainObservationServiceForTest();
+    const auto observed = TrackerGeneration();
+    Store(page);
+    const auto before = ObservationServiceCounted();
+    const auto epoch = BumpCollectEpoch();
+    DrainObservationServiceForTest();
+    const auto after = ObservationServiceCounted();
+    bool walked = true;
+    bool seen = false;
+    std::thread follower([&] {
+        AdoptCollectEpoch(epoch);
+        const auto walks = OsWalks();
+        Require(CollectWrites(address, 2 * Block) != 0, "the next epoch's collect failed");
+        walked = OsWalks() != walks;
+        seen = !UnchangedSince(page, Page, observed);
+    });
+    follower.join();
+    SetObservationServiceForTest(false);
+    Require(after.serviceWalks > before.serviceWalks, "the service did not walk a run used in the previous epoch");
+    Require(!walked, "a collect of a run the service had observed for its epoch walked again");
+    Require(seen, "the service's walk hid a store made before the ordering point");
+}
+
+void CheckHeldServiceLeavesTheCollectToItsOwnWalk() {
+    SetObservationServiceForTest(true);
+    const auto address = Base + 118 * Block;
+    const auto page = address + 2 * Page;
+    std::thread first([&] {
+        BumpCollectEpoch();
+        Require(CollectWrites(address, Block) != 0, "the first epoch's collect failed");
+    });
+    first.join();
+    DrainObservationServiceForTest();
+    const auto observed = TrackerGeneration();
+    Store(page);
+    bool walked = false;
+    bool seen = false;
+    bool finished = false;
+    {
+        ServicePause held(4);
+        const auto epoch = BumpCollectEpoch();
+        Require(held.Reached(), "the service did not start its sweep");
+        std::thread follower([&] {
+            AdoptCollectEpoch(epoch);
+            const auto walks = OsWalks();
+            Require(CollectWrites(address, Block) != 0, "the collect beside a held service failed");
+            walked = OsWalks() != walks;
+            seen = !UnchangedSince(page, Page, observed);
+            finished = true;
+        });
+        follower.join();
+    }
+    DrainObservationServiceForTest();
+    SetObservationServiceForTest(false);
+    Require(finished && walked, "a collect whose run the held service had not observed did not walk itself");
+    Require(seen, "a collect beside a held service hid a store made before the ordering point");
+}
+
 void CheckPartialGroupIsNotAHit() {
     for (std::uint64_t offset = 0; offset < 64; ++offset) {
         BumpCollectEpoch();
@@ -710,6 +809,7 @@ void CheckCoverageThreadAndDriverWrites() {
 int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
+        SetObservationServiceForTest(false);
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
@@ -757,6 +857,8 @@ int main(int argc, char** argv) {
         CheckTrackerGenerationWaitsForClaims();
         CheckAdoptedEpochReusesWalksAfterIt();
         CheckAdoptingAnOlderEpochKeepsTheNewer();
+        CheckServiceObservesUsedRunsAhead();
+        CheckHeldServiceLeavesTheCollectToItsOwnWalk();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;
