@@ -13659,6 +13659,10 @@ int main(int argc, char** argv) {
             DepthClipTests();
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--direct-depth-copy-pairs") {
+            RunDirectDepthCopyPairTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
             stencilReferenceUnusedTests();
             return 0;

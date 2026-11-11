@@ -816,6 +816,50 @@ void TestRetireStaleSurfaceWithoutWrittenUnits(const Context& context) {
     ClearDepthSurfaces(context.device);
 }
 
+bool Maintenance8DepthColorCompatible(VkFormat depth, VkImageAspectFlagBits aspect, VkFormat color) {
+    if (aspect == VK_IMAGE_ASPECT_STENCIL_BIT) {
+        const bool stencil = depth == VK_FORMAT_S8_UINT || depth == VK_FORMAT_D16_UNORM_S8_UINT || depth == VK_FORMAT_D24_UNORM_S8_UINT || depth == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        return stencil && (color == VK_FORMAT_R8_UINT || color == VK_FORMAT_R8_SINT || color == VK_FORMAT_R8_UNORM || color == VK_FORMAT_R8_SNORM);
+    }
+    if (aspect != VK_IMAGE_ASPECT_DEPTH_BIT) return false;
+    if (depth == VK_FORMAT_D32_SFLOAT || depth == VK_FORMAT_D32_SFLOAT_S8_UINT || depth == VK_FORMAT_X8_D24_UNORM_PACK32 || depth == VK_FORMAT_D24_UNORM_S8_UINT) {
+        return color == VK_FORMAT_R32_SFLOAT || color == VK_FORMAT_R32_SINT || color == VK_FORMAT_R32_UINT;
+    }
+    if (depth == VK_FORMAT_D16_UNORM || depth == VK_FORMAT_D16_UNORM_S8_UINT) {
+        return color == VK_FORMAT_R16_SFLOAT || color == VK_FORMAT_R16_UNORM || color == VK_FORMAT_R16_SNORM || color == VK_FORMAT_R16_UINT || color == VK_FORMAT_R16_SINT;
+    }
+    return false;
+}
+
+void RunDirectDepthCopyPairTests() {
+    constexpr std::array depths{VK_FORMAT_D16_UNORM, VK_FORMAT_X8_D24_UNORM_PACK32, VK_FORMAT_D32_SFLOAT, VK_FORMAT_S8_UINT, VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT};
+    constexpr std::array aspects{VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_ASPECT_STENCIL_BIT, VK_IMAGE_ASPECT_COLOR_BIT};
+    std::vector<VkFormat> colors;
+    for (int format = VK_FORMAT_R4G4_UNORM_PACK8; format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK; ++format) colors.push_back(static_cast<VkFormat>(format));
+    for (const auto format : {VK_FORMAT_A4R4G4B4_UNORM_PACK16, VK_FORMAT_A4B4G4R4_UNORM_PACK16, VK_FORMAT_A1B5G5R5_UNORM_PACK16, VK_FORMAT_A8_UNORM}) colors.push_back(format);
+    SetDirectDepthCopy(true);
+    Context context{};
+    context.maintenance8 = true;
+    std::size_t depth16 = 0;
+    std::size_t depth32 = 0;
+    for (const auto depth : depths) {
+        for (const auto aspect : aspects) {
+            for (const auto color : colors) {
+                if (!DirectDepthCopy(context, depth, aspect, color)) continue;
+                Require(Maintenance8DepthColorCompatible(depth, aspect, color), "DirectDepthCopy copies depth format " + std::to_string(depth) + " aspect " + std::to_string(aspect) + " with color format " + std::to_string(color) + ", which VK_KHR_maintenance8 does not make size-compatible");
+                (depth == VK_FORMAT_D16_UNORM || depth == VK_FORMAT_D16_UNORM_S8_UINT ? depth16 : depth32) += 1;
+            }
+        }
+    }
+    Require(depth16 != 0 && depth32 != 0, "DirectDepthCopy copies no 16-bit or no 32-bit depth plane directly, so the pairs are not pinned");
+    context.maintenance8 = false;
+    for (const auto depth : depths) {
+        for (const auto aspect : aspects) {
+            for (const auto color : colors) Require(!DirectDepthCopy(context, depth, aspect, color), "DirectDepthCopy copies depth and color directly without VK_KHR_maintenance8");
+        }
+    }
+}
+
 void RunDepthSurfaceReuseTests() {
     static int deviceTag = 0;
     Context context{};
