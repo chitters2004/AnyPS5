@@ -1785,10 +1785,24 @@ std::uint32_t EmitClassMaskF32(SpirvEmitterState& state, std::uint32_t value, st
     return Binary(state, spv::OpLogicalOr, TypeBool(state), match, EmitClassMaskBitMatch(state, mask, 9u, Binary(state, spv::OpLogicalAnd, TypeBool(state), inf, positive)));
 }
 
-std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue, F32MinMaxLowering lowering) {
     if (maxValue && lhs == ConstantF32(state, 0u)) {
         const auto positive = Binary(state, spv::OpFOrdGreaterThan, TypeBool(state), rhs, lhs);
         return Select(state, TypeF32(state), positive, rhs, lhs);
+    }
+    if (lowering != F32MinMaxLowering::Classified) {
+        const auto lhsBits = Unary(state, spv::OpBitcast, TypeU32(state), lhs);
+        const auto rhsBits = Unary(state, spv::OpBitcast, TypeU32(state), rhs);
+        const bool ordered = lowering == F32MinMaxLowering::OrderedCompare;
+        const auto strict = Binary(state, ordered ? (maxValue ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan) : (maxValue ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan), TypeBool(state), lhs, rhs);
+        auto numericBits = Select(state, TypeU32(state), strict, lhsBits, rhsBits);
+        if (!ordered) {
+            const auto equal = Binary(state, spv::OpFOrdEqual, TypeBool(state), lhs, rhs);
+            const auto zeroBits = Binary(state, maxValue ? spv::OpBitwiseAnd : spv::OpBitwiseOr, TypeU32(state), lhsBits, rhsBits);
+            numericBits = Select(state, TypeU32(state), equal, zeroBits, numericBits);
+        }
+        const auto rhsNan = Binary(state, spv::OpFUnordNotEqual, TypeBool(state), rhs, rhs);
+        return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, TypeU32(state), rhsNan, lhsBits, numericBits));
     }
     const auto lhsClass = EmitClassifyF32(state, lhs);
     const auto rhsClass = EmitClassifyF32(state, rhs);

@@ -520,5 +520,50 @@ int main() {
         return hardwareMasks == 0u && hardwareAdds == 2u && emulatedMasks == 2u && emulatedAdds == 0u;
     });
 
+    passed &= run("a min, max, min3, max3 or med3 is marked denormal-free only when every operand is", [] {
+        Builder b;
+        const auto value = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&bits}); };
+        auto& x = value(b.flush(b.unknown()));
+        auto& y = value(b.flush(b.unknown()));
+        auto& raw = value(b.unknown());
+        IrValue* marked[] = {
+            &b.emit(IrOpcode::FPMin32, IrType::F32, {&x, &y}),
+            &b.emit(IrOpcode::FPMax32, IrType::F32, {&y, &b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&b.constant(0x3f800000u)})}),
+            &b.emit(IrOpcode::FPMedTri32, IrType::F32, {&x, &y, &x}),
+        };
+        IrValue* unmarked[] = {
+            &b.emit(IrOpcode::FPMax32, IrType::F32, {&x, &raw}),
+            &b.emit(IrOpcode::FPMinTri32, IrType::F32, {&raw, &x, &y}),
+            &b.emit(IrOpcode::FPMax32, IrType::F32, {&x, &b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&b.constant(0x00000001u)})}),
+        };
+        for (auto* inst : marked) b.keep(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {inst}));
+        for (auto* inst : unmarked) b.keep(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {inst}));
+        const auto stats = DenormalFlushEliminator{}.Eliminate(b.program, false);
+        bool valid = stats.denormalFreeMinMax == 3u;
+        for (auto* inst : marked) valid &= inst->Flags<MinMaxFlags>().denormalFreeOperands;
+        for (auto* inst : unmarked) valid &= !inst->Flags<MinMaxFlags>().denormalFreeOperands;
+        return valid;
+    });
+
+    passed &= run("a v_max_f32 of flushed registers selects zeros on an equality compare instead of classifying both operands", [] {
+        const std::array<std::uint32_t, 5> code{
+            0x7e026f00u,
+            0x20040300u,
+            0xe0700000u, 0x80000200u,
+            0xbf810000u,
+        };
+        for (const bool hardwareFlush : {false, true}) {
+            const auto words = Recompiled(code, hardwareFlush);
+            const auto equal = OpcodeCount(words, spv::OpFOrdEqual);
+            const auto unordered = OpcodeCount(words, spv::OpFUnordNotEqual);
+            const auto greaterEqual = OpcodeCount(words, spv::OpFOrdGreaterThanEqual);
+            if (equal != 1u || unordered != 1u || greaterEqual != 0u) {
+                std::fprintf(stderr, "  hardware flush %d: %zu OpFOrdEqual, %zu OpFUnordNotEqual and %zu OpFOrdGreaterThanEqual, expected 1, 1 and 0\n", hardwareFlush ? 1 : 0, equal, unordered, greaterEqual);
+                return false;
+            }
+        }
+        return true;
+    });
+
     return passed ? 0 : 1;
 }

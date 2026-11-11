@@ -526,6 +526,10 @@ struct FloatConvertFlags {
     bool nanPayloadUnused = false;
 };
 
+struct MinMaxFlags {
+    bool denormalFreeOperands = false;
+};
+
 struct MemoryFlags {
     std::uint32_t index = 0;
     std::uint32_t pc = 0;

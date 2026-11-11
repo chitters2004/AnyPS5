@@ -8,6 +8,7 @@ namespace ShaderRecompiler {
 
 struct DenormalFlushEliminationStats {
     std::uint32_t removedFlushes = 0;
+    std::uint32_t denormalFreeMinMax = 0;
 };
 
 class DenormalFlushEliminator {

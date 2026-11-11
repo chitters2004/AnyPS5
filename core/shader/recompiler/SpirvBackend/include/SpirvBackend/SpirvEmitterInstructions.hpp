@@ -47,11 +47,11 @@ std::uint32_t EmitULessThan64(SpirvEmitterState& state, std::uint32_t arg0, std:
 std::uint32_t EmitSLessThan64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitUGreaterThan64(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
 std::uint32_t EmitFPIsNan32(SpirvEmitterState& state, std::uint32_t arg0);
-std::uint32_t EmitFPMin32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
-std::uint32_t EmitFPMax32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1);
-std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
-std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
-std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
+std::uint32_t EmitFPMin32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitFPMax32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1);
+std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
+std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
+std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2);
 std::uint32_t EmitFPRecip32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFPRecipIFlag32(SpirvEmitterState& state, std::uint32_t arg0);
 std::uint32_t EmitFPRecipSqrt32(SpirvEmitterState& state, std::uint32_t arg0);

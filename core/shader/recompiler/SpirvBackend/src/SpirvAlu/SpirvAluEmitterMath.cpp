@@ -136,8 +136,32 @@ std::uint32_t EmitMed3(SpirvEmitterState& state, std::uint32_t a, std::uint32_t 
     return Binary(state, spv::OpISub, TypeU32(state), Binary(state, spv::OpISub, TypeU32(state), abc, minimum), maximum);
 }
 
-std::uint32_t EmitFMinMax3(SpirvEmitterState& state, std::uint32_t a, std::uint32_t b, std::uint32_t c, bool maxValue) {
-    return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, maxValue), c, maxValue);
+bool DenormalPreservingCompares(const SpirvEmitterState& state) {
+    return state.float32DenormPreserve && !state.float32FlushToZero;
+}
+
+bool ExactMinMaxCompares(const SpirvEmitterState& state, const IrValue& inst) {
+    return inst.Flags<MinMaxFlags>().denormalFreeOperands || DenormalPreservingCompares(state);
+}
+
+bool NonZeroOrderedConstant(const IrValue* value) {
+    value = value->Resolve();
+    if (!value->HasImmediate()) return false;
+    const std::uint32_t magnitude = value->ImmediateU32() & 0x7fffffffu;
+    return magnitude != 0u && magnitude <= 0x7f800000u;
+}
+
+F32MinMaxLowering MinMaxLowering(const SpirvEmitterState& state, const IrValue& inst, std::initializer_list<std::size_t> operands) {
+    for (const std::size_t index : operands) {
+        if (NonZeroOrderedConstant(inst.Argument(index))) return F32MinMaxLowering::OrderedCompare;
+    }
+    return ExactMinMaxCompares(state, inst) ? F32MinMaxLowering::EqualityCompare : F32MinMaxLowering::Classified;
+}
+
+std::uint32_t EmitFMinMax3(SpirvEmitterState& state, const IrValue& inst, std::uint32_t a, std::uint32_t b, std::uint32_t c, bool maxValue) {
+    const auto pair = EmitMinMaxF32Value(state, a, b, maxValue, MinMaxLowering(state, inst, {0u, 1u}));
+    const auto inner = ExactMinMaxCompares(state, inst) ? F32MinMaxLowering::EqualityCompare : F32MinMaxLowering::Classified;
+    return EmitMinMaxF32Value(state, pair, c, maxValue, NonZeroOrderedConstant(inst.Argument(2)) ? F32MinMaxLowering::OrderedCompare : inner);
 }
 
 std::uint32_t EmitExt(SpirvEmitterState& state, std::uint32_t type, std::uint32_t opcode, std::initializer_list<std::uint32_t> args) {
@@ -1361,29 +1385,35 @@ std::uint32_t EmitFPIsNan32(SpirvEmitterState& state, std::uint32_t arg0) {
     return EmitNative<spv::OpFUnordNotEqual, IrType::U1>(state, arg0, arg0);
 }
 
-std::uint32_t EmitFPMin32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitMinMaxF32Value(state, arg0, arg1, false);
+std::uint32_t EmitFPMin32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitMinMaxF32Value(state, arg0, arg1, false, MinMaxLowering(state, inst, {0u, 1u}));
 }
 
-std::uint32_t EmitFPMax32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1) {
-    return EmitMinMaxF32Value(state, arg0, arg1, true);
+std::uint32_t EmitFPMax32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1) {
+    return EmitMinMaxF32Value(state, arg0, arg1, true, MinMaxLowering(state, inst, {0u, 1u}));
 }
 
-std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
-    return EmitFMinMax3(state, arg0, arg1, arg2, false);
+std::uint32_t EmitFPMinTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    return EmitFMinMax3(state, inst, arg0, arg1, arg2, false);
 }
 
-std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
-    return EmitFMinMax3(state, arg0, arg1, arg2, true);
+std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    return EmitFMinMax3(state, inst, arg0, arg1, arg2, true);
 }
 
-std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
     const auto value = [&](std::uint32_t valueBits) { return Unary(state, spv::OpBitcast, TypeF32(state), valueBits); };
     const auto isNan = [&](std::uint32_t valueBits) { return EmitCompareU32Constant(state, spv::OpUGreaterThan, EmitAndConstant(state, valueBits, 0x7fffffffu), 0x7f800000u); };
+    const bool exactCompares = ExactMinMaxCompares(state, inst);
     const auto numeric = [&](std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+        if (exactCompares) {
+            const auto ordered = Select(state, u32, Binary(state, maxValue ? spv::OpFOrdGreaterThan : spv::OpFOrdLessThan, boolean, value(lhs), value(rhs)), lhs, rhs);
+            const auto zeroBits = Binary(state, maxValue ? spv::OpBitwiseAnd : spv::OpBitwiseOr, u32, lhs, rhs);
+            return Select(state, u32, Binary(state, spv::OpFOrdEqual, boolean, value(lhs), value(rhs)), zeroBits, ordered);
+        }
         const auto either = Binary(state, spv::OpBitwiseOr, u32, lhs, rhs);
         const auto bothZero = EmitCompareU32Constant(state, spv::OpIEqual, EmitAndConstant(state, either, 0x7fffffffu), 0u);
         const auto zeroBits = maxValue ? Binary(state, spv::OpBitwiseAnd, u32, lhs, rhs) : either;

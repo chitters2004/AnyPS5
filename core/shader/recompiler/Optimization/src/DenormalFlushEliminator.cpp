@@ -112,6 +112,10 @@ IrValue* flushedSource(const IrValue& value) {
     return maskedOperand(value.Argument(1)->Resolve(), IrOpcode::BitwiseAnd32, 0x80000000u) == source ? source : nullptr;
 }
 
+bool isFloatMinMax(IrOpcode opcode) {
+    return opcode == IrOpcode::FPMin32 || opcode == IrOpcode::FPMax32 || opcode == IrOpcode::FPMinTri32 || opcode == IrOpcode::FPMaxTri32 || opcode == IrOpcode::FPMedTri32;
+}
+
 class DenormalFreeValues {
 public:
     explicit DenormalFreeValues(bool hostFlushesArithmetic) : hostFlushesArithmetic(hostFlushesArithmetic) {}
@@ -205,6 +209,16 @@ DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& prog
             if (source == nullptr || !denormalFree.Contains(source)) continue;
             inst->ReplaceAllUsesWith(source);
             ++stats.removedFlushes;
+        }
+    }
+    for (auto* block : program.BlockOrder()) {
+        for (auto* inst : block->Instructions()) {
+            if (!isFloatMinMax(inst->Opcode()) || !inst->HasUses()) continue;
+            bool operandsFree = true;
+            for (std::size_t index = 0; index < inst->ArgumentCount() && operandsFree; ++index) operandsFree = denormalFree.Contains(inst->Argument(index));
+            if (!operandsFree) continue;
+            inst->SetFlags(MinMaxFlags{true});
+            ++stats.denormalFreeMinMax;
         }
     }
     return stats;
