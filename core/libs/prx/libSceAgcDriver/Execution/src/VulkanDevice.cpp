@@ -60,6 +60,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -544,6 +545,8 @@ struct VulkanDevice::State {
     VkDeviceMemory uploadMemory = VK_NULL_HANDLE;
     void* uploadMapping = nullptr;
     VkDeviceSize uploadSize = 0;
+    bool uploadInBar = false;
+    bool uploadBarWanted = false;
     VkPhysicalDeviceProperties properties{};
     std::string driverInfo;
     VkDriverId driverId = VK_DRIVER_ID_MAX_ENUM;
@@ -963,7 +966,8 @@ struct VulkanDevice::State {
     }
 
     void Upload(std::span<const std::byte> pixels) {
-        if (uploadSize < pixels.size()) {
+        const bool barWanted = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoBarRing) && Graphics::SnapshotMemoryProperties(memoryProperties, false) == Graphics::MappedDeviceProperties;
+        if (uploadSize < pixels.size() || uploadBarWanted != barWanted) {
             if (uploadMapping) DeviceFunction<PFN_vkUnmapMemory>("vkUnmapMemory")(device, uploadMemory);
             uploadMapping = nullptr;
             if (uploadBuffer) DeviceFunction<PFN_vkDestroyBuffer>("vkDestroyBuffer")(device, uploadBuffer, nullptr);
@@ -990,7 +994,14 @@ struct VulkanDevice::State {
             VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             allocation.allocationSize = requirements.size;
             allocation.memoryTypeIndex = memoryType;
-            check(DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &uploadMemory), "vkAllocateMemory display upload");
+            uploadInBar = false;
+            uploadBarWanted = barWanted;
+            if (const auto bar = barWanted ? Graphics::BarUploadMemoryType(memoryProperties, requirements.memoryTypeBits) : std::nullopt) {
+                allocation.memoryTypeIndex = *bar;
+                uploadInBar = DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &uploadMemory) == VK_SUCCESS;
+                if (!uploadInBar) allocation.memoryTypeIndex = memoryType;
+            }
+            if (!uploadInBar) check(DeviceFunction<PFN_vkAllocateMemory>("vkAllocateMemory")(device, &allocation, nullptr, &uploadMemory), "vkAllocateMemory display upload");
             Graphics::MemoryAccounting::Record(device, uploadMemory, allocation, memoryProperties, "display upload");
             check(DeviceFunction<PFN_vkBindBufferMemory>("vkBindBufferMemory")(device, uploadBuffer, uploadMemory, 0), "vkBindBufferMemory display upload");
             check(DeviceFunction<PFN_vkMapMemory>("vkMapMemory")(device, uploadMemory, 0, pixels.size(), 0, &uploadMapping), "vkMapMemory display upload");

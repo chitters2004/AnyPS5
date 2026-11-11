@@ -151,6 +151,16 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
+    static constexpr std::size_t UploadRingChunk = std::size_t{4} << 20u;
+    static constexpr std::size_t UploadRingRetired = 16;
+    enum class RingFallback : std::uint8_t { Switch, NoBar, CpuRead, Count };
+    std::optional<UploadSlice> UploadRing(std::size_t bytes);
+    static void NoteRingFallback(RingFallback cause);
+    struct RingStatistics {
+        std::uint64_t bytes, slices, chunks, recycled, hostPlacedBytes;
+        std::array<std::uint64_t, static_cast<std::size_t>(RingFallback::Count)> fallbacks;
+    };
+    static RingStatistics RingCounts();
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
@@ -943,6 +953,11 @@ private:
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    std::shared_ptr<Buffer> uploadRing;
+    VkDeviceSize uploadRingUsed = 0;
+    std::uint64_t uploadRingSerial = 0;
+    std::uint64_t uploadRingKept = 0;
+    std::deque<std::pair<std::shared_ptr<Buffer>, std::uint64_t>> uploadRingRetired;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
