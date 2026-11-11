@@ -111,6 +111,10 @@ private:
     bool stopped = false;
     bool closing = false;
     std::uint64_t wakes = 0;
+    std::atomic<std::uint64_t> preparerStarved{0};
+    std::atomic<std::uint64_t> preparerStarvedNs{0};
+    std::atomic<std::uint64_t> workerStarved{0};
+    std::atomic<std::uint64_t> workerStarvedNs{0};
     std::uint64_t lockWaitNs = 0;
     std::thread thread;
     std::uint64_t commits = 0;

@@ -602,6 +602,13 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         }
         AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
     }
+    {
+        const auto preparerWaits = preparerStarved.exchange(0, std::memory_order_relaxed);
+        const auto preparerNs = preparerStarvedNs.exchange(0, std::memory_order_relaxed);
+        const auto workerWaits = workerStarved.exchange(0, std::memory_order_relaxed);
+        const auto workerNs = workerStarvedNs.exchange(0, std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[committer-idle] (10 s): %llu waits for an item while the finisher held work (%.1f ms), %llu while it was idle (%.1f ms)\n", static_cast<unsigned long long>(preparerWaits), static_cast<double>(preparerNs) / 1e6, static_cast<unsigned long long>(workerWaits), static_cast<double>(workerNs) / 1e6);
+    }
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -617,12 +624,19 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        const bool starved = pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
+        const bool preparing = starved && DrawFinisher::Busy();
+        const auto starvedAt = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            if (starved) {
+                (preparing ? preparerStarved : workerStarved).fetch_add(1, std::memory_order_relaxed);
+                (preparing ? preparerStarvedNs : workerStarvedNs).fetch_add(elapsedNs(starvedAt), std::memory_order_relaxed);
+            }
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
