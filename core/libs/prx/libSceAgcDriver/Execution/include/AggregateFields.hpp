@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_AGGREGATEFIELDS_HPP
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -642,6 +643,49 @@ bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
     } else {
         static_assert(Unsupported<U>, "a member type the field walk does not know how to change");
         return false;
+    }
+}
+
+template<class T>
+inline constexpr bool Unhashable = false;
+
+template<class T, class TSink>
+void HashLeaves(const T& value, TSink& sink);
+
+template<class TParent, class TSink>
+struct HashMember {
+    const TParent& parent;
+    TSink& sink;
+
+    template<class TField>
+    void operator()(const TField& field) const {
+        if (!sink.Member(parent, field)) HashLeaves(field, sink);
+    }
+};
+
+template<class T, class TSink>
+void HashLeaves(const T& value, TSink& sink) {
+    using U = std::remove_cv_t<T>;
+    if constexpr (std::is_same_v<U, bool> || std::is_enum_v<U> || std::is_integral_v<U>) {
+        sink.Word(static_cast<std::uint64_t>(value));
+    } else if constexpr (std::is_same_v<U, float>) {
+        sink.Word(std::bit_cast<std::uint32_t>(value));
+    } else if constexpr (std::is_same_v<U, double>) {
+        sink.Word(std::bit_cast<std::uint64_t>(value));
+    } else if constexpr (IsArray<U>::value) {
+        for (const auto& element : value) HashLeaves(element, sink);
+    } else if constexpr (IsVector<U>::value) {
+        sink.Word(value.size());
+        for (const auto& element : value) HashLeaves(element, sink);
+    } else if constexpr (IsOptional<U>::value) {
+        sink.Word(value.has_value());
+        if (value.has_value()) HashLeaves(*value, sink);
+    } else if constexpr (IsShared<U>::value) {
+        sink.Word(value != nullptr);
+    } else if constexpr (std::is_aggregate_v<U>) {
+        ForEachField(value, HashMember<U, TSink>{value, sink});
+    } else {
+        static_assert(Unhashable<U>, "a member type the key walk does not know how to hash");
     }
 }
 
