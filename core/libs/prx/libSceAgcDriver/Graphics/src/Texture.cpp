@@ -4543,6 +4543,7 @@ namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
 ProfileCounter layoutStoresSkipped;
+ProfileCounter pendingSinceLoopsSkipped;
 }
 
 void StorageTexture::NoteFlip() {
@@ -4555,6 +4556,10 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 
 std::uint64_t StorageTexture::LayoutStoreSkips() {
     return layoutStoresSkipped.Sum();
+}
+
+std::uint64_t StorageTexture::PendingSinceSkips() {
+    return pendingSinceLoopsSkipped.Sum();
 }
 
 void StorageTexture::ClearLayoutWritesForTest() {
@@ -4635,7 +4640,19 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         layerPending.SetRange(first, count, true);
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
-    StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+    if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
+        pendingSinceLoopsSkipped.Add(1);
+    } else {
+        const bool everyUnit = StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+        if (everyUnit && pendingSince == pendingSinceHeld && first <= pendingSinceEnd && pendingSinceFirst <= first + count) {
+            pendingSinceFirst = std::min(pendingSinceFirst, first);
+            pendingSinceEnd = std::max(pendingSinceEnd, first + count);
+        } else if (everyUnit) {
+            pendingSinceHeld = pendingSince;
+            pendingSinceFirst = first;
+            pendingSinceEnd = first + count;
+        }
+    }
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
