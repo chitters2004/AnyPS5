@@ -75,7 +75,7 @@ private:
 
 bool OrdersColorWrites(const std::vector<Barrier>& barriers) {
     return std::any_of(barriers.begin(), barriers.end(), [](const Barrier& barrier) {
-        return barrier.source == VK_PIPELINE_STAGE_ALL_COMMANDS_BIT && barrier.destination == VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT && barrier.images.empty() && barrier.memory.size() == 1 && (barrier.memory[0].srcAccessMask & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0 && (barrier.memory[0].dstAccessMask & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0;
+        return (barrier.source & VK_PIPELINE_STAGE_ALL_COMMANDS_BIT) != 0 && (barrier.destination & (VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT)) != 0 && barrier.images.empty() && barrier.memory.size() == 1 && (barrier.memory[0].srcAccessMask & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0 && (barrier.memory[0].dstAccessMask & VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT) != 0;
     });
 }
 
