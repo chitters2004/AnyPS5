@@ -186,6 +186,9 @@ int main() {
         auto replaced = null;
         replaced.spirv = plain.spirv;
         Require(!AgcDriver::Graphics::InertFragment(replaced), "a copied result kept its source's inert answer for other SPIR-V");
+        const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> inertStages{{{ShaderStage::Vertex, &full.vertex, 0}, {ShaderStage::Fragment, &null, PixelPushOffset(full.vertexPush, device->Target())}}};
+        Require(AgcDriver::Graphics::SplitsSets(context, inertStages) == context.graphicsPipelineLibrary, "an inert fragment program did not split the descriptor sets, so its fragment library would be keyed by the vertex program's layout");
 
         Reset(*device, full, plain);
         const auto expected = Draw(*device, half, plain, {.color = true, .depthTest = false});
