@@ -10,7 +10,7 @@
 #include <bit>
 #include <cerrno>
 #include <chrono>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -840,7 +840,7 @@ public:
 
     void Flush() {
         std::unique_lock lock(mutex);
-        idle.wait(lock, [&] { return queue.empty() && !writing; });
+        idle.Wait(lock, [&] { return queue.empty() && !writing; });
     }
 
     PipelineJournalCounters Totals() const {
@@ -1053,7 +1053,7 @@ private:
             std::lock_guard lock(mutex);
             queue.push_back(std::move(pending));
         }
-        wake.notify_one();
+        wake.NotifyOne();
     }
 
     void run() {
@@ -1061,7 +1061,7 @@ private:
             Pending pending;
             {
                 std::unique_lock lock(mutex);
-                wake.wait(lock, [&] { return !queue.empty(); });
+                wake.Wait(lock, [&] { return !queue.empty(); });
                 pending = std::move(queue.front());
                 queue.pop_front();
                 writing = true;
@@ -1076,7 +1076,7 @@ private:
             {
                 std::lock_guard lock(mutex);
                 writing = false;
-                if (queue.empty()) idle.notify_all();
+                if (queue.empty()) idle.NotifyAll();
             }
         }
     }
@@ -1305,8 +1305,8 @@ private:
     std::atomic<bool> bound{false};
     std::atomic<bool> mismatched{false};
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable idle;
+    AddressCondition wake;
+    AddressCondition idle;
     std::deque<Pending> queue;
     bool writing = false;
     bool indexed = false;
