@@ -1954,6 +1954,7 @@ std::uint64_t Recorder::ReapsWithWork() {
 }
 
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
+    NoteShadowCommands();
     ensureOpen();
     flushDeferredDispatch();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the

@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -203,6 +204,21 @@ enum class CommitDrawKind : std::uint8_t {
     Count
 };
 
+enum class ShadowReason : std::uint8_t {
+    TemplateBuilt,
+    AddressBased,
+    CpuIndirect,
+    PreOp,
+    TemplateWalk,
+    TargetMiss,
+    TargetSlow,
+    InputFresh,
+    StoreFlush,
+    SpecialPass,
+    Waited,
+    Count
+};
+
 struct CommitPhaseTotals {
     std::uint64_t draws = 0;
     std::uint64_t keys = 0;
@@ -213,6 +229,9 @@ struct CommitPhaseTotals {
     std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)> ns{};
     std::array<std::uint64_t, static_cast<std::size_t>(CommitDrawKind::Count)> kindDraws{};
     std::array<std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)>, static_cast<std::size_t>(CommitDrawKind::Count)> kindNs{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CommitDrawKind::Count)> shadowEligible{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShadowReason::Count)> shadowFirst{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShadowReason::Count)> shadowAny{};
 };
 
 bool CommitPhasesEnabled();
@@ -230,6 +249,12 @@ unsigned EpochCauses();
 CommitCounter EpochCauseCounter(unsigned causes);
 CommitPhase CurrentCommitPhase();
 void RelabelCommitPhase(CommitPhase phase);
+void NoteShadowReason(ShadowReason reason);
+void NoteShadowRecording();
+void NoteShadowCommands();
+ShadowReason FirstShadowReason(unsigned mask);
+const char* ShadowReasonName(ShadowReason reason);
+std::string FormatShadowReport(const CommitPhaseTotals& window);
 CommitPhaseTotals ReadCommitPhases();
 CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier);
 

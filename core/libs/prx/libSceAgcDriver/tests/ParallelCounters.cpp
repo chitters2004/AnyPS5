@@ -2,16 +2,107 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
 
 namespace {
 
+using AgcDriver::Graphics::CommitCounter;
+using AgcDriver::Graphics::CommitDrawKind;
+using AgcDriver::Graphics::CommitPhase;
+using AgcDriver::Graphics::CommitPhaseDraw;
+using AgcDriver::Graphics::CommitPhaseTotals;
 using AgcDriver::Graphics::Recorder;
+using AgcDriver::Graphics::ShadowReason;
 
 void Check(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
+}
+
+std::size_t Index(ShadowReason reason) {
+    return static_cast<std::size_t>(reason);
+}
+
+CommitPhaseTotals Draw(const std::function<void()>& body) {
+    const auto before = AgcDriver::Graphics::ReadCommitPhases();
+    {
+        const CommitPhaseDraw draw;
+        body();
+    }
+    return AgcDriver::Graphics::ReadCommitPhases() - before;
+}
+
+void RequireEligible(const CommitPhaseTotals& window, const std::string& what) {
+    Check(window.draws == 1, what + ": the draw was not counted");
+    Check(window.shadowEligible[static_cast<std::size_t>(CommitDrawKind::Full)] == 1, what + ": the draw was not counted as worker-eligible");
+    for (std::size_t reason = 0; reason < window.shadowFirst.size(); ++reason) Check(window.shadowFirst[reason] == 0 && window.shadowAny[reason] == 0, what + ": an eligible draw counted a reason");
+}
+
+void RequireFirst(const CommitPhaseTotals& window, ShadowReason first, const std::string& what) {
+    Check(window.draws == 1, what + ": the draw was not counted");
+    std::uint64_t eligible = 0;
+    for (const auto count : window.shadowEligible) eligible += count;
+    Check(eligible == 0, what + ": a draw with a reason was counted as worker-eligible");
+    for (std::size_t reason = 0; reason < window.shadowFirst.size(); ++reason) Check(window.shadowFirst[reason] == (reason == Index(first) ? 1u : 0u), what + ": wrong first reason");
+    Check(window.shadowAny[Index(first)] == 1, what + ": the first reason is missing from the any-reason counts");
+}
+
+void TestEligibleDraw() {
+    RequireEligible(Draw([] {}), "an empty draw");
+    RequireEligible(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetRefreshEpoch); }), "a draw whose targets hit their epoch proof");
+    RequireEligible(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetRefreshSlow, 0); }), "a draw counting zero slow refreshes");
+}
+
+void TestFirstAndAnyReasons() {
+    const auto window = Draw([] {
+        AgcDriver::Graphics::NoteShadowReason(ShadowReason::Waited);
+        AgcDriver::Graphics::NoteShadowReason(ShadowReason::AddressBased);
+        AgcDriver::Graphics::NoteShadowReason(ShadowReason::Waited);
+    });
+    RequireFirst(window, ShadowReason::AddressBased, "an address-based draw that waited");
+    Check(window.shadowAny[Index(ShadowReason::Waited)] == 1, "a second reason is missing from the any-reason counts");
+    Check(AgcDriver::Graphics::FirstShadowReason(0) == ShadowReason::Count, "no reason must give Count");
+    Check(AgcDriver::Graphics::FirstShadowReason((1u << Index(ShadowReason::Waited)) | (1u << Index(ShadowReason::TemplateBuilt))) == ShadowReason::TemplateBuilt, "the first reason must be the lowest one");
+}
+
+void TestCommandsBeforeRecordingArePreOps() {
+    RequireFirst(Draw([] { AgcDriver::Graphics::NoteShadowCommands(); }), ShadowReason::PreOp, "commands recorded during resolve");
+    RequireEligible(Draw([] {
+        AgcDriver::Graphics::NoteShadowRecording();
+        AgcDriver::Graphics::NoteShadowCommands();
+    }), "commands recorded by the draw's own recording");
+    RequireEligible(Draw([] {}), "a draw after a pre-op draw");
+}
+
+void TestPhaseAndCounterHooks() {
+    RequireFirst(Draw([] { AgcDriver::Graphics::InCommitPhase(CommitPhase::ResolveBuild, [] {}); }), ShadowReason::TemplateBuilt, "a template build");
+    RequireFirst(Draw([] { AgcDriver::Graphics::BeginCommitPhase(CommitPhase::RevalidateWalk); }), ShadowReason::TemplateWalk, "a revalidation walk");
+    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::PreparedSurfaceMisses); }), ShadowReason::TargetMiss, "a prepared surface miss");
+    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetRefreshSlow); }), ShadowReason::TargetSlow, "a slow target refresh");
+    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::OtherRefreshSlow); }), ShadowReason::TargetSlow, "a slow texture refresh");
+    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::InputIndexCopyFresh); }), ShadowReason::InputFresh, "a fresh index copy");
+    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::InputVertexCopyFresh); }), ShadowReason::InputFresh, "a fresh vertex copy");
+}
+
+void TestNotesOutsideADrawAreIgnored() {
+    const auto before = AgcDriver::Graphics::ReadCommitPhases();
+    AgcDriver::Graphics::NoteShadowReason(ShadowReason::TemplateBuilt);
+    AgcDriver::Graphics::NoteShadowCommands();
+    AgcDriver::Graphics::CountCommit(CommitCounter::TargetRefreshSlow);
+    const auto outside = AgcDriver::Graphics::ReadCommitPhases() - before;
+    for (std::size_t reason = 0; reason < outside.shadowAny.size(); ++reason) Check(outside.shadowAny[reason] == 0, "a note outside a draw was counted");
+    RequireEligible(Draw([] {}), "a draw after notes made outside any draw");
+}
+
+void TestShadowReport() {
+    const auto window = Draw([] { AgcDriver::Graphics::NoteShadowReason(ShadowReason::StoreFlush); });
+    const auto report = AgcDriver::Graphics::FormatShadowReport(window);
+    Check(report.rfind("[parallel-shadow] (10 s) 1 draws, 0 worker-eligible (0.0%)", 0) == 0, "shadow report header: " + report);
+    Check(report.find("first reason: template built 0,") != std::string::npos, "shadow report first reasons: " + report);
+    Check(report.find("store flush 1") != std::string::npos, "shadow report store flush: " + report);
+    Check(std::string(AgcDriver::Graphics::ShadowReasonName(ShadowReason::Waited)) == "waited", "the last reason name is out of order");
 }
 
 void TestBatchBuckets() {
@@ -62,6 +153,12 @@ void TestSubmitCauseScope() {
 int main() {
     try {
         Check(AgcDriver::Graphics::CommitPhasesEnabled(), "APS5_PROFILE_COMMIT must be set for this test");
+        TestEligibleDraw();
+        TestFirstAndAnyReasons();
+        TestCommandsBeforeRecordingArePreOps();
+        TestPhaseAndCounterHooks();
+        TestNotesOutsideADrawAreIgnored();
+        TestShadowReport();
         TestBatchBuckets();
         TestBatchStatistics();
         TestSubmitCauseScope();
