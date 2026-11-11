@@ -7056,15 +7056,20 @@ void GuestBufferMemory::MarkStagedWrites() const {
 
 void GuestBufferMemory::MarkDirectWrites() const {
     for (const auto& [begin, end] : writes) {
-        const auto* found = owner(begin, end);
-        if (found == nullptr) continue;
-        const auto& region = *found;
-        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
-            std::uint64_t order = 0;
-            static_cast<void>(GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order));
-            directWritesGeneration = std::max(directWritesGeneration, order);
-        }
+        if (!directWrite(begin, end)) continue;
+        std::uint64_t order = 0;
+        static_cast<void>(GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order));
+        directWritesGeneration = std::max(directWritesGeneration, order);
     }
+}
+
+bool GuestBufferMemory::directWrite(std::uint64_t begin, std::uint64_t end) const {
+    const auto* found = owner(begin, end);
+    return found != nullptr && (found->direct != nullptr || (found->gpuCopy && found->copiedBack));
+}
+
+void GuestBufferMemory::SplitDirectWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>>& direct, std::vector<std::pair<std::uint64_t, std::uint64_t>>& other) const {
+    for (const auto& range : writes) (directWrite(range.first, range.second) ? direct : other).push_back(range);
 }
 
 namespace {
