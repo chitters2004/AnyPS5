@@ -73,7 +73,7 @@ public:
     using RunAccess = std::array<std::uint64_t, 3>;
     static std::uint32_t PeekUnorderedDispatch();
     VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped);
-    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses);
+    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkPipelineStageFlags extraStages = 0, VkAccessFlags extraAccess = 0);
     VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess);
     void OpenBatch() { ensureOpen(); }
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
@@ -83,6 +83,9 @@ public:
         std::uint64_t deferred, overlapped, flushed;
     };
     static OverlapStatistics OverlapCounts();
+    static constexpr std::uint32_t WriteBackRunKey = 0xffffffffu;
+    static bool WriteBackRuns();
+    static std::uint64_t WriteBackJoins();
     struct DrawPassStart {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
@@ -739,6 +742,8 @@ private:
         std::uint32_t deferredDispatchQueue = 0;
         std::vector<const void*> deferredRun;
         std::vector<RunAccess> runAccess;
+        VkPipelineStageFlags deferredStages = 0;
+        VkAccessFlags deferredAccess = 0;
         std::vector<std::function<void(Recorder&)>> afterRun;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {

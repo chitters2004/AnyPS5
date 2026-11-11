@@ -11301,7 +11301,7 @@ private:
 
 namespace FusionTrace {
 
-enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch };
+enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch, Copy };
 
 struct Event {
     Kind kind;
@@ -11310,6 +11310,7 @@ struct Event {
 
 std::vector<Event> events;
 constexpr std::uint32_t DispatchValue = 0xd15;
+constexpr std::uint32_t CopyValue = 0xc0b;
 PFN_vkGetDeviceProcAddr realProc = nullptr;
 PFN_vkCmdPipelineBarrier realBarrier = nullptr;
 PFN_vkCmdBeginRenderPass realBeginPass = nullptr;
@@ -11356,7 +11357,7 @@ VKAPI_ATTR void VKAPI_CALL Draw(VkCommandBuffer commands, std::uint32_t vertices
 }
 
 VKAPI_ATTR void VKAPI_CALL Fill(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint32_t value) {
-    events.push_back({value == DispatchValue ? Kind::Dispatch : Kind::Fill, {}});
+    events.push_back({value == DispatchValue ? Kind::Dispatch : value == CopyValue ? Kind::Copy : Kind::Fill, {}});
     realFill(commands, buffer, offset, bytes, value);
 }
 
@@ -11383,6 +11384,8 @@ constexpr BarrierMask PassStartNeeds{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPE
 
 constexpr BarrierMask DispatchNeeds{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
 
+constexpr BarrierMask CopyNeeds{VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+
 bool CoveredBetween(std::size_t first, std::size_t before, const BarrierMask& needed) {
     for (std::size_t i = first; i < before; ++i) {
         auto mask = events[i].mask;
@@ -11401,6 +11404,7 @@ void CheckOracle(const std::string& scenario) {
         for (std::size_t end = 0; end < i; ++end) {
             if (events[end].kind == Kind::End) Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
             if (events[end].kind == Kind::Dispatch) Require(CoveredBetween(end + 1, i, DispatchNeeds), scenario + ": a command after a dispatch ran before its trailing barrier");
+            if (events[end].kind == Kind::Copy && kind != Kind::Copy) Require(CoveredBetween(end + 1, i, CopyNeeds), scenario + ": a command after a write-back run's copy ran before a barrier that orders the copy before it");
         }
         afterCommand = i + 1;
     }
@@ -11445,6 +11449,20 @@ void barrierFusionTests(const Device& device) {
     DeviceBuffer dispatched(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto dispatch = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::DispatchValue); };
     const BarrierMask dispatchTrailing = FusionTrace::DispatchNeeds;
+    const auto copy = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::CopyValue); };
+    int firstOwner = 0, secondOwner = 0;
+    const std::array<Recorder::RunAccess, 1> firstRange{Recorder::RunAccess{0x100000, 0x110000, Recorder::RunAccessWritten}};
+    const std::array<Recorder::RunAccess, 1> secondRange{Recorder::RunAccess{0x110000, 0x120000, Recorder::RunAccessWritten}};
+    const std::array<Recorder::RunAccess, 1> overlapping{Recorder::RunAccess{0x10f000, 0x111000, Recorder::RunAccessWritten}};
+    const std::array<Recorder::RunAccess, 1> apart{Recorder::RunAccess{0x200000, 0x210000, Recorder::RunAccessWritten}};
+    const auto writeBack = [&](const void* owner, std::span<const Recorder::RunAccess> accesses) {
+        bool inRun = false;
+        VkAccessFlags covered = 0;
+        const auto commands = recorder.RunCommands(Recorder::WriteBackRunKey, owner, accesses, inRun, &covered);
+        copy(commands);
+        recorder.DeferDispatchBarrier(Recorder::WriteBackRunKey, std::span(&owner, 1), accesses, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        return inRun;
+    };
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{0x10000, 0x20000}}};
     const PassAccess writes{{}, range};
     const PassAccess reads{range, {}};
@@ -11538,6 +11556,25 @@ void barrierFusionTests(const Device& device) {
             recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
         });
         Require(Recorder::FusionCounts().trailingFused - before.trailingFused == (fusion ? 2u : 0u), "the trailing barriers fused into a pass start were not counted");
+    }
+    {
+        const bool runs = true;
+        const std::string suffix;
+        scenario("write-back run then command" + suffix, true, 0, [&] {
+            Require(!writeBack(&firstOwner, firstRange), "a write-back joined a run with no run open");
+            Require(writeBack(&secondOwner, secondRange) == runs, "a write-back of disjoint memory did not join the open write-back run");
+            fill(recorder.Commands());
+        });
+        scenario("write-back run then pass" + suffix, true, 0, [&] {
+            Require(!writeBack(&firstOwner, firstRange), "a write-back joined a run with no run open");
+            Require(writeBack(&secondOwner, secondRange) == runs, "a write-back of disjoint memory did not join the open write-back run");
+            draw(10, PassAccess{}, {}, {});
+        });
+        scenario("overlapping write-back" + suffix, true, 0, [&] {
+            Require(!writeBack(&firstOwner, firstRange), "a write-back joined a run with no run open");
+            Require(!writeBack(&secondOwner, overlapping), "a write-back of memory the run writes joined the run");
+            Require(!writeBack(&secondOwner, apart), "a write-back joined a run that already holds its owner");
+        });
     }
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierFusion, false);
     std::cout << "Barrier fusion tests passed\n";
