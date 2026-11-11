@@ -109,6 +109,7 @@ void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t genera
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
+constexpr std::size_t WriteBumpSizeBuckets = 7;
 struct WriteIndexStats {
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
@@ -119,6 +120,7 @@ struct WriteIndexStats {
     std::uint64_t overflows = 0;
     std::uint64_t lookupNanoseconds = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
+    std::array<std::array<std::uint64_t, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };
 WriteIndexStats WriteIndexCounted();
 void ResetWriteIndexCounts();
