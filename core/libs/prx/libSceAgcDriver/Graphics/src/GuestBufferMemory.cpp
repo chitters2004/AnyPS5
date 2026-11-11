@@ -64,7 +64,7 @@ constexpr unsigned long UDMABUF_CREATE_LIST = 0;
 #include <utility>
 #include <functional>
 #include <bit>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <deque>
 #include <iterator>
 #include <list>
@@ -2998,10 +2998,10 @@ public:
             finished = 0;
             ++serial;
         }
-        wake.notify_all();
+        wake.NotifyAll();
         work(blocks);
         std::unique_lock lock(mutex);
-        done.wait(lock, [&] { return finished == helpers; });
+        done.Wait(lock, [&] { return finished == helpers; });
         job = {};
         return copiedBlocks.load(std::memory_order_relaxed);
     }
@@ -3034,7 +3034,7 @@ private:
             std::span<const RefreshBlock> blocks;
             {
                 std::unique_lock lock(mutex);
-                if (!wake.wait(lock, token, [&] { return serial != seen; })) return;
+                if (!wake.Wait(lock, token, [&] { return serial != seen; })) return;
                 seen = serial;
                 blocks = job;
             }
@@ -3043,7 +3043,7 @@ private:
                 std::lock_guard lock(mutex);
                 ++finished;
             }
-            done.notify_all();
+            done.NotifyAll();
         }
     }
 
@@ -3051,8 +3051,8 @@ private:
     unsigned helpers = 0;
     AgcDriver::Mutex runMutex;
     std::mutex mutex;
-    std::condition_variable_any wake;
-    std::condition_variable done;
+    AddressCondition wake;
+    AddressCondition done;
     std::span<const RefreshBlock> job;
     std::uint64_t serial = 0;
     unsigned finished = 0;

@@ -2,7 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINECACHE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -63,7 +63,7 @@ private:
     std::size_t settledBytes = 0;
     std::optional<FileHeader> settledFile;
     std::mutex mutex;
-    std::condition_variable wake;
+    AddressCondition wake;
     bool stopping = false;
     std::thread saver;
 };
