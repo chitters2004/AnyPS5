@@ -445,11 +445,32 @@ void CheckDomains() {
     Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after a bump of its range");
 }
 
+void CheckCrowdedKey() {
+    std::vector<std::shared_ptr<WriteSubscription>> crowd;
+    std::vector<std::uint64_t> seen;
+    for (int i = 0; i < 7; ++i) {
+        crowd.push_back(Subscribe(Base + 20 * Block, 1));
+        seen.push_back(ObserveSubscription(*crowd.back()));
+    }
+    Pending(Base + 20 * Block);
+    for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription sharing its block with six others missed a bump");
+    crowd.erase(crowd.begin(), crowd.begin() + 4);
+    seen.erase(seen.begin(), seen.begin() + 4);
+    for (int i = 0; i < 3; ++i) {
+        crowd.push_back(Subscribe(Base + 20 * Block, 1));
+        seen.push_back(ObserveSubscription(*crowd.back()));
+    }
+    for (std::size_t i = 0; i < crowd.size(); ++i) seen[i] = ObserveSubscription(*crowd[i]);
+    Pending(Base + 20 * Block);
+    for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription missed a bump after its neighbours were released and replaced");
+}
+
 void CheckWriteIndex() {
     CheckObserveAndArm();
     CheckHistoryOutlivesTheArmedBit();
     CheckTypeMask();
     CheckReusedSlot();
+    CheckCrowdedKey();
     CheckBackingKeys();
     CheckDomains();
 }
