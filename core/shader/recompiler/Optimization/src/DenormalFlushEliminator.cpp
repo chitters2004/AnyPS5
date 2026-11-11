@@ -41,6 +41,7 @@ bool testsForNan(const IrValue* condition, const IrValue* bits) {
 bool takenOnlyAsNan(const IrValue* condition, const IrValue* arm) {
     const IrValue* bits = bitsOf(arm);
     if (const IrValue* quieted = maskedOperand(bits, IrOpcode::BitwiseOr32, 0x00400000u)) bits = bitsOf(quieted);
+    if (const IrValue* negated = maskedOperand(bits, IrOpcode::BitwiseXor32, 0x80000000u)) bits = bitsOf(negated);
     return testsForNan(condition, bits);
 }
 

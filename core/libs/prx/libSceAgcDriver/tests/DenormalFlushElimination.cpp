@@ -565,6 +565,42 @@ int main() {
         return true;
     });
 
+    passed &= run("a sign-flipped arm a select takes only when the unflipped bits are NaN needs no flush", [] {
+        Builder b;
+        auto& x = b.unknown();
+        auto& other = b.unknown();
+        const auto isNan = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::UGreaterThan32, IrType::Bool, {&b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&bits, &b.constant(0x7fffffffu)}), &b.constant(0x7f800000u)}); };
+        const auto chosen = [&](IrValue& condition, IrValue& arm) -> IrValue& { return b.flush(b.emit(IrOpcode::SelectU32, IrType::U32, {&condition, &arm, &b.flush(b.unknown())})); };
+        const auto negated = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::BitwiseXor32, IrType::U32, {&bits, &b.constant(0x80000000u)}); };
+        IrValue* removed[] = {
+            &chosen(isNan(x), negated(x)),
+            &chosen(isNan(x), b.emit(IrOpcode::BitwiseOr32, IrType::U32, {&negated(x), &b.constant(0x00400000u)})),
+        };
+        IrValue* kept[] = {
+            &chosen(isNan(other), negated(x)),
+            &chosen(isNan(x), b.emit(IrOpcode::BitwiseXor32, IrType::U32, {&x, &b.constant(0x40000000u)})),
+        };
+        for (auto* flushed : removed) b.keep(*flushed);
+        for (auto* flushed : kept) b.keep(*flushed);
+        const bool counted = b.eliminate() == 2u;
+        bool flushes = true;
+        for (auto* flushed : removed) flushes &= !flushed->HasUses();
+        for (auto* flushed : kept) flushes &= flushed->HasUses();
+        return counted && flushes;
+    });
+
+    passed &= run("a v_max_f32 of a v_sub_f32 difference drops the difference's input flush under the hardware flush", [] {
+        const std::array<std::uint32_t, 5> code{
+            0x08040100u,
+            0x20060102u,
+            0xe0700000u, 0x80000300u,
+            0xbf810000u,
+        };
+        const auto hardware = ExponentMasks(Recompiled(code, true));
+        if (hardware != 1u) std::fprintf(stderr, "  %zu f32 exponent masks with the hardware flush, expected 1\n", hardware);
+        return hardware == 1u;
+    });
+
     passed &= run("an add of +0.0 that only feeds compares is dropped when its source is denormal-free", [] {
         Builder b;
         const auto value = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&bits}); };
