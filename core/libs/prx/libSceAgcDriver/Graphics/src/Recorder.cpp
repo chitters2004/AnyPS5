@@ -605,6 +605,7 @@ std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, qu
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
 std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0}, readsRepeated{0};
+std::atomic<std::uint64_t> retainedByteRepeats{0};
 std::atomic<std::uint64_t> readHits[ReadKinds]{};
 
 bool ReadTrackingEnabled() {
@@ -1996,9 +1997,11 @@ void Recorder::ensureOpen() {
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
         retentionCount = 0;
+        retainedByteOwners.Reset();
         notedReadKeys.Reset();
         if (++retentionEpoch == 0) {
             for (auto& slot : retention) slot = {};
+            retainedByteOwners.Clear();
             notedReadKeys.Clear();
             ++retentionEpoch;
         }
@@ -3284,10 +3287,15 @@ void Recorder::dropStaleHoldKept() {
     if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
 }
 
-void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
+void Recorder::Retain(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
-    if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    if (retainedByteOwners.Insert(owner, retentionEpoch)) open->keptBytes += bytes;
+    else retainedByteRepeats.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t Recorder::RetainedByteRepeats() {
+    return retainedByteRepeats.load(std::memory_order_relaxed);
 }
 
 void Recorder::BoundKeptBytes() {

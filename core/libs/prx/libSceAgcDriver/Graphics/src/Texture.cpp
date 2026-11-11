@@ -110,7 +110,7 @@ TextureProfile& Profile() {
 
 void keepStorageTexture(Recorder& recorder, std::shared_ptr<StorageTexture> texture) {
     if (texture == nullptr) return;
-    if (!texture->Cached()) recorder.KeepBytes(texture.get(), static_cast<std::size_t>(texture->BudgetBytes()));
+    if (!texture->Cached()) recorder.Retain(texture.get(), static_cast<std::size_t>(texture->BudgetBytes()));
     recorder.Keep(std::move(texture));
 }
 

@@ -229,17 +229,17 @@ void SharedOwnerCountsOncePerBatch() {
     auto shared = std::make_shared<int>(0);
     for (int keep = 0; keep < 3; ++keep) {
         recorder.Keep(shared);
-        recorder.KeepBytes(shared.get(), Budget / 2);
+        recorder.Retain(shared.get(), Budget / 2);
         recorder.BoundKeptBytes();
     }
     Expect(recorder.Recording() && recorder.OpenKeptBytes() == Budget / 2 && mock.submits == 0, "three keeps of one owner's half budget counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not half the budget once");
     auto other = std::make_shared<int>(1);
     recorder.Keep(other);
-    recorder.KeepBytes(other.get(), Budget / 2);
+    recorder.Retain(other.get(), Budget / 2);
     recorder.BoundKeptBytes();
     Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightKeptBytes() == Budget, "a second owner's half budget did not complete the batch's budget");
     recorder.Keep(shared);
-    recorder.KeepBytes(shared.get(), Budget / 2);
+    recorder.Retain(shared.get(), Budget / 2);
     Expect(recorder.OpenKeptBytes() == Budget / 2, "the next batch did not count an owner the submitted batch counted");
     recorder.Sync();
 }
@@ -359,6 +359,48 @@ void RepeatedReadsAnswerLikeEveryNote() {
     Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
 }
 
+void RetainedBytesCountEachOwnerOncePerBatch() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    std::vector<std::shared_ptr<int>> owners;
+    for (int i = 0; i < 300; ++i) owners.push_back(std::make_shared<int>(i));
+    const auto before = Recorder::RetainedByteRepeats();
+    std::size_t expected = 0;
+    for (int round = 0; round < 3; ++round) {
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            recorder.Retain(owners[i].get(), 16 * (i + 1) + static_cast<std::size_t>(round));
+            if (round == 0) expected += 16 * (i + 1);
+            if (i % 5 == 0) recorder.Retain(owners[i / 2].get(), 1);
+        }
+    }
+    Expect(recorder.OpenKeptBytes() == expected, "300 owners retained three times counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not each owner's first bytes once (" + std::to_string(expected) + ")");
+    Expect(Recorder::RetainedByteRepeats() - before == 2 * owners.size() + 3 * 60, "the repeat counter counted " + std::to_string(Recorder::RetainedByteRepeats() - before) + " repeated owners");
+    int zero = 0;
+    recorder.Retain(&zero, 0);
+    recorder.Retain(nullptr, 64);
+    Expect(recorder.OpenKeptBytes() == expected, "an owner without bytes or a null owner was counted");
+    recorder.Retain(&zero, 7);
+    Expect(recorder.OpenKeptBytes() == expected + 7, "an owner first retained without bytes was not counted when it brought bytes");
+    recorder.Submit();
+    Expect(recorder.InFlightKeptBytes() == expected + 7, "submission changed the batch's kept bytes");
+    recorder.Retain(owners[0].get(), 5);
+    recorder.Retain(owners[0].get(), 5);
+    Expect(recorder.OpenKeptBytes() == 5, "the next batch counted " + std::to_string(recorder.OpenKeptBytes()) + " bytes for an owner the submitted batch had counted");
+    mock.endResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    mock.endResult = VK_SUCCESS;
+    Expect(failed && !recorder.Recording(), "the injected end failure did not discard the batch");
+    recorder.Retain(owners[0].get(), 9);
+    Expect(recorder.OpenKeptBytes() == 9, "the batch replacing a failed one did not count an owner the failed batch had counted");
+    recorder.Sync();
+}
+
 template<typename Condition>
 bool EventuallyTrue(Condition&& condition) {
     for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
@@ -437,7 +479,7 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
         });
         std::weak_ptr<int> released = kept;
         recorder.Retain(kept);
-        recorder.KeepBytes(kept.get(), Budget);
+        recorder.Retain(kept.get(), Budget);
         kept.reset();
         recorder.NoteLabel(address + 8, std::span<const std::byte>(memory).first(4), 2, 0);
         recorder.NoteLabel(address + 16, std::span<const std::byte>(memory).first(Recorder::LabelTableBytes + 4), 3, 0);
@@ -514,6 +556,7 @@ int main() {
         SharedOwnerCountsOncePerBatch();
         RetentionGrowsWithoutDuplicates();
         RepeatedReadsAnswerLikeEveryNote();
+        RetainedBytesCountEachOwnerOncePerBatch();
         RetentionAfterFailedSubmission();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);

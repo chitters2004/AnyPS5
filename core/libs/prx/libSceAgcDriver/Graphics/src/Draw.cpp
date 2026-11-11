@@ -650,7 +650,7 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     if (AnyShadowedOverlaps(address, bytes)) PublishShadow(address, bytes, PublishScope::Whole, PublishReason::Keys);
     recorder.FlushKeyStoresOverlapping(address, bytes);
     const auto commands = recorder.Commands();
-    if (resident != nullptr && !resident->Cached()) recorder.KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
+    if (resident != nullptr && !resident->Cached()) recorder.Retain(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
     recorder.Keep(resident);
     context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
     recorder.NotePendingWrite(address, bytes);
@@ -2486,7 +2486,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     recorder.ReserveRetention(4 + inputs.vertexBuffers.size() + residents.size() + (scratchOwner != nullptr ? 1u : 0u));
     resources->KeepStorageImageBytes(recorder);
     for (const auto& target : residents) {
-        if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
+        if (target != nullptr && !target->Cached()) recorder.Retain(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
     }
     recorder.Retain(resources);
     recorder.Retain(pipeline);
@@ -2495,7 +2495,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     for (const auto& buffer : inputs.vertexBuffers) recorder.Retain(buffer);
     if (scratchOwner != nullptr) recorder.Keep(std::move(scratchOwner));
     for (const auto& target : residents) recorder.Retain(target);
-    if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
+    if (resources != nullptr) recorder.Retain(resources.get(), resources->CopiedBytes());
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
     // finishes the recorder up to the open batch, which holds the kept resources and gets the

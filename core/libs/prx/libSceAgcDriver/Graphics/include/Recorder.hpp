@@ -134,7 +134,8 @@ public:
         ++retentionCount;
     }
 
-    void KeepBytes(const void* owner, std::size_t bytes);
+    void Retain(const void* owner, std::size_t bytes);
+    static std::uint64_t RetainedByteRepeats();
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
     static constexpr VkPipelineStageFlags UploadScratchReuseStages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -645,7 +646,6 @@ private:
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
-        std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
@@ -1004,6 +1004,9 @@ private:
             slots.swap(grown);
         }
     };
+    struct OwnerHash {
+        std::size_t operator()(const void* owner) const { return retentionHash(owner); }
+    };
     struct ReadKey {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
@@ -1016,6 +1019,7 @@ private:
             return static_cast<std::size_t>(mixed >> 32u);
         }
     };
+    BatchKeySet<const void*, OwnerHash> retainedByteOwners;
     BatchKeySet<ReadKey, ReadKeyHash> notedReadKeys;
     void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
 
