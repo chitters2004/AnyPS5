@@ -126,6 +126,7 @@ WriteIndexStats WriteIndexCounted();
 void ResetWriteIndexCounts();
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceObserved(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool ObservedUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // UnchangedSince for several ranges under one tracker lock: true only when every one holds.
 struct UnchangedQuery {
     std::uint64_t address;
