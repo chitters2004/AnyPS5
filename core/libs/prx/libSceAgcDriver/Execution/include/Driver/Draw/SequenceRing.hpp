@@ -33,6 +33,7 @@ public:
         std::chrono::nanoseconds spin{};
         void (*pause)() = nullptr;
         std::function<void()> preparerStart;
+        std::function<void(std::exception_ptr)> failed;
         bool timed = false;
     };
     static constexpr std::size_t Tags = 32;
