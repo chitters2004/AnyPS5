@@ -1562,12 +1562,12 @@ std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const Compile
     auto& memo = shader.program->planKeyMemo.words;
     auto words = memo.load(std::memory_order_acquire);
     if (words == nullptr) {
-        words = std::make_shared<const std::vector<std::uint32_t>>(walk());
+        words = std::make_shared<const ShaderRecompiler::ResultKeyWords>(ShaderRecompiler::ResultKeyWords{walk(), 0});
         memo.store(words, std::memory_order_release);
     } else if (VerifyDrawPlans()) {
-        Require(*words == walk(), "APS5_VERIFY_DRAW_PLANS: a program's memoized plan binding words differ from a walk of its bindings");
+        Require(words->words == walk(), "APS5_VERIFY_DRAW_PLANS: a program's memoized plan binding words differ from a walk of its bindings");
     }
-    return words;
+    return std::shared_ptr<const std::vector<std::uint32_t>>(words, &words->words);
 }
 
 }
@@ -4564,7 +4564,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
         BeginCommitPhase(CommitPhase::PlanHitInstance);
         if (rebinds) {
-            instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+            instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey, nullptr);
             if (instanceKey != recipe.key) {
                 if (!DrawPlanTemplates()) return instanceMiss(DrawPlanInstance::Template);
                 instanceTemplate = SharedResourceCache().Find(instanceKey);
