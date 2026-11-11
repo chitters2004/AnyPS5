@@ -51,6 +51,9 @@ struct AdoptedDrawInput {
 
 std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration);
 
+enum class PreparedRefusal : std::uint8_t { Size, Inaccessible, Forget, Pending, Unwatched, SnapshotChanged, Failed, Count };
+inline constexpr std::size_t PreparedRefusalCount = static_cast<std::size_t>(PreparedRefusal::Count);
+
 enum class DrawInputSource : std::uint8_t { OwnedReused, SnapshotReused, Adopted, Copied, Count };
 inline constexpr std::size_t DrawInputSourceCount = static_cast<std::size_t>(DrawInputSource::Count);
 bool DrawInputSourcesTimed();
@@ -61,6 +64,7 @@ struct PreparedDrawInputCounts {
     std::uint64_t ranges = 0;
     std::uint64_t prepared = 0;
     std::uint64_t refused = 0;
+    std::array<std::uint64_t, PreparedRefusalCount> refusedBy{};
     std::uint64_t adopted = 0;
     std::uint64_t reprepared = 0;
     std::uint64_t notReady = 0;
