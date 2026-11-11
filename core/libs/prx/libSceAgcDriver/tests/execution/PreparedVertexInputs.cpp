@@ -243,7 +243,7 @@ int main() {
     setenv("APS5_NO_DRAW_INPUTS_IN_PLACE", "1", 1);
 #endif
     try {
-        const auto device = OpenVulkanTestDevice();
+        auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         IndexBlock = AllocateWatched(Block);
         VertexBlock = AllocateWatched(Block);
@@ -367,6 +367,11 @@ int main() {
         Require(fresh[1] == 0 && fresh[2] == 0, "prepared vertex inputs: staging buffers were recycled with APS5_NO_DRAW_INPUT_RECYCLING set");
         const auto afterRecycling = DrawPrepared(*device, *programs, [] {});
         Require(afterRecycling.adopted == 2 && afterRecycling.covered, "prepared vertex inputs: a draw whose copies were staged in recycled buffers did not adopt both or drew wrong");
+        const auto beforeTeardown = AgcDriver::Graphics::PreparedDrawInputCounters();
+        static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 16u));
+        Require(AgcDriver::Graphics::PreparedDrawInputCounters().stashReturned > beforeTeardown.stashReturned, "prepared vertex inputs: no unused copy was kept for recycling, so destroying the device after it proves nothing");
+        device.reset();
+        AgcDriver::Graphics::SetDrawInputPreparers(0);
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
     } catch (const std::exception& error) {

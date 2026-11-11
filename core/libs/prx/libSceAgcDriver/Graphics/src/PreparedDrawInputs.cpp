@@ -950,4 +950,21 @@ void ShutdownDrawInputPreparers() {
     Preparers::Shutdown();
 }
 
+void ClearDrawInputStash(VkDevice device) {
+    std::vector<StashedBuffer> dropped;
+    {
+        auto& stash = bufferStash();
+        std::lock_guard lock(stash.mutex);
+        for (auto it = stash.buffers.begin(); it != stash.buffers.end();) {
+            if (it->device != device) {
+                ++it;
+                continue;
+            }
+            stash.bytes -= it->bytes;
+            dropped.push_back(std::move(*it));
+            it = stash.buffers.erase(it);
+        }
+    }
+}
+
 }

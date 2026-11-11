@@ -1208,6 +1208,7 @@ struct VulkanDevice::State {
             Graphics::ClearRetainedSpaces(device);
             Graphics::ClearCachedTextures(device);
             Graphics::ClearSnapshotCopies(device);
+            Graphics::ClearDrawInputStash(device);
             Graphics::ClearImageMirrors(device);
             Graphics::ClearHostImports(device);
             Graphics::ClearResidentRanges(device);
