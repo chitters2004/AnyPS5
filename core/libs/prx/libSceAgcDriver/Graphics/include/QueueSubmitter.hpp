@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_QUEUESUBMITTER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include <vulkan/vulkan.h>
 #include <atomic>
 #include <condition_variable>
@@ -91,6 +92,16 @@ public:
 private:
     QueueSubmitter* submitter;
 };
+
+inline VkResult QueueBindSparse(const Context& context, const VkBindSparseInfo& bind, VkFence fence) {
+    const auto bindSparse = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse");
+    if (context.sparseQueue != VK_NULL_HANDLE && context.sparseQueueMutex != nullptr) {
+        const std::lock_guard lock(*context.sparseQueueMutex);
+        return bindSparse(context.sparseQueue, 1, &bind, fence);
+    }
+    const QueueAccess access(context.queue);
+    return bindSparse(context.queue, 1, &bind, fence);
+}
 
 }
 

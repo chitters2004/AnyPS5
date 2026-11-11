@@ -74,6 +74,8 @@ struct MockDevice {
     VkResult failedSubmitResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
     std::uint32_t failSubmits = 0;
     std::uint32_t failedSubmitCalls = 0;
+    std::vector<std::string> events;
+    std::map<VkQueue, int> queueUsers;
 
     std::uintptr_t Handle() {
         next += 0x10;
@@ -230,8 +232,31 @@ VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer commands, VkPipe
     record(commands, "push constants");
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+struct QueueUse {
+    VkQueue queue;
+    explicit QueueUse(VkQueue queue, const char* call) : queue(queue) {
+        std::lock_guard lock(mock->mutex);
+        if (++mock->queueUsers[queue] > 1) mock->Violation(std::string(call) + " ran on a queue another thread was using");
+    }
+    ~QueueUse() {
+        std::lock_guard lock(mock->mutex);
+        --mock->queueUsers[queue];
+    }
+};
+
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueBindSparse(VkQueue queue, std::uint32_t, const VkBindSparseInfo*, VkFence) {
+    const QueueUse use(queue, "vkQueueBindSparse");
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
+    std::lock_guard lock(mock->mutex);
+    mock->events.push_back("bind " + std::to_string(reinterpret_cast<std::uintptr_t>(queue)));
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL mockQueueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    const QueueUse use(queue, "vkQueueSubmit");
+    std::this_thread::sleep_for(std::chrono::microseconds(200));
     std::unique_lock lock(mock->mutex);
+    mock->events.push_back("submit");
     if (mock->failSubmits != 0) {
         --mock->failSubmits;
         ++mock->failedSubmitCalls;
@@ -320,6 +345,7 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockBeginCommandBuffer)},
         {"vkEndCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(mockEndCommandBuffer)},
         {"vkQueueSubmit", reinterpret_cast<PFN_vkVoidFunction>(mockQueueSubmit)},
+        {"vkQueueBindSparse", reinterpret_cast<PFN_vkVoidFunction>(mockQueueBindSparse)},
         {"vkCreateFence", reinterpret_cast<PFN_vkVoidFunction>(mockCreateFence)},
         {"vkDestroyFence", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyFence)},
         {"vkGetFenceStatus", reinterpret_cast<PFN_vkVoidFunction>(mockGetFenceStatus)},
@@ -604,6 +630,56 @@ void FailedSubmitReachesFinish() {
     }
 }
 
+void SparseBindsShareTheQueueWithTheSubmitter() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    for (const bool ownQueue : {false, true}) {
+        Fixture fixture;
+        std::mutex sparseMutex;
+        if (ownQueue) {
+            fixture.context.sparseQueue = handleOf<VkQueue>(0x7fff0000);
+            fixture.context.sparseQueueMutex = &sparseMutex;
+        }
+        {
+            const Watchdog watchdog("a sparse bind next to the queue submitter");
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.gate = true;
+            }
+            fixture.Fill(recorder, 1);
+            recorder.Submit();
+            std::thread opener([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                {
+                    std::lock_guard lock(fixture.device.mutex);
+                    fixture.device.gateOpen = true;
+                }
+                fixture.device.changed.notify_all();
+            });
+            const VkBindSparseInfo info{VK_STRUCTURE_TYPE_BIND_SPARSE_INFO};
+            for (int bind = 0; bind < 20; ++bind) Expect(QueueBindSparse(fixture.context, info, VK_NULL_HANDLE) == VK_SUCCESS, "a sparse bind failed");
+            opener.join();
+            recorder.Sync();
+            std::thread binder([&] {
+                for (int bind = 0; bind < 50; ++bind) QueueBindSparse(fixture.context, info, VK_NULL_HANDLE);
+            });
+            for (std::uint32_t batch = 0; batch < 50; ++batch) {
+                fixture.Fill(recorder, 100 + batch);
+                recorder.Submit();
+            }
+            binder.join();
+            recorder.Sync();
+            std::lock_guard lock(fixture.device.mutex);
+            const auto& events = fixture.device.events;
+            const std::string queue = std::to_string(reinterpret_cast<std::uintptr_t>(ownQueue ? fixture.context.sparseQueue : fixture.context.queue));
+            Expect(events.size() == 121 && events.front() == (ownQueue ? "bind " + queue : "submit"), std::string(ownQueue ? "a sparse bind on its own queue waited for the graphics queue's submitter" : "a sparse bind on the graphics queue overtook a batch still queued in the submitter"));
+            Expect(std::count(events.begin(), events.end(), "bind " + queue) == 70, "a sparse bind went to the wrong queue");
+        }
+    }
+}
+
 void DeferredEncodeIsDecidedPerBatch() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     Fixture fixture;
@@ -796,6 +872,7 @@ int main(int argc, char** argv) {
             SubmitWaitsForTheEncodeAndDrainWaitsForBoth();
             FailedEncodeNeverCompletes();
             FailedSubmitReachesFinish();
+            SparseBindsShareTheQueueWithTheSubmitter();
             DeferredEncodeIsDecidedPerBatch();
             AsyncSubmitOffEncodesInline();
             DiscardedBatchIsNeverEncoded();

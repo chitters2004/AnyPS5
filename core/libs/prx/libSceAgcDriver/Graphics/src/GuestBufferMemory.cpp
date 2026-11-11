@@ -1003,12 +1003,8 @@ bool createSparseDmaBufImport(const Context& context, HostImport& entry, int fil
     if (const auto result = context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence); result != VK_SUCCESS) fail("vkCreateFence", result);
     VkResult bound = VK_SUCCESS;
     VkResult waited = VK_SUCCESS;
-    {
-        std::unique_lock<std::mutex> queueLock;
-        if (ownQueue) queueLock = std::unique_lock(*context.sparseQueueMutex);
-        bound = context.Function<PFN_vkQueueBindSparse>("vkQueueBindSparse")(ownQueue ? context.sparseQueue : context.queue, 1, &bind, fence);
-        if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
-    }
+    bound = QueueBindSparse(context, bind, fence);
+    if (bound == VK_SUCCESS) waited = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, UINT64_MAX);
     context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
     if (bound != VK_SUCCESS) fail("vkQueueBindSparse", bound);
     if (waited != VK_SUCCESS) fail("vkWaitForFences", waited);
