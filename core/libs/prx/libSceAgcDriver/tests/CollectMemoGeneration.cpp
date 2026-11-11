@@ -923,6 +923,36 @@ bool ResolveAlias(std::uint64_t address, std::uint64_t bytes, int* file, std::ui
     return false;
 }
 
+std::atomic<int> backingProbes{0};
+
+bool CountAliasProbe(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset) {
+    ++backingProbes;
+    return ResolveAlias(address, bytes, file, offset);
+}
+
+void CheckBackingProbesAreBounded() {
+    struct Scope {
+        Scope() { SetWriteBackingResolver(&CountAliasProbe); }
+        ~Scope() { SetWriteBackingResolver(nullptr); }
+    } scope;
+    const auto plain = Subscribe(Base + 40 * Block, 2);
+    backingProbes = 0;
+    NoteGpuPending(Base, 120 * Block);
+    Require(backingProbes.load() == 0, "a bump looked for backing keys while no subscription had any");
+    {
+        const auto backed = Subscribe(AliasA, 2);
+        backingProbes = 0;
+        NoteGpuPending(Base, 120 * Block);
+        Require(backingProbes.load() == 1, "a bump over a large unbacked range probed its backing more than once");
+        backingProbes = 0;
+        NoteGpuPending(Base, 8 * Block);
+        Require(backingProbes.load() <= 9, "a bump over a small unbacked range probed below 64 KiB blocks");
+    }
+    backingProbes = 0;
+    NoteGpuPending(Base, 8 * Block);
+    Require(backingProbes.load() == 0, "a released backed subscription left backing discovery on");
+}
+
 void CheckBackingKeys() {
     struct Scope {
         Scope() { SetWriteBackingResolver(&ResolveAlias); }
@@ -993,6 +1023,7 @@ void CheckWriteIndex() {
     CheckReusedSlot();
     CheckCrowdedKey();
     CheckBackingKeys();
+    CheckBackingProbesAreBounded();
     CheckDomains();
 }
 }
