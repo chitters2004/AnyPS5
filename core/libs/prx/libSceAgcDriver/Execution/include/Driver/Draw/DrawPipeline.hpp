@@ -45,6 +45,8 @@ public:
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
+    enum NullPixelKind : std::uint32_t { NullPixelRectList = 1u, NullPixelDepthClear = 2u, NullPixelStencilClear = 4u, NullPixelDepthWrite = 8u, NullPixelStencilTest = 16u, NullPixelNoDepthTarget = 32u, NullPixelIndirect = 64u, NullPixelKindCount = 7u };
+    static void NoteDecodedDraw(bool nullPixel, std::uint32_t kinds);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
