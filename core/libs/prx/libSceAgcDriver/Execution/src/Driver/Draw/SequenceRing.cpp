@@ -50,7 +50,7 @@ void SequenceRing::claimProducer() {
     if (!producerId.compare_exchange_strong(current, self, std::memory_order_acq_rel)) throw std::logic_error("two threads claimed the sequence ring at once");
 }
 
-void SequenceRing::rethrowFailure() {
+void SequenceRing::RethrowFailure() {
     if (!failed.load(std::memory_order_acquire)) return;
     std::exception_ptr error;
     {
@@ -74,7 +74,7 @@ std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock) {
     claimProducer();
     if (stopping.load(std::memory_order_acquire)) throw std::logic_error("an item was pushed into a stopped sequence ring");
     Reclaim();
-    rethrowFailure();
+    RethrowFailure();
     const auto index = pushed.load(std::memory_order_relaxed);
     if (index - prepared.load(std::memory_order_acquire) >= slots.size()) {
         if (holdsGpuLock) throw std::runtime_error("sequence ring full while the producer holds the GPU lock");
@@ -132,7 +132,7 @@ void SequenceRing::Drain() {
     if (OnPreparer()) return;
     waitPrepared(pushed.load(std::memory_order_acquire));
     if (Producing()) Reclaim();
-    rethrowFailure();
+    RethrowFailure();
 }
 
 void SequenceRing::Settle() {

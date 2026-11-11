@@ -173,6 +173,19 @@ void ReadsDoNotWaitInTheRing() {
     Require(log.committed == log.expected, "a reading item committed out of order");
 }
 
+void IdleDrainRethrowsAFailedPreparation() {
+    DrawFinisher::Get().Enqueue([] { throw std::runtime_error("prepare failed before the drain"); }, {});
+    WaitUntil([] { return !DrawFinisher::Busy(); }, "the failed preparation to finish");
+    bool thrown = false;
+    try {
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    } catch (const std::runtime_error& error) {
+        thrown = std::string(error.what()) == "prepare failed before the drain";
+    }
+    Require(thrown, "a pipeline drain after the failed preparation had finished did not rethrow it");
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+}
+
 void FullRingHoldsTheProducer() {
     if (!DrawFinisher::Sequenced()) return;
     Log log;
@@ -239,6 +252,7 @@ int main() {
         ForwardsDoNotWaitForEarlierDraws();
         ReadsDoNotWaitInTheRing();
         FailedPrepareReachesTheWorker();
+        IdleDrainRethrowsAFailedPreparation();
         FullRingHoldsTheProducer();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;
