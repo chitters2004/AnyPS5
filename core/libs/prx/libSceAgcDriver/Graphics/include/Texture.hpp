@@ -420,6 +420,7 @@ public:
         std::uint64_t unstamped;
     };
     static std::array<FlushWaitCounts, 2> TakeFlushWaitCounts();
+    static bool FlushWaitsProfiled();
     static void SetFlushFailureForTest(bool fail);
     static int TakeFlushFailureForTest();
     static bool OrderedFlushArmedForTest();
