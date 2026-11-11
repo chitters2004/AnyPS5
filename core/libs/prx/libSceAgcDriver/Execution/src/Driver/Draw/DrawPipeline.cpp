@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -83,6 +84,7 @@ DrawFinisher& DrawFinisher::Get() {
             };
             options.preparerStart = [] {
                 finisherThread = true;
+                NameDriverThread("draw-finish");
                 PerformanceTrace::BindThread("draw finisher");
             };
             created->ring = std::make_unique<SequenceRing>(std::move(options));
@@ -317,6 +319,7 @@ void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
 }
 
 void DrawFinisher::run() {
+    NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
     for (;;) {
         Job* job = nullptr;
@@ -624,6 +627,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 
 void DrawPipeline::run() {
+    NameDriverThread("draw-commit");
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     for (;;) {
