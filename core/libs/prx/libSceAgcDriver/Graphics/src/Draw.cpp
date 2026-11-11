@@ -2031,20 +2031,38 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // over the target's pages, the DCC key scan of TextureClearKeys, then UnchangedSince), with the
 // [draws] target-lookup accounting. `lookup` makes (or finds) the image; DrawWithRecipe refreshes
 // the stored object instead.
+void noteRepeatedTargets(const State& state, bool recipe) {
+    thread_local std::vector<std::uint64_t>* previousSlot = nullptr;
+    auto& previous = ShaderRecompiler::ThreadOwned(previousSlot);
+    thread_local std::vector<std::uint64_t>* currentSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(currentSlot);
+    current.clear();
+    for (const auto& color : state.colors) {
+        current.insert(current.end(), {color.address, color.bytes, static_cast<std::uint64_t>(color.format), static_cast<std::uint64_t>(color.tileMode), std::uint64_t{color.extent.width} << 32u | color.extent.height, color.dccAddress, color.cmaskAddress, color.fmaskAddress, std::uint64_t{color.samples} << 32u | color.mip, std::uint64_t{color.arraySlice} << 32u | color.layers});
+    }
+    current.push_back(state.depth.has_value() ? state.depth->address : 0u);
+    CountCommit(CommitCounter::TargetDraws);
+    if (recipe) CountCommit(CommitCounter::RecipeTargetDraws);
+    CountCommit(CommitCounter::ColorTargets, state.colors.size());
+    if (state.depth.has_value()) CountCommit(CommitCounter::DepthTargets);
+    if (current == previous) CountCommit(CommitCounter::RepeatedTargets);
+    std::swap(current, previous);
+}
+
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
-        if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        if (resident != nullptr) InCommitPhase(CommitPhase::TargetsClearCheck, [&] { materializeRegisterClear(context, color, *resident); });
     } catch (const std::exception& error) {
         static AgcDriver::Mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (resident != nullptr) InCommitPhase(CommitPhase::TargetsCmask, [&] { materializeCmaskClear(context, color, resident); });
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;
@@ -3348,6 +3366,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         return false;
     }
     BeginCommitPhase(CommitPhase::Targets);
+    if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
     const auto* args = prepared.args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     const int dumpLimit = prepared.dumpLimit = DumpTargetLimit();
@@ -3360,6 +3379,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const auto& color = binding.color;
         binding.gpuTiling = color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         if (color.samples > 1) {
+            const CommitPhaseScope multisample(CommitPhase::TargetsMultisample);
             binding.multisampled = true;
             timer.phase(PhaseSetup);
             if (color.staged) {
@@ -3380,8 +3400,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         APS5_LOG_OUT_DEBUG("Creating color target %zu address=0x%llx bytes=%llu extent=%ux%u", index, static_cast<unsigned long long>(color.address), static_cast<unsigned long long>(color.bytes), color.extent.width, color.extent.height);
         const ColorTargetLayout colorLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
+        BeginCommitPhase(CommitPhase::TargetsSettle);
         static_cast<void>(FlushDepthPlanes(color.address, colorLayout.Bytes(), DepthPlaneScope::Whole));
         RetireDepthSurfaces(context.device, color.address, colorLayout.Bytes());
+        BeginCommitPhase(CommitPhase::TargetsClaims);
         ClaimMultisampleTargetMemory(color.address, colorLayout.Bytes());
         if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
         constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -3390,6 +3412,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
         const bool linearResident = residentLinear && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
+        BeginCommitPhase(CommitPhase::Targets);
         if ((binding.gpuTiling || ((!ColorTileModeIsLinear(color.tileMode) || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
@@ -3398,6 +3421,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
             binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                const CommitPhaseScope lookup(CommitPhase::TargetsLookup);
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3425,7 +3449,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (binding.resident != nullptr) {
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
-            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+            targetViews.push_back(InCommitPhase(CommitPhase::TargetsView, [&] { return binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice); }));
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -3482,7 +3506,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         targetViews.push_back(binding.target->View());
     }
     if (state.depth) {
-        targetViews.push_back(DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)));
+        targetViews.push_back(InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); }));
     }
     timer.phase(PhasePrepare);
     BeginCommitPhase(CommitPhase::Resolve);
@@ -4293,14 +4317,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
     BeginCommitPhase(CommitPhase::Targets);
+    if (CommitPhasesEnabled()) noteRepeatedTargets(state, true);
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
-        if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
+        if (state.colors[index].fmaskAddress != 0) InCommitPhase(CommitPhase::TargetsClaims, [&] { GuardOneFragmentFmask(context, state.colors[index]); });
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCached(context, stored.get()); }) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
+            const CommitPhaseScope refresh(CommitPhase::TargetsRefresh);
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
             else stored->Refresh();
             return stored;
@@ -4311,7 +4337,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
-        const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
+        const auto depthView = InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
         timer.phase(PhaseReadTarget);
         if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
     }

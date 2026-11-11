@@ -1762,7 +1762,7 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
     if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;
-    it->texture->Refresh();
+    InCommitPhase(CommitPhase::TargetsRefresh, [&] { static_cast<void>(it->texture->Refresh()); });
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
     if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);

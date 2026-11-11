@@ -36,6 +36,35 @@ enum class CommitPhase : std::uint8_t {
     EpilogueWriters,
     EpilogueRecipe,
     PlanKey,
+    TargetsClaims,
+    TargetsLookup,
+    TargetsRefresh,
+    TargetsClearCheck,
+    TargetsView,
+    TargetsSettle,
+    TargetsMultisample,
+    TargetsProved,
+    TargetsCmask,
+    TargetsDepthPrep,
+    Count
+};
+
+enum class CommitCounter : std::uint8_t {
+    TargetDraws,
+    RecipeTargetDraws,
+    ColorTargets,
+    DepthTargets,
+    RepeatedTargets,
+    TargetRefreshEpoch,
+    TargetRefreshProved,
+    TargetRefreshSlow,
+    OtherRefreshEpoch,
+    OtherRefreshProved,
+    OtherRefreshSlow,
+    TargetEpochOff,
+    TargetEpochMoved,
+    TargetEpochProofMoved,
+    TargetEpochPendingMoved,
     Count
 };
 
@@ -45,6 +74,7 @@ struct CommitPhaseTotals {
     std::uint64_t keyWords = 0;
     std::uint64_t keyMemoHits = 0;
     std::uint64_t keyMemoMisses = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(CommitCounter::Count)> counters{};
     std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)> ns{};
 };
 
@@ -53,6 +83,9 @@ const char* CommitPhaseName(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
+void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
+CommitPhase CurrentCommitPhase();
+void RelabelCommitPhase(CommitPhase phase);
 CommitPhaseTotals ReadCommitPhases();
 CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier);
 
