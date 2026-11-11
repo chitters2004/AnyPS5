@@ -217,6 +217,7 @@ std::uint64_t GpuHoldSerial();
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
+bool GpuLockAssertsEnabled();
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
