@@ -466,6 +466,9 @@ def interval_number(value, field):
     return value
 
 
+ENCODER_FIELDS = ("tickets_per_frame", "encode_ms_per_frame", "spin_ms_per_frame", "submit_waits_per_frame", "submit_wait_ms_per_frame")
+
+
 def validate_interval(record):
     start = interval_number(record.get("interval_start_s"), "interval_start_s")
     end = interval_number(record.get("interval_end_s"), "interval_end_s")
@@ -489,6 +492,12 @@ def validate_interval(record):
     counts = record.get("owned_draw_counts", {})
     if not isinstance(counts, dict) or any(not isinstance(name, str) or type(value) is not int or value < 0 for name, value in counts.items()):
         raise ValueError("owned_draw_counts must map names to non-negative integers")
+    encoder = record.get("encoder", {})
+    if not isinstance(encoder, dict):
+        raise ValueError("encoder must be an object")
+    for name in ENCODER_FIELDS:
+        if name in encoder:
+            interval_number(encoder[name], f"encoder.{name}")
     if "trace_dropped" in record and type(record["trace_dropped"]) is not bool:
         raise ValueError("trace_dropped must be a boolean")
 
@@ -511,7 +520,7 @@ def digest_intervals(lines):
                      "frame_ms": line["frame_ms"], "gpu_busy_ms_per_present": line["gpu_busy_ms_per_present"],
                      "busiest_worker": {"thread": busiest[0], "pct": busiest[1]} if busiest else None,
                      "top_phase": {"name": largest[0], "ms_per_frame": largest[1]} if largest else None,
-                     "trace_dropped": line.get("trace_dropped", False), "owned_draw_counts": line.get("owned_draw_counts")})
+                     "trace_dropped": line.get("trace_dropped", False), "owned_draw_counts": line.get("owned_draw_counts"), "encoder": line.get("encoder")})
     first = lines[0] if lines else {}
     keys = ("commit", "dirty", "env", "gpu", "driver", "os", "resolution",
             "cpu", "cpu_threads", "memory_mib", "title_id", "title", "content_version")
@@ -541,6 +550,11 @@ def markdown_intervals(result):
         lines += ["", "| # | " + " | ".join(table_cell(name) for name in count_names) + " |", "|---|" + "---|" * len(count_names)]
         for index, row in enumerate(rows, 1):
             lines.append(f"| {index} | " + " | ".join(str(row["owned_draw_counts"].get(name, 0)) if row["owned_draw_counts"] is not None else "-" for name in count_names) + " |")
+    if any(row["encoder"] and row["encoder"].get("tickets_per_frame") for row in rows):
+        lines += ["", "| # | tickets/frame | encode ms/frame | spin ms/frame | submitter waits/frame | submitter wait ms/frame |", "|---|---|---|---|---|---|"]
+        for index, row in enumerate(rows, 1):
+            encoder = row["encoder"] or {}
+            lines.append(f"| {index} | " + " | ".join(f"{encoder.get(name, 0.0):.2f}" for name in ENCODER_FIELDS) + " |")
     p99 = [row["frame_ms"]["p99"] for row in rows]
     gpu = [row["gpu_busy_ms_per_present"] for row in rows]
     lines += ["", "```", f"p99 ms  {sparkline(p99)}  0-{max(p99):.1f}", f"gpu ms  {sparkline(gpu)}  0-{max(gpu):.1f}", "```"]

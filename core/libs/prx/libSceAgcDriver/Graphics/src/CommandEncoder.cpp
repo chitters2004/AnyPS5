@@ -132,7 +132,10 @@ private:
         for (;;) {
             std::shared_ptr<EncodeTicket> ticket;
             owner.spinning.fetch_add(1, std::memory_order_acq_rel);
-            SpinUntil(HandoffSpinWindow(), [&] { return owner.queued.load(std::memory_order_acquire) != 0; });
+            {
+                PerformanceTimer spin(TraceFormat::EncoderSpinScope);
+                SpinUntil(HandoffSpinWindow(), [&] { return owner.queued.load(std::memory_order_acquire) != 0; });
+            }
             owner.spinning.fetch_sub(1, std::memory_order_acq_rel);
             {
                 std::unique_lock lock(owner.mutex);
@@ -168,7 +171,7 @@ private:
         const auto& functions = owner.functions;
         auto commands = takeSpare();
         try {
-            PerformanceTimer timing("Graphics.Encode");
+            PerformanceTimer timing(TraceFormat::EncodeScope);
             if (commands == VK_NULL_HANDLE) {
                 VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
                 allocation.commandPool = pool;

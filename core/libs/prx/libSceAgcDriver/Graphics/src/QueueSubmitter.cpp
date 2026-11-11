@@ -1,8 +1,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/QueueSubmitter.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
+#include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <chrono>
+#ifdef _WIN32
+#include "prx/libc/include/general/ThreadName.hpp"
+#endif
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -51,6 +57,11 @@ std::shared_ptr<QueueSubmitter> QueueSubmitter::Existing(VkQueue queue) {
 QueueSubmitter::QueueSubmitter(VkDevice device, VkQueue queue, PFN_vkQueueSubmit submit, PFN_vkDeviceWaitIdle waitIdle) :
     device(device), queue(queue), submit(submit), waitIdle(waitIdle) {
     thread = std::thread([this] {
+        TracyZone::NameThread("queue submitter");
+#ifdef _WIN32
+        ThreadName::SetCurrent("queue submitter");
+#endif
+        PerformanceTrace::BindThread("queue submitter");
         RaiseWorkerThreadPriority("queue submitter");
         run();
     });
@@ -121,6 +132,7 @@ void QueueSubmitter::run() {
         std::exception_ptr failure;
         if (job.encode != nullptr) {
             if (!job.encode->Finished()) {
+                PerformanceTimer waiting(TraceFormat::SubmitWaitScope);
                 const auto waitStart = std::chrono::steady_clock::now();
                 job.encode->Wait();
                 CommandEncoders::CountWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()));

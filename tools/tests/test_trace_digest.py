@@ -433,6 +433,22 @@ class TraceDigestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trace_digest.validate_interval(first)
 
+    def test_encoder_interval_figures_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"tickets_per_frame": 132.5, "encode_ms_per_frame": 6.8, "spin_ms_per_frame": 18.25, "submit_waits_per_frame": 90.0, "submit_wait_ms_per_frame": 9.5}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 132.50 | 6.80 | 18.25 | 90.00 | 9.50 |", text)
+        self.assertIn("| 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |", text)
+        self.assertNotIn("tickets/frame", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"submit_waits_per_frame": -1}
+        with self.assertRaises(ValueError):
+            trace_digest.validate_interval(first)
+
     def test_empty_summary_jsonl_files_remain_valid(self):
         path = self.trace.with_name("aps5-summary.jsonl")
         for text in ("", "\n \t\r\n"):

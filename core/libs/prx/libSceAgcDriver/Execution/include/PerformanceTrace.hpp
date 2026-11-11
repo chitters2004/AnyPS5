@@ -528,6 +528,9 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::array<std::string_view, 5> WorkerBusyScopes{"Driver.Packet", "Driver.Suspend", "Driver.EndSubmission", "Driver.Rewind", "Driver.Completion"};
     static constexpr std::string_view WorkerWaitScope = "Driver.WorkerWait";
+    static constexpr char EncodeScope[] = "Graphics.Encode";
+    static constexpr char EncoderSpinScope[] = "Encoder.spin";
+    static constexpr char SubmitWaitScope[] = "Submitter.wait";
     static constexpr std::string_view WorkerPrefix = "queue worker ";
     static constexpr std::size_t TopPhases = 8;
 
@@ -685,6 +688,8 @@ public:
         bool firstWorker = true;
         std::map<std::string, Clock::duration> phases;
         std::map<std::string, std::uint64_t> ownedCounts;
+        std::uint64_t tickets = 0, submitWaits = 0;
+        Clock::duration encode{}, spin{}, submitWait{};
         bool dropped = summary.ownedDrawUnbound != 0;
         if (summary.ownedDrawUnbound != 0) ownedCounts["OwnedDraw.unbound"] = summary.ownedDrawUnbound;
         struct DroppedThread {
@@ -707,8 +712,19 @@ public:
             for (const auto& total : thread.totals) {
                 const std::string_view scope = total.scope;
                 if (total.stage == nullptr && std::find(WorkerBusyScopes.begin(), WorkerBusyScopes.end(), scope) != WorkerBusyScopes.end()) busy += total.length;
-                if (scope.starts_with("OwnedDraw.") && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
-                else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
+                if (total.stage == nullptr && scope == EncodeScope) {
+                    tickets += total.count;
+                    encode += total.length;
+                } else if (total.stage == nullptr && scope == EncoderSpinScope) {
+                    spin += total.length;
+                } else if (total.stage == nullptr && scope == SubmitWaitScope) {
+                    submitWaits += total.count;
+                    submitWait += total.length;
+                } else if (scope.starts_with("OwnedDraw.") && total.stage == nullptr) {
+                    ownedCounts[std::string(scope)] += total.count;
+                } else if (scope != WorkerWaitScope) {
+                    phases[Name(total.scope, total.stage)] += total.length;
+                }
             }
             if (!thread.name.starts_with(WorkerPrefix)) continue;
             if (!firstWorker) output += ',';
@@ -734,6 +750,7 @@ public:
             output += ':' + std::to_string(value);
         }
         output += '}';
+        output += ",\"encoder\":{\"tickets_per_frame\":" + number(static_cast<double>(tickets) * perPresent) + ",\"encode_ms_per_frame\":" + number(milliseconds(encode) * perPresent) + ",\"spin_ms_per_frame\":" + number(milliseconds(spin) * perPresent) + ",\"submit_waits_per_frame\":" + number(static_cast<double>(submitWaits) * perPresent) + ",\"submit_wait_ms_per_frame\":" + number(milliseconds(submitWait) * perPresent) + '}';
         output += ",\"trace_dropped\":";
         output += dropped ? "true" : "false";
         if (!droppedList.empty()) {
