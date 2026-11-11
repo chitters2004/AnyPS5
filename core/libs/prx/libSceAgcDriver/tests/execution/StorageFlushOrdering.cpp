@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -340,8 +341,10 @@ void RunStampedWriterLater(AgcDriver::VulkanDevice& device, const GuestBlock& gu
     const auto fill = image + OverwrittenDword * 4u;
     Fill(device, fill, 16u, what);
     const auto note = NoteOf(fill, 16u);
+    const auto direct = AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks();
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
     if (!Verifying() && StampsVisible(device, image, ImageBytes)) Require(StillPending(note, fill, 16u), what + "the store waited for the GPU to finish a fill whose stamp it already sees");
+    if (StampsVisible(device, image, ImageBytes)) Require(AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks() == direct, what + "a write-back that keeps a block for the newer fill was copied whole from the image");
     device.WaitIdle();
     Require(words[OverwrittenDword] == Filled, what + "the image's older texels landed over the newer fill");
     Require(words[FarDword] == Stored, what + "the image's texel in a block the fill did not touch was not stored");
@@ -407,6 +410,61 @@ void RunStampedWriterRewritesBaseline(AgcDriver::VulkanDevice& device, const Gue
     device.WaitIdle();
     Require(words[0] == Initial, what + "the image's older texel landed over the newer fill because the fill's bytes equal the image's baseline");
     Require(words[FarDword] == Stored, what + "the image's texel in a block the fill did not touch was not stored");
+}
+
+void RunPaddedLinearStore(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    const std::string what = "storage flush ordering, a linear image whose rows are shorter than their pitch: ";
+    constexpr std::uint32_t PaddedWidth = 24;
+    constexpr std::uint8_t Padding = 0xa5;
+    const auto mip = AgcDriver::Graphics::ComputeMipLayout(AgcDriver::Graphics::TextureTileMode::kLinear, Format32UInt, PaddedWidth, Height, 1).front();
+    Require(mip.pitchBytes > PaddedWidth * 4u, what + "the test image has no row padding");
+    auto* bytes = reinterpret_cast<std::uint8_t*>(guest.Words());
+    for (std::uint32_t row = 0; row < Height; ++row) std::fill(bytes + mip.tiledOffset + row * mip.pitchBytes + PaddedWidth * 4u, bytes + mip.tiledOffset + (row + 1u) * mip.pitchBytes, Padding);
+    AgcDriver::GuestMemory::CollectWritesUncached(guest.Address(), mip.pitchBytes * Height);
+    auto userData = ImageUserData(guest.Address());
+    userData[5] = (userData[5] & 0x3fffffffu) | (((PaddedWidth - 1u) & 3u) << 30u);
+    userData[6] = ((PaddedWidth - 1u) >> 2u) | ((Height - 1u) << 14u);
+    device.Dispatch(Compile(StoreImageCode, userData, device.Target()), 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
+    auto* label = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(guest.Address() + BlockBytes / 2u));
+    std::atomic_ref<std::uint32_t>(*label).store(0, std::memory_order_release);
+    std::atomic<bool> seen{false};
+    std::array<std::uint32_t, 3> read{};
+    std::thread poller([&] {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::atomic_ref<std::uint32_t>(*label).load(std::memory_order_acquire) != LabelValue) {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(20)) return;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        const volatile std::uint32_t* texels = guest.Words();
+        read = {texels[0], texels[100u * mip.pitchBytes / 4u], texels[(mip.tiledOffset + PaddedWidth * 4u) / 4u]};
+        seen.store(true, std::memory_order_release);
+    });
+    const auto direct = AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks();
+    const bool visible = StampsVisible(device, guest.Address(), mip.pitchBytes * Height);
+    const std::uint32_t value = LabelValue;
+    const auto stored = device.WriteLabelOnGpu(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(label)), std::as_bytes(std::span(&value, 1)), 1, 0, false);
+    if (stored != 0) {
+        device.WaitIdle();
+        std::atomic_ref<std::uint32_t>(*label).store(LabelValue, std::memory_order_release);
+        poller.join();
+        std::printf("the label was not recorded on the GPU (reason %d): the padded linear case is skipped\n", stored);
+        return;
+    }
+    device.SubmitRecorded(false);
+    poller.join();
+    Require(seen.load(std::memory_order_acquire), what + "the label never landed");
+    if (visible) Require(AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks() > direct, what + "the label's store of a whole linear image into a watched import was not copied straight from the image");
+    const std::uint32_t paddingWord = Padding * 0x01010101u;
+    Require(read[0] == Stored && read[1] == Stored, what + "the image's texels were not in guest memory at their pitch when the label was");
+    Require(read[2] == paddingWord, what + "row padding read after the label lost its guest value");
+    device.WaitIdle();
+    const auto* words = guest.Words();
+    Require(words[1] == Initial, what + "a texel the dispatch did not write lost its guest value");
+    for (std::uint32_t row = 0; row < Height; ++row) {
+        for (auto offset = mip.tiledOffset + row * mip.pitchBytes + PaddedWidth * 4u; offset < mip.tiledOffset + (row + 1u) * mip.pitchBytes; ++offset) {
+            Require(bytes[offset] == Padding, what + "padding byte " + std::to_string(offset - mip.tiledOffset - row * mip.pitchBytes) + " of row " + std::to_string(row) + " lost its guest value");
+        }
+    }
 }
 
 void RunCompletionWriterWaits(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
@@ -485,6 +543,10 @@ void RunStamped(AgcDriver::VulkanDevice& device, bool watched) {
     {
         GuestBlock guest(watched);
         RunCompletionWriterWaits(device, guest, 0);
+    }
+    {
+        GuestBlock guest(watched);
+        RunPaddedLinearStore(device, guest);
     }
     {
         GuestBlock guest(watched);
