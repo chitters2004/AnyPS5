@@ -841,6 +841,7 @@ public:
         std::uint64_t state = 0;
     };
     static bool HashReuse();
+    static bool RunningTableTotal();
     std::shared_ptr<ShaderResources> Find(const Key& key);
     std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
@@ -891,6 +892,9 @@ private:
         bool operator()(const KeyRef& left, const HashedKey& right) const noexcept { return left.hash == right.hash && *left.words == right.words; }
     };
     void erase(const Key& key, std::size_t hash);
+    void dropTables(const ShaderResources& resources);
+    std::uint64_t summedTables() const;
+    void checkTables() const;
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(std::size_t hash);
@@ -900,6 +904,7 @@ private:
     mutable AgcDriver::Mutex mutex;
     std::list<std::pair<HashedKey, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<HashedKey, decltype(entries)::iterator, KeyHash, KeyEqual> index;
+    std::uint64_t tableTotal = 0;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

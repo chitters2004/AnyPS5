@@ -4735,6 +4735,11 @@ bool ResourceCache::HashReuse() {
     return enabled;
 }
 
+bool ResourceCache::RunningTableTotal() {
+    static const bool enabled = std::getenv("APS5_NO_RUNNING_TABLE_TOTAL") == nullptr;
+    return enabled;
+}
+
 std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
     return Find(key, Hash(key));
 }
@@ -4937,10 +4942,12 @@ void ResourceCache::Insert(const Key& key, std::size_t hash, std::shared_ptr<Sha
     dropReleasedTextures(evicted);
     if (!resources->HasCachedStorageImages() || resources->HoldsReleasedTexture()) return;
     if (const auto found = index.find(KeyRef{&key, hash}); found != index.end()) {
+        dropTables(*found->second->second);
         if (evicted != nullptr) evicted->push_back(std::move(found->second->second));
         entries.erase(found->second);
         index.erase(found);
     }
+    tableTotal += resources->TableElements();
     entries.emplace_front(HashedKey{key, hash}, std::move(resources));
     index.emplace(entries.front().first, entries.begin());
     if (capacity == 0) {
@@ -4952,13 +4959,14 @@ void ResourceCache::Insert(const Key& key, std::size_t hash, std::shared_ptr<Sha
     noteUse(hash);
     while (entries.size() > capacity) {
         noteEvicted(entries.back().first.hash);
+        dropTables(*entries.back().second);
         if (evicted != nullptr) evicted->push_back(std::move(entries.back().second));
         index.erase(entries.back().first);
         entries.pop_back();
     }
+    checkTables();
     if (entries.front().second->TableElements() == 0) return;
-    std::uint64_t tables = 0;
-    for (const auto& entry : entries) tables += entry.second->TableElements();
+    std::uint64_t tables = RunningTableTotal() ? tableTotal : summedTables();
     for (auto it = std::prev(entries.end()); tables > TableElementBudget() && it != entries.begin();) {
         const auto elements = it->second->TableElements();
         if (elements == 0) {
@@ -4966,6 +4974,7 @@ void ResourceCache::Insert(const Key& key, std::size_t hash, std::shared_ptr<Sha
             continue;
         }
         tables -= elements;
+        dropTables(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = std::prev(entries.erase(it));
@@ -5003,10 +5012,12 @@ void ResourceCache::removeImage(const StorageTexture* image, std::vector<std::sh
             ++it;
             continue;
         }
+        dropTables(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
     }
+    checkTables();
 }
 
 void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted) {
@@ -5016,10 +5027,12 @@ void ResourceCache::dropReleasedTextures(std::vector<std::shared_ptr<ShaderResou
             ++it;
             continue;
         }
+        dropTables(*it->second);
         if (evicted != nullptr) evicted->push_back(std::move(it->second));
         index.erase(it->first);
         it = entries.erase(it);
     }
+    checkTables();
 }
 
 bool ResourceCache::Touch(const Key& key) {
@@ -5048,6 +5061,7 @@ void ResourceCache::Clear() {
     std::lock_guard lock(mutex);
     index.clear();
     entries.clear();
+    tableTotal = 0;
     evictedKeys.clear();
     evictedOrder.clear();
     evictionsSinceCheck = 0;
@@ -5086,16 +5100,32 @@ std::uint64_t ResourceCache::TableElementBudget() {
 
 std::uint64_t ResourceCache::TableElements() const {
     std::lock_guard lock(mutex);
+    checkTables();
+    return RunningTableTotal() ? tableTotal : summedTables();
+}
+
+std::uint64_t ResourceCache::summedTables() const {
     std::uint64_t tables = 0;
     for (const auto& entry : entries) tables += entry.second->TableElements();
     return tables;
 }
 
+void ResourceCache::dropTables(const ShaderResources& resources) {
+    tableTotal -= resources.TableElements();
+}
+
+void ResourceCache::checkTables() const {
+    static const bool verify = std::getenv("APS5_VERIFY_TABLE_TOTAL") != nullptr;
+    if (verify) Require(tableTotal == summedTables(), "APS5_VERIFY_TABLE_TOTAL: the resource cache's running image table total differs from the sum over its entries");
+}
+
 void ResourceCache::erase(const Key& key, std::size_t hash) {
     const auto found = index.find(KeyRef{&key, hash});
     if (found == index.end()) return;
+    dropTables(*found->second->second);
     entries.erase(found->second);
     index.erase(found);
+    checkTables();
 }
 
 ResourceCache& SharedResourceCache() {
