@@ -1880,6 +1880,14 @@ void ReportGuardSpanMiss(const char* list, std::uint64_t address, std::uint64_t 
     NoteGuardSpans(GuardSpanEvent::Missed);
 }
 
+std::uint64_t MultisampleGuardsGeneration() {
+    return guardSpansGeneration().load(std::memory_order_acquire);
+}
+
+bool MultisampleGuardsMayOverlap(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0 && anyGuarded().load(std::memory_order_acquire) && mayOverlapGuarded(address, bytes);
+}
+
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
     if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || !mayOverlapGuarded(address, bytes)) return;
     const auto overlaps = [&](const GuardedRange& range) { return address < range.address + range.bytes && range.address < address + bytes; };

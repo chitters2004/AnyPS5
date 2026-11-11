@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
@@ -6930,15 +6931,25 @@ void ShaderResources::prepareFaultSlot() const {
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    const bool pending = DepthOverwriteProofsPending();
+    const auto depthGeneration = DepthGuardsGeneration();
+    const auto multisampleGeneration = MultisampleGuardsGeneration();
+    if (moved.empty() && !pending && guardSetProof.Holds(depthGeneration, multisampleGeneration) && !RuntimeSwitches::Set(RuntimeSwitch::NoGuardSetProof)) return;
+    bool clearOfDepth = moved.empty() && !pending;
+    bool clearOfMultisample = moved.empty();
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
+        if (clearOfDepth && DepthGuardsMayOverlap(address, bytes)) clearOfDepth = false;
+        if (clearOfMultisample && MultisampleGuardsMayOverlap(address, bytes)) clearOfMultisample = false;
         RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
         RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
     }
+    if (clearOfDepth) guardSetProof.RecordDepth(depthGeneration);
+    if (clearOfMultisample) guardSetProof.RecordMultisample(multisampleGeneration);
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
