@@ -11628,6 +11628,93 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     inPassSampleDumpTests(recorder, context, cover, words, address, target);
 }
 
+void barRingLayoutTests() {
+    constexpr VkDeviceSize GiB = VkDeviceSize{1} << 30u;
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    const auto layout = [&](VkDeviceSize barHeap, bool barType) {
+        VkPhysicalDeviceMemoryProperties memory{};
+        memory.memoryHeapCount = 3;
+        memory.memoryHeaps[0] = {8 * GiB, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryHeaps[1] = {32 * GiB, 0};
+        memory.memoryHeaps[2] = {barHeap, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+        memory.memoryTypeCount = barType ? 3 : 2;
+        memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+        memory.memoryTypes[1] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+        memory.memoryTypes[2] = {host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 2};
+        return memory;
+    };
+    const auto rebar = layout(8 * GiB, true);
+    Require(BarUploadMemoryType(rebar, 0x7) == 2u, "the device-local host-visible type over a resizable BAR heap was not chosen");
+    Require(!BarUploadMemoryType(rebar, 0x3).has_value(), "a BAR type outside the buffer's memory types was chosen");
+    Require(SnapshotMemoryProperties(rebar, false) == MappedDeviceProperties, "a resizable BAR heap was not recognised");
+    const auto window = layout(256u << 20u, true);
+    Require(!BarUploadMemoryType(window, 0x7).has_value(), "a 256 MiB BAR window was taken for uploads");
+    Require(SnapshotMemoryProperties(window, false) != MappedDeviceProperties, "a 256 MiB BAR window was recognised as resizable BAR");
+    const auto none = layout(8 * GiB, false);
+    Require(!BarUploadMemoryType(none, 0x7).has_value(), "a device without host-visible device memory got a BAR upload type");
+}
+
+void barRingTests(const Device& device) {
+    barRingLayoutTests();
+    auto context = device.GetContext();
+    if (SnapshotMemoryProperties(context.memory, false) != MappedDeviceProperties) {
+        std::cout << "the test device has no resizable BAR type: ring placement not tested\n";
+        return;
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, false);
+    Recorder recorder(context);
+    const auto before = Recorder::RingCounts();
+    auto first = recorder.UploadRing(100);
+    auto second = recorder.UploadRing(200);
+    Require(first.has_value() && second.has_value(), "the BAR ring gave no slice on a resizable BAR device");
+    Require(first->buffer == second->buffer && second->offset >= 112 && second->offset % 16 == 0, "consecutive ring slices did not share the chunk at aligned, disjoint offsets");
+    for (std::size_t i = 0; i < 100; ++i) first->bytes[i] = static_cast<std::byte>(i + 1);
+    for (std::size_t i = 0; i < 200; ++i) second->bytes[i] = static_cast<std::byte>(255 - i);
+    Buffer readback(context, 300, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder.Commands();
+    const std::array<VkBufferCopy, 2> regions{VkBufferCopy{first->offset, 0, 100}, VkBufferCopy{second->offset, 100, 200}};
+    context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, first->buffer->Handle(), readback.Handle(), 2, regions.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    recorder.Submit();
+    recorder.Sync();
+    readback.Invalidate();
+    const auto bytes = readback.Bytes();
+    for (std::size_t i = 0; i < 100; ++i) Require(bytes[i] == static_cast<std::byte>(i + 1), "the GPU read a ring slice's bytes from the wrong place");
+    for (std::size_t i = 0; i < 200; ++i) Require(bytes[100 + i] == static_cast<std::byte>(255 - i), "the GPU read the second ring slice's bytes from the wrong place");
+    auto counts = Recorder::RingCounts();
+    Require(counts.bytes - before.bytes == 300 && counts.slices - before.slices == 2, "the ring's bytes and slices were not counted");
+    const auto rolled = Recorder::RingCounts();
+    Require(recorder.UploadRing(Recorder::UploadRingChunk).has_value(), "a whole-chunk slice was refused");
+    Require(recorder.UploadRing(Recorder::UploadRingChunk).has_value(), "a second whole-chunk slice was refused");
+    counts = Recorder::RingCounts();
+    Require(counts.recycled - rolled.recycled == 1, "the chunk of a completed batch was not recycled");
+    const auto open = Recorder::RingCounts();
+    Require(recorder.UploadRing(Recorder::UploadRingChunk).has_value(), "a third whole-chunk slice was refused");
+    counts = Recorder::RingCounts();
+    Require(counts.recycled == open.recycled && counts.chunks - open.chunks == 1, "a chunk the open batch still uses was recycled");
+    recorder.Submit();
+    recorder.Sync();
+    const auto done = Recorder::RingCounts();
+    Require(recorder.UploadRing(Recorder::UploadRingChunk).has_value(), "a fourth whole-chunk slice was refused");
+    Require(Recorder::RingCounts().recycled - done.recycled == 1, "a chunk was not recycled once its batch completed");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, true);
+    const auto switched = Recorder::RingCounts();
+    Require(!recorder.UploadRing(64).has_value(), "the ring gave a slice with APS5_NO_BAR_RING set");
+    Require(Recorder::RingCounts().fallbacks[0] - switched.fallbacks[0] == 1, "the switch fallback was not counted");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, false);
+    auto plain = device.GetContext();
+    for (std::uint32_t i = 0; i < plain.memory.memoryTypeCount; ++i) {
+        if ((plain.memory.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) plain.memory.memoryTypes[i].propertyFlags &= ~VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
+    Recorder hostOnly(plain);
+    const auto unmapped = Recorder::RingCounts();
+    Require(!hostOnly.UploadRing(64).has_value(), "the ring gave a slice on a device without resizable BAR");
+    Require(Recorder::RingCounts().fallbacks[1] - unmapped.fallbacks[1] == 1, "the no-BAR fallback was not counted");
+    recorder.Submit();
+    recorder.Sync();
+    std::cout << "BAR ring tests passed\n";
+}
+
 void uncountedPassTests(const Device& device) {
     auto context = device.GetContext();
     context.bufferDeviceAddress = false;
@@ -16093,6 +16180,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-epoch-only") {
             drawSnapshotEpochTests(device);
+            return 0;
+        }
+
+        if (argc == 2 && std::string_view(argv[1]) == "--bar-ring-only") {
+            barRingTests(device);
             return 0;
         }
 
