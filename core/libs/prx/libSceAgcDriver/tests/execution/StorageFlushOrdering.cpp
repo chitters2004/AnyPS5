@@ -347,6 +347,31 @@ void RunStampedWriterLater(AgcDriver::VulkanDevice& device, const GuestBlock& gu
     Require(words[FarDword] == Stored, what + "the image's texel in a block the fill did not touch was not stored");
 }
 
+void RunReaderGenerationAfterSkippedWait(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const std::string what = "storage flush ordering, a reader's collect generation taken before a writer the flush did not wait for: ";
+    const auto image = StoreImage(device, guest, offset);
+    const auto fill = image + OverwrittenDword * 4u;
+    const auto seen = AgcDriver::GuestMemory::CollectWrites(fill, 16u);
+    if (seen == 0 || !StampsVisible(device, image, ImageBytes)) {
+        device.WaitIdle();
+        std::puts("the image's memory is compared, not write-watched: the reader generation case is skipped");
+        return;
+    }
+    Fill(device, fill, 16u, what);
+    const auto note = NoteOf(fill, 16u);
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    if (!Verifying()) Require(StillPending(note, fill, 16u), what + "the store waited for the GPU to finish a fill whose stamp it already sees");
+    device.WaitIdle();
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+        Require(recorder == nullptr || !recorder->PendingWriteOverlaps(fill, 16u), what + "the fill is still pending after the device went idle");
+    }
+    AgcDriver::GuestMemory::CollectWritesUncached(fill, 16u);
+    Require(!AgcDriver::GuestMemory::UnchangedSince(fill, 16u, seen), what + "the range reads as unchanged since a generation taken before the fill, so a reader would keep bytes from before it");
+    Require(guest.Words()[offset / 4u + OverwrittenDword] == Filled, what + "the fill's bytes did not land");
+}
+
 void RunStampedWriterEarlier(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
     const std::string what = "storage flush ordering, a writer stamped when recorded before the image's results: ";
     const auto* words = guest.Words() + offset / 4u;
@@ -448,6 +473,10 @@ void RunStamped(AgcDriver::VulkanDevice& device, bool watched) {
     {
         GuestBlock guest(watched);
         RunStampedWriterEarlier(device, guest, 0);
+    }
+    {
+        GuestBlock guest(watched);
+        RunReaderGenerationAfterSkippedWait(device, guest, 0);
     }
     {
         GuestBlock guest(watched);
