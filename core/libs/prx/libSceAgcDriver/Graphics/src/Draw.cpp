@@ -1958,6 +1958,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
+    if (attributes.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoEmptyFetchSkip)) {
+        timer.phase(PhaseVertex);
+        timing.Mark("vertex_upload");
+        return inputs;
+    }
     const auto planned = PlanDrawVertexFetches(state.hasColorTarget ? std::optional{std::pair{state.color.MemoryAddress(), static_cast<std::uint64_t>(state.color.bytes)}} : std::nullopt, draw, attributes, inputs.VertexLayout(), inputs.maxIndex);
     const auto& fetches = planned.fetches;
     const auto& fetchValid = planned.fetchValid;

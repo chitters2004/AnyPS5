@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -313,6 +314,25 @@ void IndirectRecordIndicesChangedAfterPreparation() {
     Require(outcome.written == 0, "prepared draw inputs: the indexed indirect draw drew the indices prepared before the CPU made them degenerate");
 }
 
+void EmptyFetchSkipDrawsTheSame() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto colors = [] {
+        std::vector<std::byte> bytes(ColorBytes);
+        AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), bytes);
+        return bytes;
+    };
+    Switches::Assign(RuntimeSwitch::NoEmptyFetchSkip, true);
+    const auto planned = DrawOnce(Change::None);
+    const auto plannedColors = colors();
+    Switches::Assign(RuntimeSwitch::NoEmptyFetchSkip, false);
+    const auto skipped = DrawOnce(Change::None);
+    const auto skippedColors = colors();
+    std::printf("no vertex attributes: %zu pixels with the fetch planning, %zu without it\n", planned.written, skipped.written);
+    Require(planned.written == Width * Height && skippedColors == plannedColors, "prepared draw inputs: skipping the vertex fetch planning of a draw without vertex attributes changed what it drew");
+    Require(skipped.adopted() == planned.adopted() && skipped.copied() == planned.copied(), "prepared draw inputs: skipping the vertex fetch planning changed how the draw's inputs were made");
+}
+
 void NoPreparersCopyOnTheCommitter() {
     AgcDriver::Graphics::SetDrawInputPreparers(0);
     const auto outcome = DrawOnce(Change::None);
@@ -352,6 +372,7 @@ int main() {
         GpuWriteBeforeTheDrawReachesItsIndices();
         IndirectRecordInputsAreAdopted();
         IndirectRecordIndicesChangedAfterPreparation();
+        EmptyFetchSkipDrawsTheSame();
         NoPreparersCopyOnTheCommitter();
         AgcDriver::Graphics::SetPreparedDrawInputsHook(nullptr);
         std::puts("prepared draw inputs: copies made before the commit are adopted only while the CPU left their ranges unchanged");
