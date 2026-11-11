@@ -649,7 +649,7 @@ void ResetWriteIndexCounts() {
 }
 
 namespace {
-std::atomic<std::uint64_t> forgetCalls{0};
+ProfileCounter forgetCalls;
 // See ForgetSerial: odd while a ForgetPages call stores its page states.
 std::atomic<std::uint64_t> forgetSerial{0};
 constexpr std::size_t ForgetSlotCount = 65536;
@@ -661,12 +661,13 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
     auto current = slot.load(std::memory_order_relaxed);
     while (current < serial && !slot.compare_exchange_weak(current, serial, std::memory_order_release, std::memory_order_relaxed)) {}
 }
-std::atomic<std::uint64_t> forgetBytes{0};
+ProfileCounter forgetBytes;
+ProfileCounter collectMemoHits;
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
-std::atomic<std::uint64_t> collectDirty{0};
+ProfileCounter collectDirty;
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 constexpr unsigned ShardGranuleShift = 21;
@@ -723,8 +724,8 @@ std::size_t ImagePagesSize();
 // folded at report time; a finished thread's totals move to `retired`. Nothing is counted without
 // the profile switch (the counters are only ever printed under it).
 // Debug aid: APS5_SHARED_MEMORY_COUNTERS=1 accumulates into one shared set with atomic RMWs as before.
-enum MemoryCounterKind { CounterRead, CounterCompare, CounterWrite, CounterChangedWrite, CounterCollect, CounterVerify, CounterQuery, CounterMemoHit, MemoryCounterCount };
-constexpr const char* MemoryCounterNames[MemoryCounterCount] = {"read", "compare", "write", "write-changed", "collect", "verify", "query", "collect-memo hit"};
+enum MemoryCounterKind { CounterRead, CounterCompare, CounterWrite, CounterChangedWrite, CounterCollect, CounterVerify, CounterQuery, MemoryCounterCount };
+constexpr const char* MemoryCounterNames[MemoryCounterCount] = {"read", "compare", "write", "write-changed", "collect", "verify", "query"};
 
 struct MemoryCounter {
     std::atomic<std::uint64_t> calls{0};
@@ -931,18 +932,18 @@ public:
         if (nowMs - last < 10000 || !state.lastReport.compare_exchange_strong(last, nowMs)) return;
         const auto totals = FoldMemoryCounters();
         AgcDriver::ProfilePrint_nid_no_patch("[guestmem]");
-        for (std::size_t i = 0; i < CounterMemoHit; ++i) {
+        for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(totals[CounterMemoHit][0]), static_cast<unsigned long long>(collectEpochBumps.load()));
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.Sum()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.Sum()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         const auto& walks = walkCounters;
         AgcDriver::ProfilePrint_nid_no_patch(" | walks %llu released %llu concurrent %llu granule-only %llu waited %llu (%.1f ms) walk ms locked %.1f released %.1f closure ranges %llu/%llu/%llu/%llu granules %llu/%llu/%llu/%llu", static_cast<unsigned long long>(walks.walks.load()), static_cast<unsigned long long>(walks.released.load()), static_cast<unsigned long long>(walks.concurrent.load()), static_cast<unsigned long long>(walks.granuleOnly.load()), static_cast<unsigned long long>(walks.waited.load()), walks.waitNanoseconds.load() / 1e6, walks.lockedNanoseconds.load() / 1e6, walks.releasedNanoseconds.load() / 1e6, static_cast<unsigned long long>(walks.closureRanges[0].load()), static_cast<unsigned long long>(walks.closureRanges[1].load()), static_cast<unsigned long long>(walks.closureRanges[2].load()), static_cast<unsigned long long>(walks.closureRanges[3].load()), static_cast<unsigned long long>(walks.closureGranules[0].load()), static_cast<unsigned long long>(walks.closureGranules[1].load()), static_cast<unsigned long long>(walks.closureGranules[2].load()), static_cast<unsigned long long>(walks.closureGranules[3].load()));
 #ifdef __linux__
         const auto shootdowns = tlbShootdowns();
         AgcDriver::ProfilePrint_nid_no_patch(" tlb-ipis in 10 s %llu", static_cast<unsigned long long>(shootdowns - reportedShootdowns.exchange(shootdowns)));
 #endif
-        AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
+        AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.Sum()), forgetBytes.Sum() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
             AgcDriver::ProfilePrint_nid_no_patch(" | read callers:");
@@ -1219,10 +1220,8 @@ std::size_t ImagePagesSize() {
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
     if (certificateMutant.load(std::memory_order_relaxed) != CertificateMutant::HideMapping) bumpSubscriptions(address, bytes, WriteBumpSource::Forget);
-    if (MemoryProfiled()) {
-        forgetCalls.fetch_add(1, std::memory_order_relaxed);
-        forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
+    forgetCalls.Add();
+    forgetBytes.Add(bytes);
     const auto started = forgetSerial.fetch_add(1, std::memory_order_release) + 1;
     Pages().forget(address, bytes);
     const auto done = started + 1;
@@ -2528,7 +2527,7 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         return true;
     };
     if (!walk(singlePass || fresh)) return false;
-    if (runs.stamped != 0 && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (runs.stamped != 0) collectDirty.Add();
     return fresh || singlePass || runs.stamped == 0 || walk(true);
 }
 
@@ -2624,7 +2623,7 @@ bool walkReleased(TrackerLock& lock, WriteTracker& tracker, const std::vector<st
             if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) stampWrittenRun(&runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end));
         }
     }
-    if (runs.stamped != 0 && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (runs.stamped != 0) collectDirty.Add();
     if (failure != nullptr) std::rethrow_exception(failure);
     return complete;
 }
@@ -2651,7 +2650,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     const bool complete = collect(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first), &recordConsumedRun, &consumed);
     noteConsumed();
     for (const auto& [begin, end] : consumed.Runs()) stampWrittenRun(&runs, static_cast<std::uintptr_t>(begin), static_cast<std::uintptr_t>(end));
-    if (runs.stamped != 0 && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (runs.stamped != 0) collectDirty.Add();
 #endif
     if (window != nullptr) stampWindowRuns(runs);
 #ifdef _WIN32
@@ -2681,7 +2680,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch, unwatched, mapping);
             if (map.Covers(first, stop)) {
-                if (MemoryProfiled()) CounterFor(CounterMemoHit).Add(0, 0, SharedMemoryCounters());
+                collectMemoHits.Add();
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
@@ -2690,7 +2689,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                if (MemoryProfiled()) CounterFor(CounterMemoHit).Add(0, 0, SharedMemoryCounters());
+                collectMemoHits.Add();
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
@@ -2702,7 +2701,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
-                if (MemoryProfiled()) CounterFor(CounterMemoHit).Add(0, 0, SharedMemoryCounters());
+                collectMemoHits.Add();
                 return tracker.generation;
             }
         }
@@ -3538,7 +3537,7 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
         if (count < tracker.pages.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + WritePageBytes;
     }
-    if (marked && MemoryProfiled()) collectDirty.fetch_add(1, std::memory_order_relaxed);
+    if (marked) collectDirty.Add();
     return true;
 }
 
@@ -3562,7 +3561,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
-        if (MemoryProfiled()) CounterFor(CounterMemoHit).Add(0, 0, SharedMemoryCounters());
+        collectMemoHits.Add();
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
