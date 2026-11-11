@@ -13,6 +13,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using AgcDriver::HandoffAdaptiveFor;
 using AgcDriver::HandoffSite;
 using AgcDriver::HandoffSpinWindowFor;
 using AgcDriver::LockSpinning;
@@ -106,7 +107,7 @@ void CheckBlockingFallback() {
 }
 
 void CheckHandoffSite() {
-    HandoffSite site{"test", 3ms};
+    HandoffSite site{"test", 3ms, false};
     Require(std::string(site.Name()) == "test" && site.Window() == 3ms, "a site did not keep its name and window");
     const auto immediate = site.Spin([] { return true; });
     Require(!immediate.waited && immediate.ready, "a condition that already held was counted as a wait");
@@ -115,7 +116,7 @@ void CheckHandoffSite() {
     Require(caught.waited && caught.ready && calls == 4 && caught.end >= caught.start, "a condition that held within the window was not reported as caught");
     const auto missed = site.Spin([] { return false; });
     Require(missed.waited && !missed.ready && missed.end - missed.start >= 3ms, "a condition that never held was not reported as missed after the window");
-    HandoffSite off{"off", 0ns};
+    HandoffSite off{"off", 0ns, false};
     calls = 0;
     const auto blocked = off.Spin([&] { return ++calls > 1; });
     Require(blocked.waited && !blocked.ready && calls == 1 && blocked.start == blocked.end, "a zero window spun or evaluated the condition more than once");
@@ -128,7 +129,7 @@ void CheckHandoffSite() {
         mutex.unlock();
     });
     while (!held.load()) std::this_thread::yield();
-    HandoffSite lockSite{"lock", 100us};
+    HandoffSite lockSite{"lock", 100us, false};
     const auto locked = LockSpinning(mutex, lockSite);
     mutex.unlock();
     holder.join();
@@ -136,6 +137,62 @@ void CheckHandoffSite() {
     const auto free = LockSpinning(mutex, lockSite);
     mutex.unlock();
     Require(!free.waited && free.ready, "a free lock was reported as a wait");
+}
+
+void CheckAdaptation() {
+    Require(HandoffAdaptiveFor(nullptr), "adaptation is off by default");
+    Require(!HandoffAdaptiveFor("0"), "APS5_HANDOFF_ADAPTIVE=0 does not turn adaptation off");
+    Require(HandoffAdaptiveFor("1"), "APS5_HANDOFF_ADAPTIVE=1 turns adaptation off");
+    HandoffSite fixed{"fixed", 150us, false};
+    fixed.Learn(false, 150us);
+    fixed.Learn(true, 1us);
+    Require(fixed.Window() == 150us, "a fixed site changed its window");
+    HandoffSite site{"adaptive", 150us, true};
+    Require(site.Window() == 150us, "an adaptive site does not start at its cap");
+    site.Learn(true, 2us);
+    Require(site.Window() == 8us, "a hand-off caught after 2 us did not set a window of four times that");
+    for (int round = 0; round < 50; ++round) site.Learn(true, 10us);
+    Require(site.Window() > 32us && site.Window() <= 40us, "the window did not follow hand-offs that settled at 10 us");
+    site.Learn(true, 1ms);
+    Require(site.Window() <= 150us, "a slow hand-off raised the window above the cap");
+    HandoffSite shrinking{"shrinking", 150us, true};
+    shrinking.Learn(false, 150us);
+    Require(shrinking.Window() == 75us, "a miss did not halve the window");
+    for (int round = 0; round < 10; ++round) shrinking.Learn(false, 1us);
+    Require(shrinking.Window() == 0ns, "repeated misses did not stop the spin");
+    shrinking.Learn(true, 100ns);
+    Require(shrinking.Window() == HandoffSite::Floor, "a very short hand-off set a window below the floor");
+    HandoffSite off{"off", 0ns, true};
+    off.Learn(true, 5us);
+    Require(off.Window() == 0ns, "a zero cap learned a window");
+    int spun = 0;
+    for (std::uint32_t call = 0; call < 2 * HandoffSite::ProbeEvery; ++call) {
+        const auto result = off.Spin([] { return false; });
+        if (result.end != result.start) ++spun;
+    }
+    Require(spun == 0, "a zero cap probed");
+    HandoffSite probing{"probing", 150us, true};
+    probing.Learn(true, 20us);
+    for (int round = 0; round < 10; ++round) probing.Learn(false, 1us);
+    Require(probing.Window() == 0ns, "the probing site did not stop spinning");
+    spun = 0;
+    for (std::uint32_t call = 0; call < 2 * HandoffSite::ProbeEvery; ++call) {
+        const auto result = probing.Spin([] { return false; });
+        if (result.end != result.start) {
+            ++spun;
+            Require(result.end - result.start >= 80us, "a probe did not spin for four times the typical hand-off");
+        }
+    }
+    Require(spun == 2, "a site that stopped spinning did not probe once every " + std::to_string(HandoffSite::ProbeEvery) + " calls");
+    std::atomic<bool> released{false};
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(30us);
+        released.store(true, std::memory_order_release);
+    });
+    HandoffSite catching{"catching", 10ms, true};
+    const auto caught = catching.Spin([&] { return released.load(std::memory_order_acquire); });
+    releaser.join();
+    Require(caught.ready && catching.Window() < 10ms && catching.Window() >= HandoffSite::Floor, "a caught hand-off did not shrink the window from the cap");
 }
 
 void CheckRecursion() {
@@ -160,6 +217,7 @@ int main() {
         CheckBlockingFallback();
         CheckRecursion();
         CheckHandoffSite();
+        CheckAdaptation();
         std::cout << "handoff spin tests passed\n";
         return 0;
     } catch (const std::exception& error) {
