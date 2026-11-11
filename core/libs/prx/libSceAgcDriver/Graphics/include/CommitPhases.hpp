@@ -51,6 +51,17 @@ enum class CommitPhase : std::uint8_t {
     TargetsDepthFind,
     TargetsDepthSync,
     TargetsDepthStale,
+    RecordSetup,
+    RecordPass,
+    RecordBegin,
+    RecordBind,
+    RecordPush,
+    RecordCommands,
+    RecordLeave,
+    RecordAfter,
+    RecordRecipe,
+    RecordStores,
+    RecordPassKey,
     Count
 };
 
