@@ -251,6 +251,17 @@ void TablesChangingPerDispatch(const GuestBlock& block) {
     Require(most <= AgcDriver::Graphics::ResourceCache::TableElementBudget(), "image table cache bounds: tables that changed every dispatch kept " + std::to_string(most) + " table elements in the resource cache, over its budget of " + std::to_string(AgcDriver::Graphics::ResourceCache::TableElementBudget()));
 }
 
+void TablesInvalidatedUnderTheirKey(const GuestBlock& block) {
+    auto& cache = AgcDriver::Graphics::SharedResourceCache();
+    for (std::uint32_t record = 0; record < Records; ++record) SetRecord(block, record, record % Elements);
+    for (std::uint32_t round = 0; round < 4; ++round) {
+        for (std::uint32_t surface = 0; surface < Surfaces; ++surface) std::memset(block.Bytes(TexturesOffset + static_cast<std::size_t>(surface) * TextureBytes), static_cast<int>(surface + 17u * (round + 1u)), TextureBytes);
+        Dispatch(block, 0);
+        Dispatch(block, 0);
+    }
+    Require(cache.TableElements() <= AgcDriver::Graphics::ResourceCache::TableElementBudget(), "image table cache bounds: invalidated tables left the resource cache over its table budget");
+}
+
 void SrtMovingPerDispatch(const GuestBlock& block) {
     using AgcDriver::DriverDetail::Driver;
     for (std::uint32_t record = 0; record < Records; ++record) SetRecord(block, record, record % 4u);
@@ -587,6 +598,12 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--queued-draws") {
             VouchUnderQueuedDraws(block);
             AgcDriverShutdown_nid_postfix();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--invalidated-tables") {
+            TablesInvalidatedUnderTheirKey(block);
+            AgcDriverShutdown_nid_postfix();
+            std::puts("image table cache bounds: invalidated tables passed");
             return 0;
         }
         TablesChangingPerDispatch(block);
