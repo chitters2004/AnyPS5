@@ -98,7 +98,7 @@ public:
     void SettlePassEnd();
     static bool FuseBarriers();
     struct FusionStatistics {
-        std::uint64_t fused, settled, fencedKeyOnly, trailingFused;
+        std::uint64_t fused, settled, fencedKeyOnly, trailingFused, fencedKeyOnlyShared, fencedKeyOnlyApart;
     };
     static FusionStatistics FusionCounts();
     void SealPassWriteOnly();

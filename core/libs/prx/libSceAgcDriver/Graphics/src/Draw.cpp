@@ -2813,6 +2813,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
     }
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
+    if (state.depth.has_value()) {
+        if (const auto depthImage = DepthSurfaceImage(context, *state.depth); depthImage != VK_NULL_HANDLE) passAttachments.emplace_back(depthImage, state.depthWrite || writesStencilTarget(state));
+    }
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
