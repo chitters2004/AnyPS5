@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
-#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -947,7 +946,8 @@ public:
         if (Recording()) AgcDriverTraceCount_nid_postfix(scope);
     }
 
-    static void Handoff(const HandoffSite& site, const HandoffSpin& spin) {
+    template<typename TSite, typename TSpin>
+    static void Handoff(const TSite& site, const TSpin& spin) {
         if (!spin.waited || !Recording()) return;
         auto* thread = Thread();
         if (thread == nullptr) return;

@@ -6,17 +6,17 @@
 #include <bit>
 #include <chrono>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 #include <stop_token>
 #include <thread>
 #include <type_traits>
 #include <utility>
-#include "prx/libc/include/PreciseWait.hpp"
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 
-#if defined(_WIN32)
-#include <windows.h>
-#include <synchapi.h>
-#elif defined(__linux__)
+#if defined(__linux__)
 #include <linux/futex.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -46,33 +46,48 @@ void* Address(const std::atomic<TValue>& word) noexcept {
     return const_cast<void*>(static_cast<const volatile void*>(&word));
 }
 
+inline void Pause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+    _mm_pause();
+#elif defined(__aarch64__)
+    asm volatile("yield" ::: "memory");
+#else
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 #if defined(_WIN32)
 
 inline constexpr bool Native = true;
+inline constexpr std::uint32_t Forever = 0xffffffffu;
 
-inline DWORD Milliseconds(Clock::duration remaining) noexcept {
+void WaitOnWord(void* address, const void* old, std::size_t bytes, std::uint32_t milliseconds) noexcept;
+void WakeOneOnWord(void* address) noexcept;
+void WakeAllOnWord(void* address) noexcept;
+
+inline std::uint32_t Milliseconds(Clock::duration remaining) noexcept {
     const auto ms = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
-    return static_cast<DWORD>(std::clamp<long long>(ms, 1, static_cast<long long>(INFINITE) - 1));
+    return static_cast<std::uint32_t>(std::clamp<long long>(ms, 1, static_cast<long long>(Forever) - 1));
 }
 
 template<AddressWord TValue>
 void Wait(const std::atomic<TValue>& word, TValue old) noexcept {
-    WaitOnAddress(Address(word), &old, sizeof(TValue), INFINITE);
+    WaitOnWord(Address(word), &old, sizeof(TValue), Forever);
 }
 
 template<AddressWord TValue>
 void WaitFor(const std::atomic<TValue>& word, TValue old, Clock::duration remaining) noexcept {
-    WaitOnAddress(Address(word), &old, sizeof(TValue), Milliseconds(remaining));
+    WaitOnWord(Address(word), &old, sizeof(TValue), Milliseconds(remaining));
 }
 
 template<AddressWord TValue>
 void WakeOne(const std::atomic<TValue>& word) noexcept {
-    WakeByAddressSingle(Address(word));
+    WakeOneOnWord(Address(word));
 }
 
 template<AddressWord TValue>
 void WakeAll(const std::atomic<TValue>& word) noexcept {
-    WakeByAddressAll(Address(word));
+    WakeAllOnWord(Address(word));
 }
 
 #elif defined(__linux__)
@@ -191,7 +206,7 @@ template<AddressWord TValue>
 void AddressWait(const std::atomic<TValue>& word, std::type_identity_t<TValue> old) noexcept {
     for (int spin = 0; spin < AddressWaitSpins; ++spin) {
         if (AddressWaitDetail::Bits(word.load(std::memory_order_relaxed)) != AddressWaitDetail::Bits(old)) return;
-        PreciseSpinPause();
+        AddressWaitDetail::Pause();
     }
     if (AddressWaitDetail::Bits(word.load(std::memory_order_relaxed)) != AddressWaitDetail::Bits(old)) return;
     AddressWaitDetail::Wait(word, old);
