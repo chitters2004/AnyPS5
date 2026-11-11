@@ -982,6 +982,17 @@ std::shared_ptr<const TValue> PublishOnce(AtomicSharedPtr<const TValue>& slot, c
     return won ? made : expected;
 }
 
+struct MaskedPatchKinds {
+    bool empty = false;
+    bool pushOnly = false;
+    bool data = false;
+    bool buffers = false;
+    bool srt = false;
+    bool operator==(const MaskedPatchKinds&) const = default;
+};
+
+MaskedPatchKinds ClassifyMaskedPatch(std::size_t bufferBindings, std::size_t userWords, bool pushData, bool flattenedSrt);
+
 struct ResultKeyShape {
     struct Static {
         std::vector<std::uint32_t> drawWords;
