@@ -366,7 +366,7 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct, bool multiplication) {
-    if (!ExactF32Arithmetic()) return result;
+    if (!ExactF32Arithmetic() || DiagnosticNoNanRepair()) return result;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* bits = &ir.BitCastU32(*result);
     const bool normalFactor = multiplication && std::any_of(sources.begin(), sources.end(), [](const IrValue* source) {
@@ -387,7 +387,7 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 }
 
 IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result) {
-    if (!ExactF32Arithmetic()) return result;
+    if (!ExactF32Arithmetic() || DiagnosticNoNanRepair()) return result;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* nan = &ir.Constant(0xffc00000u);
     for (auto source = sources.end(); source != sources.begin();) {

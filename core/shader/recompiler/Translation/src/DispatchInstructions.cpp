@@ -110,6 +110,14 @@ bool ExactF32Arithmetic() {
     return exact;
 }
 
+bool DiagnosticNoNanRepair() {
+    static const bool skipped = [] {
+        const char* text = std::getenv("APS5_DIAG_NO_NAN_REPAIR");
+        return text != nullptr && *text != '\0' && std::strcmp(text, "0") != 0;
+    }();
+    return skipped;
+}
+
 DebugProbe DebugProbeConfig() {
     static const DebugProbe parsed = [] {
         DebugProbe result;

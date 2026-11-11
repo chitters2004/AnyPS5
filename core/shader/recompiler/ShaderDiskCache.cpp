@@ -1918,7 +1918,8 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    const auto version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    return DiagnosticNoNanRepair() ? version ^ 0x51ed27f1c3a5b947ull : version;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
