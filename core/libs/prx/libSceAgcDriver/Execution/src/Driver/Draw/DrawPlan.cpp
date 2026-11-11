@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPlan.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/KeyHash.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
@@ -13,9 +16,9 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-class StateWriter {
+class HandwrittenStateWriter {
 public:
-    explicit StateWriter(std::vector<std::uint64_t>& words) : words(words) {}
+    explicit HandwrittenStateWriter(std::vector<std::uint64_t>& words) : words(words) {}
 
     template<typename TValue>
     void operator()(TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
@@ -126,6 +129,117 @@ private:
     std::vector<std::uint64_t>& words;
 };
 
+template<typename TMember>
+struct MemberOf;
+
+template<typename TClass, typename TField>
+struct MemberOf<TField TClass::*> {
+    using Class = TClass;
+    using Field = TField;
+};
+
+template<auto TMember, typename TParent, typename TField>
+constexpr bool Typed = std::is_same_v<TParent, typename MemberOf<decltype(TMember)>::Class> && std::is_same_v<TField, typename MemberOf<decltype(TMember)>::Field>;
+
+template<auto TMember, typename TParent, typename TField>
+bool Is(const TParent& parent, const TField& field) {
+    if constexpr (Typed<TMember, TParent, TField>) return &field == &(parent.*TMember);
+    else return false;
+}
+
+template<auto... TMembers>
+struct Members {
+    template<typename TParent, typename TField>
+    static constexpr bool Typed = (DriverDetail::Typed<TMembers, TParent, TField> || ...);
+
+    template<typename TParent, typename TField>
+    static bool Has(const TParent& parent, const TField& field) {
+        return (Is<TMembers>(parent, field) || ...);
+    }
+};
+
+using SkippedMembers = Members<&Graphics::State::minDepthBounds, &Graphics::State::maxDepthBounds, &Graphics::State::depthBiasConstant, &Graphics::State::depthBiasSlope, &Graphics::State::backDepthBiasConstant, &Graphics::State::backDepthBiasSlope, &Graphics::State::depthScale, &Graphics::State::depthOffset, &Graphics::State::depthClampMin, &Graphics::State::depthClampMax, &Graphics::State::viewport, &Graphics::State::scissor, &Graphics::State::renderExtent, &Graphics::State::DepthRemap::scale, &Graphics::State::DepthRemap::offset, &Graphics::DepthTarget::address, &Graphics::DepthTarget::extent, &Graphics::DepthTarget::clearDepth, &Graphics::DepthTarget::clearStencil, &Graphics::DepthTarget::pipeBankXor, &Graphics::DepthTarget::firstSlice, &Graphics::ColorTarget::address, &Graphics::ColorTarget::extent, &Graphics::ColorTarget::bytes, &Graphics::ColorTarget::cmaskBytes, &Graphics::ColorTarget::surfaceAddress, &Graphics::ColorTarget::surfaceExtent, &Graphics::ColorTarget::mipCount, &Graphics::ColorTarget::mip, &Graphics::ColorTarget::clearWords, &Graphics::ColorTarget::depth, &Graphics::ColorTarget::depthSlice, &Graphics::ColorTarget::arrayAddress, &Graphics::ColorTarget::arraySlice, &Graphics::ColorTarget::pipeBankXor, &Graphics::ColorTarget::fmaskPipeBankXor>;
+
+using PresentMembers = Members<&Graphics::State::depthBiasClamp, &Graphics::State::stencilReplayReference, &Graphics::DepthTarget::stencilAddress, &Graphics::DepthTarget::htileAddress, &Graphics::ColorTarget::dccAddress, &Graphics::ColorTarget::chainDccAddress, &Graphics::ColorTarget::cmaskAddress, &Graphics::ColorTarget::arrayLastSlice, &Graphics::ColorTarget::fmaskAddress>;
+
+using LayeredDepthMembers = Members<&Graphics::DepthTarget::lastSlice>;
+
+using ColorTargetMembers = Members<&Graphics::State::color>;
+
+class PlanStateWriter {
+public:
+    PlanStateWriter(std::vector<std::uint64_t>& words, std::vector<DrawPlanStateRuledField>* ruled) : words(words), ruled(ruled), scratch(Scratch()) {
+        data = scratch.data();
+        limit = scratch.size();
+    }
+
+    void Finish() { words.insert(words.end(), data, data + used); }
+
+    [[gnu::always_inline]] void Word(std::uint64_t word) {
+        if (used == limit) [[unlikely]] Grow();
+        data[used++] = word;
+    }
+
+    template<typename TParent, typename TField>
+    bool Member(const TParent& parent, const TField& field) {
+        if constexpr (SkippedMembers::Typed<TParent, TField>) {
+            if (SkippedMembers::Has(parent, field)) return Note(field);
+        }
+        if constexpr (PresentMembers::Typed<TParent, TField>) {
+            if (PresentMembers::Has(parent, field)) return Presence(field);
+        }
+        if constexpr (LayeredDepthMembers::Typed<TParent, TField>) {
+            if (LayeredDepthMembers::Has(parent, field)) {
+                Word(parent.lastSlice != parent.firstSlice);
+                return Note(field);
+            }
+        }
+        if constexpr (ColorTargetMembers::Typed<TParent, TField>) {
+            if (ColorTargetMembers::Has(parent, field)) {
+                if (!parent.hasColorTarget) return Note(field);
+                AggregateFields::HashLeaves(field, *this);
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    template<typename TField>
+    bool Note(const TField& field) {
+        if (ruled != nullptr) ruled->push_back({&field, sizeof(TField)});
+        return true;
+    }
+
+    template<typename TField>
+    bool Presence(const TField& field) {
+        if constexpr (AggregateFields::IsOptional<TField>::value) Word(field.has_value());
+        else Word(field != TField{});
+        return Note(field);
+    }
+
+    static std::vector<std::uint64_t>& Scratch() {
+        thread_local std::vector<std::uint64_t>* slot = nullptr;
+        auto& words = ShaderRecompiler::ThreadOwned(slot);
+        if (words.size() < ReservedWords) words.resize(ReservedWords);
+        return words;
+    }
+
+    [[gnu::noinline]] void Grow() {
+        scratch.resize(scratch.size() * 2u);
+        data = scratch.data();
+        limit = scratch.size();
+    }
+
+    static constexpr std::size_t ReservedWords = 512;
+    std::vector<std::uint64_t>& words;
+    std::vector<DrawPlanStateRuledField>* ruled;
+    std::vector<std::uint64_t>& scratch;
+    std::size_t used = 0;
+    std::uint64_t* data = nullptr;
+    std::size_t limit = 0;
+};
+
 bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::VertexInputLayout& b) {
     const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
     const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
@@ -134,8 +248,8 @@ bool SameVertexInput(const Graphics::VertexInputLayout& a, const Graphics::Verte
 
 }
 
-void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words) {
-    StateWriter write(words);
+void AppendHandwrittenDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words) {
+    HandwrittenStateWriter write(words);
     write(state.stages);
     write(state.depth.has_value());
     if (state.depth) write(*state.depth);
@@ -179,6 +293,33 @@ void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uin
     write(state.pointSizeMin);
     write(state.pointSizeMax);
     write(state.quadSampleMask);
+}
+
+namespace {
+
+[[gnu::flatten]] void AppendWalkedDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words) {
+    PlanStateWriter write(words, nullptr);
+    AggregateFields::HashLeaves(state, write);
+    write.Finish();
+}
+
+}
+
+void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words) {
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::HandwrittenPlanState)) {
+        AppendHandwrittenDrawPlanStateWords(state, words);
+        return;
+    }
+    AppendWalkedDrawPlanStateWords(state, words);
+}
+
+std::vector<DrawPlanStateRuledField> DrawPlanStateRuledFields(const Graphics::State& state) {
+    std::vector<std::uint64_t> words;
+    std::vector<DrawPlanStateRuledField> ruled;
+    PlanStateWriter write(words, &ruled);
+    AggregateFields::HashLeaves(state, write);
+    write.Finish();
+    return ruled;
 }
 
 std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::CompiledShader> stages, const Graphics::State& state, const Pm4::DrawParameters& draw) {

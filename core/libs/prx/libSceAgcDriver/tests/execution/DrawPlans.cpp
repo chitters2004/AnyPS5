@@ -224,10 +224,8 @@ void ExpectNoHitsWhileOff(const DrawPlanCounts& counts) {
     if (!PlansOn()) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::MissAbsent] == 0, "the plan path ran while switched off");
 }
 
-void PlanKeysCoverThePipelineKey() {
-    namespace Graphics = AgcDriver::Graphics;
-    Graphics::Context context{};
-    Graphics::State base{};
+AgcDriver::Graphics::State PlanTestState() {
+    AgcDriver::Graphics::State base{};
     base.hasColorTarget = true;
     base.colors.resize(1);
     base.blends.resize(1);
@@ -241,6 +239,69 @@ void PlanKeysCoverThePipelineKey() {
     base.stencilTest = true;
     base.stencilFront.reference = 3u;
     base.stencilBack.reference = 5u;
+    return base;
+}
+
+std::vector<std::uint64_t> WalkedStateWords(const AgcDriver::Graphics::State& state) {
+    std::vector<std::uint64_t> words;
+    AgcDriver::DriverDetail::AppendDrawPlanStateWords(state, words);
+    return words;
+}
+
+std::vector<std::uint64_t> HandwrittenStateWords(const AgcDriver::Graphics::State& state) {
+    std::vector<std::uint64_t> words;
+    AgcDriver::DriverDetail::AppendHandwrittenDrawPlanStateWords(state, words);
+    return words;
+}
+
+void PlanStateLeavesAreHashedOrRuled() {
+    namespace Graphics = AgcDriver::Graphics;
+    const auto base = PlanTestState();
+    const auto baseWords = WalkedStateWords(base);
+    std::size_t ruledLeaves = 0;
+    const auto leaves = AggregateFields::ForEachMutation(base, [&](const Graphics::State& changed, const std::string& path, const void* leaf) {
+        if (WalkedStateWords(changed) != baseWords) return;
+        const auto ruled = AgcDriver::DriverDetail::DrawPlanStateRuledFields(changed);
+        const auto* byte = static_cast<const std::byte*>(leaf);
+        const bool named = std::any_of(ruled.begin(), ruled.end(), [&](const auto& field) {
+            const auto* begin = static_cast<const std::byte*>(field.begin);
+            return byte >= begin && byte < begin + field.bytes;
+        });
+        Expect(named, "the plan state walk ignores state member " + path + ", which no Skip or Presence rule names");
+        ++ruledLeaves;
+    });
+    const auto ruled = AgcDriver::DriverDetail::DrawPlanStateRuledFields(base);
+    Expect(!ruled.empty() && ruledLeaves > 0 && ruledLeaves < leaves, "the plan state rules named no member of a state with a depth and a color target");
+    std::printf("draw plans: %zu of %zu state leaves leave the plan state words alone, each inside one of %zu ruled members\n", ruledLeaves, leaves, ruled.size());
+}
+
+void PlanStateWalkMatchesTheHandwrittenWriter() {
+    namespace Graphics = AgcDriver::Graphics;
+    std::size_t compared = 0;
+    std::vector<std::string> extra;
+    const auto agree = [&](const Graphics::State& context, const std::string& contextPath) {
+        const auto walked = WalkedStateWords(context);
+        const auto handwritten = HandwrittenStateWords(context);
+        AggregateFields::ForEachMutation(context, [&](const Graphics::State& changed, const std::string& path) {
+            ++compared;
+            const bool walkChanged = WalkedStateWords(changed) != walked;
+            const bool handChanged = HandwrittenStateWords(changed) != handwritten;
+            Expect(walkChanged || !handChanged, "the plan state walk ignores state member " + path + contextPath + ", which the hand-written writer hashed");
+            if (walkChanged && !handChanged && std::find(extra.begin(), extra.end(), path) == extra.end()) extra.push_back(path);
+        });
+    };
+    const auto base = PlanTestState();
+    agree(base, "");
+    AggregateFields::ForEachMutation(base, [&](const Graphics::State& context, const std::string& path) { agree(context, " after a change of " + path); });
+    std::string list;
+    for (const auto& path : extra) list += " " + path;
+    std::printf("draw plans: the plan state walk hashes every member the hand-written writer hashed, over %zu leaf and leaf-pair changes; it also hashes %zu it left out:%s\n", compared, extra.size(), list.c_str());
+}
+
+void PlanKeysCoverThePipelineKey() {
+    namespace Graphics = AgcDriver::Graphics;
+    Graphics::Context context{};
+    const auto base = PlanTestState();
     const Graphics::VertexInputLayout layout{};
     const Graphics::PipelineSetLayouts sets{};
     const auto pipelineKey = [&](const Graphics::State& state) {
@@ -585,6 +646,8 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
         }
         PlanKeysCoverThePipelineKey();
+        PlanStateLeavesAreHashedOrRuled();
+        PlanStateWalkMatchesTheHandwrittenWriter();
         PlanKeysFollowTheBindingShape();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);

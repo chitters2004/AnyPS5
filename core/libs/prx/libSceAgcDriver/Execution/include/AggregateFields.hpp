@@ -570,9 +570,13 @@ template<class T>
 inline constexpr bool Unsupported = false;
 
 template<class T>
-bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
+bool MutateLeaf(T& value, std::size_t& index, std::string& path, const void** leaf = nullptr) {
     using U = std::remove_cv_t<T>;
-    const auto take = [&] { return index-- == 0; };
+    const auto take = [&] {
+        if (index-- != 0) return false;
+        if (leaf != nullptr) *leaf = &value;
+        return true;
+    };
     if constexpr (std::is_same_v<U, bool>) {
         if (!take()) return false;
         value = !value;
@@ -589,7 +593,7 @@ bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
         return true;
     } else if constexpr (IsArray<U>::value) {
         for (std::size_t element = 0; element < value.size(); ++element) {
-            if (MutateLeaf(value[element], index, path)) {
+            if (MutateLeaf(value[element], index, path, leaf)) {
                 path = "[" + std::to_string(element) + "]" + path;
                 return true;
             }
@@ -597,7 +601,7 @@ bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
         return false;
     } else if constexpr (IsVector<U>::value) {
         for (std::size_t element = 0; element < value.size(); ++element) {
-            if (MutateLeaf(value[element], index, path)) {
+            if (MutateLeaf(value[element], index, path, leaf)) {
                 path = "[" + std::to_string(element) + "]" + path;
                 return true;
             }
@@ -613,7 +617,7 @@ bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
             path = ".engaged";
             return true;
         }
-        if (value.has_value() && MutateLeaf(*value, index, path)) {
+        if (value.has_value() && MutateLeaf(*value, index, path, leaf)) {
             path = ".value" + path;
             return true;
         }
@@ -633,7 +637,7 @@ bool MutateLeaf(T& value, std::size_t& index, std::string& path) {
         bool done = false;
         std::size_t member = 0;
         ForEachField(value, [&](auto& field) {
-            if (!done && MutateLeaf(field, index, path)) {
+            if (!done && MutateLeaf(field, index, path, leaf)) {
                 path = "." + std::to_string(member) + path;
                 done = true;
             }
@@ -704,8 +708,10 @@ std::size_t ForEachMutation(const T& base, F&& check) {
         auto changed = base;
         auto index = leaf;
         std::string path;
-        if (!MutateLeaf(changed, index, path)) throw std::logic_error("aggregate fields: a counted leaf could not be changed");
-        check(changed, path);
+        const void* leafAddress = nullptr;
+        if (!MutateLeaf(changed, index, path, &leafAddress)) throw std::logic_error("aggregate fields: a counted leaf could not be changed");
+        if constexpr (std::is_invocable_v<F&, const T&, const std::string&, const void*>) check(changed, path, leafAddress);
+        else check(changed, path);
     }
     return count;
 }

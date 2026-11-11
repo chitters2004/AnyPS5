@@ -25,7 +25,14 @@ struct DrawPlanKey {
 };
 
 std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::CompiledShader> stages, const Graphics::State& state, const Pm4::DrawParameters& draw);
+struct DrawPlanStateRuledField {
+    const void* begin;
+    std::size_t bytes;
+};
+
 void AppendDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words);
+void AppendHandwrittenDrawPlanStateWords(const Graphics::State& state, std::vector<std::uint64_t>& words);
+std::vector<DrawPlanStateRuledField> DrawPlanStateRuledFields(const Graphics::State& state);
 
 enum class DrawPlanCount : std::size_t {
     Lookups,
