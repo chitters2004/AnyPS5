@@ -55,6 +55,7 @@ using Position = std::array<float, 4>;
 constexpr std::array<Position, 3> Triangle{{{-0.75f, -0.75f, 0.5f, 1.0f}, {0.75f, -0.75f, 0.5f, 1.0f}, {0.0f, 0.75f, 0.5f, 1.0f}}};
 constexpr std::array<std::uint16_t, 3> Indices{0, 1, 2};
 constexpr std::array<std::uint16_t, 3> Degenerate{0, 0, 0};
+constexpr std::array<std::uint16_t, 6> PaddedIndices{0, 1, 2, 0, 1, 3};
 
 std::byte* IndexBlock = nullptr;
 std::byte* VertexBlock = nullptr;
@@ -81,9 +82,9 @@ std::byte* AllocateWatched(std::size_t bytes) {
     return static_cast<std::byte*>(block);
 }
 
-std::array<std::uint32_t, 4> VertexBufferDescriptor() {
+std::array<std::uint32_t, 4> VertexBufferDescriptor(std::uint32_t records) {
     const auto address = reinterpret_cast<std::uintptr_t>(VertexBlock);
-    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (16u << 16u), static_cast<std::uint32_t>(Triangle.size()), 0x0104d000u | IdentitySelect};
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (16u << 16u), records, 0x0104d000u | IdentitySelect};
 }
 
 std::array<std::uint32_t, 4> OutputDescriptor() {
@@ -97,7 +98,7 @@ struct Programs {
     std::array<AgcDriver::Graphics::CompiledShader, 2> shaders;
 };
 
-std::unique_ptr<Programs> Compile(AgcDriver::VulkanDevice& device) {
+std::unique_ptr<Programs> Compile(AgcDriver::VulkanDevice& device, std::uint32_t records = static_cast<std::uint32_t>(Triangle.size())) {
     std::vector<std::uint32_t> userData(12, 0u);
     userData[0] = 0x10000000u;
     userData[1] = 0x00000001u;
@@ -105,7 +106,7 @@ std::unique_ptr<Programs> Compile(AgcDriver::VulkanDevice& device) {
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     ShaderRecompiler::ShaderVertexStageInfo info{};
     info.resourcesNum = 1;
-    info.resources[0].fields = VertexBufferDescriptor();
+    info.resources[0].fields = VertexBufferDescriptor(records);
     info.resourcesDst[0] = {8, 4, 0, 0};
     info.fetchAttribReg = 8;
     info.fetchBufferReg = 10;
@@ -165,8 +166,8 @@ AgcDriver::Graphics::State DrawState() {
     return state;
 }
 
-void WriteIndices(const std::array<std::uint16_t, 3>& indices) {
-    std::memcpy(IndexBlock, indices.data(), sizeof(indices));
+void WriteIndices(std::span<const std::uint16_t> indices) {
+    std::memcpy(IndexBlock, indices.data(), indices.size_bytes());
 }
 
 void WriteVertices(float shift) {
@@ -190,12 +191,12 @@ struct Outcome {
     std::uint64_t copied = 0;
 };
 
-Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit, bool indirect = false) {
-    WriteIndices(Indices);
+Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit, bool indirect = false, std::span<const std::uint16_t> indices = Indices) {
+    WriteIndices(indices);
     WriteVertices(0.0f);
     Pixels.fill(Background);
     const auto state = DrawState();
-    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(indices.size()), 2, 1, 0, true};
     if (indirect) {
         draw.instanceCount = 0;
         draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(IndirectRecord.data()), 0x25u, 20u, 20u, 1u, false, 0u, NoLocation, NoLocation, NoLocation, false, 0u};
@@ -214,6 +215,17 @@ Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, 
     constexpr auto copied = static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied);
     Outcome outcome{CenterCovered(), after.adopted - before.adopted, after.reprepared - before.reprepared, after.prepared - before.prepared, after.sources[copied] - before.sources[copied]};
     return outcome;
+}
+
+std::array<std::byte, Width * Height * 4> DrawInline(AgcDriver::VulkanDevice& device, const Programs& programs, float shift) {
+    WriteIndices(PaddedIndices);
+    WriteVertices(shift);
+    Pixels.fill(Background);
+    const auto state = DrawState();
+    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(PaddedIndices.size()), 2, 1, 0, true};
+    device.Draw(state, draw, programs.shaders);
+    device.WaitIdle();
+    return Pixels;
 }
 
 void Print(const char* what, const Outcome& outcome) {
@@ -294,6 +306,24 @@ int main() {
         Print("indexed indirect draw, vertices moved off the target after preparation", indirectMoved);
         Require(indirectMoved.adopted == 1 && indirectMoved.reprepared == 1 && indirectMoved.copied == 1, "prepared vertex inputs: an indirect draw's vertex extent the CPU wrote after preparation was adopted, or its untouched index range was not");
         Require(!indirectMoved.covered, "prepared vertex inputs: the indexed indirect draw used the vertices prepared before the CPU moved them off the target");
+
+        const auto padded = Compile(*device, 3u);
+        const auto paddedUnchanged = DrawPrepared(*device, *padded, [] {}, false, PaddedIndices);
+        const auto paddedPixels = Pixels;
+        const auto paddedCovered = static_cast<std::size_t>(std::count(paddedPixels.begin(), paddedPixels.end(), Covered) / 4);
+        std::printf("zero-padded draw covers %zu of %u pixels\n", paddedCovered, Width * Height);
+        Require(paddedCovered != 0, "prepared vertex inputs: the zero-padded draw covers nothing, so comparing it proves nothing");
+        Print("zero-padded vertex fetch, unchanged inputs", paddedUnchanged);
+        Require(paddedUnchanged.prepared == 2 && paddedUnchanged.adopted == 2 && paddedUnchanged.copied == 0, "prepared vertex inputs: an unchanged draw did not adopt its prepared index copy and zero-padded vertex fetch");
+        const auto paddedMoved = DrawPrepared(*device, *padded, [] { WriteVertices(0.5f); }, false, PaddedIndices);
+        const auto paddedMovedPixels = Pixels;
+        Require(paddedMovedPixels != paddedPixels, "prepared vertex inputs: moving the vertices did not change the zero-padded draw, so comparing it proves nothing");
+        Print("zero-padded vertex fetch, vertices moved after preparation", paddedMoved);
+        Require(paddedMoved.adopted == 1 && paddedMoved.reprepared == 1 && paddedMoved.copied == 1, "prepared vertex inputs: a zero-padded vertex fetch the CPU wrote after preparation was adopted, or the untouched index range was not");
+        AgcDriver::Graphics::SetDrawInputPreparers(0);
+        Require(DrawInline(*device, *padded, 0.0f) == paddedPixels, "prepared vertex inputs: the draw with an adopted zero-padded vertex fetch differs from the same draw copied on the committer");
+        Require(DrawInline(*device, *padded, 0.5f) == paddedMovedPixels, "prepared vertex inputs: the draw whose zero-padded vertex fetch was prepared again differs from the same draw copied on the committer");
+        AgcDriver::Graphics::SetDrawInputPreparers(1);
 
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
