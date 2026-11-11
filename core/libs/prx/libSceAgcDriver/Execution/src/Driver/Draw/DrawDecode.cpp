@@ -37,7 +37,7 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
         reads.clear();
         return Graphics::DecodeVertexStageInfo(header, headerAddress, userData, &reads, false, hiddenUserWords);
     };
-    if (!DrawPipeline::Active()) return decode();
+    if (!DrawPipeline::SeesQueuedWrites()) return decode();
     auto& queue = DrawPipeline::Queue0();
     const auto watch = queue.WatchWrites();
     auto info = decode();
