@@ -414,6 +414,7 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    void SplitDirectWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>>& direct, std::vector<std::pair<std::uint64_t, std::uint64_t>>& other) const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -552,6 +553,7 @@ private:
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
+    bool directWrite(std::uint64_t begin, std::uint64_t end) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {

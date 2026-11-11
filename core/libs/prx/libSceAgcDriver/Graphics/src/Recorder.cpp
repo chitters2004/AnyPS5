@@ -3932,6 +3932,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    open->writeStamped.push_back(0);
     open->writeWords.push_back(word);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
@@ -3962,6 +3963,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
+    batch.writeStamped.push_back(0);
     batch.writeWords.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -4012,6 +4014,22 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
 
 void Recorder::NotePendingReach(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     notePendingRanges(ranges, ReachValue);
+}
+
+void Recorder::NoteStampedWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    const auto first = writeNoteCount + 1;
+    NotePendingWrites(ranges);
+    if (open == nullptr) return;
+    for (auto index = open->writeNotes.size(); index-- != 0 && open->writeNotes[index] >= first;) open->writeStamped[index] = 1;
+}
+
+void Recorder::StampNote(std::uint64_t note) {
+    if (note == 0 || open == nullptr) return;
+    for (auto index = open->writeNotes.size(); index-- != 0 && open->writeNotes[index] >= note;) {
+        if (open->writeNotes[index] != note) continue;
+        open->writeStamped[index] = 1;
+        return;
+    }
 }
 
 void Recorder::notePendingRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, int value) {
@@ -4110,6 +4128,25 @@ bool Recorder::PendingStoreOverlaps(std::uint64_t address, std::size_t bytes) co
 
 bool Recorder::OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     return bytes != 0 && open != nullptr && overlaps(*open, address, address + bytes);
+}
+
+std::uint64_t Recorder::UnstampedWriterSerial(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    const auto writes = [&](const Batch& batch) {
+        for (std::size_t index = 0; index < batch.writes.size(); ++index) {
+            const auto& [begin, finish] = batch.writes[index];
+            if (address >= finish || begin >= end) continue;
+            if (index < batch.writeStamped.size() && batch.writeStamped[index] != 0) continue;
+            return true;
+        }
+        return readOverlap(batch, address, end, ReadKind::AddressBased).has_value();
+    };
+    if (open != nullptr && writes(*open)) return OpenSerial();
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (writes(**it)) return (*it)->serial;
+    }
+    return 0;
 }
 
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes) const {

@@ -206,6 +206,8 @@ public:
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static constexpr std::int16_t ReachValue = -2;
     void NotePendingReach(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void NoteStampedWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void StampNote(std::uint64_t note);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     bool PendingStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
@@ -266,6 +268,7 @@ public:
     bool OpenWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
+    std::uint64_t UnstampedWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingLeaseSerial(std::uint64_t address, std::size_t bytes) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
@@ -681,6 +684,7 @@ private:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
+        std::vector<std::uint8_t> writeStamped;
         std::vector<std::int64_t> writeWords;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
         struct Read {

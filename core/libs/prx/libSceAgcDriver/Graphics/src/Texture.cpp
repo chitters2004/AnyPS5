@@ -151,6 +151,24 @@ std::atomic<std::uint64_t> refreshesProvedPendingKeys{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 std::atomic<std::uint64_t> guestSnapshots{0};
 
+struct FlushWaitCounters {
+    std::atomic<std::uint64_t> flushes{0}, ordered{0}, none{0}, stampedOnly{0}, unstamped{0};
+    std::atomic<std::uint64_t> stampedOnlyNanos{0}, unstampedNanos{0}, writeBackNanos{0}, publishNanos{0};
+    std::atomic<std::uint64_t> linear{0}, linearBytes{0}, tiled{0}, tiledBytes{0};
+};
+std::array<FlushWaitCounters, 2> flushWaitCounters;
+std::atomic<std::uint64_t> labelSweeps{0}, labelSweepNanos{0};
+thread_local bool labelStoreScope = false;
+
+bool ProfileFlushWaits() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void chargeNanos(std::atomic<std::uint64_t>& counter, std::chrono::steady_clock::time_point started) {
+    counter.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+}
+
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -213,6 +231,26 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    auto& label = flushWaitCounters[0];
+    auto& other = flushWaitCounters[1];
+    const auto ms = [](std::atomic<std::uint64_t>& counter) { return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / 1e6; };
+    const auto mib = [](std::atomic<std::uint64_t>& counter) { return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / 1048576.0; };
+    const auto sweeps = take(labelSweeps);
+    const auto sweepMs = ms(labelSweepNanos);
+    const auto flushes = std::array{take(label.flushes), take(other.flushes)};
+    const auto ordered = std::array{take(label.ordered), take(other.ordered)};
+    const auto none = std::array{take(label.none), take(other.none)};
+    const auto stampedOnly = std::array{take(label.stampedOnly), take(other.stampedOnly)};
+    const auto stampedOnlyMs = std::array{ms(label.stampedOnlyNanos), ms(other.stampedOnlyNanos)};
+    const auto unstamped = std::array{take(label.unstamped), take(other.unstamped)};
+    const auto unstampedMs = std::array{ms(label.unstampedNanos), ms(other.unstampedNanos)};
+    const auto writeBackMs = std::array{ms(label.writeBackNanos), ms(other.writeBackNanos)};
+    const auto publishMs = std::array{ms(label.publishNanos), ms(other.publishNanos)};
+    const auto linear = std::array{take(label.linear), take(other.linear)};
+    const auto linearMiB = std::array{mib(label.linearBytes), mib(other.linearBytes)};
+    const auto tiled = std::array{take(label.tiled), take(other.tiled)};
+    const auto tiledMiB = std::array{mib(label.tiledBytes), mib(other.tiledBytes)};
+    AgcDriver::ProfilePrint_nid_no_patch("[label-waits] (label readback stores / other flushes, 10 s) readback stores %llu in %.1f ms; flushes that store %llu/%llu: ordered skip %llu/%llu, no pending writer %llu/%llu, waited with only writers stamped when recorded %llu/%llu (%.1f/%.1f ms), waited for an unstamped writer or a lease %llu/%llu (%.1f/%.1f ms); writing back %.1f/%.1f ms, publishing %.1f/%.1f ms; images written back: linear %llu/%llu (%.1f/%.1f MiB), tiled %llu/%llu (%.1f/%.1f MiB)\n", sweeps, sweepMs, flushes[0], flushes[1], ordered[0], ordered[1], none[0], none[1], stampedOnly[0], stampedOnly[1], stampedOnlyMs[0], stampedOnlyMs[1], unstamped[0], unstamped[1], unstampedMs[0], unstampedMs[1], writeBackMs[0], writeBackMs[1], publishMs[0], publishMs[1], linear[0], linear[1], linearMiB[0], linearMiB[1], tiled[0], tiled[1], tiledMiB[0], tiledMiB[1]);
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -4351,7 +4389,7 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
         }
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
-        if (!imported.empty()) recorder->NotePendingWrites(imported);
+        if (!imported.empty()) recorder->NoteStampedWrites(imported);
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
@@ -4888,6 +4926,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
     recorder->NotePendingWrite(hullBegin, hullBytes);
+    recorder->StampNote(recorder->LastWriteNote(hullBegin, hullBytes));
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
     return storedBytes;
 }
@@ -5137,6 +5176,12 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         GpuOrderedSkipped() = true;
         orderedFlushSkips.fetch_add(1, std::memory_order_relaxed);
     }
+    auto& waitCounters = flushWaitCounters[labelStoreScope ? 0 : 1];
+    if (ProfileFlushWaits()) {
+        waitCounters.flushes.fetch_add(1, std::memory_order_relaxed);
+        if (orderedSkip) waitCounters.ordered.fetch_add(1, std::memory_order_relaxed);
+        else if (Recorder::Active() == nullptr || Recorder::InCompletion()) waitCounters.none.fetch_add(1, std::memory_order_relaxed);
+    }
     if (flushFailureForTest.exchange(false, std::memory_order_acq_rel)) {
         for (const auto& texture : flush) texture->reconcilePending();
         flushFailureFiredForTest.store(GpuOrderedFlush() ? 2 : 1, std::memory_order_release);
@@ -5158,16 +5203,17 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     for (const auto& range : LiveShadowedRanges(address, bytes, scope)) stored.push_back(range);
                 }
             };
-            const auto pendingWriter = [&](const Recorder& active) {
+            const auto leaseWriter = [&](const Recorder& active) -> std::uint64_t {
+                if (!publishes) return 0;
                 constexpr std::uint64_t block = 65536;
-                std::uint64_t writer = 0;
-                if (publishes) {
-                    constexpr auto top = std::numeric_limits<std::uint64_t>::max();
-                    const auto first = address / block * block;
-                    const auto end = bytes > top - address ? top : address + bytes;
-                    const auto last = end > top - block ? end : (end + block - 1) / block * block;
-                    writer = active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
-                }
+                constexpr auto top = std::numeric_limits<std::uint64_t>::max();
+                const auto first = address / block * block;
+                const auto end = bytes > top - address ? top : address + bytes;
+                const auto last = end > top - block ? end : (end + block - 1) / block * block;
+                return active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first));
+            };
+            const auto pendingWriter = [&](const Recorder& active) {
+                std::uint64_t writer = leaseWriter(active);
                 for (const auto& [begin, end] : stored) {
                     if (writer == active.OpenSerial()) break;
                     writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes));
@@ -5177,6 +5223,21 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             const auto openWrites = [&stored](const Recorder& active) {
                 return std::any_of(stored.begin(), stored.end(), [&active](const auto& range) { return active.OpenWriteOverlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
             };
+            std::atomic<std::uint64_t>* waitNanos = nullptr;
+            auto waitStarted = std::chrono::steady_clock::time_point{};
+            if (ProfileFlushWaits()) {
+                waitRanges();
+                if (pendingWriter(*recorder) == 0) {
+                    waitCounters.none.fetch_add(1, std::memory_order_relaxed);
+                } else if (leaseWriter(*recorder) != 0 || std::any_of(stored.begin(), stored.end(), [recorder](const auto& range) { return recorder->UnstampedWriterSerial(range.first, static_cast<std::size_t>(range.second - range.first)) != 0; })) {
+                    waitCounters.unstamped.fetch_add(1, std::memory_order_relaxed);
+                    waitNanos = &waitCounters.unstampedNanos;
+                } else {
+                    waitCounters.stampedOnly.fetch_add(1, std::memory_order_relaxed);
+                    waitNanos = &waitCounters.stampedOnlyNanos;
+                }
+                waitStarted = std::chrono::steady_clock::now();
+            }
             for (waitRanges(); pendingWriter(*recorder) != 0; waitRanges()) {
                 recorder->Reap();
                 waitRanges();
@@ -5189,6 +5250,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 if (writer == 0) break;
                 recorder->FinishUpTo(writer);
             }
+            if (waitNanos != nullptr) chargeNanos(*waitNanos, waitStarted);
         } catch (...) {
             for (const auto& texture : flush) texture->reconcilePending();
             throw;
@@ -5196,7 +5258,13 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     }
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
+    const auto writeBackStarted = ProfileFlushWaits() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& texture : flush) {
+        if (ProfileFlushWaits()) {
+            const bool linear = texture->descriptor.tileMode == TextureTileMode::kLinear;
+            (linear ? waitCounters.linear : waitCounters.tiled).fetch_add(1, std::memory_order_relaxed);
+            (linear ? waitCounters.linearBytes : waitCounters.tiledBytes).fetch_add(static_cast<std::uint64_t>(texture->guestBytes), std::memory_order_relaxed);
+        }
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
             // store re-registers the image for them).
@@ -5206,12 +5274,15 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     flushReason = previousReason;
+    if (ProfileFlushWaits()) chargeNanos(waitCounters.writeBackNanos, writeBackStarted);
     if (failure) std::rethrow_exception(failure);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
     if (scope != PublishScope::None) {
+        const auto publishStarted = ProfileFlushWaits() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
         if (units != 0) waitForIdlePublish(reason);
+        if (ProfileFlushWaits()) chargeNanos(waitCounters.publishNanos, publishStarted);
         if (published != nullptr) *published = units != 0;
     }
     return true;
@@ -5580,6 +5651,16 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         explicit OrderedScope(bool on) : previous(GpuOrderedFlush()) { GpuOrderedFlush() = previous || on; }
         ~OrderedScope() { GpuOrderedFlush() = previous; }
     } ordered{gpuOrdered};
+    struct LabelScope {
+        bool previous = std::exchange(labelStoreScope, true);
+        std::chrono::steady_clock::time_point started = ProfileFlushWaits() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~LabelScope() {
+            labelStoreScope = previous;
+            if (!ProfileFlushWaits()) return;
+            labelSweeps.fetch_add(1, std::memory_order_relaxed);
+            chargeNanos(labelSweepNanos, started);
+        }
+    } labelScope;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::size_t>> occasional;
     {
@@ -6048,6 +6129,15 @@ bool StorageTexture::skippedResultsInside(std::uint64_t address, std::size_t byt
 
 StorageTexture::HookSkipCounts StorageTexture::TakeHookSkipCounts() {
     return {flushedAfterSkip.exchange(0, std::memory_order_relaxed), flushedAfterSkipSameSite.exchange(0, std::memory_order_relaxed)};
+}
+
+std::array<StorageTexture::FlushWaitCounts, 2> StorageTexture::TakeFlushWaitCounts() {
+    std::array<FlushWaitCounts, 2> counts{};
+    for (std::size_t scope = 0; scope < counts.size(); ++scope) {
+        auto& counters = flushWaitCounters[scope];
+        counts[scope] = {counters.flushes.exchange(0, std::memory_order_relaxed), counters.ordered.exchange(0, std::memory_order_relaxed), counters.none.exchange(0, std::memory_order_relaxed), counters.stampedOnly.exchange(0, std::memory_order_relaxed), counters.unstamped.exchange(0, std::memory_order_relaxed)};
+    }
+    return counts;
 }
 
 StorageTexture::OrderedSkipCounts StorageTexture::TakeOrderedSkipCounts() {
@@ -7567,6 +7657,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            recorder->StampNote(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
         countStorageWriteBack(storedBytes, true, drawn.drawn);

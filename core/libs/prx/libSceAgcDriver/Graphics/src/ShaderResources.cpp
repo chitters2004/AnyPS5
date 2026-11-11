@@ -8079,7 +8079,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     }
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> directWrites, otherWrites;
+    guestMemory.SplitDirectWrites(directWrites, otherWrites);
+    recorder.NotePendingWrites(otherWrites);
+    recorder.NoteStampedWrites(directWrites);
     if (usesBda && !bdaReadOnly) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reachable;
         guestMemory.AddressStores(reachable);

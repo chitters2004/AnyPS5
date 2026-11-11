@@ -412,6 +412,14 @@ public:
         std::uint64_t refreshes;
     };
     static OrderedSkipCounts TakeOrderedSkipCounts();
+    struct FlushWaitCounts {
+        std::uint64_t flushes;
+        std::uint64_t ordered;
+        std::uint64_t none;
+        std::uint64_t stampedOnly;
+        std::uint64_t unstamped;
+    };
+    static std::array<FlushWaitCounts, 2> TakeFlushWaitCounts();
     static void SetFlushFailureForTest(bool fail);
     static int TakeFlushFailureForTest();
     static bool OrderedFlushArmedForTest();
