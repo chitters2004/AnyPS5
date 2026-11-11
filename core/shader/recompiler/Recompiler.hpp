@@ -1034,6 +1034,7 @@ void SetDebugProbeActive(bool active);
 [[nodiscard]] bool RayTracingStrict();
 [[nodiscard]] bool RayTracingMiss();
 [[nodiscard]] bool ExactF32Arithmetic();
+[[nodiscard]] bool DiagnosticNoNanRepair();
 
 struct RectListShaders {
     RecompileResult control;
