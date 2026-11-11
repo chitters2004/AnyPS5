@@ -3351,7 +3351,15 @@ enum class ColorMemoEvent {
     PostDepthInvalidated, DepthFallback, AvoidedRefreshLookups, Count
 };
 
-void noteColorMemo([[maybe_unused]] ColorMemoEvent event, [[maybe_unused]] std::uint64_t count = 1) {
+#ifdef TRACY_ENABLE
+constexpr bool TracingColorMemo = true;
+#else
+constexpr bool TracingColorMemo = false;
+#endif
+
+void noteColorMemo(ColorMemoEvent event, std::uint64_t count = 1) {
+    static_assert(static_cast<std::size_t>(CommitCounter::TargetMemoAvoidedRefreshLookups) - static_cast<std::size_t>(CommitCounter::TargetMemoAccept) + 1 == static_cast<std::size_t>(ColorMemoEvent::Count), "every target memo event has a commit counter");
+    CountCommit(static_cast<CommitCounter>(static_cast<std::size_t>(CommitCounter::TargetMemoAccept) + static_cast<std::size_t>(event)), count);
 #ifdef TRACY_ENABLE
     static constexpr std::array names{
         "ColorMemo.Accept", "ColorMemo.AcceptWithDepthMiss", "ColorMemo.Miss.Invalid",
@@ -3369,7 +3377,7 @@ void noteColorMemo([[maybe_unused]] ColorMemoEvent event, [[maybe_unused]] std::
 
 bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     if (before == after) return true;
-#ifdef TRACY_ENABLE
+    if (!TracingColorMemo && !CommitPhasesEnabled()) return false;
     const auto note = [&](bool changed, ColorMemoEvent event) { if (changed) noteColorMemo(event); };
     note(before.epoch != after.epoch, ColorMemoEvent::Epoch);
     note(before.proofs != after.proofs, ColorMemoEvent::Proofs);
@@ -3381,7 +3389,6 @@ bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     note(before.claims != after.claims, ColorMemoEvent::Claims);
     note(before.recorder != after.recorder, ColorMemoEvent::Recorder);
     note(before.device != after.device, ColorMemoEvent::Device);
-#endif
     return false;
 }
 
@@ -3585,7 +3592,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     static_cast<void>(ownsTargetMemo(ThreadTargetMemo()));
     const auto targetProof = currentTargetProof(context);
     auto admissionProof = targetProof;
-    bool repeatedColors = repeatColors(context, state, targetProof, targets, targetViews);
+    bool repeatedColors = InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatColors(context, state, targetProof, targets, targetViews); });
     const auto prepareColors = [&] {
         targets.clear();
         targets.resize(state.colors.size());
@@ -3728,7 +3735,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         noteColorMemo(ColorMemoEvent::DepthFallback);
         return InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
     };
-    auto depthView = repeatDepth(context, state, repeatedColors ? &targetProof : nullptr);
+    auto depthView = InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatDepth(context, state, repeatedColors ? &targetProof : nullptr); });
     bool repeatedDepth = state.depth && depthView != VK_NULL_HANDLE;
     if (state.depth && !repeatedDepth) depthView = prepareDepth();
     if (repeatedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !colorProofMatches(targetProof, currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.resident->Cached(); }))) {
@@ -3746,9 +3753,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         noteColorMemo(ColorMemoEvent::Accept);
         if (state.depth && !repeatedDepth) noteColorMemo(ColorMemoEvent::AcceptWithDepthMiss);
-#ifdef TRACY_ENABLE
-        if (!VerifyTargetMemo()) noteColorMemo(ColorMemoEvent::AvoidedRefreshLookups, targets.size());
-#endif
+        if ((TracingColorMemo || CommitPhasesEnabled()) && !VerifyTargetMemo()) noteColorMemo(ColorMemoEvent::AvoidedRefreshLookups, targets.size());
     }
     if ((repeatedColors || repeatedDepth) && VerifyTargetMemo()) {
         const auto verifyProof = currentTargetProof(context);

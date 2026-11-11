@@ -54,6 +54,7 @@ enum class CommitPhase : std::uint8_t {
     TargetsLookupPure,
     TargetsLookupGuards,
     TargetsLookupCache,
+    TargetsMemo,
     Count
 };
 
@@ -109,6 +110,26 @@ enum class CommitCounter : std::uint8_t {
     TargetEpochOtherThread,
     TargetEpochThisThread,
     TargetEpochExitStamps,
+    TargetMemoAccept,
+    TargetMemoAcceptWithDepthMiss,
+    TargetMemoInvalid,
+    TargetMemoDescriptor,
+    TargetMemoResident,
+    TargetMemoDepthOverlap,
+    TargetMemoEpoch,
+    TargetMemoProofs,
+    TargetMemoPending,
+    TargetMemoUnwatch,
+    TargetMemoAllocations,
+    TargetMemoSurfaces,
+    TargetMemoReleased,
+    TargetMemoClaims,
+    TargetMemoRecorder,
+    TargetMemoDevice,
+    TargetMemoMetadata,
+    TargetMemoPostDepthInvalidated,
+    TargetMemoDepthFallback,
+    TargetMemoAvoidedRefreshLookups,
     Count
 };
 
