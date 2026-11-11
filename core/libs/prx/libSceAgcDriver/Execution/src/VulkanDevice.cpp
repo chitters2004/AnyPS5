@@ -4684,6 +4684,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.depthRangeRemap = !state->depthRangeUnrestricted;
     target.fixedPushSlots = state->graphicsPipelineLibrary;
     target.registrationModules = state->graphicsPipelineLibrary;
+    if (std::getenv("APS5_SPECIALIZED_FRAGMENTS") != nullptr) target.registrationWordLimit = 0u;
     target.robustBufferAccess2 = state->robustBufferAccess2;
     target.exactRobustLoads = state->exactRobustLoads;
     target.waveLdsMemoryBarriers = !state->subgroupControlBarriers;
