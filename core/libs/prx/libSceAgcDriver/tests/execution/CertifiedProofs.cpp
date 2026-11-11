@@ -27,8 +27,10 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <stdexcept>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <span>
 #include <string>
 #include <vector>
@@ -512,6 +514,173 @@ void Verified(AgcDriver::VulkanDevice& device) {
     Require(total.verified >= 2 && total.disagreed == 0, "verify: expected the full proof beside every 64th certified draw to agree (" + std::to_string(total.verified) + " checked, " + std::to_string(total.disagreed) + " disagreed)");
 }
 
+
+struct OracleScene {
+    Scene* scene = nullptr;
+    std::array<float, Images> values{};
+    std::uint32_t selected = Key;
+    bool unwatched = false;
+    bool readOnly = false;
+};
+
+struct OracleFailure : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+
+std::uint64_t OracleSeed() {
+    if (const char* seed = std::getenv("APS5_ORACLE_SEED"); seed != nullptr) return std::strtoull(seed, nullptr, 0);
+    return 0x5eedu;
+}
+
+std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun) {
+    std::mt19937_64 random(seed);
+    const auto pick = [&](std::uint32_t count) { return static_cast<std::uint32_t>(random() % count); };
+    std::vector<OracleScene> scenes;
+    const auto fresh = [&] {
+        OracleScene oracle;
+        oracle.scene = &NewScene();
+        Build(device, *oracle.scene);
+        for (std::uint32_t image = 0; image < Images; ++image) oracle.values[image] = image == Key ? 1.0f : 0.0f;
+        return oracle;
+    };
+    for (int i = 0; i < scenesPerRun; ++i) scenes.push_back(fresh());
+    std::uint64_t warmed = 0;
+    const auto block = [](float* texels) { return reinterpret_cast<std::uintptr_t>(texels) & ~static_cast<std::uintptr_t>(BlockBytes - 1); };
+    const auto flipMapping = [](OracleScene& oracle) {
+        oracle.readOnly = !oracle.readOnly;
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(oracle.scene->textures.base);
+        mutation.Add(oracle.scene->textures.base, oracle.scene->textures.bytes, true, !oracle.readOnly, true);
+    };
+    const auto check = [&](OracleScene& oracle, int step, const char* event, int draw, bool newEpoch) {
+        const auto outcome = Draw(device, *oracle.scene, newEpoch);
+        if (std::getenv("APS5_ORACLE_TRACE") != nullptr) std::printf("oracle %d %s draw %d %s: %s\n", step, event, draw, newEpoch ? "new" : "same", outcome.Describe().c_str());
+        const unsigned expected = oracle.values[oracle.selected] != 0.0f ? 255u : 0u;
+        if (outcome.brightest != expected || outcome.counts.disagreed != 0) {
+            throw OracleFailure("oracle: seed " + std::to_string(seed) + " step " + std::to_string(step) + " event " + event + " draw " + std::to_string(draw) + (newEpoch ? " (new epoch)" : " (same epoch)") + ": sampled " + std::to_string(outcome.brightest) + " instead of " + std::to_string(expected) + " (" + outcome.Describe() + ")");
+        }
+    };
+    for (int step = 0; step < steps; ++step) {
+        const auto chosen = pick(static_cast<std::uint32_t>(scenes.size()));
+        if (scenes[chosen].unwatched) {
+            if (scenes[chosen].readOnly) flipMapping(scenes[chosen]);
+            scenes[chosen] = fresh();
+        }
+        auto& oracle = scenes[chosen];
+        auto& scene = *oracle.scene;
+        const bool warm = Certify(device, scene).counts.proved == 1;
+        warmed += warm ? 1u : 0u;
+        const auto other = [&] {
+            auto image = pick(Images);
+            if (image == oracle.selected) image = (image + 1) % Images;
+            return image;
+        };
+        const char* event = "";
+        bool cpuWrite = false;
+        switch (pick(9)) {
+        case 0:
+        case 1: {
+            event = "cpu write to the sampled texture";
+            if (oracle.readOnly) flipMapping(oracle);
+            oracle.values[oracle.selected] = oracle.values[oracle.selected] != 0.0f ? 0.0f : 1.0f;
+            Fill(scene.Texels(oracle.selected), oracle.values[oracle.selected]);
+            cpuWrite = true;
+            break;
+        }
+        case 2: {
+            event = "cpu write to another texture";
+            if (oracle.readOnly) flipMapping(oracle);
+            const auto image = other();
+            oracle.values[image] = pick(2) == 0 ? 0.0f : 1.0f;
+            Fill(scene.Texels(image), oracle.values[image]);
+            cpuWrite = true;
+            break;
+        }
+        case 3: {
+            event = "cpu write beside the sampled texture";
+            if (oracle.readOnly) flipMapping(oracle);
+            auto* beside = reinterpret_cast<float*>(reinterpret_cast<std::uint8_t*>(scene.Texels(oracle.selected)) + 4096u * (1u + pick(8)));
+            std::fill_n(beside, 256, static_cast<float>(pick(3)));
+            cpuWrite = true;
+            break;
+        }
+        case 4:
+        case 5: {
+            event = "driver store";
+            if (oracle.readOnly) flipMapping(oracle);
+            const auto image = pick(2) == 0 ? oracle.selected : other();
+            oracle.values[image] = oracle.values[image] != 0.0f ? 0.0f : 1.0f;
+            Fill(scene.Texels(image), oracle.values[image]);
+            GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.Texels(image)), TexelWidth * TexelHeight * 4u);
+            cpuWrite = true;
+            break;
+        }
+        case 6: {
+            event = "unwatch, then a write to the sampled texture";
+            GuestMemory::Unwatch(block(scene.Texels(oracle.selected)), BlockBytes);
+            oracle.unwatched = true;
+            oracle.values[oracle.selected] = oracle.values[oracle.selected] != 0.0f ? 0.0f : 1.0f;
+            if (oracle.readOnly) flipMapping(oracle);
+            Fill(scene.Texels(oracle.selected), oracle.values[oracle.selected]);
+            break;
+        }
+        case 7: {
+            event = "a write to the sampled texture, then a mapping change";
+            if (oracle.readOnly) flipMapping(oracle);
+            oracle.values[oracle.selected] = oracle.values[oracle.selected] != 0.0f ? 0.0f : 1.0f;
+            Fill(scene.Texels(oracle.selected), oracle.values[oracle.selected]);
+            flipMapping(oracle);
+            break;
+        }
+        case 8: {
+            event = "texture release";
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            AgcDriver::Graphics::ClearCachedTextures(device.Device());
+            break;
+        }
+        default: {
+            event = "depth surfaces change";
+            AgcDriver::Graphics::ClearDepthSurfaces(device.Device());
+            break;
+        }
+        }
+        check(oracle, step, event, 0, cpuWrite || pick(2) == 0);
+        if (pick(3) == 0) check(oracle, step, event, 1, pick(2) == 0);
+    }
+    for (auto& oracle : scenes) {
+        if (oracle.readOnly) flipMapping(oracle);
+    }
+    return warmed;
+}
+
+void Oracle(AgcDriver::VulkanDevice& device) {
+    const auto seed = OracleSeed();
+    constexpr int steps = 160;
+    const auto warmed = RunOracle(device, seed, steps, 3);
+    Require(warmed * 4 >= steps * 3, "oracle: only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
+    std::printf("certified proofs: oracle seed %llu, %llu of %d events met a live certificate\n", static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps);
+}
+
+void Mutants(AgcDriver::VulkanDevice& device) {
+    using GuestMemory::CertificateMutant;
+    constexpr std::array<std::pair<CertificateMutant, const char*>, 3> mutants{{{CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}}};
+    for (const auto& [mutant, name] : mutants) {
+        GuestMemory::SetCertificateMutantForTest(mutant);
+        std::string caught;
+        try {
+            RunOracle(device, OracleSeed(), 160, 3);
+        } catch (const OracleFailure& failure) {
+            caught = failure.what();
+        }
+        GuestMemory::SetCertificateMutantForTest(CertificateMutant::None);
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            AgcDriver::Graphics::ClearCachedTextures(device.Device());
+        }
+        Require(!caught.empty(), std::string("mutants: the oracle did not catch ") + name);
+        std::printf("certified proofs: mutant caught, %s: %s\n", name, caught.c_str());
+    }
+}
 }
 
 int main(int argc, char** argv) {
@@ -533,7 +702,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 13> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 15> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
