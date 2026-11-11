@@ -225,6 +225,8 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::vector<VkDescriptorBufferInfo> writtenBuffers;
+        std::vector<VkDescriptorImageInfo> writtenImages;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -344,7 +346,18 @@ public:
         std::uint64_t calls, visited, written, notDirect, pendingWrite, overBudget, overrides, unwritten, uploaded, reused, created, setsWritten, repeated, identical, slotsDiffer;
     };
     static BindingCounts DrawBindingCounts();
-    void MarkReboundForTest() { rebound = true; }
+    struct BindingReuseCounts {
+        std::uint64_t reused, fresh, legacy, first, newBatch, generation, faultRecord, overrideWords, slotChanged, expired, nanoseconds;
+    };
+    static BindingReuseCounts DrawBindingReuseCounts();
+    static bool CompiledBindingsEnabled();
+    void NoteBindingsChangedForTest() const { noteBindingsChanged(); }
+    bool CompareBindingDecisionsForTest(std::span<const MovedBuffer> moved, bool movedOnly, std::string& difference) const;
+    void MarkReboundForTest() {
+        rebound = true;
+        noteBindingsChanged();
+    }
+    bool BindingsCompiled() const { return compiledBindings != nullptr; }
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
@@ -680,6 +693,28 @@ private:
     std::unique_ptr<BdaResources> bda;
     struct EffectInputs;
     struct BindingInputs;
+    struct CompiledBindings;
+    std::unique_ptr<const CompiledBindings> compiledBindings;
+    mutable std::uint64_t bindingGeneration = 1;
+    struct BindingReuse;
+    mutable std::unique_ptr<BindingReuse> bindingReuse;
+    struct BindingDecision {
+        std::size_t allocation = 0;
+        const MovedBuffer* override = nullptr;
+        std::uint64_t begin = 0;
+        std::size_t bytes = 0;
+        bool words = false;
+        bool operator==(const BindingDecision&) const = default;
+    };
+    void compileBindings();
+    void describeDrawSets(std::array<bool, 2>& described, std::array<std::vector<VkDescriptorPoolSize>, 2>& sizes, std::array<std::optional<std::uint32_t>, 2>& variable) const;
+    void noteBindingsChanged() const;
+    void decideBindingsLegacy(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const;
+    void decideBindingsCompiled(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const;
+    std::string bindingDecisionDifference(std::span<const BindingDecision> compiled, std::span<const BindingDecision> legacy) const;
+    std::shared_ptr<DrawBindings> reuseDrawBindings(const Recorder& recorder, const DrawBindings& candidate, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool words) const;
+    void rememberDrawBindings(const Recorder& recorder, const std::shared_ptr<DrawBindings>& bindings, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void verifyReusedBindings(const DrawBindings& reused, DrawBindings& fresh, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     mutable std::unique_ptr<BindingInputs> bindingInputs;
     std::unique_ptr<EffectInputs> effectInputs;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
@@ -729,7 +764,7 @@ private:
     };
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool capture = false) const;
     void noteDrawBindings(const Recorder& recorder, BindingCounts tally, std::span<const std::size_t> selected, const DrawBindings* result, bool written) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;

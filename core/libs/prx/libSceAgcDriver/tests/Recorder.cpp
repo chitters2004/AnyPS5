@@ -13679,6 +13679,159 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
     std::cout << "slice dirty marking: ok\n";
 }
 
+void compiledBindingsTests(const Device& device) {
+    Require(ShaderResources::CompiledBindingsEnabled(), "compiled bindings tests run with APS5_COMPILED_BINDINGS or APS5_VERIFY_COMPILED_BINDINGS");
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: compiled bindings not tested\n";
+        std::exit(77);
+    }
+    constexpr std::size_t bytes = 262144;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: compiled bindings not tested\n";
+        std::exit(77);
+    }
+    const auto descriptorWords = [](std::uint64_t base, std::uint32_t size) { return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u) & 0xffffu, size, 0x31000000u}; };
+    std::mt19937_64 random(0x5eed0c0bull);
+    const auto below = [&](std::uint64_t limit) { return limit == 0 ? std::uint64_t{0} : random() % limit; };
+    const std::array<std::uint32_t, 8> wordValues{1, 2, 3, 4, 5, 6, 7, 8};
+    std::size_t decisionsCompared = 0;
+    for (std::size_t trial = 0; trial < 48; ++trial) {
+        ShaderRecompiler::RecompileResult program;
+        const auto bindingCount = 1 + below(3);
+        std::size_t elements = 0;
+        for (std::uint32_t index = 0; index < bindingCount; ++index) {
+            ShaderRecompiler::DescriptorBinding binding;
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+            binding.descriptorSet = 0;
+            binding.binding = index;
+            binding.count = static_cast<std::uint32_t>(1 + below(5));
+            for (std::uint32_t element = 0; element < binding.count; ++element) {
+                const auto offset = 4096 + below(bytes - 32768) / 256 * 256;
+                const auto size = static_cast<std::uint32_t>(4 + below(12288));
+                const auto words = descriptorWords(address + offset, size);
+                binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+                binding.bufferWritten.push_back(below(4) == 0);
+            }
+            elements += binding.count;
+            program.bindings.push_back(binding);
+        }
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, compute);
+        Require(resources.BindingsCompiled(), "a completed template's bindings were not compiled");
+        for (std::size_t round = 0; round < 64; ++round) {
+            std::vector<ShaderResources::MovedBuffer> moved;
+            const auto count = below(7);
+            for (std::size_t entry = 0; entry < count; ++entry) {
+                const auto allocation = static_cast<std::size_t>(below(elements + 3));
+                if (below(3) == 0) moved.push_back({allocation, 0, 4 * (1 + below(wordValues.size())), std::span<const std::uint32_t>(wordValues.data(), 1 + below(wordValues.size()))});
+                else moved.push_back({allocation, address + 4096 + below(bytes - 32768), static_cast<std::size_t>(below(12288)), {}});
+            }
+            std::string difference;
+            Require(resources.CompareBindingDecisionsForTest(moved, below(4) == 0, difference), "compiled binding decisions differ from the per-draw walk: " + difference);
+            ++decisionsCompared;
+        }
+    }
+    constexpr std::size_t inputBytes = 8192;
+    const auto first = address + 16384;
+    const auto second = address + 65536;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 2;
+    for (const auto base : {first, second}) {
+        const auto words = descriptorWords(base, inputBytes);
+        binding.guestDescriptor.insert(binding.guestDescriptor.end(), words.begin(), words.end());
+        binding.bufferWritten.push_back(false);
+    }
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache cache(snapshotContext);
+    snapshotContext.descriptorCache = &cache;
+    {
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        const auto sameSlots = [](const ShaderResources::DrawBindings& left, const ShaderResources::DrawBindings& right) {
+            return left.snapshots.size() == right.snapshots.size() && std::equal(left.snapshots.begin(), left.snapshots.end(), right.snapshots.begin(), [](const auto& a, const auto& b) { return a.buffer == b.buffer && a.offset == b.offset && a.bytes == b.bytes; });
+        };
+        const auto before = ShaderResources::DrawBindingReuseCounts();
+        const auto drawn = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(drawn != nullptr && drawn->snapshots.size() == 2 && drawn->allocation.set != VK_NULL_HANDLE, "the first draw did not snapshot both inputs");
+        const auto repeated = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(repeated != nullptr && sameSlots(*drawn, *repeated), "an unchanged input was snapshotted again into a different slot");
+        Require(repeated == drawn, "a draw in the same batch with the same template and snapshots did not reuse the set");
+        const auto heldSet = drawn->allocation.set;
+        const auto heldBuffer = drawn->snapshots[0].buffer;
+        const auto heldOffset = drawn->snapshots[0].offset;
+        std::memset(reinterpret_cast<void*>(first), 0x22, inputBytes);
+        AgcDriver::GuestMemory::MarkWritten(first, inputBytes);
+        const auto changed = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(changed != nullptr && changed != drawn && changed->allocation.set != heldSet, "a draw with a changed snapshot reused the set of the draw before it");
+        Require(drawn->allocation.set == heldSet && drawn->snapshots[0].buffer == heldBuffer && drawn->snapshots[0].offset == heldOffset, "a set already bound by an earlier draw was rewritten in place");
+        Require(!sameSlots(*drawn, *changed), "a changed input kept its old snapshot slot");
+        const auto again = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(again == changed, "an unchanged draw after a changed one did not reuse the changed set");
+        resources.NoteBindingsChangedForTest();
+        const auto rebuilt = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebuilt != nullptr && rebuilt != changed && rebuilt->allocation.set != changed->allocation.set, "a set written before the template's descriptors changed was reused");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == rebuilt, "the draw after a template change did not reuse the set written after it");
+        const std::array<std::uint32_t, 4> overrideWords{9, 10, 11, 12};
+        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, sizeof(overrideWords), overrideWords}}};
+        const auto overridden = resources.PrepareDrawBindings(snapshotRecorder, moved);
+        const auto overriddenAgain = resources.PrepareDrawBindings(snapshotRecorder, moved);
+        Require(overridden != nullptr && overriddenAgain != nullptr && overridden != overriddenAgain && overridden != rebuilt, "a draw whose input words were uploaded reused a set");
+        const auto lastOfBatch = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(lastOfBatch != nullptr && lastOfBatch != overriddenAgain, "a plain draw after an uploaded one reused the uploaded one's set");
+        const auto lastSet = lastOfBatch->allocation.set;
+        snapshotRecorder.Submit();
+        const auto nextBatch = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(nextBatch != nullptr && nextBatch != lastOfBatch && nextBatch->allocation.set != lastSet, "a set kept by a submitted batch was reused by the next batch");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nextBatch, "the second draw of a new batch did not reuse the first one's set");
+        const auto after = ShaderResources::DrawBindingReuseCounts();
+        Require(after.first - before.first == 1, "the template's first draw was not counted as first");
+        Require(after.reused - before.reused == 4, "reused sets were not counted");
+        Require(after.slotChanged - before.slotChanged >= 2, "draws with changed snapshots were not counted as slot changes");
+        Require(after.generation - before.generation == 1, "the draw after a template change was not counted as a generation miss");
+        Require(after.overrideWords - before.overrideWords >= 1, "a draw with uploaded words was not counted as an override miss");
+        Require(after.newBatch - before.newBatch == 1, "the first draw of a new batch was not counted as a new batch");
+        Require(after.fresh - before.fresh == 7, "fresh sets were not counted");
+        Require(after.legacy == before.legacy, "a compiled template took the per-draw walk");
+        snapshotRecorder.Sync();
+    }
+    {
+        Recorder snapshotRecorder(snapshotContext);
+        snapshotRecorder.Activate();
+        ShaderResources resources(snapshotContext, compute);
+        snapshotRecorder.NotePendingWrite(first, inputBytes);
+        snapshotRecorder.NotePendingWrite(second, inputBytes);
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "a draw with every input behind a pending write was given a set");
+        resources.MarkReboundForTest();
+        const auto rebound = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(rebound != nullptr && rebound->snapshots.empty() && rebound->allocation.set != VK_NULL_HANDLE, "a rebound draw with no snapshot did not get its own set");
+        Require(resources.PrepareDrawBindings(snapshotRecorder) == rebound, "a second rebound draw with no snapshot did not reuse the set");
+        snapshotRecorder.Sync();
+    }
+    std::cout << "compiled bindings: " << decisionsCompared << " randomized decision walks matched the per-draw walk\n";
+}
+
 void markRepeatTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     constexpr std::uint32_t side = 128;
@@ -16061,6 +16214,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--resource-read-only") {
             resourceReadTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--compiled-bindings-only") {
+            compiledBindingsTests(device);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {
