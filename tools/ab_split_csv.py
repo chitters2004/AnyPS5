@@ -8,14 +8,18 @@ import ab_split
 
 COLUMNS = ("config", "phases", "metric", "a", "b", "change", "change_pct",
            "noise_mean", "noise_se", "noise_sd", "noise_n")
+ARM_COLUMNS = ("config", "phases", "metric", "arm", "a", "a_phases", "a_sd", "b", "b_phases", "b_sd", "change", "change_pct",
+               "noise_mean", "noise_se", "noise_sd", "noise_n")
 
 
 def render(result):
+    arms = len(result.get("arms", "AB")) > 2
     output = io.StringIO(newline="")
-    writer = csv.DictWriter(output, fieldnames=COLUMNS)
+    writer = csv.DictWriter(output, fieldnames=ARM_COLUMNS if arms else COLUMNS)
     writer.writeheader()
     for metric in result["metrics"]:
-        row = {key: metric[key] for key in ("metric", "a", "b", "change", "change_pct")}
+        keys = ("metric", "arm", "a", "a_phases", "a_sd", "b", "b_phases", "b_sd", "change", "change_pct") if arms else ("metric", "a", "b", "change", "change_pct")
+        row = {key: metric[key] for key in keys}
         row.update(config=result["config"], phases=len(result["phases"]))
         noise = metric["noise"] or {}
         row.update({"noise_" + key: noise.get(key) for key in ("mean", "se", "sd", "n")})
