@@ -2664,11 +2664,33 @@ void CollectView(std::uintptr_t view) {
     static_cast<void>(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(view, Block, [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(count) += (end - begin) / 4096; }, &pages));
 }
 
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> CollectRuns(std::uintptr_t view) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    Require(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(view, Block, [](void* found, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(found)->emplace_back(begin, end); }, &runs), "cannot collect a shared view");
+    return runs;
+}
+
+bool Reports(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& runs, std::uintptr_t address) {
+    return std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first <= address && address < run.second; });
+}
+
+void CheckAliasAfterConsumedWrite(std::size_t writer, std::size_t other) {
+    SharedViews views(2);
+    for (const auto view : views.views) static_cast<void>(CollectRuns(view));
+    reinterpret_cast<volatile std::uint8_t*>(views.views[writer])[0x80] = 0x6b;
+    Require(Reports(CollectRuns(views.views[writer]), views.views[writer] + 0x80), "a write through an unaliased view was not reported at that view");
+    Require(views.Alias(writer, other), "cannot alias the shared views");
+    Require(Reports(CollectRuns(views.views[other]), views.views[other] + 0x80), "a write consumed at one view before an alias was never reported at the other view");
+    Require(CollectRuns(views.views[other]).empty() && CollectRuns(views.views[writer]).empty(), "the views of a new alias are reported again after their first collect");
+}
+
 void RequireWaited(int seen, const std::string& what) {
     Require((seen & ChangeWaited) != 0 && (seen & ChangeDone) == 0, what + " did not wait for an overlapping scan");
 }
 
 void CheckMappingChanges() {
+    CheckAliasAfterConsumedWrite(0, 1);
+    CheckAliasAfterConsumedWrite(1, 0);
     {
         SharedViews views(2);
         RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { Require(views.Alias(0, 1), "cannot alias the shared views"); }), "an alias of the scanned view");
