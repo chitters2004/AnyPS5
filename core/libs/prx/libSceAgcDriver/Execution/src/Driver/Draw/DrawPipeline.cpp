@@ -192,6 +192,11 @@ HandoffSite& DrainSite() {
     return site;
 }
 
+bool CommitsReported() {
+    static const bool reported = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return reported;
+}
+
 }
 
 bool DrawFinisher::OnFinisherThread() {
@@ -482,7 +487,8 @@ void DrawPipeline::run() {
             lock.unlock();
             PerformanceTrace::Handoff(CommitterSite(), spin);
         }
-        const auto start = std::chrono::steady_clock::now();
+        const bool reported = CommitsReported();
+        const auto start = reported ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -498,22 +504,24 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        const auto spent = elapsedNs(start);
+        const auto spent = reported ? elapsedNs(start) : 0;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
         std::unique_lock lock(mutex);
         countWrites(items.front().writes, false);
-        const auto kindIndex = static_cast<std::size_t>(items.front().kind);
-        kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
-        kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+        if (reported) {
+            const auto kindIndex = static_cast<std::size_t>(items.front().kind);
+            kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
+            kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+            ++commits;
+            commitNs += spent;
+            if (failed) ++commitErrors;
+        }
         retired.push_back(std::move(items.front()));
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        commitNs += spent;
-        if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
         const bool wakeIdle = idleWaiters != 0 && (items.empty() || items.size() <= resumeAt);
