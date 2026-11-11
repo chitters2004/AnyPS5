@@ -157,12 +157,12 @@ std::uint64_t HashWords(std::span<const std::uint64_t> words) {
 
 }
 
-ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, std::uint32_t pushOffset, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertexInfo, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
+ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, std::uint32_t pushOffset, const Graphics::State& graphics, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
     using Stage = ShaderRecompiler::ShaderStage;
     const auto waveSize = Graphics::StageWaveSize(graphics.stages, program.binary.stage);
     ShaderRecompiler::RecompileRequest request{
         program.binary,
-        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfo, memory, RegisteredFloatMode(*program.snapshot)},
+        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, std::nullopt, std::nullopt, memory, RegisteredFloatMode(*program.snapshot)},
         target,
         {0, 0, pushOffset, Graphics::StagePushLimit(graphics.stages, pushOffset, graphics.depthRemap.mode != 0u) - pushOffset % Graphics::PipelinePushSlotBytes},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(graphics.stages, program.binary.stage), graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? meshBarycentrics : std::nullopt}
@@ -174,6 +174,10 @@ ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, 
 }
 
 bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, DrawStageKey& key) {
+    return BuildDrawStageKey(request, request.context.pixel ? &*request.context.pixel : nullptr, request.context.vertex ? &*request.context.vertex : nullptr, snapshot, codeOffset, deviceSerial, key);
+}
+
+bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::ShaderPixelStageInfo* pixel, const ShaderRecompiler::ShaderVertexStageInfo* vertex, const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, DrawStageKey& key) {
     key.words.clear();
     key.hash = 0;
     if (!request.useCache || !request.graphics || request.graphics->meshBarycentrics || !request.context.linkedCallFallbacks.empty()) return false;
@@ -191,8 +195,10 @@ bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const 
     write(context.userDataBaseRegister);
     write(context.userData);
     write(context.compute);
-    write(context.pixel);
-    write(context.vertex);
+    write(pixel != nullptr);
+    if (pixel != nullptr) write(*pixel);
+    write(vertex != nullptr);
+    if (vertex != nullptr) write(*vertex);
     write(context.floatMode);
     write(context.convertedSamples);
     write(context.layerRowSamples);
@@ -428,12 +434,14 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
         if (profile) nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
     };
     const auto& program = programs[i];
-    auto request = DrawStageRequest(program, pushOffset, graphics, pixel, vertexInfos[i], {}, {}, drawParameters, localDevice->Target(), std::nullopt);
+    auto request = DrawStageRequest(program, pushOffset, graphics, {}, {}, drawParameters, localDevice->Target(), std::nullopt);
     ApplyPreparedSampleModes(*program.snapshot, program.codeOffset, request.context);
+    const auto* stagePixel = program.binary.stage == ShaderRecompiler::ShaderStage::Fragment ? &pixel : nullptr;
+    const auto* stageVertex = vertexInfos[i] ? &*vertexInfos[i] : nullptr;
     thread_local DrawStageKey* keySlot = nullptr;
     auto& key = ShaderRecompiler::ThreadOwned(keySlot);
     drawStageMemoCounters.lookups.fetch_add(1, std::memory_order_relaxed);
-    if (!BuildDrawStageKey(request, *program.snapshot, program.codeOffset, localDevice->Serial(), key)) {
+    if (!BuildDrawStageKey(request, stagePixel, stageVertex, *program.snapshot, program.codeOffset, localDevice->Serial(), key)) {
         drawStageMemoCounters.refused.fetch_add(1, std::memory_order_relaxed);
         charge(drawStageMemoCounters.missNanoseconds);
         return nullptr;
