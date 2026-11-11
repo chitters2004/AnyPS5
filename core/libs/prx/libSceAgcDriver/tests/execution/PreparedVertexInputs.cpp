@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -29,6 +30,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -367,6 +376,35 @@ int main() {
         Require(fresh[1] == 0 && fresh[2] == 0, "prepared vertex inputs: staging buffers were recycled with APS5_NO_DRAW_INPUT_RECYCLING set");
         const auto afterRecycling = DrawPrepared(*device, *programs, [] {});
         Require(afterRecycling.adopted == 2 && afterRecycling.covered, "prepared vertex inputs: a draw whose copies were staged in recycled buffers did not adopt both or drew wrong");
+        {
+            const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+            const auto hitKey = AgcDriver::Graphics::DrawResourceCacheKey(context, epochState, epochDraw, programs->shaders);
+            Require(!hitKey.empty(), "prepared vertex inputs: the draw has no resource cache key, so a cache hit cannot be predicted for it");
+            bool predicted = true;
+            auto cachedBuild = AgcDriver::Graphics::PrepareDrawResourcesOffDevice(context, epochState, epochDraw, programs->shaders, {}, predicted);
+            Require(!predicted && cachedBuild != nullptr, "prepared vertex inputs: a cache hit was predicted for a key the resource cache does not hold");
+            auto& cache = AgcDriver::Graphics::SharedResourceCache();
+            cache.Insert(hitKey, cachedBuild);
+            Require(cache.Peek(hitKey) != nullptr, "prepared vertex inputs: the resource cache refused the entry the predicted hit needs");
+            const auto findsBefore = AgcDriver::Graphics::ResourceCache::Finds();
+            const auto touchesBefore = AgcDriver::Graphics::ResourceCache::Touches();
+            const auto uploadsBefore = AgcDriver::Graphics::PreparedUploadCounters();
+            {
+                auto job = device->PrepareDrawResourcesAhead(nullptr, epochState, epochDraw, programs->shaders, {}, (std::uint64_t{1} << 62u) + 12u);
+                Require(job != nullptr, "prepared vertex inputs: the draw's resources were not queued for preparation");
+                const auto pin = std::make_shared<int>(0);
+                AgcDriver::Graphics::SubmitPreparedDrawResources(job, pin);
+                AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+                const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+            }
+            const auto uploadsAfter = AgcDriver::Graphics::PreparedUploadCounters();
+            std::printf("draw whose resources the cache holds: %llu predicted hits, %llu stage A builds, %llu cache finds and %llu touches by the prediction\n", static_cast<unsigned long long>(uploadsAfter.stageAPredictedHit - uploadsBefore.stageAPredictedHit), static_cast<unsigned long long>(uploadsAfter.stageAPrepared - uploadsBefore.stageAPrepared), static_cast<unsigned long long>(AgcDriver::Graphics::ResourceCache::Finds() - findsBefore), static_cast<unsigned long long>(AgcDriver::Graphics::ResourceCache::Touches() - touchesBefore));
+            Require(uploadsAfter.stageAPredictedHit - uploadsBefore.stageAPredictedHit == 1 && uploadsAfter.stageAPrepared == uploadsBefore.stageAPrepared, "prepared vertex inputs: a preparer built stage A for a draw whose resources the cache holds");
+            Require(AgcDriver::Graphics::ResourceCache::Finds() == findsBefore && AgcDriver::Graphics::ResourceCache::Touches() == touchesBefore, "prepared vertex inputs: predicting the cache hit found or touched the entry, which reorders the cache and its counts");
+            cache.Remove(hitKey, cachedBuild.get());
+            cachedBuild.reset();
+        }
+
         const auto beforeTeardown = AgcDriver::Graphics::PreparedDrawInputCounters();
         static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 16u));
         Require(AgcDriver::Graphics::PreparedDrawInputCounters().stashReturned > beforeTeardown.stashReturned, "prepared vertex inputs: no unused copy was kept for recycling, so destroying the device after it proves nothing");

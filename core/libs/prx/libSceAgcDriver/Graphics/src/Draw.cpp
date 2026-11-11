@@ -5374,18 +5374,21 @@ VkDrawCounts TakeVkDrawCounts() {
     return counts;
 }
 
-std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit) {
-    predictedHit = false;
+std::vector<std::uint32_t> DrawResourceCacheKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     const bool keyed = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
-    if (keyed && SharedResourceCache().Peek(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, nullptr)) != nullptr) {
-        predictedHit = true;
-        return nullptr;
-    }
-    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, lastDrawDeviceStaging.load(std::memory_order_relaxed), ShaderResources::PreparedOffDevice{});
+    if (!keyed) return {};
+    return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey, nullptr);
+}
+
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit) {
+    const auto key = DrawResourceCacheKey(context, state, draw, shaders);
+    predictedHit = !key.empty() && SharedResourceCache().Peek(key) != nullptr;
+    if (predictedHit) return nullptr;
+    const auto indexBytes = static_cast<std::size_t>(static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, snapshots, lastDrawDeviceStaging.load(std::memory_order_relaxed), ShaderResources::PreparedOffDevice{});
 }
 
 }
