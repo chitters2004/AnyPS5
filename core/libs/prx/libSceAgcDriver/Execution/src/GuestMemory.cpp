@@ -2823,6 +2823,14 @@ Observation Observe(std::uint64_t address, std::size_t bytes) {
     return observe(address, bytes, true);
 }
 
+bool ObserveForEpoch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t epoch) {
+    if (epoch == 0 || CollectEpoch() != epoch) return false;
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin) static_cast<void>(observe(begin, static_cast<std::size_t>(end - begin), true));
+    }
+    return true;
+}
+
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
     const auto observation = observe(address, bytes, true);
     return observation.status == Observation::Status::Complete ? observation.generation : 0;

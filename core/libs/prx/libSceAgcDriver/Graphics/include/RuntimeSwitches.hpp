@@ -15,6 +15,8 @@ enum class RuntimeSwitch : std::size_t {
     NoGuardSetProof,
     NoGuardSpans,
     NoOwnedDrawInputs,
+    ObservedInputReuse,
+    PreparerObservesInputs,
     Count,
 };
 

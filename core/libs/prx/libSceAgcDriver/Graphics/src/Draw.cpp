@@ -1462,8 +1462,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             copy.reused = true;
             return copy;
         }
-        static const bool observedReuse = std::getenv("APS5_OBSERVED_INPUT_REUSE") != nullptr;
-        if (observedReuse) {
+        if (RuntimeSwitches::Set(RuntimeSwitch::ObservedInputReuse)) {
             copy.buffer = recorder->ObservedDrawSnapshot(address, bytes, use, &copy.derived);
             if (copy.buffer != nullptr) {
                 copy.reused = true;
