@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -101,6 +102,11 @@ struct Counters {
     std::atomic<std::uint64_t> requestNanoseconds{0};
     std::atomic<std::uint64_t> epochFollows{0};
     std::atomic<std::uint64_t> collectNanoseconds{0};
+    std::array<std::atomic<std::uint64_t>, 2> allocNanoseconds{};
+    std::array<std::atomic<std::uint64_t>, 2> poolWaitNanoseconds{};
+    std::array<std::atomic<std::uint64_t>, 2> stashHits{};
+    std::atomic<std::uint64_t> stashReturned{0};
+    std::atomic<std::uint64_t> spareReused{0};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sources{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceBytes{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceNanoseconds{};
@@ -139,6 +145,111 @@ std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
 }
 
+constexpr std::size_t StashLimit = 64;
+constexpr std::size_t StashBytesLimit = std::size_t{8} << 20u;
+constexpr std::array<const char*, 2> AllocNames{"DrawInputPrep.alloc_ns_preparer", "DrawInputPrep.alloc_ns_committer"};
+constexpr std::array<const char*, 2> PoolWaitNames{"DrawInputPrep.pool_wait_ns_preparer", "DrawInputPrep.pool_wait_ns_committer"};
+constexpr std::array<const char*, 2> StashHitNames{"DrawInputPrep.stash_hits_preparer", "DrawInputPrep.stash_hits_committer"};
+
+struct StashedBuffer {
+    VkDevice device = VK_NULL_HANDLE;
+    std::size_t bytes = 0;
+    VkBufferUsageFlags usage = 0;
+    VkMemoryPropertyFlags properties = 0;
+    std::shared_ptr<Buffer> buffer;
+};
+
+struct BufferStash {
+    std::mutex mutex;
+    std::vector<StashedBuffer> buffers;
+    std::size_t bytes = 0;
+    bool open = false;
+};
+
+BufferStash& bufferStash() {
+    static BufferStash stash;
+    return stash;
+}
+
+void openStash(bool open) {
+    std::vector<StashedBuffer> dropped;
+    auto& stash = bufferStash();
+    std::lock_guard lock(stash.mutex);
+    stash.open = open;
+    if (open) return;
+    dropped.swap(stash.buffers);
+    stash.bytes = 0;
+}
+
+bool recycling() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoDrawInputRecycling);
+}
+
+std::shared_ptr<Buffer> takeStashed(VkDevice device, std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+    if (!recycling()) return nullptr;
+    auto& stash = bufferStash();
+    std::lock_guard lock(stash.mutex);
+    for (auto it = stash.buffers.rbegin(); it != stash.buffers.rend(); ++it) {
+        if (it->device != device || it->bytes != bytes || it->usage != usage || it->properties != properties) continue;
+        auto buffer = std::move(it->buffer);
+        stash.bytes -= bytes;
+        stash.buffers.erase(std::next(it).base());
+        return buffer;
+    }
+    return nullptr;
+}
+
+bool returnStashed(VkDevice device, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>& buffer) {
+    if (buffer == nullptr) return false;
+    const auto properties = buffer->Properties();
+    if (buffer.use_count() != 1 || !recycling() || bytes > StashBytesLimit) return false;
+    auto& stash = bufferStash();
+    std::shared_ptr<Buffer> evicted;
+    std::lock_guard lock(stash.mutex);
+    if (!stash.open) return false;
+    while (!stash.buffers.empty() && (stash.buffers.size() >= StashLimit || stash.bytes + bytes > StashBytesLimit)) {
+        stash.bytes -= stash.buffers.front().bytes;
+        evicted = std::move(stash.buffers.front().buffer);
+        stash.buffers.erase(stash.buffers.begin());
+    }
+    stash.buffers.push_back({device, bytes, usage, properties, std::move(buffer)});
+    stash.bytes += bytes;
+    return true;
+}
+
+VkBufferUsageFlags usageOf(Recorder::SnapshotUse use) {
+    return use == Recorder::SnapshotUse::Vertex || use == Recorder::SnapshotUse::PaddedVertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
+}
+
+enum class StagingRole : std::size_t { Preparer, Committer };
+
+struct StagingCost {
+    std::uint64_t allocNanoseconds = 0;
+    std::uint64_t poolWaitNanoseconds = 0;
+    std::uint64_t stashHits = 0;
+};
+
+std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool timed, StagingCost& cost) {
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto waitedBefore = BufferPool::ThreadLockWaitNanoseconds();
+    auto buffer = takeStashed(context.device, bytes, usage, properties);
+    cost.stashHits = buffer != nullptr ? 1u : 0u;
+    if (buffer == nullptr) buffer = std::make_shared<Buffer>(context, bytes, usage, properties);
+    if (timed) {
+        cost.allocNanoseconds = nanosecondsSince(start);
+        cost.poolWaitNanoseconds = BufferPool::ThreadLockWaitNanoseconds() - waitedBefore;
+    }
+    return buffer;
+}
+
+void countStaging(StagingRole role, const StagingCost& cost) {
+    const auto index = static_cast<std::size_t>(role);
+    auto& total = counters();
+    if (cost.allocNanoseconds != 0) counted(total.allocNanoseconds[index], AllocNames[index], cost.allocNanoseconds);
+    if (cost.poolWaitNanoseconds != 0) counted(total.poolWaitNanoseconds[index], PoolWaitNames[index], cost.poolWaitNanoseconds);
+    if (cost.stashHits != 0) counted(total.stashHits[index], StashHitNames[index], cost.stashHits);
+}
+
 }
 
 class PreparedDrawInputs {
@@ -154,6 +265,7 @@ public:
     std::uint64_t epoch = 0;
     bool followedEpoch = false;
     std::uint64_t collectNanoseconds = 0;
+    StagingCost staging;
     std::atomic<JobState> state{JobState::Queued};
     std::vector<PreparedRange> ranges;
     std::uint64_t refusedRanges = 0;
@@ -223,10 +335,12 @@ public:
         Settle();
         std::uint64_t unusedRanges = 0;
         std::uint64_t preparedRanges = 0;
+        std::uint64_t returned = 0;
         if (!cancelled) {
-            for (const auto& range : ranges) {
+            for (auto& range : ranges) {
                 ++preparedRanges;
                 if (!range.consumed) ++unusedRanges;
+                if (returnStashed(context.device, range.bytes, usageOf(range.use), range.buffer)) ++returned;
             }
         }
         auto& total = counters();
@@ -239,6 +353,8 @@ public:
         counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
         counted(total.epochFollows, "DrawInputPrep.epoch_follows", !cancelled && followedEpoch ? 1 : 0);
         if (!cancelled && collectNanoseconds != 0) counted(total.collectNanoseconds, "DrawInputPrep.collect_ns", collectNanoseconds);
+        if (!cancelled) countStaging(StagingRole::Preparer, staging);
+        if (returned != 0) counted(total.stashReturned, "DrawInputPrep.stash_returned", returned);
     }
 
 private:
@@ -267,12 +383,19 @@ private:
         if (timed) collectNanoseconds += nanosecondsSince(collectStart);
         if (range.generation == 0) return refuse(PreparedRefusal::Unwatched);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        range.buffer = std::make_shared<Buffer>(context, bytes, usage);
+        StagingCost cost;
+        range.buffer = stagingBuffer(context, bytes, usage, DrawInputMemoryProperties(context, use), timed, cost);
+        staging.allocNanoseconds += cost.allocNanoseconds;
+        staging.poolWaitNanoseconds += cost.poolWaitNanoseconds;
+        staging.stashHits += cost.stashHits;
         const auto target = range.buffer->Bytes();
         std::memcpy(target.data(), reinterpret_cast<const void*>(address), readable);
         std::fill(target.begin() + static_cast<std::ptrdiff_t>(readable), target.begin() + static_cast<std::ptrdiff_t>(bytes), std::byte{0});
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (Recorder::PendingWriteSnapshot() != pending) return refuse(PreparedRefusal::SnapshotChanged);
+        if (Recorder::PendingWriteSnapshot() != pending) {
+            static_cast<void>(returnStashed(context.device, bytes, usage, range.buffer));
+            return refuse(PreparedRefusal::SnapshotChanged);
+        }
         ranges.push_back(std::move(range));
         return ranges.size() - 1u;
     }
@@ -306,6 +429,7 @@ public:
     static void Shutdown() {
         std::lock_guard lock(creation);
         delete instance.exchange(nullptr, std::memory_order_acq_rel);
+        openStash(false);
     }
 
     void Submit(const std::shared_ptr<PreparedDrawInputs>& job) {
@@ -330,6 +454,7 @@ public:
 
 private:
     explicit Preparers(unsigned count) {
+        openStash(true);
         for (unsigned index = 0; index < count; ++index) threads.emplace_back([this](std::stop_token token) { run(token); });
     }
 
@@ -348,7 +473,10 @@ private:
             if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) continue;
             job->state.notify_all();
             try {
-                if (job->epoch != 0 && job->epoch != followed) {
+                if (job->epoch == 0) {
+                    followed = 0;
+                    GuestMemory::BumpCollectEpoch();
+                } else if (job->epoch != followed) {
                     followed = job->epoch;
                     job->followedEpoch = true;
                     DriverDetail::DrawPipeline::FollowEpoch(job->epoch);
@@ -442,7 +570,7 @@ std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validByte
     return validBytes - prefix < stride ? prefix : validBytes;
 }
 
-std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable) {
+std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, std::shared_ptr<Buffer>* spare) {
     auto* job = currentPrepared.get();
     if (job == nullptr || job->context.device != context.device) return std::nullopt;
     job->Settle();
@@ -460,6 +588,10 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
         counted(total.checkNanoseconds, "DrawInputPrep.check_ns", spent);
     }
     if (!valid) {
+        if (spare != nullptr && recycling()) {
+            *spare = std::move(found->buffer);
+            counted(total.spareReused, "DrawInputPrep.spare_reused");
+        }
         found->buffer.reset();
         counted(total.reprepared, "DrawInputPrep.reprepared");
         return std::nullopt;
@@ -470,6 +602,17 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
         counted(total.verifyDiffered, "DrawInputPrep.verify_differed");
     }
     return AdoptedDrawInput{std::move(found->buffer), found->derived};
+}
+
+VkMemoryPropertyFlags DrawInputMemoryProperties(const Context& context, Recorder::SnapshotUse use) {
+    return use == Recorder::SnapshotUse::Vertex ? context.SnapshotProperties() : HostBufferProperties;
+}
+
+std::shared_ptr<Buffer> NewDrawInputBuffer(const Context& context, std::size_t bytes, Recorder::SnapshotUse use) {
+    StagingCost cost;
+    auto buffer = stagingBuffer(context, bytes, usageOf(use), DrawInputMemoryProperties(context, use), DrawInputSourcesTimed(), cost);
+    countStaging(StagingRole::Committer, cost);
+    return buffer;
 }
 
 bool DrawInputSourcesTimed() {
@@ -504,6 +647,13 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
     counts.epochFollows = total.epochFollows.load(std::memory_order_relaxed);
     counts.collectNanoseconds = total.collectNanoseconds.load(std::memory_order_relaxed);
+    for (std::size_t role = 0; role < 2; ++role) {
+        counts.allocNanoseconds[role] = total.allocNanoseconds[role].load(std::memory_order_relaxed);
+        counts.poolWaitNanoseconds[role] = total.poolWaitNanoseconds[role].load(std::memory_order_relaxed);
+        counts.stashHits[role] = total.stashHits[role].load(std::memory_order_relaxed);
+    }
+    counts.stashReturned = total.stashReturned.load(std::memory_order_relaxed);
+    counts.spareReused = total.spareReused.load(std::memory_order_relaxed);
     for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
         counts.sources[index] = total.sources[index].load(std::memory_order_relaxed);
         counts.sourceBytes[index] = total.sourceBytes[index].load(std::memory_order_relaxed);

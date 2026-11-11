@@ -190,6 +190,7 @@ struct Outcome {
     std::uint64_t reprepared = 0;
     std::uint64_t prepared = 0;
     std::uint64_t copied = 0;
+    std::uint64_t spares = 0;
 };
 
 Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit, bool indirect = false, std::span<const std::uint16_t> indices = Indices) {
@@ -214,7 +215,7 @@ Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, 
     device.WaitIdle();
     const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
     constexpr auto copied = static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied);
-    Outcome outcome{CenterCovered(), after.adopted - before.adopted, after.reprepared - before.reprepared, after.prepared - before.prepared, after.sources[copied] - before.sources[copied]};
+    Outcome outcome{CenterCovered(), after.adopted - before.adopted, after.reprepared - before.reprepared, after.prepared - before.prepared, after.sources[copied] - before.sources[copied], after.spareReused - before.spareReused};
     return outcome;
 }
 
@@ -261,6 +262,11 @@ int main() {
         Print("vertices moved off the target after preparation", moved);
         Require(moved.adopted == 1 && moved.reprepared == 1 && moved.copied == 1, "prepared vertex inputs: a vertex range the CPU wrote after preparation was adopted, or the untouched index range was not");
         Require(!moved.covered, "prepared vertex inputs: the draw used the vertices prepared before the CPU moved them off the target");
+        Require(moved.spares == 1, "prepared vertex inputs: the committer did not copy the refused vertex range into the buffer its preparation left");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, true);
+        const auto movedFresh = DrawPrepared(*device, *programs, [] { WriteVertices(4.0f); });
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, false);
+        Require(movedFresh.spares == 0 && movedFresh.copied == 1 && !movedFresh.covered, "prepared vertex inputs: with recycling off the refused range was not copied into a buffer of its own");
 
         const auto degenerate = DrawPrepared(*device, *programs, [] { WriteIndices(Degenerate); });
         Print("indices made degenerate after preparation", degenerate);
@@ -338,19 +344,29 @@ int main() {
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
         Require(again.adopted == 2 && again.covered, "prepared vertex inputs: an unchanged draw after the others did not adopt both copies");
-        const auto beforeEpochs = AgcDriver::Graphics::PreparedDrawInputCounters();
         const auto epochState = DrawState();
         const AgcDriver::Pm4::DrawParameters epochDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
-        constexpr std::uint64_t firstEpoch = std::uint64_t{1} << 62u;
-        for (const auto epoch : {firstEpoch, firstEpoch, firstEpoch + 1u}) {
-            auto job = device->PrepareDrawInputsAhead(epochState, epochDraw, programs->shaders, epoch);
-            Require(job != nullptr, "prepared vertex inputs: a draw with a collect epoch was not prepared");
-            AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
-            const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
-        }
-        const auto afterEpochs = AgcDriver::Graphics::PreparedDrawInputCounters();
-        std::printf("three preparations in epochs E, E and E+1: %llu epoch follows\n", static_cast<unsigned long long>(afterEpochs.epochFollows - beforeEpochs.epochFollows));
-        Require(afterEpochs.epochFollows - beforeEpochs.epochFollows == 2, "prepared vertex inputs: the preparer did not follow each new collect epoch of its draws exactly once");
+        const auto prepareUnused = [&](std::uint64_t firstEpoch) {
+            const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+            for (const auto epoch : {firstEpoch, firstEpoch, firstEpoch + 1u}) {
+                auto job = device->PrepareDrawInputsAhead(epochState, epochDraw, programs->shaders, epoch);
+                Require(job != nullptr, "prepared vertex inputs: a draw with a collect epoch was not prepared");
+                AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+                const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+            }
+            const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+            return std::array<std::uint64_t, 3>{after.epochFollows - before.epochFollows, after.stashHits[0] - before.stashHits[0], after.stashReturned - before.stashReturned};
+        };
+        const auto recycled = prepareUnused(std::uint64_t{1} << 62u);
+        std::printf("three unused preparations in epochs E, E and E+1: %llu epoch follows, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(recycled[0]), static_cast<unsigned long long>(recycled[1]), static_cast<unsigned long long>(recycled[2]));
+        Require(recycled[0] == 2, "prepared vertex inputs: the preparer did not follow each new collect epoch of its draws exactly once");
+        Require(recycled[1] == 4 && recycled[2] == 6, "prepared vertex inputs: the unused copies of a preparation did not stage the next preparations of the same ranges");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, true);
+        const auto fresh = prepareUnused((std::uint64_t{1} << 62u) + 8u);
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, false);
+        Require(fresh[1] == 0 && fresh[2] == 0, "prepared vertex inputs: staging buffers were recycled with APS5_NO_DRAW_INPUT_RECYCLING set");
+        const auto afterRecycling = DrawPrepared(*device, *programs, [] {});
+        Require(afterRecycling.adopted == 2 && afterRecycling.covered, "prepared vertex inputs: a draw whose copies were staged in recycled buffers did not adopt both or drew wrong");
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
     } catch (const std::exception& error) {

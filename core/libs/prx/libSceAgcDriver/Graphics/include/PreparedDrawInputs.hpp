@@ -50,7 +50,9 @@ struct AdoptedDrawInput {
 };
 
 std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validBytes, std::size_t stride);
-std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable);
+std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, std::shared_ptr<Buffer>* spare = nullptr);
+VkMemoryPropertyFlags DrawInputMemoryProperties(const Context& context, Recorder::SnapshotUse use);
+std::shared_ptr<Buffer> NewDrawInputBuffer(const Context& context, std::size_t bytes, Recorder::SnapshotUse use);
 
 enum class PreparedRefusal : std::uint8_t { Size, Inaccessible, Forget, Pending, Unwatched, SnapshotChanged, Failed, Count };
 inline constexpr std::size_t PreparedRefusalCount = static_cast<std::size_t>(PreparedRefusal::Count);
@@ -77,6 +79,11 @@ struct PreparedDrawInputCounts {
     std::uint64_t requestNanoseconds = 0;
     std::uint64_t epochFollows = 0;
     std::uint64_t collectNanoseconds = 0;
+    std::array<std::uint64_t, 2> allocNanoseconds{};
+    std::array<std::uint64_t, 2> poolWaitNanoseconds{};
+    std::array<std::uint64_t, 2> stashHits{};
+    std::uint64_t stashReturned = 0;
+    std::uint64_t spareReused = 0;
     std::array<std::uint64_t, DrawInputSourceCount> sources{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceBytes{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceNanoseconds{};
