@@ -3550,6 +3550,11 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+void Recorder::OnDiscard(std::function<void()> action) {
+    ensureOpen();
+    open->discards.push_back(std::move(action));
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -4917,6 +4922,12 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
+    for (auto& action : std::exchange(batch->discards, {})) {
+        try {
+            action();
+        } catch (...) {
+        }
+    }
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
     release(*batch);
