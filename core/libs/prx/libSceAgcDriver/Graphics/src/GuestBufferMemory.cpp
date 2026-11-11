@@ -5865,6 +5865,8 @@ struct ResidentRanges {
     std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
     std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0;
+    std::uint64_t kept = 0, refused = 0, discarded = 0, presents = 0;
+    ResidentStatistics total;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -5883,8 +5885,11 @@ void reportResidents(ResidentRanges& residents) {
     const auto now = std::chrono::steady_clock::now();
     if (now - residents.reported < std::chrono::seconds(10)) return;
     residents.reported = now;
-    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated));
+    const auto presents = Recorder::Presents();
+    const auto windowPresents = presents - std::exchange(residents.presents, presents);
+    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB, %.1f KiB per present over %llu presents) / %llu made, %llu invalidated by other stamps, %llu kept across their own copy-back, %llu refused for a copy-back that would store over CPU bytes, %llu dropped with a discarded batch\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, windowPresents != 0 ? residents.skippedBytes / 1024.0 / static_cast<double>(windowPresents) : 0.0, static_cast<unsigned long long>(windowPresents), static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.kept), static_cast<unsigned long long>(residents.refused), static_cast<unsigned long long>(residents.discarded));
     residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = 0;
+    residents.kept = residents.refused = residents.discarded = 0;
     residents.heat.clear();
     for (auto it = residents.ranges.begin(); it != residents.ranges.end();) {
         if (it->second.boundInWindow) {
@@ -5913,6 +5918,7 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
     if (const auto found = residents.ranges.find(key); found != residents.ranges.end()) {
         if (found->second.forgetStamp == forget) {
             ++residents.bound;
+            ++residents.total.bound;
             found->second.boundInWindow = true;
             return found->second.buffer;
         }
@@ -5923,7 +5929,9 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
     if (buffer == nullptr) return nullptr;
     residents.ranges[key] = ResidentRange{buffer, {}, 0, forget, true};
     ++residents.promoted;
+    ++residents.total.promoted;
     ++residents.bound;
+    ++residents.total.bound;
     return buffer;
 }
 
@@ -5941,6 +5949,7 @@ bool residentCurrent(std::uint64_t begin, std::uint64_t end, const std::shared_p
         if (range.shadow.empty()) return false;
         if (range.shadow.size() != bytes || std::memcmp(range.shadow.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(begin)), bytes) != 0) {
             ++residents.invalidated;
+            ++residents.total.invalidated;
             range.shadow.clear();
             return false;
         }
@@ -5948,12 +5957,15 @@ bool residentCurrent(std::uint64_t begin, std::uint64_t end, const std::shared_p
         static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
         if (!GuestMemory::UnchangedSince(begin, bytes, range.syncGeneration)) {
             ++residents.invalidated;
+            ++residents.total.invalidated;
             range.syncGeneration = 0;
             return false;
         }
     }
     ++residents.skipped;
+    ++residents.total.skipped;
     residents.skippedBytes += bytes;
+    residents.total.skippedBytes += bytes;
     return true;
 }
 
@@ -5963,6 +5975,7 @@ void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_pt
     const auto found = residents.ranges.find({begin, end});
     if (found == residents.ranges.end() || found->second.buffer != buffer) return;
     ++residents.copied;
+    ++residents.total.copied;
     auto& range = found->second;
     const auto bytes = static_cast<std::size_t>(end - begin);
     range.syncGeneration = GuestMemory::CollectWrites(begin, bytes);
@@ -5975,12 +5988,51 @@ void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_pt
     range.shadow.assign(guest, guest + bytes);
 }
 
-void residentStagedWrite(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, std::uint64_t generation) {
+bool residentHeld(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer || found->second.syncGeneration == 0) return false;
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (found->second.forgetStamp != GuestMemory::ForgetStamp(begin, bytes)) return false;
+    static_cast<void>(GuestMemory::CollectWritesUncached(begin, bytes));
+    return GuestMemory::UnchangedSince(begin, bytes, found->second.syncGeneration);
+}
+
+void residentWrittenBy(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, bool held, std::uint64_t generation, bool completion) {
     auto& residents = Residents();
     std::lock_guard lock(residents.mutex);
     const auto found = residents.ranges.find({begin, end});
     if (found == residents.ranges.end() || found->second.buffer != buffer || found->second.syncGeneration == 0) return;
+    if (!held || generation == 0) {
+        ++residents.invalidated;
+        ++residents.total.invalidated;
+        found->second.syncGeneration = 0;
+        return;
+    }
     found->second.syncGeneration = std::max(found->second.syncGeneration, generation);
+    if (!completion) return;
+    ++residents.kept;
+    ++residents.total.kept;
+}
+
+void residentRefused() {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    ++residents.refused;
+    ++residents.total.refused;
+}
+
+void residentsDiscarded(const std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>>& used) {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    for (const auto& [key, buffer] : used) {
+        const auto found = residents.ranges.find(key);
+        if (found == residents.ranges.end() || found->second.buffer != buffer) continue;
+        residents.ranges.erase(found);
+        ++residents.discarded;
+        ++residents.total.discarded;
+    }
 }
 
 bool residentShadowed(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
@@ -6063,7 +6115,9 @@ void reportStaging() {
 ResidentStatistics ResidentCounts() {
     auto& residents = Residents();
     std::lock_guard lock(residents.mutex);
-    return ResidentStatistics{residents.ranges.size(), residents.promoted, residents.bound, residents.skipped, residents.copied, residents.invalidated};
+    auto counts = residents.total;
+    counts.resident = residents.ranges.size();
+    return counts;
 }
 
 void ClearResidentRanges(VkDevice device) {
@@ -6095,6 +6149,20 @@ GuestBufferMemory::~GuestBufferMemory() {
     for (const auto& region : regions) {
         if (region.gpuCopy && region.deviceLocal && !region.copiedBack) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+bool GuestBufferMemory::copyBackKeepsCpuBytes(const Region& region, const Recorder& recorder) const {
+    static const bool storesEvery = std::getenv("APS5_CHANGED_COPY_ALWAYS") != nullptr;
+    bool written = false;
+    for (const auto& [begin, end] : writes) {
+        const auto from = std::max(begin, region.begin);
+        const auto to = std::min(end, region.end);
+        if (from >= to) continue;
+        written = true;
+        if (from % 4u != 0 || to % 4u != 0) return false;
+    }
+    if (!written) return true;
+    return !storesEvery && !recorder.ChangedCopyRefused() && changedCopyBacks(context) && region.buffer != nullptr && region.buffer->DeviceAddress() != 0 && region.copySourceAddress != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0;
 }
 
 bool GuestBufferMemory::gpuCopyEligible(const Region& region) const {
@@ -6743,6 +6811,19 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>> used;
+    struct DiscardUsed {
+        Recorder& recorder;
+        std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, std::shared_ptr<Buffer>>>& used;
+        ~DiscardUsed() {
+            if (used.empty()) return;
+            try {
+                recorder.OnDiscard([used = std::move(used)] { residentsDiscarded(used); });
+            } catch (...) {
+                residentsDiscarded(used);
+            }
+        }
+    } discardUsed{*recorder, used};
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
@@ -6761,6 +6842,21 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(context, addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
+        }
+        region->residentSkipped = false;
+        if (region->resident && region->deviceLocal) {
+            used.emplace_back(std::pair{region->begin, region->end}, region->buffer);
+            if (copyBackKeepsCpuBytes(*region, *recorder)) {
+                if (residentCurrent(region->begin, region->end, region->buffer)) {
+                    region->residentSkipped = true;
+                    copiedBytes -= bytes;
+                    recorder->Keep(region->buffer);
+                    region->snapshot.clear();
+                    continue;
+                }
+            } else {
+                residentRefused();
+            }
         }
         std::vector<std::byte> expected;
         const auto address = region->begin;
@@ -6784,12 +6880,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 const auto snapshotBytes = inputSnapshot->Bytes();
                 expected.assign(snapshotBytes.begin(), snapshotBytes.end());
             }
-        }
-        if (region->resident && region->deviceLocal && residentCurrent(region->begin, region->end, region->buffer)) {
-            copiedBytes -= bytes;
-            recorder->Keep(region->buffer);
-            region->snapshot.clear();
-            continue;
         }
         recorder->Keep(region->buffer);
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
@@ -6835,6 +6925,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (region->shadowCopy == nullptr) region->shadowCopy = stagingBuffer(context, bytes, gpuCopyUsage(context, true));
         if (region->shadowCopy == nullptr || region->shadowCopy->DeviceAddress() == 0) {
             region->shadowCopy = nullptr;
+            if (region->residentSkipped) {
+                region->residentSkipped = false;
+                CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->buffer->Handle(), 0, bytes);
+                residentCopied(region->begin, region->end, region->buffer);
+                copiedBytes += bytes;
+            }
             continue;
         }
         shadowed.push_back(region);
@@ -7238,8 +7334,9 @@ void GuestBufferMemory::MarkStagedWrites() const {
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr || !found->gpuCopy || found->direct != nullptr) continue;
+        const bool held = found->resident && residentHeld(found->begin, found->end, found->buffer);
         const auto generation = GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
-        if (found->resident) residentStagedWrite(found->begin, found->end, found->buffer, generation);
+        if (found->resident) residentWrittenBy(found->begin, found->end, found->buffer, held, generation, false);
     }
 }
 
@@ -7274,7 +7371,10 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto found = residents.ranges.find({region->begin, region->end});
         if (found == residents.ranges.end() || found->second.buffer != region->buffer) continue;
         if (!current) {
-            if (found->second.syncGeneration != 0) ++residents.invalidated;
+            if (found->second.syncGeneration != 0) {
+                ++residents.invalidated;
+                ++residents.total.invalidated;
+            }
             found->second.syncGeneration = 0;
             found->second.shadow.clear();
         } else if (found->second.syncGeneration != 0 && marked != 0) {
@@ -7429,7 +7529,9 @@ void GuestBufferMemory::WriteBack() {
             if (region.copiedBack) {
                 // The GPU copied the written sub-range back into the import; page write watching
                 // did not see it.
-                StorageTexture::StampKeepingNewerResults(begin, static_cast<std::size_t>(end - begin), directWritesGeneration, [&] { return GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin)); });
+                const bool held = region.resident && residentHeld(region.begin, region.end, region.buffer);
+                const auto generation = StorageTexture::StampKeepingNewerResults(begin, static_cast<std::size_t>(end - begin), directWritesGeneration, [&] { return GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin)); });
+                if (region.resident) residentWrittenBy(region.begin, region.end, region.buffer, held, generation, true);
                 continue;
             }
             static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
