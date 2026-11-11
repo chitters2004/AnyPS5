@@ -1,3 +1,6 @@
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -19,6 +22,30 @@
 #include <vector>
 
 using namespace AgcDriver::Graphics;
+
+namespace {
+
+thread_local int failAllocationIn = -1;
+std::atomic<std::uint64_t> injectedFailures{0};
+
+}
+
+void* operator new(std::size_t bytes) {
+    if (failAllocationIn >= 0 && failAllocationIn-- == 0) {
+        injectedFailures.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes != 0 ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* memory) noexcept {
+    std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept {
+    std::free(memory);
+}
 
 namespace {
 
@@ -374,6 +401,32 @@ void RepeatedReadsAnswerLikeEveryNote() {
     Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
 }
 
+void ReadSurvivesFailedNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000200000ull;
+    for (std::uint64_t index = 0; index < 8; ++index) recorder.NotePendingRead(base + index * 0x100, 0x10, Kind::CopySource);
+    const auto injected = injectedFailures.load(std::memory_order_relaxed);
+    bool threw = false;
+    failAllocationIn = 0;
+    try {
+        recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    failAllocationIn = -1;
+    if (injectedFailures.load(std::memory_order_relaxed) == injected) {
+        std::printf("allocation failure not injected into the driver: the failed read note check is skipped\n");
+        recorder.Sync();
+        return;
+    }
+    Expect(threw, "the injected allocation failure did not reach the read note");
+    recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    Expect(recorder.PendingReadOverlaps(base + 0x800, 4), "a read whose first note failed to allocate was lost when noted again");
+    recorder.Sync();
+}
+
 template<typename Condition>
 bool EventuallyTrue(Condition&& condition) {
     for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
@@ -468,6 +521,7 @@ int main(int argc, char** argv) {
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
         RepeatedReadsAnswerLikeEveryNote();
+        ReadSurvivesFailedNote();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
