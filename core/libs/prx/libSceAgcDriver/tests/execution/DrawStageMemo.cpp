@@ -38,6 +38,11 @@ namespace AgcDriver::DriverDetail {
 struct DriverTestAccess {
     static bool Unchanged(const DrawStageRecord& record) { return Driver::Get().drawStageUnchanged(record); }
     static DrawStageProof Prove(DrawStageRecord& record) { return Driver::Get().proveDrawStage(record, 0, 0); }
+    static void Memoize(const std::vector<std::shared_ptr<DrawStageRecord>>& pending, const std::vector<std::shared_ptr<DispatchVariant>>& fresh, const std::vector<bool>& reused, const std::vector<StageCapture>& captures) { Driver::Get().memoizeDrawStages(pending, fresh, reused, captures); }
+    static std::shared_ptr<DrawStageRecord> Find(const DrawStageKey& key) {
+        bool admit = false;
+        return Driver::Get().drawStageMemo.Find(key, admit);
+    }
 };
 
 }
@@ -530,6 +535,48 @@ void DrawsReuseAndInvalidateTheirStages() {
     std::puts("a draw that misses the draw cache on its fragment stage reuses the vertex stage the lookup validated");
 }
 
+std::uint8_t* CompareHookTarget = nullptr;
+int CompareHookWrites = 0;
+
+void WriteAfterCompare() {
+    const std::uint32_t value = 0x5eedu;
+    std::memcpy(CompareHookTarget, &value, sizeof(value));
+    ++CompareHookWrites;
+}
+
+void MemoizesOnlyStagesBuiltAsKeyed() {
+    using AgcDriver::DriverDetail::StageCapture;
+    using AgcDriver::DriverDetail::DispatchVariant;
+    const auto keyed = [](std::uint64_t id) {
+        auto record = std::make_shared<DrawStageRecord>();
+        record->key.words = {0xd5a9e000u, id};
+        record->key.hash = 0xd5a9e000u ^ id;
+        return record;
+    };
+    const auto fresh = std::make_shared<DispatchVariant>();
+    fresh->compiled = std::make_shared<ShaderRecompiler::RecompileResult>();
+    const auto memoize = [&](const std::shared_ptr<DrawStageRecord>& record, const StageCapture& capture, bool reused = false) {
+        DriverTestAccess::Memoize({record}, {fresh}, {reused}, {capture});
+        return DriverTestAccess::Find(record->key) != nullptr;
+    };
+    StageCapture plain;
+    Expect(memoize(keyed(1), plain), "a stage built from its keyed request was not memoized");
+    StageCapture linked;
+    linked.linkedCode = true;
+    Expect(!memoize(keyed(2), linked), "a stage whose invocation linked guest code outside its captured memory was memoized");
+    StageCapture converted;
+    converted.convertedSamples = true;
+    Expect(!memoize(keyed(3), converted), "a stage built with converted samples was memoized under a key made without them");
+    StageCapture rows;
+    rows.layerRowSamples = true;
+    Expect(!memoize(keyed(4), rows), "a stage built with layer-row samples was memoized under a key made without them");
+    auto convertedKey = keyed(5);
+    convertedKey->convertedSamples = true;
+    Expect(memoize(convertedKey, converted), "a stage built with the converted samples its key names was not memoized");
+    Expect(!memoize(keyed(6), plain, true), "a reused stage was memoized again");
+    std::puts("only stages built from their keyed request, with no linked guest code, are memoized");
+}
+
 void ProofsFollowWriteStamps() {
     GuestBlock block;
     const auto run = std::pair<std::uint64_t, std::uint64_t>{block.At(0x100), block.At(0x140)};
@@ -564,6 +611,15 @@ void ProofsFollowWriteStamps() {
     Expect(DriverTestAccess::Prove(*record) == DrawStageProof::Proved, "a stage restamped after a write beside its words was not proved");
     std::memcpy(block.Bytes(0x8000), &changed, sizeof(changed));
     Expect(DriverTestAccess::Prove(*record) == DrawStageProof::Proved, "a write on a page the stage never read broke its proof");
+    record->Restamp({});
+    CompareHookTarget = block.Bytes(0x108);
+    AgcDriver::DriverDetail::Driver::SetDrawStageCompareHook(&WriteAfterCompare);
+    const auto compared = DriverTestAccess::Prove(*record);
+    AgcDriver::DriverDetail::Driver::SetDrawStageCompareHook(nullptr);
+    Expect(compared == DrawStageProof::Compared, "an unstamped stage whose words were equal at the compare was not served");
+    Expect(CompareHookWrites == 1, "the write between the compare and the restamp did not run");
+    Expect(!DriverTestAccess::Unchanged(*record), "a write that landed after the compare was hidden by the stamp the compare left: the stamp was collected after the compare");
+    Expect(DriverTestAccess::Prove(*record) == DrawStageProof::Stale, "a stage whose word changed after its compare was served");
     std::puts("draw stage proofs hold until a guest write lands in the stage's memory, and a compare restamps them");
 }
 
@@ -579,6 +635,7 @@ int main() {
         }
         DrawsReuseAndInvalidateTheirStages();
         ProofsFollowWriteStamps();
+        MemoizesOnlyStagesBuiltAsKeyed();
         AgcDriverShutdown_nid_postfix();
         std::puts("draw stage memo: hits, misses and invalidations follow the stage inputs");
         return 0;

@@ -376,6 +376,15 @@ std::size_t Driver::DrawStageMemoSize() {
     return drawStageMemo.Size();
 }
 
+std::atomic<void (*)()>& Driver::drawStageCompareHook() {
+    static std::atomic<void (*)()> hook{nullptr};
+    return hook;
+}
+
+void Driver::SetDrawStageCompareHook(void (*hook)()) {
+    drawStageCompareHook().store(hook, std::memory_order_release);
+}
+
 bool Driver::drawStageUnchanged(const DrawStageRecord& record) {
     const auto& variant = *record.variant;
     if (record.spans.empty()) return true;
@@ -421,6 +430,7 @@ DrawStageProof Driver::proveDrawStage(DrawStageRecord& record, std::uint64_t pro
     auto outcome = validateVariant(program, queue, variant, regions, imagesFlushed, runsSynced, sampling);
     if (gateRetry() && (outcome == EntryOutcome::PublishMoved || outcome == EntryOutcome::PendingMoved)) outcome = validateVariant(program, queue, variant, regions, imagesFlushed, runsSynced, sampling);
     if (outcome != EntryOutcome::Equal) return DrawStageProof::Stale;
+    if (const auto hook = drawStageCompareHook().load(std::memory_order_acquire)) hook();
     if (stamp.generation != 0 && stamp.layout == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) record.Restamp(stamp);
     return DrawStageProof::Compared;
 }
