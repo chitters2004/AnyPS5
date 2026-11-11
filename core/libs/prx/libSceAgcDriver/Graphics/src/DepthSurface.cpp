@@ -2654,6 +2654,7 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     recorder.MarkCovered(filledAccess);
     recorder.NotePendingWordFill(address, bytes, word);
     GuestMemory::MarkWritten(address, bytes);
+    recorder.StampNote(recorder.LastWriteNote(address, bytes));
     return true;
 }
 
