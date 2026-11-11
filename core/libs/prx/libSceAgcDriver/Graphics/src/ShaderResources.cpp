@@ -4019,7 +4019,16 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 
 namespace {
 
-constexpr std::uint32_t CertifiedDomains = GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Proof) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Unwatch) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping);
+constexpr std::uint32_t CertifiedPlacementDomains = GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Unwatch) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping);
+constexpr std::uint32_t CertifiedIssueDomains = CertifiedPlacementDomains | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Proof) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::CertifiedProof);
+
+bool CertifiedProofScoped() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoCertifiedProofScope);
+}
+
+std::uint32_t CertifiedDomains() {
+    return CertifiedPlacementDomains | GuestMemory::WriteDomainBit(CertifiedProofScoped() ? GuestMemory::WriteDomain::CertifiedProof : GuestMemory::WriteDomain::Proof);
+}
 constexpr std::array<const char*, static_cast<std::size_t>(CertifiedMiss::Count)> CertifiedMissNames{"uncertified", "sweep", "subscription", "proof", "unwatch", "mapping", "pending", "depth-surfaces", "cpu-writers", "audit", "imports"};
 constexpr std::array<const char*, static_cast<std::size_t>(CertifyRefusal::Count)> CertifyRefusalNames{"unsubscribed", "per-element-textures", "compared-textures", "compared-tables", "depth-copies", "storage-images", "pending-moved", "depth-surfaces-moved"};
 constexpr std::array<const char*, static_cast<std::size_t>(UncertifiedCause::Count)> UncertifiedCauseNames{"never-proved", "refused", "voided", "proof-failed", "not-certifying", "views-stale"};
@@ -4050,9 +4059,10 @@ void countCertifiedMiss(CertifiedMiss miss) {
 }
 
 CertifiedMiss domainMiss(const GuestMemory::WriteCertificate& certificate) {
-    for (const auto domain : {GuestMemory::WriteDomain::Mapping, GuestMemory::WriteDomain::Unwatch, GuestMemory::WriteDomain::Proof}) {
-        if ((CertifiedDomains & GuestMemory::WriteDomainBit(domain)) == 0 || GuestMemory::DomainVersion(domain) == certificate.domains[static_cast<std::size_t>(domain)]) continue;
-        return domain == GuestMemory::WriteDomain::Proof ? CertifiedMiss::Proof : domain == GuestMemory::WriteDomain::Unwatch ? CertifiedMiss::Unwatch : CertifiedMiss::Mapping;
+    const auto domains = CertifiedDomains();
+    for (const auto domain : {GuestMemory::WriteDomain::Mapping, GuestMemory::WriteDomain::Unwatch, GuestMemory::WriteDomain::Proof, GuestMemory::WriteDomain::CertifiedProof}) {
+        if ((domains & GuestMemory::WriteDomainBit(domain)) == 0 || GuestMemory::DomainVersion(domain) == certificate.domains[static_cast<std::size_t>(domain)]) continue;
+        return domain == GuestMemory::WriteDomain::Unwatch ? CertifiedMiss::Unwatch : domain == GuestMemory::WriteDomain::Mapping ? CertifiedMiss::Mapping : CertifiedMiss::Proof;
     }
     return CertifiedMiss::Subscription;
 }
@@ -4529,7 +4539,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (certifying && writeSubscription == nullptr) subscribeIndex(shaders);
     const auto* certifiedSubscription = certifying ? writeSubscription.get() : nullptr;
     const auto depthBefore = DepthSurfacesSerial();
-    const auto issued = certifiedSubscription != nullptr ? GuestMemory::CertifySubscription(*certifiedSubscription, CertifiedDomains) : GuestMemory::WriteCertificate{};
+    const auto issued = certifiedSubscription != nullptr ? GuestMemory::CertifySubscription(*certifiedSubscription, CertifiedIssueDomains) : GuestMemory::WriteCertificate{};
     // (1) Textures and storage images, from stamps when every element allows it (fastRevalidate),
     // else by the same lookups as the build (which refresh or replace them as guest memory changed):
     // they must hand back the very objects the set's views belong to. The build appended them stage
@@ -4799,8 +4809,9 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
         if (reason == CertifiedMiss::Proof && GuestMemory::ProofBreaksCounted()) {
             const auto breaks = GuestMemory::ProofBreakCounts();
             bool attributed = false;
+            const bool scoped = CertifiedProofScoped();
             for (std::size_t i = 0; i < breaks.size(); ++i) {
-                if (breaks[i] == certifiedBreaks[i]) continue;
+                if (breaks[i] == certifiedBreaks[i] || (scoped && !GuestMemory::ProofBreakVoidsCertificates(static_cast<GuestMemory::ProofBreak>(i)))) continue;
                 Certified().proofMissSources[i].fetch_add(1, std::memory_order_relaxed);
                 attributed = true;
             }
@@ -4818,7 +4829,7 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     const bool sweep = epoch == 0 || epoch != certifiedEpoch;
     if (sweep && !GuestMemory::SweepSubscription(*writeSubscription)) return miss(CertifiedMiss::Sweep);
-    if (!GuestMemory::CertificateHolds(*writeSubscription, certificate, CertifiedDomains)) return miss(domainMiss(certificate));
+    if (!GuestMemory::CertificateHolds(*writeSubscription, certificate, CertifiedDomains())) return miss(domainMiss(certificate));
     if (StorageTexture::PendingSerial() != certifiedPending) return miss(CertifiedMiss::Pending);
     if (DepthSurfacesSerial() != certifiedDepth) return miss(CertifiedMiss::DepthSurfaces);
     if (AnyPendingCpuWrites(context)) return miss(CertifiedMiss::CpuWriters);
