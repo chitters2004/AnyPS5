@@ -26,6 +26,7 @@ RULES = {
     "system-dependency": ("error", "CONTRIBUTING.md#code", "Third-party code is a submodule under 3rdparty/ built from source, not found on the system"),
     "title-specific": ("error", "CONTRIBUTING.md#code", "Implement the general behaviour, not what one title needs; title-specific code belongs in its sce_module"),
     "extension": ("error", "CONTRIBUTING.md#code", "Avoid non-standard extensions where standard C++ is enough"),
+    "shared-mutex": ("error", "docs/dev/CONVENTIONS.md#reader-writer-locks", "Use NativeSharedMutex from prx/libc/include/NativeSharedMutex.hpp: on MinGW std::shared_mutex and pthread rwlocks are lazily initialised winpthreads rwlocks that can let a caller in unlocked on first use and take one process-wide spinlock on every operation"),
     "alignment": ("error", "CONTRIBUTING.md#code", "MinGW GCC rejects static objects aligned above 8192 bytes; align a larger block at run time inside a bigger buffer"),
     "notes-file": ("error", "CONTRIBUTING.md#branches-and-pull-requests", "Notes, investigation and agent files go in the pull request, not in the repository; only the root AGENTS.md is allowed"),
     "binary": ("error", "docs/dev/CONVENTIONS.md", "Only UTF-8 text files in the repository; images go in the gist comments"),
@@ -76,6 +77,8 @@ STUB_BODY = re.compile(r"^(?:\(void\)\s*\w+\s*;|static_cast<void>\(\s*\w+\s*\)\s
 SYSTEM_DEPENDENCY = re.compile(r"\b(find_package\s*\((?!\s*(Python3|Threads|Git)\b)|pkg_check_modules\b|pkg_search_module\b|find_(library|path|program|file)\b)", re.I)
 TITLE = re.compile(r"\b(PPSA|CUSA)\d{5}\b")
 EXTENSION = re.compile(r"__attribute__|__declspec|#\s*pragma\s+(?!once\b)")
+SHARED_MUTEX = re.compile(r"\bstd::shared(?:_timed)?_mutex\b|\bpthread_rwlock_t\b|\bpthread_rwlock_(?:init|destroy|rdlock|wrlock|tryrdlock|trywrlock|timedrdlock|timedwrlock|unlock)\s*\(")
+NATIVE_SHARED_MUTEX = "core/libs/prx/libc/include/NativeSharedMutex.hpp"
 INTEGER = r"(0[xX][0-9a-fA-F']+|0[bB][01']+|[0-9][0-9']*)[uUlLzZ]*"
 ALIGNAS = re.compile(rf"\balignas\s*\(\s*(?:{INTEGER}|([A-Za-z_][A-Za-z0-9_]*))\s*\)")
 CONSTANT = re.compile(rf"\bconstexpr\b[^;=]*?\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:=\s*|\{{\s*){INTEGER}\s*[;}}]")
@@ -203,6 +206,8 @@ class Check:
                     self.report("comment", path, number)
                 if EXTENSION.search(bare):
                     self.report("extension", path, number, EXTENSION.search(bare).group(0))
+                if core and path != NATIVE_SHARED_MUTEX and SHARED_MUTEX.search(bare):
+                    self.report("shared-mutex", path, number, SHARED_MUTEX.search(bare).group(0))
                 if "alignas" in bare:
                     if constants is None:
                         constants = named_constants(cpp_text("\n".join(source)))
