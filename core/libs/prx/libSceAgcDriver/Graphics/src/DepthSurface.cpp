@@ -3209,6 +3209,18 @@ void proveOverwrittenPlanes(std::uint64_t address, std::size_t bytes) {
     }
 }
 
+std::uint64_t DepthGuardsGeneration() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+bool DepthGuardsMayOverlap(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0u && anyDepthGuard().load(std::memory_order_acquire) && (address > std::numeric_limits<std::uint64_t>::max() - bytes || mayOverlapDepthGuard(address, bytes));
+}
+
+bool DepthOverwriteProofsPending() {
+    return pendingOverwriteProofs().load(std::memory_order_acquire) != 0u;
+}
+
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool allowPublication) {
     if (bytes != 0u && pendingOverwriteProofs().load(std::memory_order_acquire) != 0u && allowPublication && !HoldsMultisampleTargetsLock()) proveOverwrittenPlanes(address, bytes);
     if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;

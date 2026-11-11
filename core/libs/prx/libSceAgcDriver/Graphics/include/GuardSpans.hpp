@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUARDSPANS_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
@@ -34,6 +35,21 @@ public:
 private:
     std::uint64_t generation = std::numeric_limits<std::uint64_t>::max();
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+};
+
+class GuardSetProof {
+public:
+    bool Holds(std::uint64_t depthGeneration, std::uint64_t multisampleGeneration) const {
+        return depth.load(std::memory_order_acquire) == depthGeneration + 1 && multisample.load(std::memory_order_acquire) == multisampleGeneration + 1;
+    }
+
+    void RecordDepth(std::uint64_t generation) { depth.store(generation + 1, std::memory_order_release); }
+
+    void RecordMultisample(std::uint64_t generation) { multisample.store(generation + 1, std::memory_order_release); }
+
+private:
+    std::atomic<std::uint64_t> depth{0};
+    std::atomic<std::uint64_t> multisample{0};
 };
 
 enum class GuardSpanEvent : std::size_t { Clear, Refill, Overlap, Verified, Missed, Count };

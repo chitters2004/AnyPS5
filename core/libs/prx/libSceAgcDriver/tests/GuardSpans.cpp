@@ -82,6 +82,20 @@ void CheckRefill() {
     Require(spans.Generation() == 2, "a refill kept the old generation");
 }
 
+void CheckGuardSetProof() {
+    AgcDriver::Graphics::GuardSetProof proof;
+    Require(!proof.Holds(0, 0), "a new proof holds");
+    proof.RecordDepth(4);
+    Require(!proof.Holds(4, 9), "a proof clear of depth guards only holds");
+    proof.RecordMultisample(9);
+    Require(proof.Holds(4, 9), "a proof clear of both registries does not hold");
+    Require(!proof.Holds(5, 9), "a proof holds after the depth guards changed");
+    Require(!proof.Holds(4, 10), "a proof holds after the multisample guards changed");
+    proof.RecordDepth(5);
+    Require(proof.Holds(5, 9), "a proof renewed for the depth guards does not hold");
+    Require(!proof.Holds(4, 9), "a renewed proof holds for the older depth generation");
+}
+
 }
 
 int main() {
@@ -90,6 +104,7 @@ int main() {
         CheckEdges();
         CheckAgainstList();
         CheckRefill();
+        CheckGuardSetProof();
         std::cout << "guard spans tests passed\n";
         return 0;
     } catch (const std::exception& error) {

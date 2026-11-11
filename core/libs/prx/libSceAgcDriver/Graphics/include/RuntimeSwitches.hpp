@@ -13,6 +13,7 @@ namespace AgcDriver::Graphics {
 enum class RuntimeSwitch : std::size_t {
     NoBarrierBatch,
     NoBarrierFusion,
+    NoGuardSetProof,
     NoGuardSpans,
     NoOwnedDrawInputs,
     Count,
