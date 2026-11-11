@@ -21,7 +21,7 @@
 #include <cmath>
 #include <cerrno>
 #include <set>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -196,7 +196,7 @@ namespace {
 
 void AwaitRegisteredPreparation(PreparedShaders& prepared, std::unique_lock<std::mutex>& lock) {
     if (prepared.pending) PrioritizeRegistrationPreparation(prepared);
-    prepared.settled.wait(lock, [&] { return !prepared.pending; });
+    prepared.settled.Wait(lock, [&] { return !prepared.pending; });
     if (prepared.failure != nullptr) std::rethrow_exception(prepared.failure);
 }
 
@@ -1489,7 +1489,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
 PreparedAtUse PrepareDeferredAbis(const ShaderSnapshot& snapshot, std::unique_lock<std::mutex>& lock) {
     auto& prepared = *snapshot.prepared;
     if (prepared.deferredPreparing) {
-        prepared.settled.wait(lock, [&] { return !prepared.deferredPreparing; });
+        prepared.settled.Wait(lock, [&] { return !prepared.deferredPreparing; });
         return std::nullopt;
     }
     if (prepared.deferredAbis.empty()) return std::nullopt;
@@ -1502,7 +1502,7 @@ PreparedAtUse PrepareDeferredAbis(const ShaderSnapshot& snapshot, std::unique_lo
         ~Preparing() {
             if (!lock.owns_lock()) lock.lock();
             prepared.deferredPreparing = false;
-            prepared.settled.notify_all();
+            prepared.settled.NotifyAll();
         }
     } preparing{prepared, lock};
     lock.unlock();
@@ -1664,7 +1664,7 @@ public:
                 unfinished.insert(sequence);
                 if (prepared != nullptr) owned.emplace(prepared, sequence);
                 lock.unlock();
-                ready.notify_one();
+                ready.NotifyOne();
                 return;
             }
         }
@@ -1683,7 +1683,7 @@ public:
         std::vector<std::uint64_t> sequences;
         for (auto entry = first; entry != last; ++entry) sequences.push_back(entry->second);
         moveToFront(prepared);
-        idle.wait(lock, [&] { return std::ranges::none_of(sequences, [&](const auto sequence) { return unfinished.contains(sequence); }); });
+        idle.Wait(lock, [&] { return std::ranges::none_of(sequences, [&](const auto sequence) { return unfinished.contains(sequence); }); });
     }
 
     void Prioritize(std::span<const std::uint64_t> programs) {
@@ -1699,7 +1699,7 @@ public:
     void AwaitSubmitted() {
         std::unique_lock lock(mutex);
         const auto ticket = submitted;
-        idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
+        idle.Wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
     }
 
     void Close(bool dropQueued) {
@@ -1715,12 +1715,12 @@ public:
                     unfinished.erase(task.sequence);
                     disown(task.prepared, task.sequence);
                 }
-                idle.notify_all();
+                idle.NotifyAll();
             }
-            idle.wait(lock, [&] { return tasks.empty() && running == 0; });
+            idle.Wait(lock, [&] { return tasks.empty() && running == 0; });
             joined.swap(workers);
         }
-        ready.notify_all();
+        ready.NotifyAll();
         for (const auto& worker : joined) Join(worker);
     }
 
@@ -1802,7 +1802,7 @@ private:
             {
                 std::unique_lock lock(pool.mutex);
                 auto next = pool.tasks.end();
-                pool.ready.wait(lock, [&] {
+                pool.ready.Wait(lock, [&] {
                     next = std::ranges::find_if(pool.tasks, [&](const Task& queued) { return !queued.budgeted || pool.budgetedRunning < pool.budgetedLimit; });
                     return next != pool.tasks.end() || (pool.closed && pool.tasks.empty());
                 });
@@ -1829,9 +1829,9 @@ private:
                 pool.unfinished.erase(sequence);
                 pool.disown(prepared, sequence);
                 drained = pool.tasks.empty() && pool.running == 0;
-                pool.idle.notify_all();
+                pool.idle.NotifyAll();
             }
-            if (budgeted) pool.ready.notify_all();
+            if (budgeted) pool.ready.NotifyAll();
 #ifdef __GLIBC__
             if (drained) trimFreedMemory();
 #endif
@@ -1848,8 +1848,8 @@ private:
     };
 
     std::mutex mutex;
-    std::condition_variable ready;
-    std::condition_variable idle;
+    AddressCondition ready;
+    AddressCondition idle;
     std::deque<Task> tasks;
     std::atomic<std::size_t> waitingPrograms{0};
     std::vector<Worker> workers;
@@ -1918,7 +1918,7 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         if (deferred) LogRegistrationPrepareDeferred();
-        prepared.settled.notify_all();
+        prepared.settled.NotifyAll();
     }, preparedKey);
 }
 

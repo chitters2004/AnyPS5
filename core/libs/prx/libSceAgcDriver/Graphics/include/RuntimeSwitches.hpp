@@ -24,6 +24,8 @@ enum class RuntimeSwitch : std::size_t {
     NoSharedVertexLayout,
     CertifiedProofs,
     NoCertifiedProofScope,
+    EncoderPostChunks,
+    EncoderAsyncSubmit,
     Count,
 };
 

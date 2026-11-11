@@ -262,6 +262,35 @@ std::string DrawFinisher::DrainText() {
     return text;
 }
 
+namespace {
+
+HandoffSite& FinisherSite() {
+    static HandoffSite site{"finisher", HandoffSpinWindow()};
+    return site;
+}
+
+HandoffSite& FinisherDrainSite() {
+    static HandoffSite site{"finisher_drain", HandoffSpinWindow() * 2};
+    return site;
+}
+
+HandoffSite& CommitterSite() {
+    static HandoffSite site{"committer", HandoffSpinWindow()};
+    return site;
+}
+
+HandoffSite& DrainSite() {
+    static HandoffSite site{"drain", HandoffSpinWindow() * 2};
+    return site;
+}
+
+bool CommitsReported() {
+    static const bool reported = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return reported;
+}
+
+}
+
 bool DrawFinisher::OnFinisherThread() {
     return finisherThread;
 }
@@ -317,7 +346,7 @@ void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    idle.Wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -328,26 +357,30 @@ void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
             run();
         });
     }
-    if (sleeping) wake.notify_one();
+    const bool wakeFinisher = sleeping;
+    lock.unlock();
+    if (wakeFinisher) wake.NotifyOne();
 }
 
 void DrawFinisher::run() {
     NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
     const bool timed = pipelineStats();
+    Job* job = nullptr;
+    bool failed = false;
     for (;;) {
-        Job* job = nullptr;
-        bool failed = false;
         const auto idleSince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (job == nullptr) {
+            const auto spin = FinisherSite().Spin([&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             if (timed && jobs.empty()) finisherSleeps.fetch_add(1, std::memory_order_relaxed);
             sleeping = true;
-            wake.wait(lock, [&] { return !jobs.empty(); });
+            wake.Wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
+            lock.unlock();
+            PerformanceTrace::Handoff(FinisherSite(), spin);
         }
         const auto busySince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto cpuSince = timed ? ThreadCpuNanos() : 0;
@@ -363,13 +396,17 @@ void DrawFinisher::run() {
             finisherBusyWallNs.fetch_add(elapsedNs(busySince), std::memory_order_relaxed);
             finisherBusyCpuNs.fetch_add(ThreadCpuNanos() - cpuSince, std::memory_order_relaxed);
         }
-        std::lock_guard lock(mutex);
-        if (error != nullptr && failure == nullptr) failure = error;
-        ran.push_back(std::move(jobs.front()));
-        jobs.pop_front();
-        pending.pop_front();
-        outstanding.fetch_sub(1, std::memory_order_release);
-        idle.notify_all();
+        {
+            std::lock_guard lock(mutex);
+            if (error != nullptr && failure == nullptr) failure = error;
+            ran.push_back(std::move(jobs.front()));
+            jobs.pop_front();
+            pending.pop_front();
+            outstanding.fetch_sub(1, std::memory_order_release);
+            job = jobs.empty() ? nullptr : &jobs.front();
+            failed = failure != nullptr;
+        }
+        idle.NotifyAll();
     }
 }
 
@@ -381,7 +418,7 @@ void DrawFinisher::Settle() {
         return;
     }
     std::unique_lock lock(mutex);
-    idle.wait(lock, [&] { return jobs.empty(); });
+    idle.Wait(lock, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
@@ -391,9 +428,10 @@ void DrawFinisher::Drain() {
         ring->Drain();
         return;
     }
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
+    const auto spin = FinisherDrainSite().Spin([&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
-    if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (!jobs.empty()) idle.Wait(lock, [&] { return jobs.empty(); });
+    PerformanceTrace::Handoff(FinisherDrainSite(), spin);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -584,7 +622,7 @@ void DrawPipeline::admit(Item item) {
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() <= resumeAt; });
+        idle.Wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -607,14 +645,15 @@ void DrawPipeline::admit(Item item) {
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (committerWaiting) {
-        ++wakes;
-        wake.notify_one();
-    }
+    const bool wakeCommitter = committerWaiting;
+    if (wakeCommitter) ++wakes;
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (profile || stats) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    }
+    lock.unlock();
+    if (wakeCommitter) wake.NotifyOne();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -703,17 +742,18 @@ void DrawPipeline::run() {
     NameDriverThread("draw-commit");
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
+    bool taken = false;
+    Commit* commit = nullptr;
+    bool isDraw = false;
     for (;;) {
-        Commit* commit = nullptr;
-        bool isDraw = false;
-        const bool starved = pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
+        const bool starved = !taken && pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
         const bool preparing = starved && DrawFinisher::Busy();
         const auto starvedAt = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
-        {
+        if (!taken) {
+            const auto spin = CommitterSite().Spin([&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             committerWaiting = true;
-            wake.wait(lock, [&] { return !items.empty() || closing; });
+            wake.Wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (starved) {
                 (preparing ? preparerStarved : workerStarved).fetch_add(1, std::memory_order_relaxed);
@@ -722,8 +762,11 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            lock.unlock();
+            PerformanceTrace::Handoff(CommitterSite(), spin);
         }
-        const auto start = std::chrono::steady_clock::now();
+        const bool reported = CommitsReported();
+        const auto start = reported ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -739,26 +782,35 @@ void DrawPipeline::run() {
         } catch (...) {
             fatal = std::current_exception();
         }
-        const auto spent = elapsedNs(start);
+        const auto spent = reported ? elapsedNs(start) : 0;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         countWrites(items.front().writes, false);
-        const auto kindIndex = static_cast<std::size_t>(items.front().kind);
-        kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
-        kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+        if (reported) {
+            const auto kindIndex = static_cast<std::size_t>(items.front().kind);
+            kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
+            kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+            ++commits;
+            commitNs += spent;
+            if (failed) ++commitErrors;
+        }
         if (items.front().sequence != 0) committedSequence.store(items.front().sequence, std::memory_order_release);
         retired.push_back(std::move(items.front()));
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
-        ++commits;
-        commitNs += spent;
-        if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.notify_all();
+        const bool wakeIdle = idleWaiters != 0 && (items.empty() || items.size() <= resumeAt);
+        taken = !items.empty();
+        if (taken) {
+            commit = stopped ? nullptr : &items.front().commit;
+            isDraw = items.front().draw;
+        }
+        lock.unlock();
+        if (wakeIdle) idle.NotifyAll();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -770,7 +822,7 @@ void DrawPipeline::Stop() {
         closing = true;
         committer = std::move(thread);
     }
-    wake.notify_all();
+    wake.NotifyAll();
     if (!committer.joinable()) return;
     if (committer.get_id() == std::this_thread::get_id()) committer.detach();
     else committer.join();
@@ -795,11 +847,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
         return;
     }
     const auto start = std::chrono::steady_clock::now();
-    SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
+    const auto spin = DrainSite().Spin([&] { return !Busy(); });
     std::unique_lock lock(mutex);
     ++idleWaiters;
-    idle.wait(lock, [&] { return items.empty(); });
+    idle.Wait(lock, [&] { return items.empty(); });
     --idleWaiters;
+    PerformanceTrace::Handoff(DrainSite(), spin);
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];

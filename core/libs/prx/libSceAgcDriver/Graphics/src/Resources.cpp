@@ -308,6 +308,8 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.cmdCopyBufferToImage = context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage");
     functions.cmdCopyImageToBuffer = context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer");
     functions.cmdClearColorImage = context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage");
+    functions.cmdBeginQuery = context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery");
+    functions.cmdEndQuery = context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery");
     functions.updateDescriptorSets = context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets");
     functions.allocateDescriptorSets = context.Function<PFN_vkAllocateDescriptorSets>("vkAllocateDescriptorSets");
     functions.getFenceStatus = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus");
@@ -411,7 +413,10 @@ void CommandBatch::release() noexcept {
     GuestWorkMark::Forget(commands);
     if (pending) {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
-        if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        if (result == VK_NOT_READY) {
+            const QueueAccess access(context);
+            result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
+        }
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
@@ -436,7 +441,10 @@ void CommandBatch::Submit() {
     submission.pCommandBuffers = &commands;
     timing.Mark("command_end");
     DestroyDeferredAtIdle(context);
-    Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    {
+        const QueueAccess access(context);
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.queue, 1, &submission, fence), "vkQueueSubmit graphics");
+    }
     pending = true;
     submitted = true;
     timing.Mark("queue_submit");

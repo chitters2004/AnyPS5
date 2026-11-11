@@ -1,21 +1,22 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_MUTEX_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_MUTEX_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <atomic>
 #include <cstdint>
 
 namespace AgcDriver {
 
 inline void WaitWhile(const std::atomic<std::uint32_t>& word, std::uint32_t value) noexcept {
-    word.wait(value, std::memory_order_relaxed);
+    AddressWait(word, value);
 }
 
 inline void WakeOne(std::atomic<std::uint32_t>& word) noexcept {
-    word.notify_one();
+    AddressWakeOne(word);
 }
 
 inline void WakeAll(std::atomic<std::uint32_t>& word) noexcept {
-    word.notify_all();
+    AddressWakeAll(word);
 }
 
 class Mutex {

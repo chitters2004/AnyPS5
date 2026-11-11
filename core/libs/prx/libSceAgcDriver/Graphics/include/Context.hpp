@@ -7,6 +7,7 @@
 #include <mutex>
 #include <vulkan/vulkan.h>
 #include "prx/libc/include/PrimedSharedMutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -141,6 +142,8 @@ struct DeviceFunctions {
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage = nullptr;
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
     PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;
+    PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
+    PFN_vkCmdEndQuery cmdEndQuery = nullptr;
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
@@ -148,6 +151,10 @@ struct DeviceFunctions {
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
+void BeforeCommandLookup(VkDevice device);
+bool QueueAccessEnabled();
+bool QueueSubmitsPosted() noexcept;
+void SettleQueueSubmits(VkDevice device, bool present);
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
@@ -196,6 +203,8 @@ struct Context {
     VkCommandPool settlePool = VK_NULL_HANDLE;
     std::uint32_t settleFamily = 0;
     std::mutex* settleQueueMutex = nullptr;
+    AgcDriver::Mutex* mainQueueMutex = nullptr;
+    std::mutex* presentQueueMutex = nullptr;
     PFN_vkGetPhysicalDeviceMemoryProperties2 memoryProperties2 = nullptr;
     VkDeviceSize (*cacheReclaim)(VkDeviceSize bytes, bool newImage) = nullptr;
     RenderCache* renderCache = nullptr;
@@ -299,6 +308,7 @@ struct Context {
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
+        if (name[0] == 'v' && name[1] == 'k' && name[2] == 'C' && name[3] == 'm' && name[4] == 'd') BeforeCommandLookup(device);
         const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
@@ -412,6 +422,29 @@ struct Context {
         if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
         return HostMemoryType(mask);
     }
+};
+
+class QueueAccess {
+public:
+    enum class Queues : std::uint8_t { Main, All };
+    enum class Settle : std::uint8_t { Other, Present };
+    explicit QueueAccess(const Context& context, Queues queues = Queues::Main, Settle site = Settle::Other) {
+        if (!QueueAccessEnabled()) return;
+        if (QueueSubmitsPosted()) SettleQueueSubmits(context.device, site == Settle::Present);
+        if (context.mainQueueMutex != nullptr) main = std::unique_lock(*context.mainQueueMutex);
+        if (queues != Queues::All) return;
+        if (context.sparseQueueMutex != nullptr) sparse = std::unique_lock(*context.sparseQueueMutex);
+        if (context.settleQueueMutex != nullptr) settle = std::unique_lock(*context.settleQueueMutex);
+        if (context.presentQueueMutex != nullptr) present = std::unique_lock(*context.presentQueueMutex);
+    }
+    QueueAccess(const QueueAccess&) = delete;
+    QueueAccess& operator=(const QueueAccess&) = delete;
+
+private:
+    std::unique_lock<AgcDriver::Mutex> main;
+    std::unique_lock<std::mutex> sparse;
+    std::unique_lock<std::mutex> settle;
+    std::unique_lock<std::mutex> present;
 };
 
 inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {

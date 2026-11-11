@@ -2,7 +2,7 @@
 
 #include <array>
 #include <atomic>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdio>
 #include <deque>
 #include <exception>
@@ -34,7 +34,7 @@ public:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
+        changed.NotifyOne();
         if (worker.joinable()) worker.join();
     }
 
@@ -46,14 +46,14 @@ public:
             if (text.empty()) return true;
             if (text.size() > capacity - bytes) {
                 ++dropped;
-                changed.notify_one();
+                changed.NotifyOne();
                 return false;
             }
             const auto size = text.size();
             pending.push_back(std::move(text));
             bytes += size;
         }
-        changed.notify_one();
+        changed.NotifyOne();
         return true;
     }
 
@@ -71,7 +71,7 @@ public:
             if (failure) std::rethrow_exception(failure);
             if (stopping) return;
             ++dropped;
-            changed.notify_one();
+            changed.NotifyOne();
         } else {
             std::vector<char> text(static_cast<std::size_t>(size) + 1);
             if (std::snprintf(text.data(), text.size(), format, args...) != size) throw std::runtime_error("profile output formatting changed");
@@ -81,7 +81,7 @@ public:
 
     void Flush() {
         std::unique_lock lock(mutex);
-        idle.wait(lock, [&] { return failure || (pending.empty() && !writing && dropped == 0); });
+        idle.Wait(lock, [&] { return failure || (pending.empty() && !writing && dropped == 0); });
         if (failure) std::rethrow_exception(failure);
     }
 
@@ -93,7 +93,7 @@ private:
                 std::size_t consumed = 0;
                 {
                     std::unique_lock lock(mutex);
-                    changed.wait(lock, [&] { return stopping || !pending.empty() || dropped != 0; });
+                    changed.Wait(lock, [&] { return stopping || !pending.empty() || dropped != 0; });
                     if (stopping && pending.empty() && dropped == 0) return;
                     while (!pending.empty() && (batch.empty() || batch.size() + pending.front().size() <= 65536)) {
                         consumed += pending.front().size();
@@ -112,7 +112,7 @@ private:
                     bytes -= consumed;
                     writing = false;
                 }
-                idle.notify_all();
+                idle.NotifyAll();
             }
         } catch (...) {
             {
@@ -120,7 +120,7 @@ private:
                 failure = std::current_exception();
                 writing = false;
             }
-            idle.notify_all();
+            idle.NotifyAll();
         }
     }
 
@@ -128,8 +128,8 @@ private:
     const std::size_t capacity;
     std::mutex stopMutex;
     std::mutex mutex;
-    std::condition_variable changed;
-    std::condition_variable idle;
+    AddressCondition changed;
+    AddressCondition idle;
     std::deque<std::string> pending;
     std::size_t bytes = 0;
     std::size_t dropped = 0;

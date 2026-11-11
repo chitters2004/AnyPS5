@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -407,7 +407,7 @@ public:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
+        changed.NotifyOne();
         if (worker.joinable()) worker.join();
     }
 
@@ -419,12 +419,12 @@ public:
             if (pending) ++superseded;
             pending = std::move(snapshot);
         }
-        changed.notify_one();
+        changed.NotifyOne();
     }
 
     void Flush() {
         std::unique_lock lock(mutex);
-        idle.wait(lock, [&] { return failure || (!pending && !writing); });
+        idle.Wait(lock, [&] { return failure || (!pending && !writing); });
         if (failure) std::rethrow_exception(failure);
     }
 
@@ -440,7 +440,7 @@ private:
                 TraceBenchSnapshot snapshot;
                 {
                     std::unique_lock lock(mutex);
-                    changed.wait(lock, [&] { return stopping || pending.has_value(); });
+                    changed.Wait(lock, [&] { return stopping || pending.has_value(); });
                     if (!pending) return;
                     snapshot = std::move(*pending);
                     pending.reset();
@@ -451,7 +451,7 @@ private:
                     std::lock_guard lock(mutex);
                     writing = false;
                 }
-                idle.notify_all();
+                idle.NotifyAll();
             }
         } catch (...) {
             {
@@ -459,15 +459,15 @@ private:
                 failure = std::current_exception();
                 writing = false;
             }
-            idle.notify_all();
+            idle.NotifyAll();
         }
     }
 
     std::function<void(const TraceBenchSnapshot&)> writer;
     std::mutex stopMutex;
     std::mutex mutex;
-    std::condition_variable changed;
-    std::condition_variable idle;
+    AddressCondition changed;
+    AddressCondition idle;
     std::optional<TraceBenchSnapshot> pending;
     std::uint64_t superseded = 0;
     bool writing = false;
@@ -528,6 +528,26 @@ public:
     using Clock = std::chrono::steady_clock;
     static constexpr std::array<std::string_view, 5> WorkerBusyScopes{"Driver.Packet", "Driver.Suspend", "Driver.EndSubmission", "Driver.Rewind", "Driver.Completion"};
     static constexpr std::string_view WorkerWaitScope = "Driver.WorkerWait";
+    static constexpr char EncoderPostScope[] = "Encoder.post";
+    static constexpr char EncoderCommandScope[] = "Encoder.command";
+    static constexpr char EncoderWaitScope[] = "Encoder.wait";
+    static constexpr char EncoderWindowScope[] = "Encoder.windows";
+    static constexpr char EncoderCpuScope[] = "Encoder.cpu_us";
+    static constexpr char EncoderSubmitScope[] = "Encoder.submit";
+    static constexpr char EncodeScope[] = "Graphics.Encode";
+    static constexpr char EncoderSpinScope[] = "Encoder.spin";
+    static constexpr char SubmitWaitScope[] = "Submitter.wait";
+    static constexpr char EncoderSettleScope[] = "Encoder.settle";
+    static constexpr char EncoderSettlePresentScope[] = "Encoder.settle.present";
+    static constexpr char EncoderPostWindowScope[] = "Encoder.post.window";
+    static constexpr char EncoderPostFullScope[] = "Encoder.post.full";
+    static constexpr char EncoderPostRecordingScope[] = "Encoder.post.recording";
+    static constexpr char EncoderPostAwaitScope[] = "Encoder.post.await";
+    static constexpr char EncoderPostForeignScope[] = "Encoder.post.foreign";
+    static constexpr char EncoderPostBatchEndScope[] = "Encoder.post.batch_end";
+    static constexpr char SpinHitScope[] = "Spin.hit";
+    static constexpr char SpinMissScope[] = "Spin.miss";
+    static constexpr char SpinBlockScope[] = "Spin.block";
     static constexpr std::string_view WorkerPrefix = "queue worker ";
     static constexpr std::size_t TopPhases = 8;
 
@@ -685,6 +705,24 @@ public:
         bool firstWorker = true;
         std::map<std::string, Clock::duration> phases;
         std::map<std::string, std::uint64_t> ownedCounts;
+        std::uint64_t encoderPosts = 0;
+        std::uint64_t encoderCommands = 0;
+        std::uint64_t encoderWaits = 0;
+        std::uint64_t encoderWindows = 0;
+        std::uint64_t encoderCpuUs = 0;
+        std::uint64_t encoderSubmits = 0;
+        std::uint64_t tickets = 0, submitWaits = 0;
+        Clock::duration encode{}, encoderSpin{}, submitWait{};
+        std::pair<std::uint64_t, Clock::duration> encoderSettle{}, encoderPresentSettle{};
+        std::map<std::string, std::uint64_t> encoderCauses;
+        Clock::duration encoderWait{};
+        struct SpinSite {
+            std::uint64_t hits = 0;
+            std::uint64_t misses = 0;
+            Clock::duration spun{};
+            Clock::duration blocked{};
+        };
+        std::map<std::string, SpinSite> spinSites;
         bool dropped = summary.ownedDrawUnbound != 0;
         if (summary.ownedDrawUnbound != 0) ownedCounts["OwnedDraw.unbound"] = summary.ownedDrawUnbound;
         struct DroppedThread {
@@ -707,8 +745,42 @@ public:
             for (const auto& total : thread.totals) {
                 const std::string_view scope = total.scope;
                 if (total.stage == nullptr && std::find(WorkerBusyScopes.begin(), WorkerBusyScopes.end(), scope) != WorkerBusyScopes.end()) busy += total.length;
-                if ((scope.starts_with("OwnedDraw.") || scope.starts_with("DrawInputPrep.")) && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
-                else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
+                if (total.stage == nullptr && scope == EncoderPostScope) encoderPosts += total.count;
+                else if (total.stage == nullptr && scope == EncoderCommandScope) encoderCommands += total.count;
+                else if (total.stage == nullptr && scope == EncoderWindowScope) encoderWindows += total.count;
+                else if (total.stage == nullptr && scope == EncoderCpuScope) encoderCpuUs += total.count;
+                else if (total.stage == nullptr && scope == EncoderSubmitScope) encoderSubmits += total.count;
+                else if (total.stage == nullptr && scope == EncodeScope) {
+                    tickets += total.count;
+                    encode += total.length;
+                } else if (total.stage == nullptr && scope == EncoderSpinScope) {
+                    encoderSpin += total.length;
+                } else if (total.stage == nullptr && scope == SubmitWaitScope) {
+                    submitWaits += total.count;
+                    submitWait += total.length;
+                }
+                else if (total.stage == nullptr && (scope == EncoderSettleScope || scope == EncoderSettlePresentScope)) {
+                    auto& settle = scope == EncoderSettlePresentScope ? encoderPresentSettle : encoderSettle;
+                    settle.first += total.count;
+                    settle.second += total.length;
+                }
+                else if (total.stage == nullptr && scope.starts_with("Encoder.post.")) encoderCauses[std::string(scope.substr(13))] += total.count;
+                else if (total.stage == nullptr && scope == EncoderWaitScope) {
+                    encoderWaits += total.count;
+                    encoderWait += total.length;
+                } else if ((scope.starts_with("OwnedDraw.") || scope.starts_with("DrawInputPrep.")) && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
+                else if (total.stage != nullptr && (scope == SpinHitScope || scope == SpinMissScope || scope == SpinBlockScope)) {
+                    auto& site = spinSites[total.stage];
+                    if (scope == SpinHitScope) {
+                        site.hits += total.count;
+                        site.spun += total.length;
+                    } else if (scope == SpinMissScope) {
+                        site.misses += total.count;
+                        site.spun += total.length;
+                    } else {
+                        site.blocked += total.length;
+                    }
+                } else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
             }
             if (!thread.name.starts_with(WorkerPrefix)) continue;
             if (!firstWorker) output += ',';
@@ -732,6 +804,31 @@ public:
             firstCount = false;
             AppendString(output, name);
             output += ':' + std::to_string(value);
+        }
+        output += '}';
+        output += ",\"encoder\":{\"posts\":" + std::to_string(encoderPosts) + ",\"commands\":" + std::to_string(encoderCommands) + ",\"waits\":" + std::to_string(encoderWaits) + ",\"wait_ms_per_frame\":" + number(milliseconds(encoderWait) * perPresent);
+        output += ",\"windows\":" + std::to_string(encoderWindows) + ",\"posts_per_frame\":" + number(static_cast<double>(encoderPosts) * perPresent) + ",\"waits_per_frame\":" + number(static_cast<double>(encoderWaits) * perPresent) + ",\"windows_per_post\":" + number(encoderPosts != 0 ? static_cast<double>(encoderWindows) / static_cast<double>(encoderPosts) : 0.0) + ",\"cpu_ms_per_frame\":" + number(static_cast<double>(encoderCpuUs) / 1000.0 * perPresent);
+        output += ",\"tickets_per_frame\":" + number(static_cast<double>(tickets) * perPresent) + ",\"encode_ms_per_frame\":" + number(milliseconds(encode) * perPresent) + ",\"spin_ms_per_frame\":" + number(milliseconds(encoderSpin) * perPresent) + ",\"submit_waits_per_frame\":" + number(static_cast<double>(submitWaits) * perPresent) + ",\"submit_wait_ms_per_frame\":" + number(milliseconds(submitWait) * perPresent) + ",\"posts_by_cause\":{";
+        bool firstCause = true;
+        for (const auto& [cause, count] : encoderCauses) {
+            if (!firstCause) output += ',';
+            firstCause = false;
+            AppendString(output, cause);
+            output += ':' + std::to_string(count);
+        }
+        output += '}';
+        if (encoderSubmits != 0 || encoderSettle.first != 0 || encoderPresentSettle.first != 0) {
+            output += ",\"submit\":{\"async\":" + std::to_string(encoderSubmits) + ",\"async_per_frame\":" + number(static_cast<double>(encoderSubmits) * perPresent) + ",\"settle_waits\":" + std::to_string(encoderSettle.first) + ",\"settle_wait_ms_per_frame\":" + number(milliseconds(encoderSettle.second) * perPresent);
+            output += ",\"present_settle_waits\":" + std::to_string(encoderPresentSettle.first) + ",\"present_settle_wait_ms_per_frame\":" + number(milliseconds(encoderPresentSettle.second) * perPresent) + '}';
+        }
+        output += '}';
+        output += ",\"handoff_spin\":{";
+        bool firstSite = true;
+        for (const auto& [name, site] : spinSites) {
+            if (!firstSite) output += ',';
+            firstSite = false;
+            AppendString(output, name);
+            output += ":{\"hits\":" + std::to_string(site.hits) + ",\"misses\":" + std::to_string(site.misses) + ",\"spin_ms_per_frame\":" + number(milliseconds(site.spun) * perPresent) + ",\"block_ms_per_frame\":" + number(milliseconds(site.blocked) * perPresent) + '}';
         }
         output += '}';
         output += ",\"trace_dropped\":";
@@ -901,6 +998,19 @@ public:
 
     static void Count(const char* scope) {
         if (Recording()) AgcDriverTraceCount_nid_postfix(scope);
+    }
+
+    template<typename TSite, typename TSpin>
+    static void Handoff(const TSite& site, const TSpin& spin) {
+        if (!spin.waited || !Recording()) return;
+        auto* thread = Thread();
+        if (thread == nullptr) return;
+        if (spin.ready) {
+            thread->Add(TraceFormat::SpinHitScope, site.Name(), spin.start, spin.end);
+            return;
+        }
+        thread->Add(TraceFormat::SpinMissScope, site.Name(), spin.start, spin.end);
+        thread->Add(TraceFormat::SpinBlockScope, site.Name(), spin.end, std::chrono::steady_clock::now());
     }
 
     static void CountOwnedDraw(const char* scope, std::uint64_t amount = 1);

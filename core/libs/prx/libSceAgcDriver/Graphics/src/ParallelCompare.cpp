@@ -1,7 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include <algorithm>
 #include <atomic>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstring>
 #include <mutex>
 #include <thread>
@@ -28,17 +28,17 @@ public:
         {
             std::unique_lock lock(mutex);
             if (stopping) return false;
-            finished.wait(lock, [&] { return working == 0; });
+            finished.Wait(lock, [&] { return working == 0; });
             jobSpans = spans;
             jobEqual = equal;
             next.store(0, std::memory_order_relaxed);
             done.store(0, std::memory_order_relaxed);
             ++generation;
         }
-        wake.notify_all();
+        wake.NotifyAll();
         drain(spans, equal);
         std::unique_lock lock(mutex);
-        finished.wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == spans.size(); });
+        finished.Wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == spans.size(); });
         jobSpans = {};
         jobEqual = {};
         return true;
@@ -52,7 +52,7 @@ public:
             stopping = true;
             joined.swap(workers);
         }
-        wake.notify_all();
+        wake.NotifyAll();
         for (auto& worker : joined) {
             if (worker.get_id() == std::this_thread::get_id()) worker.detach();
             else worker.join();
@@ -74,7 +74,7 @@ private:
         std::uint64_t seen = 0;
         std::unique_lock lock(mutex);
         for (;;) {
-            wake.wait(lock, [&] { return generation != seen || stopping; });
+            wake.Wait(lock, [&] { return generation != seen || stopping; });
             if (stopping) break;
             seen = generation;
             const auto spans = jobSpans;
@@ -84,15 +84,15 @@ private:
             drain(spans, equal);
             lock.lock();
             --working;
-            if (working == 0) finished.notify_all();
+            if (working == 0) finished.NotifyAll();
         }
         runningHelpers.fetch_sub(1, std::memory_order_acq_rel);
     }
 
     std::mutex callers;
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable finished;
+    AddressCondition wake;
+    AddressCondition finished;
     std::uint64_t generation = 0;
     unsigned working = 0;
     std::span<const CompareSpan> jobSpans;

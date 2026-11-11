@@ -101,7 +101,7 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress)
 void Driver::wakeQueueZeroForCompletions() {
     if (!completionsPending()) return;
     std::lock_guard lock(mutex);
-    changed.notify_all();
+    changed.NotifyAll();
 }
 
 std::uint64_t Driver::submitFlipWork(std::uint32_t queue) {
@@ -127,7 +127,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
                 notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || completionsPending();
             }
-            if (notify) driver.changed.notify_all();
+            if (notify) driver.changed.NotifyAll();
         }
     } complete{*this, serial, received, labelWrites};
     if (holdsFlip) finishFlipWork(submitFlipWork(0));
@@ -188,9 +188,9 @@ void Driver::run(std::uint32_t id) noexcept {
             struct Running {
                 std::atomic<std::uint32_t>& count;
                 std::atomic<std::uint64_t>& idleEpoch;
-                std::condition_variable& changed;
+                AddressCondition& changed;
                 bool active = false;
-                Running(std::atomic<std::uint32_t>& count, std::atomic<std::uint64_t>& idleEpoch, std::condition_variable& changed)
+                Running(std::atomic<std::uint32_t>& count, std::atomic<std::uint64_t>& idleEpoch, AddressCondition& changed)
                     : count(count), idleEpoch(idleEpoch), changed(changed) {}
                 void Start() {
                     count.fetch_add(1, std::memory_order_acq_rel);
@@ -199,7 +199,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 ~Running() {
                     if (active && count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         idleEpoch.fetch_add(1, std::memory_order_release);
-                        changed.notify_all();
+                        changed.NotifyAll();
                     }
                 }
             } running{runningWorkers, idleEpoch, changed};
@@ -229,7 +229,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     lock.lock();
                     return done();
 #else
-                    return changed.wait_for(lock, std::chrono::milliseconds(1), done);
+                    return changed.WaitFor(lock, std::chrono::milliseconds(1), done);
 #endif
                 };
 
@@ -241,7 +241,7 @@ void Driver::run(std::uint32_t id) noexcept {
                             queue0Dormant.store(true, std::memory_order_relaxed);
                             const auto quietUntil = std::chrono::steady_clock::now() + IdleResultsQuietPeriod;
                             const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
-                            changed.wait_until(lock, quietUntil, [&] {
+                            changed.WaitUntil(lock, quietUntil, [&] {
                                 return ready() || idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait;
                             });
                             queue0Dormant.store(false, std::memory_order_relaxed);
@@ -261,7 +261,7 @@ void Driver::run(std::uint32_t id) noexcept {
                             && ((idleStore && !storeIdleResults && Graphics::StorageTexture::AnyPending()) || idleEpoch.load(std::memory_order_acquire) != idleEpochAtCheck)) continue;
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
-                        changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
+                        changed.Wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         continue;
                     }
@@ -344,7 +344,7 @@ void Driver::run(std::uint32_t id) noexcept {
 
                 notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0;
             }
-            if (notify) changed.notify_all();
+            if (notify) changed.NotifyAll();
             else ++costs.notifiesSkipped;
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
         }

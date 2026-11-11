@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -50,7 +51,7 @@ class DeviceBuffer;
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
-    explicit Recorder(const Context& context, bool timelineSemaphores = false);
+    explicit Recorder(const Context& context, bool timelineSemaphores = false, DeviceFunctions* encodedFunctions = nullptr, std::uint32_t queueFamily = 0);
     ~Recorder();
     Recorder(const Recorder&) = delete;
     Recorder& operator=(const Recorder&) = delete;
@@ -449,6 +450,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void FailNextAsyncSubmitsForTest(unsigned count, VkResult result = VK_ERROR_UNKNOWN);
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -514,6 +516,24 @@ public:
     // there must not have a publish recorded for it (UnitShadow), see SyncThrough.
     static bool InCompletion();
     void Activate();
+    bool BeginEncoding();
+    void EndEncoding();
+    bool Encodes() const { return encoder != nullptr; }
+    CommandEncoder::UnwindQuiesce UnwindGuard() const { return CommandEncoder::UnwindQuiesce(encoder.get()); }
+    class EncodingWindow {
+    public:
+        explicit EncodingWindow(Recorder& recorder) : recorder(recorder), opened(recorder.BeginEncoding()) {}
+        ~EncodingWindow() {
+            if (opened) recorder.EndEncoding();
+        }
+        EncodingWindow(const EncodingWindow&) = delete;
+        EncodingWindow& operator=(const EncodingWindow&) = delete;
+
+    private:
+        Recorder& recorder;
+        bool opened;
+    };
+    CommandEncoder::Statistics EncoderCounts() const { return encoder != nullptr ? encoder->Counts() : CommandEncoder::Statistics{}; }
     // APS5_PROFILE_DRAW: syncs by source (0 device idle, 1 CPU access to pending writes, 2 CPU read
     // after a recorded store, 3 address-based dispatch, 4 other). Contract: the call announces the
     // source for the Sync/SyncThrough this thread makes NEXT, which consumes it (a sync without a
@@ -653,6 +673,11 @@ private:
     void settleOwed();
     void oweBarrier(const BarrierMask& mask, CommandClass which, bool passEnd);
     struct Batch;
+    struct SampleSegment {
+        std::shared_ptr<void> pool;
+        VkQueryPool handle;
+        std::uint32_t slot = 0;
+    };
     struct WideLabel {
         std::uint64_t end;
         std::vector<std::byte> bytes;
@@ -661,7 +686,9 @@ private:
         const Batch* batch = nullptr;
     };
     struct Batch {
+        CommandEncoder::Recording recording;
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkCommandPool pool = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
@@ -693,6 +720,8 @@ private:
         std::uint64_t traceId = 0;
         bool submitted = false;
         bool guestWork = false;
+        bool confirmed = false;
+        std::unique_ptr<CommandEncoder::SubmitRequest> request;
         std::atomic<bool> submitStarted{false};
         // The GpuMutex queue tag of the thread that opened the batch, and when it was submitted
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
@@ -709,6 +738,8 @@ private:
         std::uint32_t segmentNext = 0;
         std::uint32_t segmentSlot = 0;
         bool segmentActive = false;
+        std::size_t ownSamples = 0;
+        std::vector<SampleSegment> foldedSamples;
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
@@ -842,11 +873,7 @@ private:
     void dispatchDumps(VkCommandBuffer commands, std::uint32_t firstDump, std::uint32_t dumps, std::uint32_t firstSegment, std::uint32_t lastSegment);
     void foldSegments();
     void foldQueuedDumps(VkCommandBuffer commands, std::span<const Batch::StoreRun::Queued> writes, std::size_t first, std::size_t end, std::uint32_t& dumpIndex, std::uint32_t& consumed);
-    struct SampleSegment {
-        std::shared_ptr<void> pool;
-        VkQueryPool handle;
-        std::uint32_t slot = 0;
-    };
+    void forgetSamples(Batch& batch) noexcept;
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
     bool holdOwed = false;
@@ -884,6 +911,7 @@ private:
     PFN_vkCmdPipelineBarrier cmdPipelineBarrier = nullptr;
     PFN_vkCmdBeginQuery cmdBeginQuery = nullptr;
     PFN_vkCmdEndQuery cmdEndQuery = nullptr;
+    bool queriesEncoded = false;
     PFN_vkCmdResetQueryPool cmdResetQueryPool = nullptr;
     PFN_vkCmdCopyQueryPoolResults cmdCopyQueryPoolResults = nullptr;
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
@@ -923,6 +951,18 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void dispatchAsync(std::unique_ptr<Batch>& batch, const std::string& tokens);
+    static void asyncSubmitSettled(void* owner, const CommandEncoder::SubmitRequest& request, CommandEncoder::SubmitRequest::State state) noexcept;
+    void noteConfirmed(Batch& batch);
+    void confirmReady();
+    void confirmThrough(std::uint64_t serial);
+    [[noreturn]] void failAsync(std::unique_ptr<Batch> failed, CommandEncoder::SubmitRequest::State state);
+    enum class AsyncSubmit : std::uint8_t { Made, Pending, Failed };
+    AsyncSubmit awaitAsyncSubmit(std::uint64_t serial, std::chrono::steady_clock::time_point deadline);
+    std::atomic<std::uint64_t> asyncDispatched{0};
+    std::atomic<std::uint64_t> asyncSettled{0};
+    std::atomic<std::uint64_t> asyncFailedFrom{~std::uint64_t{0}};
+    std::atomic<std::uint32_t> asyncWaiters{0};
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
@@ -1064,6 +1104,17 @@ private:
     BatchKeySet<ReadListKey, ReadListKeyHash> notedReadLists;
     void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
 
+    VkCommandPool encoderPool = VK_NULL_HANDLE;
+    std::unique_ptr<CommandEncoder> encoder;
+    void quiesce() {
+        if (encoder == nullptr) return;
+        encoder->Quiesce();
+        if (open != nullptr) open->recording.Report();
+    }
+    VkCommandBuffer live() {
+        quiesce();
+        return open->commands;
+    }
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;

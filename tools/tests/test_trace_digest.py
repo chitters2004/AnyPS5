@@ -433,6 +433,84 @@ class TraceDigestTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             trace_digest.validate_interval(first)
 
+    def test_encoder_interval_counts_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"posts": 3100, "commands": 84000, "waits": 23, "wait_ms_per_frame": 0.25, "windows": 3100, "posts_per_frame": 31.0, "waits_per_frame": 0.23, "windows_per_post": 1.0, "cpu_ms_per_frame": 2.5, "posts_by_cause": {"window": 3000, "batch_end": 100}}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 3100 | 84000 | 23 | 0.25 | 31.0 | 1.00 | 2.50 | batch_end 100, window 3000 |", text)
+        self.assertIn("| 2 | 0 | 0 | 0 | 0.00 | 0.0 | 0.00 | 0.00 | - |", text)
+        self.assertNotIn("encoder posts", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"waits": -1}
+        with self.assertRaises(ValueError):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"posts_by_cause": {"full": -2}}
+        with self.assertRaisesRegex(ValueError, "encoder.posts_by_cause"):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"windows_per_post": "many"}
+        with self.assertRaisesRegex(ValueError, "encoder.windows_per_post"):
+            trace_digest.validate_interval(first)
+
+    def test_encoder_ticket_fields_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"tickets_per_frame": 130.0, "encode_ms_per_frame": 6.5, "spin_ms_per_frame": 0.25, "submit_waits_per_frame": 0.0, "submit_wait_ms_per_frame": 0.0}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 130.00 | 6.50 | 0.25 | 0.00 | 0.00 |", text)
+        self.assertIn("| 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |", text)
+        self.assertNotIn("tickets/frame", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"encode_ms_per_frame": "slow"}
+        with self.assertRaisesRegex(ValueError, "encoder.encode_ms_per_frame"):
+            trace_digest.validate_interval(first)
+
+    def test_encoder_submit_settles_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["encoder"] = {"posts": 130, "submit": {"async": 130, "async_per_frame": 13.0, "settle_waits": 4, "settle_wait_ms_per_frame": 0.5, "present_settle_waits": 10, "present_settle_wait_ms_per_frame": 1.25}}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["encoder"], first["encoder"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | 130 | 13.0 | 4 | 0.50 | 10 | 1.25 |", text)
+        self.assertIn("| 2 | 0 | 0.0 | 0 | 0.00 | 0 | 0.00 |", text)
+        self.assertNotIn("async submits", trace_digest.markdown_intervals(trace_digest.digest_intervals([second])))
+        first["encoder"] = {"submit": {"settle_waits": -1}}
+        with self.assertRaisesRegex(ValueError, "encoder.submit.settle_waits"):
+            trace_digest.validate_interval(first)
+        first["encoder"] = {"submit": []}
+        with self.assertRaisesRegex(ValueError, "encoder.submit must"):
+            trace_digest.validate_interval(first)
+
+    def test_handoff_spin_interval_sites_are_preserved(self):
+        first = interval_line(0.0, 30.0, 20.0, 5.0)
+        second = interval_line(30.0, 60.0, 20.0, 5.0)
+        first["handoff_spin"] = {"drain": {"hits": 120, "misses": 40, "spin_ms_per_frame": 2.5, "block_ms_per_frame": 9.0},
+                                 "committer": {"hits": 3000, "misses": 2, "spin_ms_per_frame": 0.75, "block_ms_per_frame": 0.0}}
+        second["handoff_spin"] = {"drain": {"hits": 0, "misses": 7, "spin_ms_per_frame": 0.0, "block_ms_per_frame": 1.25}}
+        for line in (first, second):
+            trace_digest.validate_interval(line)
+        result = trace_digest.digest_intervals([first, second])
+        self.assertEqual(result["intervals"][0]["handoff_spin"], first["handoff_spin"])
+        text = trace_digest.markdown_intervals(result)
+        self.assertIn("| 1 | committer | 3000 | 2 | 0.75 | 0.00 |", text)
+        self.assertIn("| 1 | drain | 120 | 40 | 2.50 | 9.00 |", text)
+        self.assertIn("| 2 | committer | 0 | 0 | 0.00 | 0.00 |", text)
+        self.assertIn("| 2 | drain | 0 | 7 | 0.00 | 1.25 |", text)
+        self.assertNotIn("hand-off site", trace_digest.markdown_intervals(trace_digest.digest_intervals([interval_line(0.0, 30.0, 20.0, 5.0)])))
+        for bad in ({"drain": {"misses": -1}}, {"drain": {"hits": 1.5}}, {"drain": 3}, []):
+            first["handoff_spin"] = bad
+            with self.assertRaises(ValueError):
+                trace_digest.validate_interval(first)
+
     def test_empty_summary_jsonl_files_remain_valid(self):
         path = self.trace.with_name("aps5-summary.jsonl")
         for text in ("", "\n \t\r\n"):
