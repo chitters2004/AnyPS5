@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include "AggregateFields.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -23,7 +24,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
-#include <functional>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
@@ -250,47 +250,85 @@ void PlanKeysCoverThePipelineKey() {
         AgcDriver::DriverDetail::AppendDrawPlanStateWords(state, words);
         return words;
     };
-    const std::vector<std::pair<const char*, std::function<void(Graphics::State&)>>> changes{
-        {"blend constant red", [](Graphics::State& state) { state.blendConstants[0] = 0.5f; }},
-        {"blend constant green", [](Graphics::State& state) { state.blendConstants[1] = 0.0f; }},
-        {"blend constant blue", [](Graphics::State& state) { state.blendConstants[2] = 0.0f; }},
-        {"blend constant alpha", [](Graphics::State& state) { state.blendConstants[3] = 0.0f; }},
-        {"front stencil reference", [](Graphics::State& state) { state.stencilFront.reference = 4u; }},
-        {"back stencil reference", [](Graphics::State& state) { state.stencilBack.reference = 6u; }},
-        {"depth bias clamp", [](Graphics::State& state) { state.depthBiasClamp = 0.5f; }},
-        {"front stencil compare mask", [](Graphics::State& state) { state.stencilFront.compareMask = 0x0fu; }},
-        {"back stencil write mask", [](Graphics::State& state) { state.stencilBack.writeMask = 0x0fu; }},
-        {"depth compare", [](Graphics::State& state) { state.depthCompare = VK_COMPARE_OP_LESS; }},
-        {"color format", [](Graphics::State& state) { state.colors[0].format = VK_FORMAT_R8G8B8A8_UNORM; }},
-        {"color component mapping", [](Graphics::State& state) { state.colors[0].componentMapping = 0xc6u; }},
-        {"color partial write", [](Graphics::State& state) { state.colors[0].partialWriteMask = 1u; }},
-        {"blend enable", [](Graphics::State& state) { state.blends[0].blendEnable = VK_TRUE; }},
-        {"blend factor", [](Graphics::State& state) { state.blends[0].srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR; }},
-        {"color rop", [](Graphics::State& state) { state.colorRop = 0x00u; }},
-        {"samples", [](Graphics::State& state) { state.samples = 4u; }},
-        {"sample mask", [](Graphics::State& state) { state.quadSampleMask = {1u, 1u, 1u, 1u}; }},
-        {"topology", [](Graphics::State& state) { state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP; }},
-        {"cull mode", [](Graphics::State& state) { state.cullMode = VK_CULL_MODE_BACK_BIT; }},
-        {"front face", [](Graphics::State& state) { state.frontFace = VK_FRONT_FACE_CLOCKWISE; }},
-        {"polygon mode", [](Graphics::State& state) { state.polygonMode = VK_POLYGON_MODE_LINE; }},
-        {"line width", [](Graphics::State& state) { state.lineWidth = 2.0f; }},
-        {"primitive restart", [](Graphics::State& state) { state.primitiveRestart = true; }},
-        {"depth clip range", [](Graphics::State& state) { state.negativeOneToOne = true; }},
-        {"rasterizer discard", [](Graphics::State& state) { state.rasterizerDiscard = true; }},
-        {"mesh layer base", [](Graphics::State& state) { state.meshLayerBase = 1u; }},
-        {"depth format", [](Graphics::State& state) { state.depth->format = VK_FORMAT_D32_SFLOAT; }},
-        {"no depth", [](Graphics::State& state) { state.depth.reset(); }},
-    };
     std::size_t covered = 0;
-    for (const auto& [name, change] : changes) {
-        auto changed = base;
-        change(changed);
-        if (pipelineKey(changed) == pipelineKey(base)) continue;
-        ++covered;
-        Expect(planWords(changed) != planWords(base), std::string("the plan key ignores a change of ") + name + " that changes the pipeline key");
-    }
-    Expect(covered >= 7, "the pipeline key changed for too few of the changes to test the plan key against it");
-    std::printf("draw plans: the plan key follows %zu state changes that change the pipeline key\n", covered);
+    std::size_t pairs = 0;
+    std::size_t refused = 0;
+    const auto follow = [&](const Graphics::State& context, const std::string& contextPath) {
+        const auto contextPipeline = pipelineKey(context);
+        const auto contextWords = planWords(context);
+        std::size_t followed = 0;
+        AggregateFields::ForEachMutation(context, [&](const Graphics::State& changed, const std::string& path) {
+            std::vector<std::byte> changedPipeline;
+            try {
+                changedPipeline = pipelineKey(changed);
+            } catch (const std::exception&) {
+                ++refused;
+                return;
+            }
+            if (changedPipeline == contextPipeline) return;
+            ++followed;
+            Expect(planWords(changed) != contextWords, "the plan key ignores state member " + path + contextPath + ", which changes the pipeline key");
+        });
+        return followed;
+    };
+    covered = follow(base, "");
+    const auto leaves = AggregateFields::ForEachMutation(base, [&](const Graphics::State& context, const std::string& path) {
+        try {
+            pipelineKey(context);
+        } catch (const std::exception&) {
+            return;
+        }
+        pairs += follow(context, " after a change of " + path);
+    });
+    Expect(leaves > AggregateFields::FieldCount<Graphics::State>() && covered >= 20, "the field walk changed the pipeline key for too few state members to test the plan key against it");
+    std::printf("draw plans: the plan key follows all %zu of %zu state leaves and %zu leaf pairs that change the pipeline key (%zu refused by the pipeline key)\n", covered, leaves, pairs, refused);
+}
+
+void PlanKeysFollowTheBindingShape() {
+    namespace Graphics = AgcDriver::Graphics;
+    ShaderRecompiler::RecompileResult program{};
+    program.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
+    program.variantId = 0x51u;
+    ShaderRecompiler::DescriptorBinding buffers{};
+    buffers.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    buffers.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    buffers.binding = 1u;
+    buffers.count = 2u;
+    buffers.guestDescriptor = {4u, 8u};
+    buffers.bufferWritten.push_back(false);
+    buffers.bufferWritten.push_back(true);
+    buffers.bufferExtent = {64u, 128u};
+    ShaderRecompiler::DescriptorBinding images{};
+    images.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+    images.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    images.binding = 2u;
+    images.count = 1u;
+    images.readOnly = true;
+    images.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    images.imageShapes = {ShaderRecompiler::DescriptorImageShape::Image2D};
+    program.bindings = {buffers, images};
+    const AgcDriver::Pm4::DrawParameters draw{};
+    const Graphics::State state{};
+    const auto keyOf = [&](const ShaderRecompiler::RecompileResult& result) {
+        const std::array<Graphics::CompiledShader, 1> stages{Graphics::CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &result, 0u}};
+        const auto key = AgcDriver::DriverDetail::BuildDrawPlanKey(stages, state, draw);
+        Expect(key != nullptr, "a program with a variant was refused a plan key");
+        return key->words;
+    };
+    const auto baseKey = keyOf(program);
+    const auto baseIdentity = program.Identity();
+    Expect(!baseIdentity.Empty(), "the test program has no identity");
+    std::size_t shaped = 0;
+    const auto leaves = AggregateFields::ForEachMutation(program.bindings, [&](const std::vector<ShaderRecompiler::DescriptorBinding>& bindings, const std::string& path) {
+        auto changed = program;
+        changed.bindings = bindings;
+        const auto sameRoles = std::ranges::equal(bindings, program.bindings, [](const auto& a, const auto& b) { return a.role == b.role && a.readOnly == b.readOnly; });
+        if (changed.Identity() == baseIdentity && sameRoles) return;
+        ++shaped;
+        Expect(keyOf(changed) != baseKey, "the plan key ignores binding member " + path + ", which changes the program's binding shape");
+    });
+    Expect(shaped >= 11, "the field walk changed the binding shape for too few binding members to test the plan key against it");
+    std::printf("draw plans: the plan key follows all %zu of %zu binding leaves that change the binding shape\n", shaped, leaves);
 }
 
 void PlansFollowPipelineState() {
@@ -504,6 +542,7 @@ int main() {
             if (!device) return VulkanTestSkipped;
         }
         PlanKeysCoverThePipelineKey();
+        PlanKeysFollowTheBindingShape();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         Register(LoadingPixelHeader, LoadingPixelCode.data(), sizeof(LoadingPixelCode), 1);

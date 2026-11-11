@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
+#include "AggregateFields.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -112,6 +113,32 @@ DrawStageKey KeyOf(const RequestParts& parts, const ShaderSnapshot& snapshot, st
     DrawStageKey key;
     Expect(BuildDrawStageKey(parts.Request(), snapshot, codeOffset, serial, key), "a plain graphics request was refused a key");
     return key;
+}
+
+void StageInfoKeysFollowEveryField() {
+    ShaderSnapshot snapshot{};
+    RequestParts pixelParts;
+    pixelParts.stage = Stage::Fragment;
+    pixelParts.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+    pixelParts.pixel->interpolatorCount = static_cast<std::uint32_t>(pixelParts.pixel->interpolatorSettings.size());
+    pixelParts.pixel->targetMerges.push_back({});
+    const auto pixelKey = KeyOf(pixelParts, snapshot);
+    const auto pixelLeaves = AggregateFields::ForEachMutation(*pixelParts.pixel, [&](const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::string& path) {
+        auto parts = pixelParts;
+        parts.pixel = pixel;
+        Expect(!(KeyOf(parts, snapshot) == pixelKey), "the key ignores pixel stage info member " + path);
+    });
+    RequestParts vertexParts;
+    vertexParts.vertex = VertexInfo();
+    vertexParts.vertex->resourcesNum = ShaderRecompiler::ShaderVertexStageInfo::MaxResources;
+    const auto vertexKey = KeyOf(vertexParts, snapshot);
+    const auto vertexLeaves = AggregateFields::ForEachMutation(*vertexParts.vertex, [&](const ShaderRecompiler::ShaderVertexStageInfo& vertex, const std::string& path) {
+        auto parts = vertexParts;
+        parts.vertex = vertex;
+        Expect(!(KeyOf(parts, snapshot) == vertexKey), "the key ignores vertex stage info member " + path);
+    });
+    Expect(pixelLeaves > AggregateFields::FieldCount<ShaderRecompiler::ShaderPixelStageInfo>() && vertexLeaves > AggregateFields::FieldCount<ShaderRecompiler::ShaderVertexStageInfo>(), "the field walk reached fewer leaves than the stage infos have members");
+    std::printf("draw stage keys change with each of %zu pixel and %zu vertex stage info leaves\n", pixelLeaves, vertexLeaves);
 }
 
 void KeysFollowEveryInput() {
@@ -637,6 +664,7 @@ void ProofsFollowWriteStamps() {
 int main() {
     try {
         KeysFollowEveryInput();
+        StageInfoKeysFollowEveryField();
         MemoStoresByWholeKey();
         {
             const auto device = OpenVulkanTestDevice();

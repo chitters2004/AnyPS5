@@ -196,7 +196,9 @@ std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::Co
     key->words.push_back(stages.size());
     for (const auto& stage : stages) {
         const auto& program = *stage.program;
-        for (const std::uint64_t word : {static_cast<std::uint64_t>(stage.stage), program.variantId, program.specializationId, std::uint64_t{stage.pushConstantOffset}, std::uint64_t{program.pushConstants.size()}, std::uint64_t{program.bdaAbiVersion}, std::uint64_t{program.vertexAttributes.size()}}) key->words.push_back(word);
+        const auto identity = program.Identity();
+        for (const std::uint64_t word : {static_cast<std::uint64_t>(stage.stage), program.variantId, program.specializationId, std::uint64_t{stage.pushConstantOffset}, std::uint64_t{program.pushConstants.size()}, std::uint64_t{program.bdaAbiVersion}, std::uint64_t{program.vertexAttributes.size()}, identity.low, identity.high, std::uint64_t{program.bindings.size()}}) key->words.push_back(word);
+        for (const auto& binding : program.bindings) key->words.push_back(static_cast<std::uint64_t>(binding.role) | (std::uint64_t{binding.readOnly} << 32u));
         for (const auto& attribute : program.vertexAttributes) {
             const auto& fields = attribute.resource.fields;
             for (const std::uint64_t word : {std::uint64_t{attribute.location}, std::uint64_t{attribute.components}, std::uint64_t{attribute.fetchIndex}, std::uint64_t{attribute.formatComponents}, std::uint64_t{fields[1] >> 16u}, std::uint64_t{fields[3]}, std::uint64_t{Graphics::NullVertexDescriptor(attribute)}}) key->words.push_back(word);
