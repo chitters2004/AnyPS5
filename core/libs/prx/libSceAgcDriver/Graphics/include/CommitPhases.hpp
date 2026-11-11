@@ -74,6 +74,17 @@ enum class CommitPhase : std::uint8_t {
     InputsIndexRange,
     InputsExpand,
     InputsLayout,
+    RecordSetup,
+    RecordPass,
+    RecordBegin,
+    RecordBind,
+    RecordPush,
+    RecordCommands,
+    RecordLeave,
+    RecordAfter,
+    RecordRecipe,
+    RecordStores,
+    RecordPassKey,
     Count
 };
 

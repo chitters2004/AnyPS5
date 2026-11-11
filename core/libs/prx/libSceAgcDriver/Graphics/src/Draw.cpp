@@ -3021,6 +3021,7 @@ bool WriteOnlyPasses() {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+    BeginCommitPhase(CommitPhase::RecordPassKey);
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -3037,6 +3038,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
+    BeginCommitPhase(CommitPhase::RecordStores);
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
         if (resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes)) return true;
@@ -3113,7 +3115,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWriteOnly = writeOnly;
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments.Span(), unknownMemory, unknownWrites, passWriteOnly};
-    BeginCommitPhase(CommitPhase::Record);
+    BeginCommitPhase(CommitPhase::RecordPass);
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
@@ -3147,6 +3149,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
+    BeginCommitPhase(CommitPhase::RecordBegin);
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -3192,6 +3195,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, record.masked);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
+    BeginCommitPhase(CommitPhase::RecordBind);
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
@@ -3203,8 +3207,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
+    BeginCommitPhase(CommitPhase::RecordPush);
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
+    BeginCommitPhase(CommitPhase::RecordCommands);
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
     if (timeEachDraw) {
@@ -3237,6 +3243,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
     APS5_LOG_CHARS_OUT_DEBUG("Draw recorded");
+    BeginCommitPhase(CommitPhase::RecordLeave);
     std::function<void(VkCommandBuffer)> storeProxies;
     if (!continued && (!record.proxies.empty() || !record.reordered.empty() || record.depthLocations)) {
         storeProxies = [proxies = record.proxies, reordered = record.reordered, reorderPass = record.reorderPass, depthLocations = record.depthLocations, context, recorder](VkCommandBuffer passCommands) {
@@ -3261,7 +3268,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     BeginCommitPhase(CommitPhase::Effects);
     keepRecordedDraw(*recorder, record.resources, record.pipeline, record.framebuffer, inputs, record.targets, record.targetSlices, state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
-    BeginCommitPhase(CommitPhase::Record);
+    BeginCommitPhase(CommitPhase::RecordAfter);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
         for (auto& write : record.staged) {
@@ -4031,6 +4038,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     InlineList<std::pair<std::uint32_t, std::uint32_t>, 8> slices;
     for (const auto& binding : targets) slices.EmplaceBack(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u);
     if (lean) {
+        BeginCommitPhase(CommitPhase::RecordSetup);
         RecordedDraw record{resources, pipeline, framebuffer};
         record.recorder = recorder;
         record.moved = resolved.moved;
@@ -4067,6 +4075,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.spaceKeep = &prepared.spaceKeep;
         record.masked = prepared.masked.has_value() ? &*prepared.masked : nullptr;
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
+        BeginCommitPhase(CommitPhase::RecordRecipe);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
@@ -4113,6 +4122,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             if (servable) *recipeOut = std::move(recipe);
             else DrawPlanShadowSlot() = std::move(recipe);
         }
+        BeginCommitPhase(CommitPhase::Record);
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
@@ -4715,7 +4725,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers); });
     }
     timer.phase(PhasePipeline);
-    BeginCommitPhase(CommitPhase::Record);
+    BeginCommitPhase(CommitPhase::RecordSetup);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record{resources, std::move(pipeline), std::move(framebuffer)};
     record.recorder = recorder;
