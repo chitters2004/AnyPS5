@@ -66,7 +66,14 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", NonCandidateNames[i], static_cast<unsigned long long>(nonCandidateDrains[i].Sum()));
         excluded += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s; drained as no candidate, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str(), excluded.c_str());
+    std::string refused;
+    const auto refusals = VulkanDevice::DispatchRecipeRefusals();
+    for (std::size_t i = 0; i < refusals.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", VulkanDevice::DispatchRecipeRefusalName(static_cast<VulkanDevice::DispatchRecipeRefusal>(i)), static_cast<unsigned long long>(refusals[i]));
+        refused += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s; drained as no candidate, cumulative:%s; recipes refused, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str(), excluded.c_str(), refused.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {

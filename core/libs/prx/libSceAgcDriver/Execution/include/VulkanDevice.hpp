@@ -358,6 +358,9 @@ public:
     enum class RecipeKind : std::size_t { Dispatch, Indirect, Draw };
     static void NoteRecipe(RecipeEvent event, bool indirect);
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
+    enum class DispatchRecipeRefusal : std::size_t { NotCacheable, Overlay, NotReusable, NeedsCompletion, NoObjects, NoKey, Count };
+    static std::array<std::uint64_t, static_cast<std::size_t>(DispatchRecipeRefusal::Count)> DispatchRecipeRefusals();
+    static const char* DispatchRecipeRefusalName(DispatchRecipeRefusal refusal);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     using DrawTraceContext = Graphics::DrawTraceContext;
