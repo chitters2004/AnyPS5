@@ -49,6 +49,7 @@ constexpr std::array<std::uint32_t, 3> Degenerate{0, 0, 0};
 std::byte* ColorMemory = nullptr;
 std::byte* Pool = nullptr;
 std::byte* IndexMemory = nullptr;
+alignas(256) std::array<std::uint32_t, 5> IndexedRecord{3, 1, 0, 0, 0};
 
 alignas(256) constexpr std::array<std::uint32_t, 10> VertexCode{
     0xe0382000, 0x80020005, 0xe0382010, 0x80020405, 0xbf8c3f70,
@@ -131,7 +132,7 @@ void SetRegister(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::u
     words.push_back(value);
 }
 
-std::vector<std::uint32_t> Draw(bool degenerateFirst = false) {
+std::vector<std::uint32_t> Draw(bool degenerateFirst = false, bool indirect = false) {
     const auto colorAddress = reinterpret_cast<std::uintptr_t>(ColorMemory);
     const auto poolAddress = reinterpret_cast<std::uintptr_t>(Pool);
     const auto indexAddress = reinterpret_cast<std::uintptr_t>(IndexMemory);
@@ -169,6 +170,12 @@ std::vector<std::uint32_t> Draw(bool degenerateFirst = false) {
     words.insert(words.end(), {0xc0012600u, static_cast<std::uint32_t>(indexAddress), static_cast<std::uint32_t>(indexAddress >> 32u)});
     words.insert(words.end(), {0xc0001300u, static_cast<std::uint32_t>(Indices.size())});
     SetRegister(words, SetUconfigReg, 0x243, 0x401u);
+    if (indirect) {
+        const auto records = reinterpret_cast<std::uintptr_t>(IndexedRecord.data());
+        words.insert(words.end(), {0xc0021100u, 1u, static_cast<std::uint32_t>(records), static_cast<std::uint32_t>(records >> 32u)});
+        words.insert(words.end(), {0xc0032500u, 0u, 0u, 0u, 0u});
+        return words;
+    }
     words.insert(words.end(), {DrawIndexOffset2Header, static_cast<std::uint32_t>(Indices.size()), 0u, static_cast<std::uint32_t>(Indices.size()), 0u});
     return words;
 }
@@ -234,7 +241,7 @@ struct Outcome {
     std::uint64_t copied() const { return after.sources[static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied)] - before.sources[static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied)]; }
 };
 
-Outcome DrawOnce(Change change, bool degenerateFirst = false) {
+Outcome DrawOnce(Change change, bool degenerateFirst = false, bool indirect = false) {
     WriteIndices(Indices);
     WriteVertices(0.0f);
     std::memset(ColorMemory, 0, ColorBytes);
@@ -242,7 +249,7 @@ Outcome DrawOnce(Change change, bool degenerateFirst = false) {
     outcome.before = AgcDriver::Graphics::PreparedDrawInputCounters();
     const auto hooks = HookRuns.load();
     Armed.store(change);
-    Submit(Draw(degenerateFirst));
+    Submit(Draw(degenerateFirst, indirect));
     AgcDriverWaitIdle_nid_postfix();
     outcome.after = AgcDriver::Graphics::PreparedDrawInputCounters();
     outcome.hooks = HookRuns.load() - hooks;
@@ -290,6 +297,22 @@ void GpuWriteBeforeTheDrawReachesItsIndices() {
     Require(std::memcmp(IndexMemory + sizeof(std::uint32_t), &Degenerate[1], 2 * sizeof(std::uint32_t)) == 0, "prepared draw inputs: the index write never reached guest memory");
 }
 
+void IndirectRecordInputsAreAdopted() {
+    const auto outcome = DrawOnce(Change::None, false, true);
+    Print("indexed indirect draw, unchanged inputs", outcome);
+    Require(outcome.hooks == 1 && outcome.requests() == 1, "prepared draw inputs: the indexed indirect draw was not prepared ahead of its commit");
+    Require(outcome.adopted() == 1 && outcome.reprepared() == 0 && outcome.copied() == 0, "prepared draw inputs: the indexed indirect draw did not adopt its prepared index copy");
+    Require(outcome.written == Width * Height, "prepared draw inputs: the indexed indirect draw with an adopted index copy left pixels cleared");
+}
+
+void IndirectRecordIndicesChangedAfterPreparation() {
+    const auto outcome = DrawOnce(Change::DegenerateIndices, false, true);
+    Print("indexed indirect draw, indices made degenerate after preparation", outcome);
+    Require(outcome.hooks == 1 && outcome.requests() == 1, "prepared draw inputs: the indexed indirect draw was not prepared ahead of its commit");
+    Require(outcome.reprepared() == 1 && outcome.adopted() == 0, "prepared draw inputs: an indirect draw's index range the CPU wrote after preparation was not prepared again");
+    Require(outcome.written == 0, "prepared draw inputs: the indexed indirect draw drew the indices prepared before the CPU made them degenerate");
+}
+
 void NoPreparersCopyOnTheCommitter() {
     AgcDriver::Graphics::SetDrawInputPreparers(0);
     const auto outcome = DrawOnce(Change::None);
@@ -327,6 +350,8 @@ int main() {
         IndicesChangedAfterPreparationAreCopiedAgain();
         UnchangedInputsAreAdopted();
         GpuWriteBeforeTheDrawReachesItsIndices();
+        IndirectRecordInputsAreAdopted();
+        IndirectRecordIndicesChangedAfterPreparation();
         NoPreparersCopyOnTheCommitter();
         AgcDriver::Graphics::SetPreparedDrawInputsHook(nullptr);
         std::puts("prepared draw inputs: copies made before the commit are adopted only while the CPU left their ranges unchanged");
