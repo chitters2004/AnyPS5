@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -120,6 +122,10 @@ struct Look {
     bool blended = false;
     float blendConstant = 1.0f;
     const GuestBlock* indices = nullptr;
+    const GuestBlock* depth = nullptr;
+    const GuestBlock* stencil = nullptr;
+    std::uint32_t depthControl = 0;
+    float depthOffset = 0.0f;
 };
 
 void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload) {
@@ -135,7 +141,7 @@ void Draw(const GuestBlock& target, const Look& look) {
     constexpr std::uint32_t ConstantColour = 13u;
     const std::uint32_t blendControl = look.blended ? (1u << 30u) | ConstantColour : 0u;
     const auto constant = std::bit_cast<std::uint32_t>(look.blendConstant);
-    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
         {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
@@ -158,6 +164,23 @@ void Draw(const GuestBlock& target, const Look& look) {
         {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
         {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
     };
+    if (look.depth != nullptr) {
+        const auto depth = look.depth->At(0);
+        for (const auto& entry : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{
+                 {0x200, look.depthControl}, {0x114, std::bit_cast<std::uint32_t>(look.depthOffset)},
+                 {0x000, 0}, {0x002, 0}, {0x007, (3u << 16u) | 63u},
+                 {0x008, 0}, {0x009, std::bit_cast<std::uint32_t>(1.0f)}, {0x00a, 0}, {0x00b, 0},
+                 {0x010, 3u | (AgcDriver::Graphics::XorSwizzleMode(AgcDriver::Graphics::TextureTileMode::kZ64KBX) << 4u)}, {0x011, 0},
+                 {0x012, static_cast<std::uint32_t>(depth >> 8u)}, {0x014, static_cast<std::uint32_t>(depth >> 8u)},
+                 {0x01a, static_cast<std::uint32_t>(depth >> 40u)}, {0x01c, static_cast<std::uint32_t>(depth >> 40u)}}) context.push_back(entry);
+        if (look.stencil != nullptr) {
+            const auto stencil = look.stencil->At(0);
+            for (const auto& entry : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{
+                     {0x011, 1u | (AgcDriver::Graphics::XorSwizzleMode(AgcDriver::Graphics::TextureTileMode::kZ64KBX) << 4u)},
+                     {0x013, static_cast<std::uint32_t>(stencil >> 8u)}, {0x015, static_cast<std::uint32_t>(stencil >> 8u)},
+                     {0x01b, static_cast<std::uint32_t>(stencil >> 40u)}, {0x01d, static_cast<std::uint32_t>(stencil >> 40u)}}) context.push_back(entry);
+        }
+    }
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
         {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 0}, {0x8c, 0},
         {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, 1u << 1u},
@@ -211,6 +234,17 @@ std::vector<std::uint8_t> Pixels(const GuestBlock& target) {
     static_cast<void>(AgcDriver::Graphics::StorageTexture::FlushPending(target.At(0), BlockBytes, nullptr, "draw plans test"));
     AgcDriver::GuestMemory::FlushGpuWrites(target.At(0), BlockBytes);
     return {target.Bytes(0), target.Bytes(0) + BlockBytes};
+}
+
+std::vector<std::uint8_t> DepthBytes(const GuestBlock& depth) {
+    static_cast<void>(AgcDriver::Graphics::FlushDepthPlanes(depth.At(0), BlockBytes, AgcDriver::Graphics::DepthPlaneScope::Whole));
+    AgcDriverWaitIdle_nid_postfix();
+    return Pixels(depth);
+}
+
+void FillDepth(const GuestBlock& depth, float value) {
+    for (std::size_t offset = 0; offset < BlockBytes; offset += sizeof(value)) std::memcpy(depth.Bytes(offset), &value, sizeof(value));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
 }
 
 bool Drawn(const std::vector<std::uint8_t>& pixels) {
@@ -605,6 +639,52 @@ void ReboundPlansStayOffTheExactPath() {
     std::puts("draw plans: I7b, a rebound plan hit is never kept as its draw key's exact recipe");
 }
 
+void PlansDrawIntoTheirOwnDepth() {
+    constexpr std::uint32_t WriteDepth = 0x76u;
+    constexpr std::uint32_t TestDepth = 0x32u;
+    const auto run = [](bool usePlans, std::array<const GuestBlock*, 6> blocks) {
+        const auto& [firstColour, secondColour, firstDepth, secondDepth, firstStencil, secondStencil] = blocks;
+        FillDepth(*firstDepth, 1.0f);
+        FillDepth(*secondDepth, 1.0f);
+        const std::unique_ptr<FullPath> fullPath = usePlans ? nullptr : std::make_unique<FullPath>();
+        Draw(*firstColour, {.colour = 1.0f, .depth = firstDepth, .stencil = firstStencil, .depthControl = WriteDepth, .depthOffset = 0.25f});
+        Draw(*firstColour, {.colour = 1.0f, .depth = firstDepth, .stencil = firstStencil, .depthControl = WriteDepth, .depthOffset = 0.25f});
+        Draw(*firstColour, {.colour = 0.5f, .depth = firstDepth, .stencil = firstStencil, .depthControl = TestDepth, .depthOffset = 0.5f});
+        Draw(*firstColour, {.colour = 0.5f, .depth = firstDepth, .stencil = firstStencil, .depthControl = TestDepth, .depthOffset = 0.5f});
+        const auto before = Counts();
+        Draw(*secondColour, {.colour = 0.75f, .depth = secondDepth, .stencil = secondStencil, .depthControl = WriteDepth, .depthOffset = 0.5f});
+        Draw(*secondColour, {.colour = 0.25f, .depth = secondDepth, .stencil = secondStencil, .depthControl = TestDepth, .depthOffset = 0.25f});
+        Draw(*firstColour, {.colour = 0.75f, .depth = firstDepth, .stencil = firstStencil, .depthControl = WriteDepth, .depthOffset = 0.125f});
+        Draw(*secondColour, {.colour = 0.5f, .depth = secondDepth, .stencil = secondStencil, .depthControl = TestDepth, .depthOffset = 0.75f});
+        return Since(before);
+    };
+    GuestBlock plannedColours[2];
+    GuestBlock plannedDepths[2];
+    GuestBlock fullColours[2];
+    GuestBlock fullDepths[2];
+    GuestBlock plannedStencils[2];
+    GuestBlock fullStencils[2];
+    const auto counts = run(true, {&plannedColours[0], &plannedColours[1], &plannedDepths[0], &plannedDepths[1], &plannedStencils[0], &plannedStencils[1]});
+    static_cast<void>(run(false, {&fullColours[0], &fullColours[1], &fullDepths[0], &fullDepths[1], &fullStencils[0], &fullStencils[1]}));
+    Report("I7d two depth/stencil surfaces", counts);
+    std::printf("I7d own attachments %llu, depth misses %llu\n", static_cast<unsigned long long>(counts[DrawPlanCount::OwnAttachmentHits]), static_cast<unsigned long long>(counts[DrawPlanCount::InstanceDepth]));
+    ExpectNoHitsWhileOff(counts);
+    const bool ownAttachments = PlansOn() && std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    if (ownAttachments) Expect(counts[DrawPlanCount::OwnAttachmentHits] >= 3 && counts[DrawPlanCount::InstanceDepth] == 0, "draws into another depth surface were not served their plans with their own depth");
+    std::vector<float> depths(BlockBytes / sizeof(float));
+    for (std::size_t index = 0; index < 2; ++index) {
+        const auto colour = Pixels(plannedColours[index]);
+        const auto depth = DepthBytes(plannedDepths[index]);
+        Expect(Drawn(colour), "a depth scene draw wrote no colour");
+        std::memcpy(depths.data(), depth.data(), BlockBytes);
+        Expect(std::ranges::any_of(depths, [](float value) { return value != 1.0f; }), "a depth scene draw wrote no depth");
+        Expect(colour == Pixels(fullColours[index]), "a colour target of the depth scene differs from the full path's");
+        Expect(depth == DepthBytes(fullDepths[index]), "a depth surface of the depth scene differs from the full path's");
+        Expect(DepthBytes(plannedStencils[index]) == DepthBytes(fullStencils[index]), "a stencil plane of the depth scene differs from the full path's");
+    }
+    std::puts("draw plans: I7d, plan hits write and test the depth/stencil surface of their own draw");
+}
+
 void PlansRefuseTemplatesWithOtherSetLayouts() {
     GuestBlock planned;
     GuestBlock reference;
@@ -795,6 +875,7 @@ int main(int argc, char** argv) {
         PlanHitsSeeGuestWrites();
         ReboundPlansStayOffTheExactPath();
         PlansRefuseTemplatesWithOtherSetLayouts();
+        PlansDrawIntoTheirOwnDepth();
         PlannedSceneMatchesFullPath();
         SharedPushDonorsDrawTheirOwnPush();
         IndexedPlansFollowTheirIndexRange();
