@@ -12,7 +12,7 @@ struct DenormalFlushEliminationStats {
 
 class DenormalFlushEliminator {
 public:
-    [[nodiscard]] DenormalFlushEliminationStats Eliminate(IrProgram& program) const;
+    [[nodiscard]] DenormalFlushEliminationStats Eliminate(IrProgram& program, bool hostFlushesArithmetic) const;
 };
 
 }

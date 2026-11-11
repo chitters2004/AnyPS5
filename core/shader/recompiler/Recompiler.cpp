@@ -357,7 +357,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     }
 
     constexpr DenormalFlushEliminator denormalFlushEliminator;
-    if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
+    if (denormalFlushEliminator.Eliminate(program, translateOptions.float32FlushToZero).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
     }
 

@@ -114,6 +114,8 @@ IrValue* flushedSource(const IrValue& value) {
 
 class DenormalFreeValues {
 public:
+    explicit DenormalFreeValues(bool hostFlushesArithmetic) : hostFlushesArithmetic(hostFlushesArithmetic) {}
+
     bool Contains(const IrValue* value) {
         value = value->Resolve();
         if (const auto found = known.find(value); found != known.end()) return found->second;
@@ -143,6 +145,12 @@ private:
             case IrOpcode::FPSqrt:
             case IrOpcode::FPRecipSqrt32:
                 return true;
+            case IrOpcode::FPAdd32:
+            case IrOpcode::FPSub32:
+            case IrOpcode::FPMul32:
+            case IrOpcode::FPFma32:
+            case IrOpcode::FPMad32:
+                return hostFlushesArithmetic;
             case IrOpcode::BitCastU32F32:
             case IrOpcode::BitCastF32U32:
             case IrOpcode::FPAbs32:
@@ -181,14 +189,15 @@ private:
         }
     }
 
+    bool hostFlushesArithmetic;
     std::unordered_map<const IrValue*, bool> known;
 };
 
 }
 
-DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& program) const {
+DenormalFlushEliminationStats DenormalFlushEliminator::Eliminate(IrProgram& program, bool hostFlushesArithmetic) const {
     DenormalFlushEliminationStats stats;
-    DenormalFreeValues denormalFree;
+    DenormalFreeValues denormalFree(hostFlushesArithmetic);
     for (auto* block : program.BlockOrder()) {
         for (auto* inst : block->Instructions()) {
             if (!inst->HasUses()) continue;

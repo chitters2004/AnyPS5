@@ -70,8 +70,8 @@ struct Builder {
         (void)emit(IrOpcode::ReferenceU32, IrType::Void, {&value});
     }
 
-    std::uint32_t eliminate() {
-        return DenormalFlushEliminator{}.Eliminate(program).removedFlushes;
+    std::uint32_t eliminate(bool hostFlushesArithmetic = false) {
+        return DenormalFlushEliminator{}.Eliminate(program, hostFlushesArithmetic).removedFlushes;
     }
 };
 
@@ -89,9 +89,9 @@ bool run(const char* name, const std::function<bool()>& test) {
     }
 }
 
-std::vector<std::uint32_t> Recompiled(std::span<const std::uint32_t> code) {
+std::vector<std::uint32_t> Recompiled(std::span<const std::uint32_t> code, bool hardwareFlush = false) {
     const std::array<std::uint32_t, 4> userData{0x10000000u, 0x00100000u, 0x40u, 0x00027facu};
-    const std::array<std::uint32_t, 2> capabilities{1u, 61u};
+    const std::array<std::uint32_t, 3> capabilities{1u, 61u, static_cast<std::uint32_t>(spv::CapabilityDenormFlushToZero)};
     const std::array<std::string_view, 1> extensions{"SPV_KHR_storage_buffer_storage_class"};
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
@@ -103,8 +103,9 @@ std::vector<std::uint32_t> Recompiled(std::span<const std::uint32_t> code) {
     request.target.spirvVersion = 0x00010600u;
     request.target.subgroupSize = 32u;
     request.target.bdaAbiVersion = 1;
-    request.target.supportedCapabilities = capabilities;
+    request.target.supportedCapabilities = std::span<const std::uint32_t>(capabilities).first(hardwareFlush ? 3u : 2u);
     request.target.supportedExtensions = extensions;
+    request.target.float32FlushToZero = hardwareFlush;
     request.target.maxWorkgroupSize = {1024u, 1024u, 64u};
     request.target.maxWorkgroupInvocations = 1024;
     request.target.maxWorkgroupSharedMemoryBytes = 49152;
@@ -430,6 +431,63 @@ int main() {
         const auto masks = ExponentMasks(Recompiled(code));
         if (masks != 1u) std::fprintf(stderr, "  %zu f32 exponent masks, expected 1\n", masks);
         return masks == 1u;
+    });
+
+    passed &= run("host f32 sums, differences, products and fused results need no flush only under the hardware flush", [] {
+        const auto build = [](bool hostFlushesArithmetic) {
+            Builder b;
+            auto& x = b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&b.unknown()});
+            auto& y = b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&b.unknown()});
+            std::vector<IrValue*> flushed;
+            for (const auto opcode : {IrOpcode::FPAdd32, IrOpcode::FPSub32, IrOpcode::FPMul32}) {
+                flushed.push_back(&b.flush(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(opcode, IrType::F32, {&x, &y})})));
+            }
+            for (const auto opcode : {IrOpcode::FPFma32, IrOpcode::FPMad32}) {
+                flushed.push_back(&b.flush(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(opcode, IrType::F32, {&x, &y, &x})})));
+            }
+            auto& quotient = b.flush(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(IrOpcode::FPRecip32, IrType::F32, {&x})}));
+            auto& fraction = b.flush(b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(IrOpcode::FPFract32, IrType::F32, {&x})}));
+            for (auto* value : flushed) b.keep(*value);
+            b.keep(quotient);
+            b.keep(fraction);
+            const auto removed = b.eliminate(hostFlushesArithmetic);
+            bool gone = true;
+            for (auto* value : flushed) gone &= !value->HasUses();
+            return std::pair{removed, gone && quotient.HasUses() && fraction.HasUses()};
+        };
+        const auto [hardwareRemoved, hardwareShape] = build(true);
+        const auto [emulatedRemoved, emulatedShape] = build(false);
+        return hardwareRemoved == 5u && hardwareShape && emulatedRemoved == 0u && !emulatedShape;
+    });
+
+    passed &= run("a NaN-repaired host sum needs no flush under the hardware flush", [] {
+        const auto build = [](bool hostFlushesArithmetic) {
+            Builder b;
+            auto& xBits = b.unknown();
+            auto& yBits = b.unknown();
+            auto& x = b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&xBits});
+            auto& y = b.emit(IrOpcode::BitCastF32U32, IrType::F32, {&yBits});
+            const auto isNan = [&](IrValue& bits) -> IrValue& { return b.emit(IrOpcode::UGreaterThan32, IrType::Bool, {&b.emit(IrOpcode::BitwiseAnd32, IrType::U32, {&bits, &b.constant(0x7fffffffu)}), &b.constant(0x7f800000u)}); };
+            auto& sumBits = b.emit(IrOpcode::BitCastU32F32, IrType::U32, {&b.emit(IrOpcode::FPAdd32, IrType::F32, {&x, &y})});
+            auto& nan = b.emit(IrOpcode::SelectU32, IrType::U32, {&isNan(xBits), &xBits, &b.emit(IrOpcode::SelectU32, IrType::U32, {&isNan(yBits), &yBits, &b.constant(0xffc00000u)})});
+            auto& repaired = b.flush(b.emit(IrOpcode::SelectU32, IrType::U32, {&isNan(sumBits), &nan, &sumBits}));
+            b.keep(repaired);
+            return b.eliminate(hostFlushesArithmetic) == 1u && !repaired.HasUses();
+        };
+        return build(true) && !build(false);
+    });
+
+    passed &= run("a v_max_f32 of a v_add_f32 sum drops the sum's input flush under the hardware flush", [] {
+        const std::array<std::uint32_t, 5> code{
+            0x06040100u,
+            0x20060102u,
+            0xe0700000u, 0x80000300u,
+            0xbf810000u,
+        };
+        const auto hardware = ExponentMasks(Recompiled(code, true));
+        const auto emulated = ExponentMasks(Recompiled(code, false));
+        if (hardware != 1u) std::fprintf(stderr, "  %zu f32 exponent masks with the hardware flush, expected 1\n", hardware);
+        return hardware == 1u && emulated > hardware;
     });
 
     return passed ? 0 : 1;
