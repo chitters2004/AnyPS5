@@ -6,6 +6,8 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -238,6 +240,129 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+using Kind = Recorder::ReadKind;
+
+struct NotedRead {
+    std::uint64_t begin;
+    std::uint64_t end;
+    Kind kind;
+    std::shared_ptr<const Recorder::ReadList> list;
+};
+
+std::optional<Kind> FirstNotedReader(const std::vector<NotedRead>& notes, std::uint64_t address, std::uint64_t end, std::optional<Kind> only = std::nullopt) {
+    for (const auto& note : notes) {
+        if (only.has_value() && note.kind != *only) continue;
+        if (note.list == nullptr) {
+            if (address < note.end && note.begin < end) return note.kind;
+            continue;
+        }
+        for (const auto& [begin, finish] : *note.list) {
+            if (address < finish && begin < end) return note.kind;
+        }
+    }
+    return std::nullopt;
+}
+
+struct ReadSequence {
+    std::uint32_t state = 0x2545f491u;
+    std::uint32_t Next() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8u;
+    }
+};
+
+void RepeatedReadsAnswerLikeEveryNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000100000ull;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 6> ranges{{{0x000, 0x100}, {0x080, 0x200}, {0x000, 0x100}, {0x300, 0x340}, {0x100, 0x180}, {0x1c0, 0x400}}};
+    const std::array<Kind, 3> kinds{Kind::DispatchElement, Kind::AddressBased, Kind::CopySource};
+    ReadSequence random;
+    std::vector<NotedRead> notes;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, Kind>> seen;
+    std::uint64_t expectedRepeats = 0;
+    const auto remember = [&](std::uint64_t begin, std::uint64_t end, Kind kind) {
+        notes.push_back({begin, end, kind, nullptr});
+        if (std::find(seen.begin(), seen.end(), std::make_tuple(begin, end, kind)) != seen.end()) ++expectedRepeats;
+        else seen.emplace_back(begin, end, kind);
+    };
+    const auto pick = [&] {
+        const auto& range = ranges[random.Next() % ranges.size()];
+        return std::make_tuple(base + range.first, base + range.second, kinds[random.Next() % kinds.size()]);
+    };
+    const auto before = Recorder::ReadCounts();
+    std::uint64_t notedCalls = 0;
+    for (int operation = 0; operation < 600; ++operation) {
+        const auto choice = random.Next() % 10;
+        if (choice < 7) {
+            const auto [begin, end, kind] = pick();
+            recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), kind);
+            remember(begin, end, kind);
+            ++notedCalls;
+        } else if (choice < 9) {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> span;
+            const auto count = 1 + random.Next() % 3;
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto [begin, end, ignored] = pick();
+                static_cast<void>(ignored);
+                span.emplace_back(begin, end);
+            }
+            span.emplace_back(base + 0x500, base + 0x500);
+            recorder.NotePendingReads(span, kind);
+            for (const auto& [begin, end] : span) {
+                if (end > begin) remember(begin, end, kind);
+            }
+            notedCalls += span.size();
+        } else {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            const auto start = base + 0x40 * (random.Next() % 16);
+            auto list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{start, start + 0x20}, {start + 0x400, start + 0x440}});
+            recorder.NotePendingReadList(list, kind);
+            notes.push_back({0, 0, kind, std::move(list)});
+            notedCalls += 2;
+        }
+    }
+    const auto after = Recorder::ReadCounts();
+    Expect(after.noted - before.noted == notedCalls, "the noted counter counted " + std::to_string(after.noted - before.noted) + " ranges, not every one of the " + std::to_string(notedCalls) + " noted");
+    const auto repeats = Recorder::FlipReadCheck() ? 0 : expectedRepeats;
+    Expect(after.repeated - before.repeated == repeats, "the batch skipped " + std::to_string(after.repeated - before.repeated) + " repeated reads, not the " + std::to_string(repeats) + " (range, kind) repeats it was given");
+    std::size_t mismatches = 0;
+    for (std::uint64_t offset = 0; offset < 0x900; offset += 0x10) {
+        for (const std::uint64_t bytes : {1ull, 0x20ull, 0x90ull, 0x300ull}) {
+            const auto address = base + offset;
+            const auto expected = FirstNotedReader(notes, address, address + bytes);
+            const auto described = recorder.DescribePendingRead(address, static_cast<std::size_t>(bytes));
+            const bool leased = FirstNotedReader(notes, address, address + bytes, Kind::AddressBased).has_value();
+            if (recorder.PendingReadOverlaps(address, static_cast<std::size_t>(bytes)) != expected.has_value()) ++mismatches;
+            if (described.has_value() != expected.has_value() || (described.has_value() && (described->kind != *expected || !described->open))) ++mismatches;
+            if (recorder.PendingLeaseSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+            if (recorder.PendingWriterSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+        }
+    }
+    Expect(mismatches == 0, std::to_string(mismatches) + " read queries answered differently from the reader every noted read names");
+    recorder.Submit();
+    const auto submitted = recorder.Submissions();
+    const auto repeatedBefore = Recorder::ReadCounts().repeated;
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    Expect(Recorder::ReadCounts().repeated == repeatedBefore, "a range the submitted batch noted was skipped as a repeat in the next batch");
+    const auto next = recorder.DescribePendingRead(base, 4);
+    Expect(next.has_value() && next->open && next->kind == Kind::CopySource && next->serial == submitted + 1, "the next batch does not report the read it noted again");
+    recorder.NotePendingRead(base, 0x100, Kind::AddressBased);
+    Expect(recorder.PendingLeaseSerial(base, 4) == recorder.OpenSerial(), "the next batch dropped a range noted again with another reader kind");
+    recorder.Sync();
+    Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
+}
+
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+    }
+    return condition();
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -309,6 +434,7 @@ int main() {
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        RepeatedReadsAnswerLikeEveryNote();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);
