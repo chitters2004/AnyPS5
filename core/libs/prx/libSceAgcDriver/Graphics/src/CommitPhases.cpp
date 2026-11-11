@@ -34,6 +34,8 @@ struct ThreadPhases {
     Clock::time_point mark{};
     CommitDrawKind kind = CommitDrawKind::Full;
     std::array<std::uint64_t, PhaseCount> drawNs{};
+    unsigned shadow = 0;
+    bool recording = false;
 };
 
 thread_local ThreadPhases threadPhases;
@@ -47,6 +49,15 @@ std::array<ProfileCounter, static_cast<std::size_t>(CommitCounter::Count)> count
 std::array<ProfileCounter, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
 std::array<ProfileCounter, KindCount> kindDrawCount{};
 std::array<std::array<ProfileCounter, PhaseCount>, KindCount> kindPhaseNs{};
+constexpr std::size_t ShadowCount = static_cast<std::size_t>(ShadowReason::Count);
+constexpr std::array<const char*, ShadowCount> ShadowNames{"template built", "address-based", "CPU indirect", "pre-op in resolve", "template walk", "target memo miss", "slow target refresh", "input copied", "store flush", "special pass", "waited"};
+std::array<ProfileCounter, KindCount> shadowEligibleCount{};
+std::array<ProfileCounter, ShadowCount> shadowFirstCount{};
+std::array<ProfileCounter, ShadowCount> shadowAnyCount{};
+
+void markShadow(ThreadPhases& phases, ShadowReason reason) {
+    phases.shadow |= 1u << static_cast<unsigned>(reason);
+}
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
 CommitPhaseTotals reported;
@@ -129,6 +140,7 @@ void reportDue(Clock::time_point now) {
     const auto resolveDraws = std::max(1.0, count(CommitCounter::ResolveDraws));
     std::fprintf(stderr, "[commit-resolve] (10 s) %.0f draws resolved their resources (%.1f%% of all draws); of those %.1f%% keyed, %.1f%% found a template, %.1f%% checked its address space, %.1f%% revalidated it, %.1f%% hit (%.1f%% with moved buffers), %.1f%% built anew, %.1f%% invalidated a template, %.1f%% with address-based stages\n", count(CommitCounter::ResolveDraws), 100.0 * count(CommitCounter::ResolveDraws) / static_cast<double>(totals.draws), 100.0 * count(CommitCounter::ResolveCacheable) / resolveDraws, 100.0 * count(CommitCounter::ResolveFound) / resolveDraws, 100.0 * count(CommitCounter::ResolveSpaceChecks) / resolveDraws, 100.0 * count(CommitCounter::ResolveValid) / resolveDraws, 100.0 * count(CommitCounter::ResolveHits) / resolveDraws, 100.0 * count(CommitCounter::ResolveMovedHits) / resolveDraws, 100.0 * count(CommitCounter::ResolveBuilds) / resolveDraws, 100.0 * count(CommitCounter::ResolveInvalidated) / resolveDraws, 100.0 * count(CommitCounter::ResolveAddressStages) / resolveDraws);
     std::fprintf(stderr, "[commit-target-memo] (10 s) %.0f draws with targets; repeated attachment sets and fallbacks by cause: Accept %.0f; AcceptWithDepthMiss %.0f; Invalid %.0f; Descriptor %.0f; Resident %.0f; DepthOverlap %.0f; Epoch %.0f; Proofs %.0f; Pending %.0f; Unwatch %.0f; Allocations %.0f; Surfaces %.0f; Released %.0f; Claims %.0f; Recorder %.0f; Device %.0f; Metadata %.0f; PostDepthInvalidated %.0f; DepthFallback %.0f; AvoidedRefreshLookups %.0f;\n", count(CommitCounter::TargetDraws), count(CommitCounter::TargetMemoAccept), count(CommitCounter::TargetMemoAcceptWithDepthMiss), count(CommitCounter::TargetMemoInvalid), count(CommitCounter::TargetMemoDescriptor), count(CommitCounter::TargetMemoResident), count(CommitCounter::TargetMemoDepthOverlap), count(CommitCounter::TargetMemoEpoch), count(CommitCounter::TargetMemoProofs), count(CommitCounter::TargetMemoPending), count(CommitCounter::TargetMemoUnwatch), count(CommitCounter::TargetMemoAllocations), count(CommitCounter::TargetMemoSurfaces), count(CommitCounter::TargetMemoReleased), count(CommitCounter::TargetMemoClaims), count(CommitCounter::TargetMemoRecorder), count(CommitCounter::TargetMemoDevice), count(CommitCounter::TargetMemoMetadata), count(CommitCounter::TargetMemoPostDepthInvalidated), count(CommitCounter::TargetMemoDepthFallback), count(CommitCounter::TargetMemoAvoidedRefreshLookups));
+    std::fprintf(stderr, "%s\n", FormatShadowReport(totals).c_str());
 }
 
 }
@@ -151,6 +163,57 @@ void BeginCommitPhase(CommitPhase phase) {
     if (!phases.active) return;
     charge(phases, Clock::now());
     phases.current = phase;
+    if (phase == CommitPhase::ResolveBuild) markShadow(phases, ShadowReason::TemplateBuilt);
+    else if (phase == CommitPhase::RevalidateWalk) markShadow(phases, ShadowReason::TemplateWalk);
+}
+
+void NoteShadowReason(ShadowReason reason) {
+    auto& phases = threadPhases;
+    if (phases.active) markShadow(phases, reason);
+}
+
+void NoteShadowRecording() {
+    auto& phases = threadPhases;
+    if (phases.active) phases.recording = true;
+}
+
+void NoteShadowCommands() {
+    auto& phases = threadPhases;
+    if (phases.active && !phases.recording) markShadow(phases, ShadowReason::PreOp);
+}
+
+ShadowReason FirstShadowReason(unsigned mask) {
+    if (mask == 0) return ShadowReason::Count;
+    return static_cast<ShadowReason>(std::countr_zero(mask));
+}
+
+const char* ShadowReasonName(ShadowReason reason) {
+    return ShadowNames[static_cast<std::size_t>(reason)];
+}
+
+std::string FormatShadowReport(const CommitPhaseTotals& window) {
+    std::uint64_t eligible = 0;
+    for (const auto count : window.shadowEligible) eligible += count;
+    const double draws = static_cast<double>(std::max<std::uint64_t>(window.draws, 1));
+    char item[160];
+    std::snprintf(item, sizeof(item), "[parallel-shadow] (10 s) %llu draws, %llu worker-eligible (%.1f%%); by kind:", static_cast<unsigned long long>(window.draws), static_cast<unsigned long long>(eligible), 100.0 * static_cast<double>(eligible) / draws);
+    std::string report = item;
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        const auto kindDraws = window.kindDraws[kind];
+        std::snprintf(item, sizeof(item), "%s %s %llu of %llu", kind == 0 ? "" : ",", KindNames[kind], static_cast<unsigned long long>(window.shadowEligible[kind]), static_cast<unsigned long long>(kindDraws));
+        report += item;
+    }
+    report += "; first reason:";
+    for (std::size_t reason = 0; reason < ShadowCount; ++reason) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", reason == 0 ? "" : ",", ShadowNames[reason], static_cast<unsigned long long>(window.shadowFirst[reason]));
+        report += item;
+    }
+    report += "; any reason:";
+    for (std::size_t reason = 0; reason < ShadowCount; ++reason) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", reason == 0 ? "" : ",", ShadowNames[reason], static_cast<unsigned long long>(window.shadowAny[reason]));
+        report += item;
+    }
+    return report;
 }
 
 void NoteCommitKey(std::size_t words) {
@@ -198,8 +261,13 @@ CommitCounter EpochCauseCounter(unsigned causes) {
 }
 
 void CountCommit(CommitCounter counter, std::uint64_t amount) {
-    if (!threadPhases.active) return;
+    auto& phases = threadPhases;
+    if (!phases.active) return;
     counterValues[static_cast<std::size_t>(counter)].Add(amount);
+    if (amount == 0) return;
+    if (counter == CommitCounter::TargetRefreshSlow || counter == CommitCounter::OtherRefreshSlow) markShadow(phases, ShadowReason::TargetSlow);
+    else if (counter >= CommitCounter::TargetMemoInvalid && counter <= CommitCounter::TargetMemoMetadata) markShadow(phases, ShadowReason::TargetMiss);
+    else if (counter == CommitCounter::InputIndexCopyFresh || counter == CommitCounter::InputVertexCopyFresh) markShadow(phases, ShadowReason::InputFresh);
 }
 
 CommitPhase CurrentCommitPhase() {
@@ -224,6 +292,11 @@ CommitPhaseTotals ReadCommitPhases() {
     for (std::size_t kind = 0; kind < KindCount; ++kind) {
         totals.kindDraws[kind] = kindDrawCount[kind].Sum();
         for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.kindNs[kind][phase] = kindPhaseNs[kind][phase].Sum();
+        totals.shadowEligible[kind] = shadowEligibleCount[kind].Sum();
+    }
+    for (std::size_t reason = 0; reason < ShadowCount; ++reason) {
+        totals.shadowFirst[reason] = shadowFirstCount[reason].Sum();
+        totals.shadowAny[reason] = shadowAnyCount[reason].Sum();
     }
     return totals;
 }
@@ -240,6 +313,11 @@ CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTot
     for (std::size_t kind = 0; kind < KindCount; ++kind) {
         difference.kindDraws[kind] = later.kindDraws[kind] - earlier.kindDraws[kind];
         for (std::size_t phase = 0; phase < PhaseCount; ++phase) difference.kindNs[kind][phase] = later.kindNs[kind][phase] - earlier.kindNs[kind][phase];
+        difference.shadowEligible[kind] = later.shadowEligible[kind] - earlier.shadowEligible[kind];
+    }
+    for (std::size_t reason = 0; reason < ShadowCount; ++reason) {
+        difference.shadowFirst[reason] = later.shadowFirst[reason] - earlier.shadowFirst[reason];
+        difference.shadowAny[reason] = later.shadowAny[reason] - earlier.shadowAny[reason];
     }
     return difference;
 }
@@ -258,6 +336,8 @@ CommitPhaseDraw::CommitPhaseDraw() {
     phases.current = CommitPhase::Other;
     phases.kind = CommitDrawKind::Full;
     phases.drawNs.fill(0);
+    phases.shadow = 0;
+    phases.recording = false;
     phases.mark = Clock::now();
 }
 
@@ -273,6 +353,14 @@ CommitPhaseDraw::~CommitPhaseDraw() {
     kindDrawCount[kind].Add(1);
     for (std::size_t phase = 0; phase < PhaseCount; ++phase) {
         if (phases.drawNs[phase] != 0) kindPhaseNs[kind][phase].Add(phases.drawNs[phase]);
+    }
+    if (phases.shadow == 0) {
+        shadowEligibleCount[kind].Add(1);
+    } else {
+        shadowFirstCount[static_cast<std::size_t>(FirstShadowReason(phases.shadow))].Add(1);
+        for (std::size_t reason = 0; reason < ShadowCount; ++reason) {
+            if ((phases.shadow & (1u << reason)) != 0) shadowAnyCount[reason].Add(1);
+        }
     }
     reportDue(now);
 }

@@ -3064,6 +3064,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto& resources = *record.resources;
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
+    NoteShadowRecording();
+    if (resources.HoldsLease() || resources.UsesAddressTable()) NoteShadowReason(ShadowReason::AddressBased);
+    if (args != nullptr && !gpuIndirect) NoteShadowReason(ShadowReason::CpuIndirect);
+    if (!record.staged.empty() || !record.proxies.empty() || !record.reordered.empty() || record.depthLocations || CaptureInputsEnabled()) NoteShadowReason(ShadowReason::SpecialPass);
+    if (record.waited) NoteShadowReason(ShadowReason::Waited);
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
     // The pass is named by its attachment views (stable while the kept targets live, so unique
@@ -3085,11 +3090,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) {
         recorder->FlushKeyStores();
         outcome.keyStoresFlushed = true;
+        NoteShadowReason(ShadowReason::StoreFlush);
     }
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) {
         recorder->FlushStores();
         outcome.storesFlushed = true;
+        NoteShadowReason(ShadowReason::StoreFlush);
     }
     BeginCommitPhase(CommitPhase::PassAccessLocal);
     const bool capture = CaptureInputsEnabled();
