@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -461,7 +462,7 @@ private:
 
     int _uffd = -1;
     int _pagemap = -1;
-    std::shared_mutex _lock;
+    NativeSharedMutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
     std::multimap<std::uintptr_t, Link> _links;
