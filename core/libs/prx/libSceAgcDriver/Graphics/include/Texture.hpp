@@ -308,6 +308,7 @@ public:
     std::vector<VkRect2D> UnitRects(const std::vector<bool>& units) const;
     bool BlockUnits() const { return blockUnits; }
     std::uint32_t TrackedUnits() const { return trackedLayers; }
+    std::uint64_t PendingSinceForTest(std::uint32_t unit) const { return layerPendingSince.at(unit); }
     void MarkSliceDirty(std::uint32_t slice, std::uint32_t count = 1);
     bool MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor);
     void Flush(const char* reason = "cache eviction");
@@ -524,6 +525,7 @@ public:
     static std::uint64_t GuestSnapshots();
     static std::uint64_t OccasionalLabelStores();
     static std::uint64_t LayoutStoreSkips();
+    static std::uint64_t PendingSinceSkips();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
@@ -806,6 +808,9 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> layerPendingSince;
+    std::uint64_t pendingSinceHeld = 0;
+    std::uint32_t pendingSinceFirst = 0;
+    std::uint32_t pendingSinceEnd = 0;
     std::uint64_t layoutSerial = 0;
     std::vector<std::uint64_t> completionKept;
     UnitFlags layerPending;
