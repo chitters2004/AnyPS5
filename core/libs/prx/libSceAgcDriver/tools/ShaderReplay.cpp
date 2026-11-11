@@ -9,12 +9,15 @@
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
+#include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "spirv-tools/libspirv.hpp"
 #endif
 
+#include <algorithm>
+#include <array>
 #include <cstdio>
 #include <cstdint>
 #include <exception>
@@ -23,6 +26,9 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -60,8 +66,240 @@ bool g_shaderInt16 = false;
 bool g_code = false;
 bool g_float16WidenNans = false;
 bool g_float16NarrowNans = false;
+bool g_operations = false;
+bool g_spannedWaves = false;
+
+enum class OperationFamily { SpecialValueTests, FloatArithmetic, FloatCompares, Selects, BitManipulation, IntegerArithmetic, IntegerCompares, Logical, Conversions, Composites, Memory, Subgroup, Control, Other, Count };
+
+constexpr std::array<const char*, static_cast<std::size_t>(OperationFamily::Count)> OperationFamilyNames{
+    "NaN and infinity tests", "float arithmetic", "float compares", "selects", "bit manipulation", "integer arithmetic", "integer compares",
+    "logical", "conversions", "composites", "memory and images", "subgroup", "control", "other",
+};
+
+OperationFamily ExtendedFamily(std::uint32_t instruction) {
+    if (instruction >= GLSLstd450PackSnorm4x8 && instruction <= GLSLstd450UnpackDouble2x32) return OperationFamily::Conversions;
+    switch (instruction) {
+        case GLSLstd450SAbs:
+        case GLSLstd450SSign:
+        case GLSLstd450UMin:
+        case GLSLstd450SMin:
+        case GLSLstd450UMax:
+        case GLSLstd450SMax:
+        case GLSLstd450UClamp:
+        case GLSLstd450SClamp:
+        case GLSLstd450FindILsb:
+        case GLSLstd450FindSMsb:
+        case GLSLstd450FindUMsb:
+            return OperationFamily::IntegerArithmetic;
+        default:
+            return OperationFamily::FloatArithmetic;
+    }
+}
+
+OperationFamily IntegerCompareFamily(std::span<const std::uint32_t> operands, const std::unordered_set<std::uint32_t>& specialBounds) {
+    for (const auto operand : operands) {
+        if (specialBounds.contains(operand)) return OperationFamily::SpecialValueTests;
+    }
+    return OperationFamily::IntegerCompares;
+}
+
+OperationFamily Family(spv::Op opcode, std::span<const std::uint32_t> words, const std::unordered_set<std::uint32_t>& specialBounds) {
+    switch (opcode) {
+        case spv::OpIsNan:
+        case spv::OpIsInf:
+            return OperationFamily::SpecialValueTests;
+        case spv::OpFAdd:
+        case spv::OpFSub:
+        case spv::OpFMul:
+        case spv::OpFDiv:
+        case spv::OpFRem:
+        case spv::OpFMod:
+        case spv::OpFNegate:
+        case spv::OpDot:
+        case spv::OpVectorTimesScalar:
+        case spv::OpFmaKHR:
+            return OperationFamily::FloatArithmetic;
+        case spv::OpExtInst:
+            return words.size() > 4u ? ExtendedFamily(words[4]) : OperationFamily::Other;
+        case spv::OpFOrdEqual:
+        case spv::OpFUnordEqual:
+        case spv::OpFOrdNotEqual:
+        case spv::OpFUnordNotEqual:
+        case spv::OpFOrdLessThan:
+        case spv::OpFUnordLessThan:
+        case spv::OpFOrdGreaterThan:
+        case spv::OpFUnordGreaterThan:
+        case spv::OpFOrdLessThanEqual:
+        case spv::OpFUnordLessThanEqual:
+        case spv::OpFOrdGreaterThanEqual:
+        case spv::OpFUnordGreaterThanEqual:
+            return OperationFamily::FloatCompares;
+        case spv::OpSelect:
+            return OperationFamily::Selects;
+        case spv::OpBitwiseAnd:
+        case spv::OpBitwiseOr:
+        case spv::OpBitwiseXor:
+        case spv::OpNot:
+        case spv::OpShiftLeftLogical:
+        case spv::OpShiftRightLogical:
+        case spv::OpShiftRightArithmetic:
+        case spv::OpBitFieldInsert:
+        case spv::OpBitFieldSExtract:
+        case spv::OpBitFieldUExtract:
+        case spv::OpBitReverse:
+        case spv::OpBitCount:
+            return OperationFamily::BitManipulation;
+        case spv::OpIAdd:
+        case spv::OpISub:
+        case spv::OpIMul:
+        case spv::OpUDiv:
+        case spv::OpSDiv:
+        case spv::OpUMod:
+        case spv::OpSRem:
+        case spv::OpSMod:
+        case spv::OpSNegate:
+        case spv::OpIAddCarry:
+        case spv::OpISubBorrow:
+        case spv::OpUMulExtended:
+        case spv::OpSMulExtended:
+            return OperationFamily::IntegerArithmetic;
+        case spv::OpIEqual:
+        case spv::OpINotEqual:
+        case spv::OpUGreaterThan:
+        case spv::OpUGreaterThanEqual:
+        case spv::OpULessThan:
+        case spv::OpULessThanEqual:
+            return words.size() > 3u ? IntegerCompareFamily(words.subspan(3u), specialBounds) : OperationFamily::IntegerCompares;
+        case spv::OpSGreaterThan:
+        case spv::OpSGreaterThanEqual:
+        case spv::OpSLessThan:
+        case spv::OpSLessThanEqual:
+            return OperationFamily::IntegerCompares;
+        case spv::OpLogicalAnd:
+        case spv::OpLogicalOr:
+        case spv::OpLogicalNot:
+        case spv::OpLogicalEqual:
+        case spv::OpLogicalNotEqual:
+        case spv::OpAny:
+        case spv::OpAll:
+            return OperationFamily::Logical;
+        case spv::OpBitcast:
+        case spv::OpFConvert:
+        case spv::OpUConvert:
+        case spv::OpSConvert:
+        case spv::OpConvertFToU:
+        case spv::OpConvertFToS:
+        case spv::OpConvertUToF:
+        case spv::OpConvertSToF:
+        case spv::OpConvertPtrToU:
+        case spv::OpConvertUToPtr:
+        case spv::OpQuantizeToF16:
+            return OperationFamily::Conversions;
+        case spv::OpCompositeConstruct:
+        case spv::OpCompositeExtract:
+        case spv::OpCompositeInsert:
+        case spv::OpVectorShuffle:
+        case spv::OpVectorExtractDynamic:
+        case spv::OpVectorInsertDynamic:
+        case spv::OpCopyObject:
+            return OperationFamily::Composites;
+        case spv::OpLoad:
+        case spv::OpStore:
+        case spv::OpAccessChain:
+        case spv::OpInBoundsAccessChain:
+        case spv::OpPtrAccessChain:
+        case spv::OpArrayLength:
+        case spv::OpSampledImage:
+        case spv::OpImage:
+        case spv::OpImageQuerySize:
+        case spv::OpImageQuerySizeLod:
+        case spv::OpImageQueryLevels:
+        case spv::OpImageQueryLod:
+        case spv::OpImageRead:
+        case spv::OpImageWrite:
+        case spv::OpImageFetch:
+        case spv::OpImageGather:
+        case spv::OpImageDrefGather:
+        case spv::OpImageSampleImplicitLod:
+        case spv::OpImageSampleExplicitLod:
+        case spv::OpImageSampleDrefImplicitLod:
+        case spv::OpImageSampleDrefExplicitLod:
+        case spv::OpImageTexelPointer:
+            return OperationFamily::Memory;
+        case spv::OpPhi:
+        case spv::OpFunctionCall:
+        case spv::OpControlBarrier:
+        case spv::OpMemoryBarrier:
+        case spv::OpKill:
+        case spv::OpTerminateInvocation:
+        case spv::OpDemoteToHelperInvocation:
+        case spv::OpUnreachable:
+            return OperationFamily::Control;
+        default:
+            if (opcode >= spv::OpAtomicLoad && opcode <= spv::OpAtomicXor) return OperationFamily::Memory;
+            if (opcode >= spv::OpGroupNonUniformElect && opcode <= spv::OpGroupNonUniformQuadSwap) return OperationFamily::Subgroup;
+            return OperationFamily::Other;
+    }
+}
+
+bool Structural(spv::Op opcode) {
+    switch (opcode) {
+        case spv::OpLabel:
+        case spv::OpBranch:
+        case spv::OpBranchConditional:
+        case spv::OpSwitch:
+        case spv::OpSelectionMerge:
+        case spv::OpLoopMerge:
+        case spv::OpFunction:
+        case spv::OpFunctionParameter:
+        case spv::OpFunctionEnd:
+        case spv::OpReturn:
+        case spv::OpReturnValue:
+        case spv::OpVariable:
+        case spv::OpLine:
+        case spv::OpNoLine:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool PrintOperations(std::span<const std::uint32_t> spirv) {
+    if (spirv.size() < 5u || spirv[0] != spv::MagicNumber) {
+        std::printf("  ops: not a SPIR-V module\n");
+        return false;
+    }
+    std::unordered_set<std::uint32_t> specialBounds;
+    std::array<std::size_t, static_cast<std::size_t>(OperationFamily::Count)> counts{};
+    std::size_t total = 0u;
+    bool inFunction = false;
+    for (std::size_t offset = 5u; offset < spirv.size();) {
+        const auto count = spirv[offset] >> spv::WordCountShift;
+        if (count == 0u || count > spirv.size() - offset) {
+            std::printf("  ops: malformed instruction at word %zu\n", offset);
+            return false;
+        }
+        const auto opcode = static_cast<spv::Op>(spirv[offset] & spv::OpCodeMask);
+        const auto words = spirv.subspan(offset, count);
+        offset += count;
+        if (opcode == spv::OpConstant && count == 4u && (words[3] == 0x7c00u || words[3] == 0x7f800000u)) specialBounds.insert(words[2]);
+        if (opcode == spv::OpFunction) inFunction = true;
+        if (!inFunction || Structural(opcode)) continue;
+        ++counts[static_cast<std::size_t>(Family(opcode, words, specialBounds))];
+        ++total;
+    }
+    std::vector<std::pair<std::size_t, std::size_t>> ranked;
+    for (std::size_t family = 0; family < counts.size(); ++family) {
+        if (counts[family] != 0u) ranked.emplace_back(counts[family], family);
+    }
+    std::ranges::sort(ranked, [](const auto& lhs, const auto& rhs) { return lhs.first != rhs.first ? lhs.first > rhs.first : lhs.second < rhs.second; });
+    std::printf("  ops: %zu instructions\n", total);
+    for (const auto& [count, family] : ranked) std::printf("  ops %s: %zu (%.1f%%)\n", OperationFamilyNames[family], count, 100.0 * static_cast<double>(count) / static_cast<double>(total));
+    return true;
+}
 
 bool OutputSpirv(const char* path, std::span<const std::uint32_t> spirv) {
+    if (g_operations && !PrintOperations(spirv)) return false;
     if (g_spirv) {
         std::string name(path);
         name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
@@ -108,6 +346,7 @@ bool Replay(const char* path) {
     }
     if (g_float16WidenNans) request.request.target.float16WidenNans = true;
     if (g_float16NarrowNans) request.request.target.float16NarrowNans = true;
+    if (g_spannedWaves) request.request.target.spannedWaves = true;
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;
@@ -245,7 +484,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--prepare] [--materialize] [--code] [--maintenance8] [--robust2] [--wave-lds-memory-barriers] [--device-scope-lds-memory-barriers] [--lds-lock-fences] [--shader-fma] [--shader-int16] [--f16-widen-nans] [--f16-narrow-nans] [--spanned-waves] [--ops] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set; shader_<address>.prepare.req holds a request whose preparation failed before any resource capture, so replay it with --prepare\n");
         return 2;
     }
     int failures = 0;
@@ -316,6 +555,14 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--materialize") {
             g_materialize = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--spanned-waves") {
+            g_spannedWaves = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--ops") {
+            g_operations = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {
