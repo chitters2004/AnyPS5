@@ -118,6 +118,13 @@ enum class EpochCause : std::uint8_t {
     Count
 };
 
+enum class CommitDrawKind : std::uint8_t {
+    Full,
+    RecipeHit,
+    PlanHit,
+    Count
+};
+
 struct CommitPhaseTotals {
     std::uint64_t draws = 0;
     std::uint64_t keys = 0;
@@ -126,6 +133,8 @@ struct CommitPhaseTotals {
     std::uint64_t keyMemoMisses = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(CommitCounter::Count)> counters{};
     std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)> ns{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CommitDrawKind::Count)> kindDraws{};
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)>, static_cast<std::size_t>(CommitDrawKind::Count)> kindNs{};
 };
 
 bool CommitPhasesEnabled();
@@ -133,6 +142,7 @@ const char* CommitPhaseName(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
+void NoteCommitDrawKind(CommitDrawKind kind);
 void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
 void NoteEpochCauses(unsigned causes);
 void NoteEpochFollow(bool backward, unsigned causes);

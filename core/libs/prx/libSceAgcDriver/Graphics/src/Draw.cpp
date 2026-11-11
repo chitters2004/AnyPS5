@@ -4693,6 +4693,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, planned ? " recorded from plan" : " recorded from recipe");
+    NoteCommitDrawKind(planned ? CommitDrawKind::PlanHit : CommitDrawKind::RecipeHit);
     result.recorded = true;
     return result;
 }

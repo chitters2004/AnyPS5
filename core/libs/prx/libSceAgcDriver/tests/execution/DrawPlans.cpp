@@ -601,6 +601,16 @@ void PlannedSceneMatchesFullPath() {
         const auto phaseUs = [&](Graphics::CommitPhase phase) { return static_cast<double>(phases.ns[static_cast<std::size_t>(phase)]) / 1e3 / static_cast<double>(counts[DrawPlanCount::Hits]); };
         for (const auto phase : {Graphics::CommitPhase::PlanHitFind, Graphics::CommitPhase::PlanHitWords, Graphics::CommitPhase::PlanHitInstance, Graphics::CommitPhase::PlanHitTargets}) Expect(phases.ns[static_cast<std::size_t>(phase)] != 0, std::string("the plan hits charged no time to ") + Graphics::CommitPhaseName(phase));
         std::printf("I10 plan hit phases (APS5_PROFILE_COMMIT), us per hit: find %.2f words %.2f instance %.2f targets %.2f rebind %.2f\n", phaseUs(Graphics::CommitPhase::PlanHitFind), phaseUs(Graphics::CommitPhase::PlanHitWords), phaseUs(Graphics::CommitPhase::PlanHitInstance), phaseUs(Graphics::CommitPhase::PlanHitTargets), phaseUs(Graphics::CommitPhase::PlanHitRebind));
+        const auto kindDraws = [&](Graphics::CommitDrawKind kind) { return phases.kindDraws[static_cast<std::size_t>(kind)]; };
+        const auto kindUs = [&](Graphics::CommitDrawKind kind) {
+            std::uint64_t ns = 0;
+            for (const auto value : phases.kindNs[static_cast<std::size_t>(kind)]) ns += value;
+            return kindDraws(kind) == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(kindDraws(kind));
+        };
+        Expect(kindDraws(Graphics::CommitDrawKind::PlanHit) == counts[DrawPlanCount::Hits], "the commit phases counted " + std::to_string(kindDraws(Graphics::CommitDrawKind::PlanHit)) + " plan-hit draws for " + std::to_string(counts[DrawPlanCount::Hits]) + " plan hits");
+        Expect(kindDraws(Graphics::CommitDrawKind::Full) + kindDraws(Graphics::CommitDrawKind::RecipeHit) + kindDraws(Graphics::CommitDrawKind::PlanHit) == phases.draws, "the draws of each kind do not sum to the committed draws");
+        Expect(phases.kindNs[static_cast<std::size_t>(Graphics::CommitDrawKind::Full)][static_cast<std::size_t>(Graphics::CommitPhase::PlanHitWords)] == 0 || counts[DrawPlanCount::MissInstance] != 0, "full-path draws charged plan binding-word time without a missed plan");
+        std::printf("I10 committed draws by kind: %llu full at %.2f us, %llu recipe hits at %.2f us, %llu plan hits at %.2f us\n", static_cast<unsigned long long>(kindDraws(Graphics::CommitDrawKind::Full)), kindUs(Graphics::CommitDrawKind::Full), static_cast<unsigned long long>(kindDraws(Graphics::CommitDrawKind::RecipeHit)), kindUs(Graphics::CommitDrawKind::RecipeHit), static_cast<unsigned long long>(kindDraws(Graphics::CommitDrawKind::PlanHit)), kindUs(Graphics::CommitDrawKind::PlanHit));
     }
     for (std::size_t index = 0; index < planned.size(); ++index) Expect(Pixels(planned[index]) == Pixels(full[index]), "target " + std::to_string(index) + " of the planned scene differs from the full path's");
     std::puts("draw plans: I10, a scene recorded with plans renders as the full path renders it");
