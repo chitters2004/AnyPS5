@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include <algorithm>
@@ -485,7 +486,7 @@ CommandEncoder::~CommandEncoder() {
     Quiesce();
     stopping.store(true, std::memory_order_seq_cst);
     posted.fetch_add(1, std::memory_order_seq_cst);
-    posted.notify_all();
+    AddressWakeAll(posted);
     worker.join();
     delete filling;
     for (auto* chunk = spare; chunk != nullptr;) delete std::exchange(chunk, chunk->next);
@@ -581,7 +582,7 @@ void CommandEncoder::post() noexcept {
         tail = chunk;
     }
     posted.fetch_add(1, std::memory_order_seq_cst);
-    if (sleeping.load(std::memory_order_seq_cst)) posted.notify_one();
+    if (sleeping.load(std::memory_order_seq_cst)) AddressWakeOne(posted);
 }
 
 void CommandEncoder::Quiesce() noexcept {
@@ -603,7 +604,9 @@ void CommandEncoder::await() noexcept {
     if (executed.load(std::memory_order_acquire) >= through) return;
     const auto start = std::chrono::steady_clock::now();
     if (!SpinUntil(HandoffSpinWindow(), [&] { return executed.load(std::memory_order_acquire) >= through; })) {
-        for (auto seen = executed.load(std::memory_order_acquire); seen < through; seen = executed.load(std::memory_order_acquire)) executed.wait(seen, std::memory_order_acquire);
+        awaiting.fetch_add(1, std::memory_order_seq_cst);
+        for (auto seen = executed.load(std::memory_order_seq_cst); seen < through; seen = executed.load(std::memory_order_seq_cst)) AddressWait(executed, seen);
+        awaiting.fetch_sub(1, std::memory_order_relaxed);
     }
     const auto end = std::chrono::steady_clock::now();
     waitCount.fetch_add(1, std::memory_order_relaxed);
@@ -633,7 +636,7 @@ void CommandEncoder::run() {
         if (posted.load(std::memory_order_acquire) == taken) {
             if (!SpinUntil(HandoffSpinWindow(), [&] { return posted.load(std::memory_order_acquire) != taken; })) {
                 sleeping.store(true, std::memory_order_seq_cst);
-                if (posted.load(std::memory_order_seq_cst) == taken) posted.wait(taken, std::memory_order_acquire);
+                if (posted.load(std::memory_order_seq_cst) == taken) AddressWait(posted, taken);
                 sleeping.store(false, std::memory_order_relaxed);
             }
             continue;
@@ -664,8 +667,8 @@ void CommandEncoder::run() {
             std::lock_guard lock(queueMutex);
             chunk->next = std::exchange(spare, chunk);
         }
-        executed.fetch_add(1, std::memory_order_release);
-        executed.notify_all();
+        executed.fetch_add(1, std::memory_order_seq_cst);
+        if (awaiting.load(std::memory_order_seq_cst) != 0) AddressWakeAll(executed);
     }
 }
 

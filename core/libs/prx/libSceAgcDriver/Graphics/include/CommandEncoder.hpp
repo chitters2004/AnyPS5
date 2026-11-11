@@ -118,6 +118,7 @@ private:
     std::atomic<std::uint64_t> posted{0};
     std::atomic<std::uint64_t> executed{0};
     std::atomic<bool> sleeping{false};
+    std::atomic<std::uint32_t> awaiting{0};
     std::atomic<bool> stopping{false};
     std::mutex poolMutex;
     std::thread worker;
