@@ -455,8 +455,13 @@ std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
 
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
+    static const bool backwardFollows = std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr;
     if (followed == token) return;
     const bool backward = token < followed;
+    if (backward && !backwardFollows) {
+        if (Graphics::CommitPhasesEnabled()) Graphics::NoteEpochFollowSkipped();
+        return;
+    }
     followed = token;
     GuestMemory::BumpCollectEpoch();
     if (!Graphics::CommitPhasesEnabled()) return;

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -120,8 +122,31 @@ void TestReport() {
 
 }
 
+void TestFollowEpochForwardOnly() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    std::uint64_t followed = 0;
+    std::uint64_t afterOlder = 0;
+    std::uint64_t afterSame = 0;
+    std::uint64_t afterNewer = 0;
+    std::thread committer([&] {
+        DrawPipeline::FollowEpoch(1000);
+        followed = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(999);
+        afterOlder = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1000);
+        afterSame = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1001);
+        afterNewer = AgcDriver::GuestMemory::CollectEpoch();
+    });
+    committer.join();
+    Check(followed != 0, "following an epoch token left the committing thread without a collect epoch");
+    Check(afterOlder == followed && afterSame == followed, "a token older than the one already followed took a new collect epoch");
+    Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");
+}
+
 int main() {
     try {
+        TestFollowEpochForwardOnly();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";
         return 0;

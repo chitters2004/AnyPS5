@@ -100,6 +100,7 @@ enum class CommitCounter : std::uint8_t {
     EpochFollowsByNone,
     TargetMissFirstInEpoch,
     TargetSlowAgainInEpoch,
+    EpochFollowsSkipped,
     Count
 };
 
@@ -130,6 +131,7 @@ void NoteCommitKeyMemo(bool hit);
 void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
 void NoteEpochCauses(unsigned causes);
 void NoteEpochFollow(bool backward, unsigned causes);
+void NoteEpochFollowSkipped();
 unsigned EpochCauses();
 CommitCounter EpochCauseCounter(unsigned causes);
 CommitPhase CurrentCommitPhase();
