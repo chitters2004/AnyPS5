@@ -4531,6 +4531,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (planned) {
         if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return instanceMiss(DrawPlanInstance::Shape);
         rebinds = recipe.movedBases != 0;
+        BeginCommitPhase(CommitPhase::PlanHitWords);
         for (std::size_t index = 0; index < shaders.size(); ++index) {
             const auto words = PlanStageWordsOf(shaders[index]);
             const auto& planned = recipe.bindingWords[index];
@@ -4545,6 +4546,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
             if (!same) rebinds = true;
         }
         static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        BeginCommitPhase(CommitPhase::PlanHitInstance);
         if (rebinds) {
             instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
             if (instanceKey != recipe.key) {
@@ -4586,7 +4588,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (stored == nullptr) return miss(DrawRecipeMiss::TargetGone);
         const auto surface = SurfaceForTarget(state.colors[index]);
         const auto cached = [&] { return InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCached(context, stored.get()); }); };
-        if (planned && !InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCachedFor(context, stored.get(), surface); })) return cached() ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
+        if (planned && !InCommitPhase(CommitPhase::PlanHitTargets, [&] { return StorageImageCachedFor(context, stored.get(), surface); })) return cached() ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
         if ((!planned && !cached()) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             const CommitPhaseScope refresh(CommitPhase::TargetsRefresh);
@@ -4597,7 +4599,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         const auto& color = state.colors[index];
-        if (planned && resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice) != recipe.targetViews[index]) return instanceMiss(DrawPlanInstance::View);
+        if (planned && InCommitPhase(CommitPhase::PlanHitTargets, [&] { return resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice); }) != recipe.targetViews[index]) return instanceMiss(DrawPlanInstance::View);
         targets.push_back(std::move(resident));
     }
     if (recipe.hasDepth) {
@@ -4629,7 +4631,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     std::vector<ShaderResources::MovedBuffer> moved;
     if (rebinds) {
-        auto rebound = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &result.patchedData);
+        auto rebound = InCommitPhase(CommitPhase::PlanHitRebind, [&] { return resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &result.patchedData); });
         if (!rebound.has_value()) {
             timer.phase(PhaseLookup);
             return miss(DrawRecipeMiss::Moved);

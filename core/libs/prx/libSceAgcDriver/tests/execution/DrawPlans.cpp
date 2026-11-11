@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -582,7 +583,10 @@ void PlannedSceneMatchesFullPath() {
     };
     std::array<GuestBlock, 3> planned;
     std::array<GuestBlock, 3> full;
+    namespace Graphics = AgcDriver::Graphics;
+    const auto phasesBefore = Graphics::ReadCommitPhases();
     const auto counts = run(planned);
+    const auto phases = Graphics::ReadCommitPhases() - phasesBefore;
     {
         const FullPath fullPath;
         static_cast<void>(run(full));
@@ -593,6 +597,11 @@ void PlannedSceneMatchesFullPath() {
     if (PlansOn()) Expect(counts[DrawPlanCount::SharedBindingStages] + counts[DrawPlanCount::ComparedBindingStages] == 2u * counts[DrawPlanCount::Hits], "a plan hit did not prove the binding words of each of its two stages");
     std::printf("I10 binding words: %llu stages proved by the program's memo, %llu compared\n", static_cast<unsigned long long>(counts[DrawPlanCount::SharedBindingStages]), static_cast<unsigned long long>(counts[DrawPlanCount::ComparedBindingStages]));
     if (counts[DrawPlanCount::Hits] != 0 && counts[DrawPlanCount::FullDraws] != 0) std::printf("I10 committer time (APS5_PROFILE_DRAW): %.2f us per plan hit, %.2f us per full-path draw with a plan key\n", static_cast<double>(counts[DrawPlanCount::HitNanoseconds]) / static_cast<double>(counts[DrawPlanCount::Hits]) / 1000.0, static_cast<double>(counts[DrawPlanCount::FullNanoseconds]) / static_cast<double>(counts[DrawPlanCount::FullDraws]) / 1000.0);
+    if (Graphics::CommitPhasesEnabled() && counts[DrawPlanCount::Hits] != 0) {
+        const auto phaseUs = [&](Graphics::CommitPhase phase) { return static_cast<double>(phases.ns[static_cast<std::size_t>(phase)]) / 1e3 / static_cast<double>(counts[DrawPlanCount::Hits]); };
+        for (const auto phase : {Graphics::CommitPhase::PlanHitFind, Graphics::CommitPhase::PlanHitWords, Graphics::CommitPhase::PlanHitInstance, Graphics::CommitPhase::PlanHitTargets}) Expect(phases.ns[static_cast<std::size_t>(phase)] != 0, std::string("the plan hits charged no time to ") + Graphics::CommitPhaseName(phase));
+        std::printf("I10 plan hit phases (APS5_PROFILE_COMMIT), us per hit: find %.2f words %.2f instance %.2f targets %.2f rebind %.2f\n", phaseUs(Graphics::CommitPhase::PlanHitFind), phaseUs(Graphics::CommitPhase::PlanHitWords), phaseUs(Graphics::CommitPhase::PlanHitInstance), phaseUs(Graphics::CommitPhase::PlanHitTargets), phaseUs(Graphics::CommitPhase::PlanHitRebind));
+    }
     for (std::size_t index = 0; index < planned.size(); ++index) Expect(Pixels(planned[index]) == Pixels(full[index]), "target " + std::to_string(index) + " of the planned scene differs from the full path's");
     std::puts("draw plans: I10, a scene recorded with plans renders as the full path renders it");
 }

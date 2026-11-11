@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/KeyHash.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -473,7 +474,7 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
 bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const DrawPlanKey& key, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const VulkanDevice::DrawTraceContext* trace, std::shared_ptr<const DrawRecipe>& attachable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     drawPlanCounters.Add(DrawPlanCount::PlanLookups);
-    const auto plan = drawPlans.Find(key);
+    const auto plan = Graphics::InCommitPhase(Graphics::CommitPhase::PlanHitFind, [&] { return drawPlans.Find(key); });
     if (plan == nullptr) {
         drawPlanCounters.Add(DrawPlanCount::MissAbsent);
         return false;

@@ -51,6 +51,11 @@ enum class CommitPhase : std::uint8_t {
     TargetsDepthFind,
     TargetsDepthSync,
     TargetsDepthStale,
+    PlanHitFind,
+    PlanHitWords,
+    PlanHitInstance,
+    PlanHitTargets,
+    PlanHitRebind,
     Count
 };
 

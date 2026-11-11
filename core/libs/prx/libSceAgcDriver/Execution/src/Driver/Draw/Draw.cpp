@@ -1453,7 +1453,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     }
     std::shared_ptr<const DrawRecipe> served;
     if (planKey != nullptr && Graphics::DrawPlans() && serveDrawPlan(localDevice, *planKey, graphics, drawParameters, stages, snapshots, tracePtr, served)) {
-        if (served != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor);
+        if (served != nullptr && !recipeStages.empty()) Graphics::InCommitPhase(Graphics::CommitPhase::EpilogueRecipe, [&] { attachDrawRecipe(drawKey, recipeStages, std::move(served), recipeDonor); });
         return;
     }
     std::shared_ptr<const DrawRecipe> built;
