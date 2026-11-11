@@ -365,6 +365,41 @@ void PlanHitPhasesKeepTheirNames() {
     for (const auto& [phase, name] : phases) Expect(Graphics::CommitPhaseName(phase) == name, std::string("commit phase ") + std::string(name) + " is named " + Graphics::CommitPhaseName(phase) + ": the phase enum and its name table are out of order");
 }
 
+void AbsentPlanKeysAreClassified() {
+    using AgcDriver::DriverDetail::DrawPlanAbsence;
+    using AgcDriver::DriverDetail::DrawPlanCounters;
+    using AgcDriver::DriverDetail::DrawPlanIndex;
+    using AgcDriver::DriverDetail::DrawPlanKey;
+    const auto owner = std::make_shared<int>(0);
+    const auto key = [](std::uint64_t word) {
+        auto made = std::make_shared<DrawPlanKey>();
+        made->words = {word};
+        made->hash = word * 0x9e3779b97f4a7c15ull;
+        return std::shared_ptr<const DrawPlanKey>(std::move(made));
+    };
+    const auto decisions = [&] {
+        auto plan = std::make_shared<AgcDriver::DrawRecipe>();
+        plan->pipeline = std::shared_ptr<AgcDriver::Graphics::Pipeline>(owner, static_cast<AgcDriver::Graphics::Pipeline*>(nullptr));
+        return std::shared_ptr<const AgcDriver::DrawRecipe>(std::move(plan));
+    };
+    DrawPlanCounters counters;
+    DrawPlanIndex index(1);
+    const auto first = key(1);
+    const auto second = key(2);
+    const auto undecided = key(3);
+    Expect(index.ClassifyAbsent(*first) == DrawPlanAbsence::New, "a key never inserted was not classified as new");
+    index.Insert(first, decisions(), &counters);
+    index.Insert(second, decisions(), &counters);
+    Expect(index.Find(*first) == nullptr && index.ClassifyAbsent(*first) == DrawPlanAbsence::Evicted, "a key the index evicted was not classified as evicted");
+    index.NoteUndecided(*undecided);
+    Expect(index.ClassifyAbsent(*undecided) == DrawPlanAbsence::Undecided, "a key seen without a decision was not classified as undecided");
+    index.NoteUndecided(*first);
+    Expect(index.ClassifyAbsent(*first) == DrawPlanAbsence::Evicted, "an evicted key seen later without a decision lost its eviction");
+    index.Insert(undecided, decisions(), &counters);
+    Expect(index.ClassifyAbsent(*second) == DrawPlanAbsence::Evicted && index.ClassifyAbsent(*first) == DrawPlanAbsence::Undecided, "the eviction ring kept more keys than the index holds");
+    std::puts("draw plans: absent plan keys are classified as evicted, seen without a decision, or new");
+}
+
 void PlanKeysFollowTheBindingShape() {
     namespace Graphics = AgcDriver::Graphics;
     ShaderRecompiler::RecompileResult program{};
@@ -697,6 +732,7 @@ int main(int argc, char** argv) {
         PlanStateLeavesAreHashedOrRuled();
         PlanStateWalkMatchesTheHandwrittenWriter();
         PlanKeysFollowTheBindingShape();
+        AbsentPlanKeysAreClassified();
         PlanHitPhasesKeepTheirNames();
         Register(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
         Register(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);

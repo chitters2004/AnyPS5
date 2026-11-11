@@ -450,10 +450,31 @@ std::size_t DrawPlanIndex::Insert(const std::shared_ptr<const DrawPlanKey>& key,
             index.erase(it);
             break;
         }
+        if (counters != nullptr) this->evicted.Remember(victim->key->hash, capacity);
         order.erase(victim);
         ++evicted;
     }
     return evicted;
+}
+
+void DrawPlanIndex::HashRing::Remember(std::uint64_t hash, std::size_t limit) {
+    if (!hashes.insert(hash).second) return;
+    order.push_back(hash);
+    while (order.size() > limit) {
+        hashes.erase(order.front());
+        order.pop_front();
+    }
+}
+
+DrawPlanAbsence DrawPlanIndex::ClassifyAbsent(const DrawPlanKey& key) {
+    std::lock_guard lock(mutex);
+    if (evicted.hashes.contains(key.hash)) return DrawPlanAbsence::Evicted;
+    return undecided.hashes.contains(key.hash) ? DrawPlanAbsence::Undecided : DrawPlanAbsence::New;
+}
+
+void DrawPlanIndex::NoteUndecided(const DrawPlanKey& key) {
+    std::lock_guard lock(mutex);
+    undecided.Remember(key.hash, capacity);
 }
 
 std::size_t DrawPlanIndex::Size() {
@@ -478,6 +499,7 @@ void Driver::shadowDrawPlan(const std::shared_ptr<const DrawPlanKey>& key, const
     drawPlanCounters.Add(DrawPlanCount::Lookups);
     if (drawn == nullptr) {
         drawPlanCounters.Add(DrawPlanCount::NoDecision);
+        if (ProfileDrawPlans()) drawPlans.NoteUndecided(*key);
         return;
     }
     if (!drawn->servable) drawPlanCounters.Add(DrawPlanCount::Unservable);
@@ -516,6 +538,13 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
     const auto plan = Graphics::InCommitPhase(Graphics::CommitPhase::PlanHitFind, [&] { return drawPlans.Find(key, profile ? &drawPlanCounters : nullptr); });
     if (plan == nullptr) {
         drawPlanCounters.Add(DrawPlanCount::MissAbsent);
+        if (profile) {
+            switch (drawPlans.ClassifyAbsent(key)) {
+                case DrawPlanAbsence::Evicted: drawPlanCounters.Add(DrawPlanCount::AbsentEvicted); break;
+                case DrawPlanAbsence::Undecided: drawPlanCounters.Add(DrawPlanCount::AbsentUndecided); break;
+                case DrawPlanAbsence::New: drawPlanCounters.Add(DrawPlanCount::AbsentNew); break;
+            }
+        }
         return false;
     }
     if (!plan->plannable) {
