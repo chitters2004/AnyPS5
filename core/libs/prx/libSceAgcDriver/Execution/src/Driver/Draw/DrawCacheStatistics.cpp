@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include <cstdlib>
 
@@ -83,6 +84,11 @@ std::string Driver::profileDrawCacheLines(const DrawEntryCounters& counters) {
     const auto ratio = [](std::uint64_t part, std::uint64_t whole) { return whole != 0 ? static_cast<double>(part) / static_cast<double>(whole) : 0.0; };
     const auto missed = memo[Memo::Lookups] > memo.Served() ? memo[Memo::Lookups] - memo.Served() : 0;
     append("[draw-cache] draw stage memo (since start): %llu lookups (%llu refused a key), %llu absent (%llu admitted for the next sighting), %llu served (%llu proved by write stamps, %llu compared, %.0f bytes each), %llu stale, %llu inserts (%llu skipped), %llu evicted, %zu kept; fragment stages %llu looked up, %llu served; %.2f us per served stage, %.2f us per lookup that missed; %llu stages a partial draw-cache miss had validated, reused without a build; draw-cache misses %llu, %llu with every stage reused; verify: %llu served stages built again\n", count(memo[Memo::Lookups]), count(memo[Memo::Refused]), count(memo[Memo::Absent]), count(memo[Memo::AbsentAdmitted]), count(memo.Served()), count(memo[Memo::Proved]), count(memo[Memo::Compared]), ratio(memo[Memo::ComparedBytes], memo[Memo::Compared]), count(memo[Memo::Stale]), count(memo[Memo::Inserts]), count(memo[Memo::Skipped]), count(memo[Memo::Evictions]), drawStageMemo.Size(), count(memo[Memo::FragmentLookups]), count(memo[Memo::FragmentServed]), ratio(memo[Memo::HitNanoseconds], memo.Served()) / 1000.0, ratio(memo[Memo::MissNanoseconds], missed) / 1000.0, count(memo[Memo::ValidatedReused]), count(memo[Memo::DrawMisses]), count(memo[Memo::ReusedMisses]), count(memo[Memo::Verified]));
+    if (Graphics::DrawPlanShadow()) {
+        const auto plans = drawPlanCounters.Load();
+        using Plan = DrawPlanCount;
+        append("[draw-plan] shadow (since start): %llu lookups, %llu without a decision, %llu absent (inserted), %llu present: %llu agreed, differing pipeline %llu, fragment outputs %llu, shader stages %llu, push stages %llu, depth %llu, vertex input %llu, masked state %llu; instance same %llu, differs %llu, pass key differing on the same instance %llu; %llu moved bases, %llu unservable decisions, %zu plans, %llu evicted\n", count(plans[Plan::Lookups]), count(plans[Plan::NoDecision]), count(plans[Plan::Absent]), count(plans[Plan::Present]), count(plans[Plan::Agreed]), count(plans[Plan::Pipeline]), count(plans[Plan::FragmentOutputs]), count(plans[Plan::ShaderStages]), count(plans[Plan::PushStages]), count(plans[Plan::HasDepth]), count(plans[Plan::VertexInput]), count(plans[Plan::MaskedState]), count(plans[Plan::SameInstance]), count(plans[Plan::InstanceDiffers]), count(plans[Plan::PassDiffersSameInstance]), count(plans[Plan::MovedBases]), count(plans[Plan::Unservable]), drawPlans.Size(), count(plans[Plan::Evictions]));
+    }
     append("[draw-cache] indirect records (10 s): %llu patched words forwarded as push data, %llu stages re-materialized, %llu words refused (walked, not forwarded, or vertex info changed), verified %llu\n", count(counters.recordWordsForwarded), count(counters.recordStagesRecompiled), count(counters.recordWordsRefused), count(counters.recordWordsVerified));
     return text;
 }
