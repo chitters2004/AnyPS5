@@ -532,6 +532,11 @@ void ReleaseDeferredKeeps() {
 // and inside WAIT_REG_MEM polls (see the static readers in Recorder.hpp). Written under the mutex.
 constexpr std::int64_t NoPendingLabel = std::numeric_limits<std::int64_t>::min();
 constexpr BarrierMask PassEndBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+constexpr BarrierMask PassStartBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+constexpr BarrierMask FusedPassBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, PassEndBarrier.srcAccess | PassStartBarrier.srcAccess, PassEndBarrier.dstAccess | PassStartBarrier.dstAccess};
+std::atomic<std::uint64_t> passesFused{0};
+std::atomic<std::uint64_t> passEndsSettled{0};
+std::atomic<std::uint64_t> fencedKeyOnlyBreaks{0};
 constexpr BarrierMask LabelLeadingBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
 std::atomic<std::uint64_t> writeGeneration{0};
@@ -1710,6 +1715,7 @@ Recorder::OverlapStatistics Recorder::OverlapCounts() {
 }
 
 void Recorder::flushDeferredDispatch() {
+    SettlePassEnd();
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
     open->deferredDispatchQueue = 0;
     open->deferredRun.clear();
@@ -1751,6 +1757,7 @@ bool Recorder::joinsRun(std::uint32_t queueKey, std::span<const void* const> own
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess) {
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
+    SettlePassEnd();
     inRun = joinsRun(queueKey, std::span(&owner, 1), accesses);
     if (!inRun) return Commands(coveredAccess);
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -1771,6 +1778,7 @@ bool Recorder::CloseRunOwing(const void* owner) {
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped) {
     GuestMemory::AssertGpuLockHeld("Recorder::OverlapCommands");
+    SettlePassEnd();
     overlapped = joinsRun(queueKey, owners, accesses);
     if (!overlapped) return Commands(coveredAccess);
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -1856,8 +1864,11 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const auto reason = PassBreakFor(hazard);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
-    endOpenRenderPass(reason, !merge);
+    const bool fuse = !merge && MergeBarriers() && !pass.afterPass && FuseBarriers() && !DiagNoPassBarriers();
+    if (hazard == PassHazard::None && (fenced || pass.fenced)) fencedKeyOnlyBreaks.fetch_add(1, std::memory_order_relaxed);
+    endOpenRenderPass(reason, !merge && !fuse);
     const auto commands = Commands();
+    open->passEndOwed = fuse;
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide, reason};
@@ -1865,6 +1876,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
     Require(open != nullptr, "no batch is open for the render pass");
+    Require(!open->passEndOwed, "a render pass began before the previous pass's end barrier was recorded");
     auto& pass = open->renderPass;
     if (!pass.open) {
         pass.timing = timing;
@@ -1874,6 +1886,31 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
     open->passHazards.Add(access);
+}
+
+void Recorder::RecordPassStartBarrier(VkCommandBuffer commands) {
+    Require(open != nullptr && open->commands == commands && !open->renderPass.open, "a pass start barrier is recorded outside the open batch or inside its render pass");
+    const auto& mask = open->passEndOwed ? FusedPassBarrier : PassStartBarrier;
+    if (open->passEndOwed) passesFused.fetch_add(1, std::memory_order_relaxed);
+    open->passEndOwed = false;
+    recordBarrier(commands, mask.srcStage, mask.dstStage, mask.srcAccess, mask.dstAccess);
+    CountBarriers(CommandClass::Draw);
+}
+
+void Recorder::SettlePassEnd() {
+    if (open == nullptr || !open->passEndOwed) return;
+    open->passEndOwed = false;
+    recordBarrier(open->commands, PassEndBarrier.srcStage, PassEndBarrier.dstStage, PassEndBarrier.srcAccess, PassEndBarrier.dstAccess);
+    CountBarriers(CommandClass::Draw);
+    passEndsSettled.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool Recorder::FuseBarriers() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoBarrierFusion);
+}
+
+Recorder::FusionStatistics Recorder::FusionCounts() {
+    return FusionStatistics{passesFused.load(std::memory_order_relaxed), passEndsSettled.load(std::memory_order_relaxed), fencedKeyOnlyBreaks.load(std::memory_order_relaxed)};
 }
 
 void Recorder::SealPassWriteOnly() {
@@ -1967,6 +2004,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::ensureOpen() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    SettlePassEnd();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         try {
@@ -2333,7 +2371,10 @@ void reportBarriers() {
         const auto destination = static_cast<std::uint32_t>(masks[i].second & 0xffffffffu);
         maskLine += " " + StageText(source) + ">" + StageText(destination) + " x" + std::to_string(masks[i].first);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s\n", maskLine.c_str());
+    const auto fused = passesFused.exchange(0, std::memory_order_relaxed);
+    const auto settled = passEndsSettled.exchange(0, std::memory_order_relaxed);
+    const auto keyOnly = fencedKeyOnlyBreaks.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s; pass end and start fused %llu, owed pass ends recorded alone %llu, fenced key-only pass breaks %llu\n", maskLine.c_str(), static_cast<unsigned long long>(fused), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(keyOnly));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -2420,7 +2461,7 @@ bool Recorder::BarrierValidate() {
 
 void Recorder::NoteAccess(CommandClass which, const Access& access) {
     if (!BarrierValidate()) return;
-    ensureOpen();
+    if (open == nullptr) ensureOpen();
     auto& tracker = open->tracker;
     const auto overlapsAny = [](const auto& ranges, const std::pair<std::uint64_t, std::uint64_t>& range) {
         return std::any_of(ranges.begin(), ranges.end(), [&](const auto& other) { return range.first < other.end && other.begin < range.second; });
@@ -2496,7 +2537,7 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     if (!GpuTimingEnabled()) return NoTiming;
-    Commands();
+    if (open == nullptr || !open->passEndOwed) Commands();
     return beginTiming(key);
 }
 

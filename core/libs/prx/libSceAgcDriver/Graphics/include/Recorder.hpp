@@ -91,6 +91,13 @@ public:
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
+    void RecordPassStartBarrier(VkCommandBuffer commands);
+    void SettlePassEnd();
+    static bool FuseBarriers();
+    struct FusionStatistics {
+        std::uint64_t fused, settled, fencedKeyOnly;
+    };
+    static FusionStatistics FusionCounts();
     void SealPassWriteOnly();
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
@@ -755,6 +762,7 @@ private:
             PassBreak closedBy = PassBreak::NewBatch;
         } renderPass;
         PassHazards passHazards;
+        bool passEndOwed = false;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
