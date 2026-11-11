@@ -4422,6 +4422,7 @@ namespace {
 constexpr std::uint32_t CertifiedDomains = GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Proof) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Unwatch) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping);
 constexpr std::array<const char*, static_cast<std::size_t>(CertifiedMiss::Count)> CertifiedMissNames{"uncertified", "sweep", "subscription", "proof", "unwatch", "mapping", "pending", "depth-surfaces", "cpu-writers", "audit", "imports"};
 constexpr std::array<const char*, static_cast<std::size_t>(CertifyRefusal::Count)> CertifyRefusalNames{"unsubscribed", "per-element-textures", "compared-textures", "compared-tables", "depth-copies", "storage-images", "pending-moved", "depth-surfaces-moved"};
+constexpr std::array<const char*, static_cast<std::size_t>(UncertifiedCause::Count)> UncertifiedCauseNames{"never-proved", "refused", "voided", "proof-failed", "not-certifying", "views-stale"};
 
 struct CertifiedCounts {
     std::atomic<std::uint64_t> proved{0};
@@ -4431,6 +4432,12 @@ struct CertifiedCounts {
     std::atomic<std::uint64_t> disagreed{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(UncertifiedCause::Count)> uncertified{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifyRefusal::Count)> uncertifiedRefused{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CertifiedMiss::Count)> uncertifiedVoided{};
+    std::atomic<std::uint64_t> epochServed{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
+    std::atomic<std::uint64_t> proofMissUnattributed{0};
 };
 
 CertifiedCounts& Certified() {
@@ -4482,6 +4489,12 @@ void reportCertifiedProofs() {
     };
     const auto misses = list(now.missed, reported.missed, CertifiedMissNames);
     const auto refusals = list(now.refused, reported.refused, CertifyRefusalNames);
+    std::array<const char*, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> breakNames{};
+    for (std::size_t i = 0; i < breakNames.size(); ++i) breakNames[i] = GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i));
+    static std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> reportedBreaks{};
+    const auto breaks = GuestMemory::ProofBreakCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified causes (10 s): uncertified uses by cause:%s; refused by reason:%s; voided by miss:%s; served by epoch reuse while uncertified %llu; proof misses by break source since the certificate:%s, unattributed %llu; proof breaks by source:%s\n", list(now.uncertified, reported.uncertified, UncertifiedCauseNames).c_str(), list(now.uncertifiedRefused, reported.uncertifiedRefused, CertifyRefusalNames).c_str(), list(now.uncertifiedVoided, reported.uncertifiedVoided, CertifiedMissNames).c_str(), static_cast<unsigned long long>(now.epochServed - reported.epochServed), list(now.proofMissSources, reported.proofMissSources, breakNames).c_str(), static_cast<unsigned long long>(now.proofMissUnattributed - reported.proofMissUnattributed), list(breaks, reportedBreaks, breakNames).c_str());
+    reportedBreaks = breaks;
     const auto perFrame = [&](std::uint64_t count) { return frames == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(frames); };
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified proofs (10 s): %llu proved (%llu after a sweep), %llu certificates issued; misses:%s; refused:%s; verify: %llu checked, %llu disagreed; index bumps: %llu calls touching %llu subscriptions over %llu frames, %.1f calls and %.1f subscriptions per frame, %.1f ms\n", static_cast<unsigned long long>(now.proved - reported.proved), static_cast<unsigned long long>(now.swept - reported.swept), static_cast<unsigned long long>(now.issued - reported.issued), misses.c_str(), refusals.c_str(), static_cast<unsigned long long>(now.verified - reported.verified), static_cast<unsigned long long>(now.disagreed - reported.disagreed), static_cast<unsigned long long>(index.calls), static_cast<unsigned long long>(index.bumps), static_cast<unsigned long long>(frames), perFrame(index.calls), perFrame(index.bumps), static_cast<double>(index.lookupNanoseconds) / 1e6);
     reported = now;
@@ -4504,6 +4517,12 @@ CertifiedProofOutcomes CertifiedProofOutcomesCounted() {
     outcomes.disagreed = counts.disagreed.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < outcomes.missed.size(); ++i) outcomes.missed[i] = counts.missed[i].load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < outcomes.refused.size(); ++i) outcomes.refused[i] = counts.refused[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.uncertified.size(); ++i) outcomes.uncertified[i] = counts.uncertified[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.uncertifiedRefused.size(); ++i) outcomes.uncertifiedRefused[i] = counts.uncertifiedRefused[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.uncertifiedVoided.size(); ++i) outcomes.uncertifiedVoided[i] = counts.uncertifiedVoided[i].load(std::memory_order_relaxed);
+    outcomes.epochServed = counts.epochServed.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.proofMissSources.size(); ++i) outcomes.proofMissSources[i] = counts.proofMissSources[i].load(std::memory_order_relaxed);
+    outcomes.proofMissUnattributed = counts.proofMissUnattributed.load(std::memory_order_relaxed);
     return outcomes;
 }
 
@@ -4826,6 +4845,13 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     return outcome(partial || !replaced.empty() ? IndexOutcome::Partial : IndexOutcome::Accepted);
 }
 
+void ShaderResources::noteUncertified(UncertifiedCause cause, CertifyRefusal refusal, CertifiedMiss miss) {
+    uncertifiedCause = cause;
+    uncertifiedRefusal = refusal;
+    uncertifiedMiss = miss;
+    epochServed = false;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (CertifiedProofs()) {
         const CommitPhaseScope certifiedPhase(CommitPhase::RevalidateCertified);
@@ -4833,6 +4859,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     const CommitPhaseScope epochPhase(CommitPhase::RevalidateEpoch);
     if (!registeredImageViewsCurrent(registeredImageViews)) {
+        if (!certified) noteUncertified(UncertifiedCause::ViewsStale);
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
         return false;
@@ -4851,6 +4878,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
+            if (!certified) epochServed = true;
             return true;
         }
         const bool ok = revalidateFull(shaders, report);
@@ -4892,6 +4920,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        if (!ok) noteUncertified(UncertifiedCause::ProofFailed);
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
@@ -5125,7 +5154,9 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         if (!refusal.has_value() && DepthSurfacesSerial() != depthBefore) refusal = CertifyRefusal::DepthSurfacesMoved;
         if (refusal.has_value()) {
             Certified().refused[static_cast<std::size_t>(*refusal)].fetch_add(1, std::memory_order_relaxed);
+            noteUncertified(UncertifiedCause::Refused, *refusal);
         } else {
+            if (GuestMemory::ProofBreaksCounted()) certifiedBreaks = GuestMemory::ProofBreakCounts();
             certificate = issued;
             certifiedPending = serialBefore;
             certifiedDepth = depthBefore;
@@ -5133,6 +5164,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             certified = true;
             Certified().issued.fetch_add(1, std::memory_order_relaxed);
         }
+    } else {
+        noteUncertified(UncertifiedCause::NotCertifying);
     }
     return finish(fast, true);
 }
@@ -5161,11 +5194,27 @@ std::optional<CertifyRefusal> ShaderResources::certifyRefusal() const {
 std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!certified || writeSubscription == nullptr) {
         countCertifiedMiss(CertifiedMiss::Uncertified);
+        auto& counts = Certified();
+        counts.uncertified[static_cast<std::size_t>(uncertifiedCause)].fetch_add(1, std::memory_order_relaxed);
+        if (uncertifiedCause == UncertifiedCause::Refused && uncertifiedRefusal != CertifyRefusal::Count) counts.uncertifiedRefused[static_cast<std::size_t>(uncertifiedRefusal)].fetch_add(1, std::memory_order_relaxed);
+        if (uncertifiedCause == UncertifiedCause::Voided && uncertifiedMiss != CertifiedMiss::Count) counts.uncertifiedVoided[static_cast<std::size_t>(uncertifiedMiss)].fetch_add(1, std::memory_order_relaxed);
+        if (epochServed) counts.epochServed.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
     const auto miss = [&](CertifiedMiss reason) -> std::optional<bool> {
         countCertifiedMiss(reason);
+        if (reason == CertifiedMiss::Proof && GuestMemory::ProofBreaksCounted()) {
+            const auto breaks = GuestMemory::ProofBreakCounts();
+            bool attributed = false;
+            for (std::size_t i = 0; i < breaks.size(); ++i) {
+                if (breaks[i] == certifiedBreaks[i]) continue;
+                Certified().proofMissSources[i].fetch_add(1, std::memory_order_relaxed);
+                attributed = true;
+            }
+            if (!attributed) Certified().proofMissUnattributed.fetch_add(1, std::memory_order_relaxed);
+        }
         certified = false;
+        noteUncertified(UncertifiedCause::Voided, CertifyRefusal::Count, reason);
         return std::nullopt;
     };
     if (DepthPlanesStale()) {
@@ -5198,6 +5247,7 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
     if (const auto failure = recordStaging(); failure != ProofFailure::None) {
         if (report != nullptr) *report = {ProofPath::Fast, failure};
         certified = false;
+        noteUncertified(UncertifiedCause::ProofFailed);
         return false;
     }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serial ? serial : 0;
@@ -7892,7 +7942,7 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
-    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs(GuestMemory::ProofBreak::ResourceWrites);
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;
