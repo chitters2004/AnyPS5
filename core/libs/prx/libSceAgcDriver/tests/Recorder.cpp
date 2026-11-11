@@ -9886,6 +9886,16 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
         Require(proved() == before, "a new image of the surface was answered from another image's proof");
         std::memset(keys, 0x00, keyCount);
         expectFull("a fast clear of the keys was answered from the proof");
+        if (StorageTexture::UploadRefreshProofs() && StorageTexture::RefreshExitEpochStamps()) {
+            std::memset(keys, 0xff, keyCount);
+            texels[0] = 0x44;
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            expectFull("a CPU write before the collect epoch was answered from the proof");
+            const auto epochHits = StorageTexture::epochRefreshes.load();
+            expectProved("the refresh after an upload stamped with the epoch was not proved");
+            Require(StorageTexture::epochRefreshes.load() == epochHits + 1, "the refresh after an upload stamped with the epoch was not answered from the epoch");
+            std::cout << "Refresh exit epoch stamps: passed\n";
+        }
         recorder.Sync();
     }
     recorder.Sync();

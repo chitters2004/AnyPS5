@@ -526,6 +526,7 @@ public:
         std::uint64_t rollBacks = 0;
     };
     static SyncedBorrowCounts SyncedBorrows();
+    static bool RefreshExitEpochStamps();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();
@@ -543,6 +544,7 @@ public:
 private:
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> missedEpoch{0};
+    std::atomic<std::uint64_t> provedThread{0};
     std::atomic<std::uint64_t> slowEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};

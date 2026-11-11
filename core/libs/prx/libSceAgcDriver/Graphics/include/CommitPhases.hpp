@@ -61,6 +61,9 @@ enum class CommitPhase : std::uint8_t {
     ResolveMoved,
     ResolveBuild,
     ResolveEvict,
+    TargetsLookupPure,
+    TargetsLookupGuards,
+    TargetsLookupCache,
     Count
 };
 
@@ -122,6 +125,12 @@ enum class CommitCounter : std::uint8_t {
     ResolveBuilds,
     ResolveInvalidated,
     ResolveAddressStages,
+    PreparedSurfaceHits,
+    PreparedSurfaceMisses,
+    TargetEpochNeverStamped,
+    TargetEpochOtherThread,
+    TargetEpochThisThread,
+    TargetEpochExitStamps,
     Count
 };
 
