@@ -11301,7 +11301,7 @@ private:
 
 namespace FusionTrace {
 
-enum class Kind { Barrier, Begin, End, Draw, Fill };
+enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch };
 
 struct Event {
     Kind kind;
@@ -11309,6 +11309,7 @@ struct Event {
 };
 
 std::vector<Event> events;
+constexpr std::uint32_t DispatchValue = 0xd15;
 PFN_vkGetDeviceProcAddr realProc = nullptr;
 PFN_vkCmdPipelineBarrier realBarrier = nullptr;
 PFN_vkCmdBeginRenderPass realBeginPass = nullptr;
@@ -11355,7 +11356,7 @@ VKAPI_ATTR void VKAPI_CALL Draw(VkCommandBuffer commands, std::uint32_t vertices
 }
 
 VKAPI_ATTR void VKAPI_CALL Fill(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize bytes, std::uint32_t value) {
-    events.push_back({Kind::Fill, {}});
+    events.push_back({value == DispatchValue ? Kind::Dispatch : Kind::Fill, {}});
     realFill(commands, buffer, offset, bytes, value);
 }
 
@@ -11380,6 +11381,8 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice device, const char* name)
 constexpr BarrierMask PassEndNeeds{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
 constexpr BarrierMask PassStartNeeds{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
 
+constexpr BarrierMask DispatchNeeds{VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
+
 bool CoveredBetween(std::size_t first, std::size_t before, const BarrierMask& needed) {
     for (std::size_t i = first; i < before; ++i) {
         auto mask = events[i].mask;
@@ -11396,11 +11399,21 @@ void CheckOracle(const std::string& scenario) {
         if (kind == Kind::Barrier) continue;
         if (kind == Kind::Begin) Require(CoveredBetween(afterCommand, i, PassStartNeeds), scenario + ": a render pass began without a barrier after the previous command that orders earlier writes before it");
         for (std::size_t end = 0; end < i; ++end) {
-            if (events[end].kind != Kind::End) continue;
-            Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
+            if (events[end].kind == Kind::End) Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
+            if (events[end].kind == Kind::Dispatch) Require(CoveredBetween(end + 1, i, DispatchNeeds), scenario + ": a command after a dispatch ran before its trailing barrier");
         }
         afterCommand = i + 1;
     }
+}
+
+std::size_t BarriersAfterDispatch() {
+    for (std::size_t i = 0; i < events.size(); ++i) {
+        if (events[i].kind != Kind::Dispatch) continue;
+        std::size_t next = i + 1;
+        while (next < events.size() && events[next].kind == Kind::Barrier) ++next;
+        return next - i - 1;
+    }
+    return 0;
 }
 
 std::size_t BarriersBetweenPasses() {
@@ -11429,6 +11442,9 @@ void barrierFusionTests(const Device& device) {
     CoverPass cover(context);
     DeviceBuffer scratch(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto fill = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, scratch.Handle(), 0, 256, 7); };
+    DeviceBuffer dispatched(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto dispatch = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::DispatchValue); };
+    const BarrierMask dispatchTrailing = FusionTrace::DispatchNeeds;
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{0x10000, 0x20000}}};
     const PassAccess writes{{}, range};
     const PassAccess reads{range, {}};
@@ -11496,6 +11512,33 @@ void barrierFusionTests(const Device& device) {
         Require(!start.continued && start.barrier, "a read after write continued the pass");
     });
     Require(Recorder::FusionCounts().settled - settledBefore == 3u, "an owed pass end recorded alone was not counted");
+    for (const bool fusion : {true, false}) {
+        const std::string suffix = fusion ? " (fused)" : " (not fused)";
+        const auto before = Recorder::FusionCounts();
+        scenario("dispatch then pass" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+            draw(8, PassAccess{}, {}, {});
+            Require(FusionTrace::BarriersAfterDispatch() == (fusion ? 1u : 2u), "dispatch then pass" + suffix + ": " + std::to_string(FusionTrace::BarriersAfterDispatch()) + " barriers between a dispatch and the next pass");
+        });
+        scenario("deferred dispatch then pass" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            const void* owner = &dispatched;
+            recorder.DeferDispatchBarrier(1, std::span(&owner, 1), {});
+            draw(9, PassAccess{}, {}, {});
+            Require(FusionTrace::BarriersAfterDispatch() == (fusion ? 1u : 2u), "deferred dispatch then pass" + suffix + ": " + std::to_string(FusionTrace::BarriersAfterDispatch()) + " barriers between a dispatch and the next pass");
+        });
+        scenario("dispatch then command" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+            fill(recorder.Commands());
+        });
+        scenario("dispatch then submit" + suffix, fusion, 0, [&] {
+            dispatch(recorder.Commands());
+            recorder.OweTrailingBarrier(dispatchTrailing, Recorder::CommandClass::DispatchTrailing);
+        });
+        Require(Recorder::FusionCounts().trailingFused - before.trailingFused == (fusion ? 2u : 0u), "the trailing barriers fused into a pass start were not counted");
+    }
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierFusion, false);
     std::cout << "Barrier fusion tests passed\n";
 }
