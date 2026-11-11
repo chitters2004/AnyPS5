@@ -5987,6 +5987,10 @@ StorageTexture::HookSkipCounts StorageTexture::TakeHookSkipCounts() {
     return {flushedAfterSkip.exchange(0, std::memory_order_relaxed), flushedAfterSkipSameSite.exchange(0, std::memory_order_relaxed)};
 }
 
+bool StorageTexture::FlushWaitsProfiled() {
+    return ProfileFlushWaits();
+}
+
 std::array<StorageTexture::FlushWaitCounts, 2> StorageTexture::TakeFlushWaitCounts() {
     std::array<FlushWaitCounts, 2> counts{};
     for (std::size_t scope = 0; scope < counts.size(); ++scope) {
