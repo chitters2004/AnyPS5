@@ -126,6 +126,40 @@ ShaderRecompiler::RecompileResult Shaped(std::uint32_t staticBufferElements, std
     return result;
 }
 
+void IdentityMemoFollowsTheResult() {
+    auto result = Program(0x1000u, 0x2000u);
+    result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
+    Expect(result.identityMemo.low.load() == 0, "a new result started with a memoized identity");
+    const auto identity = result.Identity();
+    Expect(!identity.Empty() && identity == result.ComputedIdentity(), "the memoized identity differs from the computed one");
+    Expect(result.identityMemo.low.load() == identity.low && result.identityMemo.high.load() == identity.high, "the identity was not memoized");
+    Expect(result.Identity() == identity, "a memo hit returned another identity");
+    auto copy = result;
+    Expect(copy.identityMemo.low.load() == 0, "a copy kept its source's memoized identity");
+    copy.bindings[1].binding = 9u;
+    Expect(copy.Identity() == copy.ComputedIdentity() && copy.Identity() != identity, "a copy with another binding layout kept the source's identity");
+    copy = result;
+    Expect(copy.identityMemo.low.load() == 0 && copy.Identity() == identity, "an assigned result kept the identity memoized before the assignment");
+    ShaderRecompiler::RecompileResult empty;
+    Expect(empty.Identity().Empty() && empty.identityMemo.low.load() == 0, "a result without SPIR-V memoized an identity");
+    std::puts("stage key shape: a result memoizes its pipeline identity, and copies and assignments compute their own");
+}
+
+void BenchIdentity() {
+    auto result = Program(0x1000u, 0x2000u);
+    result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
+    for (std::uint32_t binding = 2; binding < 24u; ++binding) result.bindings.push_back({DescriptorKind::SampledImage, DescriptorRole::GuestImages, 0, binding, 1, {}});
+    constexpr int Calls = 200000;
+    std::uint64_t sink = 0;
+    const auto computedStart = ThreadMicroseconds();
+    for (int call = 0; call < Calls; ++call) sink += result.ComputedIdentity().low;
+    const auto computedNs = (ThreadMicroseconds() - computedStart) * 1000.0 / Calls;
+    const auto memoStart = ThreadMicroseconds();
+    for (int call = 0; call < Calls; ++call) sink += result.Identity().low;
+    const auto memoNs = (ThreadMicroseconds() - memoStart) * 1000.0 / Calls;
+    std::printf("bench identity, 24 bindings: computed %.1f ns, memoized %.1f ns per call, thread CPU (%llu)\n", computedNs, memoNs, static_cast<unsigned long long>(sink & 1u));
+}
+
 void Bench(const char* name, std::uint32_t staticBufferElements, std::uint32_t patchedBufferElements) {
     using AgcDriver::Graphics::ShaderResources;
     constexpr int Draws = 4000;
@@ -165,10 +199,12 @@ int main(int argc, char** argv) {
             Bench("GTA-like (one 1-element patched buffer)", 0, 1);
             Bench("Village-like (2000-element static buffer table, 1-element patched buffer)", 2000, 1);
             Bench("Village-like worst case (2000-element patched buffer table)", 0, 2000);
+            BenchIdentity();
             return 0;
         }
         FirstFillRaces();
         CopiesShareTheStaticPart();
+        IdentityMemoFollowsTheResult();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

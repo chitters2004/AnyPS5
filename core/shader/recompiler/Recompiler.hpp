@@ -972,6 +972,20 @@ struct ResultKeyMemo {
     }
 };
 
+struct IdentityMemo {
+    mutable std::atomic<std::uint64_t> low{0};
+    mutable std::atomic<std::uint64_t> high{0};
+    IdentityMemo() = default;
+    IdentityMemo(const IdentityMemo&) {}
+    IdentityMemo& operator=(const IdentityMemo&) {
+        low.store(0, std::memory_order_relaxed);
+        high.store(0, std::memory_order_relaxed);
+        return *this;
+    }
+};
+
+[[nodiscard]] bool VerifyIdentityMemo();
+
 template<typename TValue, typename TBuild>
 std::shared_ptr<const TValue> PublishOnce(AtomicSharedPtr<const TValue>& slot, const TBuild& build, bool* published = nullptr) {
     if (auto current = slot.load(std::memory_order_acquire)) return current;
@@ -1007,11 +1021,25 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     ResultKeyMemo planKeyMemo;
     std::shared_ptr<const ResultKeyShape> keyShape;
+    IdentityMemo identityMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
     [[nodiscard]] PipelineIdentity Identity() const {
+        if (const auto low = identityMemo.low.load(std::memory_order_acquire); low != 0) {
+            const PipelineIdentity memoized{low, identityMemo.high.load(std::memory_order_relaxed)};
+            if (VerifyIdentityMemo() && memoized != ComputedIdentity()) throw std::logic_error("APS5_VERIFY_KEY_MEMO: a compiled shader's memoized pipeline identity differs from one computed from its SPIR-V and bindings");
+            return memoized;
+        }
+        const auto identity = ComputedIdentity();
+        if (identity.low != 0) {
+            identityMemo.high.store(identity.high, std::memory_order_relaxed);
+            identityMemo.low.store(identity.low, std::memory_order_release);
+        }
+        return identity;
+    }
+    [[nodiscard]] PipelineIdentity ComputedIdentity() const {
         const auto hash = spirv.ContentHash();
         if (hash == SpirvContentHash{}) return {};
         PipelineIdentity identity{hash.low, hash.high};
