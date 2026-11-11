@@ -64,7 +64,7 @@ void registry() {
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, true);
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back set");
     const auto ring = AbSchedule::Parse("30:APS5_NO_TARGET_MEMO+APS5_FOLLOW_OLDER_EPOCH_TOKENS+APS5_UPLOAD_REFRESH_PROOF+APS5_REFRESH_EXIT_EPOCH_STAMP+APS5_NO_DEPTH_REPEAT_FIND", "", "");
-    Require(ring.switches.size() == 5 && ring.switches.front() == RuntimeSwitch::NoTargetMemo && ring.switches.back() == RuntimeSwitch::NoDepthRepeatFind, "the ring's target and epoch switches are not all flippable by APS5_AB");
+    Require(ring.arms.size() == 1 && ring.arms[0].size() == 5 && ring.arms[0].front() == RuntimeSwitch::NoTargetMemo && ring.arms[0].back() == RuntimeSwitch::NoDepthRepeatFind, "the ring's target and epoch switches are not all flippable by APS5_AB");
 }
 
 void parse() {
