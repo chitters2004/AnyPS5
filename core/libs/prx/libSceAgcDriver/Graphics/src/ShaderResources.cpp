@@ -2814,6 +2814,7 @@ void ShaderResources::buildComplete() {
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         resolveImageTables();
+        noteReadImages();
         Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed during resource materialization");
         timing.bindingsMs += phase(BuildPhase::Images);
         requireGuestBuffers();
@@ -4658,6 +4659,10 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
         rebound = true;
         noteBindingsChanged();
         countIndex(IndexRebound);
+    }
+    if (!replaced.empty()) {
+        GuestMemory::AssertGpuLockHeld("ShaderResources::reresolveElements read images");
+        noteReadImages();
     }
     const auto& log = lookupLog();
     for (const auto i : elements) {
@@ -7865,7 +7870,33 @@ bool ShaderResources::HoldsReleasedTexture() const {
     return std::any_of(textures.begin(), textures.end(), [](const auto& texture) { return texture != nullptr && texture->Released(); });
 }
 
+bool ShaderResources::ReadImageSet() {
+    static const bool enabled = std::getenv("APS5_NO_READ_IMAGE_SET") == nullptr;
+    return enabled;
+}
+
+void ShaderResources::noteReadImages() {
+    readImages.clear();
+    for (const auto& texture : textures) {
+        if (texture != nullptr && texture->StorageSource() != nullptr) readImages.push_back(texture->StorageSource());
+    }
+    for (const auto& storage : storageTextures) {
+        if (storage != nullptr) readImages.push_back(storage.get());
+    }
+    std::sort(readImages.begin(), readImages.end());
+    readImages.erase(std::unique(readImages.begin(), readImages.end()), readImages.end());
+}
+
 bool ShaderResources::ReadsImage(const StorageTexture* image) const {
+    GuestMemory::AssertGpuLockHeld("ShaderResources::ReadsImage");
+    if (!ReadImageSet()) return walkReadsImage(image);
+    const bool reads = image != nullptr && std::binary_search(readImages.begin(), readImages.end(), image);
+    static const bool verify = std::getenv("APS5_VERIFY_READ_IMAGE_SET") != nullptr;
+    if (verify) Require(reads == walkReadsImage(image), "APS5_VERIFY_READ_IMAGE_SET: the template's set of read images disagrees with a walk over its textures");
+    return reads;
+}
+
+bool ShaderResources::walkReadsImage(const StorageTexture* image) const {
     if (image == nullptr) return false;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->StorageSource() == image) return true;

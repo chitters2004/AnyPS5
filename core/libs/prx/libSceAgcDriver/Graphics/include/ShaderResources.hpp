@@ -333,6 +333,7 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
+    static bool ReadImageSet();
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
@@ -470,6 +471,8 @@ public:
     std::vector<PresyncSurface> PresyncSurfaces() const;
 
 private:
+    void noteReadImages();
+    bool walkReadsImage(const StorageTexture* image) const;
     friend class AgcDriver::VulkanDevice;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
@@ -811,6 +814,7 @@ private:
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
     std::vector<bool> textureSrgb;
+    std::vector<const StorageTexture*> readImages;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<VkImageView> multisampleStorageViews;
     std::vector<std::uint32_t> storageMips;
