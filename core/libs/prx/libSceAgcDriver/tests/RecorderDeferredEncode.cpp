@@ -17,6 +17,8 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <random>
+#include <random>
 #include <mutex>
 #include <set>
 #include <string>
@@ -65,6 +67,8 @@ struct MockDevice {
     std::vector<Submission> submissions;
     std::vector<std::string> violations;
     bool gate = false;
+    bool jitter = false;
+    bool jitter = false;
     bool gateOpen = false;
     bool holdSubmitReturn = false;
     bool submitReturnOpen = false;
@@ -159,6 +163,20 @@ VKAPI_ATTR VkResult VKAPI_CALL mockBeginCommandBuffer(VkCommandBuffer commands, 
         return VK_ERROR_INITIALIZATION_FAILED;
     }
     if (mock->gate && owner->second != mock->contextPool) mock->changed.wait(lock, [] { return mock->gateOpen; });
+    if (mock->jitter && owner->second != mock->contextPool) {
+        thread_local std::mt19937 delay(static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+        const auto pause = std::chrono::microseconds(delay() % 400);
+        lock.unlock();
+        std::this_thread::sleep_for(pause);
+        lock.lock();
+    }
+    if (mock->jitter && owner->second != mock->contextPool) {
+        thread_local std::mt19937 delay(static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+        const auto pause = std::chrono::microseconds(delay() % 400);
+        lock.unlock();
+        std::this_thread::sleep_for(pause);
+        lock.lock();
+    }
     if (mock->buffersInSubmit.count(commands) != 0) mock->Violation("a command buffer was begun again while its vkQueueSubmit had not returned");
     mock->states[commands] = BufferState::Recording;
     mock->recorded[commands].clear();
@@ -204,8 +222,8 @@ VKAPI_ATTR void VKAPI_CALL mockCmdDispatch(VkCommandBuffer commands, std::uint32
     record(commands, "dispatch " + std::to_string(x));
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t, const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
-    record(commands, "barrier");
+VKAPI_ATTR void VKAPI_CALL mockCmdPipelineBarrier(VkCommandBuffer commands, VkPipelineStageFlags, VkPipelineStageFlags, VkDependencyFlags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t, const VkBufferMemoryBarrier*, std::uint32_t, const VkImageMemoryBarrier*) {
+    record(commands, "barrier " + std::to_string(memoryCount != 0 ? memory[0].srcAccessMask : 0u));
 }
 
 VKAPI_ATTR void VKAPI_CALL mockCmdBeginQuery(VkCommandBuffer commands, VkQueryPool, std::uint32_t, VkQueryControlFlags) {
@@ -228,8 +246,10 @@ VKAPI_ATTR void VKAPI_CALL mockCmdBindPipeline(VkCommandBuffer commands, VkPipel
     record(commands, "bind pipeline");
 }
 
-VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer commands, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) {
-    record(commands, "push constants");
+VKAPI_ATTR void VKAPI_CALL mockCmdPushConstants(VkCommandBuffer commands, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t size, const void* values) {
+    std::uint32_t value = 0;
+    if (size >= sizeof(value)) std::memcpy(&value, values, sizeof(value));
+    record(commands, "push " + std::to_string(value));
 }
 
 struct QueueUse {
@@ -866,6 +886,169 @@ void StaleHandleIsRefusedAfterSubmit() {
     }
 }
 
+void RandomProgramsKeepProgramOrder() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    for (std::uint32_t seed = 1; seed <= 6; ++seed) {
+        const Watchdog watchdog("a random program, seed " + std::to_string(seed));
+        std::mt19937 random(seed);
+        Fixture fixture;
+        fixture.device.jitter = seed % 2 == 0;
+        std::vector<std::vector<std::string>> expected(1);
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            const auto close = [&] {
+                if (!expected.back().empty()) expected.emplace_back();
+            };
+            for (std::uint32_t step = 0; step < 600; ++step) {
+                const auto value = static_cast<std::uint32_t>(random() % 251);
+                auto& ops = expected.back();
+                switch (random() % 14) {
+                case 0:
+                case 1:
+                    fixture.Fill(recorder, value);
+                    ops.push_back("fill " + std::to_string(value));
+                    break;
+                case 2:
+                    fixture.Update(recorder, value);
+                    ops.push_back("update " + std::to_string(value));
+                    break;
+                case 3:
+                    fixture.context.Function<PFN_vkCmdDispatch>("vkCmdDispatch")(recorder.Commands(), value, 1, 1);
+                    ops.push_back("dispatch " + std::to_string(value));
+                    break;
+                case 4: {
+                    std::array<std::uint32_t, 8> values;
+                    values.fill(value);
+                    fixture.context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(recorder.Commands(), handleOf<VkPipelineLayout>(0x200), VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(values), values.data());
+                    values.fill(0xdeadbeefu);
+                    ops.push_back("push " + std::to_string(value));
+                    break;
+                }
+                case 5: {
+                    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+                    barrier.srcAccessMask = value;
+                    fixture.context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+                    barrier.srcAccessMask = 0xdeadbeefu;
+                    ops.push_back("barrier " + std::to_string(value));
+                    break;
+                }
+                case 6:
+                    fixture.context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(recorder.Commands(), VK_PIPELINE_BIND_POINT_COMPUTE, handleOf<VkPipeline>(0x300 + value));
+                    ops.push_back("bind pipeline");
+                    break;
+                case 7:
+                    fixture.context.Function<PFN_vkCmdBeginQuery>("vkCmdBeginQuery")(recorder.Commands(), handleOf<VkQueryPool>(0x400), value, 0);
+                    fixture.context.Function<PFN_vkCmdEndQuery>("vkCmdEndQuery")(recorder.Commands(), handleOf<VkQueryPool>(0x400), value);
+                    ops.push_back("begin query");
+                    ops.push_back("end query");
+                    break;
+                case 8:
+                case 9:
+                    recorder.Submit();
+                    close();
+                    break;
+                case 10:
+                    recorder.Sync();
+                    close();
+                    break;
+                case 11:
+                    recorder.Reap();
+                    break;
+                default:
+                    fixture.Fill(recorder, value);
+                    ops.push_back("fill " + std::to_string(value));
+                    break;
+                }
+            }
+            recorder.Sync();
+        }
+        std::vector<std::vector<std::string>> batches;
+        for (const auto& ops : expected) {
+            if (!ops.empty()) batches.push_back(ops);
+        }
+        const auto submissions = fixture.Submissions();
+        Expect(submissions.size() == batches.size(), "seed " + std::to_string(seed) + ": " + std::to_string(batches.size()) + " batches made " + std::to_string(submissions.size()) + " submissions");
+        for (std::size_t index = 0; index < std::min(submissions.size(), batches.size()); ++index) Expect(submissions[index].recorded == batches[index], "seed " + std::to_string(seed) + ": batch " + std::to_string(index) + " encoded " + joined(submissions[index].recorded) + ", the program recorded " + joined(batches[index]));
+    }
+}
+
+void KeptOwnersOutliveTheirEncode() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    for (const bool failing : {false, true}) {
+        Fixture fixture;
+        {
+            const Watchdog watchdog("a batch holding kept objects");
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            std::atomic<bool> destroyed{false};
+            std::size_t submissionsAtDestruction = 99;
+            std::shared_ptr<void> owner(new int(0), [&](int* value) {
+                submissionsAtDestruction = fixture.Submissions().size();
+                destroyed.store(true);
+                delete value;
+            });
+            const std::weak_ptr<void> watched = owner;
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.gate = true;
+                if (failing) fixture.device.encoderEndResult = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            }
+            fixture.Fill(recorder, 1);
+            recorder.Keep(owner);
+            owner.reset();
+            recorder.Submit();
+            Expect(!recorder.Reap() && !destroyed.load() && !watched.expired(), "a kept object was released while its batch was still being encoded");
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.gateOpen = true;
+            }
+            fixture.device.changed.notify_all();
+            Reported([&] { recorder.Sync(); });
+            Expect(destroyed.load() && watched.expired(), "a kept object outlived its retired batch");
+            Expect(failing || submissionsAtDestruction == 1, "a kept object was released before its batch was submitted");
+        }
+    }
+}
+
+void TeardownWaitsForQueuedEncodes() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    Fixture fixture;
+    {
+        const Watchdog watchdog("a recorder torn down with encodes queued");
+        std::thread opener;
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.gate = true;
+            }
+            for (std::uint32_t batch = 0; batch < 6; ++batch) {
+                fixture.Fill(recorder, batch);
+                recorder.Submit();
+            }
+            opener = std::thread([&] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                {
+                    std::lock_guard lock(fixture.device.mutex);
+                    fixture.device.gateOpen = true;
+                }
+                fixture.device.changed.notify_all();
+            });
+        }
+        opener.join();
+        const auto submissions = fixture.Submissions();
+        Expect(submissions.size() == 6, "a recorder torn down with six queued encodes submitted " + std::to_string(submissions.size()));
+        for (std::size_t index = 0; index < submissions.size(); ++index) Expect(joined(submissions[index].recorded) == "[fill " + std::to_string(index) + "]", "batch " + std::to_string(index) + " of a torn-down recorder encoded " + joined(submissions[index].recorded));
+        std::lock_guard lock(fixture.device.mutex);
+        Expect(fixture.device.poolsDestroyed == fixture.device.poolsCreated && fixture.device.allocated == fixture.device.freed, "tearing down with queued encodes leaked pools or command buffers");
+    }
+}
+
 void VerifyEncodesInline() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
@@ -909,6 +1092,9 @@ int main(int argc, char** argv) {
             FailedSubmitReachesFinish();
             SparseBindsShareTheQueueWithTheSubmitter();
             SubmittersAreScopedToTheirDevice();
+            RandomProgramsKeepProgramOrder();
+            KeptOwnersOutliveTheirEncode();
+            TeardownWaitsForQueuedEncodes();
             DeferredEncodeIsDecidedPerBatch();
             AsyncSubmitOffEncodesInline();
             DiscardedBatchIsNeverEncoded();

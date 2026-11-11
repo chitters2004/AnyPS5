@@ -7,8 +7,11 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <map>
+#include <regex>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -710,6 +713,26 @@ void EveryOpReplaysItsDeepCopies() {
     Expect(calls == direct, "a second replay of the same stream differs: " + firstDifference(direct, calls));
 }
 
+void EveryVkCmdNameTheDriverResolvesIsRecorded() {
+    namespace fs = std::filesystem;
+    const fs::path root = "core/libs/prx/libSceAgcDriver";
+    Expect(fs::is_directory(root), "the test did not run from the repository root");
+    const std::regex name("\"(vkCmd[A-Za-z0-9]+)\"");
+    std::set<std::string> names;
+    for (const auto* directory : {"Graphics", "Execution"}) {
+        std::error_code error;
+        for (fs::recursive_directory_iterator it(root / directory, error), end; !error && it != end; it.increment(error)) {
+            const auto extension = it->path().extension();
+            if (!it->is_regular_file() || (extension != ".cpp" && extension != ".hpp")) continue;
+            std::ifstream stream(it->path());
+            const std::string text((std::istreambuf_iterator<char>(stream)), std::istreambuf_iterator<char>());
+            for (std::sregex_iterator match(text.begin(), text.end(), name), none; match != none; ++match) names.insert((*match)[1].str());
+        }
+    }
+    Expect(names.count("vkCmdDraw") == 1 && names.size() >= 40, "the scan found " + std::to_string(names.size()) + " vkCmd names in the driver sources");
+    for (const auto& command : names) Expect(CommandStream::Records(command.c_str()), command + " is resolved by the driver but has no command stream thunk: a batch would call it on a stream handle");
+}
+
 void UntaggedHandlesPassThrough() {
     const auto functions = resolve(stubContext());
     const std::array<std::uintptr_t, 5> handles{0x1, 0x3, 0x7fffffffffffull, 0xA5C3000000001000ull, 0x5A3C000000001001ull};
@@ -865,6 +888,7 @@ int main() {
     try {
         EveryOpReplaysItsDeepCopies();
         UntaggedHandlesPassThrough();
+        EveryVkCmdNameTheDriverResolvesIsRecorded();
         ResolverRefusals();
         ChainsAndDescriptorTypesTheStreamCannotCopy();
         ClosedStreamsRefuseAppends();

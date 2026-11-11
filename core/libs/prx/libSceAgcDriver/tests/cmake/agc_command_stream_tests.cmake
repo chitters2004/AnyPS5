@@ -7,7 +7,7 @@ configure_windows_unwind(agc_command_stream_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_command_stream_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_command_stream COMMAND agc_command_stream_tests)
-    set_tests_properties(agc_command_stream PROPERTIES TIMEOUT 30)
+    set_tests_properties(agc_command_stream PROPERTIES TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
         set_tests_properties(agc_command_stream PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
