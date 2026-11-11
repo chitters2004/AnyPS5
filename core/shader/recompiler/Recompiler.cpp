@@ -1848,6 +1848,11 @@ void reportResultMemo() {
 
 }
 
+bool VerifyIdentityMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_KEY_MEMO") != nullptr;
+    return verify;
+}
+
 MaskedPatchKinds ClassifyMaskedPatch(std::size_t bufferBindings, std::size_t userWords, bool pushData, bool flattenedSrt) {
     MaskedPatchKinds kinds;
     kinds.buffers = bufferBindings != 0;

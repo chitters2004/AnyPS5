@@ -278,6 +278,9 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileResult
             ResultKeyShape
             PublishOnce
+            IdentityMemo
+            VerifyIdentityMemo
+            ComputedIdentity
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate
