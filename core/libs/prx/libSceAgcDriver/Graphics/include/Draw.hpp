@@ -135,6 +135,9 @@ struct DrawRecipeOutcome {
     bool templateInstance = false;
     bool ownAttachments = false;
     bool handedTargets = false;
+    std::shared_ptr<const DrawRecipe> ownRecipe;
+    std::uint64_t ownTargetsNs = 0;
+    std::uint64_t ownFramebufferNs = 0;
 };
 
 inline constexpr std::uint8_t PlanMismatchShape = 1u;

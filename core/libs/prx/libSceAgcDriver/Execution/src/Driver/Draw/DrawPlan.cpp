@@ -552,7 +552,7 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
         return false;
     }
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto outcome = device->DrawFromPlan(graphics, draw, stages, snapshots, *plan, trace);
+    auto outcome = device->DrawFromPlan(graphics, draw, stages, snapshots, *plan, trace);
     if (outcome.recorded) {
         drawPlanCounters.Add(DrawPlanCount::Hits);
         drawPlanCounters.Add(DrawPlanCount::SharedBindingStages, outcome.sharedBindingStages);
@@ -562,8 +562,17 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
             drawPlanCounters.Add(DrawPlanCount::RebasedBuffers, outcome.movedBuffers);
         }
         if (outcome.templateInstance) drawPlanCounters.Add(DrawPlanCount::TemplateInstanceHits);
-        if (outcome.ownAttachments) drawPlanCounters.Add(DrawPlanCount::OwnAttachmentHits);
-        if (plan->servable && outcome.movedBuffers == 0 && !outcome.templateInstance && !outcome.ownAttachments && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) attachable = plan;
+        if (outcome.ownAttachments) {
+            drawPlanCounters.Add(DrawPlanCount::OwnAttachmentHits);
+            drawPlanCounters.Add(DrawPlanCount::OwnTargetsNanoseconds, outcome.ownTargetsNs);
+            drawPlanCounters.Add(DrawPlanCount::OwnFramebufferNanoseconds, outcome.ownFramebufferNs);
+        }
+        if (outcome.ownRecipe != nullptr) {
+            drawPlanCounters.Add(DrawPlanCount::OwnRecipes);
+            attachable = std::move(outcome.ownRecipe);
+        } else if (plan->servable && outcome.movedBuffers == 0 && !outcome.templateInstance && !outcome.ownAttachments && plan->renderExtent.width == graphics.renderExtent.width && plan->renderExtent.height == graphics.renderExtent.height) {
+            attachable = plan;
+        }
         if (Graphics::VerifyDrawPlans()) drawPlanCounters.Add(DrawPlanCount::Verified);
         if (profile) drawPlanCounters.Add(DrawPlanCount::HitNanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         return true;

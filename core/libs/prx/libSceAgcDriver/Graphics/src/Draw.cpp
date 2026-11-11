@@ -5078,7 +5078,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
         std::vector<TargetBinding> bindings;
         ResolvedTargets resolution{bindings, ownViews};
+        const auto resolveStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto how = ResolveDrawTargets(context, state, 0, DumpTargetLimit(), outcome, timer, profile, resolution);
+        if (profile) result.ownTargetsNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolveStart).count());
         const bool direct = how != TargetResolution::ResolvedWithCopies && std::ranges::all_of(bindings, [](const TargetBinding& binding) { return binding.resident != nullptr && !binding.multisampled && binding.stagedTemporary == nullptr; });
         if (!direct) {
             auto& handed = ThreadHandedTargets();
@@ -5188,9 +5190,35 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const auto& drawnViews = result.ownAttachments ? ownViews : recipe.targetViews;
     auto framebuffer = (!planned || sameExtent) && !result.ownAttachments ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
+        const auto acquireStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto stored = targets.Span();
         const std::vector<std::shared_ptr<void>> framebufferOwners(stored.begin(), stored.end());
         framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(drawnViews, framebufferOwners, state.renderExtent, state.renderLayers); });
+        if (profile && result.ownAttachments) result.ownFramebufferNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - acquireStart).count());
+    }
+    if (result.ownAttachments && recipe.servable && result.movedBuffers == 0 && !result.templateInstance) {
+        auto own = std::make_shared<DrawRecipe>(recipe);
+        own->framebuffer = framebuffer;
+        const auto stored = targets.Span();
+        own->targets.assign(stored.begin(), stored.end());
+        own->targetViews = drawnViews;
+        own->targetViewInputs.clear();
+        for (const auto& color : state.colors) own->targetViewInputs.push_back(TargetViewInputs(color));
+        own->depthViewInputs = DepthViewInputs(state);
+        own->passKey = DrawRenderPassKey(context, state, drawnViews);
+        own->renderExtent = state.renderExtent;
+        if (VerifyDrawPlans()) {
+            const auto offered = own->framebuffer.lock();
+            Require(offered != nullptr, "APS5_VERIFY_DRAW_PLANS: the exact recipe a plan hit offers with its own attachments has no framebuffer");
+            const auto views = offered->Views();
+            auto next = own->targetViews.begin();
+            for (const auto view : views) {
+                next = std::find(next, own->targetViews.end(), view);
+                Require(next != own->targetViews.end(), "APS5_VERIFY_DRAW_PLANS: the exact recipe a plan hit offers with its own attachments has a framebuffer over other views than its own");
+                ++next;
+            }
+        }
+        result.ownRecipe = std::move(own);
     }
     timer.phase(PhasePipeline);
     BeginCommitPhase(CommitPhase::RecordSetup);
