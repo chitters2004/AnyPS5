@@ -523,12 +523,23 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
     return certificate;
 }
 
+namespace {
+std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
+}
+
+void SetCertificateMutantForTest(CertificateMutant mutant) {
+    certificateMutant.store(mutant, std::memory_order_release);
+}
+
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask) {
+    const auto mutant = certificateMutant.load(std::memory_order_relaxed);
+    if (mutant == CertificateMutant::HideUnwatch) domainMask &= ~WriteDomainBit(WriteDomain::Unwatch);
+    if (mutant == CertificateMutant::HideMapping) domainMask &= ~WriteDomainBit(WriteDomain::Mapping);
     const auto domains = readDomains(domainMask);
     for (std::size_t i = 0; i < domains.size(); ++i) {
         if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) return false;
     }
-    return subscription.version.load(std::memory_order_acquire) == certificate.version;
+    return mutant == CertificateMutant::IgnoreVersion || subscription.version.load(std::memory_order_acquire) == certificate.version;
 }
 
 bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t generation, std::vector<std::uint64_t>& blocks, std::vector<std::uint64_t>& lookupBlocks) {
@@ -1136,7 +1147,7 @@ std::size_t ImagePagesSize() {
 }
 
 void ForgetPages(std::uintptr_t address, std::size_t bytes) {
-    bumpSubscriptions(address, bytes, WriteBumpSource::Forget);
+    if (certificateMutant.load(std::memory_order_relaxed) != CertificateMutant::HideMapping) bumpSubscriptions(address, bytes, WriteBumpSource::Forget);
     forgetCalls.fetch_add(1, std::memory_order_relaxed);
     forgetBytes.fetch_add(bytes, std::memory_order_relaxed);
     const auto started = forgetSerial.fetch_add(1, std::memory_order_release) + 1;
@@ -3044,12 +3055,12 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {
         unwatchSerial.fetch_add(1, std::memory_order_release);
-        bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
+        if (certificateMutant.load(std::memory_order_relaxed) != CertificateMutant::HideUnwatch) bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
     }
 #else
     if (GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), bytes)) {
         unwatchSerial.fetch_add(1, std::memory_order_release);
-        bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
+        if (certificateMutant.load(std::memory_order_relaxed) != CertificateMutant::HideUnwatch) bumpSubscriptions(address, bytes, WriteBumpSource::Unwatch);
     }
 #endif
 }
