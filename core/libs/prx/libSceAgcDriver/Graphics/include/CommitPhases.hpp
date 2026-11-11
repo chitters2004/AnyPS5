@@ -80,6 +80,9 @@ enum class CommitCounter : std::uint8_t {
     ResolveBuilds,
     ResolveInvalidated,
     ResolveAddressStages,
+    ResolveMoveCompared,
+    ResolveMoveMoved,
+    ResolveMoveRefused,
     Count
 };
 
