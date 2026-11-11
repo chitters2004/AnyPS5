@@ -81,7 +81,7 @@ extern char** environ;
 #include <atomic>
 #include <chrono>
 #include <charconv>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <future>
 #include <fstream>
 #include <cctype>
@@ -358,7 +358,7 @@ public:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_all();
+        changed.NotifyAll();
         if (worker.joinable()) worker.join();
     }
 
@@ -367,13 +367,13 @@ public:
         require(!stopping, "frame dump writer has stopped");
         if (!screenshot && !frameDumpOutput.Enabled_nid_no_patch()) return;
         require(pixels.size() <= maxBytes, "a frame dump exceeds the 64 MiB queue");
-        changed.wait(lock, [&] { return stopping || pixels.size() <= maxBytes - queuedBytes; });
+        changed.Wait(lock, [&] { return stopping || pixels.size() <= maxBytes - queuedBytes; });
         require(!stopping, "frame dump writer has stopped");
         if (!worker.joinable()) worker = Libc::StartHostThread([this] { run(); });
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, screenshot, std::move(pixels)});
         queuedBytes += bytes;
-        changed.notify_all();
+        changed.NotifyAll();
     }
 
     bool Idle() {
@@ -396,7 +396,7 @@ private:
                 std::deque<Frame> batch;
                 {
                     std::unique_lock lock(mutex);
-                    changed.wait(lock, [this] { return stopping || !pending.empty(); });
+                    changed.Wait(lock, [this] { return stopping || !pending.empty(); });
                     if (pending.empty() && stopping) return;
                     batch.swap(pending);
                 }
@@ -405,7 +405,7 @@ private:
                     else WriteFrameBmp(frame.index, frame.width, frame.height, frame.pixels);
                     std::lock_guard lock(mutex);
                     queuedBytes -= frame.pixels.size();
-                    changed.notify_all();
+                    changed.NotifyAll();
                 }
             }
         } catch (const std::exception& error) {
@@ -416,7 +416,7 @@ private:
 
     static constexpr std::size_t maxBytes = 64 * 1024 * 1024;
     std::mutex mutex;
-    std::condition_variable changed;
+    AddressCondition changed;
     std::deque<Frame> pending;
     std::thread worker;
     std::size_t queuedBytes = 0;

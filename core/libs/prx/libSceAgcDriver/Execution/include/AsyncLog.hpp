@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -159,7 +159,7 @@ public:
         if (!asynchronous) return;
         std::unique_lock lock(mutex);
         const auto target = queued.load(std::memory_order_relaxed);
-        idle.wait(lock, [&] { return finished.load(std::memory_order_relaxed) >= target; });
+        idle.Wait(lock, [&] { return finished.load(std::memory_order_relaxed) >= target; });
     }
 
     bool FlushFor(std::chrono::milliseconds limit) {
@@ -205,14 +205,8 @@ private:
         if (!asynchronous) return;
         LogSink().store(&AsyncLog::Sink, std::memory_order_release);
         std::atexit(&AsyncLog::FlushAtEnd);
-        InitializeWaits();
         Libc::StartHostThread([this] { Run(); }).detach();
         LibcSetEndFlush_nid_no_patch(&AsyncLog::FlushAtEnd);
-    }
-
-    void InitializeWaits() {
-        std::unique_lock lock(mutex);
-        for (auto* condition : {&wake, &space, &idle}) static_cast<void>(condition->wait_for(lock, std::chrono::nanoseconds(0)));
     }
 
     static int Sink(std::FILE* stream, const char* text, std::size_t length) {
@@ -246,7 +240,7 @@ private:
         bool notify = false;
         {
             std::unique_lock lock(mutex);
-            space.wait(lock, [&] { return bytes == 0 || bytes + entry.cost <= Capacity; });
+            space.Wait(lock, [&] { return bytes == 0 || bytes + entry.cost <= Capacity; });
             bytes += entry.cost;
             peak = std::max(peak, bytes);
             pending.push_back(std::move(entry));
@@ -254,7 +248,7 @@ private:
             notify = sleeping;
             sleeping = false;
         }
-        if (notify) wake.notify_one();
+        if (notify) wake.NotifyOne();
     }
 
     void Run() noexcept {
@@ -264,12 +258,12 @@ private:
             {
                 std::unique_lock lock(mutex);
                 sleeping = true;
-                wake.wait_for(lock, Tick, [&] { return !pending.empty(); });
+                wake.WaitFor(lock, Tick, [&] { return !pending.empty(); });
                 sleeping = false;
                 batch.swap(pending);
                 bytes = 0;
             }
-            space.notify_all();
+            space.NotifyAll();
             if (!batch.empty()) {
                 const auto start = Clock::now();
                 const auto count = batch.size();
@@ -284,7 +278,7 @@ private:
                     std::lock_guard lock(mutex);
                     finished.fetch_add(count, std::memory_order_release);
                 }
-                idle.notify_all();
+                idle.NotifyAll();
             }
             try {
                 Housekeeping();
@@ -366,9 +360,9 @@ private:
     bool asynchronous = true;
     bool statsEnabled = true;
     std::mutex mutex;
-    std::condition_variable wake;
-    std::condition_variable space;
-    std::condition_variable idle;
+    AddressCondition wake;
+    AddressCondition space;
+    AddressCondition idle;
     std::deque<AsyncLogDetail::Entry> pending;
     std::size_t bytes = 0;
     std::size_t peak = 0;

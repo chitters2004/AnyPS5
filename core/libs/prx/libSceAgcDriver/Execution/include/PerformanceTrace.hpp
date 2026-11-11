@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <exception>
 #include "prx/libc/include/RunReport.hpp"
 #include <filesystem>
@@ -408,7 +408,7 @@ public:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
+        changed.NotifyOne();
         if (worker.joinable()) worker.join();
     }
 
@@ -420,12 +420,12 @@ public:
             if (pending) ++superseded;
             pending = std::move(snapshot);
         }
-        changed.notify_one();
+        changed.NotifyOne();
     }
 
     void Flush() {
         std::unique_lock lock(mutex);
-        idle.wait(lock, [&] { return failure || (!pending && !writing); });
+        idle.Wait(lock, [&] { return failure || (!pending && !writing); });
         if (failure) std::rethrow_exception(failure);
     }
 
@@ -441,7 +441,7 @@ private:
                 TraceBenchSnapshot snapshot;
                 {
                     std::unique_lock lock(mutex);
-                    changed.wait(lock, [&] { return stopping || pending.has_value(); });
+                    changed.Wait(lock, [&] { return stopping || pending.has_value(); });
                     if (!pending) return;
                     snapshot = std::move(*pending);
                     pending.reset();
@@ -452,7 +452,7 @@ private:
                     std::lock_guard lock(mutex);
                     writing = false;
                 }
-                idle.notify_all();
+                idle.NotifyAll();
             }
         } catch (...) {
             {
@@ -460,15 +460,15 @@ private:
                 failure = std::current_exception();
                 writing = false;
             }
-            idle.notify_all();
+            idle.NotifyAll();
         }
     }
 
     std::function<void(const TraceBenchSnapshot&)> writer;
     std::mutex stopMutex;
     std::mutex mutex;
-    std::condition_variable changed;
-    std::condition_variable idle;
+    AddressCondition changed;
+    AddressCondition idle;
     std::optional<TraceBenchSnapshot> pending;
     std::uint64_t superseded = 0;
     bool writing = false;

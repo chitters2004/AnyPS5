@@ -4,7 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <atomic>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdlib>
 #include <deque>
 #include <functional>
@@ -51,8 +51,8 @@ struct DeviceLibraries {
 struct LibraryStore {
     std::mutex mutex;
     std::map<VkDevice, DeviceLibraries> devices;
-    std::condition_variable idle;
-    std::condition_variable work;
+    AddressCondition idle;
+    AddressCondition work;
     std::deque<std::pair<VkDevice, std::function<void()>>> jobs;
     std::map<VkDevice, std::size_t> pending;
     std::map<VkDevice, std::size_t> activeBuilds;
@@ -70,14 +70,14 @@ LibraryStore& Libraries() {
 void runJobs(LibraryStore& store) {
     std::unique_lock lock(store.mutex);
     for (;;) {
-        store.work.wait(lock, [&] { return !store.jobs.empty() || store.stopping; });
+        store.work.Wait(lock, [&] { return !store.jobs.empty() || store.stopping; });
         if (store.stopping) break;
         auto [device, job] = std::move(store.jobs.front());
         store.jobs.pop_front();
         lock.unlock();
         job();
         lock.lock();
-        if (--store.pending[device] == 0) store.idle.notify_all();
+        if (--store.pending[device] == 0) store.idle.NotifyAll();
     }
     runningWorkers.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -91,7 +91,7 @@ void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     auto& pending = store.pending[device];
     store.jobs.emplace_back(device, std::move(job));
     ++pending;
-    store.work.notify_one();
+    store.work.NotifyOne();
 }
 
 Key Combined(const Key& part, const Key& context) {
@@ -126,7 +126,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         std::unique_lock<std::mutex>& lock;
         ~ActiveBuild() {
             if (!lock.owns_lock()) lock.lock();
-            if (--store.activeBuilds[device] == 0) store.idle.notify_all();
+            if (--store.activeBuilds[device] == 0) store.idle.NotifyAll();
         }
     } activeBuild{store, context.device, lock};
     auto& device = store.devices[context.device];
@@ -348,13 +348,13 @@ void OptimizedPipeline::Schedule() {
 void WaitForOptimizedPipelines(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
-    store.idle.wait(lock, [&] { return store.pending[device] == 0; });
+    store.idle.Wait(lock, [&] { return store.pending[device] == 0; });
 }
 
 void ClearPipelineLibraries(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
-    store.idle.wait(lock, [&] { return store.pending[device] == 0 && store.activeBuilds[device] == 0; });
+    store.idle.Wait(lock, [&] { return store.pending[device] == 0 && store.activeBuilds[device] == 0; });
     const auto found = store.devices.find(device);
     if (found == store.devices.end()) return;
     auto& libraries = found->second;
@@ -376,8 +376,8 @@ void StopPipelineLibraryWorker() {
         store.jobs.clear();
         worker = std::move(store.worker);
     }
-    store.idle.notify_all();
-    store.work.notify_all();
+    store.idle.NotifyAll();
+    store.work.NotifyAll();
     if (!worker.joinable()) return;
     if (worker.get_id() == std::this_thread::get_id()) worker.detach();
     else worker.join();

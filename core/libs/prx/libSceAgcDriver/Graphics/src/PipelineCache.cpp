@@ -94,7 +94,7 @@ PipelineCache::~PipelineCache() {
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        wake.notify_all();
+        wake.NotifyAll();
         saver.join();
         save(true, true);
     }
@@ -310,7 +310,7 @@ void PipelineCache::SaveUnlessBusy() {
 
 void PipelineCache::run() {
     std::unique_lock lock(mutex);
-    while (!wake.wait_for(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
+    while (!wake.WaitFor(lock, std::chrono::seconds(SaveIntervalSeconds), [&] { return stopping; })) {
         lock.unlock();
         save(false, false);
         lock.lock();

@@ -3,7 +3,7 @@
 
 #include <array>
 #include <chrono>
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -121,7 +121,7 @@ private:
             std::lock_guard lock(mutex);
             stopping = true;
         }
-        changed.notify_one();
+        changed.NotifyOne();
         if (worker.joinable()) worker.join();
     }
 
@@ -135,7 +135,7 @@ private:
         }
         appendRecord(pending, line);
         if (line.starts_with("blit ")) flushRequested = true;
-        if (pending.size() >= 65536 || flushRequested) changed.notify_one();
+        if (pending.size() >= 65536 || flushRequested) changed.NotifyOne();
     }
 
     void drop() {
@@ -167,7 +167,7 @@ private:
             bool stop;
             {
                 std::unique_lock lock(mutex);
-                changed.wait_for(lock, std::chrono::milliseconds(100), [this] { return stopping || flushRequested || pending.size() >= 65536; });
+                changed.WaitFor(lock, std::chrono::milliseconds(100), [this] { return stopping || flushRequested || pending.size() >= 65536; });
                 batch.swap(pending);
                 if (droppedPending != 0) {
                     appendRecord(batch, "capture-trace-dropped records=" + std::to_string(droppedPending));
@@ -197,7 +197,7 @@ private:
 
     std::ofstream output;
     std::mutex mutex;
-    std::condition_variable changed;
+    AddressCondition changed;
     std::string pending;
     std::thread worker;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

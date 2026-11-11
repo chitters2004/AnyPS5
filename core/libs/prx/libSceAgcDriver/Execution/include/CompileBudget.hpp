@@ -1,7 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_COMPILEBUDGET_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_COMPILEBUDGET_HPP
 
-#include <condition_variable>
+#include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
 #include <cstdint>
 #include <cstdlib>
 #include <mutex>
@@ -16,10 +16,10 @@ public:
             std::unique_lock lock(budget.mutex);
             if (bytes > budget.limit) {
                 ++budget.waitingAlone;
-                budget.released.wait(lock, [&] { return budget.held == 0; });
+                budget.released.Wait(lock, [&] { return budget.held == 0; });
                 --budget.waitingAlone;
             } else {
-                budget.released.wait(lock, [&] { return budget.waitingAlone == 0 && budget.held + bytes <= budget.limit; });
+                budget.released.Wait(lock, [&] { return budget.waitingAlone == 0 && budget.held + bytes <= budget.limit; });
             }
             budget.held += bytes;
             if (budget.held > budget.peak) budget.peak = budget.held;
@@ -30,7 +30,7 @@ public:
                 std::lock_guard lock(budget.mutex);
                 budget.held -= bytes;
             }
-            budget.released.notify_all();
+            budget.released.NotifyAll();
         }
 
         Hold(const Hold&) = delete;
@@ -55,7 +55,7 @@ public:
 
 private:
     mutable std::mutex mutex;
-    std::condition_variable released;
+    AddressCondition released;
     std::uint64_t limit;
     std::uint64_t held = 0;
     std::uint64_t peak = 0;
