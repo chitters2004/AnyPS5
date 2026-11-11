@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -447,11 +448,25 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
+std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
+    static std::array<std::atomic<std::uint64_t>, 5> causes{};
+    return causes;
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
     GuestMemory::BumpCollectEpoch();
+    if (!Graphics::CommitPhasesEnabled()) return;
+    static thread_local std::array<std::uint64_t, 5> seen{};
+    unsigned causes = 0;
+    for (std::size_t cause = 0; cause < seen.size(); ++cause) {
+        const auto count = EpochTokenCauses()[cause].load(std::memory_order_relaxed);
+        if (count != seen[cause]) causes |= 1u << cause;
+        seen[cause] = count;
+    }
+    Graphics::NoteEpochCauses(causes);
 }
 
 unsigned DrawPipeline::Committers() {

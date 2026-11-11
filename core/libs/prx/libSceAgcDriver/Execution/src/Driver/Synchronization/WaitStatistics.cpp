@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -33,7 +34,13 @@ std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     lastEpochBump() = std::chrono::steady_clock::now();
     GuestMemory::BumpCollectEpoch();
-    if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
+    const bool profiled = Graphics::CommitPhasesEnabled();
+    const auto cause = static_cast<std::size_t>(counter == &EpochBumps::submissions ? Graphics::EpochCause::Submission : counter == &EpochBumps::waits ? Graphics::EpochCause::Wait : counter == &EpochBumps::drains ? Graphics::EpochCause::Drain : counter == &EpochBumps::reaps ? Graphics::EpochCause::Reap : Graphics::EpochCause::Packet);
+    if (profiled) Graphics::NoteEpochCauses(1u << cause);
+    if (DrawPipeline::Active()) {
+        if (profiled) DrawPipeline::EpochTokenCauses()[cause].fetch_add(1, std::memory_order_relaxed);
+        DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
+    }
     ++(epochBumps().*counter);
 }
 

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <algorithm>
+#include <bit>
 #include <string>
 #include <string_view>
 
@@ -12,10 +13,10 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale"};
 static_assert(PhaseNames.back() != nullptr);
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets"};
 static_assert(PhaseGroups.back() != nullptr);
 
 constexpr std::array<const char*, 12> GroupOrder{"other", "plan", "inputs", "targets", "resolve", "revalidate", "classify", "record", "bindings", "pass access", "effects", "epilogue"};
@@ -29,6 +30,7 @@ struct ThreadPhases {
 };
 
 thread_local ThreadPhases threadPhases;
+thread_local unsigned threadEpochCauses = 0;
 std::atomic<std::uint64_t> drawCount{0};
 std::atomic<std::uint64_t> keyCount{0};
 std::atomic<std::uint64_t> keyWordCount{0};
@@ -87,6 +89,8 @@ void reportDue(Clock::time_point now) {
     const auto targetDraws = std::max(1.0, count(CommitCounter::TargetDraws));
     std::fprintf(stderr, "[commit-phases] (10 s) %llu draws, %.2f us each; us per draw by phase:%s; by group (phases and their sub-phases, summing to the total):%s; %llu content keys of %.0f words on average, stage key memo %llu hits / %llu misses\n", static_cast<unsigned long long>(totals.draws), static_cast<double>(all) / 1e3 / static_cast<double>(totals.draws), text.c_str(), groups.c_str(), static_cast<unsigned long long>(totals.keys), totals.keys != 0 ? static_cast<double>(totals.keyWords) / static_cast<double>(totals.keys) : 0.0, static_cast<unsigned long long>(totals.keyMemoHits), static_cast<unsigned long long>(totals.keyMemoMisses));
     std::fprintf(stderr, "[commit-targets] (10 s) %.0f draws with targets, %.1f%% by recipe; per such draw %.2f color and %.2f depth attachments, %.1f%% on the previous draw's targets; target refreshes per draw: %.2f epoch hits, %.2f proved, %.2f slow; epoch misses per draw: %.2f no epoch, %.2f epoch moved, %.2f proof serial moved, %.2f pending serial moved; other refreshes per draw: %.2f epoch hits, %.2f proved, %.2f slow\n", count(CommitCounter::TargetDraws), 100.0 * count(CommitCounter::RecipeTargetDraws) / targetDraws, count(CommitCounter::ColorTargets) / targetDraws, count(CommitCounter::DepthTargets) / targetDraws, 100.0 * count(CommitCounter::RepeatedTargets) / targetDraws, perDraw(CommitCounter::TargetRefreshEpoch), perDraw(CommitCounter::TargetRefreshProved), perDraw(CommitCounter::TargetRefreshSlow), perDraw(CommitCounter::TargetEpochOff), perDraw(CommitCounter::TargetEpochMoved), perDraw(CommitCounter::TargetEpochProofMoved), perDraw(CommitCounter::TargetEpochPendingMoved), perDraw(CommitCounter::OtherRefreshEpoch), perDraw(CommitCounter::OtherRefreshProved), perDraw(CommitCounter::OtherRefreshSlow));
+    const auto depthPreps = std::max(1.0, count(CommitCounter::DepthPreps));
+    std::fprintf(stderr, "[commit-target-causes] (10 s) epoch moved per draw by the ordering points since the committing thread's previous epoch: %.3f submission start, %.3f WAIT_REG_MEM, %.3f drain, %.3f reap, %.3f packet, %.3f several kinds, %.3f unknown; target refresh proofs refused per draw: %.3f no proof, %.3f image generation moved, %.3f GPU lock not held, %.3f collect refused, %.3f DCC keys, %.3f memory changed, %.3f other pending results; depth preps %.0f: %.1f%% on the previous draw's surface, %.1f%% created, %.1f%% after a clear, %.1f%% mirrored, %.1f%% scanned other surfaces for stale mirrors\n", perDraw(CommitCounter::TargetEpochBySubmission), perDraw(CommitCounter::TargetEpochByWait), perDraw(CommitCounter::TargetEpochByDrain), perDraw(CommitCounter::TargetEpochByReap), perDraw(CommitCounter::TargetEpochByPacket), perDraw(CommitCounter::TargetEpochBySeveral), perDraw(CommitCounter::TargetEpochByUnknown), perDraw(CommitCounter::TargetProofNone), perDraw(CommitCounter::TargetProofGeneration), perDraw(CommitCounter::TargetProofUnlocked), perDraw(CommitCounter::TargetProofRefused), perDraw(CommitCounter::TargetProofKeys), perDraw(CommitCounter::TargetProofChanged), perDraw(CommitCounter::TargetProofPending), count(CommitCounter::DepthPreps), 100.0 * count(CommitCounter::DepthSameSurface) / depthPreps, 100.0 * count(CommitCounter::DepthCreated) / depthPreps, 100.0 * count(CommitCounter::DepthCleared) / depthPreps, 100.0 * count(CommitCounter::DepthMirrored) / depthPreps, 100.0 * count(CommitCounter::DepthStaleScans) / depthPreps);
 }
 
 }
@@ -116,6 +120,20 @@ void NoteCommitKey(std::size_t words) {
 void NoteCommitKeyMemo(bool hit) {
     if (!threadPhases.active) return;
     (hit ? keyMemoHitCount : keyMemoMissCount).fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteEpochCauses(unsigned causes) {
+    threadEpochCauses = causes;
+}
+
+unsigned EpochCauses() {
+    return threadEpochCauses;
+}
+
+CommitCounter EpochCauseCounter(unsigned causes) {
+    if (causes == 0) return CommitCounter::TargetEpochByUnknown;
+    if ((causes & (causes - 1)) != 0) return CommitCounter::TargetEpochBySeveral;
+    return static_cast<CommitCounter>(static_cast<unsigned>(CommitCounter::TargetEpochBySubmission) + static_cast<unsigned>(std::countr_zero(causes)));
 }
 
 void CountCommit(CommitCounter counter, std::uint64_t amount) {

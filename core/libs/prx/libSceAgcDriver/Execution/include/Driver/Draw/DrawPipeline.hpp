@@ -41,6 +41,7 @@ public:
     static bool& Active();
     static bool SeesQueuedWrites();
     static std::atomic<std::uint64_t>& EpochToken();
+    static std::array<std::atomic<std::uint64_t>, 5>& EpochTokenCauses();
     static void FollowEpoch(std::uint64_t token);
     static unsigned Committers();
 
