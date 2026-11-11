@@ -1234,7 +1234,65 @@ bool MovableBuffers() {
     return enabled;
 }
 
-ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
+bool KeyShapes() {
+    static const bool enabled = std::getenv("APS5_NO_KEY_SHAPE") == nullptr;
+    return enabled;
+}
+
+bool ProfileKeyShapes() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+bool VerifyKeyMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_KEY_MEMO") != nullptr;
+    return verify;
+}
+
+struct StageKeyMemoCounterSet {
+    std::atomic<std::uint64_t> staticHits{0};
+    std::atomic<std::uint64_t> staticFills{0};
+    std::atomic<std::uint64_t> staticLosses{0};
+    std::atomic<std::uint64_t> patchedSegments{0};
+    std::atomic<std::uint64_t> layoutSplitMisses{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> resultHits{0};
+    std::atomic<std::uint64_t> resultWalks{0};
+};
+
+StageKeyMemoCounterSet& stageKeyMemoCounters() {
+    static StageKeyMemoCounterSet counters;
+    return counters;
+}
+
+const ShaderRecompiler::ResultKeyShape* KeyShapeOf(const CompiledShader& shader) {
+    return KeyShapes() && shader.program != nullptr ? shader.program->keyShape.get() : nullptr;
+}
+
+ShaderRecompiler::ResultKeyShape::Static BuildStaticKeys(const CompiledShader& shader, const ShaderRecompiler::ResultKeyShape& shape) {
+    ShaderRecompiler::ResultKeyShape::Static keys;
+    ShaderResources::AppendStaticContentKey(shader, true, MovableBuffers(), shape.patchedBindings, keys.drawWords);
+    ShaderResources::AppendStaticContentKey(shader, true, false, shape.patchedBindings, keys.planWords);
+    return keys;
+}
+
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StaticKeys(const CompiledShader& shader, const ShaderRecompiler::ResultKeyShape& shape) {
+    auto& counters = stageKeyMemoCounters();
+    if (auto current = shape.words.load(std::memory_order_acquire)) {
+        counters.staticHits.fetch_add(1, std::memory_order_relaxed);
+        if (VerifyKeyMemo() || VerifyDrawPlans()) {
+            Require(BuildStaticKeys(shader, shape) == *current, "APS5_VERIFY_KEY_MEMO: a program's shared static content key differs from a walk of its own bindings outside the patched slots");
+            counters.verified.fetch_add(1, std::memory_order_relaxed);
+        }
+        return current;
+    }
+    bool won = false;
+    auto published = ShaderRecompiler::PublishOnce(shape.words, [&] { return BuildStaticKeys(shader, shape); }, &won);
+    (won ? counters.staticFills : counters.staticLosses).fetch_add(1, std::memory_order_relaxed);
+    return published;
+}
+
+ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges, bool shapes = true) {
     ResourceCache::Key key;
     key.reserve(256);
     key.push_back(0xffffffffu);
@@ -1244,15 +1302,25 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     };
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    bool shaped = false;
     for (const auto& shader : shaders) {
         const auto sizeAt = key.size();
         key.push_back(0u);
         auto& memo = shader.program->drawKeyMemo.words;
-        auto words = memo.load(std::memory_order_acquire);
-        NoteCommitKeyMemo(words != nullptr);
-        if (words != nullptr) {
+        const auto* shape = shapes ? KeyShapeOf(shader) : nullptr;
+        auto words = shape == nullptr ? memo.load(std::memory_order_acquire) : nullptr;
+        NoteCommitKeyMemo(shape != nullptr || words != nullptr);
+        if (shape != nullptr) {
+            const auto statics = StaticKeys(shader, *shape);
+            key.insert(key.end(), statics->drawWords.begin(), statics->drawWords.end());
+            for (const auto binding : shape->patchedBindings) ShaderResources::AppendBindingContentKey(shader, binding, true, MovableBuffers(), key);
+            stageKeyMemoCounters().patchedSegments.fetch_add(shape->patchedBindings.size(), std::memory_order_relaxed);
+            shaped = true;
+        } else if (words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
+            stageKeyMemoCounters().resultHits.fetch_add(1, std::memory_order_relaxed);
         } else {
+            stageKeyMemoCounters().resultWalks.fetch_add(1, std::memory_order_relaxed);
             ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
             memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
         }
@@ -1264,6 +1332,14 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         append64(target.bytes);
         append64(indexAddress);
         append64(indexBytes);
+    }
+    if (shaped && VerifyKeyMemo()) {
+        static AgcDriver::Mutex mutex;
+        static std::map<ResourceCache::Key, ResourceCache::Key> seen;
+        auto full = DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false);
+        std::lock_guard lock(mutex);
+        Require(seen.emplace(key, std::move(full)).first->second == DrawResourceKey(context, shaders, target, colorAttachments, indexAddress, indexBytes, ranges, false), "APS5_VERIFY_KEY_MEMO: two draws share a split content key but not their full content key");
+        stageKeyMemoCounters().verified.fetch_add(1, std::memory_order_relaxed);
     }
     return key;
 }
@@ -1402,8 +1478,105 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+bool DrawPlanShadow() {
+    static const bool shadow = std::getenv("APS5_DRAW_PLAN_SHADOW") != nullptr;
+    return shadow;
+}
+
+namespace {
+
+std::atomic<int> drawPlansForTest{-1};
+
+}
+
+bool DrawPlans() {
+    static const bool plans = std::getenv("APS5_DRAW_PLANS") != nullptr;
+    const auto forced = drawPlansForTest.load(std::memory_order_relaxed);
+    return forced < 0 ? plans : forced != 0;
+}
+
+bool DrawPlanTemplates() {
+    static const bool enabled = std::getenv("APS5_NO_DRAW_PLAN_TEMPLATES") == nullptr;
+    return enabled;
+}
+
+bool VerifyDrawPlans() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLANS") != nullptr;
+    return verify;
+}
+
+void SetDrawPlansForTest(int enabled) {
+    drawPlansForTest.store(enabled, std::memory_order_relaxed);
+}
+
+namespace {
+
+std::atomic<std::uint32_t> drawPlanSetKeySalt{0};
+
+}
+
+void SetDrawPlanSetKeySaltForTest(std::uint32_t salt) {
+    drawPlanSetKeySalt.store(salt, std::memory_order_relaxed);
+}
+
+StageKeyMemoCounts StageKeyMemoCounters() {
+    const auto& counters = stageKeyMemoCounters();
+    return {counters.staticHits.load(std::memory_order_relaxed), counters.staticFills.load(std::memory_order_relaxed), counters.staticLosses.load(std::memory_order_relaxed), counters.patchedSegments.load(std::memory_order_relaxed), counters.layoutSplitMisses.load(std::memory_order_relaxed), counters.verified.load(std::memory_order_relaxed), counters.resultHits.load(std::memory_order_relaxed), counters.resultWalks.load(std::memory_order_relaxed)};
+}
+
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StageStaticKeys(const CompiledShader& shader) {
+    const auto* shape = KeyShapeOf(shader);
+    return shape != nullptr ? StaticKeys(shader, *shape) : nullptr;
+}
+
+namespace {
+
+std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const CompiledShader& shader);
+
+PlanStageWords PlanStageWordsOf(const CompiledShader& shader) {
+    if (const auto* shape = KeyShapeOf(shader)) {
+        const auto statics = StaticKeys(shader, *shape);
+        PlanStageWords words{std::shared_ptr<const std::vector<std::uint32_t>>(statics, &statics->planWords), {}};
+        for (const auto binding : shape->patchedBindings) ShaderResources::AppendBindingContentKey(shader, binding, true, false, words.patched);
+        return words;
+    }
+    return {PlanBindingWords(shader), {}};
+}
+
+std::shared_ptr<const std::vector<std::uint32_t>> PlanBindingWords(const CompiledShader& shader) {
+    const auto walk = [&] {
+        std::vector<std::uint32_t> words;
+        ShaderResources::AppendContentKey(shader, true, false, words);
+        return words;
+    };
+    auto& memo = shader.program->planKeyMemo.words;
+    auto words = memo.load(std::memory_order_acquire);
+    if (words == nullptr) {
+        words = std::make_shared<const std::vector<std::uint32_t>>(walk());
+        memo.store(words, std::memory_order_release);
+    } else if (VerifyDrawPlans()) {
+        Require(*words == walk(), "APS5_VERIFY_DRAW_PLANS: a program's memoized plan binding words differ from a walk of its bindings");
+    }
+    return words;
+}
+
+}
+
+namespace {
+
+std::shared_ptr<const DrawRecipe>& DrawPlanShadowSlot() {
+    thread_local std::shared_ptr<const DrawRecipe>* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+}
+
+std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision() {
+    return std::exchange(DrawPlanShadowSlot(), nullptr);
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "instance", "moved"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -2223,6 +2396,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
+        } else if (ProfileKeyShapes() && std::ranges::any_of(shaders, [](const CompiledShader& shader) { return KeyShapeOf(shader) != nullptr; })) {
+            if (SharedResourceCache().Find(DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey, false)) != nullptr) stageKeyMemoCounters().layoutSplitMisses.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
         countCache(&DrawProfile::uncacheable);
@@ -3844,8 +4019,13 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        const bool plannable = DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && !multisampled && !pipeline->ReordersSamples();
+        const bool servable = plannable && resolved.moved.empty();
+        if (recipeOut != nullptr && (servable || DrawPlanShadow() || (plannable && DrawPlans()))) {
             auto recipe = std::make_shared<DrawRecipe>();
+            recipe->servable = servable;
+            recipe->plannable = plannable;
+            recipe->movedBases = static_cast<std::uint32_t>(resolved.moved.size());
             recipe->device = context.device;
             recipe->templateRef = resources;
             recipe->key = contentKey;
@@ -3865,7 +4045,20 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
-            *recipeOut = std::move(recipe);
+            recipe->renderExtent = state.renderExtent;
+            const auto layouts = resources->SetLayouts();
+            recipe->mainSetKey.assign(layouts.mainKey.begin(), layouts.mainKey.end());
+            recipe->fragmentSetKey.assign(layouts.fragmentKey.begin(), layouts.fragmentKey.end());
+            recipe->splitSets = layouts.split;
+            if (const auto salt = drawPlanSetKeySalt.load(std::memory_order_relaxed); salt != 0) recipe->mainSetKey.push_back(salt);
+            if (DrawPlans()) {
+                for (const auto& shader : shaders) {
+                    recipe->bindingWords.push_back(PlanStageWordsOf(shader));
+                    if (VerifyDrawPlans()) ShaderResources::AppendContentKey(shader, true, false, recipe->verifyWords.emplace_back());
+                }
+            }
+            if (servable) *recipeOut = std::move(recipe);
+            else DrawPlanShadowSlot() = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
@@ -4272,10 +4465,36 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     keepHeldSpace(prepared);
 }
 
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
+namespace {
+
+void requirePlanDecisionsRepeat(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const ResourceCache::Key& key, bool templateInstance, const ShaderResources& resources, std::span<const ShaderResources::MovedBuffer> moved, const std::shared_ptr<Pipeline>& pipeline, std::span<const std::shared_ptr<StorageTexture>> targets) {
+    DrawOutcome scratch;
+    DrawTimer scratchTimer(false);
+    const auto full = planDraw(context, state, draw, shaders, nullptr, scratch, scratchTimer);
+    const auto sameBinding = [](const VkVertexInputBindingDescription& a, const VkVertexInputBindingDescription& b) { return a.binding == b.binding && a.stride == b.stride && a.inputRate == b.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& a, const VkVertexInputAttributeDescription& b) { return a.location == b.location && a.binding == b.binding && a.format == b.format && a.offset == b.offset; };
+    const auto& layout = full.VertexLayout();
+    Require(!full.nothing && full.fragmentOutputs == plan.fragmentOutputs && full.shaderStages == plan.shaderStages && std::ranges::equal(layout.bindings, plan.vertexInput.bindings, sameBinding) && std::ranges::equal(layout.attributes, plan.vertexInput.attributes, sameAttribute), "APS5_VERIFY_DRAW_PLANS: the plan's fragment outputs, pipeline stages or vertex input differ from the full path's");
+    Require(full.keyed && full.contentKey == key, "APS5_VERIFY_DRAW_PLANS: the resource template key a plan hit used differs from the full path's");
+    Require(!templateInstance || SharedResourceCache().Find(key).get() == &resources, "APS5_VERIFY_DRAW_PLANS: a plan hit with another template bound one the resource cache does not hold for the draw's key");
+    if (!moved.empty()) {
+        const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(full.indexBytes), snapshots);
+        Require(resources.BoundBuffers(moved) == fresh.BoundBuffers(), "APS5_VERIFY_DRAW_PLANS: the buffers a plan hit rebound differ from those a full build of the draw binds");
+    }
+    Require(PushConstantStages(shaders) == plan.pushStages, "APS5_VERIFY_DRAW_PLANS: the plan's push constant stages differ from the full path's");
+    const auto masked = maskedState(state, full.fragmentOutputs);
+    const auto sameMask = [](const VkPipelineColorBlendAttachmentState& a, const VkPipelineColorBlendAttachmentState& b) { return a.colorWriteMask == b.colorWriteMask; };
+    Require(masked.has_value() == plan.masked.has_value() && (!masked.has_value() || std::ranges::equal(masked->blends, plan.masked->blends, sameMask)), "APS5_VERIFY_DRAW_PLANS: the plan's masked outputs differ from the full path's");
+    const State& pipelineState = masked.has_value() ? *masked : state;
+    Require(CachedPipeline(context, pipelineState, layout, resources.SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL) == pipeline, "APS5_VERIFY_DRAW_PLANS: the plan's pipeline differs from the pipeline store's for the draw");
+    for (std::size_t index = 0; index < targets.size(); ++index) Require(CachedStorageSurface(context, SurfaceForTarget(state.colors[index])) == targets[index], "APS5_VERIFY_DRAW_PLANS: the plan's render target differs from the storage cache's for the draw");
+}
+
+}
+
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace, DrawRecipeUse use) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
-    static_cast<void>(snapshots);
     const CommitPhaseDraw commitPhases;
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4300,6 +4519,48 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
+    const bool planned = use == DrawRecipeUse::Plan;
+    bool rebinds = false;
+    const ResourceCache::Key* usedKey = &recipe.key;
+    ResourceCache::Key instanceKey;
+    std::shared_ptr<ShaderResources> instanceTemplate;
+    const auto instanceMiss = [&](DrawPlanInstance reason) {
+        result.instance = reason;
+        return miss(DrawRecipeMiss::Instance);
+    };
+    if (planned) {
+        if (recipe.bindingWords.size() != shaders.size() || std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.arrayLastSlice != 0; })) return instanceMiss(DrawPlanInstance::Shape);
+        rebinds = recipe.movedBases != 0;
+        BeginCommitPhase(CommitPhase::PlanHitWords);
+        for (std::size_t index = 0; index < shaders.size(); ++index) {
+            const auto words = PlanStageWordsOf(shaders[index]);
+            const auto& planned = recipe.bindingWords[index];
+            const bool shared = words.fixed == planned.fixed;
+            ++(shared ? result.sharedBindingStages : result.comparedBindingStages);
+            const bool same = (shared || *words.fixed == *planned.fixed) && words.patched == planned.patched;
+            if (same && VerifyDrawPlans() && index < recipe.verifyWords.size()) {
+                std::vector<std::uint32_t> full;
+                ShaderResources::AppendContentKey(shaders[index], true, false, full);
+                Require(full == recipe.verifyWords[index], "APS5_VERIFY_DRAW_PLANS: the split plan binding words of a stage equal the plan's while its full content key does not");
+            }
+            if (!same) rebinds = true;
+        }
+        static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+        BeginCommitPhase(CommitPhase::PlanHitInstance);
+        if (rebinds) {
+            instanceKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey);
+            if (instanceKey != recipe.key) {
+                if (!DrawPlanTemplates()) return instanceMiss(DrawPlanInstance::Template);
+                instanceTemplate = SharedResourceCache().Find(instanceKey);
+                if (instanceTemplate == nullptr || !instanceTemplate->Reusable() || instanceTemplate->SpaceReuse()) return instanceMiss(DrawPlanInstance::Template);
+                const auto layouts = instanceTemplate->SetLayouts();
+                if (layouts.split != recipe.splitSets || !std::ranges::equal(layouts.mainKey, recipe.mainSetKey) || !std::ranges::equal(layouts.fragmentKey, recipe.fragmentSetKey)) return instanceMiss(DrawPlanInstance::Template);
+                usedKey = &instanceKey;
+                result.templateInstance = true;
+            }
+        }
+        ValidateVertexAddresses(shaders.front().program->vertexAttributes);
+    }
     BeginCommitPhase(CommitPhase::Plan);
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
@@ -4324,7 +4585,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) InCommitPhase(CommitPhase::TargetsClaims, [&] { GuardOneFragmentFmask(context, state.colors[index]); });
         auto stored = recipe.targets[index].lock();
-        if (stored == nullptr || !InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCached(context, stored.get()); }) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        if (stored == nullptr) return miss(DrawRecipeMiss::TargetGone);
+        const auto surface = SurfaceForTarget(state.colors[index]);
+        const auto cached = [&] { return InCommitPhase(CommitPhase::TargetsLru, [&] { return StorageImageCached(context, stored.get()); }); };
+        if (planned && !InCommitPhase(CommitPhase::PlanHitTargets, [&] { return StorageImageCachedFor(context, stored.get(), surface); })) return cached() ? instanceMiss(DrawPlanInstance::Target) : miss(DrawRecipeMiss::TargetGone);
+        if ((!planned && !cached()) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             const CommitPhaseScope refresh(CommitPhase::TargetsRefresh);
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
@@ -4333,19 +4598,21 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         });
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
+        const auto& color = state.colors[index];
+        if (planned && InCommitPhase(CommitPhase::PlanHitTargets, [&] { return resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice); }) != recipe.targetViews[index]) return instanceMiss(DrawPlanInstance::View);
         targets.push_back(std::move(resident));
     }
     if (recipe.hasDepth) {
         timer.phase(PhaseSetup);
         const auto depthView = InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
         timer.phase(PhaseReadTarget);
-        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+        if (recipe.targetViews.back() != depthView) return planned ? instanceMiss(DrawPlanInstance::Depth) : miss(DrawRecipeMiss::TargetGone);
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
-    auto resources = recipe.templateRef.lock();
+    auto resources = instanceTemplate != nullptr ? std::move(instanceTemplate) : recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4355,17 +4622,27 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }();
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
     if (!proved) {
-        SharedResourceCache().Remove(recipe.key, resources.get());
+        SharedResourceCache().Remove(*usedKey, resources.get());
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
         recorder->Keep(std::move(resources));
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
+    std::vector<ShaderResources::MovedBuffer> moved;
+    if (rebinds) {
+        auto rebound = InCommitPhase(CommitPhase::PlanHitRebind, [&] { return resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &result.patchedData); });
+        if (!rebound.has_value()) {
+            timer.phase(PhaseLookup);
+            return miss(DrawRecipeMiss::Moved);
+        }
+        moved = std::move(*rebound);
+        result.movedBuffers = static_cast<std::uint32_t>(moved.size());
+    }
     BeginCommitPhase(CommitPhase::Classify);
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
-    InCommitPhase(CommitPhase::ResolveCache, [&] { SharedResourceCache().Touch(recipe.key); });
+    InCommitPhase(CommitPhase::ResolveCache, [&] { SharedResourceCache().Touch(*usedKey); });
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();
@@ -4377,7 +4654,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     BeginCommitPhase(CommitPhase::Plan);
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
-    auto framebuffer = recipe.framebuffer.lock();
+    if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *usedKey, result.templateInstance, *resources, moved, pipeline, targets);
+    const bool sameExtent = recipe.renderExtent.width == state.renderExtent.width && recipe.renderExtent.height == state.renderExtent.height;
+    auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers); });
@@ -4390,6 +4669,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.masked = recipe.masked.has_value() ? &*recipe.masked : nullptr;
     record.completion = outcome.completion;
     record.resources = std::move(resources);
+    record.moved = std::move(moved);
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
@@ -4412,7 +4692,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         ++stats.recipeHits;
     }
     timing.Mark("draw_and_resource_release");
-    reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
+    reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, planned ? " recorded from plan" : " recorded from recipe");
+    NoteCommitDrawKind(planned ? CommitDrawKind::PlanHit : CommitDrawKind::RecipeHit);
     result.recorded = true;
     return result;
 }

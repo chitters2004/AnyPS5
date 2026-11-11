@@ -13,20 +13,26 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale", "plan.hit.find", "plan.hit.words", "plan.hit.instance", "plan.hit.targets", "plan.hit.rebind"};
 static_assert(PhaseNames.back() != nullptr);
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "plan.hit", "plan.hit", "plan.hit", "plan.hit", "plan.hit"};
 static_assert(PhaseGroups.back() != nullptr);
 
-constexpr std::array<const char*, 12> GroupOrder{"other", "plan", "inputs", "targets", "resolve", "revalidate", "classify", "record", "bindings", "pass access", "effects", "epilogue"};
+constexpr std::array<const char*, 13> GroupOrder{"other", "plan", "plan.hit", "inputs", "targets", "resolve", "revalidate", "classify", "record", "bindings", "pass access", "effects", "epilogue"};
 
 using Clock = std::chrono::steady_clock;
+
+constexpr std::size_t PhaseCount = static_cast<std::size_t>(CommitPhase::Count);
+constexpr std::size_t KindCount = static_cast<std::size_t>(CommitDrawKind::Count);
+constexpr std::array<const char*, KindCount> KindNames{"full", "recipe hit", "plan hit"};
 
 struct ThreadPhases {
     bool active = false;
     CommitPhase current = CommitPhase::Other;
     Clock::time_point mark{};
+    CommitDrawKind kind = CommitDrawKind::Full;
+    std::array<std::uint64_t, PhaseCount> drawNs{};
 };
 
 thread_local ThreadPhases threadPhases;
@@ -38,13 +44,18 @@ std::atomic<std::uint64_t> keyMemoHitCount{0};
 std::atomic<std::uint64_t> keyMemoMissCount{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitCounter::Count)> counterValues{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
+std::array<std::atomic<std::uint64_t>, KindCount> kindDrawCount{};
+std::array<std::array<std::atomic<std::uint64_t>, PhaseCount>, KindCount> kindPhaseNs{};
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
 CommitPhaseTotals reported;
 
 void charge(ThreadPhases& phases, Clock::time_point now) {
     const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(now - phases.mark).count();
-    if (spent > 0) phaseNs[static_cast<std::size_t>(phases.current)].fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
+    if (spent > 0) {
+        phaseNs[static_cast<std::size_t>(phases.current)].fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
+        phases.drawNs[static_cast<std::size_t>(phases.current)] += static_cast<std::uint64_t>(spent);
+    }
     phases.mark = now;
 }
 
@@ -84,6 +95,26 @@ void reportDue(Clock::time_point now) {
         std::snprintf(item, sizeof(item), " %s %.2f", group, static_cast<double>(ns) / 1e3 / static_cast<double>(totals.draws));
         groups += item;
     }
+    std::string kinds;
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        const auto draws = totals.kindDraws[kind];
+        if (draws == 0) continue;
+        std::uint64_t kindAll = 0;
+        for (const auto ns : totals.kindNs[kind]) kindAll += ns;
+        char item[96];
+        std::snprintf(item, sizeof(item), "%s%s: %llu draws, %.2f us each, by group:", kinds.empty() ? " " : "; ", KindNames[kind], static_cast<unsigned long long>(draws), static_cast<double>(kindAll) / 1e3 / static_cast<double>(draws));
+        kinds += item;
+        for (const auto* group : GroupOrder) {
+            std::uint64_t ns = 0;
+            for (std::size_t phase = 0; phase < PhaseCount; ++phase) {
+                if (std::string_view(PhaseGroups[phase]) == group) ns += totals.kindNs[kind][phase];
+            }
+            if (ns == 0) continue;
+            std::snprintf(item, sizeof(item), " %s %.2f", group, static_cast<double>(ns) / 1e3 / static_cast<double>(draws));
+            kinds += item;
+        }
+    }
+    std::fprintf(stderr, "[commit-phases-by-kind] (10 s) us per draw of each kind, by group (phases and their sub-phases, summing to that kind's total):%s\n", kinds.c_str());
     const auto count = [&](CommitCounter counter) { return static_cast<double>(totals.counters[static_cast<std::size_t>(counter)]); };
     const auto perDraw = [&](CommitCounter counter) { return count(counter) / static_cast<double>(totals.draws); };
     const auto targetDraws = std::max(1.0, count(CommitCounter::TargetDraws));
@@ -120,6 +151,11 @@ void NoteCommitKey(std::size_t words) {
 void NoteCommitKeyMemo(bool hit) {
     if (!threadPhases.active) return;
     (hit ? keyMemoHitCount : keyMemoMissCount).fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteCommitDrawKind(CommitDrawKind kind) {
+    auto& phases = threadPhases;
+    if (phases.active) phases.kind = kind;
 }
 
 void NoteEpochCauses(unsigned causes) {
@@ -174,6 +210,10 @@ CommitPhaseTotals ReadCommitPhases() {
     totals.keyMemoMisses = keyMemoMissCount.load(std::memory_order_relaxed);
     for (std::size_t counter = 0; counter < totals.counters.size(); ++counter) totals.counters[counter] = counterValues[counter].load(std::memory_order_relaxed);
     for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].load(std::memory_order_relaxed);
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        totals.kindDraws[kind] = kindDrawCount[kind].load(std::memory_order_relaxed);
+        for (std::size_t phase = 0; phase < PhaseCount; ++phase) totals.kindNs[kind][phase] = kindPhaseNs[kind][phase].load(std::memory_order_relaxed);
+    }
     return totals;
 }
 
@@ -186,6 +226,10 @@ CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTot
     difference.keyMemoMisses = later.keyMemoMisses - earlier.keyMemoMisses;
     for (std::size_t counter = 0; counter < difference.counters.size(); ++counter) difference.counters[counter] = later.counters[counter] - earlier.counters[counter];
     for (std::size_t phase = 0; phase < difference.ns.size(); ++phase) difference.ns[phase] = later.ns[phase] - earlier.ns[phase];
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        difference.kindDraws[kind] = later.kindDraws[kind] - earlier.kindDraws[kind];
+        for (std::size_t phase = 0; phase < PhaseCount; ++phase) difference.kindNs[kind][phase] = later.kindNs[kind][phase] - earlier.kindNs[kind][phase];
+    }
     return difference;
 }
 
@@ -201,6 +245,8 @@ CommitPhaseDraw::CommitPhaseDraw() {
     owner = true;
     phases.active = true;
     phases.current = CommitPhase::Other;
+    phases.kind = CommitDrawKind::Full;
+    phases.drawNs.fill(0);
     phases.mark = Clock::now();
 }
 
@@ -212,6 +258,11 @@ CommitPhaseDraw::~CommitPhaseDraw() {
     charge(phases, now);
     phases.active = false;
     drawCount.fetch_add(1, std::memory_order_relaxed);
+    const auto kind = static_cast<std::size_t>(phases.kind);
+    kindDrawCount[kind].fetch_add(1, std::memory_order_relaxed);
+    for (std::size_t phase = 0; phase < PhaseCount; ++phase) {
+        if (phases.drawNs[phase] != 0) kindPhaseNs[kind][phase].fetch_add(phases.drawNs[phase], std::memory_order_relaxed);
+    }
     reportDue(now);
 }
 
