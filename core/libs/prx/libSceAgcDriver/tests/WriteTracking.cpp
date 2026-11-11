@@ -3197,6 +3197,14 @@ void CheckProofBreakSources() {
     const auto moved = [&](ProofBreak source) { return after[static_cast<std::size_t>(source)] - before[static_cast<std::size_t>(source)]; };
     Require(moved(ProofBreak::OwnStore) == 2, "an own store did not break proofs as an own store when it began and when it was stored");
     Require(moved(ProofBreak::Unlabelled) == 0, "an own store broke proofs without a source");
+    const auto marked = ProofBreakCounts();
+    static_cast<void>(MarkWritten(base + 128, 4));
+    const auto done = ProofBreakCounts();
+    for (std::size_t i = 0; i < done.size(); ++i) {
+        const auto source = static_cast<ProofBreak>(i);
+        const auto expected = source == ProofBreak::MarkWritten ? 2u : 0u;
+        Require(done[i] - marked[i] == expected, std::string("a driver store moved the ") + ProofBreakName(source) + " break count by " + std::to_string(done[i] - marked[i]) + " instead of " + std::to_string(expected) + "; both its breaks must be mark-written, which certificates treat as covered");
+    }
 }
 
 void RunMemoHitBench(int threads) {
