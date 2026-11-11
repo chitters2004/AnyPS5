@@ -365,9 +365,28 @@ Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource sourc
     return result;
 }
 
+std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
+thread_local bool markWrittenBumpsMuted = false;
+
+class MarkWrittenBumpsMute {
+public:
+    MarkWrittenBumpsMute() : muted(certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HideMarkWrittenBumps) {
+        if (muted) markWrittenBumpsMuted = true;
+    }
+    ~MarkWrittenBumpsMute() {
+        if (muted) markWrittenBumpsMuted = false;
+    }
+    MarkWrittenBumpsMute(const MarkWrittenBumpsMute&) = delete;
+    MarkWrittenBumpsMute& operator=(const MarkWrittenBumpsMute&) = delete;
+
+private:
+    bool muted;
+};
+
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
     auto& index = Index();
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
+    if (certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HideMarkWrittenBumps && markWrittenBumpsMuted) return;
     index.calls.fetch_add(1, std::memory_order_relaxed);
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -526,6 +545,7 @@ std::uint64_t DomainVersion(WriteDomain domain) {
     case WriteDomain::Proof: return ProofSerial();
     case WriteDomain::Unwatch: return UnwatchSerial();
     case WriteDomain::Mapping: return GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    case WriteDomain::CertifiedProof: return CertificateBreakSerial();
     default: return 0;
     }
 }
@@ -547,9 +567,6 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
     return certificate;
 }
 
-namespace {
-std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
-}
 
 void SetCertificateMutantForTest(CertificateMutant mutant) {
     certificateMutant.store(mutant, std::memory_order_release);
@@ -559,6 +576,7 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
     const auto mutant = certificateMutant.load(std::memory_order_relaxed);
     if (mutant == CertificateMutant::HideUnwatch) domainMask &= ~WriteDomainBit(WriteDomain::Unwatch);
     if (mutant == CertificateMutant::HideMapping) domainMask &= ~WriteDomainBit(WriteDomain::Mapping);
+    if (mutant == CertificateMutant::HideCertifiedProof) domainMask &= ~WriteDomainBit(WriteDomain::CertifiedProof);
     const auto domains = readDomains(domainMask);
     for (std::size_t i = 0; i < domains.size(); ++i) {
         if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) return false;
@@ -2834,6 +2852,8 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
+std::atomic<std::uint64_t> certificateBreakSerial{1};
+constexpr std::uint32_t CertificateCoveredBreaks = std::uint32_t{1} << static_cast<unsigned>(ProofBreak::MarkWritten);
 thread_local bool proofThread = false;
 const bool proofBreaksCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
@@ -2859,8 +2879,17 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
+bool ProofBreakVoidsCertificates(ProofBreak source) {
+    return (CertificateCoveredBreaks & (std::uint32_t{1} << static_cast<unsigned>(source))) == 0;
+}
+
+std::uint64_t CertificateBreakSerial() {
+    return certificateBreakSerial.load(std::memory_order_acquire);
+}
+
 void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (ProofBreakVoidsCertificates(source)) certificateBreakSerial.fetch_add(1, std::memory_order_acq_rel);
     if (proofBreaksCounted) proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -3322,6 +3351,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
     BreakProofs(GuestMemory::ProofBreak::MarkWritten);
+    const MarkWrittenBumpsMute mute;
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;
@@ -3331,6 +3361,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
         if (tracker.watched) tracker.stampWatchedPart(address, address + bytes, tracker.generation, complete);
+        bumpSubscriptions(address, bytes, WriteBumpSource::Driver);
         if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
         return 0;
     }
@@ -3351,6 +3382,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             ++tracker.generation;
             unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             tracker.noteUnstampedStore(address, address + bytes);
+            bumpSubscriptions(address, bytes, WriteBumpSource::Driver);
             if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
             return 0;
         }

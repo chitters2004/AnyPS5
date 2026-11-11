@@ -433,11 +433,11 @@ void Causes(AgcDriver::VulkanDevice& device) {
         if (outcome.counts.proved == 1) break;
     }
     Require(outcome.counts.proved == 1 && neverProved == 1, "causes: a new template's first proof was not counted once as never proved (" + std::to_string(neverProved) + "; " + outcome.Describe() + ")");
-    GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.Texels(Other)), TexelWidth * TexelHeight * 4u);
-    outcome = Draw(device, scene);
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    outcome = Draw(device, scene, false);
     RequireMissed(outcome, "causes", 255u);
-    if (GuestMemory::ProofBreaksCounted() && outcome.Missed(CertifiedMiss::Proof) == 1) Require(outcome.ProofSource(GuestMemory::ProofBreak::MarkWritten) == 1 && outcome.counts.proofMissUnattributed == 0, "causes: a proof miss after a driver store was not attributed to mark-written (" + outcome.Describe() + ")");
-    if (GuestMemory::ProofBreaksCounted()) Require(outcome.Missed(CertifiedMiss::Proof) == 1, "causes: a driver store did not void the certificate through the proof domain (" + outcome.Describe() + ")");
+    Require(outcome.Missed(CertifiedMiss::Proof) == 1, "causes: an uncovered proof break did not void the certificate through the proof domain (" + outcome.Describe() + ")");
+    if (GuestMemory::ProofBreaksCounted()) Require(outcome.ProofSource(GuestMemory::ProofBreak::GpuLock) == 1 && outcome.counts.proofMissUnattributed == 0, "causes: a proof miss after a gpu-lock break was not attributed to it (" + outcome.Describe() + ")");
     Require(outcome.Uncertified(UncertifiedCause::Voided) == 0 && outcome.Uncertified(UncertifiedCause::NeverProved) == 0, "causes: a certified template was counted as uncertified (" + outcome.Describe() + ")");
     Settle(device, scene, "causes (after)");
 }
@@ -514,6 +514,52 @@ void Verified(AgcDriver::VulkanDevice& device) {
     Require(total.verified >= 2 && total.disagreed == 0, "verify: expected the full proof beside every 64th certified draw to agree (" + std::to_string(total.verified) + " checked, " + std::to_string(total.disagreed) + " disagreed)");
 }
 
+
+constexpr std::array<GuestMemory::ProofBreak, 1> CoveredBreaks{GuestMemory::ProofBreak::MarkWritten};
+
+bool UncoveredBreakVoids(AgcDriver::VulkanDevice& device, const std::string& what) {
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, what);
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::Unlabelled);
+    const auto outcome = Draw(device, scene, false);
+    Require(outcome.brightest == 255u && outcome.counts.disagreed == 0, what + ": the draw after an uncovered proof break sampled the wrong texels (" + outcome.Describe() + ")");
+    return outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1;
+}
+
+void Scope(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(GuestMemory::ProofBreak::Count); ++i) {
+        const auto source = static_cast<GuestMemory::ProofBreak>(i);
+        const bool covered = std::find(CoveredBreaks.begin(), CoveredBreaks.end(), source) != CoveredBreaks.end();
+        Require(GuestMemory::ProofBreakVoidsCertificates(source) != covered, std::string("scope: ") + GuestMemory::ProofBreakName(source) + " is not in the expected covered set");
+        const auto proof = GuestMemory::ProofSerial();
+        const auto certificates = GuestMemory::CertificateBreakSerial();
+        GuestMemory::BreakProofs(source);
+        Require(GuestMemory::ProofSerial() != proof, std::string("scope: a ") + GuestMemory::ProofBreakName(source) + " break did not move the proof serial");
+        Require((GuestMemory::CertificateBreakSerial() != certificates) != covered, std::string("scope: a ") + GuestMemory::ProofBreakName(source) + (covered ? " break voided certificates though its writes bump their ranges" : " break left certificates standing"));
+    }
+    Require(UncoveredBreakVoids(device, "scope"), "scope: an uncovered proof break kept the certificate");
+    const auto unrelatedStore = [&](const std::string& what) {
+        auto& scene = NewScene();
+        Build(device, scene);
+        Settle(device, scene, what);
+        GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.blocks.base), 256);
+        const auto outcome = Draw(device, scene, false);
+        Require(outcome.brightest == 255u, what + ": the draw after a driver store elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
+        return outcome;
+    };
+    auto outcome = unrelatedStore("scope (driver store elsewhere)");
+    Require(outcome.counts.proved == 1, "scope: a driver store to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
+    outcome = unrelatedStore("scope (driver store elsewhere, unscoped)");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
+    Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE a driver store elsewhere kept the certificate (" + outcome.Describe() + ")");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
+    const bool unscoped = UncoveredBreakVoids(device, "scope (unscoped)");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
+    Require(unscoped, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE an uncovered proof break kept the certificate");
+}
 
 struct OracleScene {
     Scene* scene = nullptr;
@@ -612,7 +658,6 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
             oracle.values[image] = oracle.values[image] != 0.0f ? 0.0f : 1.0f;
             Fill(scene.Texels(image), oracle.values[image]);
             GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.Texels(image)), TexelWidth * TexelHeight * 4u);
-            cpuWrite = true;
             break;
         }
         case 6: {
@@ -663,7 +708,7 @@ void Oracle(AgcDriver::VulkanDevice& device) {
 
 void Mutants(AgcDriver::VulkanDevice& device) {
     using GuestMemory::CertificateMutant;
-    constexpr std::array<std::pair<CertificateMutant, const char*>, 3> mutants{{{CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}}};
+    constexpr std::array<std::pair<CertificateMutant, const char*>, 4> mutants{{{CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing"}}};
     for (const auto& [mutant, name] : mutants) {
         GuestMemory::SetCertificateMutantForTest(mutant);
         std::string caught;
@@ -680,6 +725,11 @@ void Mutants(AgcDriver::VulkanDevice& device) {
         Require(!caught.empty(), std::string("mutants: the oracle did not catch ") + name);
         std::printf("certified proofs: mutant caught, %s: %s\n", name, caught.c_str());
     }
+    GuestMemory::SetCertificateMutantForTest(CertificateMutant::HideCertifiedProof);
+    const bool voided = UncoveredBreakVoids(device, "mutants (hidden certificate breaks)");
+    GuestMemory::SetCertificateMutantForTest(CertificateMutant::None);
+    Require(!voided, "mutants: hiding the certificate break serial did not keep a certificate across an uncovered proof break, so the scope check tests nothing");
+    std::printf("certified proofs: mutant caught, hidden certificate breaks\n");
 }
 }
 
@@ -702,7 +752,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 15> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 16> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
