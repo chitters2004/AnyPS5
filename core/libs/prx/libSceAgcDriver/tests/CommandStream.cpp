@@ -710,7 +710,7 @@ void EveryOpReplaysItsDeepCopies() {
     const auto direct = calls;
     std::set<std::string> names;
     for (const auto& call : direct) names.insert(call.substr(0, call.find('@')));
-    Expect(names.size() == 53, "the direct calls reached " + std::to_string(names.size()) + " of the 53 functions");
+    Expect(names.size() == 54, "the direct calls reached " + std::to_string(names.size()) + " of the 54 functions");
     CommandStream stream;
     calls.clear();
     recordAll(stream.Handle(), functions, data, large);

@@ -1017,7 +1017,7 @@ void KeptOwnersOutliveTheirEncode() {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             Recorder recorder(fixture.context);
             std::atomic<bool> destroyed{false};
-            std::size_t submissionsAtDestruction = 99;
+            std::atomic<std::size_t> submissionsAtDestruction{99};
             std::shared_ptr<void> owner(new int(0), [&](int* value) {
                 submissionsAtDestruction = fixture.Submissions().size();
                 destroyed.store(true);
@@ -1041,6 +1041,7 @@ void KeptOwnersOutliveTheirEncode() {
             fixture.device.changed.notify_all();
             Reported([&] { recorder.Sync(); });
             recorder.FlushDeferredReleases();
+            for (int wait = 0; wait < 5000 && !destroyed.load(); ++wait) std::this_thread::sleep_for(std::chrono::milliseconds(1));
             Expect(destroyed.load() && watched.expired(), "a kept object outlived its retired batch");
             Expect(failing || submissionsAtDestruction == 1, "a kept object was released before its batch was submitted");
         }
