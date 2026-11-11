@@ -3149,6 +3149,7 @@ bool ShaderResources::CompareBindingDecisionsForTest(std::span<const MovedBuffer
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::reuseDrawBindings(const Recorder& recorder, const DrawBindings& candidate, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool words) const {
+    GuestMemory::AssertGpuLockHeld("ShaderResources::PrepareDrawBindings");
     if (bindingReuse == nullptr) {
         countReuse(ReuseFirst);
         return {};
