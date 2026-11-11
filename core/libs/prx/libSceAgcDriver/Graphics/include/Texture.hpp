@@ -526,6 +526,7 @@ public:
     static std::uint64_t OccasionalLabelStores();
     static std::uint64_t LayoutStoreSkips();
     static std::uint64_t PendingSinceSkips();
+    static void ClearLayoutWritesForTest();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
@@ -811,7 +812,8 @@ private:
     std::uint64_t pendingSinceHeld = 0;
     std::uint32_t pendingSinceFirst = 0;
     std::uint32_t pendingSinceEnd = 0;
-    std::uint64_t layoutSerial = 0;
+    std::uint64_t layoutStripeSerial = 0;
+    std::uint64_t layoutClears = 0;
     std::vector<std::uint64_t> completionKept;
     UnitFlags layerPending;
     std::vector<bool> layerBehind;

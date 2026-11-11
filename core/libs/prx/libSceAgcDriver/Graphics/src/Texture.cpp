@@ -4444,12 +4444,18 @@ namespace {
 struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
-    std::atomic<std::uint64_t> serial{0};
+    std::uint64_t serial = 0;
+    std::array<std::atomic<std::uint64_t>, 256> stripes{};
+    std::atomic<std::uint64_t> clears{0};
 };
 
 WriteRecords& LayoutWrites() {
     static WriteRecords records;
     return records;
+}
+
+std::atomic<std::uint64_t>& LayoutStripe(WriteRecords& records, std::uint64_t address) {
+    return records.stripes[static_cast<std::size_t>(address >> 16u) % records.stripes.size()];
 }
 
 }
@@ -4485,15 +4491,26 @@ std::uint64_t StorageTexture::PendingSinceSkips() {
     return pendingSinceLoopsSkipped.load(std::memory_order_relaxed);
 }
 
+void StorageTexture::ClearLayoutWritesForTest() {
+    auto& records = LayoutWrites();
+    std::lock_guard lock(records.mutex);
+    records.byAddress.clear();
+    records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+}
+
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    if (auto& records = LayoutWrites(); layoutSerial == 0 || records.serial.load(std::memory_order_acquire) != layoutSerial) {
+    if (auto& records = LayoutWrites(); layoutStripeSerial == 0 || LayoutStripe(records, descriptor.baseAddress).load(std::memory_order_acquire) != layoutStripeSerial || records.clears.load(std::memory_order_acquire) != layoutClears) {
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        const auto serial = records.serial.load(std::memory_order_relaxed) + 1;
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, serial};
-        records.serial.store(serial, std::memory_order_release);
-        layoutSerial = serial;
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        }
+        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        auto& stripe = LayoutStripe(records, descriptor.baseAddress);
+        layoutStripeSerial = stripe.load(std::memory_order_relaxed) + 1;
+        stripe.store(layoutStripeSerial, std::memory_order_release);
+        layoutClears = records.clears.load(std::memory_order_relaxed);
     } else {
         layoutStoresSkipped.store(layoutStoresSkipped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
