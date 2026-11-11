@@ -650,6 +650,41 @@ void FailedSubmitReachesFinish() {
     }
 }
 
+void BatchesBehindAFailureAreNotSubmitted() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    for (const bool deferred : {true, false}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, deferred);
+        const std::string kind = deferred ? "deferred" : "direct";
+        Fixture fixture;
+        {
+            const Watchdog watchdog("batches queued behind a failed " + kind + " submit");
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(fixture.context);
+            std::size_t completed = 0;
+            {
+                std::lock_guard lock(fixture.device.mutex);
+                fixture.device.failSubmits = 1;
+            }
+            for (std::uint32_t batch = 0; batch < 3; ++batch) {
+                recorder.OnComplete([&] { ++completed; });
+                fixture.Fill(recorder, batch);
+                recorder.Submit();
+                fixture.Drain();
+            }
+            std::size_t reported = 0;
+            while (!recorder.Idle()) {
+                if (!Reported([&] { recorder.Sync(); }).empty()) ++reported;
+            }
+            Expect(reported == 3, "the three batches queued behind a failed " + kind + " submit reported " + std::to_string(reported) + " failures");
+            Expect(completed == 0 && fixture.Submissions().empty(), "a batch queued behind a failed " + kind + " submit ran");
+            fixture.Fill(recorder, 9);
+            recorder.Sync();
+            const auto submissions = fixture.Submissions();
+            Expect(submissions.size() == 1 && joined(submissions[0].recorded) == "[fill 9]", "the " + kind + " batch after the reported failures was not submitted");
+        }
+    }
+}
+
 void SparseBindsShareTheQueueWithTheSubmitter() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
@@ -1090,6 +1125,7 @@ int main(int argc, char** argv) {
             SubmitWaitsForTheEncodeAndDrainWaitsForBoth();
             FailedEncodeNeverCompletes();
             FailedSubmitReachesFinish();
+            BatchesBehindAFailureAreNotSubmitted();
             SparseBindsShareTheQueueWithTheSubmitter();
             SubmittersAreScopedToTheirDevice();
             RandomProgramsKeepProgramOrder();

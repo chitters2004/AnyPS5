@@ -128,6 +128,7 @@ void QueueSubmitter::run() {
             if (job.encode->Failed()) failure = job.encode->Error();
             else commands = job.encode->Commands();
         }
+        if (failure == nullptr && job.failures->Unreported()) failure = std::make_exception_ptr(std::runtime_error("AGC graphics: vkQueueSubmit recorder (queue submitter): an earlier batch failed"));
         if (failure == nullptr) {
             VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
             submission.commandBufferCount = 1;
