@@ -7503,12 +7503,19 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
 }
 
 std::optional<GuestBufferMemory::SplitReads> GuestBufferMemory::SplitInPlaceReads() const {
-    if (!uploaded || committed || space == nullptr || space->directReads == nullptr) return std::nullopt;
-    SplitReads split{space->directReads, {}};
-    for (const auto& region : regions) {
-        if (region.direct != nullptr) split.own.emplace_back(region.begin, region.end);
-    }
+    SplitReads split;
+    split.space = SplitInPlaceReads(split.own);
+    if (split.space == nullptr) return std::nullopt;
     return split;
+}
+
+std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::SplitInPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& own) const {
+    if (!uploaded || committed || space == nullptr || space->directReads == nullptr) return nullptr;
+    own.clear();
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) own.emplace_back(region.begin, region.end);
+    }
+    return space->directReads;
 }
 
 bool GuestBufferMemory::InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const {

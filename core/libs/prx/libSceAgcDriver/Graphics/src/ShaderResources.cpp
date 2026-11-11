@@ -2951,6 +2951,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
+std::atomic<std::uint64_t> inPlaceReadReuses{0};
 thread_local bool indexProof = false;
 
 }
@@ -3010,6 +3011,10 @@ void ShaderResources::noteReusable() {
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::InPlaceReadReuses() {
+    return inPlaceReadReuses.load(std::memory_order_relaxed);
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -7088,12 +7093,18 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
-    if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
+    auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
+    auto reads = std::move(ownedReads);
+    const auto capacity = reads.capacity();
+    if (auto space = guestMemory.SplitInPlaceReads(reads)) {
+        recorder.NotePendingReadList(std::move(space), kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        guestMemory.InPlaceReads(reads);
     }
+    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.fetch_add(1, std::memory_order_relaxed);
+    recorder.NotePendingReads(reads, kind);
+    ownedReads = std::move(reads);
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

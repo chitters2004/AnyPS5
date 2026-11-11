@@ -581,6 +581,12 @@ void spaceReadListTests(const Context& context) {
         joined.insert(joined.end(), split->own.begin(), split->own.end());
         Require(joined == leased.InPlaceReads(), std::string("the split reads differ from InPlaceReads: ") + step);
         Require(Recorder::ValidReadList(*split->space), std::string("the space's read list is not sorted and disjoint: ") + step);
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reused{{1, 2}, {3, 4}, {5, 6}, {7, 8}};
+        const auto space = leased.SplitInPlaceReads(reused);
+        Require(space == split->space && reused == split->own, std::string("split reads filled into a reused buffer differ from a fresh split: ") + step);
+        reused.assign({{9, 10}});
+        leased.InPlaceReads(reused);
+        Require(reused == leased.InPlaceReads(), std::string("in-place reads filled into a reused buffer differ from a fresh list: ") + step);
         leased.WriteBack();
         Require(!leased.SplitInPlaceReads().has_value(), "a committed build still offers split reads");
         return split->space;
@@ -606,6 +612,10 @@ void spaceReadListTests(const Context& context) {
         plain.AddReadable(reinterpret_cast<std::uintptr_t>(guest), 256);
         plain.Upload(false);
         Require(!plain.SplitInPlaceReads().has_value(), "a build without the address space offers split reads");
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reused{{1, 2}};
+        Require(plain.SplitInPlaceReads(reused) == nullptr, "a build without the address space splits its reads into a reused buffer");
+        plain.InPlaceReads(reused);
+        Require(reused == plain.InPlaceReads(), "a build's in-place reads filled into a reused buffer kept stale ranges");
         plain.WriteBack();
     }
     change(guest, false);
