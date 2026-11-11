@@ -7502,6 +7502,45 @@ void unsetFormatStorageImageTests() {
     }
 }
 
+void contentKeyHashTests() {
+    using Cache = AgcDriver::Graphics::ResourceCache;
+    std::uint64_t seed = 0x2545f4914f6cdd1dull;
+    const auto next = [&] {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return static_cast<std::uint32_t>(seed);
+    };
+    std::set<std::size_t> hashes;
+    std::set<std::vector<std::uint32_t>> keys;
+    for (std::uint32_t round = 0; round < 2000; ++round) {
+        const auto stages = 1u + round % 4u;
+        std::vector<std::uint32_t> key{0xffffffffu, next(), next() & 0xffffu, stages};
+        Cache::DrawKeyHash composed{std::span<const std::uint32_t>(key)};
+        for (std::uint32_t stage = 0; stage < stages; ++stage) {
+            const auto words = (next() % 97u) + (round % 3u == 0 ? 0u : 1u);
+            key.push_back(words);
+            const auto at = key.size();
+            for (std::uint32_t word = 0; word < words; ++word) key.push_back(next() % 5u);
+            composed.Stage(words, Cache::SegmentHash(std::span<const std::uint32_t>(key).subspan(at, words)));
+        }
+        const auto tailAt = key.size();
+        key.push_back(1u + round % 8u);
+        if (round % 2u == 0) for (std::uint32_t word = 0; word < 8u; ++word) key.push_back(next() % 3u);
+        const auto hash = composed.Finish(std::span<const std::uint32_t>(key).subspan(tailAt));
+        Require(hash == Cache::Hash(key), "a draw content key's hash composed from its stages differs from the hash of its words");
+        if (keys.insert(key).second) hashes.insert(hash);
+        auto moved = key;
+        moved.back() ^= 1u;
+        Require(Cache::Hash(moved) != hash, "two draw content keys differing in their last word hash alike");
+    }
+    Require(hashes.size() == keys.size(), "distinct draw content keys collided");
+    const std::vector<std::uint32_t> dispatch{1u, 2u, 3u, 4u, 5u};
+    Require(Cache::Hash(dispatch) == Cache::SegmentHash(dispatch), "a dispatch key does not hash its words");
+    const std::vector<std::uint32_t> truncated{0xffffffffu, 1u, 2u, 3u, 9u, 1u};
+    Require(Cache::Hash(truncated) == Cache::SegmentHash(truncated), "a draw-marked key whose stages run past its end does not hash its words");
+}
+
 void descriptorCacheTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -13806,6 +13845,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--fault-only-template-records") {
             faultOnlyTemplateRecordTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--content-key-hash") {
+            contentKeyHashTests();
+            std::cout << "content key hash tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {
