@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -5485,6 +5486,26 @@ bool VulkanDevice::TemplateDataRefresh() {
     return AgcDriver::TemplateDataRefresh();
 }
 
+namespace {
+
+std::array<ProfileCounter, static_cast<std::size_t>(VulkanDevice::DispatchRecipeRefusal::Count)>& dispatchRecipeRefusals() {
+    static std::array<ProfileCounter, static_cast<std::size_t>(VulkanDevice::DispatchRecipeRefusal::Count)> refusals{};
+    return refusals;
+}
+
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(VulkanDevice::DispatchRecipeRefusal::Count)> VulkanDevice::DispatchRecipeRefusals() {
+    std::array<std::uint64_t, static_cast<std::size_t>(DispatchRecipeRefusal::Count)> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = dispatchRecipeRefusals()[i].Sum();
+    return counts;
+}
+
+const char* VulkanDevice::DispatchRecipeRefusalName(DispatchRecipeRefusal refusal) {
+    constexpr std::array<const char*, static_cast<std::size_t>(DispatchRecipeRefusal::Count)> names{"not cacheable", "overlay", "not reusable", "needs completion", "no objects", "no key"};
+    return names[static_cast<std::size_t>(refusal)];
+}
+
 void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
     NoteRecipe(event, indirect ? RecipeKind::Indirect : RecipeKind::Dispatch);
 }
@@ -6543,6 +6564,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     // object the resource cache serves under this content key (reusable: no lease, no copied
     // writes, every direct region import- or mirror-served), so a hit's proof is the template's
     // Revalidate and nothing needs completion work.
+    if (recipeOut != nullptr && DispatchRecipes()) {
+        const auto refusal = !cacheable ? DispatchRecipeRefusal::NotCacheable : overlay != nullptr ? DispatchRecipeRefusal::Overlay : !resources->Reusable() ? DispatchRecipeRefusal::NotReusable : resources->NeedsCompletion() ? DispatchRecipeRefusal::NeedsCompletion : objects == nullptr ? DispatchRecipeRefusal::NoObjects : contentKey.empty() ? DispatchRecipeRefusal::NoKey : DispatchRecipeRefusal::Count;
+        if (refusal != DispatchRecipeRefusal::Count) dispatchRecipeRefusals()[static_cast<std::size_t>(refusal)].Add();
+    }
     if (recipeOut != nullptr && DispatchRecipes() && cacheable && overlay == nullptr && resources->Reusable() && !resources->NeedsCompletion() && objects != nullptr && !contentKey.empty()) {
         auto recipe = std::make_shared<Recipe>();
         recipe->device = state->device;
