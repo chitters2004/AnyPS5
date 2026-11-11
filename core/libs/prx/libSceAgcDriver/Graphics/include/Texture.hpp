@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -516,6 +517,7 @@ public:
     static std::uint64_t PaddingSeedCopies();
     static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
+    static bool UploadRefreshProofs();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();
@@ -530,6 +532,8 @@ public:
 
 private:
     std::atomic<std::uint64_t> provedEpoch{0};
+    std::atomic<std::uint64_t> missedEpoch{0};
+    std::atomic<std::uint64_t> slowEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};
     StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
@@ -682,7 +686,7 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
-    bool refreshProved();
+    bool refreshProved(CommitCounter& refused);
     bool keysReplacedByClear() const;
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;

@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -32,13 +34,28 @@ std::atomic<std::uint64_t> drawKeysSeenRecently{0};
 std::atomic<std::uint64_t> drawShapesSameAsPrevious{0};
 std::atomic<std::uint64_t> drawShapesSeenRecently{0};
 
+bool pipelineStats() {
+    static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::atomic<std::uint64_t> finisherJobs{0};
+std::atomic<std::uint64_t> finisherBusyCpuNs{0};
+std::atomic<std::uint64_t> finisherBusyWallNs{0};
+std::atomic<std::uint64_t> finisherIdleNs{0};
+std::atomic<std::uint64_t> finisherSleeps{0};
+
 std::atomic<std::uint64_t> heldReadRanges{0};
 std::atomic<std::uint64_t> heldReadQueries{0};
 std::atomic<std::uint64_t> heldReadHits{0};
+
+bool heldOverlaps(const DrawFinisher::Pending& held, std::uint64_t begin, std::uint64_t end) {
+    return std::any_of(held.writes.begin(), held.writes.end(), [&](const DrawFinisher::Range& range) { return begin < range.second && range.first < end; });
+}
 
 template<typename TItem>
 struct ClearOnExit {
@@ -54,8 +71,52 @@ thread_local bool finisherProducer = false;
 }
 
 DrawFinisher& DrawFinisher::Get() {
-    static DrawFinisher* finisher = new DrawFinisher();
+    static DrawFinisher* finisher = [] {
+        auto* created = new DrawFinisher();
+        if (Sequenced()) {
+            constexpr std::size_t SequenceDepth = 32;
+            SequenceRing::Options options;
+            options.capacity = SequenceDepth;
+            options.spin = HandoffSpinWindow();
+            options.pause = &SpinPause;
+            options.timed = pipelineStats();
+            options.threadCpu = &ThreadCpuNanos;
+            options.failed = [](std::exception_ptr error) {
+                try {
+                    std::rethrow_exception(error);
+                } catch (const ProcessShutdown&) {
+                    return;
+                } catch (...) {
+                }
+                Driver::Get().ReportFailure(error);
+            };
+            options.preparerStart = [] {
+                finisherThread = true;
+                NameDriverThread("draw-finish");
+                PerformanceTrace::BindThread("draw finisher");
+            };
+            created->ring = std::make_unique<SequenceRing>(std::move(options));
+        }
+        return created;
+    }();
     return *finisher;
+}
+
+bool DrawFinisher::Sequenced() {
+    static const bool sequenced = std::getenv("APS5_NO_SEQUENCE_RING") == nullptr;
+    return sequenced;
+}
+
+SequenceRing& DrawFinisher::Ring() {
+    return *ring;
+}
+
+bool DrawFinisher::Producing() {
+    return Sequenced() ? ring->Producing() : finisherProducer;
+}
+
+std::uint64_t DrawFinisher::Bypass() {
+    return ring->Bypass();
 }
 
 bool DrawFinisher::Enabled() {
@@ -83,7 +144,8 @@ bool DrawFinisher::Overlap() {
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !Producing()) return false;
+    if (Sequenced()) return ring->AnyNewestFirst([&](const Pending& held) { return held.unknown || heldOverlaps(held, begin, end); });
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -95,8 +157,27 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !finisherProducer) return LabelLookup::NotHeld;
+    if (!Busy() || !Producing()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
+    if (Sequenced()) {
+        auto lookup = LabelLookup::NotHeld;
+        ring->AnyNewestFirst([&](const Pending& held) {
+            if (held.unknown) {
+                lookup = LabelLookup::Unknown;
+                return true;
+            }
+            if (!heldOverlaps(held, address, end)) return false;
+            if (held.labelBytes.empty() || address < held.labelAddress || end > held.labelAddress + held.labelBytes.size()) {
+                lookup = LabelLookup::Unknown;
+                return true;
+            }
+            value = 0;
+            std::memcpy(&value, held.labelBytes.data() + (address - held.labelAddress), bytes);
+            lookup = LabelLookup::Value;
+            return true;
+        });
+        return lookup;
+    }
     std::lock_guard lock(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
         if (held->unknown) return LabelLookup::Unknown;
@@ -111,7 +192,12 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !Producing()) return false;
+    if (Sequenced()) {
+        return ring->AnyNewestFirst([&](const Pending& held) {
+            return held.unknown || std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return heldOverlaps(held, range.first, range.second); });
+        });
+    }
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -125,7 +211,8 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !Producing()) return false;
+    if (Sequenced()) return ring->AnyNewestFirst([&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
 }
@@ -148,7 +235,7 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "end"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
         char item[64];
@@ -178,8 +265,45 @@ void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }
 
+DrawPipeline::QueuedWrite DrawFinisher::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
+    if (!Busy() || !Producing()) return DrawPipeline::QueuedWrite::None;
+    const auto end = address + bytes;
+    auto answer = DrawPipeline::QueuedWrite::None;
+    ring->AnyNewestFirst([&](const Pending& held) {
+        if (held.unknown) {
+            answer = DrawPipeline::QueuedWrite::Unknown;
+            return true;
+        }
+        if (!heldOverlaps(held, address, end)) return false;
+        if (!held.store) {
+            answer = DrawPipeline::QueuedWrite::Unknown;
+            return true;
+        }
+        if (out.empty()) {
+            answer = DrawPipeline::QueuedWrite::Stored;
+            return false;
+        }
+        if (out.size() != bytes || address < held.labelAddress || end > held.labelAddress + held.labelBytes.size()) {
+            answer = DrawPipeline::QueuedWrite::Unknown;
+            return true;
+        }
+        std::memcpy(out.data(), held.labelBytes.data() + (address - held.labelAddress), bytes);
+        answer = DrawPipeline::QueuedWrite::Stored;
+        return true;
+    });
+    return answer;
+}
+
 void DrawFinisher::Enqueue(Job job, Pending held) {
+    Enqueue(std::move(job), std::move(held), 0);
+}
+
+void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
     finisherProducer = true;
+    if (Sequenced()) {
+        ring->Push(std::move(job), std::move(held), GuestMemory::GpuMutex().HeldByThisThread(), tag);
+        return;
+    }
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -203,24 +327,36 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 }
 
 void DrawFinisher::run() {
+    NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
+    const bool timed = pipelineStats();
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
+        const auto idleSince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
+            if (timed && jobs.empty()) finisherSleeps.fetch_add(1, std::memory_order_relaxed);
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
             job = &jobs.front();
             failed = failure != nullptr;
         }
+        const auto busySince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto cpuSince = timed ? ThreadCpuNanos() : 0;
+        if (timed) finisherIdleNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(busySince - idleSince).count()), std::memory_order_relaxed);
         std::exception_ptr error;
         try {
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
+        }
+        if (timed) {
+            finisherJobs.fetch_add(1, std::memory_order_relaxed);
+            finisherBusyWallNs.fetch_add(elapsedNs(busySince), std::memory_order_relaxed);
+            finisherBusyCpuNs.fetch_add(ThreadCpuNanos() - cpuSince, std::memory_order_relaxed);
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
@@ -235,6 +371,10 @@ void DrawFinisher::run() {
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    if (Sequenced()) {
+        ring->Settle();
+        return;
+    }
     std::unique_lock lock(mutex);
     idle.wait(lock, [&] { return jobs.empty(); });
 }
@@ -242,13 +382,31 @@ void DrawFinisher::Settle() {
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    if (Sequenced()) {
+        ring->Drain();
+        return;
+    }
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
+void DrawFinisher::RethrowFailure() {
+    if (OnFinisherThread()) return;
+    if (Sequenced()) {
+        ring->RethrowFailure();
+        return;
+    }
+    std::lock_guard lock(mutex);
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+}
+
 void DrawFinisher::ReleaseRan() {
+    if (Sequenced()) {
+        ring->Reclaim();
+        return;
+    }
     std::vector<Job> done;
     std::lock_guard lock(mutex);
     std::swap(done, ran);
@@ -281,16 +439,41 @@ bool& DrawPipeline::Active() {
     return active;
 }
 
+bool DrawPipeline::SeesQueuedWrites() {
+    return Active() || DrawFinisher::OnFinisherThread();
+}
+
 std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     static std::atomic<std::uint64_t> token{1};
     return token;
 }
 
+std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
+    static std::array<std::atomic<std::uint64_t>, 5> causes{};
+    return causes;
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
+    static const bool backwardFollows = std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr;
     if (followed == token) return;
+    const bool backward = token < followed;
+    if (backward && !backwardFollows) {
+        if (Graphics::CommitPhasesEnabled()) Graphics::NoteEpochFollowSkipped();
+        return;
+    }
     followed = token;
     GuestMemory::BumpCollectEpoch();
+    if (!Graphics::CommitPhasesEnabled()) return;
+    static thread_local std::array<std::uint64_t, 5> seen{};
+    unsigned causes = 0;
+    for (std::size_t cause = 0; cause < seen.size(); ++cause) {
+        const auto count = EpochTokenCauses()[cause].load(std::memory_order_relaxed);
+        if (count != seen[cause]) causes |= 1u << cause;
+        seen[cause] = count;
+    }
+    Graphics::NoteEpochCauses(causes);
+    Graphics::NoteEpochFollow(backward, causes);
 }
 
 unsigned DrawPipeline::Committers() {
@@ -336,7 +519,38 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 }
 
 void DrawPipeline::enqueue(Item item) {
-    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+    if (!DrawFinisher::Sequenced()) {
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+        admit(std::move(item));
+        return;
+    }
+    auto& finisher = DrawFinisher::Get();
+    if (DrawFinisher::OnFinisherThread()) {
+        item.sequence = SequenceRing::Running();
+    } else if (Active()) {
+        if (!item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
+        if (DrawFinisher::Busy()) {
+            DrawFinisher::Pending held;
+            held.unknown = false;
+            held.store = item.store;
+            held.writes = item.writes;
+            held.labelAddress = item.labelAddress;
+            held.labelBytes = item.labelBytes;
+            const auto tag = static_cast<std::uint8_t>(1 + static_cast<std::size_t>(item.kind));
+            finisher.Enqueue([this, item = std::move(item)]() mutable {
+                item.sequence = SequenceRing::Running();
+                admit(std::move(item));
+            }, std::move(held), tag);
+            return;
+        }
+        item.sequence = finisher.Bypass();
+    } else if (DrawFinisher::Busy()) {
+        finisher.Drain();
+    }
+    admit(std::move(item));
+}
+
+void DrawPipeline::admit(Item item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -361,6 +575,10 @@ void DrawPipeline::enqueue(Item item) {
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
+    }
+    if (item.sequence != 0) {
+        if (item.sequence < admittedSequence) throw std::logic_error("draw committer admitted sequence " + std::to_string(item.sequence) + " after sequence " + std::to_string(admittedSequence));
+        admittedSequence = item.sequence;
     }
     depthSum += items.size();
     ++enqueued;
@@ -421,6 +639,36 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         kindText += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    SequenceRing::Counters ringWork;
+    if (DrawFinisher::Sequenced()) {
+        const auto ring = DrawFinisher::Get().Ring().TakeCounters();
+        ringWork = ring;
+        std::string residencyText;
+        for (std::size_t tag = 0; tag < ring.residency.size(); ++tag) {
+            const auto& residency = ring.residency[tag];
+            if (residency.items == 0) continue;
+            char item[96];
+            std::snprintf(item, sizeof(item), " %s %llu (%.1f us, longest %.1f us)", tag == 0 ? "prepare" : tag - 1 < KindNames.size() ? KindNames[tag - 1] : "other", static_cast<unsigned long long>(residency.items), static_cast<double>(residency.totalNs) / 1e3 / static_cast<double>(residency.items), static_cast<double>(residency.longestNs) / 1e3);
+            residencyText += item;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
+    }
+    {
+        struct Finisher {
+            const char* name;
+            std::uint64_t jobs, cpuNs, wallNs, idleNs, sleeps;
+        } finisherCounters{"queue", finisherJobs.exchange(0, std::memory_order_relaxed), finisherBusyCpuNs.exchange(0, std::memory_order_relaxed), finisherBusyWallNs.exchange(0, std::memory_order_relaxed), finisherIdleNs.exchange(0, std::memory_order_relaxed), finisherSleeps.exchange(0, std::memory_order_relaxed)};
+        if (DrawFinisher::Sequenced()) finisherCounters = {"ring preparer", ringWork.worked, ringWork.busyCpuNs, ringWork.busyWallNs, ringWork.idleNs, ringWork.preparerSleeps};
+        const auto perJob = [&](std::uint64_t ns) { return finisherCounters.jobs == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(finisherCounters.jobs); };
+        AgcDriver::ProfilePrint_nid_no_patch("[finisher] %s (10 s): %llu jobs, busy %.1f ms CPU and %.1f ms wall (%.1f / %.1f us per job), idle %.1f ms wall, %llu sleeps\n", finisherCounters.name, static_cast<unsigned long long>(finisherCounters.jobs), static_cast<double>(finisherCounters.cpuNs) / 1e6, static_cast<double>(finisherCounters.wallNs) / 1e6, perJob(finisherCounters.cpuNs), perJob(finisherCounters.wallNs), static_cast<double>(finisherCounters.idleNs) / 1e6, static_cast<unsigned long long>(finisherCounters.sleeps));
+    }
+    {
+        const auto preparerWaits = preparerStarved.exchange(0, std::memory_order_relaxed);
+        const auto preparerNs = preparerStarvedNs.exchange(0, std::memory_order_relaxed);
+        const auto workerWaits = workerStarved.exchange(0, std::memory_order_relaxed);
+        const auto workerNs = workerStarvedNs.exchange(0, std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[committer-idle] (10 s): %llu waits for an item while the finisher held work (%.1f ms), %llu while it was idle (%.1f ms)\n", static_cast<unsigned long long>(preparerWaits), static_cast<double>(preparerNs) / 1e6, static_cast<unsigned long long>(workerWaits), static_cast<double>(workerNs) / 1e6);
+    }
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -430,17 +678,25 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 
 void DrawPipeline::run() {
+    NameDriverThread("draw-commit");
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        const bool starved = pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
+        const bool preparing = starved && DrawFinisher::Busy();
+        const auto starvedAt = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
+            if (starved) {
+                (preparing ? preparerStarved : workerStarved).fetch_add(1, std::memory_order_relaxed);
+                (preparing ? preparerStarvedNs : workerStarvedNs).fetch_add(elapsedNs(starvedAt), std::memory_order_relaxed);
+            }
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
@@ -471,6 +727,7 @@ void DrawPipeline::run() {
         const auto kindIndex = static_cast<std::size_t>(items.front().kind);
         kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
         kindNs[kindIndex].fetch_add(spent, std::memory_order_relaxed);
+        if (items.front().sequence != 0) committedSequence.store(items.front().sequence, std::memory_order_release);
         retired.push_back(std::move(items.front()));
         items.pop_front();
         retiredItems.fetch_add(1, std::memory_order_release);
@@ -509,7 +766,12 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
-    if (!Busy()) return;
+    else DrawFinisher::Get().RethrowFailure();
+    if (!Busy()) {
+        std::lock_guard lock(mutex);
+        rethrowFailure();
+        return;
+    }
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);
@@ -580,8 +842,13 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
     const auto end = address + bytes;
-    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) return QueuedWrite::Unknown;
     auto answer = QueuedWrite::None;
+    if (DrawFinisher::Overlap() && DrawFinisher::Sequenced()) {
+        answer = DrawFinisher::Get().StoredBytes(address, bytes, out);
+        if (answer == QueuedWrite::Unknown || (answer == QueuedWrite::Stored && !out.empty())) return answer;
+    } else if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlaps(address, end)) {
+        return QueuedWrite::Unknown;
+    }
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
         if (std::none_of(item->writes.begin(), item->writes.end(), [&](const Range& range) { return address < range.second && range.first < end; })) continue;

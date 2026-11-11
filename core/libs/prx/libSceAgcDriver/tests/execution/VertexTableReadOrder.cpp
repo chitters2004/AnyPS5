@@ -194,6 +194,29 @@ int main() {
         check(completeAtBufferRead == nullptr, "the unrelated queued store did not complete during the decode");
         check(info.resources[0].fields[0] == 0xb000u && DrawPipeline::Queue0().DecodeDrains() == drains, "a store elsewhere that retired during the decode made the decode drain");
 
+        WaitEmpty();
+        auto finisherGate = Hold(BufferTable.data() + 4, 16, [] {
+            BufferTable[4] = 0xd000u;
+            BufferTable[6] = 512u;
+        });
+        ShaderRecompiler::ShaderVertexStageInfo prepared;
+        std::vector<AgcDriver::Graphics::DecodeRead> preparedReads;
+        drains = DrawPipeline::Queue0().DecodeDrains();
+        AgcDriver::DriverDetail::DrawFinisher::Get().Enqueue([&] { prepared = Decode(preparedReads); });
+        std::thread finisherReleaser([finisherGate] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            finisherGate->release.store(true, std::memory_order_release);
+        });
+        try {
+            AgcDriver::DriverDetail::DrawFinisher::Get().Drain();
+        } catch (...) {
+            finisherReleaser.join();
+            throw;
+        }
+        finisherReleaser.join();
+        check(prepared.resources[0].fields[0] == 0xd000u && prepared.resources[0].fields[2] == 512u, "the draw finisher decoded the vertex buffer table before a queued store into it");
+        check(DrawPipeline::Queue0().DecodeDrains() == drains + 1, "the draw finisher's decode behind a queued store was not counted as a drain");
+
         StopQueue();
         std::puts("vertex table read order tests passed");
         return 0;

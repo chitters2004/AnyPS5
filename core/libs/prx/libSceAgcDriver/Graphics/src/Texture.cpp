@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -2460,6 +2461,9 @@ std::atomic<int> flushFailureFiredForTest{0};
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    const auto callerPhase = CurrentCommitPhase();
+    const bool targetPhase = callerPhase == CommitPhase::TargetsRefresh || callerPhase == CommitPhase::TargetsLookup;
+    const CommitPhaseScope provedPhase(targetPhase ? CommitPhase::TargetsProved : callerPhase);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -2469,13 +2473,21 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
+        CountCommit(targetPhase ? CommitCounter::TargetRefreshEpoch : CommitCounter::OtherRefreshEpoch);
         return true;
+    }
+    if (targetPhase) {
+        const bool moved = epoch != 0 && provedEpoch.load(std::memory_order_relaxed) != epoch;
+        CountCommit(epoch == 0 ? CommitCounter::TargetEpochOff : moved ? CommitCounter::TargetEpochMoved : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? CommitCounter::TargetEpochProofMoved : CommitCounter::TargetEpochPendingMoved);
+        if (moved) CountCommit(EpochCauseCounter(EpochCauses()));
+        if (CommitPhasesEnabled() && epoch != 0 && missedEpoch.exchange(epoch, std::memory_order_relaxed) != epoch) CountCommit(CommitCounter::TargetMissFirstInEpoch);
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    auto refused = CommitCounter::Count;
+    if (refreshProved(refused)) {
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2486,8 +2498,13 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile && keyProof.pendingNote != 0) refreshesProvedPendingKeys.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+        CountCommit(targetPhase ? CommitCounter::TargetRefreshProved : CommitCounter::OtherRefreshProved);
         return true;
     }
+    CountCommit(targetPhase ? CommitCounter::TargetRefreshSlow : CommitCounter::OtherRefreshSlow);
+    if (targetPhase && refused != CommitCounter::Count) CountCommit(refused);
+    if (targetPhase && CommitPhasesEnabled() && epoch != 0 && slowEpoch.exchange(epoch, std::memory_order_relaxed) == epoch) CountCommit(CommitCounter::TargetSlowAgainInEpoch);
+    if (targetPhase) RelabelCommitPhase(CommitPhase::TargetsRefresh);
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
@@ -2813,6 +2830,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
         upload(&changed);
+        if (UploadRefreshProofs() && !scoped && layerBehind.empty() && !anyBorrowed && current != 0 && generation >= current) takeRefreshProof(alias != nullptr);
     } else {
         uploadedKeys = keys;
     }
@@ -2851,24 +2869,30 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+bool StorageTexture::refreshProved(CommitCounter& refused) {
+    const auto refuse = [&](CommitCounter reason) {
+        refused = reason;
+        return false;
+    };
+    if (refreshProof.generation == 0) return refuse(CommitCounter::TargetProofNone);
+    if (generation != refreshProof.generation) return refuse(CommitCounter::TargetProofGeneration);
+    if (uploadedKeys != refreshProof.keys) return refuse(CommitCounter::TargetProofKeys);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return refuse(CommitCounter::TargetProofUnlocked);
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return refuse(CommitCounter::TargetProofRefused);
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return refuse(CommitCounter::TargetProofKeys);
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return refuse(CommitCounter::TargetProofRefused);
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return refuse(CommitCounter::TargetProofChanged);
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) return refuse(CommitCounter::TargetProofPending);
         refreshProof.pendingSerial = serial;
     }
     return true;
@@ -2881,6 +2905,11 @@ void StorageTexture::takeRefreshProof(bool aliased) {
     const auto serial = PendingSerial();
     if (otherPendingOverlaps()) return;
     refreshProof = {generation, serial, keyProof.generation, uploadedKeys};
+}
+
+bool StorageTexture::UploadRefreshProofs() {
+    static const bool enabled = std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr;
+    return enabled;
 }
 
 std::uint64_t StorageTexture::RefreshesProved() {

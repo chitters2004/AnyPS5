@@ -273,12 +273,13 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    const bool ownsHandOffs = DrawFinisher::Sequenced() && executingSubmission().get() == &submission;
     struct SettleFinisher {
         bool queue0;
         ~SettleFinisher() {
             if (queue0) DrawFinisher::Get().Settle();
         }
-    } settleFinisher{submission.queue == 0};
+    } settleFinisher{submission.queue == 0 && !ownsHandOffs};
     auto* const executingPacket = workerPacket();
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
@@ -294,7 +295,8 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
-            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
+            const bool sequencedStore = pipelined && !predicated && opcode == 0x83 && DrawFinisher::Sequenced() && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor);
+            const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || sequencedStore || keepsDrawPipeline(packet, header, opcode));
             if (!beside) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
@@ -607,7 +609,8 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain();
+    if (submission.queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::End, !ownsHandOffs);
+    if (submission.queue == 0 && !ownsHandOffs) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

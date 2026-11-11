@@ -597,6 +597,27 @@ void TestRepeatedDepthViewAllocations(const Context& context) {
 #endif
 }
 
+void TestRepeatedDepthSurfaceFind(const Context& context) {
+    ClearDepthSurfaces(context.device);
+    constexpr VkExtent2D extent{128, 128};
+    const DepthTarget first{0xa6000000, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    const DepthTarget second{0xa6400000, 0, extent, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    const auto before = DepthSurfaceFindCounts();
+    const auto firstView = DepthSurfaceView(context, first);
+    const auto repeatedView = DepthSurfaceView(context, first);
+    const auto secondView = DepthSurfaceView(context, second);
+    const auto returnedView = DepthSurfaceView(context, first);
+    const auto againView = DepthSurfaceView(context, first);
+    const auto after = DepthSurfaceFindCounts();
+    Require(firstView != VK_NULL_HANDLE && secondView != VK_NULL_HANDLE && firstView != secondView, "two depth targets must render through two surfaces");
+    Require(repeatedView == firstView && returnedView == firstView && againView == firstView, "a depth target found as the previous draw's surface or by the scan must keep its surface");
+    Require(after.repeated - before.repeated == 2 && after.scanned - before.scanned == 3, "the depth surface find took " + std::to_string(after.repeated - before.repeated) + " repeats and " + std::to_string(after.scanned - before.scanned) + " scans over A A B A A, not 2 and 3");
+    ClearDepthSurfaces(context.device);
+    const auto cleared = DepthSurfaceFindCounts();
+    Require(DepthSurfaceView(context, first) != VK_NULL_HANDLE && DepthSurfaceFindCounts().scanned == cleared.scanned + 1, "a depth target after its surfaces were cleared was not found by a scan");
+    ClearDepthSurfaces(context.device);
+}
+
 void TestUnmappedStalePlaneFlush(const Context& context) {
     ClearDepthSurfaces(context.device);
     constexpr VkExtent2D extent{256, 256};
@@ -835,6 +856,7 @@ void RunDepthSurfaceReuseTests() {
     TestUntrackedHtileStencilScan(context);
     TestUntrackedHtileDriverStore(context);
     TestRepeatedDepthViewAllocations(context);
+    TestRepeatedDepthSurfaceFind(context);
     TestStencilWriteBeyondPlane(context);
     TestRetireStaleSurfaceWithoutWrittenUnits(context);
     TestUnmappedStalePlaneFlush(context);

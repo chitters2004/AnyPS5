@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -3172,6 +3173,15 @@ void retireStoringStale(DepthSurface& surface) {
 }
 }
 
+namespace {
+std::atomic<std::uint64_t> repeatedDepthFinds{0};
+std::atomic<std::uint64_t> scannedDepthFinds{0};
+}
+
+DepthSurfaceFinds DepthSurfaceFindCounts() {
+    return {repeatedDepthFinds.load(std::memory_order_relaxed), scannedDepthFinds.load(std::memory_order_relaxed)};
+}
+
 std::uint64_t DepthSurfacesSerial() {
     return surfacesSerial.load(std::memory_order_acquire);
 }
@@ -3367,26 +3377,43 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 }
 
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
+    const bool phased = CurrentCommitPhase() == CommitPhase::TargetsDepthPrep;
+    const auto phase = [&](CommitPhase next) {
+        if (phased) BeginCommitPhase(next);
+    };
+    phase(CommitPhase::TargetsDepthClaims);
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
     if (target.stencilPartiallyResident) Require(resident(target.stencilAddress, planeBytes(1u)), "partially resident stencil (DB_STENCIL_INFO) with pages that are not mapped is unsupported");
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
+    phase(CommitPhase::TargetsDepthClear);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
     const bool cleared = takeClearedHtile(target);
+    phase(CommitPhase::TargetsDepthFind);
+    static const bool repeatFind = std::getenv("APS5_NO_DEPTH_REPEAT_FIND") == nullptr;
     DepthSurface* surface = nullptr;
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
-            surface = candidate.get();
-            break;
+    if (repeatFind && drawnDepth != nullptr && drawnDepth->active->load(std::memory_order_acquire) && drawnDepth->context.device == context.device && sameSurface(drawnDepth->target, target)) {
+        surface = drawnDepth;
+        repeatedDepthFinds.fetch_add(1, std::memory_order_relaxed);
+        if (phased) CountCommit(CommitCounter::DepthFoundRepeated);
+    } else {
+        scannedDepthFinds.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& candidate : surfaces()) {
+            if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameSurface(candidate->target, target)) {
+                surface = candidate.get();
+                break;
+            }
         }
     }
-    for (const auto& candidate : surfaces()) {
-        if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
+    if (surface == nullptr) {
+        for (const auto& candidate : surfaces()) {
+            if (surface == nullptr && candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && sameLayoutWithin(candidate->target, target)) surface = candidate.get();
+        }
     }
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();
@@ -3436,6 +3463,14 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     surface->clearStencil = target.clearStencil;
     const auto stencilOwner = stencilOwners().find({context.device, target.stencilAddress});
     const bool stencilRebound = stencilOwner == stencilOwners().end() || stencilOwner->second.surface != surface;
+    if (phased) {
+        CountCommit(CommitCounter::DepthPreps);
+        if (surface == drawnDepth) CountCommit(CommitCounter::DepthSameSurface);
+        if (created) CountCommit(CommitCounter::DepthCreated);
+        if (cleared || htileCleared != 0u) CountCommit(CommitCounter::DepthCleared);
+        if (mirrorable(target)) CountCommit(CommitCounter::DepthMirrored);
+    }
+    phase(CommitPhase::TargetsDepthSync);
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
     if (cleared || htileCleared != 0u) surface->expanded = false;
     if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
@@ -3449,10 +3484,12 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
+    phase(CommitPhase::TargetsDepthStale);
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
     surface->NoteMemory();
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
+        if (phased) CountCommit(CommitCounter::DepthStaleScans);
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
         for (const auto& other : surfaces()) {
