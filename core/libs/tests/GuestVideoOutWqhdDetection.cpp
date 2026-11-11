@@ -1,0 +1,59 @@
+#include "prx/libSceVideoOut/include/Output.hpp"
+#include "SceTypes.hpp"
+#include "prx/libc/include/Shutdown.hpp"
+#include "tests/VideoOutTestEnvironment.hpp"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+
+static constexpr int SYSTEM_USER = 255;
+static constexpr int MAIN_BUS = 0;
+static constexpr int NEVER_OPENED_HANDLE = 2;
+
+static void Require(bool value) { if (!value) std::abort(); }
+
+static bool RejectsHandle(int handle) {
+    try {
+        sceVideoOutAllowOutputResolutionWqhdDetection(handle);
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+static bool SameStatus(const VideoOutOutputStatus& a, const VideoOutOutputStatus& b) {
+    return std::memcmp(&a, &b, sizeof(a)) == 0;
+}
+
+int main() {
+    VideoOutTestEnvironment environment;
+    int handle = 0;
+    try {
+        handle = sceVideoOutOpen(SYSTEM_USER, MAIN_BUS, 0, nullptr);
+    } catch (const std::runtime_error& error) {
+        if (std::getenv("ANYPS5_REQUIRE_DISPLAY") != nullptr) throw;
+        std::printf("skipped, no display or Vulkan device: %s\n", error.what());
+        return 77;
+    }
+    Require(handle > 0);
+
+    VideoOutOutputStatus before{};
+    Require(sceVideoOutGetOutputStatus(handle, &before) == 0);
+    Require(sceVideoOutAllowOutputResolutionWqhdDetection(handle) == 0);
+    Require(sceVideoOutAllowOutputResolutionWqhdDetection(handle) == 0);
+    VideoOutOutputStatus after{};
+    Require(sceVideoOutGetOutputStatus(handle, &after) == 0);
+    Require(SameStatus(before, after));
+    Require(before.refreshRate == 3 || before.refreshRate == 13);
+    Require(before.resolution == 1 || before.resolution == 2);
+    Require(before.flags == 0);
+
+    Require(RejectsHandle(0));
+    Require(RejectsHandle(-1));
+    Require(RejectsHandle(NEVER_OPENED_HANDLE));
+
+    Require(sceVideoOutClose(handle) == 0);
+    Require(RejectsHandle(handle));
+    LibcRunShutdown_nid_postfix();
+}
