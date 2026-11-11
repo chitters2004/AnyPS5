@@ -133,6 +133,9 @@ struct StageCapture {
     std::uint32_t pushOffset = 0;
     ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    bool linkedCode = false;
+    bool convertedSamples = false;
+    bool layerRowSamples = false;
 };
 
 struct RelocatableUserWord {

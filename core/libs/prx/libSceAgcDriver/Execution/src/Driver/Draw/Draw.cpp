@@ -940,6 +940,19 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::size_t> resultIndex(programs.size(), 0);
+    std::vector<std::shared_ptr<DrawStageRecord>> memoPending(programs.size());
+    const auto verifyMemoStage = [&](std::size_t i, const DispatchVariant& kept) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+        std::vector<std::uint32_t> words;
+        freshRuns(i, runs, words);
+        const char* what = DrawStageMismatch(kept, runs, words, *stageCaptures[i].compiled);
+        if (what == nullptr && (vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)))) what = "vertex stage info";
+        drawStageMemoCounters.verified.fetch_add(1, std::memory_order_relaxed);
+        if (what == nullptr) return;
+        char message[256];
+        std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_STAGE_MEMO: stage %zu (program 0x%llx) of a draw stage memo hit differs from its full build in its %s", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what);
+        throw std::runtime_error(message);
+    };
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
@@ -967,11 +980,23 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         break;
                     }
                 }
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
-                if (!rejected.empty()) return DrawVerdict::Rejected;
-                programResults[i] = compiledStages.back().get();
-                if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
-                if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
+                if (memoHit != nullptr && !verifyDrawStageMemo()) {
+                    matched[i] = memoHit->variant;
+                    stageCaptures[i].registeredViews = matched[i]->registeredViews;
+                    matchedRegions[i].clear();
+                    appendEntryRegions(*matched[i], matchedRegions[i]);
+                    reused[i] = true;
+                    programResults[i] = matched[i]->compiled.get();
+                    memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                } else {
+                    compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                    if (!rejected.empty()) return DrawVerdict::Rejected;
+                    programResults[i] = compiledStages.back().get();
+                    if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
+                    if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                    if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                }
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
@@ -1025,7 +1050,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, &memoPending);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {

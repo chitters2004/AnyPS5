@@ -1138,7 +1138,21 @@ std::shared_ptr<const ShaderRecompiler::LinkedCalls> LinkUserDataCallees(const S
 
 }
 
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+namespace {
+
+void ApplyPreparedSampleModesLocked(const PreparedShaders& prepared, std::size_t codeOffset, ShaderRecompiler::GuestContext& context) {
+    if (std::ranges::find(prepared.convertedSamples, codeOffset) != prepared.convertedSamples.end()) context.convertedSamples = true;
+    if (std::ranges::find(prepared.layerRowSamples, codeOffset) != prepared.layerRowSamples.end()) context.layerRowSamples = true;
+}
+
+}
+
+void ApplyPreparedSampleModes(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::GuestContext& context) {
+    std::lock_guard lock(snapshot.prepared->mutex);
+    ApplyPreparedSampleModesLocked(*snapshot.prepared, codeOffset, context);
+}
+
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool* linkedCode) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
@@ -1146,6 +1160,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::LinkedCalls tail;
     if (shared == nullptr || shared->code.empty()) tail.code = LinkGraphicsUserDataTail(request, snapshot);
     const auto& linked = shared != nullptr && tail.code.empty() ? *shared : tail;
+    if (linkedCode != nullptr) *linkedCode = !linked.code.empty();
     auto source = request;
     if (!linked.code.empty()) {
         source.shader.code = linked.code;
@@ -1153,8 +1168,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     }
     std::unique_lock lock(snapshot.prepared->mutex);
     AwaitRegisteredPreparation(*snapshot.prepared, lock);
-    if (std::ranges::find(snapshot.prepared->convertedSamples, codeOffset) != snapshot.prepared->convertedSamples.end()) source.context.convertedSamples = true;
-    if (std::ranges::find(snapshot.prepared->layerRowSamples, codeOffset) != snapshot.prepared->layerRowSamples.end()) source.context.layerRowSamples = true;
+    ApplyPreparedSampleModesLocked(*snapshot.prepared, codeOffset, source.context);
     auto invocationRequest = source;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
