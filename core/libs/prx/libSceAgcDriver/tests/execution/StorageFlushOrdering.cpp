@@ -18,12 +18,16 @@
 #endif
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <span>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -56,6 +60,8 @@ constexpr std::size_t FillBytes = 4096u;
 constexpr std::size_t FillPast = 0x10000u;
 constexpr std::size_t ShadowUnitBytes = 0x10000u;
 constexpr std::uint32_t Standard256B = 1u;
+constexpr std::uint32_t LabelValue = 0x5eedf00du;
+constexpr std::size_t LabelPast = 0x100u;
 
 alignas(256) constexpr std::array<std::uint32_t, 11> StoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Stored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 11> RestoreImageCode{0x7e000280u, 0x7e020280u, 0x7e0402ffu, Restored, 0xf0200108u, 0x00010200u, 0x7e0202ffu, 0x00000064u, 0xf0200108u, 0x00010200u, 0xbf810000u};
@@ -253,25 +259,25 @@ void RunStoredAgain(AgcDriver::VulkanDevice& device, const GuestBlock& guest, st
         restores.push_back(Compile(RestoreImageCode, ImageUserData(first + index * ImageBytes), target));
     }
     for (const auto& store : stores) device.Dispatch(store, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
-    const std::string subject = "storage flush ordering, " + std::to_string(images) + (images == 1 ? " image" : " images") + (unrelated ? " under another stamped write" : "");
+    const std::string subject = "storage flush ordering, " + std::to_string(images) + (images == 1 ? " image" : " images") + (unrelated ? " under another write stamped at completion" : "");
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(first, ImageBytes * images, nullptr, "test"), subject + " stored again in the open batch: the first store left no results pending");
     const auto& context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     const bool imported = AgcDriver::Graphics::ExistingHostImportFor(context, first, ImageBytes * images) != nullptr;
     const bool compared = imported && AgcDriver::Graphics::ComparedHostImportCovers(context, first, ImageBytes * images);
-    const bool skips = images == 1 && imported && !unrelated;
+    const bool skips = imported && !unrelated;
     const std::string what = subject + (imported ? compared ? " over a compared host import" : "" : " without a host import") + " stored again in the open batch: ";
     for (const auto& restore : restores) device.Dispatch(restore, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(RestoreImageCode.data()));
     if (unrelated) {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
-        const std::array stamped{std::pair{first, first + ImageBytes}};
-        AgcDriver::Graphics::Recorder::Active()->NoteStampedWrites(stamped);
+        const std::array unstamped{std::pair{first, first + ImageBytes}};
+        AgcDriver::Graphics::Recorder::Active()->NotePendingWrites(unstamped);
     }
     const auto open = OpenSerial();
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(first, ImageBytes * images, nullptr, "test"), what + "the second store left no results pending");
     if (!compared || unrelated) {
-        if (skips) Require(OpenSerial() == open, what + "the second store waited for the GPU to finish the image's own earlier store");
-        else if (unrelated) Require(OpenSerial() != open, what + "the second store did not wait for a stamped write that is not the image's own");
-        else Require(OpenSerial() != open, what + "the second store did not wait for the earlier store, which only a single image with a host import may skip");
+        if (skips) Require(OpenSerial() == open, what + "the second store waited for the GPU to finish an earlier store stamped when it was recorded");
+        else if (unrelated) Require(OpenSerial() != open, what + "the second store did not wait for a write that is not the image's own and stamps guest memory only at completion");
+        else Require(OpenSerial() != open, what + "the second store did not wait for the earlier store, which only an image with a host import may skip");
     }
     device.WaitIdle();
     for (std::size_t index = 0; index < images; ++index) {
@@ -288,14 +294,173 @@ void RunStoredAloneAfterJoint(AgcDriver::VulkanDevice& device, const GuestBlock&
     for (const auto& store : stores) device.Dispatch(store, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(StoreImageCode.data()));
     const std::string what = "storage flush ordering, 1 image stored alone after a joint store of 2 images in the open batch: ";
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(first, ImageBytes * 2u, nullptr, "test"), what + "the joint store left no results pending");
-    const bool compared = AgcDriver::Graphics::ComparedHostImportCovers(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), first, ImageBytes * 2u);
+    const auto& context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const bool imported = AgcDriver::Graphics::ExistingHostImportFor(context, first, ImageBytes * 2u) != nullptr;
+    const bool compared = imported && AgcDriver::Graphics::ComparedHostImportCovers(context, first, ImageBytes * 2u);
     device.Dispatch(restore, 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(RestoreImageCode.data()));
     const auto open = OpenSerial();
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(first, ImageBytes, nullptr, "test"), what + "the second store left no results pending");
-    Require(compared || OpenSerial() != open, what + "the second store did not wait for the joint store, whose writes are not the image's own");
+    if (!compared && imported) Require(OpenSerial() == open, what + "the second store waited for the GPU to finish the joint store, which was stamped when it was recorded");
+    if (!imported) Require(OpenSerial() != open, what + "the second store did not wait for the joint store without a host import");
     device.WaitIdle();
     const auto* words = guest.Words() + offset / 4u;
     Require(words[0] == Restored && words[FarDword] == Restored, what + "the newer texels did not land over the joint store");
+}
+
+std::uint64_t NoteOf(std::uint64_t address, std::size_t bytes) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const auto note = recorder != nullptr ? recorder->LastWriteNote(address, bytes) : 0;
+    Require(note != 0, "storage flush ordering: the writer's note is not the open batch's last write");
+    return note;
+}
+
+bool StillPending(std::uint64_t note, std::uint64_t address, std::size_t bytes) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    if (recorder == nullptr) return false;
+    const auto writes = recorder->PendingWritesOver(address, bytes);
+    return std::any_of(writes.begin(), writes.end(), [&](const AgcDriver::Graphics::Recorder::PendingWrite& write) { return write.note == note; });
+}
+
+bool Verifying() {
+    static const bool verifying = std::getenv("APS5_LABEL_STORE_VERIFY") != nullptr;
+    return verifying;
+}
+
+bool StampsVisible(const AgcDriver::VulkanDevice& device, std::uint64_t address, std::size_t bytes) {
+    const auto& context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    return AgcDriver::GuestMemory::Watched(address, bytes) && AgcDriver::Graphics::ExistingHostImportFor(context, address, bytes) != nullptr && !AgcDriver::Graphics::ComparedHostImportCovers(context, address, bytes);
+}
+
+void RunStampedWriterLater(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const std::string what = "storage flush ordering, a writer stamped when recorded after the image's results: ";
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = StoreImage(device, guest, offset);
+    const auto fill = image + OverwrittenDword * 4u;
+    Fill(device, fill, 16u, what);
+    const auto note = NoteOf(fill, 16u);
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    if (!Verifying() && StampsVisible(device, image, ImageBytes)) Require(StillPending(note, fill, 16u), what + "the store waited for the GPU to finish a fill whose stamp it already sees");
+    device.WaitIdle();
+    Require(words[OverwrittenDword] == Filled, what + "the image's older texels landed over the newer fill");
+    Require(words[FarDword] == Stored, what + "the image's texel in a block the fill did not touch was not stored");
+}
+
+void RunStampedWriterEarlier(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const std::string what = "storage flush ordering, a writer stamped when recorded before the image's results: ";
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = guest.Address() + offset;
+    Fill(device, image, 16u, what);
+    const auto note = NoteOf(image, 16u);
+    StoreImage(device, guest, offset);
+    if (!StillPending(note, image, 16u)) {
+        std::puts("the image's first use waited for the earlier fill: the earlier stamped writer case is skipped");
+        device.WaitIdle();
+        return;
+    }
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    if (!Verifying() && StampsVisible(device, image, ImageBytes)) Require(StillPending(note, image, 16u), what + "the store waited for the GPU to finish a fill whose stamp it already sees");
+    device.WaitIdle();
+    Require(words[0] == Stored, what + "the earlier fill kept its block over the image's newer texel");
+    Require(words[FarDword] == Stored, what + "the image's texel away from the fill was not stored");
+}
+
+void RunStampedWriterRewritesBaseline(AgcDriver::VulkanDevice& device, const GuestBlock& guest) {
+    const std::string what = "storage flush ordering, a writer stamped when recorded that rewrites the image's baseline value after its results: ";
+    const auto* words = guest.Words();
+    const auto image = StoreImage(device, guest, 0);
+    const std::array<std::uint32_t, 4> baseline{Initial, Initial, Initial, Initial};
+    Require(device.FillBuffer(image, 16u, baseline), what + "the fill was not recorded on the GPU");
+    Require(OpenBatchWrites(image, 16u), what + "the fill is not a write of the open batch");
+    if (!StampsVisible(device, image, ImageBytes)) {
+        device.WaitIdle();
+        std::puts("the image's memory is compared, not write-watched: the baseline rewrite case is skipped");
+        return;
+    }
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    device.WaitIdle();
+    Require(words[0] == Initial, what + "the image's older texel landed over the newer fill because the fill's bytes equal the image's baseline");
+    Require(words[FarDword] == Stored, what + "the image's texel in a block the fill did not touch was not stored");
+}
+
+void RunCompletionWriterWaits(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const std::string what = "storage flush ordering, a write stamped only at completion over the image's results: ";
+    const auto image = StoreImage(device, guest, offset);
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        const std::array unstamped{std::pair{image + OverwrittenDword * 4u, image + OverwrittenDword * 4u + 16u}};
+        AgcDriver::Graphics::Recorder::Active()->NotePendingWrites(unstamped);
+    }
+    const auto note = NoteOf(image + OverwrittenDword * 4u, 16u);
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    Require(!StillPending(note, image + OverwrittenDword * 4u, 16u), what + "the store did not wait for a writer whose stamp lands only when its batch completes");
+    device.WaitIdle();
+    Require(guest.Words()[offset / 4u + FarDword] == Stored, what + "the image's texel was not stored");
+}
+
+void RunPollerAfterLabel(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
+    const std::string what = "storage flush ordering, a guest thread polling a label after a linear image and a newer fill: ";
+    const auto* words = guest.Words() + offset / 4u;
+    const auto image = guest.Address() + offset;
+    device.Dispatch(Compile(RestoreImageCode, ImageUserData(image), device.Target()), 1u, 1u, 1u, {}, reinterpret_cast<std::uintptr_t>(RestoreImageCode.data()));
+    const auto fill = image + OverwrittenDword * 4u;
+    Fill(device, fill, 16u, what);
+    const auto note = NoteOf(fill, 16u);
+    auto* label = reinterpret_cast<std::uint32_t*>(static_cast<std::uintptr_t>(image + ImageBytes + LabelPast));
+    std::atomic_ref<std::uint32_t>(*label).store(0, std::memory_order_release);
+    std::atomic<bool> seen{false};
+    std::array<std::uint32_t, 2> read{};
+    std::thread poller([&] {
+        const auto start = std::chrono::steady_clock::now();
+        while (std::atomic_ref<std::uint32_t>(*label).load(std::memory_order_acquire) != LabelValue) {
+            if (std::chrono::steady_clock::now() - start > std::chrono::seconds(20)) return;
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+        const volatile std::uint32_t* texels = words;
+        read = {texels[FarDword], texels[OverwrittenDword]};
+        seen.store(true, std::memory_order_release);
+    });
+    const std::uint32_t value = LabelValue;
+    const auto stored = device.WriteLabelOnGpu(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(label)), std::as_bytes(std::span(&value, 1)), 1, 0, false);
+    const bool waited = !StillPending(note, fill, 16u);
+    if (stored != 0) {
+        device.WaitIdle();
+        std::atomic_ref<std::uint32_t>(*label).store(LabelValue, std::memory_order_release);
+        poller.join();
+        std::printf("the label was not recorded on the GPU (reason %d): the label poller case is skipped\n", stored);
+        return;
+    }
+    device.SubmitRecorded(false);
+    poller.join();
+    Require(seen.load(std::memory_order_acquire), what + "the label never landed");
+    if (!Verifying() && StampsVisible(device, image, ImageBytes)) Require(!waited, what + "the label's readback store waited for the GPU to finish a fill whose stamp it already sees");
+    Require(read[0] == Restored, what + "the image's texel was not in guest memory when the label was");
+    Require(read[1] == Filled, what + "the image's older texels landed over the newer fill before the label");
+    device.WaitIdle();
+}
+
+void RunStamped(AgcDriver::VulkanDevice& device, bool watched) {
+    {
+        GuestBlock guest(watched);
+        RunStampedWriterLater(device, guest, 0);
+    }
+    {
+        GuestBlock guest(watched);
+        RunStampedWriterEarlier(device, guest, 0);
+    }
+    {
+        GuestBlock guest(watched);
+        RunStampedWriterRewritesBaseline(device, guest);
+    }
+    {
+        GuestBlock guest(watched);
+        RunCompletionWriterWaits(device, guest, 0);
+    }
+    {
+        GuestBlock guest(watched);
+        RunPollerAfterLabel(device, guest, 0);
+    }
 }
 
 }
@@ -306,6 +471,11 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock guest(watched);
+        if (argc > 1 && std::string(argv[1]) == "--stamped") {
+            RunStamped(*device, watched);
+            std::puts("storage flush ordering stamped writer tests passed");
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--stored-again") {
             RunStoredAgain(*device, guest, BlockBytes / 4u, 1, false);
             RunStoredAgain(*device, guest, BlockBytes / 8u * 5u, 2, false);
@@ -324,6 +494,7 @@ int main(int argc, char** argv) {
         RunStoredAloneAfterJoint(*device, guest, BlockBytes / 8u * 5u);
         RunWriterOutsideLayers(*device, guest, BlockBytes / 4u);
         RunWriterInsideLayer(*device, guest, 3u * BlockBytes / 4u);
+        RunStamped(*device, watched);
         GuestBlock shadowed(watched);
         RunShadowedUnitUnderWriter(*device, shadowed);
         std::puts("storage flush ordering tests passed");

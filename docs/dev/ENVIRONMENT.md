@@ -212,6 +212,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_LABEL_REAP_ALL_QUEUES` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | reaps completion labels on every queue instead of only queue 0 |
 | `APS5_LABEL_RUNS_INLINE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | records store runs at once and closes each run at the next command |
 | `APS5_LABEL_STORE_ALWAYS` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | writes back every label store even when a later store already covered its bytes |
+| `APS5_LABEL_STORE_VERIFY` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | decides a storage write-back's kept blocks without waiting for writers stamped when recorded, waits, decides them again and throws on a difference |
 | `APS5_LABEL_SUBMIT_NOW` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | submits every label immediately instead of waiting for the flush deadline |
 | `APS5_LABEL_TRUST_LATE` | string | `core/libs/prx/libSceAgcDriver/Graphics/src/Recorder.cpp` |  | trusts cache entries with a stamp at or below the wait's stamp under the late rule (off unless set to a non-zero value) |
 | `APS5_LABEL_TRY_EACH_PACKET` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/DeferredLabels.cpp` |  | attempts to record deferred labels at every self-locking packet instead of deferring to its lock |

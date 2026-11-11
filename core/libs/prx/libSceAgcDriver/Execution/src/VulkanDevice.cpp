@@ -2844,6 +2844,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
+    recorder.StampNote(recorder.LastWriteNote(address, bytes.size()));
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
@@ -2880,6 +2881,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
+    recorder.StampNote(recorder.LastWriteNote(address, bytes));
     return true;
 }
 
@@ -3074,6 +3076,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
     else recorder.NotePendingWrite(address, bytes);
     const auto generation = GuestMemory::MarkWritten(address, bytes);
+    recorder.StampNote(recorder.LastWriteNote(address, bytes));
     if (elideRepeats && generation != 0) {
         constexpr std::size_t RepeatedFillsKept = 256;
         if (state->repeatedFills.size() >= RepeatedFillsKept && !state->repeatedFills.contains(address)) state->repeatedFills.clear();
@@ -3351,6 +3354,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
     GuestMemory::MarkWritten(destination, bytes);
     recorder.NotePendingWrite(destination, bytes);
+    recorder.StampNote(recorder.LastWriteNote(destination, bytes));
     // The destination's bytes after the transfer are the source's now when nothing recorded,
     // pending or still to land can change the source before the transfer reads it (a CPU store
     // to it in between is a hardware race too): the caller's ring entry carries them, stamped
@@ -3360,6 +3364,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
     recorder.NotePendingWrite(destination, bytes);
+    recorder.StampNote(recorder.LastWriteNote(destination, bytes));
     outcome.path = 1;
     return outcome;
 }
