@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4515,11 +4516,17 @@ struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
     std::uint64_t serial = 0;
+    std::array<std::atomic<std::uint64_t>, 256> stripes{};
+    std::atomic<std::uint64_t> clears{0};
 };
 
 WriteRecords& LayoutWrites() {
     static WriteRecords records;
     return records;
+}
+
+std::atomic<std::uint64_t>& LayoutStripe(WriteRecords& records, std::uint64_t address) {
+    return records.stripes[static_cast<std::size_t>(address >> 16u) % records.stripes.size()];
 }
 
 }
@@ -4535,6 +4542,7 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
+ProfileCounter layoutStoresSkipped;
 }
 
 void StorageTexture::NoteFlip() {
@@ -4545,13 +4553,32 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
 }
 
+std::uint64_t StorageTexture::LayoutStoreSkips() {
+    return layoutStoresSkipped.Sum();
+}
+
+void StorageTexture::ClearLayoutWritesForTest() {
+    auto& records = LayoutWrites();
+    std::lock_guard lock(records.mutex);
+    records.byAddress.clear();
+    records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+}
+
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    {
-        auto& records = LayoutWrites();
+    if (auto& records = LayoutWrites(); layoutStripeSerial == 0 || LayoutStripe(records, descriptor.baseAddress).load(std::memory_order_acquire) != layoutStripeSerial || records.clears.load(std::memory_order_acquire) != layoutClears) {
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        }
         records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        auto& stripe = LayoutStripe(records, descriptor.baseAddress);
+        layoutStripeSerial = stripe.load(std::memory_order_relaxed) + 1;
+        stripe.store(layoutStripeSerial, std::memory_order_release);
+        layoutClears = records.clears.load(std::memory_order_relaxed);
+    } else {
+        layoutStoresSkipped.Add(1);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
