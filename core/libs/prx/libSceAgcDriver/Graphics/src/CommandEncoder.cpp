@@ -810,6 +810,10 @@ void CommandEncoder::PostSubmit(SubmitRequest& request) noexcept {
     if (sleeping.load(std::memory_order_seq_cst)) AddressWakeOne(posted);
 }
 
+void CommandEncoder::Adopt(VkCommandBuffer commands) noexcept {
+    if (windows.empty()) recent.store(commands, std::memory_order_relaxed);
+}
+
 void CommandEncoder::SettleSubmits(SettleSite site) {
     const auto through = submitsPosted.load(std::memory_order_acquire);
     if (submitsDone.load(std::memory_order_acquire) >= through) return;

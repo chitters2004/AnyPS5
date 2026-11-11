@@ -1130,6 +1130,10 @@ endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
 target_sources(agc_driver_command_encoder_tests PRIVATE tests/AllocationFailure.cpp)
+if(Python3_Interpreter_FOUND)
+    add_test(NAME agc_encoder_bypass_sites COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_encoder_bypass_sites.py)
+    set_tests_properties(agc_encoder_bypass_sites PROPERTIES TIMEOUT 20)
+endif()
 
 if(WIN32)
     get_directory_property(agcTargets BUILDSYSTEM_TARGETS)

@@ -1574,8 +1574,43 @@ void NextBatchDoesNotWaitForTheSubmit() {
     Compare({{Handle<VkCommandBuffer>(0x8000), {"draw 1 1 0 0", "end", SubmitLine(1)}}, {Handle<VkCommandBuffer>(0x8100), {"draw 2 1 0 0"}}}, "a window on the next batch while the previous submit is posted");
 }
 
+void DirectCallsOnTheNextBatchWaitForTheHandedOffOne() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5e);
+    Settled settled;
+    std::atomic<bool> gate{false};
+    std::atomic<bool> held{false};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (held.exchange(true)) return;
+        while (!gate.load()) std::this_thread::yield();
+    });
+    bool gateOpenAtReturn = false;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto first = Handle<VkCommandBuffer>(0x8200);
+        const auto second = Handle<VkCommandBuffer>(0x8300);
+        PostOne(encoder, table, first, 1);
+        const auto request = Request(first, 1, settled);
+        encoder.PostSubmit(*request);
+        encoder.Adopt(second);
+        std::thread release([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            gate.store(true);
+        });
+        table.cmdDraw(second, 2, 1, 0, 0);
+        gateOpenAtReturn = gate.load();
+        release.join();
+        encoder.SettleSubmits();
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Require(gateOpenAtReturn, "a direct call on the next batch ran while the encoder still recorded the handed-off batch from the same pool");
+}
+
 void RunAsyncSubmit() {
     NextBatchDoesNotWaitForTheSubmit();
+    DirectCallsOnTheNextBatchWaitForTheHandedOffOne();
     for (std::uint32_t seed = 1; seed <= 4; ++seed) AsyncSubmitsFollowTheirChunks(seed, seed % 2 == 0);
     AFailedSubmitIsSticky(SubmitFailure::Injected);
     AFailedSubmitIsSticky(SubmitFailure::DeviceLost);

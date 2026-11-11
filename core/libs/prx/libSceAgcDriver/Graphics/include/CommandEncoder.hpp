@@ -100,6 +100,7 @@ public:
     bool Direct() noexcept;
     void Settle() noexcept;
     void PostSubmit(SubmitRequest& request) noexcept;
+    void Adopt(VkCommandBuffer commands) noexcept;
     void SettleSubmits(SettleSite site = SettleSite::Other);
     [[noreturn]] static void RefuseForeignProducer();
     bool OpenOnThisThread() const { return target.load(std::memory_order_acquire) != VK_NULL_HANDLE && owner.load(std::memory_order_relaxed) == std::this_thread::get_id(); }

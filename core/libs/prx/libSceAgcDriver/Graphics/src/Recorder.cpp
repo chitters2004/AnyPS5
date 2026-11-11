@@ -1525,7 +1525,7 @@ std::uint64_t Recorder::RecordedWorkSinceSubmit() {
 }
 
 bool Recorder::NoteGuestWork(VkCommandBuffer commands) {
-    if (open == nullptr || open->commands != commands) return false;
+    if (open == nullptr || !open->commands.Same(commands)) return false;
     open->guestWork = true;
     return true;
 }
@@ -1903,7 +1903,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
 
 bool Recorder::BeginEncoding() {
     if (encoder == nullptr || open == nullptr) return false;
-    encoder->Open(open->commands, open->recording);
+    encoder->Open(open->commands.Get(BatchCommands::Use::Handoff), open->recording);
     return true;
 }
 
@@ -1932,7 +1932,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         return {commands, false, true, reason};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false, PassBreak::Continued};
+    if (hazard == PassHazard::None && pass.key == key) return {open->commands.Get(BatchCommands::Use::Interposed), true, false, PassBreak::Continued};
     const auto reason = PassBreakFor(hazard);
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
@@ -1964,7 +1964,7 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
 }
 
 void Recorder::RecordPassStartBarrier(VkCommandBuffer commands) {
-    Require(open != nullptr && open->commands == commands && !open->renderPass.open, "a pass start barrier is recorded outside the open batch or inside its render pass");
+    Require(open != nullptr && open->commands.Same(commands) && !open->renderPass.open, "a pass start barrier is recorded outside the open batch or inside its render pass");
     auto mask = PassStartBarrier;
     if (open->owing) {
         mask.srcStage |= open->owed.srcStage;
@@ -1988,7 +1988,7 @@ void Recorder::settleOwed() {
     if (open == nullptr || !open->owing) return;
     open->owing = false;
     open->owesPassEnd = false;
-    recordBarrier(open->commands, open->owed.srcStage, open->owed.dstStage, open->owed.srcAccess, open->owed.dstAccess);
+    recordBarrier(open->commands.Get(BatchCommands::Use::Interposed), open->owed.srcStage, open->owed.dstStage, open->owed.srcAccess, open->owed.dstAccess);
     CountBarriers(open->owedClass);
     passEndsSettled.fetch_add(1, std::memory_order_relaxed);
 }
@@ -2011,7 +2011,7 @@ void Recorder::OweTrailingBarrier(const BarrierMask& mask, CommandClass which) {
         oweBarrier(mask, which, false);
         return;
     }
-    recordBarrier(open->commands, mask.srcStage, mask.dstStage, mask.srcAccess, mask.dstAccess);
+    recordBarrier(open->commands.Get(BatchCommands::Use::Interposed), mask.srcStage, mask.dstStage, mask.srcAccess, mask.dstAccess);
     CountBarriers(which);
 }
 
@@ -2127,9 +2127,10 @@ void Recorder::beginBatch() {
             {
                 if (!handedOff) quiesce();
                 std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
-                Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+                Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, batch->commands.Slot(BatchCommands::Use::Lifetime)), "vkAllocateCommandBuffers recorder");
             }
             batch->pool = allocation.commandPool;
+            if (encoder != nullptr) encoder->Adopt(batch->commands.Get(BatchCommands::Use::Handoff));
             if (!spare.empty()) {
                 batch->fence = spare.back();
                 spare.pop_back();
@@ -2141,7 +2142,7 @@ void Recorder::beginBatch() {
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             {
                 std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
-                Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+                Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands.Get(BatchCommands::Use::Lifetime), &begin), "vkBeginCommandBuffer recorder");
             }
         } catch (...) {
             release(*batch);
@@ -2828,7 +2829,7 @@ std::uint64_t Recorder::SamplesTotal() {
 void Recorder::NoteSampledDraw(VkCommandBuffer commands) {
     if (open == nullptr) return;
     if (segmentMode()) {
-        if (countingSamples && commands == open->commands && !open->segmentActive) beginSegment(*open);
+        if (countingSamples && open->commands.Same(commands) && !open->segmentActive) beginSegment(*open);
         return;
     }
     if (open->sampleActive) open->samplesDrawn = true;
@@ -3050,20 +3051,20 @@ void Recorder::takeSegmentPool(Batch& batch) {
         throw;
     }
     batch.segmentNext = 0;
-    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.segments, 0, SegmentSlots);
+    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.segments, 0, SegmentSlots);
 }
 
 void Recorder::beginSegment(Batch& batch) {
     if (!queriesEncoded) quiesce();
     Require(batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots, "an occlusion segment begins without a reset query slot");
     batch.segmentSlot = batch.segmentNext++;
-    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
+    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands.Get(queriesEncoded ? BatchCommands::Use::Interposed : BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.segmentActive = true;
 }
 
 void Recorder::endSegment(Batch& batch) {
     if (!queriesEncoded) quiesce();
-    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.segments, batch.segmentSlot);
+    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands.Get(queriesEncoded ? BatchCommands::Use::Interposed : BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot);
     batch.segmentActive = false;
     pendingSamples.push_back({batch.segmentPool, batch.segments, batch.segmentSlot});
     ++batch.ownSamples;
@@ -3157,7 +3158,7 @@ void Recorder::foldSegments() {
 void Recorder::endSamples(Batch& batch) {
     if (!batch.sampleActive) return;
     quiesce();
-    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands, batch.samples, 0);
+    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.samples, 0);
     batch.sampleActive = false;
     if (sampleCounterState > 0 && batch.samplesDrawn) {
         pendingSamples.push_back({batch.samplePool, batch.samples});
@@ -3169,7 +3170,7 @@ void Recorder::endSamples(Batch& batch) {
 void Recorder::foldSamples(Batch& batch, VkDeviceAddress target) {
     quiesce();
     reserveMore(batch.foldedSamples, pendingSamples.size());
-    const auto commands = batch.commands;
+    const auto commands = batch.commands.Get(BatchCommands::Use::Quiesced);
     const auto copy = function(cmdCopyQueryPoolResults, "vkCmdCopyQueryPoolResults");
     const auto bind = function(cmdBindPipeline, "vkCmdBindPipeline");
     const auto push = function(cmdPushConstants, "vkCmdPushConstants");
@@ -3372,8 +3373,8 @@ void Recorder::beginSamples(Batch& batch) {
             throw;
         }
     }
-    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands, batch.samples, 0, 1);
-    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands, batch.samples, 0, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
+    function(cmdResetQueryPool, "vkCmdResetQueryPool")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.samples, 0, 1);
+    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.samples, 0, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.sampleActive = true;
     batch.samplesDrawn = false;
 }
@@ -4623,7 +4624,7 @@ void Recorder::dispatchAsync(std::unique_ptr<Batch>& batch, const std::string& t
         }
     }
     CaptureTrace::Log("submit batch=%llu tokens=%s", static_cast<unsigned long long>(serial), tokens.c_str());
-    request->commands = batch->commands;
+    request->commands = batch->commands.Get(BatchCommands::Use::Handoff);
     request->queue = context.queue;
     request->fence = batch->fence;
     request->timeline = timeline;
@@ -4814,11 +4815,11 @@ void Recorder::Submit() {
         encoder->FinishBatch();
         batch->recording.Finish();
     }
-    Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands.Get(BatchCommands::Use::Lifetime)), "vkEndCommandBuffer recorder");
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    submission.pCommandBuffers = batch->commands.Slot(BatchCommands::Use::Lifetime);
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     if (CheckpointMarkersEnabled() && batch->queue == 0 && batch->predictedSerial != 0) {
@@ -5535,12 +5536,12 @@ void Recorder::release(Batch& batch) noexcept {
     batch.segmentPool.reset();
     batch.foldedSamples.clear();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (batch.commands != VK_NULL_HANDLE) {
+    if (!batch.commands.Empty()) {
         std::unique_lock poolLock = encoder != nullptr ? std::unique_lock(encoder->PoolMutex()) : std::unique_lock<AgcDriver::Mutex>();
-        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, batch.pool != VK_NULL_HANDLE ? batch.pool : context.pool, 1, &batch.commands);
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, batch.pool != VK_NULL_HANDLE ? batch.pool : context.pool, 1, batch.commands.Slot(BatchCommands::Use::Lifetime));
         if (profile) commandBuffersFreed.fetch_add(1, std::memory_order_relaxed);
     }
-    batch.commands = VK_NULL_HANDLE;
+    batch.commands.Clear();
     if (batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
         try {
             spare.push_back(batch.fence);
