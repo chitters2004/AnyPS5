@@ -3252,6 +3252,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
+    open->writeStamped.push_back(0);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
@@ -3281,6 +3282,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // moves as well, so a poller re-consults the label table for a completion label.
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
+    batch.writeStamped.push_back(0);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
@@ -3341,7 +3343,40 @@ void Recorder::NoteStampedWrites(std::span<const std::pair<std::uint64_t, std::u
     const auto first = writeNoteCount + 1;
     NotePendingWrites(ranges);
     if (open == nullptr) return;
-    for (auto note = first; note <= writeNoteCount; ++note) open->stampedNotes.push_back(note);
+    for (auto index = open->writeNotes.size(); index-- != 0 && open->writeNotes[index] >= first;) open->writeStamped[index] = 1;
+}
+
+void Recorder::StampNote(std::uint64_t note) {
+    if (note == 0 || open == nullptr) return;
+    for (auto index = open->writeNotes.size(); index-- != 0 && open->writeNotes[index] >= note;) {
+        if (open->writeNotes[index] != note) continue;
+        open->writeStamped[index] = 1;
+        return;
+    }
+}
+
+bool Recorder::UnfinishedStampedBlocks(std::uint64_t spanBegin, std::span<std::uint8_t> blocks) const {
+    constexpr std::uint64_t block = 65536;
+    const auto spanEnd = spanBegin + blocks.size() * block;
+    bool any = false;
+    const auto mark = [&](const Batch& batch) {
+        for (std::size_t index = 0; index < batch.writes.size(); ++index) {
+            if (index >= batch.writeStamped.size() || batch.writeStamped[index] == 0) continue;
+            const auto begin = std::max(batch.writes[index].first, spanBegin);
+            const auto end = std::min(batch.writes[index].second, spanEnd);
+            if (begin >= end) continue;
+            for (auto at = (begin - spanBegin) / block; at <= (end - 1 - spanBegin) / block; ++at) blocks[static_cast<std::size_t>(at)] = 1;
+            any = true;
+        }
+    };
+    if (open != nullptr) mark(*open);
+    for (const auto& batch : inFlight) {
+        if (!signaled(*batch)) mark(*batch);
+    }
+    for (const auto* batch : finishing) {
+        if (!signaled(*batch)) mark(*batch);
+    }
+    return any;
 }
 
 void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions) const {
@@ -3429,14 +3464,15 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
     return 0;
 }
 
-std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const {
-    if (exceptNotes.empty()) return PendingWriterSerial(address, bytes);
+std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes, bool skipStamped) const {
+    if (exceptNotes.empty() && !skipStamped) return PendingWriterSerial(address, bytes);
     if (bytes == 0) return 0;
     const auto end = address + bytes;
     const auto writes = [&](const Batch& batch) {
         for (std::size_t index = 0; index < batch.writes.size(); ++index) {
             const auto& [begin, finish] = batch.writes[index];
             if (address >= finish || begin >= end) continue;
+            if (skipStamped && index < batch.writeStamped.size() && batch.writeStamped[index] != 0) continue;
             if (index < batch.writeNotes.size() && std::find(exceptNotes.begin(), exceptNotes.end(), batch.writeNotes[index]) != exceptNotes.end()) continue;
             return true;
         }
@@ -3472,18 +3508,6 @@ bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) con
         if (overlaps(*batch, address, end) && !signaled(*batch)) return false;
     }
     return true;
-}
-
-std::vector<std::uint64_t> Recorder::StampedNotesSince(std::uint64_t note) const {
-    std::vector<std::uint64_t> notes;
-    const auto collect = [&](const Batch& batch) {
-        for (const auto stamped : batch.stampedNotes) {
-            if (stamped > note) notes.push_back(stamped);
-        }
-    };
-    for (const auto& batch : inFlight) collect(*batch);
-    if (open != nullptr) collect(*open);
-    return notes;
 }
 
 std::uint64_t Recorder::LastWriteNote(std::uint64_t address, std::size_t bytes) const {

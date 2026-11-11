@@ -4633,7 +4633,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         if (!flush.empty()) BumpPendingSerial();
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
-            ownNotes.insert(ownNotes.end(), texture->flushNotes.begin(), texture->flushNotes.end());
         }
     }
     if (flush.empty()) {
@@ -4690,7 +4689,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 }
                 for (const auto& [begin, end] : stored) {
                     if (writer == active.OpenSerial()) break;
-                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes));
+                    writer = std::max(writer, active.PendingWriterSerial(begin, static_cast<std::size_t>(end - begin), ownNotes, true));
                 }
                 return writer;
             };
@@ -4714,8 +4713,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             throw;
         }
     }
-    const auto* noting = Recorder::Active();
-    const auto firstNote = noting != nullptr ? noting->WriteNoteCount() : 0;
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
     for (const auto& texture : flush) {
@@ -4735,15 +4732,6 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         const auto units = PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited);
         if (units != 0) waitForIdlePublish(reason);
         if (published != nullptr) *published = units != 0;
-    }
-    if (flush.size() == 1 && noting != nullptr && noting == Recorder::Active()) {
-        if (const auto notes = noting->StampedNotesSince(firstNote); !notes.empty()) {
-            auto& pending = Pending();
-            std::lock_guard lock(pending.mutex);
-            auto& own = flush.front()->flushNotes;
-            own.insert(own.end(), notes.begin(), notes.end());
-            if (own.size() > 32) own.erase(own.begin(), own.end() - 32);
-        }
     }
     return true;
 }
@@ -6675,6 +6663,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<std::uint8_t> cpuBlocks(drawn.drawn ? spanBlocks : 0);
     const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks, cpuBlocks);
     std::vector<bool> compared(trackedLayers, false);
+    std::vector<std::uint8_t> unfinishedStamps(spanBlocks);
+    auto* stampingRecorder = Recorder::Active();
+    const bool stampsUnfinished = tracked && stampingRecorder != nullptr && stampingRecorder->UnfinishedStampedBlocks(spanBegin, unfinishedStamps);
     if (!tracked) {
         awaitStoredSave(&layers);
         std::vector<bool> saved(trackedLayers, false);
@@ -6695,6 +6686,22 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     };
     bool unsavedOutsideWatch = false;
     std::string unsavedCause;
+    static const bool verifyKeep = std::getenv("APS5_LABEL_STORE_VERIFY") != nullptr;
+    struct KeepDecision {
+        std::uint64_t at;
+        std::uint64_t from;
+        std::uint64_t to;
+        std::uint32_t layer;
+        bool kept;
+        bool unknown;
+        bool written;
+    };
+    std::vector<KeepDecision> decisions;
+    const auto blockWritten = [&](const KeepDecision& entry, std::span<const std::uint8_t> changed, bool forgivable) {
+        const bool edge = entry.from != entry.at || entry.to != entry.at + block;
+        const auto index = static_cast<std::size_t>((entry.at - spanBegin) / block);
+        return entry.kept || entry.unknown || (changed[index] == GuestMemory::BlockWritten && (compared[entry.layer] || !edge || GuestMemory::StoredOver(entry.from, static_cast<std::size_t>(entry.to - entry.from), unitBlockGeneration(entry.layer, entry.at))) && !(forgivable && cpuLeftUnchanged(entry.layer, entry.from, entry.to, edge)));
+    };
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
         const auto begin = layerBegin(layer);
@@ -6710,10 +6717,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto from = std::max(at, begin);
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
-            const bool edge = from != at || to != at + block;
             const auto index = static_cast<std::size_t>((at - spanBegin) / block);
-            const bool kept = keptAtUnwatchHolds(from, layer);
-            const bool written = kept || unknown || (changedBlocks[index] == GuestMemory::BlockWritten && (compared[layer] || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), unitBlockGeneration(layer, at))) && !cpuLeftUnchanged(layer, from, to, edge));
+            KeepDecision decision{at, from, to, layer, keptAtUnwatchHolds(from, layer), unknown, false};
+            decision.written = blockWritten(decision, changedBlocks, unfinishedStamps[index] == 0);
+            if (verifyKeep && stampsUnfinished) decisions.push_back(decision);
+            const bool kept = decision.kept;
+            const bool written = decision.written;
             if (written && (!drawn.rect || (tracked && !kept && !unknown && cpuBlocks[index] == 0))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
@@ -6724,6 +6733,28 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (written && drawn.rect) skippedLayer[layer] = true;
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
             else keep.emplace_back(from, to);
+        }
+    }
+    if (!decisions.empty() && !Recorder::InCompletion()) {
+        const auto spanBytes = static_cast<std::size_t>(lastStored - firstStored);
+        std::vector<std::uint8_t> before(spanBlocks), cpuBefore(spanBlocks), after(spanBlocks), cpuAfter(spanBlocks);
+        GuestMemory::ChangedBlocks(firstStored, spanBytes, generations, before, cpuBefore);
+        Recorder::CountSync(1);
+        stampingRecorder->Sync();
+        GuestMemory::CollectWritesUncached(firstStored, spanBytes);
+        GuestMemory::ChangedBlocks(firstStored, spanBytes, generations, after, cpuAfter);
+        for (const auto& decision : decisions) {
+            const auto index = static_cast<std::size_t>((decision.at - spanBegin) / block);
+            if (cpuAfter[index] != cpuBefore[index]) continue;
+            const bool waited = blockWritten(decision, after, true);
+            if (waited == decision.written) continue;
+            if (decision.written && unfinishedStamps[index] != 0 && blockWritten(decision, after, false)) {
+                std::fprintf(stderr, "[flush] APS5_LABEL_STORE_VERIFY: image 0x%llx+0x%llx block 0x%llx kept for a newer stamped writer whose bytes equal the image's baseline; the wait would have stored the image's texels over them\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(decision.from));
+                continue;
+            }
+            char message[256];
+            std::snprintf(message, sizeof(message), "APS5_LABEL_STORE_VERIFY: storage image 0x%llx+0x%llx unit %u block 0x%llx is %s without waiting for its stamped writers and %s after the wait", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), decision.layer, static_cast<unsigned long long>(decision.from), decision.written ? "kept" : "stored", waited ? "kept" : "stored");
+            throw std::runtime_error(message);
         }
     }
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
