@@ -1397,6 +1397,24 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+bool DrawPlanShadow() {
+    static const bool shadow = std::getenv("APS5_DRAW_PLAN_SHADOW") != nullptr;
+    return shadow;
+}
+
+namespace {
+
+std::shared_ptr<const DrawRecipe>& DrawPlanShadowSlot() {
+    thread_local std::shared_ptr<const DrawRecipe>* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+}
+
+std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision() {
+    return std::exchange(DrawPlanShadowSlot(), nullptr);
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -3788,8 +3806,11 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples()) {
+        const bool servable = DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && resolved.moved.empty() && !multisampled && !pipeline->ReordersSamples();
+        if (recipeOut != nullptr && (servable || DrawPlanShadow())) {
             auto recipe = std::make_shared<DrawRecipe>();
+            recipe->servable = servable;
+            recipe->movedBases = static_cast<std::uint32_t>(resolved.moved.size());
             recipe->device = context.device;
             recipe->templateRef = resources;
             recipe->key = contentKey;
@@ -3808,7 +3829,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->fragmentOutputs = inputs.fragmentOutputs;
             recipe->shaderStages = inputs.shaderStages;
             recipe->hasDepth = state.depth.has_value();
-            *recipeOut = std::move(recipe);
+            if (servable) *recipeOut = std::move(recipe);
+            else DrawPlanShadowSlot() = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
