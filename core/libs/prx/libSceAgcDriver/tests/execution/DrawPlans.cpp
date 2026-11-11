@@ -553,6 +553,10 @@ void PlansBindTheirOwnTargets() {
         const auto unexpected = static_cast<std::uint8_t>(AgcDriver::Graphics::PlanMismatchShape | AgcDriver::Graphics::PlanMismatchDepth | (trimmed ? AgcDriver::Graphics::PlanMismatchTemplate : 0u));
         Expect(sum(DrawPlanCount::InstanceMismatchSets, 32, unexpected) == 0, trimmed ? "the another-instance miss into another render target counted a shape, template or depth mismatch" : "the another-instance miss into another render target counted a shape or depth mismatch");
         Expect(sum(DrawPlanCount::LookupDistances, PlanLookupDistanceBucketsForTest, 0) >= 1, "repeated plan lookups were not counted by lookup distance");
+        if (ownAttachments) {
+            Expect(counts[DrawPlanCount::OwnTargetsNanoseconds] != 0 && counts[DrawPlanCount::OwnFramebufferNanoseconds] != 0, "the own-attachment hit charged no time to resolving its targets or acquiring its framebuffer");
+            std::printf("I7 own-attachment hit (APS5_PROFILE_DRAW): %.2f us resolving targets, %.2f us acquiring the framebuffer\n", static_cast<double>(counts[DrawPlanCount::OwnTargetsNanoseconds]) / 1e3, static_cast<double>(counts[DrawPlanCount::OwnFramebufferNanoseconds]) / 1e3);
+        }
     }
     Expect(Pixels(firstPlanned) == Pixels(firstFull), "the plan's own target differs from the full path's");
     Expect(Pixels(secondPlanned) == Pixels(secondFull), "the other target differs from the full path's");

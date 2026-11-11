@@ -562,7 +562,11 @@ bool Driver::serveDrawPlan(const std::shared_ptr<VulkanDevice>& device, const Dr
             drawPlanCounters.Add(DrawPlanCount::RebasedBuffers, outcome.movedBuffers);
         }
         if (outcome.templateInstance) drawPlanCounters.Add(DrawPlanCount::TemplateInstanceHits);
-        if (outcome.ownAttachments) drawPlanCounters.Add(DrawPlanCount::OwnAttachmentHits);
+        if (outcome.ownAttachments) {
+            drawPlanCounters.Add(DrawPlanCount::OwnAttachmentHits);
+            drawPlanCounters.Add(DrawPlanCount::OwnTargetsNanoseconds, outcome.ownTargetsNs);
+            drawPlanCounters.Add(DrawPlanCount::OwnFramebufferNanoseconds, outcome.ownFramebufferNs);
+        }
         if (outcome.ownRecipe != nullptr) {
             drawPlanCounters.Add(DrawPlanCount::OwnRecipes);
             attachable = std::move(outcome.ownRecipe);
