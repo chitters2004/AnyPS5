@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -2416,6 +2417,9 @@ std::atomic<int> flushFailureFiredForTest{0};
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    const auto callerPhase = CurrentCommitPhase();
+    const bool targetPhase = callerPhase == CommitPhase::TargetsRefresh || callerPhase == CommitPhase::TargetsLookup;
+    const CommitPhaseScope provedPhase(targetPhase ? CommitPhase::TargetsProved : callerPhase);
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
@@ -2425,8 +2429,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
+        CountCommit(targetPhase ? CommitCounter::TargetRefreshEpoch : CommitCounter::OtherRefreshEpoch);
         return true;
     }
+    if (targetPhase) CountCommit(epoch == 0 ? CommitCounter::TargetEpochOff : provedEpoch.load(std::memory_order_relaxed) != epoch ? CommitCounter::TargetEpochMoved : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? CommitCounter::TargetEpochProofMoved : CommitCounter::TargetEpochPendingMoved);
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -2442,8 +2448,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile && keyProof.pendingNote != 0) refreshesProvedPendingKeys.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
+        CountCommit(targetPhase ? CommitCounter::TargetRefreshProved : CommitCounter::OtherRefreshProved);
         return true;
     }
+    CountCommit(targetPhase ? CommitCounter::TargetRefreshSlow : CommitCounter::OtherRefreshSlow);
+    if (targetPhase) RelabelCommitPhase(CommitPhase::TargetsRefresh);
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
