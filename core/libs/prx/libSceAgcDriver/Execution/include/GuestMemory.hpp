@@ -78,9 +78,30 @@ void SetFreshCollectHook(FreshCollectHook hook);
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
+enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
+enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Count };
+constexpr std::uint32_t WriteChangeBit(WriteChange change) {
+    return std::uint32_t{1} << static_cast<unsigned>(change);
+}
+constexpr std::uint32_t WriteChangeAll = WriteChangeBit(WriteChange::Bytes) | WriteChangeBit(WriteChange::Authority) | WriteChangeBit(WriteChange::Capability) | WriteChangeBit(WriteChange::Identity);
+WriteChange WriteChangeOf(WriteBumpSource source);
+enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, Count };
+constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
+    return std::uint32_t{1} << static_cast<unsigned>(domain);
+}
+struct WriteCertificate {
+    std::uint64_t version = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
+};
 bool WriteIndexEnabled();
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
+std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
+std::uint64_t DomainVersion(WriteDomain domain);
+WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
+bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
+using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
+void SetWriteBackingResolver(WriteBackingResolver resolver);
 std::span<const std::pair<std::uint64_t, std::uint64_t>> SubscriptionSpans(const WriteSubscription& subscription);
 bool SweepSubscription(const WriteSubscription& subscription);
 bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t generation, std::vector<std::uint64_t>& blocks, std::vector<std::uint64_t>& lookupBlocks);
@@ -88,7 +109,6 @@ void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t genera
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
-enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
 struct WriteIndexStats {
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
