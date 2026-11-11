@@ -39,6 +39,10 @@ bool pipelineStats() {
     static const bool enabled = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return enabled;
 }
+std::atomic<std::uint64_t> decodedDraws{0};
+std::atomic<std::uint64_t> nullPixelDraws{0};
+std::array<std::atomic<std::uint64_t>, DrawPipeline::NullPixelKindCount> nullPixelKinds{};
+constexpr std::array<const char*, DrawPipeline::NullPixelKindCount> NullPixelKindNames{"rect-list", "DB depth clear", "DB stencil clear", "depth write", "stencil test", "no depth target", "indirect"};
 
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
@@ -495,6 +499,15 @@ void DrawPipeline::Enqueue(CommitKind kind, Commit commit, std::vector<Range> wr
     enqueue({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), draw, false, kind});
 }
 
+void DrawPipeline::NoteDecodedDraw(bool nullPixel, std::uint32_t kinds) {
+    decodedDraws.fetch_add(1, std::memory_order_relaxed);
+    if (!nullPixel) return;
+    nullPixelDraws.fetch_add(1, std::memory_order_relaxed);
+    for (std::uint32_t bit = 0; bit < NullPixelKindCount; ++bit) {
+        if ((kinds & (1u << bit)) != 0) nullPixelKinds[bit].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
     constexpr std::size_t RecentSlots = 4096;
     thread_local std::array<std::uint64_t, RecentSlots> recent{};
@@ -672,6 +685,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()));
+    std::string nullPixelText;
+    for (std::size_t i = 0; i < NullPixelKindCount; ++i) {
+        char item[64];
+        std::snprintf(item, sizeof(item), "%s %s %llu", i == 0 ? "" : ",", NullPixelKindNames[i], static_cast<unsigned long long>(nullPixelKinds[i].exchange(0, std::memory_order_relaxed)));
+        nullPixelText += item;
+    }
+    const auto inert = Graphics::TakeInertFragmentCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[nullpixel] (10 s): %llu of %llu decoded draws run the null pixel program; of them%s; draws recorded with an inert fragment program: %llu without the fragment stage, %llu with it\n", static_cast<unsigned long long>(nullPixelDraws.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodedDraws.exchange(0, std::memory_order_relaxed)), nullPixelText.c_str(), static_cast<unsigned long long>(inert.omitted), static_cast<unsigned long long>(inert.kept));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};

@@ -62,6 +62,10 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(VkDrawKind::Coun
 void CountVkDraw(VkDrawKind kind) {
     vkDrawCounts[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
+std::array<std::atomic<std::uint64_t>, 2> inertFragmentCounts{};
+void CountInertFragment(const Pipeline& pipeline) {
+    if (pipeline.InertFragmentStage()) inertFragmentCounts[pipeline.FragmentStageOmitted() ? 0u : 1u].fetch_add(1, std::memory_order_relaxed);
+}
 
 
 bool DrawFaultTokens() {
@@ -3232,12 +3236,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     auto eachDrawTiming = Recorder::NoTiming;
     if (timeEachDraw) {
         std::uint64_t key = 0;
+        const bool byFragment = !record.pipeline->InertFragmentStage();
         for (const auto& shader : shaders) {
-            if (shader.program != nullptr && (key == 0 || shader.stage == ShaderRecompiler::ShaderStage::Fragment)) key = shader.program->variantId;
+            if (shader.program != nullptr && (key == 0 || (byFragment && shader.stage == ShaderRecompiler::ShaderStage::Fragment))) key = shader.program->variantId;
         }
         eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
     }
     noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
+    CountInertFragment(*record.pipeline);
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
@@ -4268,6 +4274,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     std::uint32_t subdraw = 0;
     if (recorded) noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), args);
+    CountInertFragment(*pipeline);
     if (stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, prepared.trace, subdraw);
     else {
         recordStencilReplay(context, commands, state, draw, inputs, stencilReplay, shaders, *resources);
@@ -4885,6 +4892,10 @@ bool CommitTrims() {
     return DrawPipelineEnabled();
 }
 
+
+InertFragmentCounts TakeInertFragmentCounts() {
+    return {inertFragmentCounts[0].exchange(0, std::memory_order_relaxed), inertFragmentCounts[1].exchange(0, std::memory_order_relaxed)};
+}
 
 VkDrawCounts TakeVkDrawCounts() {
     VkDrawCounts counts;

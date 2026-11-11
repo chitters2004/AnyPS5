@@ -300,6 +300,23 @@ bool EmptyIndirectSkip() {
     return enabled;
 }
 
+void noteDecodedDraw(const QueueState& queue, const Graphics::State& graphics, const std::vector<DrawProgram>& programs, const Pm4::DrawParameters& parameters) {
+    const bool nullPixel = std::ranges::any_of(programs, [](const DrawProgram& program) { return program.nullPixel; });
+    std::uint32_t kinds = 0;
+    if (nullPixel) {
+        const auto control = queue.context.find(0x000u);
+        const auto renderControl = control == queue.context.end() ? 0u : control->second;
+        if (graphics.rectList) kinds |= DrawPipeline::NullPixelRectList;
+        if ((renderControl & 1u) != 0) kinds |= DrawPipeline::NullPixelDepthClear;
+        if ((renderControl & 2u) != 0) kinds |= DrawPipeline::NullPixelStencilClear;
+        if (graphics.depthWrite) kinds |= DrawPipeline::NullPixelDepthWrite;
+        if (graphics.stencilTest) kinds |= DrawPipeline::NullPixelStencilTest;
+        if (!graphics.depth) kinds |= DrawPipeline::NullPixelNoDepthTarget;
+        if (parameters.indirect) kinds |= DrawPipeline::NullPixelIndirect;
+    }
+    DrawPipeline::NoteDecodedDraw(nullPixel, kinds);
+}
+
 struct CpuIndirectProgramsStorage {};
 
 std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
@@ -528,6 +545,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     for (const auto& patch : userPatches) writablePrograms[patch.program].userData[patch.index] = patch.value;
     tail.programs = writesPrograms ? &writablePrograms : &decode->programs;
     const auto& programs = *tail.programs;
+    noteDecodedDraw(queue, graphics, programs, drawParameters);
     if (std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return SkippedShader(program.binary.codeAddress); })) return drawn();
     const bool emptyIndirectSkip = EmptyIndirectSkip();
     auto& cpuIndirectPrograms = CpuIndirectPrograms();

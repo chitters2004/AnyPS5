@@ -22,6 +22,12 @@ struct VkDrawCounts {
 };
 VkDrawCounts TakeVkDrawCounts();
 
+struct InertFragmentCounts {
+    std::uint64_t omitted = 0;
+    std::uint64_t kept = 0;
+};
+InertFragmentCounts TakeInertFragmentCounts();
+
 struct HostImport;
 
 struct DrawTraceContext {

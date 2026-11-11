@@ -1022,11 +1022,22 @@ struct ResultKeyShape {
     mutable AtomicSharedPtr<const Static> words;
 };
 
+struct ResultFlagMemo {
+    mutable std::atomic<std::uint8_t> state{0};
+    ResultFlagMemo() = default;
+    ResultFlagMemo(const ResultFlagMemo&) {}
+    ResultFlagMemo& operator=(const ResultFlagMemo&) {
+        state.store(0, std::memory_order_relaxed);
+        return *this;
+    }
+};
+
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     ResultKeyMemo planKeyMemo;
     std::shared_ptr<const ResultKeyShape> keyShape;
     IdentityMemo identityMemo;
+    ResultFlagMemo inertFragmentMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
