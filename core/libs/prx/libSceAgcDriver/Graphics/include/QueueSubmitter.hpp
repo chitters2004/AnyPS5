@@ -69,6 +69,9 @@ public:
         std::shared_ptr<EncodeTicket> encode;
         std::shared_ptr<SubmitFailures> failures;
         std::shared_ptr<SubmitOutcome> outcome;
+        // The failures reported when the job was queued (set by Enqueue): a failure raised after that
+        // is one this job was queued behind, whether or not it has been reported since.
+        std::uint64_t reportedAtQueue = 0;
     };
 
     static bool Enabled();

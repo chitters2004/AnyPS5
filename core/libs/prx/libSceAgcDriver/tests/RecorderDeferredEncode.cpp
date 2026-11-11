@@ -717,6 +717,43 @@ void BatchesBehindAFailureAreNotSubmitted() {
     }
 }
 
+void ReportingAFailureDoesNotReleaseTheBatchesQueuedBehindIt() {
+    RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::DeferredEncode, true);
+    Fixture fixture;
+    {
+        const Watchdog watchdog("a batch queued behind a failure that was reported meanwhile");
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(fixture.context);
+        {
+            std::lock_guard lock(fixture.device.mutex);
+            fixture.device.failSubmits = 1;
+        }
+        fixture.Fill(recorder, 1);
+        recorder.Submit();
+        {
+            std::unique_lock lock(fixture.device.mutex);
+            fixture.device.changed.wait(lock, [&] { return fixture.device.failedSubmitCalls == 1; });
+            fixture.device.gate = true;
+        }
+        fixture.Fill(recorder, 2);
+        recorder.Submit();
+        Expect(!Reported([&] { recorder.Sync(); }).empty(), "the failed batch was not reported");
+        {
+            std::lock_guard lock(fixture.device.mutex);
+            fixture.device.gateOpen = true;
+        }
+        fixture.device.changed.notify_all();
+        fixture.Drain();
+        Expect(fixture.Submissions().empty(), "a batch queued behind a failure ran once the failure had been reported");
+        Expect(!Reported([&] { recorder.Sync(); }).empty(), "the batch queued behind the failure was not reported");
+        fixture.Fill(recorder, 3);
+        recorder.Sync();
+        const auto submissions = fixture.Submissions();
+        Expect(submissions.size() == 1 && joined(submissions[0].recorded) == "[fill 3]", "the batch queued after the reported failure was not submitted");
+    }
+}
+
 void TimelineWaitsGiveUpOnAFailedBatch() {
     RuntimeSwitches::Assign(RuntimeSwitch::AsyncSubmit, true);
     for (const bool deferred : {true, false}) {
@@ -1211,6 +1248,7 @@ int main(int argc, char** argv) {
             SubmitWaitsForTheEncodeAndDrainWaitsForBoth();
             FailedEncodeNeverCompletes();
             FailedSubmitReachesFinish();
+            ReportingAFailureDoesNotReleaseTheBatchesQueuedBehindIt();
             TimelineWaitsGiveUpOnAFailedBatch();
             TeardownRetiresEveryBatchAfterAFailure();
             BatchesBehindAFailureAreNotSubmitted();
