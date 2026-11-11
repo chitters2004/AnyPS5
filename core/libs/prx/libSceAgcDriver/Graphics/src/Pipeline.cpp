@@ -329,6 +329,11 @@ void ValidateSampleMask(const Context& context, const State& state, std::span<co
     }
 }
 
+bool OmitsInertFragments() {
+    static const bool enabled = std::getenv("APS5_KEEP_INERT_FRAGMENT") == nullptr;
+    return enabled;
+}
+
 namespace {
 
 thread_local bool prebuilding = false;
@@ -547,11 +552,14 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || (shader.pushConstantOffset >= PipelinePushSlotBytes) == (shader.stage == ShaderRecompiler::ShaderStage::Fragment), "a stage's push constants lie outside its push constant slot");
     }
     try {
+        inertFragment = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program != nullptr && InertFragment(*shader.program); });
+        fragmentOmitted = inertFragment && OmitsInertFragments() && state.blends.empty() && !state.alphaToCoverage;
         std::vector<VkPipelineShaderStageCreateInfo> stages(shaders.size());
         std::vector<PipelineSpecialization> specializations;
         specializations.reserve(shaders.size());
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT meshSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, nullptr, 32u};
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
+            if (fragmentOmitted && shaders[i].stage == ShaderRecompiler::ShaderStage::Fragment) continue;
             const auto& shader = *shaders[i].program;
             _modules[i] = CreateShaderModule(context, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule graphics");
             const auto stage = VulkanStage(shaders[i].stage);
@@ -569,6 +577,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
                 Require(stages[i].flags == 0u && stages[i].pNext == nullptr, "stencil replay vertex stage allows varying subgroup size");
             }
         }
+        std::erase_if(stages, [](const VkPipelineShaderStageCreateInfo& stage) { return stage.module == VK_NULL_HANDLE; });
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
         const bool pixelLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
