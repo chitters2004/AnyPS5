@@ -125,6 +125,7 @@ enum class DrawVerdict { Drawn, Nothing, Rejected };
 
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const std::vector<std::byte>> push;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
     std::vector<ShaderRecompiler::MemoryRegion> regions;

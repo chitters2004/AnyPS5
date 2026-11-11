@@ -280,7 +280,9 @@ function(add_shader_recompiler target runtimeTarget)
             PublishOnce
             IdentityMemo
             VerifyIdentityMemo
+            SharedPushDonorStages
             ComputedIdentity
+            SealIdentity
             PrepareShader
             GetPreparedCode
             PreparedShaderInvocation::TryCreate

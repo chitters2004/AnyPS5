@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <cstdlib>
@@ -155,7 +156,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     timing.Mark("capture_resources");
     try {
-        stageCapture.compiled = invocation.Materialize(*capture);
+        stageCapture.push = nullptr;
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SharePushDonor)) {
+            std::vector<std::byte> push;
+            stageCapture.compiled = invocation.Materialize(*capture, &push);
+            if (!push.empty()) stageCapture.push = std::make_shared<const std::vector<std::byte>>(std::move(push));
+        } else {
+            stageCapture.compiled = invocation.Materialize(*capture);
+        }
         stageCapture.capture = capture;
     } catch (const std::exception& error) {
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
@@ -225,6 +233,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
+            variant->push = stageCapture.push;
             variant->registeredViews = stageCapture.registeredViews;
             if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
                 std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
@@ -264,17 +273,20 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 };
                 return (a.runs == b.runs && words == b.words) || flatten(a, words) == flatten(b, b.words);
             };
-            const auto sameForwardedWords = [](const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b, std::uint32_t hidden) {
-                if (a.pushConstants.size() != b.pushConstants.size() || a.shaderDataUserWords != b.shaderDataUserWords) return false;
-                for (std::size_t slot = 0; slot < a.shaderDataUserWords.size() && (slot + 1) * sizeof(std::uint32_t) <= a.pushConstants.size(); ++slot) {
-                    if (a.shaderDataUserWords[slot] >= hidden && std::memcmp(a.pushConstants.data() + slot * sizeof(std::uint32_t), b.pushConstants.data() + slot * sizeof(std::uint32_t), sizeof(std::uint32_t)) != 0) return false;
+            const auto sameForwardedWords = [](const ShaderRecompiler::RecompileResult& a, const std::vector<std::byte>* aPush, const ShaderRecompiler::RecompileResult& b, const std::vector<std::byte>* bPush, std::uint32_t hidden) {
+                const auto& aBytes = Graphics::PushBytes(a, aPush);
+                const auto& bBytes = Graphics::PushBytes(b, bPush);
+                if (aBytes.size() != bBytes.size() || a.shaderDataUserWords != b.shaderDataUserWords) return false;
+                for (std::size_t slot = 0; slot < a.shaderDataUserWords.size() && (slot + 1) * sizeof(std::uint32_t) <= aBytes.size(); ++slot) {
+                    if (a.shaderDataUserWords[slot] >= hidden && std::memcmp(aBytes.data() + slot * sizeof(std::uint32_t), bBytes.data() + slot * sizeof(std::uint32_t), sizeof(std::uint32_t)) != 0) return false;
                 }
                 return true;
             };
             if (verifyHit && matched[i] != nullptr) {
                 const auto& words = stageData[i].compiled != nullptr ? stageData[i].words : matched[i]->words;
                 const auto& compiled = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
-                if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
+                const auto* compiledPush = stageData[i].compiled != nullptr ? nullptr : matched[i]->push.get();
+                if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, compiledPush, *variant->compiled, variant->push.get(), programs[i].hiddenUserWords)) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> reports{0};
                     if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), words.size(), variant->runs.size(), variant->words.size());

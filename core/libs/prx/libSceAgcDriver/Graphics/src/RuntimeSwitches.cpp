@@ -32,6 +32,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_SHARED_VERTEX_LAYOUT",
     "APS5_CERTIFIED_PROOFS",
     "APS5_NO_CERTIFIED_PROOF_SCOPE",
+    "APS5_SHARE_PUSH_DONOR",
 };
 
 struct SwitchValues {
@@ -51,6 +52,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_SHARED_VERTEX_LAYOUT") != nullptr,
             std::getenv("APS5_CERTIFIED_PROOFS") != nullptr,
             std::getenv("APS5_NO_CERTIFIED_PROOF_SCOPE") != nullptr,
+            std::getenv("APS5_SHARE_PUSH_DONOR") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

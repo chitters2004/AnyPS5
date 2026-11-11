@@ -202,7 +202,7 @@ std::vector<std::pair<std::uint64_t, std::size_t>> DrawStageSpans(std::span<cons
     return spans;
 }
 
-const char* DrawStageMismatch(const DispatchVariant& kept, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, const ShaderRecompiler::RecompileResult& compiled) {
+const char* DrawStageMismatch(const DispatchVariant& kept, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::uint32_t> words, const ShaderRecompiler::RecompileResult& compiled, const std::vector<std::byte>* compiledPush) {
     const auto flatten = [](std::span<const std::pair<std::uint64_t, std::uint64_t>> source, std::span<const std::uint32_t> values) {
         std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
         std::size_t word = 0;
@@ -217,7 +217,7 @@ const char* DrawStageMismatch(const DispatchVariant& kept, std::span<const std::
     const bool sameBindings = memoized.bindings.size() == compiled.bindings.size() && std::equal(memoized.bindings.begin(), memoized.bindings.end(), compiled.bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; });
     if (flatten(kept.runs, kept.words) != flatten(runs, words)) return "captured words";
     if (memoized.variantId != compiled.variantId) return "variant";
-    if (memoized.pushConstants != compiled.pushConstants) return "push constants";
+    if (Graphics::PushBytes(memoized, kept.push.get()) != Graphics::PushBytes(compiled, compiledPush)) return "push constants";
     if (!sameBindings) return "bindings";
     if (memoized.parameterExports != compiled.parameterExports) return "parameter exports";
     return nullptr;
