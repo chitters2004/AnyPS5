@@ -2552,30 +2552,73 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
-std::atomic<int> releasedWalkHookCalls{0};
-std::atomic<bool> releasedWalkScanned{false};
+struct WalkGate {
+    std::atomic<bool> holdBeforeScan{false};
+    std::atomic<bool> holdAfterScan{false};
+    std::atomic<bool> throwAfterScan{false};
+    std::atomic<bool> throwInScan{false};
+    std::atomic<bool> claimed{false};
+    std::atomic<std::thread::id> walker{};
+    std::array<std::atomic<bool>, 2> held{};
+    std::array<std::atomic<bool>, 2> released{};
+};
 
-void DelayFirstReleasedWalk() {
-    if (releasedWalkHookCalls.fetch_add(1, std::memory_order_acq_rel) != 0) return;
-    releasedWalkScanned.store(true, std::memory_order_release);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+WalkGate walkGate;
+
+void GateReleasedWalk(int stage) {
+    auto& gate = walkGate;
+    const auto self = std::this_thread::get_id();
+    if (!gate.claimed.exchange(true, std::memory_order_acq_rel)) gate.walker.store(self, std::memory_order_release);
+    else if (gate.walker.load(std::memory_order_acquire) != self) return;
+    if (stage == 1 && gate.throwAfterScan.load(std::memory_order_acquire)) throw std::runtime_error("injected after the released walk's scan");
+    if (stage == 2 && gate.throwInScan.load(std::memory_order_acquire)) throw std::runtime_error("injected inside the released walk's scan");
+    if (stage == 2) return;
+    const bool hold = stage == 0 ? gate.holdBeforeScan.load(std::memory_order_acquire) : gate.holdAfterScan.load(std::memory_order_acquire);
+    if (!hold || gate.held[static_cast<std::size_t>(stage)].exchange(true, std::memory_order_acq_rel)) return;
+    while (!gate.released[static_cast<std::size_t>(stage)].load(std::memory_order_acquire)) std::this_thread::yield();
 }
 
-void RandomReleasedWalkDelay() {
-    thread_local std::uint32_t state = static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1u;
-    state ^= state << 13u;
-    state ^= state >> 17u;
-    state ^= state << 5u;
-    if (state % 4u == 0u) std::this_thread::sleep_for(std::chrono::microseconds(state % 200u));
+void ArmWalkGate(bool beforeScan, bool afterScan, bool throwAfterScan = false, bool throwInScan = false) {
+    auto& gate = walkGate;
+    gate.throwInScan.store(throwInScan, std::memory_order_release);
+    gate.holdBeforeScan.store(beforeScan, std::memory_order_release);
+    gate.holdAfterScan.store(afterScan, std::memory_order_release);
+    gate.throwAfterScan.store(throwAfterScan, std::memory_order_release);
+    gate.claimed.store(false, std::memory_order_release);
+    for (auto& flag : gate.held) flag.store(false, std::memory_order_release);
+    for (auto& flag : gate.released) flag.store(false, std::memory_order_release);
+    SetReleasedWalkHookForTest(&GateReleasedWalk);
 }
 
-void HoldFirstReleasedWalk() {
-    releasedWalkHookCalls.store(0, std::memory_order_release);
-    releasedWalkScanned.store(false, std::memory_order_release);
-    SetReleasedWalkHookForTest(&DelayFirstReleasedWalk);
+void AwaitHeldWalk(int stage) {
+    while (!walkGate.held[static_cast<std::size_t>(stage)].load(std::memory_order_acquire)) std::this_thread::yield();
 }
 
-void CheckReleasedWalkWaits() {
+void ReleaseWalk(int stage) {
+    walkGate.released[static_cast<std::size_t>(stage)].store(true, std::memory_order_release);
+}
+
+void DisarmWalkGate() {
+    ReleaseWalk(0);
+    ReleaseWalk(1);
+    SetReleasedWalkHookForTest(nullptr);
+}
+
+template <typename Collect>
+bool ReturnedWhileHeld(Collect&& collect, int stage) {
+    std::atomic<bool> done{false};
+    std::thread waiting([&] {
+        collect();
+        done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const bool early = done.load(std::memory_order_acquire);
+    ReleaseWalk(stage);
+    waiting.join();
+    return early;
+}
+
+void CheckUncachedCollectWaitsForHeldWalk() {
     SetReleasedWalksForTest(true);
     constexpr std::size_t bytes = 4 * Block;
     void* memory = AllocateWatched(bytes);
@@ -2585,17 +2628,17 @@ void CheckReleasedWalkWaits() {
     const auto before = CollectWritesUncached(base, bytes);
     Require(before != 0, "the released walk fixture was not collected");
     data[Block + 64] = 0x22;
-    HoldFirstReleasedWalk();
+    ArmWalkGate(false, true);
     std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
-    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
-    static_cast<void>(CollectWritesUncached(base, bytes));
-    const bool seen = !UnchangedSince(base, bytes, before);
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(base, bytes)); }, 1);
     walker.join();
-    SetReleasedWalkHookForTest(nullptr);
-    Require(seen, "a collect overlapping a released walk returned before that walk stamped the write it found");
+    DisarmWalkGate();
+    Require(!early, "an uncached collect overlapping a held walk returned before that walk stamped");
+    Require(!UnchangedSince(base, bytes, before), "an uncached collect after a held walk reports the write that walk found unchanged");
 }
 
-void CheckReleasedWalkWatermark() {
+void CheckGenerationsDuringHeldWalkPrecedeItsStamps() {
     SetReleasedWalksForTest(true);
     constexpr std::size_t bytes = 4 * Block;
     void* memory = AllocateWatched(bytes);
@@ -2605,18 +2648,21 @@ void CheckReleasedWalkWatermark() {
     std::memset(memory, 0x11, bytes);
     Require(CollectWritesUncached(base, bytes) != 0, "the watermark fixture was not collected");
     data[2 * Block + 64] = 0x33;
-    HoldFirstReleasedWalk();
+    ArmWalkGate(false, true);
     std::thread walker([&] { static_cast<void>(CollectWritesUncached(walked, 2 * Block)); });
-    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
+    AwaitHeldWalk(1);
     BumpCollectEpoch();
     static_cast<void>(CollectWrites(base, Block));
-    const auto held = CollectWrites(base, Block);
+    const auto fromMemo = CollectWrites(base, Block);
+    const auto fromUncached = CollectWritesUncached(base, Block);
+    ReleaseWalk(1);
     walker.join();
-    SetReleasedWalkHookForTest(nullptr);
-    Require(!UnchangedSince(walked, 2 * Block, held), "a write a released walk found was stamped no newer than a generation handed out while it walked");
+    DisarmWalkGate();
+    Require(!UnchangedSince(walked, 2 * Block, fromMemo), "a write a held walk found was stamped no newer than a generation a memo hit handed out while it was held");
+    Require(!UnchangedSince(walked, 2 * Block, fromUncached), "a write a held walk found was stamped no newer than a generation an uncached collect handed out while it was held");
 }
 
-void CheckReleasedWalkMemoHit() {
+void CheckMemoHitOnHeldRangeDefersUnstampedWrites() {
     SetReleasedWalksForTest(true);
     constexpr std::size_t bytes = 2 * Block;
     void* memory = AllocateWatched(bytes);
@@ -2627,22 +2673,156 @@ void CheckReleasedWalkMemoHit() {
     const auto beforeOld = TrackerGeneration();
     data[64] = 0x44;
     BumpCollectEpoch();
-    const auto recorded = CollectWrites(base, bytes);
-    Require(recorded != 0, "the memo entry's collect failed");
+    Require(CollectWrites(base, bytes) != 0, "the memo entry's collect failed");
     data[Block + 64] = 0x55;
-    HoldFirstReleasedWalk();
+    ArmWalkGate(false, true);
     std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
-    while (!releasedWalkScanned.load(std::memory_order_acquire)) std::this_thread::yield();
+    AwaitHeldWalk(1);
     const auto held = CollectWrites(base, bytes);
     const bool oldSeen = !UnchangedSince(base, bytes, beforeOld);
     const bool newBeforeStamp = !UnchangedSince(base, bytes, held);
+    ReleaseWalk(1);
     walker.join();
-    SetReleasedWalkHookForTest(nullptr);
+    DisarmWalkGate();
     const bool newAfterStamp = !UnchangedSince(base, bytes, held);
     Require(held <= TrackerGeneration(), "a memo hit returned a generation newer than the tracker's");
     Require(oldSeen, "a memo hit on a range a held walk had scanned reported a write older than its epoch unchanged");
     Require(!newBeforeStamp, "a write the held walk had not stamped yet was visible before its stamp");
     Require(newAfterStamp, "a write found by a walk held across a memo hit was stamped no newer than the generation the memo hit returned");
+}
+
+void CheckThrowKeepsWrites(bool inScan) {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the throw fixture was not collected");
+    data[Block + 64] = 0x66;
+    ArmWalkGate(false, false, !inScan, inScan);
+    bool thrown = false;
+    try {
+        static_cast<void>(CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    DisarmWalkGate();
+    Require(thrown, "the injected failure in the released walk was not raised");
+    Require(!UnchangedSince(base, bytes, before), "a write a failed walk had consumed was lost");
+}
+
+void CheckWriteDuringHeldWalkIsCollected(int stage) {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the concurrent write fixture was not collected");
+    data[64] = 0x12;
+    ArmWalkGate(stage == 0, stage == 1);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    AwaitHeldWalk(stage);
+    const auto before = TrackerGeneration();
+    std::atomic_ref<std::uint8_t>(data[Block + 128]).store(0x34, std::memory_order_relaxed);
+    ReleaseWalk(stage);
+    walker.join();
+    DisarmWalkGate();
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    Require(!UnchangedSince(base + Block, Block, before), "a write made while a walk of its range was held was lost to the next uncached collect");
+}
+
+void CheckMemoHitDefersWritesToNextEpoch() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the epoch fixture was not collected");
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, bytes));
+    const auto memo = CollectWrites(base, bytes);
+    data[Block + 256] = 0x56;
+    static_cast<void>(CollectWrites(base, bytes));
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, bytes));
+    Require(!UnchangedSince(base, bytes, memo), "a write after a memo hit was still unchanged since its generation in the next epoch");
+    data[256] = 0x57;
+    const auto epochGeneration = CollectWrites(base, bytes);
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    Require(!UnchangedSince(base, bytes, epochGeneration), "an uncached collect inside an epoch did not see a write made after that epoch's memo hit");
+}
+
+#if defined(__linux__)
+struct AliasedViews {
+    std::uintptr_t first = 0;
+    std::uintptr_t second = 0;
+};
+
+AliasedViews MapAliasedViews(const char* name, bool linked) {
+    const int file = memfd_create(name, 0);
+    Require(file >= 0 && ftruncate(file, Block) == 0, "cannot create the aliased views' backing");
+    void* raw = mmap(nullptr, 3 * Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(raw != MAP_FAILED, "cannot reserve the aliased views");
+    AliasedViews views;
+    views.first = (reinterpret_cast<std::uintptr_t>(raw) + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+    views.second = views.first + Block;
+    for (const auto view : {views.first, views.second}) {
+        Require(mmap(reinterpret_cast<void*>(view), Block, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) != MAP_FAILED, "cannot map an aliased view");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(view), Block);
+    }
+    if (linked) Require(GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views.first), reinterpret_cast<void*>(views.second), Block), "the views could not be aliased");
+    std::memset(reinterpret_cast<void*>(views.first), 0x11, Block);
+    return views;
+}
+
+void CheckAliasedViewWaitsForHeldWalk() {
+    SetReleasedWalksForTest(true);
+    const auto views = MapAliasedViews("aps5-released-walk-alias", true);
+    Require(CollectWritesUncached(views.first, Block) != 0 && CollectWritesUncached(views.second, Block) != 0, "the aliased views were not collected");
+    const auto collected = CollectWritesUncached(views.second, Block);
+    reinterpret_cast<volatile std::uint8_t*>(views.first)[0x200] = 0x77;
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(views.first, Block)); });
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(views.second, Block)); }, 1);
+    walker.join();
+    DisarmWalkGate();
+    Require(!early, "an uncached collect of an aliased view returned while a walk of its alias was held");
+    Require(!UnchangedSince(views.second, Block, collected), "a write through one view was reported unchanged in its alias after a walk of the first was held");
+}
+
+void CheckAliasCreatedDuringHeldWalk(int stage) {
+    SetReleasedWalksForTest(true);
+    const auto views = MapAliasedViews("aps5-released-walk-late-alias", false);
+    Require(CollectWritesUncached(views.first, Block) != 0 && CollectWritesUncached(views.second, Block) != 0, "the late-alias views were not collected");
+    const auto collected = CollectWritesUncached(views.second, Block);
+    reinterpret_cast<volatile std::uint8_t*>(views.first)[0x300] = 0x88;
+    ArmWalkGate(stage == 0, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(views.first, Block)); });
+    AwaitHeldWalk(stage);
+    const bool aliased = GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views.first), reinterpret_cast<void*>(views.second), Block);
+    if (stage == 0) ReleaseWalk(0);
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(views.second, Block)); }, 1);
+    walker.join();
+    DisarmWalkGate();
+    Require(aliased, "the views could not be aliased during the walk");
+    Require(!early, "an uncached collect of a view aliased during a held walk returned while that walk was held");
+    Require(!UnchangedSince(views.second, Block, collected), "a write through a view aliased during a walk was reported unchanged in the new alias");
+}
+#endif
+
+void RandomReleasedWalkDelay(int stage) {
+    if (stage != 1) return;
+    thread_local std::uint32_t state = static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1u;
+    state ^= state << 13u;
+    state ^= state >> 17u;
+    state ^= state << 5u;
+    if (state % 4u == 0u) std::this_thread::sleep_for(std::chrono::microseconds(state % 200u));
 }
 
 void CheckReleasedWalkStress(bool released) {
@@ -2870,14 +3050,29 @@ int main(int argc, char** argv) {
             return 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--released-walks") {
-            CheckReleasedWalkWaits();
-            CheckReleasedWalkWatermark();
-            CheckReleasedWalkMemoHit();
+#ifdef _WIN32
+            std::cout << "collect walks stay under the tracker mutex on Windows: skipped\n";
+            return 77;
+#else
+            CheckUncachedCollectWaitsForHeldWalk();
+            CheckGenerationsDuringHeldWalkPrecedeItsStamps();
+            CheckMemoHitOnHeldRangeDefersUnstampedWrites();
+            CheckMemoHitDefersWritesToNextEpoch();
+            CheckWriteDuringHeldWalkIsCollected(0);
+            CheckWriteDuringHeldWalkIsCollected(1);
+            CheckThrowKeepsWrites(false);
+            CheckThrowKeepsWrites(true);
+#if defined(__linux__)
+            CheckAliasedViewWaitsForHeldWalk();
+            CheckAliasCreatedDuringHeldWalk(0);
+            CheckAliasCreatedDuringHeldWalk(1);
+#endif
             CheckReleasedWalkStress(true);
             CheckReleasedWalkStress(false);
             CheckReleasedWalkDifferential();
             std::cout << "released walk tests passed\n";
             return 0;
+#endif
         }
         if (argc == 4 && std::string_view(argv[1]) == "--mapping-bench") {
 #ifdef _WIN32
