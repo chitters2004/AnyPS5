@@ -7,6 +7,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "Translation/EmbeddedVertexFetch.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 
@@ -48,6 +49,8 @@ struct TranslateOptions {
     ShaderStageInputInfo inputInfo;
     const EmbeddedFetchPlan* embeddedFetch = nullptr;
 };
+
+[[nodiscard]] bool NanSpeculationRestorable(const IrBlock& block, std::size_t firstInstruction);
 
 class InstructionTranslator {
 public:
