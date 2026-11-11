@@ -335,6 +335,8 @@ std::atomic<std::uint64_t> claimWaits{0};
 std::atomic<std::uint64_t> claimWaitNanoseconds{0};
 std::atomic<std::uint64_t> unlockedWalks{0};
 std::atomic<std::uint64_t> fallbackWalks{0};
+std::atomic<std::uint64_t> observedProofs{0};
+std::atomic<std::uint64_t> refusedGeneration{0};
 std::atomic<std::uint64_t> fallbackNanoseconds{0};
 std::atomic<std::uint64_t> serviceSweeps{0};
 std::atomic<std::uint64_t> serviceRuns{0};
@@ -567,6 +569,7 @@ public:
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" unlocked walks %llu claim waits %llu (%.2f ms)", static_cast<unsigned long long>(unlockedWalks.load()), static_cast<unsigned long long>(claimWaits.load()), claimWaitNanoseconds.load() / 1e6);
+        AgcDriver::ProfilePrint_nid_no_patch(" | observed proofs %llu", static_cast<unsigned long long>(observedProofs.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | epoch service sweeps %llu runs %llu walks %llu skipped %llu (%.2f ms), fallback walks %llu (%.2f ms)", static_cast<unsigned long long>(serviceSweeps.load()), static_cast<unsigned long long>(serviceRuns.load()), static_cast<unsigned long long>(serviceWalks.load()), static_cast<unsigned long long>(serviceSkips.load()), serviceNanoseconds.load() / 1e6, static_cast<unsigned long long>(fallbackWalks.load()), fallbackNanoseconds.load() / 1e6);
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1336,6 +1339,7 @@ struct WriteTracker {
         std::array<std::atomic<std::uint64_t>, LeafBlocks> ticks{};
         std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> coarse{};
         std::array<std::atomic<std::uint32_t>, LeafBlocks> noted{};
+        std::array<std::atomic<std::uint64_t>, LeafBlocks> stamps{};
     };
     std::unique_ptr<std::atomic<ObservationLeaf*>[]> observationLeaves;
     std::size_t observationLeafCount = 0;
@@ -1450,12 +1454,28 @@ struct WriteTracker {
         return true;
     }
 
+    void mirrorStamp(std::uint64_t block, std::uint64_t stampGeneration) {
+        if (block / LeafBlocks >= observationLeafCount) return;
+        if (auto* leaf = observationLeaves[block / LeafBlocks].load(std::memory_order_relaxed)) leaf->stamps[block % LeafBlocks].store(stampGeneration, std::memory_order_release);
+    }
+
+    bool observedStampsAtMost(std::uint64_t first, std::uint64_t stop, std::uint64_t generation) const {
+        const auto last = blockOf(stop - 1);
+        for (auto block = blockOf(first); block <= last; ++block) {
+            if (block / LeafBlocks >= observationLeafCount) return false;
+            const auto* leaf = observationLeaves[block / LeafBlocks].load(std::memory_order_acquire);
+            if (leaf == nullptr || leaf->stamps[block % LeafBlocks].load(std::memory_order_acquire) > generation) return false;
+        }
+        return true;
+    }
+
     void publishObserved(std::uint64_t first, std::uint64_t last, std::uint64_t tick) {
         for (auto block = first; block <= last;) {
             const auto index = block / LeafBlocks;
             auto* leaf = observationLeaves[index].load(std::memory_order_relaxed);
             if (leaf == nullptr) {
                 leaf = new ObservationLeaf();
+                for (std::uint64_t at = 0; at < LeafBlocks; ++at) leaf->stamps[at].store(stampOf(index * LeafBlocks + at), std::memory_order_relaxed);
                 observationLeaves[index].store(leaf, std::memory_order_release);
             }
             const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
@@ -1816,6 +1836,7 @@ struct WriteTracker {
         auto& leaf = leafFor(block);
         if (stored) {
             leaf.blocks[block % LeafBlocks] = stampGeneration;
+            mirrorStamp(block, stampGeneration);
             auto& coarse = leaf.coarseBlocks[(block % LeafBlocks) / CoarseBlocks];
             coarse = std::max(coarse, stampGeneration);
         }
@@ -2069,7 +2090,10 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
     StampRuns runs{tracker, StampKind::Cpu};
     pagesOf(&GuestArena::GuestArenaTakeUnreportedPages_nid_no_patch, [&](std::uintptr_t page) { stampWrittenRun(&runs, page, page + WritePageBytes); });
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
-    pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) { tracker.refused[tracker.blockOf(page)] = generation; });
+    pagesOf(&GuestArena::GuestArenaComparedPages_nid_no_patch, [&](std::uintptr_t page) {
+        tracker.refused[tracker.blockOf(page)] = generation;
+        refusedGeneration.store(generation, std::memory_order_release);
+    });
 }
 #endif
 
@@ -2878,6 +2902,21 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     return tracker.rangeUnchanged(address, bytes, generation);
+}
+
+bool UnchangedSinceObserved(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0 || generation == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+    static const bool disabled = std::getenv("APS5_NO_OBSERVED_PROOFS") != nullptr;
+    if (!disabled && stop > first && epoch != 0 && collectMemoEnabled() && refusedGeneration.load(std::memory_order_acquire) <= generation && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix()) && tracker.observedStampsAtMost(first, stop, generation)) {
+        observedProofs.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return UnchangedSince(address, bytes, generation);
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
