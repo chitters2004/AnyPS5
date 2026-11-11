@@ -37,6 +37,9 @@
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -673,6 +676,201 @@ void testRewindFilledAcrossChunks(const std::filesystem::path& tool) {
     check(replayed(tool, checkCapture(0), layout.label, 4) == std::vector<std::byte>{std::byte{Done}, std::byte{0}, std::byte{0}, std::byte{0}}, "the replay resumed the REWIND before the delta restored the buffer its tail jumps to");
 }
 
+void testGpuStoreBehindRewind(const std::filesystem::path& tool) {
+    constexpr std::uint32_t ComputeQueue = 0x20;
+    constexpr std::uint32_t Filled = 0x5a5a5a5au;
+    constexpr std::size_t FillBytes = 0x3fff000u;
+    constexpr std::size_t Fills = 4;
+    const auto layout = allocate();
+    const auto bulk = allocate(Fills * FillBytes);
+    const auto read = pattern(41);
+    std::memcpy(layout.source, read.data(), read.size());
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    auto* const released = layout.label + 1;
+    auto* const title = layout.label + 2;
+    auto* const filled = reinterpret_cast<const std::uint32_t*>(bulk.base + Fills * FillBytes) - 1;
+    auto graphics = commands(layout.firstCommands);
+    auto* const first = sceAgcDcbRewind(&graphics, 0) + 1;
+    for (std::size_t fill = 0; fill < Fills; ++fill) sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(bulk.base + fill * FillBytes), 2, 0, Filled, FillBytes, 0, 1, 0);
+    sceAgcDcbWaitRegMem(&graphics, 0, 3, 0, 0, filled, Filled, 0xffffffffu, 0);
+    sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(layout.firstTarget), DmaMemory, 0, at(layout.source), DataBytes, 0, 1, 0);
+    releaseMem(graphics, released);
+    auto* const second = sceAgcDcbRewind(&graphics, 0) + 1;
+    writeDone(graphics, layout.label);
+    Packet producer{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&producer) == 0, "graphics submission failed");
+    auto compute = commands(layout.secondCommands);
+    sceAgcAcbWaitRegMem(&compute, 0, 3, 0, released, Done, 0xffffffffu, 0);
+    sceAgcAcbDmaData(&compute, DmaMemory, 0, at(layout.secondTarget), DmaMemory, 0, at(layout.firstTarget), DataBytes, 0, 1);
+    Packet consumer{layout.secondCommands, static_cast<std::uint32_t>(compute.cursor_up - layout.secondCommands), 0, {}};
+    check(sceAgcDriverSubmitAcb(ComputeQueue, &consumer) == 0, "compute submission failed");
+    std::atomic_ref<std::uint32_t>(*title).store(Done, std::memory_order_release);
+    release(first);
+    waitUntil([&] { return equal(layout.secondTarget, read); }, "the compute queue did not copy after the label the graphics queue released");
+    flip();
+    release(second);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto capture = checkCapture(1);
+    const FrameCaptureReader reader(capture);
+    const auto delta = [&](const std::uint32_t* address) {
+        return std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
+            if (chunk.kind != FrameMemoryKind::Delta || at(address) < chunk.address || chunk.address + chunk.bytes < at(address) + 4) return false;
+            const auto bytes = reader.Read(chunk);
+            std::uint32_t value = 0;
+            std::memcpy(&value, bytes.data() + (at(address) - chunk.address), sizeof(value));
+            return value == Done;
+        });
+    };
+    check(delta(title), "the memory delta lost the word the title wrote beside the label");
+    check(!delta(released), "the memory delta holds the label the graphics queue's RELEASE_MEM wrote, so the replay releases the compute queue before the graphics queue copies");
+    check(replayed(tool, capture, layout.secondTarget, DataBytes) == read, "the replay released the compute queue before the copy ahead of the label it waits on");
+}
+
+void checkUnwatchedTitleStores(const std::filesystem::path& tool, bool initiallyUnwatched, const std::function<void(std::byte*)>& prepare = {}) {
+    constexpr std::uint32_t Stored = 0x77u;
+    const auto bulk = allocate();
+    check(AgcDriver::GuestMemory::Watched(at(bulk.base), 4096), "the fixture needs initially watched memory");
+    if (prepare) prepare(bulk.base);
+    auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    std::atomic_ref<std::uint32_t>(*word).store(0, std::memory_order_release);
+    if (initiallyUnwatched) AgcDriver::GuestMemory::Unwatch(at(bulk.base), 4096);
+    flip();
+    if (!initiallyUnwatched) AgcDriver::GuestMemory::Unwatch(at(bulk.base), 4096);
+    check(!AgcDriver::GuestMemory::Watched(at(bulk.base), 4096), "the test buffer did not lose write-watch coverage");
+    std::atomic_ref<std::uint32_t>(*word).store(Stored, std::memory_order_release);
+    flip();
+    std::atomic_ref<std::uint32_t>(*word).store(0, std::memory_order_release);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto capture = checkCapture(0);
+    const FrameCaptureReader reader(capture);
+    if (prepare) {
+        check(std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
+            return chunk.kind == FrameMemoryKind::Range && chunk.rangeKind == AgcDriver::FrameRangeKind::Section && chunk.address <= at(word) && at(word) + 4 <= chunk.address + chunk.bytes;
+        }), "the capture fixture did not record the word in shared section memory");
+    }
+    std::uint64_t storedGroup = 0;
+    std::uint64_t restoredGroup = 0;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Delta || chunk.address > at(word) || at(word) + 4 > chunk.address + chunk.bytes) continue;
+        const auto bytes = reader.Read(chunk);
+        std::uint32_t value = 0;
+        std::memcpy(&value, bytes.data() + (at(word) - chunk.address), sizeof(value));
+        if (value == Stored && storedGroup == 0) storedGroup = chunk.group;
+        if (value == 0 && storedGroup != 0 && chunk.group > storedGroup) restoredGroup = chunk.group;
+    }
+    check(storedGroup != 0, "the capture lost the intermediate CPU store into unwatched memory");
+    check(restoredGroup > storedGroup, "the capture lost the CPU restore to its initial value in unwatched memory");
+    const auto dumped = replayed(tool, capture, word, 4);
+    std::uint32_t value = 0;
+    std::memcpy(&value, dumped.data(), sizeof(value));
+    check(value == 0, "the replay did not restore the unwatched word's initial value");
+}
+
+void testInitiallyUnwatchedTitleStores(const std::filesystem::path& tool) {
+    checkUnwatchedTitleStores(tool, true);
+}
+
+void testLaterUnwatchedTitleStores(const std::filesystem::path& tool) {
+    checkUnwatchedTitleStores(tool, false);
+}
+
+void testSharedTitleStores(const std::filesystem::path& tool) {
+    constexpr std::size_t Bytes = 65536;
+#ifdef _WIN32
+    struct Backing {
+        HANDLE section = nullptr;
+        std::byte* mapped = nullptr;
+        ~Backing() {
+            if (mapped != nullptr) GuestArena::GuestArenaReset_nid_postfix(mapped, 2 * Bytes);
+            if (section == nullptr) return;
+            GuestArena::GuestArenaForgetSection_nid_postfix(section);
+            CloseHandle(section);
+        }
+    } backing;
+    backing.section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, Bytes, nullptr);
+    check(backing.section != nullptr, "cannot create the capture fixture's shared backing");
+    checkUnwatchedTitleStores(tool, true, [&](std::byte* base) {
+        backing.mapped = base;
+        AgcDriver::GuestMemory::Unwatch(at(base), 2 * Bytes);
+        GuestArena::GuestArenaReset_nid_postfix(base, BlockBytes);
+        GuestArena::GuestArenaMapDirect_nid_postfix(base, Bytes, backing.section, 0, PAGE_READWRITE);
+        GuestArena::GuestArenaMapDirect_nid_postfix(base + Bytes, Bytes, backing.section, 0, PAGE_READWRITE);
+    });
+#else
+    const auto closeFile = [](std::FILE* file) { std::fclose(file); };
+    std::unique_ptr<std::FILE, decltype(closeFile)> backing(std::tmpfile(), closeFile);
+    check(backing != nullptr && ftruncate(fileno(backing.get()), Bytes) == 0, "cannot create the capture fixture's shared backing");
+    checkUnwatchedTitleStores(tool, true, [&](std::byte* base) {
+        AgcDriver::GuestMemory::Unwatch(at(base), 2 * Bytes);
+        check(mmap(base, Bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fileno(backing.get()), 0) == base, "cannot map the capture fixture's shared backing");
+        check(mmap(base + Bytes, Bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, fileno(backing.get()), 0) == base + Bytes, "cannot map the capture fixture's shared alias");
+    });
+#endif
+}
+
+void testGpuFillRestoredToCachedValue(const std::filesystem::path& tool) {
+    constexpr std::uint32_t Filled = 0x5a5a5a5au;
+    constexpr std::size_t FillBytes = 65536;
+    const auto layout = allocate();
+    const auto bulk = allocate();
+    auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    flip();
+    AgcDriver::GuestMemory::Unwatch(at(bulk.base), FillBytes);
+    flip();
+    auto graphics = commands(layout.firstCommands);
+    sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(bulk.base), 2, 0, Filled, FillBytes, 0, 1, 0);
+    writeDone(graphics, layout.label);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "graphics submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(*word == Filled, "the driver did not fill the previously sampled buffer");
+    std::memset(bulk.base, 0, FillBytes);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto dumped = replayed(tool, checkCapture(0), word, 4);
+    std::uint32_t value = 0;
+    std::memcpy(&value, dumped.data(), sizeof(value));
+    check(value == 0, "the replay lost a CPU restore matching the cached bytes after an intervening GPU fill");
+}
+
+void testFillRewrittenByTitle(const std::filesystem::path& tool) {
+    constexpr std::uint32_t Filled = 0x5a5a5a5au;
+    constexpr std::uint32_t Stored = 0x77u;
+    constexpr std::size_t FillBytes = 512u * 1024u;
+    const auto layout = allocate();
+    const auto bulk = allocate();
+    auto* const word = reinterpret_cast<std::uint32_t*>(bulk.base + FillBytes / 2);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    auto graphics = commands(layout.firstCommands);
+    sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(bulk.base), 2, 0, Filled, FillBytes, 0, 1, 0);
+    writeDone(graphics, layout.label);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "graphics submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(*word == Filled, "the driver did not fill the buffer");
+    std::atomic_ref<std::uint32_t>(*word).store(Stored, std::memory_order_release);
+    flip();
+    std::atomic_ref<std::uint32_t>(*word).store(Filled, std::memory_order_release);
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto replayedWord = replayed(tool, checkCapture(0), word, 4);
+    std::uint32_t value = 0;
+    std::memcpy(&value, replayedWord.data(), sizeof(value));
+    check(value == Filled, "the replay kept the title's earlier store over its later one, which wrote the value the fill had left");
+}
+
 void testFenceReused(const std::filesystem::path& tool) {
     const auto layout = allocate();
     const auto copied = pattern(53);
@@ -739,14 +937,43 @@ void testQueueBusyPastPacing(const std::filesystem::path& tool) {
     check(replayed(tool, checkCapture(0), layout.firstTarget, DataBytes, " --pace-timeout-ms 1") == copied, "the replay gave up pacing or released the compute queue while the graphics queue was still copying");
 }
 
+void testFillClearedBeforeRange(const std::filesystem::path& tool) {
+    constexpr std::uint32_t Filled = 0x5a5a5a5au;
+    const auto layout = allocate();
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+
+    flip();
+    auto* const block = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, 65536));
+    check(block != nullptr, "cannot allocate guest memory");
+    GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, 0x04, BlockBytes);
+    auto graphics = commands(layout.firstCommands);
+    sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(block), 2, 0, Filled, BlockBytes, 0, 1, 0);
+    writeDone(graphics, layout.label);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "graphics submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    check(*reinterpret_cast<const std::uint32_t*>(block) == Filled, "the driver did not fill the block");
+    std::memset(block, 0, BlockBytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, BlockBytes, true, true, true);
+    }
+    copy(layout.secondCommands, CommandBytes, block, layout.firstTarget, layout.label);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    check(replayed(tool, checkCapture(0), layout.firstTarget, DataBytes) == std::vector<std::byte>(DataBytes), "the replay copied the GPU fill of a block the title cleared before its range was first recorded");
+}
+
 }
 
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|fence_reuse|busy_queue]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
         return 2;
     }
     int status = 0;
