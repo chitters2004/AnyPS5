@@ -609,7 +609,7 @@ bool KeyStoresEach() {
 std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
-ProfileCounter readsNoted, readQueries, readStaleIgnored;
+ProfileCounter readsNoted, readQueries, readStaleIgnored, readsRepeated;
 ProfileCounter readHits[ReadKinds];
 
 bool ReadTrackingEnabled() {
@@ -2184,6 +2184,11 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        notedReadKeys.Reset();
+        if (++batchEpoch == 0) {
+            notedReadKeys.Clear();
+            ++batchEpoch;
+        }
         open->predictedSerial = submissions + 1;
         try {
             if (open->queue == 0) WriteCheckpointSerial(context, open->commands, open->predictedSerial, open->queue);
@@ -4148,7 +4153,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
-    open->reads.push_back({address, address + bytes, kind});
+    noteRead(address, address + bytes, kind);
     readsNoted.Add(1);
 }
 
@@ -4157,9 +4162,16 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
-        if (end > begin) open->reads.push_back({begin, end, kind});
+        if (end > begin) noteRead(begin, end, kind);
     }
     readsNoted.Add(ranges.size());
+}
+
+void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
+    open->reads.push_back({begin, end, kind});
+    if (FlipReadCheck() || notedReadKeys.Insert({begin, end, kind}, batchEpoch)) return;
+    open->reads.pop_back();
+    readsRepeated.Add(1);
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
@@ -4256,7 +4268,7 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}};
+    ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}, readsRepeated.Sum()};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].Sum();
     return counts;
 }
