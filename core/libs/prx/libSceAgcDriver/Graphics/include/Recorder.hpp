@@ -95,7 +95,7 @@ public:
     void SettlePassEnd();
     static bool FuseBarriers();
     struct FusionStatistics {
-        std::uint64_t fused, settled, fencedKeyOnly;
+        std::uint64_t fused, settled, fencedKeyOnly, trailingFused;
     };
     static FusionStatistics FusionCounts();
     void SealPassWriteOnly();
@@ -555,6 +555,7 @@ public:
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    void OweTrailingBarrier(const BarrierMask& mask, CommandClass which);
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
@@ -623,6 +624,8 @@ public:
     static bool FlipReadCheck();
 
 private:
+    void settleOwed();
+    void oweBarrier(const BarrierMask& mask, CommandClass which, bool passEnd);
     struct Batch;
     struct WideLabel {
         std::uint64_t end;
@@ -762,7 +765,10 @@ private:
             PassBreak closedBy = PassBreak::NewBatch;
         } renderPass;
         PassHazards passHazards;
-        bool passEndOwed = false;
+        bool owing = false;
+        bool owesPassEnd = false;
+        BarrierMask owed{};
+        CommandClass owedClass = CommandClass::Draw;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
         bool hostReadOwed = false;
         // Queued DCC key stores (see QueueKeyStore).
@@ -816,6 +822,7 @@ private:
     };
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
+    bool holdOwed = false;
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
