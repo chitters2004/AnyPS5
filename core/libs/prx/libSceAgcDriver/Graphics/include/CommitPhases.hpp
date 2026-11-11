@@ -56,6 +56,7 @@ enum class CommitPhase : std::uint8_t {
     ResolveMoved,
     ResolveBuild,
     ResolveEvict,
+    RevalidateCertified,
     Count
 };
 
