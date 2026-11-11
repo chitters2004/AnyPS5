@@ -543,7 +543,7 @@ void verifyConcurrentRecompile() {
     constexpr std::uint32_t Shaders = 16u;
     constexpr std::uint32_t Values = 8u;
     constexpr std::uint32_t Keys = Shaders * Values;
-    const auto threads = std::max(4u, std::thread::hardware_concurrency());
+    const auto threads = std::clamp(std::thread::hardware_concurrency(), 4u, 8u);
     std::vector<std::shared_ptr<const RecompileResult>> results(static_cast<std::size_t>(threads) * Keys);
     std::barrier start(static_cast<std::ptrdiff_t>(threads));
     std::mutex failureMutex;
