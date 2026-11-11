@@ -498,6 +498,7 @@ public:
     static std::uint64_t RefreshesProved();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t DirectLinearWriteBacks();
+    static std::uint64_t GuestByteCaptures();
     static std::uint64_t CreationHandOvers();
     static std::uint64_t HandedOverSuperseded();
     static void SetClearHandOver(bool enabled);
@@ -621,7 +622,7 @@ private:
         std::uint64_t end;
     };
     std::vector<ImportSegment> importSegments() const;
-    bool writeBackLinearDirect(const std::vector<bool>& layers, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::span<const ImportSegment> segments, std::span<const std::uint32_t> saveUnits, std::uint64_t firstStored, std::uint64_t lastStored, bool drawn);
+    bool writeBackLinearDirect(const std::vector<bool>& layers, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::span<const ImportSegment> segments, Buffer* save, std::uint64_t firstStored, std::uint64_t lastStored, bool drawn);
     PaddingSeeds paddingSeeds(std::span<const ImportSegment> segments, const std::vector<CopiedBytes>& copied) const;
     // The direct upload and GPU-direct write-back of the runs through their windows (block units);
     // both return the bytes moved. The upload reads each unit from its unit shadow while fresh,

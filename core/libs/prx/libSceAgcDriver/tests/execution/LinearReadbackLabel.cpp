@@ -222,6 +222,26 @@ void ReadAfterLabel(std::uint8_t* block, std::uint32_t width = Width, std::size_
     }
 }
 
+void StoreAgainKeepsCpuWrite(std::uint8_t* block) {
+    auto* texels = block + PaddedOffset;
+    auto* label = reinterpret_cast<std::uint32_t*>(block + PaddedLabelOffset);
+    const auto mip = Layout(PaddedWidth);
+    const auto direct = AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks();
+    const auto captures = AgcDriver::Graphics::StorageTexture::GuestByteCaptures();
+    SubmitAndWait(Commands(StoreCode, PaddedWidth, UserData(texels, PaddedWidth), label), label, "linear readback label stored again");
+    const bool stored = AgcDriver::Graphics::StorageTexture::DirectLinearWriteBacks() > direct;
+    const auto captured = AgcDriver::Graphics::StorageTexture::GuestByteCaptures() - captures;
+    std::printf("linear readback label stored again: %s, %llu guest byte captures\n", stored ? "both stores copied straight from the image" : "not copied straight from the image", static_cast<unsigned long long>(captured));
+    if (stored && !AgcDriver::GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(texels), mip.pitchBytes * Height)) Require(captured == 0, "linear readback label stored again: the second dispatch read the guest bytes on the CPU again, so the first direct store's saved bytes did not become the baseline");
+    const auto cpuOffset = mip.tiledOffset + 7u * static_cast<std::uint64_t>(mip.pitchBytes) + 5u * TexelBytes;
+    constexpr std::uint32_t CpuWritten = 0xc0ffee00u;
+    std::memcpy(texels + cpuOffset, &CpuWritten, TexelBytes);
+    SubmitAndWait(Commands(StoreCode, PaddedWidth, UserData(texels, PaddedWidth), label), label, "linear readback label stored a third time");
+    std::uint32_t actual = 0;
+    std::memcpy(&actual, texels + cpuOffset, TexelBytes);
+    Require(actual == CpuWritten, "linear readback label stored again: a CPU write made after the first store to a texel no dispatch writes was lost at the second store (the first store's guest bytes were not kept as the baseline)");
+}
+
 void ReadTiledAfterLabel(std::uint8_t* block) {
     auto* texels = reinterpret_cast<std::uint32_t*>(block + TiledOffset);
     auto* label = reinterpret_cast<std::uint32_t*>(block + TiledLabelOffset);
@@ -277,6 +297,7 @@ int main() {
         GuestBlock block;
         ReadAfterLabel(block.Data());
         ReadAfterLabel(block.Data(), PaddedWidth, PaddedOffset, PaddedLabelOffset);
+        StoreAgainKeepsCpuWrite(block.Data());
         ReadTiledAfterLabel(block.Data());
         ReadOccasionalAfterLabel(block.Data());
         AgcDriverWaitIdle_nid_postfix();

@@ -138,7 +138,7 @@ std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWrit
 std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKept{0};
 std::atomic<std::uint64_t> flushWaits{0}, stampedWaitsSkipped{0}, labelStoreSweeps{0}, labelStoreImages{0}, labelStoreNanos{0};
 std::atomic<std::uint64_t> flushWaitNanos{0}, flushWriteBackNanos{0}, flushPublishNanos{0};
-std::atomic<std::uint64_t> directLinearWriteBacks{0}, retiledWriteBacks{0};
+std::atomic<std::uint64_t> directLinearWriteBacks{0}, retiledWriteBacks{0}, guestByteCaptures{0};
 
 std::chrono::steady_clock::time_point chargeNanos(std::atomic<std::uint64_t>& counter, std::chrono::steady_clock::time_point since) {
     const auto now = std::chrono::steady_clock::now();
@@ -2673,6 +2673,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers, bool keepWritten) {
+    guestByteCaptures.fetch_add(1, std::memory_order_relaxed);
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedRanges = {};
     std::vector<bool> selected(trackedLayers, true);
@@ -6624,13 +6625,13 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
     return cpu[0] == 0;
 }
 
-bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::span<const ImportSegment> segments, std::span<const std::uint32_t> saveUnits, std::uint64_t firstStored, std::uint64_t lastStored, bool drawn) {
+bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std::span<const std::pair<std::uint64_t, std::uint64_t>> keep, std::span<const ImportSegment> segments, Buffer* save, std::uint64_t firstStored, std::uint64_t lastStored, bool drawn) {
     static const bool enabled = std::getenv("APS5_NO_DIRECT_LINEAR_WRITE_BACK") == nullptr;
     auto* recorder = recorderFor(context);
     const auto elementBytes = BytesPerElement(descriptor.format);
     if (!enabled || recorder == nullptr || descriptor.tileMode != TextureTileMode::kLinear || geometry.thick || elementBytes == 0 || BlockWidth(descriptor.format) != 1) return false;
     if (std::any_of(mips.begin(), mips.end(), [](const TileMipLayout& mip) { return mip.tail; })) return false;
-    if (!saveUnits.empty() || segments.size() != 1 || segments.front().begin > firstStored || segments.front().end < lastStored) return false;
+    if (segments.size() != 1 || segments.front().begin > firstStored || segments.front().end < lastStored) return false;
     if (keep.size() != 1 || keep.front().first != firstStored || keep.front().second != lastStored) return false;
     const auto& import = *segments.front().import;
     const auto* storedLayers = trackedLayers == arrayLayers && trackedLayers > 1 ? &layers : nullptr;
@@ -6658,10 +6659,10 @@ bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std:
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
     if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
-    Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, 2);
+    Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, save != nullptr ? 3 : 2);
     if (Recorder::BarrierValidate()) {
         const std::pair<VkImage, bool> read{image, false};
-        recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{{}, keep, std::span(&read, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
+        recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{save != nullptr ? keep : std::span<const std::pair<std::uint64_t, std::uint64_t>>{}, keep, std::span(&read, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
     VkImageMemoryBarrier toSource{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toSource.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
@@ -6675,6 +6676,12 @@ bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std:
     const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &importReady, 0, nullptr, 1, &toSource);
     context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, import.buffer, static_cast<std::uint32_t>(regions.size()), regions.data());
+    if (save != nullptr) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        std::vector<VkBufferCopy> saves;
+        for (const auto& [from, to] : keep) saves.push_back({HostImportOffset(import, from), from - descriptor.baseAddress, to - from});
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, import.buffer, save->Handle(), static_cast<std::uint32_t>(saves.size()), saves.data());
+    }
     VkImageMemoryBarrier backToGeneral = toSource;
     backToGeneral.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
     backToGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
@@ -6695,6 +6702,10 @@ bool StorageTexture::writeBackLinearDirect(const std::vector<bool>& layers, std:
 
 std::uint64_t StorageTexture::DirectLinearWriteBacks() {
     return directLinearWriteBacks.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StorageTexture::GuestByteCaptures() {
+    return guestByteCaptures.load(std::memory_order_relaxed);
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
@@ -6958,13 +6969,14 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         // keep a neighbour's shadowed results in the rest of their bytes, which reach the import
         // first (this write-back's stamps then make those units stale).
         PublishShadow(firstStored, static_cast<std::size_t>(lastStored - firstStored), PublishScope::PartialUnits, PublishReason::Upload);
-        if (writeBackLinearDirect(layers, keep, segments, saveUnits, firstStored, lastStored, drawn.drawn)) {
+        if (writeBackLinearDirect(layers, keep, segments, saveUnits.empty() ? nullptr : savedBytes.get(), firstStored, lastStored, drawn.drawn)) {
             forgetStored();
             traceKeyStore("linear write-back", descriptor, guestBytes);
             if (!IsDccClear(filledKeys) && uploadedKeys != DccKeys::Uncompressed) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
             uploadedKeys = DccKeys::Uncompressed;
             for (const auto& [from, to] : keep) GuestMemory::MarkWritten(from, static_cast<std::size_t>(to - from));
             settle(true);
+            commitStoredSave(saveUnits);
             ++Profile().storageDirectWriteBacks;
             return;
         }
