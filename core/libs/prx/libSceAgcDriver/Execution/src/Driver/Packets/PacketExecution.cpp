@@ -273,12 +273,13 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
+    const bool ownsHandOffs = DrawFinisher::Sequenced() && executingSubmission().get() == &submission;
     struct SettleFinisher {
         bool queue0;
         ~SettleFinisher() {
             if (queue0) DrawFinisher::Get().Settle();
         }
-    } settleFinisher{submission.queue == 0};
+    } settleFinisher{submission.queue == 0 && !ownsHandOffs};
     auto* const executingPacket = workerPacket();
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
@@ -608,7 +609,8 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain();
+    if (submission.queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::End, !ownsHandOffs);
+    if (submission.queue == 0 && !ownsHandOffs) DrawFinisher::Get().Drain();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
