@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -2839,6 +2840,82 @@ void CheckConsumeCompaction() {
 }
 #endif
 
+#ifdef _WIN32
+struct LatencySummary {
+    double median = 0.0;
+    double p99 = 0.0;
+};
+
+LatencySummary Summarize(std::vector<double>& samples) {
+    if (samples.empty()) return {};
+    std::sort(samples.begin(), samples.end());
+    return {samples[samples.size() / 2], samples[samples.size() * 99 / 100]};
+}
+
+void RunMappingBench(int collectors, int spinners) {
+    constexpr std::size_t RangeBlocks = 4;
+    constexpr int Rounds = 20000;
+    const auto lanes = static_cast<std::size_t>(std::max(collectors, 1));
+    void* memory = AllocateWatched(lanes * RangeBlocks * Block);
+    std::memset(memory, 0x5a, lanes * RangeBlocks * Block);
+    constexpr std::array<const char*, 9> sites{"handlewrite", "handleread", "collect", "registry", "pin", "hostwrite", "owned", "zero", "other"};
+    std::array<std::uint64_t, sites.size() * 3> before{};
+    std::array<std::uint64_t, sites.size() * 3> after{};
+    std::uint64_t frequency = 0;
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> spinning;
+    for (int spinner = 0; spinner < spinners; ++spinner) {
+        spinning.emplace_back([&] {
+            std::uint64_t value = 0;
+            while (!stop.load(std::memory_order_relaxed)) value = value * 6364136223846793005ull + 1442695040888963407ull;
+            static_cast<void>(value);
+        });
+    }
+    std::vector<std::vector<double>> latencies(lanes);
+    std::vector<std::thread> pool;
+    GuestArena::GuestArenaMappingLockCounts_nid_no_patch(before.data(), before.size(), &frequency);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        pool.emplace_back([&, lane] {
+            auto* range = static_cast<std::uint8_t*>(memory) + lane * RangeBlocks * Block;
+            const auto address = reinterpret_cast<std::uintptr_t>(range);
+            std::vector<void*> pages(RangeBlocks * Block / 4096);
+            latencies[lane].reserve(Rounds);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int round = 0; round < Rounds; ++round) {
+                range[(static_cast<std::size_t>(round) % pages.size()) * 4096] = static_cast<std::uint8_t>(round);
+                std::size_t count = pages.size();
+                const auto began = std::chrono::steady_clock::now();
+                static_cast<void>(GuestArena::GuestArenaCollectWrites_nid_postfix(address, RangeBlocks * Block, pages.data(), &count, true));
+                latencies[lane].push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - began).count());
+            }
+        });
+    }
+    const auto began = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : pool) thread.join();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& thread : spinning) thread.join();
+    GuestArena::GuestArenaMappingLockCounts_nid_no_patch(after.data(), after.size(), &frequency);
+    std::vector<double> all;
+    for (auto& samples : latencies) all.insert(all.end(), samples.begin(), samples.end());
+    const auto collect = Summarize(all);
+    std::printf("mapping bench: %zu collectors, %d spinners; %.0f collects/s; collect median %.2f us p99 %.2f us", lanes, spinners, static_cast<double>(all.size()) / seconds, collect.median, collect.p99);
+    if (frequency != 0 && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        std::printf("; mapping lock acquisitions/contended/ms waited:");
+        for (std::size_t site = 0; site < sites.size(); ++site) {
+            const auto acquired = after[site * 3] - before[site * 3];
+            if (acquired == 0) continue;
+            std::printf(" %s %llu/%llu/%.2f", sites[site], static_cast<unsigned long long>(acquired), static_cast<unsigned long long>(after[site * 3 + 1] - before[site * 3 + 1]), static_cast<double>(after[site * 3 + 2] - before[site * 3 + 2]) * 1000.0 / static_cast<double>(frequency));
+        }
+    } else {
+        std::printf("; set APS5_PROFILE_DRAW=1 for the mapping lock counts");
+    }
+    std::printf("\n");
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2852,6 +2929,14 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
             RunMemoHitBench(std::stoi(argv[2]));
+            return 0;
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--mapping-bench") {
+#ifdef _WIN32
+            RunMappingBench(std::stoi(argv[2]), std::stoi(argv[3]));
+#else
+            std::cout << "the mapping bench measures WindowsMappings and runs on Windows only\n";
+#endif
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--lossless-consume") {
