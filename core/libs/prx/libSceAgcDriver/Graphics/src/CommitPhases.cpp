@@ -100,6 +100,10 @@ bool CommitPhasesEnabled() {
     return enabled;
 }
 
+const char* CommitPhaseGroup(CommitPhase phase) {
+    return PhaseGroups[static_cast<std::size_t>(phase)];
+}
+
 const char* CommitPhaseName(CommitPhase phase) {
     return PhaseNames[static_cast<std::size_t>(phase)];
 }

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -144,8 +146,32 @@ void TestFollowEpochForwardOnly() {
     Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");
 }
 
+void TestRingPhasesKeepTheirNames() {
+    using AgcDriver::Graphics::CommitPhase;
+    struct Named {
+        CommitPhase phase;
+        std::string_view name;
+        std::string_view group;
+    };
+    const std::array<Named, 8> phases{{
+        {CommitPhase::TargetsDepthClaims, "targets.depth.claims", "targets"},
+        {CommitPhase::TargetsDepthClear, "targets.depth.clear", "targets"},
+        {CommitPhase::TargetsDepthFind, "targets.depth.find", "targets"},
+        {CommitPhase::TargetsDepthSync, "targets.depth.sync", "targets"},
+        {CommitPhase::TargetsDepthStale, "targets.depth.stale", "targets"},
+        {CommitPhase::TargetsLookupPure, "targets.lookup.pure", "targets"},
+        {CommitPhase::TargetsLookupGuards, "targets.lookup.guards", "targets"},
+        {CommitPhase::TargetsLookupCache, "targets.lookup.cache", "targets"},
+    }};
+    for (const auto& entry : phases) {
+        Check(AgcDriver::Graphics::CommitPhaseName(entry.phase) == entry.name, ("commit phase " + std::string(entry.name) + " is named " + AgcDriver::Graphics::CommitPhaseName(entry.phase) + ": the phase enum and its name table are out of order").c_str());
+        Check(AgcDriver::Graphics::CommitPhaseGroup(entry.phase) == entry.group, ("commit phase " + std::string(entry.name) + " is in group " + AgcDriver::Graphics::CommitPhaseGroup(entry.phase) + ": the phase enum and its group table are out of order").c_str());
+    }
+}
+
 int main() {
     try {
+        TestRingPhasesKeepTheirNames();
         TestFollowEpochForwardOnly();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";

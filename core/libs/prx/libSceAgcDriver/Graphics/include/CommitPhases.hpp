@@ -135,6 +135,7 @@ struct CommitPhaseTotals {
 
 bool CommitPhasesEnabled();
 const char* CommitPhaseName(CommitPhase phase);
+const char* CommitPhaseGroup(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
