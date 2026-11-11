@@ -1189,10 +1189,14 @@ std::uint64_t memoEvent(CommitCounter counter) {
 void requireTargetMiss(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, bool miss, CommitCounter path, const std::string& what, bool taken = true) {
     const auto before = TargetMissDrawsForTest();
     const auto pathBefore = memoEvent(path);
+    const auto shadowBefore = ReadCommitPhases();
     draw(device, color, options);
     const auto misses = TargetMissDrawsForTest() - before;
     const std::uint64_t expected = miss || !memoRepeats() ? 1u : 0u;
     Require(misses == expected, what + " counted " + std::to_string(misses) + " target misses, expected " + std::to_string(expected));
+    const auto shadow = ReadCommitPhases() - shadowBefore;
+    const auto shadowMisses = shadow.shadowAny[static_cast<std::size_t>(AgcDriver::Graphics::ShadowReason::TargetMiss)];
+    Require(!CommitPhasesEnabled() || shadowMisses == expected, what + " marked " + std::to_string(shadowMisses) + " draws with a target memo miss for the worker shadow, expected " + std::to_string(expected));
     Require(!taken || !CommitPhasesEnabled() || !memoRepeats() || memoEvent(path) != pathBefore, what + " did not take its target memo path");
 }
 
