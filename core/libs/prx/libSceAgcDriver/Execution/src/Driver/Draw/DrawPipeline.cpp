@@ -74,6 +74,15 @@ DrawFinisher& DrawFinisher::Get() {
             options.spin = HandoffSpinWindow();
             options.pause = &SpinPause;
             options.timed = pipelineStats();
+            options.failed = [](std::exception_ptr error) {
+                try {
+                    std::rethrow_exception(error);
+                } catch (const ProcessShutdown&) {
+                    return;
+                } catch (...) {
+                }
+                Driver::Get().ReportFailure(error);
+            };
             options.preparerStart = [] {
                 finisherThread = true;
                 PerformanceTrace::BindThread("draw finisher");

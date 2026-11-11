@@ -272,6 +272,38 @@ void WaitingItemsAreVisibleNewestFirst() {
     Require(!ring.AnyNewestFirst([](const SequenceRing::Held&) { return true; }), "a prepared item stayed visible");
 }
 
+void FirstFailureIsReportedAtOnce() {
+    std::atomic<int> reports{0};
+    std::string reported;
+    auto options = Small(4);
+    options.failed = [&](std::exception_ptr error) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception& caught) {
+            reported = caught.what();
+        }
+        reports.fetch_add(1);
+    };
+    std::atomic<bool> open{false};
+    SequenceRing ring(std::move(options));
+    const OpenOnExit opener{open};
+    ring.Push([&] {
+        while (!open.load(std::memory_order_acquire)) std::this_thread::yield();
+        throw std::runtime_error("first");
+    }, {});
+    ring.Push([] { throw std::runtime_error("second"); }, {});
+    open.store(true, std::memory_order_release);
+    ring.Settle();
+    Require(reports.load() == 1 && reported == "first", "the first failed preparation was not reported once when it happened");
+    bool rethrown = false;
+    try {
+        ring.Drain();
+    } catch (const std::runtime_error& error) {
+        rethrown = std::string(error.what()) == "first";
+    }
+    Require(rethrown, "the reported failure was not also rethrown to the producer");
+}
+
 void ResidencyIsCountedPerTag() {
     auto options = Small(8);
     options.timed = true;
@@ -322,6 +354,7 @@ int main() {
         WaitingItemsAreVisibleNewestFirst();
         PreparedWorkIsReleasedByTheProducer();
         ResidencyIsCountedPerTag();
+        FirstFailureIsReportedAtOnce();
         std::cout << "sequence ring tests passed\n";
         return 0;
     } catch (const std::exception& error) {
