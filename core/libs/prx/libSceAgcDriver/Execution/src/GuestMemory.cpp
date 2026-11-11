@@ -1314,8 +1314,17 @@ struct WriteTracker {
     std::size_t leafSlots = 0;
 
     void allocateLeafSlots(std::size_t count) {
+        releaseLeaves();
         leaves = std::make_unique<std::atomic<Leaf*>[]>(count);
         leafSlots = count;
+    }
+
+    void releaseLeaves() {
+        for (std::size_t slot = 0; slot < leafSlots; ++slot) delete leaves[slot].exchange(nullptr, std::memory_order_acq_rel);
+    }
+
+    ~WriteTracker() {
+        releaseLeaves();
     }
 
     Leaf* leafAt(std::uint64_t block) const {
