@@ -2585,6 +2585,125 @@ void RunMemoHitBench(int threads) {
     std::printf("memo hits, %d threads: %.1f ns per hit per thread\n", threads, total / static_cast<double>(lanes));
 }
 
+#if defined(__linux__)
+std::atomic<int> scanPark{0};
+std::atomic<int> changeEvents{0};
+constexpr int ChangeWaited = 1;
+constexpr int ChangeDone = 2;
+
+void ParkFirstScan() {
+    int armed = 1;
+    if (!scanPark.compare_exchange_strong(armed, 2, std::memory_order_acq_rel)) return;
+    scanPark.notify_all();
+    while (scanPark.load(std::memory_order_acquire) == 2) scanPark.wait(2, std::memory_order_acquire);
+}
+
+void NoteChangeWait() {
+    changeEvents.fetch_or(ChangeWaited, std::memory_order_acq_rel);
+    changeEvents.notify_all();
+}
+
+struct SharedViews {
+    explicit SharedViews(std::size_t count) : count(count) {
+        file = memfd_create("aps5-mapping-change", 0);
+        Require(file >= 0 && ftruncate(file, Block) == 0, "cannot create the shared views' backing");
+        raw = mmap(nullptr, (count + 2) * Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        Require(raw != MAP_FAILED, "cannot reserve the shared views");
+        const auto base = (reinterpret_cast<std::uintptr_t>(raw) + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+        for (std::size_t index = 0; index < count; ++index) {
+            views.push_back(base + index * Block);
+            Require(mmap(reinterpret_cast<void*>(views.back()), Block, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) != MAP_FAILED, "cannot map a shared view");
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.back()), Block);
+        }
+        spare = base + count * Block;
+        Require(mmap(reinterpret_cast<void*>(spare), Block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot map the unrelated view");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(spare), Block);
+    }
+    ~SharedViews() {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.front()), (count + 1) * Block);
+        munmap(raw, (count + 2) * Block);
+        close(file);
+    }
+    bool Alias(std::size_t first, std::size_t second) const {
+        return GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views[first]), reinterpret_cast<void*>(views[second]), Block);
+    }
+    SharedViews(const SharedViews&) = delete;
+    SharedViews& operator=(const SharedViews&) = delete;
+    std::size_t count;
+    int file = -1;
+    void* raw = nullptr;
+    std::vector<std::uintptr_t> views;
+    std::uintptr_t spare = 0;
+};
+
+int ChangeDuringParkedScan(const std::function<void()>& scan, const std::function<void()>& change) {
+    scanPark.store(1, std::memory_order_release);
+    changeEvents.store(0, std::memory_order_release);
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(&ParkFirstScan);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(&NoteChangeWait);
+    std::thread walker(scan);
+    while (scanPark.load(std::memory_order_acquire) != 2) scanPark.wait(1, std::memory_order_acquire);
+    std::thread changer([&] {
+        change();
+        changeEvents.fetch_or(ChangeDone, std::memory_order_acq_rel);
+        changeEvents.notify_all();
+    });
+    while (changeEvents.load(std::memory_order_acquire) == 0) changeEvents.wait(0, std::memory_order_acquire);
+    const int seen = changeEvents.load(std::memory_order_acquire);
+    scanPark.store(3, std::memory_order_release);
+    scanPark.notify_all();
+    walker.join();
+    changer.join();
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(nullptr);
+    return seen;
+}
+
+void CollectView(std::uintptr_t view) {
+    std::size_t pages = 0;
+    static_cast<void>(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(view, Block, [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(count) += (end - begin) / 4096; }, &pages));
+}
+
+void RequireWaited(int seen, const std::string& what) {
+    Require((seen & ChangeWaited) != 0 && (seen & ChangeDone) == 0, what + " did not wait for an overlapping scan");
+}
+
+void CheckMappingChanges() {
+    {
+        SharedViews views(2);
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { Require(views.Alias(0, 1), "cannot alias the shared views"); }), "an alias of the scanned view");
+        CollectView(views.views[0]);
+        CollectView(views.views[1]);
+        reinterpret_cast<volatile std::uint8_t*>(views.views[0])[0x40] = 0x5a;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> reported;
+        Require(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(views.views[0], Block, [](void* found, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(found)->emplace_back(begin, end); }, &reported), "cannot collect the aliased view");
+        const auto partner = views.views[1] + 0x40;
+        Require(std::any_of(reported.begin(), reported.end(), [&](const auto& run) { return run.first <= partner && partner < run.second; }), "a write after an alias made during a scan was not reported at the alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.views[1]), Block); }), "an unregistration of the scanned view's alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[1]); }, [&] { GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.views[0]), Block); }), "a registration over the scanned view's alias");
+    }
+    {
+        SharedViews views(3);
+        Require(views.Alias(0, 1) && views.Alias(1, 2), "cannot chain the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.views[2]), Block); }), "an unregistration of an alias of the scanned view's alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        const int seen = ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.spare), Block); });
+        Require(seen == ChangeDone, "a registration of an unrelated range waited for a scan");
+    }
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2599,6 +2718,20 @@ int main(int argc, char** argv) {
         if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
             RunMemoHitBench(std::stoi(argv[2]));
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mapping-changes") {
+#if defined(__linux__)
+            if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+                std::cout << "no Linux write watch: mapping change tests skipped\n";
+                return 77;
+            }
+            CheckMappingChanges();
+            std::cout << "mapping change tests passed\n";
+            return 0;
+#else
+            std::cout << "mapping changes are ordered by the Linux write watch: skipped\n";
+            return 77;
+#endif
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
             SetObservationServiceForTest(false);

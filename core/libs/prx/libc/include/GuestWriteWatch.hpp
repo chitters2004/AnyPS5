@@ -26,6 +26,8 @@ bool GuestWriteWatchCollectFresh_nid_postfix(std::uintptr_t address, std::size_t
 bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr_t begin, std::uintptr_t end));
 bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestWriteWatchSetScanHookForTest_nid_postfix(void (*hook)());
+void GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(void (*hook)());
 
 }
 

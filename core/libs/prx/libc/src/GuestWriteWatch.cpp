@@ -1,6 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -14,6 +15,7 @@
 
 #if defined(__linux__)
 #include <cerrno>
+#include <condition_variable>
 #include <cstring>
 #include <fcntl.h>
 #include <linux/fs.h>
@@ -49,6 +51,9 @@ namespace {
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
 constexpr std::uintptr_t PageBytes = 4096;
 
+std::atomic<void (*)()> scanHook{nullptr};
+std::atomic<void (*)()> changeWaitHook{nullptr};
+
 class Watch {
 public:
     static Watch& Get() {
@@ -63,6 +68,7 @@ public:
     void Register(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available() || end <= begin) return;
         std::unique_lock lock(_lock);
+        const Change change{*this, lock, begin, end};
         remove(_ranges, begin, end);
         remove(_fresh, begin, end);
         cut(begin, end);
@@ -85,6 +91,7 @@ public:
     bool Unregister(std::uintptr_t begin, std::uintptr_t end) {
         if (!Available() || end <= begin) return false;
         std::unique_lock lock(_lock);
+        const Change change{*this, lock, begin, end};
         const bool watched = remove(_ranges, begin, end);
         remove(_fresh, begin, end);
         cut(begin, end);
@@ -94,6 +101,7 @@ public:
     bool Alias(std::uintptr_t first, std::uintptr_t second, std::uintptr_t bytes) {
         if (!Available() || bytes == 0 || first == second || (first | second | bytes) % PageBytes != 0) return false;
         std::unique_lock lock(_lock);
+        const Change change{*this, lock, first, first + bytes, second, second + bytes};
         if (!covers(first, first + bytes) || !covers(second, second + bytes)) return false;
         link(first, first + bytes, second);
         link(second, second + bytes, first);
@@ -118,7 +126,8 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
-        const auto plan = aliasPlan(begin, end);
+        const Scan scan{*this, begin, end};
+        const auto& plan = scan.plan;
         Fanout fanout{&plan.own, written, context};
         if (!takeFresh(begin, end, true, &Fanout::Report, &fanout) || !scanWritten(begin, end, &Fanout::Report, &fanout)) return false;
         for (const auto& alias : plan.aliases) {
@@ -133,14 +142,15 @@ public:
         begin &= ~(PageBytes - 1);
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
-        const auto plan = aliasPlan(begin, end);
-        if (plan.aliases.empty()) {
+        {
             std::shared_lock lock(_lock);
             auto it = _fresh.upper_bound(begin);
             if (it != _fresh.begin()) --it;
             while (it != _fresh.end() && it->first < end && it->second <= begin) ++it;
-            if (it == _fresh.end() || it->first >= end) return true;
+            if ((it == _fresh.end() || it->first >= end) && translations(begin, end).empty()) return true;
         }
+        const Scan scan{*this, begin, end};
+        const auto& plan = scan.plan;
         Fanout fanout{&plan.own, written, context};
         if (!takeFresh(begin, end, false, &Fanout::Report, &fanout)) return false;
         for (const auto& alias : plan.aliases) {
@@ -156,15 +166,16 @@ public:
         end = (end + PageBytes - 1) & ~(PageBytes - 1);
         if (end <= begin) return true;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armed;
-        AliasPlan plan;
         std::vector<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>> aliasArmed;
-        {
-            std::shared_lock lock(_lock);
-            if (!covers(begin, end)) return false;
+        bool covered = false;
+        const Scan scan{*this, begin, end, [&](const AliasPlan& plan) {
+            covered = covers(begin, end);
+            if (!covered) return;
             armed = armedParts(begin, end);
-            plan = aliasPlanLocked(begin, end);
             for (const auto& alias : plan.aliases) aliasArmed.push_back(armedParts(alias.begin, alias.end));
-        }
+        }};
+        if (!covered) return false;
+        const auto& plan = scan.plan;
         Fanout fanout{&plan.own, written, context};
         for (const auto& [from, to] : armed) {
             if (!scanWritten(from, to, &Fanout::Report, &fanout)) return false;
@@ -217,9 +228,109 @@ private:
         std::uintptr_t partner;
     };
 
-    AliasPlan aliasPlan(std::uintptr_t begin, std::uintptr_t end) {
-        std::shared_lock lock(_lock);
-        return aliasPlanLocked(begin, end);
+    using Spans = std::vector<std::pair<std::uintptr_t, std::uintptr_t>>;
+
+    class Busy {
+    public:
+        Busy(std::vector<const Spans*>& table, const Spans& spans) : table(table), spans(spans) {
+            table.push_back(&spans);
+        }
+
+        ~Busy() {
+            std::erase(table, &spans);
+        }
+
+        Busy(const Busy&) = delete;
+        Busy& operator=(const Busy&) = delete;
+
+    private:
+        std::vector<const Spans*>& table;
+        const Spans& spans;
+    };
+
+    class Scan {
+    public:
+        Scan(Watch& watch, std::uintptr_t begin, std::uintptr_t end) : Scan(watch, begin, end, [](const AliasPlan&) {}) {}
+
+        template <typename Locked>
+        Scan(Watch& watch, std::uintptr_t begin, std::uintptr_t end, Locked&& locked) : watch(watch) {
+            {
+                std::unique_lock lock(watch._lock);
+                for (;;) {
+                    plan = watch.aliasPlanLocked(begin, end);
+                    spans.assign(1, {begin, end});
+                    for (const auto& alias : plan.aliases) spans.emplace_back(alias.begin, alias.end);
+                    if (!overlaps(watch._changes, spans)) break;
+                    watch._settled.wait(lock);
+                }
+                locked(plan);
+                watch._scans.push_back(&spans);
+            }
+            if (const auto hook = scanHook.load(std::memory_order_acquire)) hook();
+        }
+
+        ~Scan() {
+            {
+                const std::unique_lock lock(watch._lock);
+                std::erase(watch._scans, &spans);
+            }
+            watch._settled.notify_all();
+        }
+
+        Scan(const Scan&) = delete;
+        Scan& operator=(const Scan&) = delete;
+
+        AliasPlan plan;
+
+    private:
+        Watch& watch;
+        Spans spans;
+    };
+
+    class Change {
+    public:
+        Change(Watch& watch, std::unique_lock<std::shared_mutex>& lock, std::uintptr_t begin, std::uintptr_t end, std::uintptr_t otherBegin = 0, std::uintptr_t otherEnd = 0) : watch(watch), busy(watch._changes, spans) {
+            for (bool waited = false;;) {
+                spans.clear();
+                watch.affected(spans, begin, end);
+                watch.affected(spans, otherBegin, otherEnd);
+                if (!overlaps(watch._scans, spans)) break;
+                if (!waited) {
+                    waited = true;
+                    if (const auto hook = changeWaitHook.load(std::memory_order_acquire)) hook();
+                }
+                watch._settled.wait(lock);
+            }
+        }
+
+        ~Change() {
+            watch._settled.notify_all();
+        }
+
+        Change(const Change&) = delete;
+        Change& operator=(const Change&) = delete;
+
+    private:
+        Watch& watch;
+        Spans spans;
+        Busy busy;
+    };
+
+    void affected(Spans& spans, std::uintptr_t begin, std::uintptr_t end) const {
+        if (end <= begin) return;
+        spans.emplace_back(begin, end);
+        for (const auto& [from, to, partner] : translations(begin, end)) spans.emplace_back(partner, partner + (to - from));
+    }
+
+    static bool overlaps(const std::vector<const Spans*>& table, const Spans& spans) {
+        for (const auto* busy : table) {
+            for (const auto& [busyBegin, busyEnd] : *busy) {
+                for (const auto& [begin, end] : spans) {
+                    if (busyBegin < end && begin < busyEnd) return true;
+                }
+            }
+        }
+        return false;
     }
 
     AliasPlan aliasPlanLocked(std::uintptr_t begin, std::uintptr_t end) const {
@@ -466,6 +577,9 @@ private:
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
     std::multimap<std::uintptr_t, Link> _links;
     std::uintptr_t _linkBytes = 0;
+    std::vector<const Spans*> _scans;
+    std::vector<const Spans*> _changes;
+    std::condition_variable_any _settled;
 };
 
 const bool g_opened = (Watch::Get(), true);
@@ -1323,6 +1437,22 @@ void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
+#endif
+}
+
+void GuestWriteWatchSetScanHookForTest_nid_postfix(void (*hook)()) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    scanHook.store(hook, std::memory_order_release);
+#else
+    static_cast<void>(hook);
+#endif
+}
+
+void GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(void (*hook)()) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    changeWaitHook.store(hook, std::memory_order_release);
+#else
+    static_cast<void>(hook);
 #endif
 }
 
