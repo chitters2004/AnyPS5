@@ -2931,7 +2931,13 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    std::string tables;
+    std::uint64_t capacity = DescriptorCache::SmallestTableClass;
+    for (std::size_t index = 0; index < DescriptorCache::TableClasses; ++index, capacity *= 2) {
+        if (descriptors.tableDraws[index] == 0) continue;
+        tables += " <=" + std::to_string(capacity) + ":" + std::to_string(descriptors.tableDraws[index]);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, recycled %llu sets of %llu descriptors (%llu refused), samplers %llu hits / %llu created, table draws by elements:%s\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.recycledSets), static_cast<unsigned long long>(descriptors.recycledDescriptors), static_cast<unsigned long long>(descriptors.recycleRefused), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses), tables.c_str());
 }
 
 constexpr std::size_t CompactTableKeyWords = 8192;
@@ -5094,7 +5100,9 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPT
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
     bool fits = true;
+    std::uint64_t descriptors = 0;
     for (const auto& size : sizes) {
+        descriptors += size.descriptorCount;
         const auto limit = SetDescriptorLimit(context, size.type, updateAfterBind);
         Require(size.descriptorCount <= limit, "descriptor set exceeds the device's per-set descriptor limit");
         const auto capacity = std::find_if(ChainPoolSizes.begin(), ChainPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
@@ -5117,6 +5125,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         });
         if (same != kept.end()) {
             auto reused = std::move(*same);
+            reused.descriptors = descriptors;
             kept.erase(same);
             dedicated.push_back(reused.pool);
             ++stats.reusedSets;
@@ -5134,7 +5143,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         dedicated.push_back(pool);
         ++stats.dedicatedPools;
         ++stats.sets;
-        return {set, pool, 0, updateAfterBind, layout, std::vector<VkDescriptorPoolSize>(sizes.begin(), sizes.end()), variableCount, {}};
+        return {set, pool, 0, updateAfterBind, layout, std::vector<VkDescriptorPoolSize>(sizes.begin(), sizes.end()), variableCount, {}, descriptors};
     }
     auto& chain = updateAfterBind ? updateAfterBindPools : pools;
     for (std::size_t index = chain.size(); index != 0; --index) {
@@ -5146,7 +5155,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         if (result == VK_SUCCESS) {
             ++stats.sets;
             ++pool.liveSets;
-            return {set, pool.handle, index - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
+            return {set, pool.handle, index - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}, descriptors};
         }
         if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
         pool.exhausted = true;
@@ -5167,7 +5176,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     Check(allocate(context.device, &allocation, &set), "vkAllocateDescriptorSets");
     chain.back().liveSets = 1;
     ++stats.sets;
-    return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
+    return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}, descriptors};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
@@ -5176,6 +5185,8 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSe
         if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
             const auto allocation = found->second.back();
             found->second.pop_back();
+            --stats.recycledSets;
+            stats.recycledDescriptors -= allocation.descriptors;
             return allocation;
         }
     }
@@ -5188,10 +5199,13 @@ void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation&
         std::lock_guard lock(mutex);
         try {
             auto& list = recycled[{layout, allocation.variableCount.value_or(0u)}];
-            if (list.size() < 4096) {
+            if (list.size() < 4096 && stats.recycledDescriptors + allocation.descriptors <= RecycledDescriptorBudget) {
                 list.push_back(allocation);
+                ++stats.recycledSets;
+                stats.recycledDescriptors += allocation.descriptors;
                 return;
             }
+            ++stats.recycleRefused;
         } catch (...) {
         }
     }
@@ -5228,7 +5242,17 @@ void DescriptorCache::Free(const SetAllocation& allocation, std::shared_ptr<cons
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
     std::lock_guard lock(mutex);
-    return stats;
+    auto result = stats;
+    for (std::size_t index = 0; index < TableClasses; ++index) result.tableDraws[index] = tableDraws[index].load(std::memory_order_relaxed);
+    return result;
+}
+
+static_assert((std::uint64_t{DescriptorCache::SmallestTableClass} << (DescriptorCache::TableClasses - 1)) == std::uint64_t{ShaderRecompiler::RuntimeAbi::StageCount} * ShaderRecompiler::ImageTableAbi::ImageElementBudget);
+
+void DescriptorCache::NoteTableDraw(std::uint32_t elements) noexcept {
+    std::size_t index = 0;
+    for (std::uint64_t capacity = SmallestTableClass; capacity < elements && index + 1 < TableClasses; capacity *= 2) ++index;
+    tableDraws[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
@@ -6716,6 +6740,13 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    if (BuildProfiled() && context.descriptorCache != nullptr) {
+        std::optional<std::uint32_t> elements;
+        for (const auto table : tableBindings) {
+            if (table != std::numeric_limits<std::size_t>::max()) elements = std::max(elements.value_or(0u), static_cast<std::uint32_t>(bindings[table].imageAllocations.size()));
+        }
+        if (elements.has_value()) context.descriptorCache->NoteTableDraw(*elements);
+    }
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
