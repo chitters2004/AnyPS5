@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -187,7 +188,8 @@ void PlansFollowTheirKey() {
     Expect(first[DrawPlanCount::Absent] == 1, "the first draw did not insert a plan");
     Expect(second[DrawPlanCount::Lookups] == 0 || (second[DrawPlanCount::Present] == 1 && second[DrawPlanCount::Agreed] == 1 && second[DrawPlanCount::SameInstance] == 1), "a repeated draw did not find and agree with its plan on the same instance");
     Expect(third[DrawPlanCount::Lookups] == 0 || (third[DrawPlanCount::Present] == 1 && third[DrawPlanCount::Agreed] == 1 && third[DrawPlanCount::SameInstance] == 1), "a repeated draw that its exact-key recipe did not serve did not find and agree with its plan on the same instance");
-    Expect(otherTarget[DrawPlanCount::Present] == 1 && otherTarget[DrawPlanCount::Agreed] == 1 && otherTarget[DrawPlanCount::InstanceDiffers] == 1, "a draw into another render target did not share the plan as another instance");
+    const bool servedIntoOwnTarget = AgcDriver::Graphics::DrawPlans() && AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::PlanAttachments) && otherTarget[DrawPlanCount::Lookups] == 0;
+    Expect(servedIntoOwnTarget || (otherTarget[DrawPlanCount::Present] == 1 && otherTarget[DrawPlanCount::Agreed] == 1 && otherTarget[DrawPlanCount::InstanceDiffers] == 1), "a draw into another render target did not share the plan as another instance");
     Expect(strip[DrawPlanCount::Absent] == 1 && strip[DrawPlanCount::Present] == 0, "a draw with another topology shared the triangle list's plan");
     Expect(stripAgain[DrawPlanCount::Lookups] == 0 || (stripAgain[DrawPlanCount::Present] == 1 && stripAgain[DrawPlanCount::Agreed] == 1), "the triangle strip did not find its own plan");
     std::puts("draw plan shadow: plans follow the compiled stages and the pipeline-shaping state, and render targets are instances");

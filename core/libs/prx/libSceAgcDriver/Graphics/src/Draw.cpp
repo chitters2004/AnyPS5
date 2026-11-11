@@ -3945,6 +3945,31 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
     return copies ? TargetResolution::ResolvedWithCopies : TargetResolution::Resolved;
 }
 
+struct HandedTargets {
+    bool valid = false;
+    std::vector<ColorTarget> colors;
+    std::optional<DepthTarget> depth;
+    std::vector<TargetBinding> targets;
+    std::vector<VkImageView> views;
+};
+
+HandedTargets& ThreadHandedTargets() {
+    thread_local HandedTargets* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+bool takeHandedTargets(const State& state, std::vector<TargetBinding>& targets, std::vector<VkImageView>& views) {
+    auto& handed = ThreadHandedTargets();
+    if (!handed.valid) return false;
+    const bool same = handed.colors == state.colors && handed.depth == state.depth;
+    if (same) {
+        targets = std::move(handed.targets);
+        views = std::move(handed.views);
+    }
+    handed = {};
+    return same;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
@@ -4008,7 +4033,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targets = prepared.targets;
     auto& targetViews = prepared.targetViews;
     ResolvedTargets resolvedTargets{targets, targetViews};
-    static_cast<void>(ResolveDrawTargets(context, state, prepared.shape, dumpLimit, outcome, timer, profile, resolvedTargets));
+    if (!takeHandedTargets(state, targets, targetViews)) static_cast<void>(ResolveDrawTargets(context, state, prepared.shape, dumpLimit, outcome, timer, profile, resolvedTargets));
     timer.phase(PhasePrepare);
     BeginCommitPhase(CommitPhase::Resolve);
     const bool recordDraws = RecordDraws();
@@ -4941,14 +4966,49 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
-    auto& memo = ThreadTargetMemo();
-    static_cast<void>(ownsTargetMemo(memo));
-    memo.Invalidate();
-    BeginCommitPhase(CommitPhase::Targets);
-    if (CommitPhasesEnabled()) noteRepeatedTargets(state, true);
+    ThreadHandedTargets() = {};
     std::vector<std::shared_ptr<StorageTexture>> targets;
     targets.reserve(recipe.targets.size());
-    for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
+    std::vector<VkImageView> ownViews;
+    const bool resolving = planned && RuntimeSwitches::Set(RuntimeSwitch::PlanAttachments) && TargetsPlanRecordable(state, DumpTargetLimit());
+    if (resolving) {
+        BeginCommitPhase(CommitPhase::Targets);
+        if (CommitPhasesEnabled()) noteRepeatedTargets(state, false);
+        std::vector<TargetBinding> bindings;
+        ResolvedTargets resolution{bindings, ownViews};
+        const auto how = ResolveDrawTargets(context, state, 0, DumpTargetLimit(), outcome, timer, profile, resolution);
+        const bool direct = how != TargetResolution::ResolvedWithCopies && std::ranges::all_of(bindings, [](const TargetBinding& binding) { return binding.resident != nullptr && !binding.multisampled && binding.stagedTemporary == nullptr; });
+        if (!direct) {
+            auto& handed = ThreadHandedTargets();
+            handed.valid = true;
+            handed.colors = state.colors;
+            handed.depth = state.depth;
+            handed.targets = std::move(bindings);
+            handed.views = std::move(ownViews);
+            result.handedTargets = true;
+            return instanceMiss(DrawPlanInstance::Target);
+        }
+        if (VerifyDrawPlans()) {
+            Require(ownViews.size() == recipe.targetViews.size(), "APS5_VERIFY_DRAW_PLANS: a plan hit resolved another number of attachments than its plan holds");
+            for (std::size_t index = 0; index < bindings.size(); ++index) {
+                const auto& color = state.colors[index];
+                const auto& binding = bindings[index];
+                Require(binding.resident == CachedStorageSurface(context, SurfaceForTarget(color)), "APS5_VERIFY_DRAW_PLANS: a plan hit resolved a colour target the storage cache does not hold for the draw's surface");
+                Require(ownViews[index] == (binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice)), "APS5_VERIFY_DRAW_PLANS: a plan hit resolved a colour view the full path would not bind");
+            }
+            if (state.depth) Require(ownViews.back() == DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)), "APS5_VERIFY_DRAW_PLANS: a plan hit resolved a depth view other than the depth surface's for the draw");
+        }
+        for (const auto& binding : bindings) targets.push_back(binding.resident);
+        result.ownAttachments = ownViews != recipe.targetViews;
+    }
+    auto& memo = ThreadTargetMemo();
+    if (!resolving) {
+        static_cast<void>(ownsTargetMemo(memo));
+        memo.Invalidate();
+        BeginCommitPhase(CommitPhase::Targets);
+        if (CommitPhasesEnabled()) noteRepeatedTargets(state, true);
+    }
+    for (std::size_t index = 0; !resolving && index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) InCommitPhase(CommitPhase::TargetsClaims, [&] { GuardOneFragmentFmask(context, state.colors[index]); });
         auto stored = recipe.targets[index].lock();
@@ -4969,7 +5029,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if (planned && InCommitPhase(CommitPhase::PlanHitTargets, [&] { return resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice); }) != recipe.targetViews[index]) return instanceMiss(DrawPlanInstance::View);
         targets.push_back(std::move(resident));
     }
-    if (recipe.hasDepth) {
+    if (recipe.hasDepth && !resolving) {
         timer.phase(PhaseSetup);
         const auto depthView = InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
         timer.phase(PhaseReadTarget);
@@ -5023,10 +5083,11 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (pipeline == nullptr) return miss(DrawRecipeMiss::ObjectsGone);
     if (planned && VerifyDrawPlans()) requirePlanDecisionsRepeat(context, state, draw, shaders, snapshots, recipe, *usedKey, result.templateInstance, *resources, moved, pipeline, targets);
     const bool sameExtent = recipe.renderExtent.width == state.renderExtent.width && recipe.renderExtent.height == state.renderExtent.height;
-    auto framebuffer = !planned || sameExtent ? recipe.framebuffer.lock() : nullptr;
+    const auto& drawnViews = result.ownAttachments ? ownViews : recipe.targetViews;
+    auto framebuffer = (!planned || sameExtent) && !result.ownAttachments ? recipe.framebuffer.lock() : nullptr;
     if (framebuffer == nullptr) {
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
-        framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers); });
+        framebuffer = InCommitPhase(CommitPhase::PlanFramebuffer, [&] { return pipeline->AcquireFramebuffer(drawnViews, framebufferOwners, state.renderExtent, state.renderLayers); });
     }
     timer.phase(PhasePipeline);
     BeginCommitPhase(CommitPhase::Record);
@@ -5039,7 +5100,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.moved = std::move(moved);
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
-    record.targetViews = recipe.targetViews;
+    record.targetViews = drawnViews;
     record.targets = std::move(targets);
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
     auto pushBytes = recipe.pushBytes;

@@ -82,6 +82,8 @@ enum class DrawPlanCount : std::size_t {
     InstanceView,
     InstanceDepth,
     TemplateInstanceHits,
+    OwnAttachmentHits,
+    HandedTargets,
     AbsentEvicted,
     AbsentUndecided,
     AbsentNew,

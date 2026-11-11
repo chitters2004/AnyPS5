@@ -126,6 +126,8 @@ struct DrawRecipeOutcome {
     DrawPlanInstance instance = DrawPlanInstance::None;
     std::uint8_t instanceMismatches = 0;
     bool templateInstance = false;
+    bool ownAttachments = false;
+    bool handedTargets = false;
 };
 
 inline constexpr std::uint8_t PlanMismatchShape = 1u;
