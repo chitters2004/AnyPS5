@@ -340,6 +340,10 @@ public:
         std::uint64_t probed, repeated, identical;
     };
     static EffectRepeats EffectRepeatCounts();
+    struct BindingCounts {
+        std::uint64_t calls, visited, written, notDirect, pendingWrite, overBudget, overrides, unwritten, uploaded, reused, created, setsWritten, repeated, identical, slotsDiffer;
+    };
+    static BindingCounts DrawBindingCounts();
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
@@ -674,6 +678,8 @@ private:
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     struct EffectInputs;
+    struct BindingInputs;
+    mutable std::unique_ptr<BindingInputs> bindingInputs;
     std::unique_ptr<EffectInputs> effectInputs;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
@@ -723,6 +729,7 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void noteDrawBindings(const Recorder& recorder, BindingCounts tally, std::span<const std::size_t> selected, const DrawBindings* result, bool written) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write

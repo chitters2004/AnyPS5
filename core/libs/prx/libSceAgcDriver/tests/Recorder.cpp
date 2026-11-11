@@ -4248,12 +4248,26 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         Recorder snapshotRecorder(snapshotContext);
         snapshotRecorder.Activate();
         ShaderResources resources(snapshotContext, compute);
+        const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        const auto countsBefore = ShaderResources::DrawBindingCounts();
         auto first = resources.PrepareDrawBindings(snapshotRecorder);
         Require(first != nullptr && first->snapshots.size() == 1, "read-only draw input was not snapshotted");
         std::memset(reinterpret_cast<void*>(element), 0x22, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto second = resources.PrepareDrawBindings(snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
+        auto third = resources.PrepareDrawBindings(snapshotRecorder);
+        Require(third != nullptr && third->snapshots.size() == 1, "unchanged draw input was not bound a third time");
+        const auto countsAfter = ShaderResources::DrawBindingCounts();
+        const auto sameSlot = [](const ShaderResources::DrawBindings& left, const ShaderResources::DrawBindings& right) { return left.snapshots[0].buffer == right.snapshots[0].buffer && left.snapshots[0].offset == right.snapshots[0].offset && left.snapshots[0].bytes == right.snapshots[0].bytes; };
+        const std::uint64_t expectedDiffer = (sameSlot(*first, *second) ? 0u : 1u) + (sameSlot(*second, *third) ? 0u : 1u);
+        if (profiled) {
+            Require(countsAfter.calls == countsBefore.calls + 3 && countsAfter.visited == countsBefore.visited + 3 && countsAfter.setsWritten == countsBefore.setsWritten + 3, "three bindings of one draw input were not counted as three calls visiting one allocation each");
+            Require(countsAfter.repeated == countsBefore.repeated + 2, "the second and third bindings in one batch were not counted as repeats");
+            Require(countsAfter.slotsDiffer - countsBefore.slotsDiffer == expectedDiffer && countsAfter.identical - countsBefore.identical == 2 - expectedDiffer, "the repeats' differing slots do not match the snapshots the bindings returned");
+        } else {
+            Require(countsAfter.calls == countsBefore.calls && countsAfter.visited == countsBefore.visited, "draw bindings were counted without APS5_PROFILE_DRAW");
+        }
         Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
@@ -4270,13 +4284,17 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         snapshotLifetime = first;
         first.reset();
         second.reset();
+        third.reset();
         Require(!snapshotLifetime.expired(), "draw snapshot was released before its GPU batch");
         snapshotRecorder.Sync();
         const auto contents = downloaded->Bytes();
         Require(std::all_of(contents.begin(), contents.begin() + elementBytes, [](std::byte value) { return value == std::byte{0x11}; }), "first draw observed overwritten input");
         Require(std::all_of(contents.begin() + elementBytes, contents.end(), [](std::byte value) { return value == std::byte{0x22}; }), "second draw observed overwritten input");
         snapshotRecorder.NotePendingWrite(element, elementBytes);
+        const auto pendingBefore = ShaderResources::DrawBindingCounts();
         Require(resources.PrepareDrawBindings(snapshotRecorder) == nullptr, "GPU-produced input was replaced with stale CPU memory");
+        const auto pendingAfter = ShaderResources::DrawBindingCounts();
+        if (profiled) Require(pendingAfter.pendingWrite == pendingBefore.pendingWrite + 1 && pendingAfter.setsWritten == pendingBefore.setsWritten && pendingAfter.calls == pendingBefore.calls + 1, "a draw input behind a pending GPU write was not counted as skipped for it");
         snapshotRecorder.Sync();
     }
     Require(snapshotLifetime.expired(), "draw snapshots outlived their recorder");
@@ -16036,6 +16054,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--slice-dirty-only") {
             sliceDirtyTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-read-only") {
+            resourceReadTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {

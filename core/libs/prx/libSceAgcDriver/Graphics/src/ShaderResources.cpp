@@ -2913,6 +2913,38 @@ std::uint64_t ShaderResources::InPlaceReadReuses() {
     return inPlaceReadReuses.load(std::memory_order_relaxed);
 }
 
+struct ShaderResources::BindingInputs {
+    struct Slot {
+        std::size_t allocation = 0;
+        const void* buffer = nullptr;
+        VkDeviceSize offset = 0;
+        std::size_t bytes = 0;
+        bool operator==(const Slot&) const = default;
+    };
+    const Recorder* recorder = nullptr;
+    std::uint64_t batch = 0;
+    std::vector<Slot> slots;
+};
+
+namespace {
+
+std::array<std::atomic<std::uint64_t>, sizeof(ShaderResources::BindingCounts) / sizeof(std::uint64_t)> bindingCounters{};
+
+bool DrawBindingsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+}
+
+ShaderResources::BindingCounts ShaderResources::DrawBindingCounts() {
+    std::array<std::uint64_t, sizeof(BindingCounts) / sizeof(std::uint64_t)> values{};
+    for (std::size_t index = 0; index < values.size(); ++index) values[index] = bindingCounters[index].load(std::memory_order_relaxed);
+    BindingCounts counts{};
+    std::memcpy(&counts, values.data(), sizeof(counts));
+    return counts;
+}
+
 struct ShaderResources::EffectInputs {
     const Recorder* recorder = nullptr;
     std::uint64_t batch = 0;
@@ -6761,6 +6793,9 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    const bool profiled = DrawBindingsProfiled();
+    BindingCounts tally;
+    if (profiled) tally = {};
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -6783,7 +6818,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     };
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
+        if (profiled) ++tally.visited;
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (profiled && override != moved.end()) ++tally.overrides;
         if (override != moved.end() && !override->words.empty()) {
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
@@ -6800,13 +6837,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) {
+                if (profiled) ++tally.written;
+                continue;
+            }
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!direct) {
+                if (profiled) ++tally.notDirect;
+                continue;
+            }
+            if (recorder.PendingWriteOverlaps(item.address, item.size)) {
+                if (profiled) ++tally.pendingWrite;
+                continue;
+            }
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) {
+            if (profiled) ++tally.overBudget;
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
@@ -6824,8 +6874,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
+        if (profiled && buffer != nullptr) ++tally.unwritten;
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            if (profiled && uploaded) ++tally.uploaded;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
@@ -6834,6 +6886,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             } else {
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
+                if (profiled) ++(buffer != nullptr ? tally.reused : tally.created);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
@@ -6848,11 +6901,46 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty() && !rebound) return {};
+    if (selected.empty() && !rebound) {
+        if (profiled) noteDrawBindings(recorder, tally, selected, nullptr, false);
+        return {};
+    }
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
+    if (profiled) noteDrawBindings(recorder, tally, selected, result.get(), true);
     for (const auto& snapshot : result->snapshots) recorder.Retain(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
+}
+
+void ShaderResources::noteDrawBindings(const Recorder& recorder, BindingCounts tally, std::span<const std::size_t> selected, const DrawBindings* result, bool written) const {
+    tally.calls = 1;
+    tally.setsWritten = written ? 1 : 0;
+    if (bindingInputs == nullptr) bindingInputs = std::make_unique<BindingInputs>();
+    auto& inputs = *bindingInputs;
+    thread_local std::vector<BindingInputs::Slot>* currentSlot = nullptr;
+    auto& current = ShaderRecompiler::ThreadOwned(currentSlot);
+    current.clear();
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result->snapshots[index];
+        current.push_back({selected[index], snapshot.buffer.get(), snapshot.offset, snapshot.bytes});
+    }
+    const auto batch = recorder.Recording() ? recorder.BatchEpoch() : 0;
+    if (batch != 0 && inputs.recorder == &recorder && inputs.batch == batch) {
+        tally.repeated = 1;
+        const auto shared = std::min(current.size(), inputs.slots.size());
+        std::size_t differ = std::max(current.size(), inputs.slots.size()) - shared;
+        for (std::size_t index = 0; index < shared; ++index) differ += current[index] == inputs.slots[index] ? 0 : 1;
+        tally.slotsDiffer = differ;
+        tally.identical = differ == 0 ? 1 : 0;
+    }
+    inputs.recorder = &recorder;
+    inputs.batch = batch;
+    inputs.slots.assign(current.begin(), current.end());
+    std::array<std::uint64_t, sizeof(BindingCounts) / sizeof(std::uint64_t)> values{};
+    std::memcpy(values.data(), &tally, sizeof(tally));
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        if (values[index] != 0) bindingCounters[index].fetch_add(values[index], std::memory_order_relaxed);
+    }
 }
 
 void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
