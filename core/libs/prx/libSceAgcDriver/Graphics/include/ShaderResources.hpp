@@ -81,6 +81,14 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
+struct PreparedViewedSurface {
+    GuestTextureResource viewed{};
+    std::uint64_t viewedBytes = 0;
+    bool repeated = false;
+};
+PreparedViewedSurface PrepareViewedSurface(const GuestTextureResource& requested, std::uint32_t maxArrayLayers);
+bool PreparedTargets();
+bool VerifyPreparedTargets();
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).

@@ -51,6 +51,9 @@ enum class CommitPhase : std::uint8_t {
     TargetsDepthFind,
     TargetsDepthSync,
     TargetsDepthStale,
+    TargetsLookupPure,
+    TargetsLookupGuards,
+    TargetsLookupCache,
     Count
 };
 
@@ -102,6 +105,8 @@ enum class CommitCounter : std::uint8_t {
     TargetSlowAgainInEpoch,
     EpochFollowsSkipped,
     DepthFoundRepeated,
+    PreparedSurfaceHits,
+    PreparedSurfaceMisses,
     Count
 };
 
