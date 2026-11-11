@@ -142,6 +142,7 @@ int main() {
         Require(brightest + 2 >= 128 && brightest <= 130, "the draws before the labels wrote " + std::to_string(brightest) + ", expected 128");
         if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
         if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
+        if (finisher && DrawFinisher::Sequenced()) Require(drains.find(" end 0/") != std::string::npos, "the end of a submission whose draws the finisher still held drained the finisher:" + drains);
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
         return 0;
