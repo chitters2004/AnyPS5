@@ -85,7 +85,7 @@ constexpr std::uint32_t WriteChangeBit(WriteChange change) {
 }
 constexpr std::uint32_t WriteChangeAll = WriteChangeBit(WriteChange::Bytes) | WriteChangeBit(WriteChange::Authority) | WriteChangeBit(WriteChange::Capability) | WriteChangeBit(WriteChange::Identity);
 WriteChange WriteChangeOf(WriteBumpSource source);
-enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, Count };
+enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, CertifiedProof, Count };
 constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
     return std::uint32_t{1} << static_cast<unsigned>(domain);
 }
@@ -100,7 +100,7 @@ std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
 std::uint64_t DomainVersion(WriteDomain domain);
 WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
 void SetWriteBackingResolver(WriteBackingResolver resolver);
@@ -177,6 +177,8 @@ std::uint64_t ProofSerial();
 enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, Count };
 const char* ProofBreakName(ProofBreak source);
 void BreakProofs(ProofBreak source = ProofBreak::Unlabelled);
+bool ProofBreakVoidsCertificates(ProofBreak source);
+std::uint64_t CertificateBreakSerial();
 bool ProofBreaksCounted();
 std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakCounts();
 void MarkProofThread();
