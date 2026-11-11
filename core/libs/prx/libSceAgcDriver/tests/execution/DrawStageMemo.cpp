@@ -6,8 +6,8 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
 #include "VulkanTestDevice.hpp"
-#include "AggregateFields.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +50,8 @@ struct DriverTestAccess {
 }
 
 namespace {
+
+namespace AggregateFields = AgcDriver::AggregateFields;
 
 using AgcDriver::DriverDetail::BuildDrawStageKey;
 using AgcDriver::DriverDetail::DrawStageProof;
@@ -661,7 +664,39 @@ void ProofsFollowWriteStamps() {
 
 }
 
-int main() {
+int BenchStageKeys() {
+    ShaderSnapshot snapshot{};
+    RequestParts pixelParts;
+    pixelParts.stage = Stage::Fragment;
+    pixelParts.pixel = ShaderRecompiler::ShaderPixelStageInfo{};
+    pixelParts.pixel->interpolatorCount = 8u;
+    pixelParts.pixel->targetMerges.push_back({});
+    RequestParts vertexParts;
+    vertexParts.vertex = VertexInfo();
+    vertexParts.vertex->resourcesNum = 4u;
+    const auto pixelRequest = pixelParts.Request();
+    const auto vertexRequest = vertexParts.Request();
+    constexpr std::size_t Keys = 200000;
+    DrawStageKey key;
+    std::uint64_t sink = 0;
+    const auto time = [&](const ShaderRecompiler::RecompileRequest& request) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < Keys; ++i) {
+            BuildDrawStageKey(request, snapshot, i & 3u, 1, key);
+            sink += key.hash;
+        }
+        return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Keys;
+    };
+    for (int round = 0; round < 3; ++round) {
+        const auto pixel = time(pixelRequest);
+        const auto vertex = time(vertexRequest);
+        std::printf("bench stage keys: pixel %.1f ns, vertex %.1f ns per key (%zu words, %zu words)\n", pixel, vertex, KeyOf(pixelParts, snapshot).words.size(), KeyOf(vertexParts, snapshot).words.size());
+    }
+    return sink == 0 ? 1 : 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
     try {
         KeysFollowEveryInput();
         StageInfoKeysFollowEveryField();

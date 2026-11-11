@@ -1,5 +1,5 @@
-#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_EXECUTION_AGGREGATEFIELDS_HPP
-#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_TESTS_EXECUTION_AGGREGATEFIELDS_HPP
+#ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_AGGREGATEFIELDS_HPP
+#define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_AGGREGATEFIELDS_HPP
 
 #include <array>
 #include <cstddef>
@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-namespace AggregateFields {
+namespace AgcDriver::AggregateFields {
 
 template<class T> struct IsOptional : std::false_type {};
 template<class T> struct IsOptional<std::optional<T>> : std::true_type {};

@@ -4,8 +4,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
 #include "VulkanTestDevice.hpp"
-#include "AggregateFields.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -33,6 +33,8 @@
 #include <vector>
 
 namespace {
+
+namespace AggregateFields = AgcDriver::AggregateFields;
 
 using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DrawPlanCount;
