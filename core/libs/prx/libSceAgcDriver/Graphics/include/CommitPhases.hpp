@@ -46,6 +46,11 @@ enum class CommitPhase : std::uint8_t {
     TargetsProved,
     TargetsCmask,
     TargetsDepthPrep,
+    TargetsDepthClaims,
+    TargetsDepthClear,
+    TargetsDepthFind,
+    TargetsDepthSync,
+    TargetsDepthStale,
     Count
 };
 
@@ -65,6 +70,35 @@ enum class CommitCounter : std::uint8_t {
     TargetEpochMoved,
     TargetEpochProofMoved,
     TargetEpochPendingMoved,
+    TargetEpochBySubmission,
+    TargetEpochByWait,
+    TargetEpochByDrain,
+    TargetEpochByReap,
+    TargetEpochByPacket,
+    TargetEpochBySeveral,
+    TargetEpochByUnknown,
+    TargetProofNone,
+    TargetProofGeneration,
+    TargetProofUnlocked,
+    TargetProofRefused,
+    TargetProofKeys,
+    TargetProofChanged,
+    TargetProofPending,
+    DepthPreps,
+    DepthSameSurface,
+    DepthCreated,
+    DepthCleared,
+    DepthMirrored,
+    DepthStaleScans,
+    Count
+};
+
+enum class EpochCause : std::uint8_t {
+    Submission,
+    Wait,
+    Drain,
+    Reap,
+    Packet,
     Count
 };
 
@@ -84,6 +118,9 @@ void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
 void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
+void NoteEpochCauses(unsigned causes);
+unsigned EpochCauses();
+CommitCounter EpochCauseCounter(unsigned causes);
 CommitPhase CurrentCommitPhase();
 void RelabelCommitPhase(CommitPhase phase);
 CommitPhaseTotals ReadCommitPhases();
