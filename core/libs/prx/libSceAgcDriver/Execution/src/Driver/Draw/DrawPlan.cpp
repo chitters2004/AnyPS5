@@ -325,7 +325,10 @@ std::vector<DrawPlanStateRuledField> DrawPlanStateRuledFields(const Graphics::St
 std::shared_ptr<const DrawPlanKey> BuildDrawPlanKey(std::span<const Graphics::CompiledShader> stages, const Graphics::State& state, const Pm4::DrawParameters& draw) {
     if (stages.empty() || std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr || stage.program->PipelineVariantId() == 0; })) return nullptr;
     auto key = std::make_shared<DrawPlanKey>();
-    key->words.reserve(160);
+    constexpr std::size_t StateWords = 256;
+    std::size_t stageWords = 1;
+    for (const auto& stage : stages) stageWords += 10 + stage.program->bindings.size() + 7 * stage.program->vertexAttributes.size();
+    key->words.reserve(stageWords + StateWords + 3);
     key->words.push_back(stages.size());
     for (const auto& stage : stages) {
         const auto& program = *stage.program;
