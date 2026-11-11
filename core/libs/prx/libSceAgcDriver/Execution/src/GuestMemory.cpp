@@ -159,25 +159,34 @@ bool resolveBacking(std::uint64_t address, std::uint64_t bytes, int* file, std::
 #endif
 }
 
-void backingKeysOf(std::uint64_t address, std::uint64_t bytes, const std::function<void(std::uint64_t key, std::uint64_t block)>& emit) {
-    if (bytes == 0) return;
+constexpr std::uint64_t SubdividedBackingBytes = 16 * IndexBlockBytes;
+
+bool backingResolvable() {
+#ifdef _WIN32
+    return backingResolver.load(std::memory_order_acquire) != nullptr;
+#else
+    return true;
+#endif
+}
+
+bool emitBackingKeys(std::uint64_t address, std::uint64_t bytes, const std::function<void(std::uint64_t key, std::uint64_t block)>& emit) {
     int file = 0;
     std::uint64_t offset = 0;
-    if (resolveBacking(address, bytes, &file, &offset)) {
-        if (file < 0 || static_cast<std::uint64_t>(file) >= BackingFileLimit || (offset + bytes - 1) / IndexBlockBytes >= BackingOffsetBlockLimit) return;
-        for (auto block = offset / IndexBlockBytes; block <= (offset + bytes - 1) / IndexBlockBytes; ++block) {
-            const auto start = std::max(block * IndexBlockBytes, offset);
-            emit(BackingKeyFlag | (static_cast<std::uint64_t>(file) << 40) | block, (address + (start - offset)) / IndexBlockBytes);
-        }
-        return;
+    if (!resolveBacking(address, bytes, &file, &offset)) return false;
+    if (file < 0 || static_cast<std::uint64_t>(file) >= BackingFileLimit || (offset + bytes - 1) / IndexBlockBytes >= BackingOffsetBlockLimit) return true;
+    for (auto block = offset / IndexBlockBytes; block <= (offset + bytes - 1) / IndexBlockBytes; ++block) {
+        const auto start = std::max(block * IndexBlockBytes, offset);
+        emit(BackingKeyFlag | (static_cast<std::uint64_t>(file) << 40) | block, (address + (start - offset)) / IndexBlockBytes);
     }
-    constexpr std::uint64_t page = 4096;
-    if (bytes <= page) return;
-    const auto step = bytes > IndexBlockBytes ? IndexBlockBytes : page;
+    return true;
+}
+
+void backingKeysOf(std::uint64_t address, std::uint64_t bytes, const std::function<void(std::uint64_t key, std::uint64_t block)>& emit) {
+    if (bytes == 0 || !backingResolvable() || emitBackingKeys(address, bytes, emit) || bytes > SubdividedBackingBytes) return;
     const auto end = address + bytes;
     for (auto cursor = address; cursor < end;) {
-        const auto next = std::min(end, (cursor / step + 1) * step);
-        backingKeysOf(cursor, next - cursor, emit);
+        const auto next = std::min(end, (cursor / IndexBlockBytes + 1) * IndexBlockBytes);
+        emitBackingKeys(cursor, next - cursor, emit);
         cursor = next;
     }
 }
@@ -216,6 +225,7 @@ struct WriteIndex {
     AgcDriver::Mutex mutex;
     AgcDriver::Mutex overflowMutex;
     std::atomic<std::uint64_t> live{0};
+    std::atomic<std::uint64_t> backedLive{0};
     std::vector<std::uint32_t> freeSlots;
     std::uint64_t slotCount = 0;
     std::array<std::atomic<Chunk*>, ChunkCount> chunks{};
@@ -229,6 +239,7 @@ struct WriteIndex {
     std::atomic<std::uint64_t> overflows{0};
     std::atomic<std::uint64_t> lookupNanoseconds{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
+    std::array<std::array<std::atomic<std::uint64_t>, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };
 
 WriteIndex& Index() {
@@ -356,10 +367,15 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto first = address / IndexBlockBytes;
     const auto last = (address + bytes - 1) / IndexBlockBytes;
-    std::vector<std::uint64_t> backing;
-    if (source != WriteBumpSource::Forget) backingKeysOf(address, bytes, [&](std::uint64_t key, std::uint64_t) { backing.push_back(key); });
-    std::sort(backing.begin(), backing.end());
-    backing.erase(std::unique(backing.begin(), backing.end()), backing.end());
+    index.bySize[static_cast<std::size_t>(source)][std::min<std::size_t>(WriteBumpSizeBuckets - 1, bytes <= 4096 ? 0 : static_cast<std::size_t>((std::bit_width(bytes - 1) - 12 + 1) / 2))].fetch_add(1, std::memory_order_relaxed);
+    struct BackingSlot {};
+    auto& backing = ThreadScratch<std::vector<std::uint64_t>, BackingSlot>();
+    backing.clear();
+    if (source != WriteBumpSource::Forget && index.backedLive.load(std::memory_order_acquire) != 0) {
+        backingKeysOf(address, bytes, [&](std::uint64_t key, std::uint64_t) { backing.push_back(key); });
+        std::sort(backing.begin(), backing.end());
+        backing.erase(std::unique(backing.begin(), backing.end()), backing.end());
+    }
     std::uint64_t lookups = 0;
     std::uint64_t bumped = 0;
     std::uint64_t overflowed = 0;
@@ -426,6 +442,7 @@ void releaseSubscription(WriteSubscription* subscription) {
         subscription->generation.store(static_cast<std::uint32_t>(next), std::memory_order_release);
         std::vector<std::uint64_t>().swap(subscription->blocks);
         std::vector<std::uint64_t>().swap(subscription->keys);
+        if (!subscription->backed.empty()) index.backedLive.fetch_sub(1, std::memory_order_acq_rel);
         std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(subscription->backed);
         std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(subscription->spans);
         std::vector<WriteSubscription::Bump>().swap(subscription->bumps);
@@ -559,6 +576,9 @@ WriteIndexStats WriteIndexCounted() {
     stats.overflows = index.overflows.load(std::memory_order_relaxed);
     stats.lookupNanoseconds = index.lookupNanoseconds.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < stats.bySource.size(); ++i) stats.bySource[i] = index.bySource[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < stats.bySize.size(); ++i) {
+        for (std::size_t k = 0; k < WriteBumpSizeBuckets; ++k) stats.bySize[i][k] = index.bySize[i][k].load(std::memory_order_relaxed);
+    }
     return stats;
 }
 
@@ -566,6 +586,9 @@ void ResetWriteIndexCounts() {
     auto& index = Index();
     for (auto* counter : {&index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds}) counter->store(0, std::memory_order_relaxed);
     for (auto& counter : index.bySource) counter.store(0, std::memory_order_relaxed);
+    for (auto& sizes : index.bySize) {
+        for (auto& counter : sizes) counter.store(0, std::memory_order_relaxed);
+    }
 }
 
 namespace {
@@ -2745,6 +2768,7 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
             subscription->head.store(1, std::memory_order_relaxed);
             subscription->blocks = std::move(blocks);
             subscription->keys = std::move(keys);
+            if (!backed.empty()) index.backedLive.fetch_add(1, std::memory_order_acq_rel);
             subscription->backed = std::move(backed);
             subscription->spans = std::move(spans);
             handle = (static_cast<std::uint64_t>(subscription->slot) << 24) | subscription->generation.load(std::memory_order_relaxed);
