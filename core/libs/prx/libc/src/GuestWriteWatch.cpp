@@ -53,6 +53,7 @@ constexpr std::uintptr_t PageBytes = 4096;
 
 std::atomic<void (*)()> scanHook{nullptr};
 std::atomic<void (*)()> changeWaitHook{nullptr};
+std::atomic<void (*)()> scanWaitHook{nullptr};
 
 class Watch {
 public:
@@ -280,11 +281,15 @@ private:
         Scan(Watch& watch, std::uintptr_t begin, std::uintptr_t end, Locked&& locked) : watch(watch) {
             {
                 std::unique_lock lock(watch._lock);
-                for (;;) {
+                for (bool waited = false;;) {
                     plan = watch.aliasPlanLocked(begin, end);
                     spans.assign(1, {begin, end});
                     for (const auto& alias : plan.aliases) spans.emplace_back(alias.begin, alias.end);
                     if (!overlaps(watch._changes, spans)) break;
+                    if (!waited) {
+                        waited = true;
+                        if (const auto hook = scanWaitHook.load(std::memory_order_acquire)) hook();
+                    }
                     watch._settled.wait(lock);
                 }
                 locked(plan);
@@ -1488,6 +1493,14 @@ void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t
 void GuestWriteWatchSetScanHookForTest_nid_postfix(void (*hook)()) {
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
     scanHook.store(hook, std::memory_order_release);
+#else
+    static_cast<void>(hook);
+#endif
+}
+
+void GuestWriteWatchSetScanWaitHookForTest_nid_postfix(void (*hook)()) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
+    scanWaitHook.store(hook, std::memory_order_release);
 #else
     static_cast<void>(hook);
 #endif

@@ -29,6 +29,7 @@ void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t
 void GuestWriteWatchAliasRanges_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*range)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
 std::uint64_t GuestWriteWatchMappingSerial_nid_postfix();
 void GuestWriteWatchSetScanHookForTest_nid_postfix(void (*hook)());
+void GuestWriteWatchSetScanWaitHookForTest_nid_postfix(void (*hook)());
 void GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(void (*hook)());
 
 }
