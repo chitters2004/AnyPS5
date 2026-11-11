@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 
 namespace AgcDriver::Graphics {
 
@@ -23,6 +24,17 @@ enum class CommitPhase : std::uint8_t {
     Bindings,
     PassAccess,
     Effects,
+    PlanStore,
+    PlanFramebuffer,
+    InputsCollect,
+    InputsLocal,
+    TargetsLru,
+    ResolveCache,
+    ResolveAlias,
+    RecordLocal,
+    PassAccessLocal,
+    EpilogueWriters,
+    EpilogueRecipe,
     Count
 };
 
@@ -32,6 +44,7 @@ struct CommitPhaseTotals {
 };
 
 bool CommitPhasesEnabled();
+const char* CommitPhaseName(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
 CommitPhaseTotals ReadCommitPhases();
 CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier);
@@ -44,7 +57,9 @@ public:
     CommitPhaseDraw& operator=(const CommitPhaseDraw&) = delete;
 
 private:
+    CommitPhase previous = CommitPhase::Other;
     bool owner = false;
+    bool nested = false;
 };
 
 class CommitPhaseScope {
@@ -58,6 +73,12 @@ private:
     CommitPhase previous = CommitPhase::Other;
     bool active = false;
 };
+
+template <class Work>
+decltype(auto) InCommitPhase(CommitPhase phase, Work&& work) {
+    const CommitPhaseScope scope(phase);
+    return std::forward<Work>(work)();
+}
 
 }
 

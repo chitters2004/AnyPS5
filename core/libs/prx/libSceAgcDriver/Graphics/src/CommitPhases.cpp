@@ -10,7 +10,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe"};
+static_assert(PhaseNames.back() != nullptr);
 
 using Clock = std::chrono::steady_clock;
 
@@ -69,6 +70,10 @@ bool CommitPhasesEnabled() {
     return enabled;
 }
 
+const char* CommitPhaseName(CommitPhase phase) {
+    return PhaseNames[static_cast<std::size_t>(phase)];
+}
+
 void BeginCommitPhase(CommitPhase phase) {
     auto& phases = threadPhases;
     if (!phases.active) return;
@@ -92,7 +97,13 @@ CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTot
 
 CommitPhaseDraw::CommitPhaseDraw() {
     auto& phases = threadPhases;
-    if (!CommitPhasesEnabled() || phases.active) return;
+    if (phases.active) {
+        nested = true;
+        previous = phases.current;
+        BeginCommitPhase(CommitPhase::Other);
+        return;
+    }
+    if (!CommitPhasesEnabled()) return;
     owner = true;
     phases.active = true;
     phases.current = CommitPhase::Other;
@@ -100,6 +111,7 @@ CommitPhaseDraw::CommitPhaseDraw() {
 }
 
 CommitPhaseDraw::~CommitPhaseDraw() {
+    if (nested) BeginCommitPhase(previous);
     if (!owner) return;
     auto& phases = threadPhases;
     const auto now = Clock::now();
