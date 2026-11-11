@@ -724,8 +724,8 @@ private:
     std::shared_ptr<StorageTexture> pendingAlias() const;
     bool sameShape(const StorageTexture& other) const;
     std::shared_ptr<StorageTexture> syncedAlias(const std::vector<bool>& wanted, std::vector<bool>& lent) const;
-    void rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units);
-    void armRefreshRollBack(const std::vector<std::uint64_t>& before);
+    void rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units, bool uploaded);
+    void armRefreshRollBack(const std::vector<std::uint64_t>& before, bool uploaded);
     static void noteSyncedBorrow(std::size_t units, std::uint64_t bytes);
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);

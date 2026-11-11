@@ -193,6 +193,7 @@ bool IgnoringPageWrites = false;
 void Write(Fixture& fixture, std::size_t offset, std::size_t length, std::uint8_t value) {
     std::memset(fixture.guest + offset, value, length);
     if (IgnoringPageWrites) AgcDriver::GuestMemory::MarkWritten(AddressOf(fixture.guest + offset), length);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
 }
 
 void Refresh(StorageTexture& texture, const std::string& what) {
@@ -360,6 +361,37 @@ int Run(AgcDriver::VulkanDevice& device) {
         CheckMatchesGuest(fixture, *solo, Format32UInt, "after a committed upload");
     }
     std::puts("synced alias borrow: a discarded upload gives its units back to guest memory, a committed one keeps them");
+
+    Settle();
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        Write(fixture, 0, bytes, 0x91);
+        before = StorageTexture::SyncedBorrows();
+        const auto created = StorageTexture::Create(context, detiler, fixture.uints, 0);
+        Recorder::FailNextSubmitsForTest(1u);
+        bool discarded = false;
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            discarded = std::string(error.what()).find("injected failure") != std::string::npos;
+        }
+        Recorder::FailNextSubmitsForTest(0u);
+        Require(discarded, "synced alias borrow: the batch holding a new image's first upload was not discarded");
+        Require(Delta(before).rollBacks == 1, "synced alias borrow: the discarded first upload was not rolled back");
+        Refresh(*created, "the refresh after a discarded first upload");
+        recorder.Sync();
+        CheckMatchesGuest(fixture, *created, Format32UInt, "after a discarded first upload and a refresh");
+        Write(fixture, 0, bytes, 0x92);
+        before = StorageTexture::SyncedBorrows();
+        const auto committed = StorageTexture::Create(context, detiler, fixture.uints, 0);
+        recorder.Sync();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(committed->Refresh(), "synced alias borrow: a committed first upload left the new image claiming stale guest bytes");
+        Require(Delta(before).rollBacks == 0, "synced alias borrow: a committed first upload was rolled back");
+        CheckMatchesGuest(fixture, *committed, Format32UInt, "after a committed first upload");
+    }
+    std::puts("synced alias borrow: a new image whose first upload was discarded uploads again, a committed one stays current");
 
     std::puts("synced alias borrow tests passed");
     return 0;

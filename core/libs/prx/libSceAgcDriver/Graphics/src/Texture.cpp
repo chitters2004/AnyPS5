@@ -1675,6 +1675,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     texture->forgetSeen = GuestMemory::ForgetSerial();
     uploadReason = "first";
     texture->upload();
+    texture->armRefreshRollBack(std::vector<std::uint64_t>(texture->trackedLayers, 0), true);
     texture->defaultMip = mipLevel;
     texture->view = texture->createView(mipLevel, false, texture->storageFormat);
     if (const auto hook = publishHookForTest.load(std::memory_order_acquire)) hook();
@@ -2799,20 +2800,20 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     } else {
         uploadedKeys = keys;
     }
-    if (!before.empty()) armRefreshRollBack(before);
+    if (!before.empty()) armRefreshRollBack(before, uploads);
     return false;
 }
 
-void StorageTexture::armRefreshRollBack(const std::vector<std::uint64_t>& before) {
+void StorageTexture::armRefreshRollBack(const std::vector<std::uint64_t>& before, bool uploaded) {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || recorder->Device() != context.device || before.size() != trackedLayers) return;
     std::vector<std::array<std::uint64_t, 3>> moved;
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
-        if (layerGeneration[unit] != before[unit]) moved.push_back({unit, layerGeneration[unit], before[unit]});
+        if (uploaded || layerGeneration[unit] != before[unit]) moved.push_back({unit, layerGeneration[unit], before[unit]});
     }
     if (moved.empty()) return;
-    recorder->OnDiscard([weak = weak_from_this(), moved = std::move(moved)] {
-        if (auto self = weak.lock()) self->rollBackRefresh(moved);
+    recorder->OnDiscard([weak = weak_from_this(), moved = std::move(moved), uploaded] {
+        if (auto self = weak.lock()) self->rollBackRefresh(moved, uploaded);
     });
 }
 
@@ -6842,17 +6843,22 @@ std::shared_ptr<StorageTexture> StorageTexture::syncedAlias(const std::vector<bo
     return best;
 }
 
-void StorageTexture::rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units) {
+void StorageTexture::rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units, bool uploaded) {
     bool rolledBack = false;
     for (const auto& [unit, set, previous] : units) {
         if (unit >= trackedLayers || layerGeneration[static_cast<std::size_t>(unit)] != set) continue;
         layerGeneration[static_cast<std::size_t>(unit)] = previous;
         forgetBorrowed(static_cast<std::uint32_t>(unit), 1);
+        if (uploaded) {
+            layerOriginal[static_cast<std::size_t>(unit)] = false;
+            cancelStoredSave(static_cast<std::uint32_t>(unit));
+        }
         rolledBack = true;
     }
     if (!rolledBack) return;
     refreshGeneration();
     refreshProof = {};
+    comparedRanges = {};
     provedEpoch.store(0, std::memory_order_relaxed);
     ++version;
     syncedRollBacks.fetch_add(1, std::memory_order_relaxed);
