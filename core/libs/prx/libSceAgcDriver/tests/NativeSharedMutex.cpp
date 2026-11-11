@@ -1,11 +1,13 @@
 #include "prx/libc/include/NativeSharedMutex.hpp"
 #include <algorithm>
 #include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <latch>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -154,12 +156,13 @@ void ReadersAndWriters(int readers, int writers, int iterations) {
     std::uint64_t second = 0;
     std::atomic<int> readersInside{0};
     std::atomic<int> writersInside{0};
-    std::atomic<int> writersLeft{writers};
     std::atomic<bool> broken{false};
     std::atomic<std::uint64_t> reads{0};
+    std::latch start(readers + writers);
     std::vector<std::thread> threads;
     for (int w = 0; w < writers; ++w) {
         threads.emplace_back([&] {
+            start.arrive_and_wait();
             for (int i = 0; i < iterations; ++i) {
                 std::unique_lock lock(mutex);
                 if (writersInside.fetch_add(1) != 0 || readersInside.load() != 0) broken.store(true);
@@ -168,12 +171,12 @@ void ReadersAndWriters(int readers, int writers, int iterations) {
                 ++second;
                 writersInside.fetch_sub(1);
             }
-            writersLeft.fetch_sub(1);
         });
     }
     for (int r = 0; r < readers; ++r) {
         threads.emplace_back([&] {
-            for (int i = 0; i < iterations && writersLeft.load() != 0; ++i) {
+            start.arrive_and_wait();
+            for (int i = 0; i < iterations; ++i) {
                 {
                     std::shared_lock lock(mutex);
                     readersInside.fetch_add(1);
@@ -188,37 +191,118 @@ void ReadersAndWriters(int readers, int writers, int iterations) {
     for (auto& thread : threads) thread.join();
     Check(!broken.load(), "no reader saw a writer or a half-written pair, and writers ran alone");
     Check(first == static_cast<std::uint64_t>(writers) * static_cast<std::uint64_t>(iterations) && first == second, "every write under the exclusive lock counted");
-    Check(reads.load() != 0, "readers got through between writers");
+    Check(reads.load() == static_cast<std::uint64_t>(readers) * static_cast<std::uint64_t>(iterations), "every read under the shared lock completed");
 }
 
 void TryLocksUnderContention(int threads, int iterations) {
     NativeSharedMutex mutex;
     std::uint64_t counter = 0;
     std::atomic<int> writersInside{0};
+    std::atomic<int> readersInside{0};
     std::atomic<bool> broken{false};
     std::atomic<std::uint64_t> taken{0};
+    std::latch start(threads);
     std::vector<std::thread> workers;
     for (int t = 0; t < threads; ++t) {
         workers.emplace_back([&, t] {
+            start.arrive_and_wait();
             for (int i = 0; i < iterations; ++i) {
                 if (((i + t) & 1) == 0) {
                     if (!mutex.try_lock()) continue;
-                    if (writersInside.fetch_add(1) != 0) broken.store(true);
+                    if (writersInside.fetch_add(1) != 0 || readersInside.load() != 0) broken.store(true);
                     ++counter;
+                    if (readersInside.load() != 0) broken.store(true);
                     writersInside.fetch_sub(1);
                     mutex.unlock();
                     taken.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     if (!mutex.try_lock_shared()) continue;
+                    readersInside.fetch_add(1);
                     if (writersInside.load() != 0) broken.store(true);
+                    std::this_thread::yield();
+                    if (writersInside.load() != 0) broken.store(true);
+                    readersInside.fetch_sub(1);
                     mutex.unlock_shared();
                 }
             }
         });
     }
     for (auto& worker : workers) worker.join();
-    Check(!broken.load(), "a successful try_lock excludes every other holder");
+    Check(!broken.load(), "a successful try_lock excludes every reader and writer, and a successful try_lock_shared excludes every writer");
     Check(counter == taken.load(), "every increment after a successful try_lock counted");
+    std::atomic<bool> held{false};
+    std::atomic<bool> release{false};
+    std::thread reader([&] {
+        std::shared_lock lock(mutex);
+        held.store(true, std::memory_order_release);
+        WaitFor(release, 5000ms);
+    });
+    WaitFor(held, 5000ms);
+    int writes = 0;
+    int reads = 0;
+    std::thread other([&] {
+        for (int i = 0; i < iterations; ++i) {
+            if (mutex.try_lock()) {
+                ++writes;
+                mutex.unlock();
+            }
+            if (mutex.try_lock_shared()) {
+                ++reads;
+                mutex.unlock_shared();
+            }
+        }
+    });
+    other.join();
+    release.store(true, std::memory_order_release);
+    reader.join();
+    Check(writes == 0, "try_lock fails on every attempt while another thread holds the lock shared");
+    Check(reads == iterations, "try_lock_shared succeeds on every attempt while another thread holds the lock shared");
+}
+
+template<typename TMutex>
+std::uint64_t FirstUseViolations(int threads, int locks) {
+    const auto fresh = std::make_unique<TMutex[]>(static_cast<std::size_t>(locks));
+    std::atomic<int> writersInside{0};
+    std::atomic<int> readersInside{0};
+    std::atomic<std::uint64_t> violations{0};
+    std::atomic<std::uint64_t> work{0};
+    std::barrier start(threads);
+    std::vector<std::thread> workers;
+    for (int t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            for (int index = 0; index < locks; ++index) {
+                auto& mutex = fresh[static_cast<std::size_t>(index)];
+                const bool writer = (index & 1) == 0 || t == index % threads;
+                start.arrive_and_wait();
+                if (writer) {
+                    mutex.lock();
+                    if (writersInside.fetch_add(1) != 0 || readersInside.load() != 0) violations.fetch_add(1);
+                    for (int spin = 0; spin < 64; ++spin) work.fetch_add(1, std::memory_order_relaxed);
+                    if (readersInside.load() != 0) violations.fetch_add(1);
+                    writersInside.fetch_sub(1);
+                    mutex.unlock();
+                } else {
+                    mutex.lock_shared();
+                    readersInside.fetch_add(1);
+                    if (writersInside.load() != 0) violations.fetch_add(1);
+                    for (int spin = 0; spin < 64; ++spin) work.fetch_add(1, std::memory_order_relaxed);
+                    if (writersInside.load() != 0) violations.fetch_add(1);
+                    readersInside.fetch_sub(1);
+                    mutex.unlock_shared();
+                }
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    return violations.load();
+}
+
+int FirstUseThreads() {
+    return static_cast<int>(std::clamp(std::thread::hardware_concurrency(), 2u, 8u));
+}
+
+void FirstUse(int locks) {
+    Check(FirstUseViolations<NativeSharedMutex>(FirstUseThreads(), locks) == 0, "threads released together onto a fresh lock never hold it together");
 }
 
 void ScopedLockPairs(int threads, int iterations) {
@@ -438,6 +522,11 @@ int main(int argc, char** argv) {
         const int contendedIterations = argc >= 5 ? std::max(1, std::atoi(argv[4])) : 100000;
         Benchmark(maximumThreads, iterations);
         ContendedBenchmark(maximumThreads, contendedIterations);
+        const int freshLocks = argc >= 6 ? std::max(1, std::atoi(argv[5])) : 20000;
+        const auto stdViolations = FirstUseViolations<std::shared_mutex>(FirstUseThreads(), freshLocks);
+        const auto nativeViolations = FirstUseViolations<NativeSharedMutex>(FirstUseThreads(), freshLocks);
+        std::printf("first use: %d fresh locks, %d threads released together onto each; exclusion violations: std %llu, native %llu\n", freshLocks, FirstUseThreads(), static_cast<unsigned long long>(stdViolations), static_cast<unsigned long long>(nativeViolations));
+        Check(nativeViolations == 0, "NativeSharedMutex let two threads hold a fresh lock together");
         return failures == 0 ? 0 : 1;
     }
     ExclusiveCounts(8, 20000);
@@ -451,6 +540,7 @@ int main(int argc, char** argv) {
     ScopedLockPairs(4, 20000);
     StripedLocks(8, 50000);
     StaticLock();
+    FirstUse(5000);
     NanosecondsPerOperation<NativeSharedMutex>(4, 10000, true);
     NanosecondsPerOperation<NativeSharedMutex>(4, 10000, false);
     NanosecondsPerContendedOperation<NativeSharedMutex>(4, 10000, Contention::Mixed);
