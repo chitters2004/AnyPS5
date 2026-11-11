@@ -10,7 +10,7 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
-constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe"};
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key"};
 static_assert(PhaseNames.back() != nullptr);
 
 using Clock = std::chrono::steady_clock;
@@ -23,6 +23,10 @@ struct ThreadPhases {
 
 thread_local ThreadPhases threadPhases;
 std::atomic<std::uint64_t> drawCount{0};
+std::atomic<std::uint64_t> keyCount{0};
+std::atomic<std::uint64_t> keyWordCount{0};
+std::atomic<std::uint64_t> keyMemoHitCount{0};
+std::atomic<std::uint64_t> keyMemoMissCount{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
 std::atomic<std::int64_t> reportedAt{0};
 std::mutex reportMutex;
@@ -60,7 +64,7 @@ void reportDue(Clock::time_point now) {
         std::snprintf(item, sizeof(item), " %s %.2f", PhaseNames[phase], static_cast<double>(totals.ns[phase]) / 1e3 / static_cast<double>(totals.draws));
         text += item;
     }
-    std::fprintf(stderr, "[commit-phases] (10 s) %llu draws, %.2f us each; us per draw by phase:%s\n", static_cast<unsigned long long>(totals.draws), static_cast<double>(all) / 1e3 / static_cast<double>(totals.draws), text.c_str());
+    std::fprintf(stderr, "[commit-phases] (10 s) %llu draws, %.2f us each; us per draw by phase:%s; %llu content keys of %.0f words on average, stage key memo %llu hits / %llu misses\n", static_cast<unsigned long long>(totals.draws), static_cast<double>(all) / 1e3 / static_cast<double>(totals.draws), text.c_str(), static_cast<unsigned long long>(totals.keys), totals.keys != 0 ? static_cast<double>(totals.keyWords) / static_cast<double>(totals.keys) : 0.0, static_cast<unsigned long long>(totals.keyMemoHits), static_cast<unsigned long long>(totals.keyMemoMisses));
 }
 
 }
@@ -81,9 +85,24 @@ void BeginCommitPhase(CommitPhase phase) {
     phases.current = phase;
 }
 
+void NoteCommitKey(std::size_t words) {
+    if (!threadPhases.active) return;
+    keyCount.fetch_add(1, std::memory_order_relaxed);
+    keyWordCount.fetch_add(words, std::memory_order_relaxed);
+}
+
+void NoteCommitKeyMemo(bool hit) {
+    if (!threadPhases.active) return;
+    (hit ? keyMemoHitCount : keyMemoMissCount).fetch_add(1, std::memory_order_relaxed);
+}
+
 CommitPhaseTotals ReadCommitPhases() {
     CommitPhaseTotals totals;
     totals.draws = drawCount.load(std::memory_order_relaxed);
+    totals.keys = keyCount.load(std::memory_order_relaxed);
+    totals.keyWords = keyWordCount.load(std::memory_order_relaxed);
+    totals.keyMemoHits = keyMemoHitCount.load(std::memory_order_relaxed);
+    totals.keyMemoMisses = keyMemoMissCount.load(std::memory_order_relaxed);
     for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].load(std::memory_order_relaxed);
     return totals;
 }
@@ -91,6 +110,10 @@ CommitPhaseTotals ReadCommitPhases() {
 CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier) {
     CommitPhaseTotals difference;
     difference.draws = later.draws - earlier.draws;
+    difference.keys = later.keys - earlier.keys;
+    difference.keyWords = later.keyWords - earlier.keyWords;
+    difference.keyMemoHits = later.keyMemoHits - earlier.keyMemoHits;
+    difference.keyMemoMisses = later.keyMemoMisses - earlier.keyMemoMisses;
     for (std::size_t phase = 0; phase < difference.ns.size(); ++phase) difference.ns[phase] = later.ns[phase] - earlier.ns[phase];
     return difference;
 }

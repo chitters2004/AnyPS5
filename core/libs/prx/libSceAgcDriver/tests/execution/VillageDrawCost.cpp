@@ -505,6 +505,7 @@ void Cost(const Layout& layout, std::uint32_t frames) {
         phaseList += text;
     }
     std::printf("village commit phases: %llu committed draws, us per draw:%s\n", static_cast<unsigned long long>(phases.draws), phaseList.c_str());
+    std::printf("village content keys: %llu of %.0f words on average, stage key memo %llu hits / %llu misses\n", static_cast<unsigned long long>(phases.keys), phases.keys != 0 ? static_cast<double>(phases.keyWords) / static_cast<double>(phases.keys) : 0.0, static_cast<unsigned long long>(phases.keyMemoHits), static_cast<unsigned long long>(phases.keyMemoMisses));
 }
 
 }
