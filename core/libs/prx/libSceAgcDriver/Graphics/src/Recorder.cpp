@@ -2181,8 +2181,10 @@ void Recorder::ensureOpen() {
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
         notedReadKeys.Reset();
+        notedReadLists.Reset();
         if (++batchEpoch == 0) {
             notedReadKeys.Clear();
+            notedReadLists.Clear();
             ++batchEpoch;
         }
         open->predictedSerial = submissions + 1;
@@ -4102,10 +4104,9 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
     }
     ensureOpen();
     readsNoted.Add(ranges->size());
-    for (const auto& note : open->readLists) {
-        if (note.ranges == ranges && note.kind == kind) return;
-    }
+    const ReadListKey key{ranges.get(), kind};
     open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+    if (!notedReadLists.Insert(key, batchEpoch)) open->readLists.pop_back();
 }
 
 std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only) {

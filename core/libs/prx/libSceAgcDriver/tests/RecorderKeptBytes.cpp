@@ -280,6 +280,7 @@ void RepeatedReadsAnswerLikeEveryNote() {
     const std::array<Kind, 3> kinds{Kind::DispatchElement, Kind::AddressBased, Kind::CopySource};
     ReadSequence random;
     std::vector<NotedRead> notes;
+    std::vector<std::shared_ptr<const Recorder::ReadList>> lists;
     std::vector<std::tuple<std::uint64_t, std::uint64_t, Kind>> seen;
     std::uint64_t expectedRepeats = 0;
     const auto remember = [&](std::uint64_t begin, std::uint64_t end, Kind kind) {
@@ -317,10 +318,17 @@ void RepeatedReadsAnswerLikeEveryNote() {
             notedCalls += span.size();
         } else {
             const auto kind = kinds[random.Next() % kinds.size()];
-            const auto start = base + 0x40 * (random.Next() % 16);
-            auto list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{start, start + 0x20}, {start + 0x400, start + 0x440}});
+            std::shared_ptr<const Recorder::ReadList> list;
+            if (!lists.empty() && random.Next() % 2 == 0) {
+                list = lists[random.Next() % lists.size()];
+            } else {
+                const auto start = base + 0x40 * (random.Next() % 16);
+                list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{start, start + 0x20}, {start + 0x400, start + 0x440}});
+                lists.push_back(list);
+            }
             recorder.NotePendingReadList(list, kind);
-            notes.push_back({0, 0, kind, std::move(list)});
+            const bool listed = std::any_of(notes.begin(), notes.end(), [&](const NotedRead& note) { return note.list == list && note.kind == kind; });
+            if (!listed) notes.push_back({0, 0, kind, list});
             notedCalls += 2;
         }
     }
@@ -351,6 +359,13 @@ void RepeatedReadsAnswerLikeEveryNote() {
     Expect(next.has_value() && next->open && next->kind == Kind::CopySource && next->serial == submitted + 1, "the next batch does not report the read it noted again");
     recorder.NotePendingRead(base, 0x100, Kind::AddressBased);
     Expect(recorder.PendingLeaseSerial(base, 4) == recorder.OpenSerial(), "the next batch dropped a range noted again with another reader kind");
+    Expect(!lists.empty(), "the read sequence noted no list: the list checks prove nothing");
+    if (!lists.empty()) {
+        const auto& list = lists.front();
+        recorder.NotePendingReadList(list, Kind::DispatchElement);
+        const auto listed = recorder.DescribePendingRead(list->back().first, 4);
+        Expect(listed.has_value() && listed->open && listed->kind == Kind::DispatchElement && listed->serial == submitted + 1, "the next batch does not report a list the submitted batch had noted");
+    }
     recorder.Sync();
     Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
 }
