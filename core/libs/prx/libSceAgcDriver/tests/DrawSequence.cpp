@@ -217,7 +217,7 @@ void FailedPrepareReachesTheWorker() {
     DrawFinisher::Get().Enqueue([] { throw std::runtime_error("prepare failed"); }, {});
     bool thrown = false;
     try {
-        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        DrawFinisher::Get().Drain();
     } catch (const std::runtime_error& error) {
         thrown = std::string(error.what()) == "prepare failed";
     }
