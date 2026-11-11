@@ -2994,10 +2994,19 @@ std::string WaitedBehindReport(const HolderMatrixValues& waited) {
 
 namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
+
+HandoffSite& GpuHandoffSite() {
+    static HandoffSite site{"gpu_lock", HandoffSpinWindow()};
+    return site;
+}
+
+void LockGpu(Mutex& mutex) {
+    PerformanceTrace::Handoff(GpuHandoffSite(), LockSpinning(mutex, GpuHandoffSite()));
+}
 }
 
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (!HeldByThisThread()) LockGpu(mutex);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -3084,7 +3093,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
+                LockGpu(mutex);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -3102,7 +3111,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex, HandoffSpinWindow());
+        LockGpu(mutex);
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);

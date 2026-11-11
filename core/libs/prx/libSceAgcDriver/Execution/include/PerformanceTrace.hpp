@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include "prx/libSceAgcDriver/Execution/include/AddressWait.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <exception>
 #include <filesystem>
 #include <functional>
@@ -531,6 +532,9 @@ public:
     static constexpr char EncoderPostScope[] = "Encoder.post";
     static constexpr char EncoderCommandScope[] = "Encoder.command";
     static constexpr char EncoderWaitScope[] = "Encoder.wait";
+    static constexpr char SpinHitScope[] = "Spin.hit";
+    static constexpr char SpinMissScope[] = "Spin.miss";
+    static constexpr char SpinBlockScope[] = "Spin.block";
     static constexpr std::string_view WorkerPrefix = "queue worker ";
     static constexpr std::size_t TopPhases = 8;
 
@@ -692,6 +696,13 @@ public:
         std::uint64_t encoderCommands = 0;
         std::uint64_t encoderWaits = 0;
         Clock::duration encoderWait{};
+        struct SpinSite {
+            std::uint64_t hits = 0;
+            std::uint64_t misses = 0;
+            Clock::duration spun{};
+            Clock::duration blocked{};
+        };
+        std::map<std::string, SpinSite> spinSites;
         bool dropped = summary.ownedDrawUnbound != 0;
         if (summary.ownedDrawUnbound != 0) ownedCounts["OwnedDraw.unbound"] = summary.ownedDrawUnbound;
         struct DroppedThread {
@@ -720,7 +731,18 @@ public:
                     encoderWaits += total.count;
                     encoderWait += total.length;
                 } else if (scope.starts_with("OwnedDraw.") && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
-                else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
+                else if (total.stage != nullptr && (scope == SpinHitScope || scope == SpinMissScope || scope == SpinBlockScope)) {
+                    auto& site = spinSites[total.stage];
+                    if (scope == SpinHitScope) {
+                        site.hits += total.count;
+                        site.spun += total.length;
+                    } else if (scope == SpinMissScope) {
+                        site.misses += total.count;
+                        site.spun += total.length;
+                    } else {
+                        site.blocked += total.length;
+                    }
+                } else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
             }
             if (!thread.name.starts_with(WorkerPrefix)) continue;
             if (!firstWorker) output += ',';
@@ -747,6 +769,15 @@ public:
         }
         output += '}';
         output += ",\"encoder\":{\"posts\":" + std::to_string(encoderPosts) + ",\"commands\":" + std::to_string(encoderCommands) + ",\"waits\":" + std::to_string(encoderWaits) + ",\"wait_ms_per_frame\":" + number(milliseconds(encoderWait) * perPresent) + '}';
+        output += ",\"handoff_spin\":{";
+        bool firstSite = true;
+        for (const auto& [name, site] : spinSites) {
+            if (!firstSite) output += ',';
+            firstSite = false;
+            AppendString(output, name);
+            output += ":{\"hits\":" + std::to_string(site.hits) + ",\"misses\":" + std::to_string(site.misses) + ",\"spin_ms_per_frame\":" + number(milliseconds(site.spun) * perPresent) + ",\"block_ms_per_frame\":" + number(milliseconds(site.blocked) * perPresent) + '}';
+        }
+        output += '}';
         output += ",\"trace_dropped\":";
         output += dropped ? "true" : "false";
         if (!droppedList.empty()) {
@@ -914,6 +945,18 @@ public:
 
     static void Count(const char* scope) {
         if (Recording()) AgcDriverTraceCount_nid_postfix(scope);
+    }
+
+    static void Handoff(const HandoffSite& site, const HandoffSpin& spin) {
+        if (!spin.waited || !Recording()) return;
+        auto* thread = Thread();
+        if (thread == nullptr) return;
+        if (spin.ready) {
+            thread->Add(TraceFormat::SpinHitScope, site.Name(), spin.start, spin.end);
+            return;
+        }
+        thread->Add(TraceFormat::SpinMissScope, site.Name(), spin.start, spin.end);
+        thread->Add(TraceFormat::SpinBlockScope, site.Name(), spin.end, std::chrono::steady_clock::now());
     }
 
     static void CountOwnedDraw(const char* scope, std::uint64_t amount = 1);

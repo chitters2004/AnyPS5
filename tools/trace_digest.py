@@ -497,6 +497,18 @@ def validate_interval(record):
             raise ValueError(f"encoder.{name} must be a non-negative integer")
     if "wait_ms_per_frame" in encoder:
         interval_number(encoder["wait_ms_per_frame"], "encoder.wait_ms_per_frame")
+    sites = record.get("handoff_spin", {})
+    if not isinstance(sites, dict):
+        raise ValueError("handoff_spin must be an object")
+    for site, values in sites.items():
+        if not isinstance(site, str) or not isinstance(values, dict):
+            raise ValueError("handoff_spin must map site names to objects")
+        for name in ("hits", "misses"):
+            if name in values and (type(values[name]) is not int or values[name] < 0):
+                raise ValueError(f"handoff_spin.{site}.{name} must be a non-negative integer")
+        for name in ("spin_ms_per_frame", "block_ms_per_frame"):
+            if name in values:
+                interval_number(values[name], f"handoff_spin.{site}.{name}")
     if "trace_dropped" in record and type(record["trace_dropped"]) is not bool:
         raise ValueError("trace_dropped must be a boolean")
 
@@ -519,7 +531,8 @@ def digest_intervals(lines):
                      "frame_ms": line["frame_ms"], "gpu_busy_ms_per_present": line["gpu_busy_ms_per_present"],
                      "busiest_worker": {"thread": busiest[0], "pct": busiest[1]} if busiest else None,
                      "top_phase": {"name": largest[0], "ms_per_frame": largest[1]} if largest else None,
-                     "trace_dropped": line.get("trace_dropped", False), "owned_draw_counts": line.get("owned_draw_counts"), "encoder": line.get("encoder")})
+                     "trace_dropped": line.get("trace_dropped", False), "owned_draw_counts": line.get("owned_draw_counts"), "encoder": line.get("encoder"),
+                     "handoff_spin": line.get("handoff_spin")})
     first = lines[0] if lines else {}
     keys = ("commit", "dirty", "env", "gpu", "driver", "os", "resolution",
             "cpu", "cpu_threads", "memory_mib", "title_id", "title", "content_version")
@@ -554,6 +567,13 @@ def markdown_intervals(result):
         for index, row in enumerate(rows, 1):
             encoder = row["encoder"] or {}
             lines.append(f"| {index} | {encoder.get('posts', 0)} | {encoder.get('commands', 0)} | {encoder.get('waits', 0)} | {encoder.get('wait_ms_per_frame', 0.0):.2f} |")
+    spin_sites = sorted({site for row in rows for site in (row["handoff_spin"] or {})})
+    if spin_sites:
+        lines += ["", "| # | hand-off site | hits | misses | spin ms/frame | block ms/frame |", "|---|---|---|---|---|---|"]
+        for index, row in enumerate(rows, 1):
+            for site in spin_sites:
+                values = (row["handoff_spin"] or {}).get(site, {})
+                lines.append(f"| {index} | {table_cell(site)} | {values.get('hits', 0)} | {values.get('misses', 0)} | {values.get('spin_ms_per_frame', 0.0):.2f} | {values.get('block_ms_per_frame', 0.0):.2f} |")
     p99 = [row["frame_ms"]["p99"] for row in rows]
     gpu = [row["gpu_busy_ms_per_present"] for row in rows]
     lines += ["", "```", f"p99 ms  {sparkline(p99)}  0-{max(p99):.1f}", f"gpu ms  {sparkline(gpu)}  0-{max(gpu):.1f}", "```"]
