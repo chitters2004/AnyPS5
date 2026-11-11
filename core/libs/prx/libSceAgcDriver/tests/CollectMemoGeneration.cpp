@@ -4,6 +4,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -512,6 +513,120 @@ void CheckFailedRequestPublishesNothing() {
     Require(CollectWrites(address + Page, Page) != 0 && OsWalks() == before + 1, "a block of an incomplete request was answered without a walk");
 }
 
+void CheckCollectDoesNotWaitForAnotherWalk() {
+    const auto other = Base + 102 * Block;
+    const auto mine = Base + 104 * Block + 3 * Page;
+    PausedWalk walker(3, [&] { CollectWritesUncached(other, Block); });
+    Waiter waiter(true, mine, Page);
+    waiter.Go();
+    const bool finished = waiter.Finished(std::chrono::milliseconds(2000));
+    walker.Release();
+    Require(finished, "a collect of another block waited for a walk in progress");
+    Require(waiter.Join() != 0, "the collect beside a walk in progress failed");
+}
+
+void CheckCollectOverClaimedBlockSeesItsStamps() {
+    const auto block = Base + 106 * Block;
+    const auto page = block + 3 * Page;
+    BumpCollectEpoch();
+    Require(CollectWrites(block, Block) != 0, "the block was not collected");
+    const auto before = TrackerGeneration();
+    Store(page);
+    std::uint64_t seen = 0;
+    {
+        PausedWalk walker(3, [&] { CollectWritesUncached(block, Block); });
+        Waiter late(true, block, Block);
+        late.Go();
+        static_cast<void>(late.Finished(std::chrono::milliseconds(150)));
+        walker.Release();
+        seen = late.Join();
+    }
+    Require(seen != 0, "the collect over a claimed block failed");
+    Require(!UnchangedSince(page, Page, before), "a store consumed by a walk in progress was lost");
+    Require(UnchangedSince(block, Block, seen), "a collect over a block another walk had consumed returned a generation older than that walk's stamps");
+}
+
+void CheckQueriesWaitForClaimedStamps() {
+    const auto block = Base + 108 * Block;
+    const auto page = block + 5 * Page;
+    const std::array<const char*, 4> names{"UnchangedSince", "UnchangedSinceAll", "ChangedBlocks", "NewestStamp"};
+    for (std::size_t query = 0; query < names.size(); ++query) {
+        BumpCollectEpoch();
+        Require(CollectWrites(block, Block) != 0, "the block was not collected");
+        const auto before = TrackerGeneration();
+        Store(page);
+        std::atomic<int> unchanged{-1};
+        {
+            PausedWalk walker(3, [&] { CollectWritesUncached(block, Block); });
+            std::thread reader([&] {
+                bool same = false;
+                if (query == 0) same = UnchangedSince(page, Page, before);
+                else if (query == 1) {
+                    const std::array<UnchangedQuery, 1> queries{{{page, static_cast<std::size_t>(Page), before}}};
+                    same = UnchangedSinceAll(queries);
+                } else if (query == 2) {
+                    const std::array<std::uint64_t, 1> generations{before};
+                    std::array<std::uint8_t, 1> changed{};
+                    same = ChangedBlocks(block, Block, generations, changed) && changed[0] == BlockUnchanged;
+                } else same = NewestStamp(page, Page) <= before;
+                unchanged.store(same ? 1 : 0);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            walker.Release();
+            reader.join();
+        }
+        Require(unchanged.load() == 0, std::string(names[query]) + " answered from a block whose write-watch bits a walk in progress had consumed");
+    }
+}
+
+void CheckTrackerGenerationWaitsForClaims() {
+    const auto block = Base + 110 * Block;
+    const auto page = block + 2 * Page;
+    BumpCollectEpoch();
+    Require(CollectWrites(block, Block) != 0, "the block was not collected");
+    Store(page);
+    std::uint64_t settled = 0;
+    {
+        PausedWalk walker(3, [&] { CollectWritesUncached(block, Block); });
+        std::thread reader([&] { settled = TrackerGeneration(); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        walker.Release();
+        reader.join();
+    }
+    Require(UnchangedSince(page, Page, settled), "TrackerGeneration returned before a walk in progress stamped the writes it had consumed");
+}
+
+void CheckAdoptedEpochReusesWalksAfterIt() {
+    const auto address = Base + 112 * Block;
+    std::uint64_t epoch = 0;
+    std::thread worker([&] {
+        epoch = BumpCollectEpoch();
+        Require(CollectWrites(address, Block) != 0, "the worker's collect failed");
+    });
+    worker.join();
+    bool reused = false;
+    std::thread committer([&] {
+        AdoptCollectEpoch(epoch);
+        const auto before = OsWalks();
+        Require(CollectWrites(address, Block) != 0, "the adopting collect failed");
+        reused = OsWalks() == before;
+    });
+    committer.join();
+    Require(reused, "a thread that adopted an epoch did not reuse a walk made after it");
+}
+
+void CheckAdoptingAnOlderEpochKeepsTheNewer() {
+    const auto address = Base + 114 * Block + 6 * Page;
+    const auto older = BumpCollectEpoch();
+    Require(CollectWrites(address, Page) != 0, "the first collect failed");
+    const auto observed = TrackerGeneration();
+    Store(address);
+    BumpCollectEpoch();
+    AdoptCollectEpoch(older);
+    Require(CollectWrites(address, Page) != 0, "the collect after adopting failed");
+    Require(!UnchangedSince(address & ~(Page - 1), Page, observed), "adopting an older epoch let a walk made before the newer ordering point hide a store");
+}
+
 void CheckPartialGroupIsNotAHit() {
     for (std::uint64_t offset = 0; offset < 64; ++offset) {
         BumpCollectEpoch();
@@ -636,6 +751,12 @@ int main(int argc, char** argv) {
         CheckWaiterNeedingLaterTickWalks();
         CheckMappingChangeForcesWalk();
         CheckFailedRequestPublishesNothing();
+        CheckCollectDoesNotWaitForAnotherWalk();
+        CheckCollectOverClaimedBlockSeesItsStamps();
+        CheckQueriesWaitForClaimedStamps();
+        CheckTrackerGenerationWaitsForClaims();
+        CheckAdoptedEpochReusesWalksAfterIt();
+        CheckAdoptingAnOlderEpochKeepsTheNewer();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;

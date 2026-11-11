@@ -144,7 +144,8 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // A thread that never bumps (the presenter, game threads inside the flush hook) gets a fresh epoch
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
-void BumpCollectEpoch();
+std::uint64_t BumpCollectEpoch();
+void AdoptCollectEpoch(std::uint64_t epoch);
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();

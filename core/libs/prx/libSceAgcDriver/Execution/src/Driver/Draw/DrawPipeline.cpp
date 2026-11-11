@@ -286,11 +286,18 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
+void DrawPipeline::RaiseEpochToken(std::uint64_t epoch) {
+    auto& token = EpochToken();
+    auto current = token.load(std::memory_order_relaxed);
+    while (current < epoch && !token.compare_exchange_weak(current, epoch, std::memory_order_relaxed)) {}
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
-    GuestMemory::BumpCollectEpoch();
+    if (token > 1) GuestMemory::AdoptCollectEpoch(token);
+    else GuestMemory::BumpCollectEpoch();
 }
 
 unsigned DrawPipeline::Committers() {
