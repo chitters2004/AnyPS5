@@ -1021,6 +1021,15 @@ private:
     };
     BatchKeySet<const void*, OwnerHash> retainedByteOwners;
     BatchKeySet<ReadKey, ReadKeyHash> notedReadKeys;
+    struct ReadListKey {
+        const void* list = nullptr;
+        ReadKind kind = ReadKind::Count;
+        bool operator==(const ReadListKey&) const = default;
+    };
+    struct ReadListKeyHash {
+        std::size_t operator()(const ReadListKey& key) const { return retentionHash(key.list) ^ static_cast<std::size_t>(key.kind); }
+    };
+    BatchKeySet<ReadListKey, ReadListKeyHash> notedReadLists;
     void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
 
     std::vector<std::shared_ptr<void>> holdKept;
