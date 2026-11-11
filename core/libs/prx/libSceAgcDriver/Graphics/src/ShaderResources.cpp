@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4231,6 +4232,7 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const CommitPhaseScope epochPhase(CommitPhase::RevalidateEpoch);
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
@@ -4267,6 +4269,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const CommitPhaseScope fullPhase(CommitPhase::RevalidatePending);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4403,6 +4406,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     bool accepted = false;
     bool indexProved = false;
     std::uint64_t indexBaseline = 0;
+    BeginCommitPhase(CommitPhase::RevalidateFast);
     if (GuestMemory::WriteIndexEnabled() && !noFast && EpochRevalidate()) {
         if (indexRevalidate(shaders, serialBefore) != IndexOutcome::Fallback) indexProved = true;
         else {
@@ -4442,8 +4446,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     if (!fast) {
         countFullWalk(reason);
+        BeginCommitPhase(CommitPhase::RevalidateWalk);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool walked = fullWalk();
+        BeginCommitPhase(CommitPhase::Revalidate);
         countFullWalkTime(reason, walkStart);
         if (!walked) {
             const auto failure = [&] {

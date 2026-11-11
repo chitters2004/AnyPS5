@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -438,6 +439,7 @@ void Cost(const Layout& layout, std::uint32_t frames) {
     for (std::uint32_t set = 0; set < ObjectSets(); ++set) commandSets.push_back(Commands(layout, Frame(), set));
     std::vector<double> warmMs;
     for (auto& commands : commandSets) warmMs.push_back(Submit(commands) / 1e3);
+    const auto phasesBefore = AgcDriver::Graphics::ReadCommitPhases();
     std::vector<double> perDraw;
 #ifdef __linux__
     const auto threads = DriverThreads();
@@ -494,6 +496,16 @@ void Cost(const Layout& layout, std::uint32_t frames) {
     std::printf("village split: us per draw, median of %u frames:%s\n", frames, split.c_str());
     std::printf("village memory:%s\n", ResidentMemory().c_str());
 #endif
+    if (!AgcDriver::Graphics::CommitPhasesEnabled()) return;
+    constexpr std::array<const char*, static_cast<std::size_t>(AgcDriver::Graphics::CommitPhase::Count)> phaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects"};
+    const auto phases = AgcDriver::Graphics::ReadCommitPhases() - phasesBefore;
+    std::string phaseList;
+    for (std::size_t phase = 0; phase < phases.ns.size() && phases.draws != 0; ++phase) {
+        if (phases.ns[phase] == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %.2f", phaseNames[phase], static_cast<double>(phases.ns[phase]) / 1e3 / static_cast<double>(phases.draws));
+        phaseList += text;
+    }
+    std::printf("village commit phases: %llu committed draws, us per draw:%s\n", static_cast<unsigned long long>(phases.draws), phaseList.c_str());
 }
 
 }
