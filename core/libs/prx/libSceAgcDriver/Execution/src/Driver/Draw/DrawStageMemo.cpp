@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/AggregateFields.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -12,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -24,85 +26,60 @@ namespace {
 
 class KeyWriter {
 public:
-    explicit KeyWriter(std::vector<std::uint64_t>& words) : words(words) {}
+    explicit KeyWriter(std::vector<std::uint64_t>& words) : words(words) {
+        words.resize(std::max(words.capacity(), ReservedWords));
+        data = words.data();
+        limit = words.size();
+    }
+
+    void Finish() { words.resize(used); }
+
+    [[gnu::always_inline]] void Word(std::uint64_t word) {
+        if (used == limit) [[unlikely]] Grow();
+        data[used++] = word;
+    }
 
     template<typename TValue>
     void operator()(TValue value) requires (std::is_integral_v<TValue> || std::is_enum_v<TValue>) {
-        words.push_back(static_cast<std::uint64_t>(value));
+        Word(static_cast<std::uint64_t>(value));
     }
 
-    void operator()(float value) { words.push_back(std::bit_cast<std::uint32_t>(value)); }
+    void operator()(float value) { Word(std::bit_cast<std::uint32_t>(value)); }
 
     template<typename TValue, std::size_t TSize>
     void operator()(const std::array<TValue, TSize>& values) {
         for (const auto& value : values) (*this)(value);
     }
 
-    void operator()(const ShaderRecompiler::TargetBlend& blend) {
-        for (const auto value : {blend.enabled, blend.snorm}) (*this)(value);
-        for (const auto value : {blend.colorSource, blend.colorDestination, blend.colorOperation, blend.alphaSource, blend.alphaDestination, blend.alphaOperation, blend.writeMask}) (*this)(value);
-        (*this)(blend.constants);
+    template<typename TParent, typename TField>
+    bool Member(const TParent&, const TField&) { return false; }
+
+    bool Member(const ShaderRecompiler::ShaderPixelStageInfo& pixel, const decltype(ShaderRecompiler::ShaderPixelStageInfo::interpolatorSettings)& settings) {
+        if (&settings != &pixel.interpolatorSettings) return false;
+        for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) (*this)(settings[i]);
+        return true;
     }
 
-    void operator()(const ShaderRecompiler::TargetMerge& merge) {
-        (*this)(merge.target);
-        (*this)(merge.mask);
-        (*this)(merge.samples);
-        (*this)(merge.packing);
-        (*this)(merge.blendControl);
-        (*this)(merge.layered);
-        (*this)(merge.firstSlice);
-        (*this)(merge.lastSlice);
-        (*this)(merge.descriptor);
-        (*this)(merge.depthStencilWrites);
-        (*this)(merge.depthStencilTests);
-        (*this)(merge.blend);
+    bool Member(const ShaderRecompiler::ShaderVertexStageInfo& vertex, const decltype(ShaderRecompiler::ShaderVertexStageInfo::resources)& resources) {
+        if (&resources != &vertex.resources) return false;
+        for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) AggregateFields::HashLeaves(resources[r], *this);
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::ShaderVertexStageInfo& vertex, const decltype(ShaderRecompiler::ShaderVertexStageInfo::resourcesDst)& destinations) {
+        if (&destinations != &vertex.resourcesDst) return false;
+        for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) AggregateFields::HashLeaves(destinations[r], *this);
+        return true;
     }
 
     void operator()(const ShaderRecompiler::ShaderPixelStageInfo& pixel) {
         Graphics::Require(pixel.interpolatorCount <= pixel.interpolatorSettings.size(), "draw stage memo: pixel stage info interpolator count exceeds its table");
-        (*this)(pixel.interpolatorCount);
-        for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) (*this)(pixel.interpolatorSettings[i]);
-        for (const auto value : {pixel.wave32, pixel.hasPerspectiveCenterVgpr, pixel.perspectiveCentroid, pixel.posX, pixel.posY, pixel.posZ, pixel.posW, pixel.frontFace, pixel.frontFaceAllBits, pixel.ancillary, pixel.sampleShading, pixel.noPerspective, pixel.linearCentroid, pixel.pixelKillEnable, pixel.depthExportEnable, pixel.sampleMaskExportEnable, pixel.earlyZ, pixel.executeOnNoop, pixel.orderedPixelShader, pixel.dualSourceBlend, pixel.alphaToCoverage, pixel.stencilRefExportEnable, pixel.stencilOperationValueExport, pixel.layerExported, pixel.ditheredAlphaToCoverage, pixel.iteratesSamples}) (*this)(value);
-        (*this)(pixel.inputAddr);
-        (*this)(pixel.depthExportMin);
-        (*this)(pixel.depthExportMax);
-        (*this)(pixel.conservativeZExport);
-        (*this)(pixel.targetOutputMode);
-        (*this)(pixel.targetExportMapping);
-        (*this)(pixel.targetExportPacking);
-        (*this)(pixel.rasterPrimitive);
-        (*this)(pixel.ditheredAlphaSamples);
-        (*this)(pixel.quadPixelMask);
-        (*this)(pixel.quadSampleMask);
-        (*this)(pixel.reversedBlend);
-        (*this)(pixel.positionLocation);
-        (*this)(pixel.sampleLocations);
-        (*this)(pixel.targetMerges.size());
-        for (const auto& merge : pixel.targetMerges) (*this)(merge);
-        (*this)(pixel.sampleOrder);
+        AggregateFields::HashLeaves(pixel, *this);
     }
 
     void operator()(const ShaderRecompiler::ShaderVertexStageInfo& vertex) {
         Graphics::Require(vertex.resourcesNum <= vertex.resources.size(), "draw stage memo: vertex stage info resource count exceeds its table");
-        (*this)(vertex.resourcesNum);
-        for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) {
-            (*this)(vertex.resources[r].fields);
-            const auto& destination = vertex.resourcesDst[r];
-            (*this)(destination.registerStart);
-            (*this)(destination.registersNum);
-            (*this)(destination.attrId);
-            (*this)(destination.fetchIndex);
-        }
-        (*this)(vertex.fetchAttribReg);
-        (*this)(vertex.fetchBufferReg);
-        (*this)(vertex.fetchEmbedded);
-        (*this)(vertex.paClVsOutCntl);
-        (*this)(vertex.depthRemapMode);
-        (*this)(vertex.pointList);
-        (*this)(vertex.pointSize);
-        (*this)(vertex.pointSizeMin);
-        (*this)(vertex.pointSizeMax);
+        AggregateFields::HashLeaves(vertex, *this);
     }
 
     void operator()(const ShaderRecompiler::ShaderComputeStageInfo& compute) {
@@ -144,7 +121,17 @@ public:
     }
 
 private:
+    [[gnu::noinline]] void Grow() {
+        words.resize(words.size() * 2u);
+        data = words.data();
+        limit = words.size();
+    }
+
+    static constexpr std::size_t ReservedWords = 256;
     std::vector<std::uint64_t>& words;
+    std::uint64_t* data = nullptr;
+    std::size_t limit = 0;
+    std::size_t used = 0;
 };
 
 }
@@ -209,6 +196,7 @@ bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const 
     write(ShaderRecompiler::DebugProbeActive());
     write(ShaderRecompiler::RayTracingStrict());
     write(ShaderRecompiler::RayTracingMiss());
+    write.Finish();
     key.hash = HashKeyWords(key.words, 0x9e3779b97f4a7c15ull);
     return true;
 }
