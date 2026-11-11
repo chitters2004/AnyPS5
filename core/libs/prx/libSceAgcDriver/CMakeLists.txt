@@ -417,7 +417,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AddressWait.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -554,6 +553,17 @@ add_shader_recompiler(shader_recompiler_agc_driver libc
 target_include_directories(libSceAgcDriver INTERFACE
         $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>
 )
+
+add_library(agc_address_wait STATIC ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AddressWait.cpp)
+target_include_directories(agc_address_wait PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_address_wait PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(WIN32)
+    target_link_libraries(agc_address_wait PUBLIC synchronization)
+endif()
+if(MINGW)
+    target_link_options(agc_address_wait INTERFACE LINKER:--exclude-libs,$<TARGET_FILE_NAME:agc_address_wait>)
+endif()
+target_link_libraries(libSceAgcDriver PUBLIC agc_address_wait)
 
 target_link_libraries(libSceAgcDriver PRIVATE
         shader_recompiler_agc_driver
