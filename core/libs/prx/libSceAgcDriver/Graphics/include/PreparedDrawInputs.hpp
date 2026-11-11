@@ -82,6 +82,7 @@ struct PreparedDrawInputCounts {
 PreparedDrawInputCounts PreparedDrawInputCounters();
 void SetDrawInputPreparers(unsigned count);
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared));
+void HoldDrawInputPreparers(bool held);
 void ShutdownDrawInputPreparers();
 
 }

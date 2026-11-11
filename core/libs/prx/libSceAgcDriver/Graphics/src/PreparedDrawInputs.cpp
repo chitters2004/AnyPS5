@@ -113,6 +113,7 @@ constexpr std::array<const char*, DrawInputSourceCount> SourceByteNames{"DrawInp
 constexpr std::array<const char*, DrawInputSourceCount> SourceTimeNames{"DrawInputPrep.ns_owned_reused", "DrawInputPrep.ns_snapshot_reused", "DrawInputPrep.ns_adopted", "DrawInputPrep.ns_copied"};
 
 std::atomic<int> configuredPreparers{-1};
+std::atomic<bool> preparersHeld{false};
 std::atomic<void (*)(PreparedDrawInputs&)> preparedHook{nullptr};
 
 unsigned wantedPreparers() {
@@ -280,6 +281,16 @@ public:
         return made;
     }
 
+    static void Release() {
+        std::lock_guard lock(creation);
+        if (auto* existing = instance.load(std::memory_order_acquire); existing != nullptr) {
+            {
+                std::lock_guard jobsLock(existing->mutex);
+            }
+            existing->wake.notify_all();
+        }
+    }
+
     static void Shutdown() {
         std::lock_guard lock(creation);
         delete instance.exchange(nullptr, std::memory_order_acq_rel);
@@ -315,7 +326,7 @@ private:
             std::shared_ptr<PreparedDrawInputs> job;
             {
                 std::unique_lock lock(mutex);
-                if (!wake.wait(lock, token, [&] { return !jobs.empty(); })) return;
+                if (!wake.wait(lock, token, [&] { return !jobs.empty() && !preparersHeld.load(std::memory_order_acquire); })) return;
                 job = jobs.front().lock();
                 jobs.pop_front();
             }
@@ -488,6 +499,11 @@ void SetDrawInputPreparers(unsigned count) {
 
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared)) {
     preparedHook.store(hook, std::memory_order_release);
+}
+
+void HoldDrawInputPreparers(bool held) {
+    preparersHeld.store(held, std::memory_order_release);
+    if (!held) Preparers::Release();
 }
 
 void ShutdownDrawInputPreparers() {
