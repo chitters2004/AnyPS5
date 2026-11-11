@@ -829,19 +829,35 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
+    static std::uint64_t SegmentHash(std::span<const std::uint32_t> words) noexcept;
+    static std::size_t Hash(std::span<const std::uint32_t> key) noexcept;
+    class DrawKeyHash {
+    public:
+        explicit DrawKeyHash(std::span<const std::uint32_t> head) noexcept;
+        void Stage(std::uint32_t words, std::uint64_t segment) noexcept;
+        std::size_t Finish(std::span<const std::uint32_t> tail) const noexcept;
+
+    private:
+        std::uint64_t state = 0;
+    };
+    static bool HashReuse();
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
     void Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    void Insert(const Key& key, std::size_t hash, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // With `object`, erases the entry only while it still holds that object (a replacement made
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
+    void Remove(const Key& key, std::size_t hash, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     bool TryRemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
+    bool Touch(const Key& key, std::size_t hash);
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
@@ -855,40 +871,35 @@ public:
     static constexpr std::size_t MaximumEntries = 16384;
 
 private:
-    void erase(const Key& key);
+    struct HashedKey {
+        Key words;
+        std::size_t hash = 0;
+    };
+    struct KeyRef {
+        const Key* words = nullptr;
+        std::size_t hash = 0;
+    };
+    struct KeyHash {
+        using is_transparent = void;
+        std::size_t operator()(const HashedKey& key) const noexcept { return key.hash; }
+        std::size_t operator()(const KeyRef& key) const noexcept { return key.hash; }
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const HashedKey& left, const HashedKey& right) const noexcept { return left.hash == right.hash && left.words == right.words; }
+        bool operator()(const HashedKey& left, const KeyRef& right) const noexcept { return left.hash == right.hash && left.words == *right.words; }
+        bool operator()(const KeyRef& left, const HashedKey& right) const noexcept { return left.hash == right.hash && *left.words == right.words; }
+    };
+    void erase(const Key& key, std::size_t hash);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
-    void noteEvicted(const Key& key);
-    void noteReturn(const Key& key);
-    void noteUse(const Key& key);
+    void noteEvicted(std::size_t hash);
+    void noteReturn(std::size_t hash);
+    void noteUse(std::size_t hash);
     void removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted);
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            constexpr std::uint64_t Prime = 0x9e3779b97f4a7c15ull;
-            std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
-            const auto* words = key.data();
-            const auto count = key.size();
-            std::size_t at = 0;
-            for (; at + 8u <= count; at += 8u) {
-                for (std::size_t lane = 0; lane < 4u; ++lane) {
-                    const auto value = static_cast<std::uint64_t>(words[at + lane * 2u]) | static_cast<std::uint64_t>(words[at + lane * 2u + 1u]) << 32u;
-                    lanes[lane] = (lanes[lane] ^ value) * Prime;
-                    lanes[lane] ^= lanes[lane] >> 29u;
-                }
-            }
-            std::uint64_t hash = lanes[0] ^ (lanes[1] << 17u | lanes[1] >> 47u) ^ (lanes[2] << 31u | lanes[2] >> 33u) ^ (lanes[3] << 47u | lanes[3] >> 17u) ^ count;
-            for (; at < count; ++at) hash = (hash ^ words[at]) * Prime;
-            hash ^= hash >> 33u;
-            hash *= 0xff51afd7ed558ccdull;
-            hash ^= hash >> 33u;
-            hash *= 0xc4ceb9fe1a85ec53ull;
-            hash ^= hash >> 33u;
-            return static_cast<std::size_t>(hash);
-        }
-    };
     mutable AgcDriver::Mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::list<std::pair<HashedKey, std::shared_ptr<ShaderResources>>> entries;
+    std::unordered_map<HashedKey, decltype(entries)::iterator, KeyHash, KeyEqual> index;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

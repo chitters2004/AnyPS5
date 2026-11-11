@@ -962,8 +962,13 @@ struct PipelineIdentity {
     auto operator<=>(const PipelineIdentity&) const = default;
 };
 
+struct ResultKeyWords {
+    std::vector<std::uint32_t> words;
+    std::uint64_t hash = 0;
+};
+
 struct ResultKeyMemo {
-    mutable AtomicSharedPtr<const std::vector<std::uint32_t>> words;
+    mutable AtomicSharedPtr<const ResultKeyWords> words;
     ResultKeyMemo() = default;
     ResultKeyMemo(const ResultKeyMemo&) {}
     ResultKeyMemo& operator=(const ResultKeyMemo&) {
