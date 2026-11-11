@@ -240,6 +240,7 @@ int DrawsReadQueuedDumps() {
     const auto captureDrainsBefore = DrawPipeline::DrainRequestsByReason(DrawPipeline::DrainReason::Capture);
     const auto knownBefore = AgcDriver::ShaderMemory::KnownValues();
     const auto queuedStoreMissesBefore = DriverTestAccess::DrawQueuedStoreMisses();
+    static_cast<void>(AgcDriver::DriverDetail::DrawFinisher::DrainText());
     std::atomic<bool> released{false};
     struct Release {
         std::atomic<bool>& flag;
@@ -258,6 +259,7 @@ int DrawsReadQueuedDumps() {
     AgcDriverWaitIdle_nid_postfix();
     const auto known = AgcDriver::ShaderMemory::KnownValues();
     const auto queuedStoreMisses = DriverTestAccess::DrawQueuedStoreMisses() - queuedStoreMissesBefore;
+    const auto finisherDrains = AgcDriver::DriverDetail::DrawFinisher::DrainText();
 
     AgcDriver::GuestMemory::FlushGpuWrites(destination, TableWords * 4u);
     Require(std::memcmp(block.Data() + TableOffset, second.data(), TableWords * 4u) == 0, "queued constant RAM dump: the table in guest memory is not the second dump's");
@@ -267,13 +269,14 @@ int DrawsReadQueuedDumps() {
         Require(brightest == expected[draw], "queued constant RAM dump: draw " + std::to_string(draw) + " wrote " + std::to_string(brightest) + ", expected " + std::to_string(expected[draw]) + " (draw 0 reads the table before both dumps, draw 1 after the first, draw 2 after the second)");
     }
     Require(dumpDrains == 0, "queued constant RAM dump: a DUMP_CONST_RAM drained the draw pipeline " + std::to_string(dumpDrains) + " times");
+    if (AgcDriver::DriverDetail::DrawFinisher::Overlap() && AgcDriver::DriverDetail::DrawFinisher::Sequenced()) Require(finisherDrains.find(" 0x83 x") == std::string::npos, "queued constant RAM dump: a DUMP_CONST_RAM queued in the sequence ring drained the draw finisher:" + finisherDrains);
     Require(known.served > knownBefore.served, "queued constant RAM dump: no capture word was served from a queued dump");
     if (std::getenv("APS5_VERIFY_KNOWN_VALUES") != nullptr) {
         Require(known.mismatches == knownBefore.mismatches, "queued constant RAM dump: a word served from a queued dump differs from what the dump stored");
     } else {
         Require(captureDrains == 0, "queued constant RAM dump: a capture after a queued dump drained the draw pipeline " + std::to_string(captureDrains) + " times instead of reading the queued bytes");
         Require(drains == 0, "queued constant RAM dump: the submission drained the draw pipeline " + std::to_string(drains) + " times");
-        Require(queuedStoreMisses != 0, "queued constant RAM dump: no draw-cache miss was counted as a recapture over queued stores");
+        if (!AgcDriver::DriverDetail::DrawFinisher::Overlap()) Require(queuedStoreMisses != 0, "queued constant RAM dump: no draw-cache miss was counted as a recapture over queued stores");
     }
     std::cout << "three draws around two queued constant RAM dumps read " << known.served - knownBefore.served << " dumped words without draining the draw pipeline, " << queuedStoreMisses << " draw-cache misses recaptured over queued stores\n";
     return 0;

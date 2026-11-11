@@ -81,6 +81,14 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 bool StorageImageCached(const Context& context, const StorageTexture* image);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
+struct PreparedViewedSurface {
+    GuestTextureResource viewed{};
+    std::uint64_t viewedBytes = 0;
+    bool repeated = false;
+};
+PreparedViewedSurface PrepareViewedSurface(const GuestTextureResource& requested, std::uint32_t maxArrayLayers);
+bool PreparedTargets();
+bool VerifyPreparedTargets();
 
 // Defined in Texture.cpp beside the pending-results registry, for the fast Revalidate below: whether
 // a storage image other than `except` has results pending in [address, address + bytes).
@@ -120,7 +128,11 @@ public:
         std::vector<VkDescriptorPoolSize> sizes;
         std::optional<std::uint32_t> variableCount;
         std::shared_ptr<const TableDescriptors> table;
+        std::uint64_t descriptors = 0;
     };
+    static constexpr std::uint64_t RecycledDescriptorBudget = std::uint64_t{1} << 22;
+    static constexpr std::size_t TableClasses = 9;
+    static constexpr std::uint32_t SmallestTableClass = 1024;
     SetAllocation Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
     void Free(const SetAllocation& allocation, std::shared_ptr<const TableDescriptors> table = {}) noexcept;
     SetAllocation AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind = false, std::optional<std::uint32_t> variableCount = std::nullopt);
@@ -134,8 +146,13 @@ public:
         std::uint64_t dedicatedPools = 0;
         std::uint64_t keptSets = 0;
         std::uint64_t reusedSets = 0;
+        std::uint64_t recycledSets = 0;
+        std::uint64_t recycledDescriptors = 0;
+        std::uint64_t recycleRefused = 0;
+        std::array<std::uint64_t, TableClasses> tableDraws{};
     };
     Stats Counters() const;
+    void NoteTableDraw(std::uint32_t elements) noexcept;
 
 private:
     Context context;
@@ -156,6 +173,7 @@ private:
     std::map<std::pair<VkDescriptorSetLayout, std::uint32_t>, std::vector<SetAllocation>> recycled;
     std::vector<SetAllocation> kept;
     Stats stats;
+    std::array<std::atomic<std::uint64_t>, TableClasses> tableDraws{};
 };
 
 enum class ContentKeyComponent : std::size_t { Layout, BufferWord0, BufferWord1, BufferWord2, BufferWord3, Image, Sampler, ShaderData, Other, DrawTarget, Count };

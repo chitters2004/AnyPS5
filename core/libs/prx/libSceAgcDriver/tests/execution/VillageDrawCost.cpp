@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -391,7 +392,7 @@ std::vector<std::pair<pid_t, std::string>> DriverThreads() {
             std::ifstream comm(std::string("/proc/self/task/") + entry->d_name + "/comm");
             std::string name;
             std::getline(comm, name);
-            if (name.rfind("qworker 0x0", 0) == 0 || name.rfind("draw-commit", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
+            if (name.rfind("qworker 0x0", 0) == 0 || name.rfind("draw-commit", 0) == 0 || name.rfind("draw-finish", 0) == 0 || name.rfind("llvmpipe-", 0) == 0) threads.emplace_back(static_cast<pid_t>(std::stol(entry->d_name)), name + "/" + entry->d_name);
         }
         closedir(tasks);
     }
@@ -438,6 +439,7 @@ void Cost(const Layout& layout, std::uint32_t frames) {
     for (std::uint32_t set = 0; set < ObjectSets(); ++set) commandSets.push_back(Commands(layout, Frame(), set));
     std::vector<double> warmMs;
     for (auto& commands : commandSets) warmMs.push_back(Submit(commands) / 1e3);
+    const auto phasesBefore = AgcDriver::Graphics::ReadCommitPhases();
     std::vector<double> perDraw;
 #ifdef __linux__
     const auto threads = DriverThreads();
@@ -494,6 +496,16 @@ void Cost(const Layout& layout, std::uint32_t frames) {
     std::printf("village split: us per draw, median of %u frames:%s\n", frames, split.c_str());
     std::printf("village memory:%s\n", ResidentMemory().c_str());
 #endif
+    if (!AgcDriver::Graphics::CommitPhasesEnabled()) return;
+    const auto phases = AgcDriver::Graphics::ReadCommitPhases() - phasesBefore;
+    std::string phaseList;
+    for (std::size_t phase = 0; phase < phases.ns.size() && phases.draws != 0; ++phase) {
+        if (phases.ns[phase] == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %.2f", AgcDriver::Graphics::CommitPhaseName(static_cast<AgcDriver::Graphics::CommitPhase>(phase)), static_cast<double>(phases.ns[phase]) / 1e3 / static_cast<double>(phases.draws));
+        phaseList += text;
+    }
+    std::printf("village commit phases: %llu committed draws, us per draw:%s\n", static_cast<unsigned long long>(phases.draws), phaseList.c_str());
+    std::printf("village content keys: %llu of %.0f words on average, stage key memo %llu hits / %llu misses\n", static_cast<unsigned long long>(phases.keys), phases.keys != 0 ? static_cast<double>(phases.keyWords) / static_cast<double>(phases.keys) : 0.0, static_cast<unsigned long long>(phases.keyMemoHits), static_cast<unsigned long long>(phases.keyMemoMisses));
 }
 
 }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -39,6 +40,8 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "ImageTableAbi.hpp"
 #include <cstring>
+#include <tuple>
+#include <type_traits>
 #include <limits>
 #include <list>
 #include <map>
@@ -1842,18 +1845,75 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
     return !MetadataMoved(image, resource);
 }
 
+bool PreparedTargets() {
+    static const bool enabled = std::getenv("APS5_PREPARED_TARGETS") != nullptr;
+    return enabled;
+}
+
+bool VerifyPreparedTargets() {
+    static const bool enabled = std::getenv("APS5_VERIFY_PREPARED_TARGETS") != nullptr;
+    return enabled;
+}
+
+PreparedViewedSurface PrepareViewedSurface(const GuestTextureResource& requested, std::uint32_t maxArrayLayers) {
+    static_assert(sizeof(GuestTextureResource) == 112, "the prepared surface key compares every field of a resource");
+    const auto fields = [](const GuestTextureResource& r) { return std::tie(r.baseAddress, r.width, r.height, r.depthOrLastArray, r.baseArray, r.mipCount, r.baseLevel, r.tileMode, r.dimension, r.format, r.dstSelX, r.dstSelY, r.dstSelZ, r.dstSelW, r.pipeBankXor, r.bcSwizzle, r.lastLevel, r.dccAddress, r.dccAlphaOnMsb, r.dccPipeAligned, r.iterate256, r.minLod, r.allocatedMipCount, r.samples, r.gcnPitch, r.gcnPow2Pad, r.gcnLinearGeneral, r.linearPitch, r.fmaskCmaskAddress); };
+    const auto same = [&](const GuestTextureResource& a, const GuestTextureResource& b) { return fields(a) == fields(b); };
+    struct Entry {
+        GuestTextureResource requested{};
+        std::uint32_t maxArrayLayers = 0;
+        bool valid = false;
+        PreparedViewedSurface prepared;
+    };
+    const auto compute = [&] {
+        PreparedViewedSurface prepared;
+        prepared.viewed = ArrayLayerWindow(requested, maxArrayLayers);
+        prepared.viewedBytes = DescribeSurface(prepared.viewed).guestBytes;
+        return prepared;
+    };
+    if (!PreparedTargets()) return compute();
+    thread_local std::array<Entry, 4> entries{};
+    thread_local std::size_t next = 0;
+    for (auto& entry : entries) {
+        if (!entry.valid || entry.maxArrayLayers != maxArrayLayers || !same(entry.requested, requested)) continue;
+        CountCommit(CommitCounter::PreparedSurfaceHits);
+        auto prepared = entry.prepared;
+        prepared.repeated = true;
+        if (VerifyPreparedTargets()) {
+            const auto fresh = compute();
+            Require(same(fresh.viewed, prepared.viewed) && fresh.viewedBytes == prepared.viewedBytes, "APS5_VERIFY_PREPARED_TARGETS: a prepared colour surface differs from the one computed for the draw");
+        }
+        return prepared;
+    }
+    CountCommit(CommitCounter::PreparedSurfaceMisses);
+    auto& entry = entries[next++ % entries.size()];
+    entry.requested = requested;
+    entry.maxArrayLayers = maxArrayLayers;
+    entry.prepared = compute();
+    entry.valid = true;
+    return entry.prepared;
+}
+
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
-    const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    const bool phased = CurrentCommitPhase() == CommitPhase::TargetsLookup;
+    const auto phase = [&](CommitPhase next) {
+        if (phased) BeginCommitPhase(next);
+    };
+    phase(CommitPhase::TargetsLookupPure);
+    const auto prepared = PrepareViewedSurface(requested, context.limits.maxImageArrayLayers);
+    const auto& viewed = prepared.viewed;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
-    const auto viewedBytes = DescribeSurface(viewed).guestBytes;
+    const auto viewedBytes = prepared.viewedBytes;
+    phase(CommitPhase::TargetsLookupGuards);
     RequireNoMultisampleTarget(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), "a storage image access");
     if (DepthSurfaceStorage(context, {}, viewed, 0) != nullptr) return nullptr;
     if (DepthPlanesStale()) static_cast<void>(FlushDepthPlanes(viewed.baseAddress, static_cast<std::size_t>(viewedBytes), DepthPlaneScope::Overlapped));
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    phase(CommitPhase::TargetsLookupCache);
     const auto resource = StorageSurface(context, viewed);
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
@@ -1861,7 +1921,7 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
     if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;
-    it->texture->Refresh();
+    InCommitPhase(CommitPhase::TargetsRefresh, [&] { static_cast<void>(it->texture->Refresh()); });
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
     if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
@@ -3030,7 +3090,13 @@ void ShaderResources::reportDescriptorCaches() const {
     const auto descriptors = context.descriptorCache != nullptr ? context.descriptorCache->Counters() : DescriptorCache::Stats{};
     const auto samplerHits = context.samplerCache != nullptr ? context.samplerCache->Hits() : 0;
     const auto samplerMisses = context.samplerCache != nullptr ? context.samplerCache->Misses() : 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
+    std::string tables;
+    std::uint64_t capacity = DescriptorCache::SmallestTableClass;
+    for (std::size_t index = 0; index < DescriptorCache::TableClasses; ++index, capacity *= 2) {
+        if (descriptors.tableDraws[index] == 0) continue;
+        tables += " <=" + std::to_string(capacity) + ":" + std::to_string(descriptors.tableDraws[index]);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, recycled %llu sets of %llu descriptors (%llu refused), samplers %llu hits / %llu created, table draws by elements:%s\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(descriptors.recycledSets), static_cast<unsigned long long>(descriptors.recycledDescriptors), static_cast<unsigned long long>(descriptors.recycleRefused), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses), tables.c_str());
 }
 
 constexpr std::size_t CompactTableKeyWords = 8192;
@@ -4331,6 +4397,7 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const CommitPhaseScope epochPhase(CommitPhase::RevalidateEpoch);
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         provedEpoch = 0;
@@ -4367,6 +4434,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const CommitPhaseScope fullPhase(CommitPhase::RevalidatePending);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -4503,6 +4571,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     bool accepted = false;
     bool indexProved = false;
     std::uint64_t indexBaseline = 0;
+    BeginCommitPhase(CommitPhase::RevalidateFast);
     if (GuestMemory::WriteIndexEnabled() && !noFast && EpochRevalidate()) {
         if (indexRevalidate(shaders, serialBefore) != IndexOutcome::Fallback) indexProved = true;
         else {
@@ -4542,8 +4611,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     if (!fast) {
         countFullWalk(reason);
+        BeginCommitPhase(CommitPhase::RevalidateWalk);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const bool walked = fullWalk();
+        BeginCommitPhase(CommitPhase::Revalidate);
         countFullWalkTime(reason, walkStart);
         if (!walked) {
             const auto failure = [&] {
@@ -5188,7 +5259,9 @@ constexpr std::array<VkDescriptorPoolSize, 4> ChainPoolCreateSizes{{{VK_DESCRIPT
 
 DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
     bool fits = true;
+    std::uint64_t descriptors = 0;
     for (const auto& size : sizes) {
+        descriptors += size.descriptorCount;
         const auto limit = SetDescriptorLimit(context, size.type, updateAfterBind);
         Require(size.descriptorCount <= limit, "descriptor set exceeds the device's per-set descriptor limit");
         const auto capacity = std::find_if(ChainPoolSizes.begin(), ChainPoolSizes.end(), [&](const auto& item) { return item.type == size.type; });
@@ -5211,6 +5284,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         });
         if (same != kept.end()) {
             auto reused = std::move(*same);
+            reused.descriptors = descriptors;
             kept.erase(same);
             dedicated.push_back(reused.pool);
             ++stats.reusedSets;
@@ -5228,7 +5302,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         dedicated.push_back(pool);
         ++stats.dedicatedPools;
         ++stats.sets;
-        return {set, pool, 0, updateAfterBind, layout, std::vector<VkDescriptorPoolSize>(sizes.begin(), sizes.end()), variableCount, {}};
+        return {set, pool, 0, updateAfterBind, layout, std::vector<VkDescriptorPoolSize>(sizes.begin(), sizes.end()), variableCount, {}, descriptors};
     }
     auto& chain = updateAfterBind ? updateAfterBindPools : pools;
     for (std::size_t index = chain.size(); index != 0; --index) {
@@ -5240,7 +5314,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
         if (result == VK_SUCCESS) {
             ++stats.sets;
             ++pool.liveSets;
-            return {set, pool.handle, index - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
+            return {set, pool.handle, index - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}, descriptors};
         }
         if (result != VK_ERROR_OUT_OF_POOL_MEMORY && result != VK_ERROR_FRAGMENTED_POOL) Check(result, "vkAllocateDescriptorSets");
         pool.exhausted = true;
@@ -5261,7 +5335,7 @@ DescriptorCache::SetAllocation DescriptorCache::Allocate(VkDescriptorSetLayout l
     Check(allocate(context.device, &allocation, &set), "vkAllocateDescriptorSets");
     chain.back().liveSets = 1;
     ++stats.sets;
-    return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}};
+    return {set, pool, chain.size() - 1, updateAfterBind, VK_NULL_HANDLE, {}, variableCount, {}, descriptors};
 }
 
 DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSetLayout layout, std::span<const VkDescriptorPoolSize> sizes, bool updateAfterBind, std::optional<std::uint32_t> variableCount) {
@@ -5270,6 +5344,8 @@ DescriptorCache::SetAllocation DescriptorCache::AllocateRewritten(VkDescriptorSe
         if (const auto found = recycled.find({layout, variableCount.value_or(0u)}); found != recycled.end() && !found->second.empty()) {
             const auto allocation = found->second.back();
             found->second.pop_back();
+            --stats.recycledSets;
+            stats.recycledDescriptors -= allocation.descriptors;
             return allocation;
         }
     }
@@ -5282,10 +5358,13 @@ void DescriptorCache::Recycle(VkDescriptorSetLayout layout, const SetAllocation&
         std::lock_guard lock(mutex);
         try {
             auto& list = recycled[{layout, allocation.variableCount.value_or(0u)}];
-            if (list.size() < 4096) {
+            if (list.size() < 4096 && stats.recycledDescriptors + allocation.descriptors <= RecycledDescriptorBudget) {
                 list.push_back(allocation);
+                ++stats.recycledSets;
+                stats.recycledDescriptors += allocation.descriptors;
                 return;
             }
+            ++stats.recycleRefused;
         } catch (...) {
         }
     }
@@ -5322,7 +5401,17 @@ void DescriptorCache::Free(const SetAllocation& allocation, std::shared_ptr<cons
 
 DescriptorCache::Stats DescriptorCache::Counters() const {
     std::lock_guard lock(mutex);
-    return stats;
+    auto result = stats;
+    for (std::size_t index = 0; index < TableClasses; ++index) result.tableDraws[index] = tableDraws[index].load(std::memory_order_relaxed);
+    return result;
+}
+
+static_assert((std::uint64_t{DescriptorCache::SmallestTableClass} << (DescriptorCache::TableClasses - 1)) == std::uint64_t{ShaderRecompiler::RuntimeAbi::StageCount} * ShaderRecompiler::ImageTableAbi::ImageElementBudget);
+
+void DescriptorCache::NoteTableDraw(std::uint32_t elements) noexcept {
+    std::size_t index = 0;
+    for (std::uint64_t capacity = SmallestTableClass; capacity < elements && index + 1 < TableClasses; capacity *= 2) ++index;
+    tableDraws[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t ShaderResources::guestBufferBytes(std::span<const std::uint32_t> words) const {
@@ -6810,6 +6899,13 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    if (BuildProfiled() && context.descriptorCache != nullptr) {
+        std::optional<std::uint32_t> elements;
+        for (const auto table : tableBindings) {
+            if (table != std::numeric_limits<std::size_t>::max()) elements = std::max(elements.value_or(0u), static_cast<std::uint32_t>(bindings[table].imageAllocations.size()));
+        }
+        if (elements.has_value()) context.descriptorCache->NoteTableDraw(*elements);
+    }
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);

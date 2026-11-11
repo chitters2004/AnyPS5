@@ -1,0 +1,234 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
+#include <algorithm>
+#include <bit>
+#include <string>
+#include <string_view>
+
+namespace AgcDriver::Graphics {
+
+namespace {
+
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseNames{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate epoch", "revalidate pending", "revalidate fast", "revalidate walk", "classify", "record", "bindings", "pass access", "effects", "plan.store", "plan.fb", "inputs.collect", "inputs.local", "targets.lru", "resolve.cache", "resolve.alias", "record.local", "pass access.local", "epilogue.writers", "epilogue.recipe", "plan.key", "targets.claims", "targets.lookup", "targets.refresh", "targets.clearcheck", "targets.view", "targets.settle", "targets.msaa", "targets.proved", "targets.cmask", "targets.depthprep", "targets.depth.claims", "targets.depth.clear", "targets.depth.find", "targets.depth.sync", "targets.depth.stale", "targets.lookup.pure", "targets.lookup.guards", "targets.lookup.cache"};
+static_assert(PhaseNames.back() != nullptr);
+
+constexpr std::array<const char*, static_cast<std::size_t>(CommitPhase::Count)> PhaseGroups{"other", "plan", "inputs", "targets", "resolve", "revalidate", "revalidate", "revalidate", "revalidate", "revalidate", "classify", "record", "bindings", "pass access", "effects", "plan", "plan", "inputs", "inputs", "targets", "resolve", "resolve", "record", "pass access", "epilogue", "epilogue", "plan", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets", "targets"};
+static_assert(PhaseGroups.back() != nullptr);
+
+constexpr std::array<const char*, 12> GroupOrder{"other", "plan", "inputs", "targets", "resolve", "revalidate", "classify", "record", "bindings", "pass access", "effects", "epilogue"};
+
+using Clock = std::chrono::steady_clock;
+
+struct ThreadPhases {
+    bool active = false;
+    CommitPhase current = CommitPhase::Other;
+    Clock::time_point mark{};
+};
+
+thread_local ThreadPhases threadPhases;
+thread_local unsigned threadEpochCauses = 0;
+std::atomic<std::uint64_t> drawCount{0};
+std::atomic<std::uint64_t> keyCount{0};
+std::atomic<std::uint64_t> keyWordCount{0};
+std::atomic<std::uint64_t> keyMemoHitCount{0};
+std::atomic<std::uint64_t> keyMemoMissCount{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitCounter::Count)> counterValues{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitPhase::Count)> phaseNs{};
+std::atomic<std::int64_t> reportedAt{0};
+std::mutex reportMutex;
+CommitPhaseTotals reported;
+
+void charge(ThreadPhases& phases, Clock::time_point now) {
+    const auto spent = std::chrono::duration_cast<std::chrono::nanoseconds>(now - phases.mark).count();
+    if (spent > 0) phaseNs[static_cast<std::size_t>(phases.current)].fetch_add(static_cast<std::uint64_t>(spent), std::memory_order_relaxed);
+    phases.mark = now;
+}
+
+void reportDue(Clock::time_point now) {
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count() / 10;
+    auto previous = reportedAt.load(std::memory_order_relaxed);
+    if (previous == window) return;
+    if (previous == 0) {
+        reportedAt.compare_exchange_strong(previous, window, std::memory_order_relaxed);
+        return;
+    }
+    if (!reportedAt.compare_exchange_strong(previous, window, std::memory_order_relaxed)) return;
+    CommitPhaseTotals totals;
+    {
+        std::lock_guard lock(reportMutex);
+        const auto now = ReadCommitPhases();
+        totals = now - reported;
+        reported = now;
+    }
+    if (totals.draws == 0) return;
+    std::uint64_t all = 0;
+    for (const auto ns : totals.ns) all += ns;
+    std::string text;
+    for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) {
+        if (totals.ns[phase] == 0) continue;
+        char item[80];
+        std::snprintf(item, sizeof(item), " %s %.2f", PhaseNames[phase], static_cast<double>(totals.ns[phase]) / 1e3 / static_cast<double>(totals.draws));
+        text += item;
+    }
+    std::string groups;
+    for (const auto* group : GroupOrder) {
+        std::uint64_t ns = 0;
+        for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) {
+            if (std::string_view(PhaseGroups[phase]) == group) ns += totals.ns[phase];
+        }
+        char item[80];
+        std::snprintf(item, sizeof(item), " %s %.2f", group, static_cast<double>(ns) / 1e3 / static_cast<double>(totals.draws));
+        groups += item;
+    }
+    const auto count = [&](CommitCounter counter) { return static_cast<double>(totals.counters[static_cast<std::size_t>(counter)]); };
+    const auto perDraw = [&](CommitCounter counter) { return count(counter) / static_cast<double>(totals.draws); };
+    const auto targetDraws = std::max(1.0, count(CommitCounter::TargetDraws));
+    std::fprintf(stderr, "[commit-phases] (10 s) %llu draws, %.2f us each; us per draw by phase:%s; by group (phases and their sub-phases, summing to the total):%s; %llu content keys of %.0f words on average, stage key memo %llu hits / %llu misses\n", static_cast<unsigned long long>(totals.draws), static_cast<double>(all) / 1e3 / static_cast<double>(totals.draws), text.c_str(), groups.c_str(), static_cast<unsigned long long>(totals.keys), totals.keys != 0 ? static_cast<double>(totals.keyWords) / static_cast<double>(totals.keys) : 0.0, static_cast<unsigned long long>(totals.keyMemoHits), static_cast<unsigned long long>(totals.keyMemoMisses));
+    std::fprintf(stderr, "[commit-targets] (10 s) %.0f draws with targets, %.1f%% by recipe; per such draw %.2f color and %.2f depth attachments, %.1f%% on the previous draw's targets; target refreshes per draw: %.2f epoch hits, %.2f proved, %.2f slow; epoch misses per draw: %.2f no epoch, %.2f epoch moved, %.2f proof serial moved, %.2f pending serial moved; other refreshes per draw: %.2f epoch hits, %.2f proved, %.2f slow\n", count(CommitCounter::TargetDraws), 100.0 * count(CommitCounter::RecipeTargetDraws) / targetDraws, count(CommitCounter::ColorTargets) / targetDraws, count(CommitCounter::DepthTargets) / targetDraws, 100.0 * count(CommitCounter::RepeatedTargets) / targetDraws, perDraw(CommitCounter::TargetRefreshEpoch), perDraw(CommitCounter::TargetRefreshProved), perDraw(CommitCounter::TargetRefreshSlow), perDraw(CommitCounter::TargetEpochOff), perDraw(CommitCounter::TargetEpochMoved), perDraw(CommitCounter::TargetEpochProofMoved), perDraw(CommitCounter::TargetEpochPendingMoved), perDraw(CommitCounter::OtherRefreshEpoch), perDraw(CommitCounter::OtherRefreshProved), perDraw(CommitCounter::OtherRefreshSlow));
+    const auto depthPreps = std::max(1.0, count(CommitCounter::DepthPreps));
+    std::fprintf(stderr, "[commit-target-causes] (10 s) epoch moved per draw by the ordering points since the committing thread's previous epoch: %.3f submission start, %.3f WAIT_REG_MEM, %.3f drain, %.3f reap, %.3f packet, %.3f several kinds, %.3f unknown; target refresh proofs refused per draw: %.3f no proof, %.3f image generation moved, %.3f GPU lock not held, %.3f collect refused, %.3f DCC keys, %.3f memory changed, %.3f other pending results; depth preps %.0f: %.1f%% on the previous draw's surface, %.1f%% created, %.1f%% after a clear, %.1f%% mirrored, %.1f%% scanned other surfaces for stale mirrors, %.1f%% found as the previous draw's surface without a scan; prepared colour surfaces %.0f repeated, %.0f computed; committing threads followed the epoch token %.0f times (%.0f to an older token than the one followed before, %.0f older tokens kept the newer epoch; with a submission start %.0f, WAIT_REG_MEM %.0f, drain %.0f, reap %.0f, packet %.0f, no new ordering point %.0f); epoch-moved target misses per draw %.3f never stamped, %.3f stamped by another thread, %.3f stamped in an earlier epoch of this thread; target refresh exits stamped with the epoch per draw %.3f; target epoch misses per draw %.3f first for that image in the epoch; slow target refreshes per draw %.3f again for an image already slow-refreshed in the epoch\n", perDraw(CommitCounter::TargetEpochBySubmission), perDraw(CommitCounter::TargetEpochByWait), perDraw(CommitCounter::TargetEpochByDrain), perDraw(CommitCounter::TargetEpochByReap), perDraw(CommitCounter::TargetEpochByPacket), perDraw(CommitCounter::TargetEpochBySeveral), perDraw(CommitCounter::TargetEpochByUnknown), perDraw(CommitCounter::TargetProofNone), perDraw(CommitCounter::TargetProofGeneration), perDraw(CommitCounter::TargetProofUnlocked), perDraw(CommitCounter::TargetProofRefused), perDraw(CommitCounter::TargetProofKeys), perDraw(CommitCounter::TargetProofChanged), perDraw(CommitCounter::TargetProofPending), count(CommitCounter::DepthPreps), 100.0 * count(CommitCounter::DepthSameSurface) / depthPreps, 100.0 * count(CommitCounter::DepthCreated) / depthPreps, 100.0 * count(CommitCounter::DepthCleared) / depthPreps, 100.0 * count(CommitCounter::DepthMirrored) / depthPreps, 100.0 * count(CommitCounter::DepthStaleScans) / depthPreps, 100.0 * count(CommitCounter::DepthFoundRepeated) / depthPreps, count(CommitCounter::PreparedSurfaceHits), count(CommitCounter::PreparedSurfaceMisses), count(CommitCounter::EpochFollows), count(CommitCounter::EpochFollowsBackward), count(CommitCounter::EpochFollowsSkipped), count(CommitCounter::EpochFollowsBySubmission), count(CommitCounter::EpochFollowsByWait), count(CommitCounter::EpochFollowsByDrain), count(CommitCounter::EpochFollowsByReap), count(CommitCounter::EpochFollowsByPacket), count(CommitCounter::EpochFollowsByNone), perDraw(CommitCounter::TargetEpochNeverStamped), perDraw(CommitCounter::TargetEpochOtherThread), perDraw(CommitCounter::TargetEpochThisThread), perDraw(CommitCounter::TargetEpochExitStamps), perDraw(CommitCounter::TargetMissFirstInEpoch), perDraw(CommitCounter::TargetSlowAgainInEpoch));
+}
+
+}
+
+bool CommitPhasesEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_COMMIT") != nullptr;
+    return enabled;
+}
+
+const char* CommitPhaseGroup(CommitPhase phase) {
+    return PhaseGroups[static_cast<std::size_t>(phase)];
+}
+
+const char* CommitPhaseName(CommitPhase phase) {
+    return PhaseNames[static_cast<std::size_t>(phase)];
+}
+
+void BeginCommitPhase(CommitPhase phase) {
+    auto& phases = threadPhases;
+    if (!phases.active) return;
+    charge(phases, Clock::now());
+    phases.current = phase;
+}
+
+void NoteCommitKey(std::size_t words) {
+    if (!threadPhases.active) return;
+    keyCount.fetch_add(1, std::memory_order_relaxed);
+    keyWordCount.fetch_add(words, std::memory_order_relaxed);
+}
+
+void NoteCommitKeyMemo(bool hit) {
+    if (!threadPhases.active) return;
+    (hit ? keyMemoHitCount : keyMemoMissCount).fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteEpochCauses(unsigned causes) {
+    threadEpochCauses = causes;
+}
+
+void NoteEpochFollowSkipped() {
+    counterValues[static_cast<std::size_t>(CommitCounter::EpochFollowsSkipped)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteEpochFollow(bool backward, unsigned causes) {
+    const auto add = [](CommitCounter counter) { counterValues[static_cast<std::size_t>(counter)].fetch_add(1, std::memory_order_relaxed); };
+    add(CommitCounter::EpochFollows);
+    if (backward) add(CommitCounter::EpochFollowsBackward);
+    if (causes == 0) add(CommitCounter::EpochFollowsByNone);
+    for (unsigned cause = 0; cause < static_cast<unsigned>(EpochCause::Count); ++cause) {
+        if ((causes & (1u << cause)) != 0) add(static_cast<CommitCounter>(static_cast<unsigned>(CommitCounter::EpochFollowsBySubmission) + cause));
+    }
+}
+
+unsigned EpochCauses() {
+    return threadEpochCauses;
+}
+
+CommitCounter EpochCauseCounter(unsigned causes) {
+    if (causes == 0) return CommitCounter::TargetEpochByUnknown;
+    if ((causes & (causes - 1)) != 0) return CommitCounter::TargetEpochBySeveral;
+    return static_cast<CommitCounter>(static_cast<unsigned>(CommitCounter::TargetEpochBySubmission) + static_cast<unsigned>(std::countr_zero(causes)));
+}
+
+void CountCommit(CommitCounter counter, std::uint64_t amount) {
+    if (!threadPhases.active) return;
+    counterValues[static_cast<std::size_t>(counter)].fetch_add(amount, std::memory_order_relaxed);
+}
+
+CommitPhase CurrentCommitPhase() {
+    const auto& phases = threadPhases;
+    return phases.active ? phases.current : CommitPhase::Other;
+}
+
+void RelabelCommitPhase(CommitPhase phase) {
+    auto& phases = threadPhases;
+    if (phases.active) phases.current = phase;
+}
+
+CommitPhaseTotals ReadCommitPhases() {
+    CommitPhaseTotals totals;
+    totals.draws = drawCount.load(std::memory_order_relaxed);
+    totals.keys = keyCount.load(std::memory_order_relaxed);
+    totals.keyWords = keyWordCount.load(std::memory_order_relaxed);
+    totals.keyMemoHits = keyMemoHitCount.load(std::memory_order_relaxed);
+    totals.keyMemoMisses = keyMemoMissCount.load(std::memory_order_relaxed);
+    for (std::size_t counter = 0; counter < totals.counters.size(); ++counter) totals.counters[counter] = counterValues[counter].load(std::memory_order_relaxed);
+    for (std::size_t phase = 0; phase < totals.ns.size(); ++phase) totals.ns[phase] = phaseNs[phase].load(std::memory_order_relaxed);
+    return totals;
+}
+
+CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier) {
+    CommitPhaseTotals difference;
+    difference.draws = later.draws - earlier.draws;
+    difference.keys = later.keys - earlier.keys;
+    difference.keyWords = later.keyWords - earlier.keyWords;
+    difference.keyMemoHits = later.keyMemoHits - earlier.keyMemoHits;
+    difference.keyMemoMisses = later.keyMemoMisses - earlier.keyMemoMisses;
+    for (std::size_t counter = 0; counter < difference.counters.size(); ++counter) difference.counters[counter] = later.counters[counter] - earlier.counters[counter];
+    for (std::size_t phase = 0; phase < difference.ns.size(); ++phase) difference.ns[phase] = later.ns[phase] - earlier.ns[phase];
+    return difference;
+}
+
+CommitPhaseDraw::CommitPhaseDraw() {
+    auto& phases = threadPhases;
+    if (phases.active) {
+        nested = true;
+        previous = phases.current;
+        BeginCommitPhase(CommitPhase::Other);
+        return;
+    }
+    if (!CommitPhasesEnabled()) return;
+    owner = true;
+    phases.active = true;
+    phases.current = CommitPhase::Other;
+    phases.mark = Clock::now();
+}
+
+CommitPhaseDraw::~CommitPhaseDraw() {
+    if (nested) BeginCommitPhase(previous);
+    if (!owner) return;
+    auto& phases = threadPhases;
+    const auto now = Clock::now();
+    charge(phases, now);
+    phases.active = false;
+    drawCount.fetch_add(1, std::memory_order_relaxed);
+    reportDue(now);
+}
+
+CommitPhaseScope::CommitPhaseScope(CommitPhase phase) {
+    auto& phases = threadPhases;
+    if (!phases.active) return;
+    active = true;
+    previous = phases.current;
+    BeginCommitPhase(phase);
+}
+
+CommitPhaseScope::~CommitPhaseScope() {
+    if (active) BeginCommitPhase(previous);
+}
+
+}

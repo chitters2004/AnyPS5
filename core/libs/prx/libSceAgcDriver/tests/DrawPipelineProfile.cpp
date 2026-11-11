@@ -1,5 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include <array>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <exception>
 #include <filesystem>
@@ -53,6 +57,11 @@ public:
 
     StderrCapture(const StderrCapture&) = delete;
     StderrCapture& operator=(const StderrCapture&) = delete;
+
+    std::string Text() const {
+        std::ifstream file(path, std::ios::binary);
+        return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+    }
 
     std::string ReadReport() const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
@@ -108,12 +117,62 @@ void TestReport() {
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    const auto text = capture.Text();
+    const auto idle = text.find("[committer-idle] (10 s): ");
+    Check(idle != std::string::npos && text.find(" while the finisher held work (", idle) != std::string::npos && text.find(" while it was idle (", idle) != std::string::npos, "the committer idle counters were not reported");
 }
 
+}
+
+void TestFollowEpochForwardOnly() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    std::uint64_t followed = 0;
+    std::uint64_t afterOlder = 0;
+    std::uint64_t afterSame = 0;
+    std::uint64_t afterNewer = 0;
+    std::thread committer([&] {
+        DrawPipeline::FollowEpoch(1000);
+        followed = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(999);
+        afterOlder = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1000);
+        afterSame = AgcDriver::GuestMemory::CollectEpoch();
+        DrawPipeline::FollowEpoch(1001);
+        afterNewer = AgcDriver::GuestMemory::CollectEpoch();
+    });
+    committer.join();
+    Check(followed != 0, "following an epoch token left the committing thread without a collect epoch");
+    Check(afterOlder == followed && afterSame == followed, "a token older than the one already followed took a new collect epoch");
+    Check(afterNewer != followed, "a newer epoch token did not take a new collect epoch");
+}
+
+void TestRingPhasesKeepTheirNames() {
+    using AgcDriver::Graphics::CommitPhase;
+    struct Named {
+        CommitPhase phase;
+        std::string_view name;
+        std::string_view group;
+    };
+    const std::array<Named, 8> phases{{
+        {CommitPhase::TargetsDepthClaims, "targets.depth.claims", "targets"},
+        {CommitPhase::TargetsDepthClear, "targets.depth.clear", "targets"},
+        {CommitPhase::TargetsDepthFind, "targets.depth.find", "targets"},
+        {CommitPhase::TargetsDepthSync, "targets.depth.sync", "targets"},
+        {CommitPhase::TargetsDepthStale, "targets.depth.stale", "targets"},
+        {CommitPhase::TargetsLookupPure, "targets.lookup.pure", "targets"},
+        {CommitPhase::TargetsLookupGuards, "targets.lookup.guards", "targets"},
+        {CommitPhase::TargetsLookupCache, "targets.lookup.cache", "targets"},
+    }};
+    for (const auto& entry : phases) {
+        Check(AgcDriver::Graphics::CommitPhaseName(entry.phase) == entry.name, ("commit phase " + std::string(entry.name) + " is named " + AgcDriver::Graphics::CommitPhaseName(entry.phase) + ": the phase enum and its name table are out of order").c_str());
+        Check(AgcDriver::Graphics::CommitPhaseGroup(entry.phase) == entry.group, ("commit phase " + std::string(entry.name) + " is in group " + AgcDriver::Graphics::CommitPhaseGroup(entry.phase) + ": the phase enum and its group table are out of order").c_str());
+    }
 }
 
 int main() {
     try {
+        TestRingPhasesKeepTheirNames();
+        TestFollowEpochForwardOnly();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";
         return 0;
