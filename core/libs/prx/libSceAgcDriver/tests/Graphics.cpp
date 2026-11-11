@@ -9240,7 +9240,6 @@ void pipelineLibrarySetTests() {
         ShaderRecompiler::DescriptorBinding invalid{};
         invalid.descriptorSet = 32;
         fragment.bindings.push_back(invalid);
-        fragment.identityMemo = {};
         expectFailure(prebuild, "descriptor set exceeds two slots");
         ClearPipelineLibraries(context.device);
         Require(mock.live == 0, "shader library tests leaked Vulkan objects");

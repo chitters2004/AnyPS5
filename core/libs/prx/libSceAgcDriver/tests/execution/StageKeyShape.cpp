@@ -129,20 +129,27 @@ ShaderRecompiler::RecompileResult Shaped(std::uint32_t staticBufferElements, std
 void IdentityMemoFollowsTheResult() {
     auto result = Program(0x1000u, 0x2000u);
     result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
-    Expect(result.identityMemo.low.load() == 0, "a new result started with a memoized identity");
     const auto identity = result.Identity();
-    Expect(!identity.Empty() && identity == result.ComputedIdentity(), "the memoized identity differs from the computed one");
-    Expect(result.identityMemo.low.load() == identity.low && result.identityMemo.high.load() == identity.high, "the identity was not memoized");
-    Expect(result.Identity() == identity, "a memo hit returned another identity");
+    Expect(!identity.Empty() && identity == result.ComputedIdentity(), "an unsealed result's identity differs from the computed one");
+    Expect(result.identityMemo.low.load() == 0, "reading an unsealed result's identity memoized it");
+    result.spirv[4] = 1u;
+    const auto edited = result.Identity();
+    Expect(edited != identity && edited == result.ComputedIdentity(), "an unsealed result kept its identity after its SPIR-V changed in place");
+    result.bindings[1].descriptorSet = 1u;
+    Expect(result.Identity() != edited && result.Identity() == result.ComputedIdentity(), "an unsealed result kept its identity after a binding changed in place");
+    result.SealIdentity();
+    const auto sealed = result.ComputedIdentity();
+    Expect(result.identityMemo.low.load() == sealed.low && result.identityMemo.high.load() == sealed.high && result.Identity() == sealed, "a sealed result did not serve its memoized identity");
     auto copy = result;
-    Expect(copy.identityMemo.low.load() == 0, "a copy kept its source's memoized identity");
-    copy.bindings[1].binding = 9u;
-    Expect(copy.Identity() == copy.ComputedIdentity() && copy.Identity() != identity, "a copy with another binding layout kept the source's identity");
+    Expect(copy.identityMemo.low.load() == 0, "a copy kept its source's sealed identity");
+    copy.spirv[4] = 2u;
+    Expect(copy.Identity() == copy.ComputedIdentity() && copy.Identity() != sealed, "a copy whose SPIR-V changed kept the source's identity");
     copy = result;
-    Expect(copy.identityMemo.low.load() == 0 && copy.Identity() == identity, "an assigned result kept the identity memoized before the assignment");
+    Expect(copy.identityMemo.low.load() == 0 && copy.Identity() == sealed, "an assigned result kept the identity sealed before the assignment");
     ShaderRecompiler::RecompileResult empty;
-    Expect(empty.Identity().Empty() && empty.identityMemo.low.load() == 0, "a result without SPIR-V memoized an identity");
-    std::puts("stage key shape: a result memoizes its pipeline identity, and copies and assignments compute their own");
+    empty.SealIdentity();
+    Expect(empty.Identity().Empty() && empty.identityMemo.low.load() == 0, "a result without SPIR-V sealed an identity");
+    std::puts("stage key shape: only a sealed result serves a memoized identity; unsealed results, copies and assignments compute theirs");
 }
 
 void BenchIdentity() {
@@ -152,12 +159,13 @@ void BenchIdentity() {
     constexpr int Calls = 200000;
     std::uint64_t sink = 0;
     const auto computedStart = ThreadMicroseconds();
-    for (int call = 0; call < Calls; ++call) sink += result.ComputedIdentity().low;
+    for (int call = 0; call < Calls; ++call) sink += result.Identity().low;
     const auto computedNs = (ThreadMicroseconds() - computedStart) * 1000.0 / Calls;
+    result.SealIdentity();
     const auto memoStart = ThreadMicroseconds();
     for (int call = 0; call < Calls; ++call) sink += result.Identity().low;
     const auto memoNs = (ThreadMicroseconds() - memoStart) * 1000.0 / Calls;
-    std::printf("bench identity, 24 bindings: computed %.1f ns, memoized %.1f ns per call, thread CPU (%llu)\n", computedNs, memoNs, static_cast<unsigned long long>(sink & 1u));
+    std::printf("bench identity, 24 bindings: unsealed %.1f ns, sealed %.1f ns per call, thread CPU (%llu)\n", computedNs, memoNs, static_cast<unsigned long long>(sink & 1u));
 }
 
 void Bench(const char* name, std::uint32_t staticBufferElements, std::uint32_t patchedBufferElements) {

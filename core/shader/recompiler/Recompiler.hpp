@@ -1032,12 +1032,13 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
             if (VerifyIdentityMemo() && memoized != ComputedIdentity()) throw std::logic_error("APS5_VERIFY_KEY_MEMO: a compiled shader's memoized pipeline identity differs from one computed from its SPIR-V and bindings");
             return memoized;
         }
+        return ComputedIdentity();
+    }
+    void SealIdentity() const {
         const auto identity = ComputedIdentity();
-        if (identity.low != 0) {
-            identityMemo.high.store(identity.high, std::memory_order_relaxed);
-            identityMemo.low.store(identity.low, std::memory_order_release);
-        }
-        return identity;
+        if (identity.low == 0) return;
+        identityMemo.high.store(identity.high, std::memory_order_relaxed);
+        identityMemo.low.store(identity.low, std::memory_order_release);
     }
     [[nodiscard]] PipelineIdentity ComputedIdentity() const {
         const auto hash = spirv.ContentHash();

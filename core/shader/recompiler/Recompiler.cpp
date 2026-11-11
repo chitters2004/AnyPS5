@@ -2076,6 +2076,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
     result->cacheHit = cacheHit;
+    result->SealIdentity();
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     if (donor != nullptr) {
         reportResultMemo();
@@ -2300,6 +2301,7 @@ std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(con
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
+    result->SealIdentity();
     return result;
 }
 
@@ -2328,6 +2330,7 @@ std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest&
     if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
+    result->SealIdentity();
     return result;
 }
 
