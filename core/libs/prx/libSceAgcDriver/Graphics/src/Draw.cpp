@@ -2225,6 +2225,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
             if (valid && recorder != nullptr) moved = InCommitPhase(CommitPhase::ResolveMoved, [&] { return cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched); });
+            if (valid && recorder != nullptr) CountCommit(moved.has_value() ? CommitCounter::ResolveMoveMoved : CommitCounter::ResolveMoveRefused, moved.has_value() ? moved->size() : 1u);
             if (moved.has_value()) {
                 CountCommit(CommitCounter::ResolveHits);
                 if (!moved->empty()) CountCommit(CommitCounter::ResolveMovedHits);
