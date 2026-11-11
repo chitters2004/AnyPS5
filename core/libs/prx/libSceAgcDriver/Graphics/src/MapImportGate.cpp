@@ -1,13 +1,13 @@
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 
@@ -16,7 +16,7 @@ namespace AgcDriver::Graphics::MapImportGate {
 namespace {
 
 struct alignas(64) Stripe {
-    std::shared_mutex mutex;
+    NativeSharedMutex mutex;
 };
 
 std::array<Stripe, StripeCount>& StripeLocks() {

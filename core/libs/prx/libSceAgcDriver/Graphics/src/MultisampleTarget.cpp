@@ -21,7 +21,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include "prx/libc/include/PrimedSharedMutex.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -928,8 +928,8 @@ struct GuardedRange {
     const char* plane = "multisampled color target";
 };
 
-std::shared_mutex& guardedMutex() {
-    static PrimedSharedMutex mutex;
+NativeSharedMutex& guardedMutex() {
+    static NativeSharedMutex mutex;
     return mutex;
 }
 

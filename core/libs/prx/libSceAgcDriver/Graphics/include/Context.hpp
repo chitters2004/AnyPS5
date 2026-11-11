@@ -6,7 +6,7 @@
 #endif
 #include <mutex>
 #include <vulkan/vulkan.h>
-#include "prx/libc/include/PrimedSharedMutex.hpp"
+#include "prx/libc/include/NativeSharedMutex.hpp"
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -40,15 +40,15 @@ class VertexBufferFormats;
 
 class PipelineCacheSynchronization {
 public:
-    using PipelineUseLock = std::shared_lock<std::shared_mutex>;
-    using SnapshotLock = std::unique_lock<std::shared_mutex>;
+    using PipelineUseLock = std::shared_lock<NativeSharedMutex>;
+    using SnapshotLock = std::unique_lock<NativeSharedMutex>;
 
     PipelineUseLock LockForPipelineUse() const { return PipelineUseLock(mutex); }
     SnapshotLock LockForSnapshot() const { return SnapshotLock(mutex); }
     SnapshotLock TryLockForSnapshot() const { return SnapshotLock(mutex, std::try_to_lock); }
 
 private:
-    mutable PrimedSharedMutex mutex;
+    mutable NativeSharedMutex mutex;
 };
 
 inline void Require(bool condition, const std::string& reason) {
