@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1637,6 +1638,11 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    const bool timed = DrawInputSourcesTimed();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto counted = [&](DrawInputSource source) {
+        CountDrawInputSource(source, bytes, timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u);
+    };
     DrawInputCopy copy;
     const bool vertex = use == Recorder::SnapshotUse::Vertex;
     if (recorder != nullptr && bytes != 0) {
@@ -1650,6 +1656,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (copy.buffer != nullptr) {
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopyOwned : CommitCounter::InputIndexCopyOwned);
+            counted(DrawInputSource::OwnedReused);
             return copy;
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -1662,24 +1669,35 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (copy.buffer != nullptr) {
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopySnapshot : CommitCounter::InputIndexCopySnapshot);
+            counted(DrawInputSource::SnapshotReused);
             return copy;
+        }
+        if (copy.generation != 0) {
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes); })) {
+                copy.buffer = std::move(adopted->buffer);
+                copy.derived = adopted->derived;
+                copy.prepared = true;
+                counted(DrawInputSource::Adopted);
+                return copy;
+            }
         }
     }
     CountCommit(vertex ? CommitCounter::InputVertexCopyFresh : CommitCounter::InputIndexCopyFresh);
     copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return std::make_shared<Buffer>(context, bytes, vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT); });
     InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.buffer->Bytes(), alignment); });
+    counted(DrawInputSource::Copied);
     return copy;
 }
 
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride) {
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
+    const bool timed = DrawInputSourcesTimed();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto counted = [&](DrawInputSource source) {
+        CountDrawInputSource(source, bytes, timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u);
+    };
     CountCommit(CommitCounter::InputVertexPadded);
-    auto readable = validBytes;
-    if (stride != 0 && !InCommitPhase(CommitPhase::InputsValidate, [&] { return GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes); })) {
-        const auto ranges = InCommitPhase(CommitPhase::InputsValidate, [&] { return GuestMemory::CommittedRanges(address, validBytes); });
-        const std::size_t prefix = !ranges.empty() && ranges.front().first == address ? static_cast<std::size_t>(ranges.front().second - address) : 0;
-        if (validBytes - prefix < stride) readable = prefix;
-    }
+    const auto readable = InCommitPhase(CommitPhase::InputsValidate, [&] { return ZeroPaddedReadableBytes(address, validBytes, stride); });
     if (readable != 0) InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, readable); });
     DrawInputCopy copy;
     auto* recorder = context.recorder;
@@ -1692,9 +1710,19 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         if (copy.buffer != nullptr && keptReadable == readable) {
             copy.reused = true;
             CountCommit(CommitCounter::InputVertexPaddedReused);
+            counted(DrawInputSource::SnapshotReused);
             return copy;
         }
         copy.buffer = nullptr;
+        if (copy.generation != 0) {
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable); })) {
+                copy.buffer = std::move(adopted->buffer);
+                copy.prepared = true;
+                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
+                counted(DrawInputSource::Adopted);
+                return copy;
+            }
+        }
     }
     copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); });
     const auto span = copy.buffer->Bytes();
@@ -1703,6 +1731,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
     });
     if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable)); });
+    counted(DrawInputSource::Copied);
     return copy;
 }
 
@@ -1777,6 +1806,7 @@ struct DrawInputs {
     std::uint32_t listRestartPrimitive = 0;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    const VertexInputLayout* sharedVertexInput = nullptr;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
@@ -1789,7 +1819,7 @@ struct DrawInputs {
     std::uint32_t meshLayerStride = 0;
     std::vector<std::uint32_t> restartTable;
     std::uint32_t expandedIndexCount = 0;
-    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : sharedVertexInput != nullptr ? *sharedVertexInput : vertexInput; }
 };
 
 bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
@@ -1815,11 +1845,12 @@ struct DrawPlan {
     std::uint32_t meshLayerStride = 0;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    const VertexInputLayout* sharedVertexInput = nullptr;
     bool candidate = false;
     bool keyed = false;
     ResourceCache::Key contentKey;
     std::size_t contentHash = 0;
-    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : sharedVertexInput != nullptr ? *sharedVertexInput : vertexInput; }
 };
 
 DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, DrawOutcome& outcome, DrawTimer& timer) {
@@ -1895,7 +1926,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     const auto layoutStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& attributes = shaders.front().program->vertexAttributes;
     if (recipe != nullptr) {
-        plan.vertexInput = recipe->vertexInput;
+        if (RuntimeSwitches::Set(RuntimeSwitch::NoSharedVertexLayout)) plan.vertexInput = recipe->vertexInput;
+        else plan.sharedVertexInput = &recipe->vertexInput;
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) plan.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (plan.retainedVertexInput == nullptr) plan.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -1940,8 +1972,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.meshGroups = drawPlan.meshGroups;
     inputs.meshLayers = drawPlan.meshLayers;
     inputs.meshLayerStride = drawPlan.meshLayerStride;
-    inputs.vertexInput = drawPlan.vertexInput;
     inputs.retainedVertexInput = drawPlan.retainedVertexInput;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoSharedVertexLayout)) {
+        inputs.vertexInput = drawPlan.vertexInput;
+        inputs.sharedVertexInput = drawPlan.sharedVertexInput;
+    } else if (inputs.retainedVertexInput == nullptr) {
+        inputs.sharedVertexInput = &drawPlan.VertexLayout();
+    }
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     CountCommit(CommitCounter::InputDraws);
@@ -2089,7 +2126,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart); });
+            if (!copy.prepared) highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart); });
+            else if (!skipRestart) highest = copy.derived;
+            else if (copy.derived != 0) highest = copy.derived - 1u;
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
         } else if (!skipRestart) {
             highest = copy.derived;
@@ -2146,48 +2185,26 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - inputs.maxIndex, "indexed draw vertex range overflow");
         inputs.maxIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
-    fetches.reserve(attributes.size());
-    fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
+    if (attributes.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoEmptyFetchSkip)) {
+        timer.phase(PhaseVertex);
+        timing.Mark("vertex_upload");
+        return inputs;
+    }
+    const auto planned = PlanDrawVertexFetches(state.hasColorTarget ? std::optional{std::pair{state.color.MemoryAddress(), static_cast<std::uint64_t>(state.color.bytes)}} : std::nullopt, draw, attributes, inputs.VertexLayout(), inputs.maxIndex);
+    const auto& fetches = planned.fetches;
+    const auto& fetchValid = planned.fetchValid;
+    const auto& fetchOf = planned.fetchOf;
+    const auto& soloFetches = planned.soloFetches;
+    const auto& isSolo = planned.isSolo;
+    const auto& plannedOf = planned.plannedOf;
+    const auto& plan = planned.plan;
     std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
-    const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
-        const auto& attribute = attributes[i];
-        const auto described = std::find_if(layout.attributes.begin(), layout.attributes.end(), [&](const auto& entry) { return entry.location == attribute.location; });
-        Require(described != layout.attributes.end(), "vertex attribute missing from its input layout");
-        const auto narrow = DecodeVertexFormat(attribute);
-        const std::size_t widened = described->format == narrow.format ? 0u : VertexReadBytes(attribute, described->format) - narrow.bytes;
-        if (NullVertexDescriptor(attribute) || VertexFetchOutOfRange(attribute)) {
+        if (planned.zeroBytes[i]) {
             CountCommit(CommitCounter::InputVertexZeroed);
-            zeroed[i] = zeroVertexBuffer(context, narrow.bytes + widened);
-            continue;
+            zeroed[i] = zeroVertexBuffer(context, *planned.zeroBytes[i]);
         }
-        // An indirect draw's counts are unknown here: the descriptor's whole range is copied.
-        const auto bytes = (args != nullptr ? VertexBufferExtent(attribute) : VertexBufferReadSize(attribute, inputs.maxIndex, draw.instanceCount, draw.firstInstance)) + widened;
-        const auto& fields = attribute.resource.fields;
-        const auto address = fields[0] | (static_cast<std::uint64_t>(fields[1] & 0xffffu) << 32u);
-        const auto firstByte = args == nullptr ? VertexBufferReadOffset(attribute, draw.firstVertex, draw.firstInstance) : 0;
-        Require(!state.hasColorTarget || address + bytes <= state.color.MemoryAddress() || state.color.MemoryAddress() + state.color.bytes <= address + firstByte, "vertex buffer aliases the render target");
-        const auto stride = (fields[1] >> 16u) & 0x3fffu;
-        fetchOf[i] = fetches.size();
-        fetches.push_back({address, address + bytes, stride, attribute.fetchIndex, DecodeVertexFormat(attribute).alignment});
-        const auto recordBytes = static_cast<std::uint64_t>(fields[2]) * stride;
-        fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
-    const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
-    for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
-    plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
-    for (std::size_t f = 0; f < fetches.size(); ++f) {
-        if (isSolo[f]) continue;
-        plannedOf[f] = plannedFetches.size();
-        plannedFetches.push_back(fetches[f]);
-    }
-    const auto plan = PlanVertexCopies(plannedFetches);
     std::vector<VkBuffer> rangeHandles;
     std::vector<VkDeviceSize> rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
@@ -3401,6 +3418,7 @@ struct PreparedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
+    DrawPlan plan;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -3591,7 +3609,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
     BeginCommitPhase(CommitPhase::Plan);
-    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    prepared.plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    const auto& plan = prepared.plan;
     if (plan.nothing) return false;
     BeginCommitPhase(CommitPhase::Inputs);
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);

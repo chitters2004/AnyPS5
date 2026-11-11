@@ -18,6 +18,9 @@ enum class RuntimeSwitch : std::size_t {
     NoOwnedDrawInputs,
     HandwrittenPlanState,
     NoResidentRanges,
+    NoEarlyDrawInputs,
+    NoEmptyFetchSkip,
+    NoSharedVertexLayout,
     Count,
 };
 

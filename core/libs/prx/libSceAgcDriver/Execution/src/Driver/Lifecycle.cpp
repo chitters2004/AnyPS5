@@ -205,6 +205,7 @@ void Driver::stop() {
     replacedDevices.clear();
     Graphics::FlushPipelineJournal();
     Graphics::ShutdownGuestBufferWorkers();
+    Graphics::ShutdownDrawInputPreparers();
     Graphics::StopCompareHelpers();
     ShaderRecompiler::ShaderDiskCache::Shutdown();
     PerformanceTrace::StopOutput();

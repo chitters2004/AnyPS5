@@ -4958,6 +4958,11 @@ bool VulkanDevice::DrawInputsInPlace() const {
     return state->drawInputsInPlace;
 }
 
+std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const {
+    if (state->drawInputsInPlace || (draw.indirect && !draw.indexed)) return nullptr;
+    return Graphics::PrepareDrawInputsAhead(graphicsContext(), graphics, draw, shaders);
+}
+
 namespace {
 
 // The resource cache serves dispatches unless disabled; Revalidate proves a hit by texture identity,
