@@ -6,11 +6,13 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -338,7 +340,7 @@ void DrawStageMemo::Clear() {
 
 DrawStageMemoCounts DrawStageMemoCounters::Load() const {
     const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(lookups), load(refused), load(absent), load(proved), load(compared), load(stale), load(inserts), load(evictions), load(skipped), load(verified)};
+    return {load(lookups), load(refused), load(absent), load(proved), load(compared), load(stale), load(inserts), load(evictions), load(skipped), load(verified), load(hitNanoseconds), load(missNanoseconds), load(validatedReused)};
 }
 
 bool Driver::drawStageMemoEnabled() {
@@ -420,37 +422,53 @@ DrawStageProof Driver::proveDrawStage(DrawStageRecord& record, std::uint64_t pro
 std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uint32_t pushOffset, std::uint32_t queue, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, std::shared_ptr<DrawStageRecord>& pending) {
     pending.reset();
     if (!drawStageMemoEnabled() || drawParameters.indirect) return nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto charge = [&](std::atomic<std::uint64_t>& nanoseconds) {
+        if (profile) nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    };
     const auto& program = programs[i];
     auto request = DrawStageRequest(program, pushOffset, graphics, pixel, vertexInfos[i], {}, {}, drawParameters, localDevice->Target(), std::nullopt);
     ApplyPreparedSampleModes(*program.snapshot, program.codeOffset, request.context);
-    auto record = std::make_shared<DrawStageRecord>();
+    thread_local DrawStageKey* keySlot = nullptr;
+    auto& key = ShaderRecompiler::ThreadOwned(keySlot);
     drawStageMemoCounters.lookups.fetch_add(1, std::memory_order_relaxed);
-    if (!BuildDrawStageKey(request, *program.snapshot, program.codeOffset, localDevice->Serial(), record->key)) {
+    if (!BuildDrawStageKey(request, *program.snapshot, program.codeOffset, localDevice->Serial(), key)) {
         drawStageMemoCounters.refused.fetch_add(1, std::memory_order_relaxed);
+        charge(drawStageMemoCounters.missNanoseconds);
         return nullptr;
     }
-    record->convertedSamples = request.context.convertedSamples;
-    record->layerRowSamples = request.context.layerRowSamples;
+    const auto pend = [&] {
+        auto record = std::make_shared<DrawStageRecord>();
+        record->key = key;
+        record->convertedSamples = request.context.convertedSamples;
+        record->layerRowSamples = request.context.layerRowSamples;
+        pending = std::move(record);
+    };
     bool admit = false;
-    auto found = drawStageMemo.Find(record->key, admit);
+    auto found = drawStageMemo.Find(key, admit);
     if (found == nullptr) {
         drawStageMemoCounters.absent.fetch_add(1, std::memory_order_relaxed);
-        if (admit) pending = std::move(record);
+        if (admit) pend();
+        charge(drawStageMemoCounters.missNanoseconds);
         return nullptr;
     }
     switch (proveDrawStage(*found, program.binary.codeAddress, queue)) {
     case DrawStageProof::Proved:
         drawStageMemoCounters.proved.fetch_add(1, std::memory_order_relaxed);
+        charge(drawStageMemoCounters.hitNanoseconds);
         return found;
     case DrawStageProof::Compared:
         drawStageMemoCounters.compared.fetch_add(1, std::memory_order_relaxed);
+        charge(drawStageMemoCounters.hitNanoseconds);
         return found;
     case DrawStageProof::Stale:
         break;
     }
     drawStageMemoCounters.stale.fetch_add(1, std::memory_order_relaxed);
     drawStageMemo.Erase(found);
-    pending = std::move(record);
+    pend();
+    charge(drawStageMemoCounters.missNanoseconds);
     return nullptr;
 }
 

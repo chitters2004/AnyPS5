@@ -241,6 +241,8 @@ alignas(256) constexpr std::array<std::uint32_t, 40> VertexCode{
 };
 alignas(256) std::array<std::uint32_t, 40> SecondVertexCode = VertexCode;
 
+alignas(256) constexpr std::array<std::uint32_t, 8> ConstantPixelCode{0xf4000080u, 0xfa000000u, 0xbf8cc07fu, 0x7e000202u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
+
 alignas(256) constexpr std::array<std::uint32_t, 11> PixelRead{0x7e1a0280u, 0xdc308000u, 0x0c02000du, 0xbf8c3f70u, 0x7e10030cu, 0x7e120280u, 0x7e140280u, 0x7e160280u, 0xf800180fu, 0x0b0a0908u, 0xbf810000u};
 
 struct alignas(256) PixelProgram {
@@ -256,6 +258,7 @@ struct Header {
 
 alignas(8) Header VertexHeader{};
 alignas(8) Header SecondVertexHeader{};
+alignas(8) Header ConstantPixelHeader{};
 alignas(8) std::array<Header, PixelCopies> PixelHeaders{};
 
 void Register(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
@@ -329,6 +332,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 }
 
 struct Scene {
+    GuestBlock constants;
     GuestBlock tables;
     GuestBlock vertices;
     GuestBlock data;
@@ -336,12 +340,12 @@ struct Scene {
     std::size_t nextPixel = 0;
 };
 
-unsigned Draw(Scene& scene, const std::uint32_t* vertexCode, std::size_t table) {
-    Expect(scene.nextPixel < PixelCopies, "the test ran out of pixel shader copies");
+unsigned Draw(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, bool constantPixel = false) {
+    Expect(constantPixel || scene.nextPixel < PixelCopies, "the test ran out of pixel shader copies");
     std::memset(scene.target.Bytes(0), 0, ColorBytes);
     const auto color = scene.target.At(0);
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
-    const auto pixel = reinterpret_cast<std::uintptr_t>(Pixels[scene.nextPixel++].code.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(constantPixel ? ConstantPixelCode.data() : Pixels[scene.nextPixel++].code.data());
     const auto tableAddress = scene.tables.At(table);
     const auto pointer = scene.data.At(0);
     const float scale = 32.0f;
@@ -370,9 +374,15 @@ unsigned Draw(Scene& scene, const std::uint32_t* vertexCode, std::size_t table) 
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
     for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
-    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(tableAddress)}, {0x8d, static_cast<std::uint32_t>(tableAddress >> 32u)}, {0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}}) Append(commands, 0x76, {offset, value});
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(tableAddress)}, {0x8d, static_cast<std::uint32_t>(tableAddress >> 32u)}}) Append(commands, 0x76, {offset, value});
     Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
-    Append(commands, 0x76, {0x00e, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u)});
+    if (constantPixel) {
+        const auto constant = scene.constants.At(0);
+        for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x00b, 2u << 1u}, {0x00c, static_cast<std::uint32_t>(constant)}, {0x00d, static_cast<std::uint32_t>(constant >> 32u)}}) Append(commands, 0x76, {offset, value});
+    } else {
+        for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0x00b, 8u << 1u}, {0x00c, 0}, {0x00d, 0}}) Append(commands, 0x76, {offset, value});
+        Append(commands, 0x76, {0x00e, static_cast<std::uint32_t>(pointer), static_cast<std::uint32_t>(pointer >> 32u)});
+    }
     Append(commands, 0x2d, {3, 2});
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "draw stage memo: the draw submission failed");
@@ -389,22 +399,26 @@ struct Step {
 };
 
 DrawStageMemoCounts Since(const DrawStageMemoCounts& before, const DrawStageMemoCounts& after) {
-    return {after.lookups - before.lookups, after.refused - before.refused, after.absent - before.absent, after.proved - before.proved, after.compared - before.compared, after.stale - before.stale, after.inserts - before.inserts, after.evictions - before.evictions, after.skipped - before.skipped, after.verified - before.verified};
+    return {after.lookups - before.lookups, after.refused - before.refused, after.absent - before.absent, after.proved - before.proved, after.compared - before.compared, after.stale - before.stale, after.inserts - before.inserts, after.evictions - before.evictions, after.skipped - before.skipped, after.verified - before.verified, after.hitNanoseconds - before.hitNanoseconds, after.missNanoseconds - before.missNanoseconds, after.validatedReused - before.validatedReused};
 }
 
-Step Measure(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, const char* label) {
+Step Measure(Scene& scene, const std::uint32_t* vertexCode, std::size_t table, const char* label, bool constantPixel = false) {
     auto& driver = AgcDriver::DriverDetail::Driver::Get();
     const auto before = driver.StageMemoCounts();
     Step step;
-    step.brightest = Draw(scene, vertexCode, table);
+    step.brightest = Draw(scene, vertexCode, table, constantPixel);
     step.counts = Since(before, driver.StageMemoCounts());
     const auto& c = step.counts;
-    std::printf("%s: brightest %u; memo lookups %llu, absent %llu, proved %llu, compared %llu, stale %llu, inserts %llu, verified %llu\n", label, step.brightest, static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.absent), static_cast<unsigned long long>(c.proved), static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.stale), static_cast<unsigned long long>(c.inserts), static_cast<unsigned long long>(c.verified));
+    std::printf("%s: brightest %u; memo lookups %llu, absent %llu, proved %llu, compared %llu, stale %llu, inserts %llu, verified %llu; validated stages reused %llu\n", label, step.brightest, static_cast<unsigned long long>(c.lookups), static_cast<unsigned long long>(c.absent), static_cast<unsigned long long>(c.proved), static_cast<unsigned long long>(c.compared), static_cast<unsigned long long>(c.stale), static_cast<unsigned long long>(c.inserts), static_cast<unsigned long long>(c.verified), static_cast<unsigned long long>(c.validatedReused));
     return step;
 }
 
 std::uint64_t Hits(const Step& step) {
     return step.counts.proved + step.counts.compared;
+}
+
+AgcDriver::DriverDetail::Driver& driver() {
+    return AgcDriver::DriverDetail::Driver::Get();
 }
 
 void DrawsReuseAndInvalidateTheirStages() {
@@ -479,6 +493,27 @@ void DrawsReuseAndInvalidateTheirStages() {
     Expect(otherProgram.brightest == 255u, "the draw with the second vertex program did not draw");
     if (memo) Expect(Hits(otherProgram) == 0 && otherProgram.counts.stale == 0, "a stage of another registered program was served the first program's build");
     std::puts("draw stages repeat from the memo, and a guest write under a memoized stage rebuilds it");
+
+    Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    const auto writeConstant = [&](float value) {
+        const std::array<float, 4> words{value, value, value, value};
+        std::memcpy(scene.constants.Bytes(0), words.data(), sizeof(words));
+    };
+    writeConstant(1.0f);
+    for (const char* label : {"a constant-colour draw, first", "the constant-colour draw again", "the constant-colour draw from the draw cache"}) {
+        Expect(Measure(scene, VertexCode.data(), TableOffset, label, true).brightest == 255u, "the constant-colour draw did not draw at full colour");
+    }
+    const auto entries = driver().DrawCacheCounters();
+    writeConstant(0.25f);
+    const auto partial = Measure(scene, VertexCode.data(), TableOffset, "after the guest changed the constant only the pixel stage read", true);
+    const auto missed = driver().DrawCacheCounters();
+    Expect(partial.brightest > 0u && partial.brightest < 128u, "the pixel stage whose constant changed was not rebuilt from the new constant (brightest " + std::to_string(partial.brightest) + ")");
+    const bool fragmentMissed = missed.misses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawMiss::FragmentDiffering)] > entries.misses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawMiss::FragmentDiffering)];
+    std::printf("the draw cache %s on the fragment stage alone\n", fragmentMissed ? "missed" : "did not miss");
+    if (std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") != nullptr) Expect(fragmentMissed, "without stage data hits, a changed constant did not make the draw cache miss on the fragment stage, so this case does not exercise a partial miss");
+    if (fragmentMissed && !verify) Expect(partial.counts.validatedReused == 1, "the vertex stage the draw cache had validated before the fragment stage missed was built again");
+    if (!fragmentMissed || verify) Expect(partial.counts.validatedReused == 0, "a stage was reused as validated without a partial draw-cache miss");
+    std::puts("a draw that misses the draw cache on its fragment stage reuses the vertex stage the lookup validated");
 }
 
 void ProofsFollowWriteStamps() {

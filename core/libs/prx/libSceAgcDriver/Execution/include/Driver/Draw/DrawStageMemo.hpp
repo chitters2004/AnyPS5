@@ -54,11 +54,11 @@ struct DrawStageRecord {
 enum class DrawStageProof : std::uint8_t { Proved, Compared, Stale };
 
 struct DrawStageMemoCounts {
-    std::uint64_t lookups = 0, refused = 0, absent = 0, proved = 0, compared = 0, stale = 0, inserts = 0, evictions = 0, skipped = 0, verified = 0;
+    std::uint64_t lookups = 0, refused = 0, absent = 0, proved = 0, compared = 0, stale = 0, inserts = 0, evictions = 0, skipped = 0, verified = 0, hitNanoseconds = 0, missNanoseconds = 0, validatedReused = 0;
 };
 
 struct DrawStageMemoCounters {
-    std::atomic<std::uint64_t> lookups{0}, refused{0}, absent{0}, proved{0}, compared{0}, stale{0}, inserts{0}, evictions{0}, skipped{0}, verified{0};
+    std::atomic<std::uint64_t> lookups{0}, refused{0}, absent{0}, proved{0}, compared{0}, stale{0}, inserts{0}, evictions{0}, skipped{0}, verified{0}, hitNanoseconds{0}, missNanoseconds{0}, validatedReused{0};
     DrawStageMemoCounts Load() const;
 };
 

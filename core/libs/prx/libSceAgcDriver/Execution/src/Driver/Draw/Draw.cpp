@@ -980,22 +980,30 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         break;
                     }
                 }
-                const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
-                if (memoHit != nullptr && !verifyDrawStageMemo()) {
-                    matched[i] = memoHit->variant;
-                    stageCaptures[i].registeredViews = matched[i]->registeredViews;
-                    matchedRegions[i].clear();
-                    appendEntryRegions(*matched[i], matchedRegions[i]);
+                const bool validated = matched[i] != nullptr && !verifyHit && !verifyDrawDataHits() && !verifyDrawStageMemo() && tail.relocatedDecode == decode && candidate == dataCandidates[i].end() && matched[i]->pushOffset == pushCursorBytes;
+                if (validated) {
                     reused[i] = true;
-                    programResults[i] = matched[i]->compiled.get();
+                    programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
                     memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                    drawStageMemoCounters.validatedReused.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
-                    if (!rejected.empty()) return DrawVerdict::Rejected;
-                    programResults[i] = compiledStages.back().get();
-                    if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
-                    if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
-                    if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                    const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
+                    if (memoHit != nullptr && !verifyDrawStageMemo()) {
+                        matched[i] = memoHit->variant;
+                        stageCaptures[i].registeredViews = matched[i]->registeredViews;
+                        matchedRegions[i].clear();
+                        appendEntryRegions(*matched[i], matchedRegions[i]);
+                        reused[i] = true;
+                        programResults[i] = matched[i]->compiled.get();
+                        memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
+                    } else {
+                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                        if (!rejected.empty()) return DrawVerdict::Rejected;
+                        programResults[i] = compiledStages.back().get();
+                        if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
+                        if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                        if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
+                    }
                 }
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;

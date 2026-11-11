@@ -4,9 +4,11 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_stage_memo_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_STAGE_MEMO=1" SKIP_RETURN_CODE 77)
     add_test(NAME agc_driver_draw_stage_memo_verify COMMAND agc_driver_draw_stage_memo_tests)
     set_tests_properties(agc_driver_draw_stage_memo_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_STAGE_MEMO=1" SKIP_RETURN_CODE 77)
-    set_tests_properties(agc_driver_draw_stage_memo agc_driver_draw_stage_memo_off agc_driver_draw_stage_memo_verify agc_driver_draw_stage_memo_draw_pipeline PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_draw_stage_memo_partial COMMAND agc_driver_draw_stage_memo_tests)
+    set_tests_properties(agc_driver_draw_stage_memo_partial PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_STAGE_DATA_HITS=1" SKIP_RETURN_CODE 77)
+    set_tests_properties(agc_driver_draw_stage_memo agc_driver_draw_stage_memo_off agc_driver_draw_stage_memo_verify agc_driver_draw_stage_memo_partial agc_driver_draw_stage_memo_draw_pipeline PROPERTIES FAIL_REGULAR_EXPRESSION "FATAL:")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_stage_memo_off agc_driver_draw_stage_memo_verify PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_stage_memo_off agc_driver_draw_stage_memo_verify agc_driver_draw_stage_memo_partial PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
