@@ -35,17 +35,24 @@ enum class CommitPhase : std::uint8_t {
     PassAccessLocal,
     EpilogueWriters,
     EpilogueRecipe,
+    PlanKey,
     Count
 };
 
 struct CommitPhaseTotals {
     std::uint64_t draws = 0;
+    std::uint64_t keys = 0;
+    std::uint64_t keyWords = 0;
+    std::uint64_t keyMemoHits = 0;
+    std::uint64_t keyMemoMisses = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(CommitPhase::Count)> ns{};
 };
 
 bool CommitPhasesEnabled();
 const char* CommitPhaseName(CommitPhase phase);
 void BeginCommitPhase(CommitPhase phase);
+void NoteCommitKey(std::size_t words);
+void NoteCommitKeyMemo(bool hit);
 CommitPhaseTotals ReadCommitPhases();
 CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTotals& earlier);
 

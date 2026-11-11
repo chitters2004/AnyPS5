@@ -1248,7 +1248,9 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         const auto sizeAt = key.size();
         key.push_back(0u);
         auto& memo = shader.program->drawKeyMemo.words;
-        if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
+        auto words = memo.load(std::memory_order_acquire);
+        NoteCommitKeyMemo(words != nullptr);
+        if (words != nullptr) {
             key.insert(key.end(), words->begin(), words->end());
         } else {
             ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
@@ -1710,7 +1712,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        plan.contentKey = InCommitPhase(CommitPhase::PlanKey, [&] { return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey); });
+        NoteCommitKey(plan.contentKey.size());
         timer.charge(PhaseLookup, keyStart);
     }
     return plan;
