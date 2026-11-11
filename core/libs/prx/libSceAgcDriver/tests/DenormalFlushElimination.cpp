@@ -639,5 +639,25 @@ int main() {
         return adds == 0u && masks == 0u;
     });
 
+    passed &= run("a v_med3_f32 of a register between two constants is lowered as a clamp", [] {
+        const std::array<std::uint32_t, 5> code{
+            0xd5570002u, 0x03c90100u,
+            0xe0700000u, 0x80000200u,
+            0xbf810000u,
+        };
+        for (const bool hardwareFlush : {false, true}) {
+            const auto words = Recompiled(code, hardwareFlush);
+            const auto equal = OpcodeCount(words, spv::OpFOrdEqual);
+            const auto lessEqual = OpcodeCount(words, spv::OpFOrdLessThanEqual);
+            const auto less = OpcodeCount(words, spv::OpFOrdLessThan);
+            const auto greater = OpcodeCount(words, spv::OpFOrdGreaterThan);
+            if (equal != 0u || lessEqual != 1u || less != 0u || greater != 0u) {
+                std::fprintf(stderr, "  hardware flush %d: %zu OpFOrdEqual, %zu OpFOrdLessThanEqual, %zu OpFOrdLessThan, %zu OpFOrdGreaterThan, expected 0, 1, 0, 0\n", hardwareFlush ? 1 : 0, equal, lessEqual, less, greater);
+                return false;
+            }
+        }
+        return true;
+    });
+
     return passed ? 0 : 1;
 }

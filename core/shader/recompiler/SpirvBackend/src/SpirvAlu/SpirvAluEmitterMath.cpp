@@ -1401,7 +1401,54 @@ std::uint32_t EmitFPMaxTri32(SpirvEmitterState& state, const IrValue& inst, std:
     return EmitFMinMax3(state, inst, arg0, arg1, arg2, true);
 }
 
+std::int32_t TotalOrderKey(std::uint32_t bits) {
+    const auto value = static_cast<std::int32_t>(bits);
+    return value < 0 ? static_cast<std::int32_t>(bits ^ 0x7fffffffu) : value;
+}
+
+std::optional<std::uint32_t> ClampF32WithConstantBounds(SpirvEmitterState& state, const IrValue& inst, const std::array<std::uint32_t, 3>& args) {
+    std::optional<std::size_t> variable;
+    std::array<std::uint32_t, 2> bounds{};
+    std::size_t constants = 0;
+    for (std::size_t index = 0; index < 3u; ++index) {
+        const IrValue* operand = inst.Argument(index)->Resolve();
+        if (!operand->HasImmediate()) {
+            if (variable.has_value()) return std::nullopt;
+            variable = index;
+            continue;
+        }
+        if ((operand->ImmediateU32() & 0x7fffffffu) > 0x7f800000u) return std::nullopt;
+        bounds[constants++] = operand->ImmediateU32();
+    }
+    if (!variable.has_value()) return std::nullopt;
+    const bool ordered = TotalOrderKey(bounds[0]) <= TotalOrderKey(bounds[1]);
+    const std::uint32_t low = ordered ? bounds[0] : bounds[1];
+    const std::uint32_t high = ordered ? bounds[1] : bounds[0];
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto x = args[*variable];
+    const auto xBits = Unary(state, spv::OpBitcast, u32, x);
+    const auto zero = ConstantF32(state, 0u);
+    std::uint32_t atLeastLow = 0;
+    if (low == 0u) {
+        atLeastLow = Binary(state, spv::OpULessThan, boolean, xBits, ConstantU32(state, 0x7f800001u));
+    } else {
+        atLeastLow = Binary(state, spv::OpFOrdGreaterThanEqual, boolean, x, low == 0x80000000u ? zero : ConstantF32(state, low));
+    }
+    std::uint32_t atMostHigh = 0;
+    if (high == 0x80000000u) {
+        atMostHigh = Binary(state, spv::OpSLessThan, boolean, xBits, ConstantU32(state, 0u));
+    } else {
+        atMostHigh = Binary(state, spv::OpFOrdLessThanEqual, boolean, x, high == 0u ? zero : ConstantF32(state, high));
+    }
+    const auto clamped = Select(state, u32, atMostHigh, xBits, ConstantU32(state, high));
+    return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, u32, atLeastLow, clamped, ConstantU32(state, low)));
+}
+
 std::uint32_t EmitFPMedTri32(SpirvEmitterState& state, const IrValue& inst, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    if (ExactMinMaxCompares(state, inst)) {
+        if (const auto clamped = ClampF32WithConstantBounds(state, inst, {arg0, arg1, arg2})) return *clamped;
+    }
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto bits = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, u32, value); };
