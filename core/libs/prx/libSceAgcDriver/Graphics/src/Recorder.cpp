@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -611,9 +612,9 @@ bool KeyStoresEach() {
 std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
-std::atomic<std::uint64_t> readsNoted{0}, readQueries{0}, readStaleIgnored{0}, readsRepeated{0};
-std::atomic<std::uint64_t> retainedByteRepeats{0};
-std::atomic<std::uint64_t> readHits[ReadKinds]{};
+ProfileCounter readsNoted, readQueries, readStaleIgnored, readsRepeated;
+ProfileCounter retainedByteRepeats;
+ProfileCounter readHits[ReadKinds];
 
 bool ReadTrackingEnabled() {
     // APS5_COPY_READ_TRACKING=0: no in-place reads are noted; the copy HLE's CPU path then requires
@@ -3496,11 +3497,11 @@ void Recorder::Retain(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
     if (retainedByteOwners.Insert(owner, retentionEpoch)) open->keptBytes += bytes;
-    else retainedByteRepeats.store(retainedByteRepeats.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    else retainedByteRepeats.Add(1);
 }
 
 std::uint64_t Recorder::RetainedByteRepeats() {
-    return retainedByteRepeats.load(std::memory_order_relaxed);
+    return retainedByteRepeats.Sum();
 }
 
 void Recorder::BoundKeptBytes() {
@@ -4109,7 +4110,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     noteRead(address, address + bytes, kind);
-    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    readsNoted.Add(1);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
@@ -4119,14 +4120,14 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
         if (end > begin) noteRead(begin, end, kind);
     }
-    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges.size(), std::memory_order_relaxed);
+    readsNoted.Add(ranges.size());
 }
 
 void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
     open->reads.push_back({begin, end, kind});
     if (FlipReadCheck() || notedReadKeys.Insert({begin, end, kind}, retentionEpoch)) return;
     open->reads.pop_back();
-    readsRepeated.store(readsRepeated.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    readsRepeated.Add(1);
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
@@ -4144,7 +4145,7 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
         return;
     }
     ensureOpen();
-    readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges->size(), std::memory_order_relaxed);
+    readsNoted.Add(ranges->size());
     const ReadListKey key{ranges.get(), kind};
     open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
     if (!notedReadLists.Insert(key, retentionEpoch)) open->readLists.pop_back();
@@ -4187,11 +4188,11 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::notedReads(const 
 
 bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, bool ignoreSignaled) const {
     if (bytes == 0) return false;
-    readQueries.fetch_add(1, std::memory_order_relaxed);
+    readQueries.Add(1);
     const auto end = address + bytes;
     if (open != nullptr) {
         if (const auto kind = readOverlap(*open, address, end)) {
-            readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
+            readHits[static_cast<std::size_t>(*kind)].Add(1);
             return true;
         }
     }
@@ -4200,10 +4201,10 @@ bool Recorder::PendingReadOverlaps(std::uint64_t address, std::size_t bytes, boo
         const auto kind = readOverlap(**it, address, end);
         if (!kind.has_value()) continue;
         if (ignoreSignaled && signaled(**it)) {
-            readStaleIgnored.fetch_add(1, std::memory_order_relaxed);
+            readStaleIgnored.Add(1);
             continue;
         }
-        readHits[static_cast<std::size_t>(*kind)].fetch_add(1, std::memory_order_relaxed);
+        readHits[static_cast<std::size_t>(*kind)].Add(1);
         return true;
     }
     return false;
@@ -4222,8 +4223,8 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.load(std::memory_order_relaxed), readQueries.load(std::memory_order_relaxed), readStaleIgnored.load(std::memory_order_relaxed), {}, readsRepeated.load(std::memory_order_relaxed)};
-    for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].load(std::memory_order_relaxed);
+    ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}, readsRepeated.Sum()};
+    for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].Sum();
     return counts;
 }
 
