@@ -2966,6 +2966,7 @@ void VulkanDevice::StoreIdleResults(bool reapFirst, const std::function<bool()>&
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     static_cast<void>(Graphics::StorageTexture::FlushAllPendingUntil("idle", stop, state->device));
+    const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::Idle);
     SubmitRecorded(reapFirst);
 }
 
@@ -4235,7 +4236,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
-    SubmitRecorded(false);
+    {
+        const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::Present);
+        SubmitRecorded(false);
+    }
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
