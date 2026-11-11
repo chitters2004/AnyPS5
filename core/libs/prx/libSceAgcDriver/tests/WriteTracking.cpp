@@ -2684,6 +2684,51 @@ void CheckAliasAfterConsumedWrite(std::size_t writer, std::size_t other) {
     Require(CollectRuns(views.views[other]).empty() && CollectRuns(views.views[writer]).empty(), "the views of a new alias are reported again after their first collect");
 }
 
+std::atomic<int> scanWaitEvents{0};
+constexpr int ScanWaited = 1;
+constexpr int LaterScanDone = 2;
+
+void NoteScanWait() {
+    scanWaitEvents.fetch_or(ScanWaited, std::memory_order_acq_rel);
+    scanWaitEvents.notify_all();
+}
+
+void CheckPendingChangeHoldsNewScans() {
+    SharedViews views(2);
+    for (const auto view : views.views) static_cast<void>(CollectRuns(view));
+    reinterpret_cast<volatile std::uint8_t*>(views.views[0])[0x100] = 0x4d;
+    scanPark.store(1, std::memory_order_release);
+    changeEvents.store(0, std::memory_order_release);
+    scanWaitEvents.store(0, std::memory_order_release);
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(&ParkFirstScan);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(&NoteChangeWait);
+    GuestWriteWatch::GuestWriteWatchSetScanWaitHookForTest_nid_postfix(&NoteScanWait);
+    std::thread parked([&] { static_cast<void>(CollectRuns(views.views[1])); });
+    while (scanPark.load(std::memory_order_acquire) != 2) scanPark.wait(1, std::memory_order_acquire);
+    bool aliased = false;
+    std::thread changer([&] { aliased = views.Alias(0, 1); });
+    while ((changeEvents.load(std::memory_order_acquire) & ChangeWaited) == 0) changeEvents.wait(0, std::memory_order_acquire);
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> later;
+    std::thread scanner([&] {
+        later = CollectRuns(views.views[0]);
+        scanWaitEvents.fetch_or(LaterScanDone, std::memory_order_acq_rel);
+        scanWaitEvents.notify_all();
+    });
+    while (scanWaitEvents.load(std::memory_order_acquire) == 0) scanWaitEvents.wait(0, std::memory_order_acquire);
+    const int seen = scanWaitEvents.load(std::memory_order_acquire);
+    scanPark.store(3, std::memory_order_release);
+    scanPark.notify_all();
+    parked.join();
+    changer.join();
+    scanner.join();
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetScanWaitHookForTest_nid_postfix(nullptr);
+    Require(aliased, "cannot alias the shared views");
+    Require(seen == ScanWaited, "a scan overlapping a pending mapping change did not wait for it");
+    Require(Reports(later, views.views[1] + 0x100), "a scan held behind an alias did not report through the new link");
+}
+
 void RequireWaited(int seen, const std::string& what) {
     Require((seen & ChangeWaited) != 0 && (seen & ChangeDone) == 0, what + " did not wait for an overlapping scan");
 }
@@ -2691,6 +2736,7 @@ void RequireWaited(int seen, const std::string& what) {
 void CheckMappingChanges() {
     CheckAliasAfterConsumedWrite(0, 1);
     CheckAliasAfterConsumedWrite(1, 0);
+    CheckPendingChangeHoldsNewScans();
     {
         SharedViews views(2);
         RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { Require(views.Alias(0, 1), "cannot alias the shared views"); }), "an alias of the scanned view");
