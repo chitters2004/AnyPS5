@@ -90,6 +90,16 @@ enum class CommitCounter : std::uint8_t {
     DepthCleared,
     DepthMirrored,
     DepthStaleScans,
+    EpochFollows,
+    EpochFollowsBackward,
+    EpochFollowsBySubmission,
+    EpochFollowsByWait,
+    EpochFollowsByDrain,
+    EpochFollowsByReap,
+    EpochFollowsByPacket,
+    EpochFollowsByNone,
+    TargetMissFirstInEpoch,
+    TargetSlowAgainInEpoch,
     Count
 };
 
@@ -119,6 +129,7 @@ void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
 void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
 void NoteEpochCauses(unsigned causes);
+void NoteEpochFollow(bool backward, unsigned causes);
 unsigned EpochCauses();
 CommitCounter EpochCauseCounter(unsigned causes);
 CommitPhase CurrentCommitPhase();

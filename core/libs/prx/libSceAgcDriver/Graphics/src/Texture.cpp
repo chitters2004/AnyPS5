@@ -2436,6 +2436,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         const bool moved = epoch != 0 && provedEpoch.load(std::memory_order_relaxed) != epoch;
         CountCommit(epoch == 0 ? CommitCounter::TargetEpochOff : moved ? CommitCounter::TargetEpochMoved : provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? CommitCounter::TargetEpochProofMoved : CommitCounter::TargetEpochPendingMoved);
         if (moved) CountCommit(EpochCauseCounter(EpochCauses()));
+        if (CommitPhasesEnabled() && epoch != 0 && missedEpoch.exchange(epoch, std::memory_order_relaxed) != epoch) CountCommit(CommitCounter::TargetMissFirstInEpoch);
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
@@ -2458,6 +2459,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     }
     CountCommit(targetPhase ? CommitCounter::TargetRefreshSlow : CommitCounter::OtherRefreshSlow);
     if (targetPhase && refused != CommitCounter::Count) CountCommit(refused);
+    if (targetPhase && CommitPhasesEnabled() && epoch != 0 && slowEpoch.exchange(epoch, std::memory_order_relaxed) == epoch) CountCommit(CommitCounter::TargetSlowAgainInEpoch);
     if (targetPhase) RelabelCommitPhase(CommitPhase::TargetsRefresh);
     refreshProof = {};
     struct Exempt {

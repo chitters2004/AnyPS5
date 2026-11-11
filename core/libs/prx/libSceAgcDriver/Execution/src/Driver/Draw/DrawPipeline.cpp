@@ -456,6 +456,7 @@ std::array<std::atomic<std::uint64_t>, 5>& DrawPipeline::EpochTokenCauses() {
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
+    const bool backward = token < followed;
     followed = token;
     GuestMemory::BumpCollectEpoch();
     if (!Graphics::CommitPhasesEnabled()) return;
@@ -467,6 +468,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
         seen[cause] = count;
     }
     Graphics::NoteEpochCauses(causes);
+    Graphics::NoteEpochFollow(backward, causes);
 }
 
 unsigned DrawPipeline::Committers() {
