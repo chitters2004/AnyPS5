@@ -1965,8 +1965,12 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 }
 #endif
 
+thread_local bool proofThread = false;
+std::atomic<std::uint64_t> committerScans{0};
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     ++tracker.generation;
+    if (proofThread) committerScans.fetch_add(1, std::memory_order_relaxed);
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
@@ -2175,15 +2179,33 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
-thread_local bool proofThread = false;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
+
+bool proofBreaksCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return counted;
+}
 }
 
 std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (proofBreaksCounted()) proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* ProofBreakName(ProofBreak source) {
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> names{"non-draw commit", "own store", "marked written", "changed write", "changed if held", "GPU lock elsewhere", "completion labels", "recorded work", "written back", "copied draw writes", "resource write-back"};
+    return names.at(static_cast<std::size_t>(source));
+}
+
+ProofCounts TakeProofCounts() {
+    ProofCounts counts;
+    for (std::size_t index = 0; index < proofBreaks.size(); ++index) counts.breaks[index] = proofBreaks[index].exchange(0, std::memory_order_relaxed);
+    counts.committerScans = committerScans.exchange(0, std::memory_order_relaxed);
+    return counts;
 }
 
 void MarkProofThread() {
@@ -2550,7 +2572,7 @@ void SetOwnStoreCompare(bool compare) {
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, const std::function<std::pair<std::uint64_t, std::uint64_t>(std::span<std::byte>)>& store, bool complete = true) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(ProofBreak::OwnStore);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2617,7 +2639,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    BreakProofs();
+    BreakProofs(ProofBreak::MarkedWritten);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;
@@ -3020,7 +3042,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(ProofBreak::GpuLockElsewhere);
     }
 }
 
@@ -3606,7 +3628,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::ChangedWrite);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3671,7 +3693,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::ChangedIfHeld);
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());
