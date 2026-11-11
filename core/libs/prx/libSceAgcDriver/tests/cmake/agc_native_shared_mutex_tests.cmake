@@ -1,0 +1,10 @@
+add_test_executable(agc_native_shared_mutex_tests EXCLUDE_FROM_ALL tests/NativeSharedMutex.cpp)
+target_include_directories(agc_native_shared_mutex_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_native_shared_mutex_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(agc_native_shared_mutex_tests)
+
+if(BUILD_TESTING)
+    set_target_properties(agc_native_shared_mutex_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_native_shared_mutex COMMAND agc_native_shared_mutex_tests)
+    set_tests_properties(agc_native_shared_mutex PROPERTIES TIMEOUT 120)
+endif()
