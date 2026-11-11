@@ -345,8 +345,9 @@ void DrawStageMemo::Clear() {
 }
 
 DrawStageMemoCounts DrawStageMemoCounters::Load() const {
-    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
-    return {load(lookups), load(refused), load(absent), load(proved), load(compared), load(stale), load(inserts), load(evictions), load(skipped), load(verified), load(hitNanoseconds), load(missNanoseconds), load(validatedReused)};
+    DrawStageMemoCounts counts;
+    for (std::size_t kind = 0; kind < DrawStageMemoCountKinds; ++kind) counts.values[kind] = values[kind].load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool Driver::drawStageMemoEnabled() {
@@ -432,6 +433,7 @@ DrawStageProof Driver::proveDrawStage(DrawStageRecord& record, std::uint64_t pro
     if (outcome != EntryOutcome::Equal) return DrawStageProof::Stale;
     if (const auto hook = drawStageCompareHook().load(std::memory_order_acquire)) hook();
     if (stamp.generation != 0 && stamp.layout == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) record.Restamp(stamp);
+    drawStageMemoCounters.Add(DrawStageMemoCount::ComparedBytes, variant.words.size() * sizeof(std::uint32_t));
     return DrawStageProof::Compared;
 }
 
@@ -440,8 +442,8 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
     if (!drawStageMemoEnabled() || drawParameters.indirect) return nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto charge = [&](std::atomic<std::uint64_t>& nanoseconds) {
-        if (profile) nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+    const auto charge = [&](DrawStageMemoCount nanoseconds) {
+        if (profile) drawStageMemoCounters.Add(nanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     };
     const auto& program = programs[i];
     auto request = DrawStageRequest(program, pushOffset, graphics, {}, {}, drawParameters, localDevice->Target(), std::nullopt);
@@ -450,10 +452,12 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
     const auto* stageVertex = vertexInfos[i] ? &*vertexInfos[i] : nullptr;
     thread_local DrawStageKey* keySlot = nullptr;
     auto& key = ShaderRecompiler::ThreadOwned(keySlot);
-    drawStageMemoCounters.lookups.fetch_add(1, std::memory_order_relaxed);
+    const bool fragment = program.binary.stage == ShaderRecompiler::ShaderStage::Fragment;
+    drawStageMemoCounters.Add(DrawStageMemoCount::Lookups);
+    if (fragment) drawStageMemoCounters.Add(DrawStageMemoCount::FragmentLookups);
     if (!BuildDrawStageKey(request, stagePixel, stageVertex, *program.snapshot, program.codeOffset, localDevice->Serial(), key)) {
-        drawStageMemoCounters.refused.fetch_add(1, std::memory_order_relaxed);
-        charge(drawStageMemoCounters.missNanoseconds);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Refused);
+        charge(DrawStageMemoCount::MissNanoseconds);
         return nullptr;
     }
     const auto pend = [&] {
@@ -466,27 +470,30 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
     bool admit = false;
     auto found = drawStageMemo.Find(key, admit);
     if (found == nullptr) {
-        drawStageMemoCounters.absent.fetch_add(1, std::memory_order_relaxed);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Absent);
+        if (admit) drawStageMemoCounters.Add(DrawStageMemoCount::AbsentAdmitted);
         if (admit) pend();
-        charge(drawStageMemoCounters.missNanoseconds);
+        charge(DrawStageMemoCount::MissNanoseconds);
         return nullptr;
     }
     switch (proveDrawStage(*found, program.binary.codeAddress, queue)) {
     case DrawStageProof::Proved:
-        drawStageMemoCounters.proved.fetch_add(1, std::memory_order_relaxed);
-        charge(drawStageMemoCounters.hitNanoseconds);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Proved);
+        charge(DrawStageMemoCount::HitNanoseconds);
+        if (fragment) drawStageMemoCounters.Add(DrawStageMemoCount::FragmentServed);
         return found;
     case DrawStageProof::Compared:
-        drawStageMemoCounters.compared.fetch_add(1, std::memory_order_relaxed);
-        charge(drawStageMemoCounters.hitNanoseconds);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Compared);
+        charge(DrawStageMemoCount::HitNanoseconds);
+        if (fragment) drawStageMemoCounters.Add(DrawStageMemoCount::FragmentServed);
         return found;
     case DrawStageProof::Stale:
         break;
     }
-    drawStageMemoCounters.stale.fetch_add(1, std::memory_order_relaxed);
+    drawStageMemoCounters.Add(DrawStageMemoCount::Stale);
     drawStageMemo.Erase(found);
     pend();
-    charge(drawStageMemoCounters.missNanoseconds);
+    charge(DrawStageMemoCount::MissNanoseconds);
     return nullptr;
 }
 
@@ -496,14 +503,14 @@ void Driver::memoizeDrawStages(const std::vector<std::shared_ptr<DrawStageRecord
         if (record == nullptr) continue;
         const auto& capture = stageCaptures[i];
         if (reused[i] || fresh[i] == nullptr || capture.linkedCode || capture.convertedSamples != record->convertedSamples || capture.layerRowSamples != record->layerRowSamples) {
-            drawStageMemoCounters.skipped.fetch_add(1, std::memory_order_relaxed);
+            drawStageMemoCounters.Add(DrawStageMemoCount::Skipped);
             continue;
         }
         record->variant = fresh[i];
         record->spans = DrawStageSpans(fresh[i]->runs);
-        drawStageMemoCounters.inserts.fetch_add(1, std::memory_order_relaxed);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Inserts);
         const auto evicted = drawStageMemo.Insert(record);
-        if (evicted != 0) drawStageMemoCounters.evictions.fetch_add(evicted, std::memory_order_relaxed);
+        if (evicted != 0) drawStageMemoCounters.Add(DrawStageMemoCount::Evictions, evicted);
     }
 }
 

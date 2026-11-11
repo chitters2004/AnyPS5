@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Recompiler.hpp"
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -54,12 +55,19 @@ struct DrawStageRecord {
 
 enum class DrawStageProof : std::uint8_t { Proved, Compared, Stale };
 
+enum class DrawStageMemoCount : std::size_t { Lookups, Refused, Absent, AbsentAdmitted, Proved, Compared, ComparedBytes, Stale, Inserts, Evictions, Skipped, Verified, HitNanoseconds, MissNanoseconds, ValidatedReused, FragmentLookups, FragmentServed, DrawMisses, ReusedMisses, Count };
+
+inline constexpr std::size_t DrawStageMemoCountKinds = static_cast<std::size_t>(DrawStageMemoCount::Count);
+
 struct DrawStageMemoCounts {
-    std::uint64_t lookups = 0, refused = 0, absent = 0, proved = 0, compared = 0, stale = 0, inserts = 0, evictions = 0, skipped = 0, verified = 0, hitNanoseconds = 0, missNanoseconds = 0, validatedReused = 0;
+    std::array<std::uint64_t, DrawStageMemoCountKinds> values{};
+    std::uint64_t operator[](DrawStageMemoCount count) const { return values[static_cast<std::size_t>(count)]; }
+    std::uint64_t Served() const { return (*this)[DrawStageMemoCount::Proved] + (*this)[DrawStageMemoCount::Compared]; }
 };
 
 struct DrawStageMemoCounters {
-    std::atomic<std::uint64_t> lookups{0}, refused{0}, absent{0}, proved{0}, compared{0}, stale{0}, inserts{0}, evictions{0}, skipped{0}, verified{0}, hitNanoseconds{0}, missNanoseconds{0}, validatedReused{0};
+    std::array<std::atomic<std::uint64_t>, DrawStageMemoCountKinds> values{};
+    void Add(DrawStageMemoCount count, std::uint64_t amount = 1) { values[static_cast<std::size_t>(count)].fetch_add(amount, std::memory_order_relaxed); }
     DrawStageMemoCounts Load() const;
 };
 

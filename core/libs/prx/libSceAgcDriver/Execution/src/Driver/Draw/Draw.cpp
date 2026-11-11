@@ -947,7 +947,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         freshRuns(i, runs, words);
         const char* what = DrawStageMismatch(kept, runs, words, *stageCaptures[i].compiled);
         if (what == nullptr && (vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)))) what = "vertex stage info";
-        drawStageMemoCounters.verified.fetch_add(1, std::memory_order_relaxed);
+        drawStageMemoCounters.Add(DrawStageMemoCount::Verified);
         if (what == nullptr) return;
         char message[256];
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_STAGE_MEMO: stage %zu (program 0x%llx) of a draw stage memo hit differs from its full build in its %s", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what);
@@ -985,7 +985,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     reused[i] = true;
                     programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
                     memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
-                    drawStageMemoCounters.validatedReused.fetch_add(1, std::memory_order_relaxed);
+                    drawStageMemoCounters.Add(DrawStageMemoCount::ValidatedReused);
                 } else {
                     const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
                     if (memoHit != nullptr && !verifyDrawStageMemo()) {
@@ -1027,6 +1027,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (!drawHit && stageEntries) {
+        drawStageMemoCounters.Add(DrawStageMemoCount::DrawMisses);
+        bool everyStageReused = true;
+        for (std::size_t i = 0; i < programs.size(); ++i) everyStageReused = everyStageReused && (roles[i] == Role::GeometryBack || reused[i]);
+        if (everyStageReused) drawStageMemoCounters.Add(DrawStageMemoCount::ReusedMisses);
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
