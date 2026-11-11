@@ -1113,3 +1113,13 @@ endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
 target_sources(agc_driver_command_encoder_tests PRIVATE tests/AllocationFailure.cpp)
+
+if(WIN32)
+    get_directory_property(agcTargets BUILDSYSTEM_TARGETS)
+    foreach(agcTarget IN LISTS agcTargets)
+        get_target_property(agcTargetType ${agcTarget} TYPE)
+        if(agcTargetType MATCHES "^(EXECUTABLE|SHARED_LIBRARY|MODULE_LIBRARY|STATIC_LIBRARY|OBJECT_LIBRARY)$")
+            target_link_libraries(${agcTarget} PRIVATE synchronization)
+        endif()
+    endforeach()
+endif()
