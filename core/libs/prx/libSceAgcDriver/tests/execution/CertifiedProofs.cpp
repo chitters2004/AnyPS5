@@ -674,6 +674,7 @@ struct OracleScene {
     std::uint32_t selected = Key;
     bool unwatched = false;
     bool readOnly = false;
+    std::vector<GuestMemory::WriteOwner> owners;
 };
 
 struct OracleFailure : std::runtime_error {
@@ -685,7 +686,7 @@ std::uint64_t OracleSeed() {
     return 0x5eedu;
 }
 
-std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun) {
+std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, bool owners) {
     std::mt19937_64 random(seed);
     const auto pick = [&](std::uint32_t count) { return static_cast<std::uint32_t>(random() % count); };
     std::vector<OracleScene> scenes;
@@ -694,6 +695,9 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
         oracle.scene = &NewScene();
         Build(device, *oracle.scene);
         for (std::uint32_t image = 0; image < Images; ++image) oracle.values[image] = image == Key ? 1.0f : 0.0f;
+        if (owners) {
+            for (std::uint32_t image = 0; image < Images; ++image) oracle.owners.emplace_back(reinterpret_cast<std::uintptr_t>(oracle.scene->Texels(image)), BlockBytes);
+        }
         return oracle;
     };
     for (int i = 0; i < scenesPerRun; ++i) scenes.push_back(fresh());
@@ -822,23 +826,45 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
     return warmed;
 }
 
+std::uint64_t RunOracleWith(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, bool owners) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    struct Restore {
+        ~Restore() { AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, false); }
+    } restore;
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, !owners);
+    return RunOracle(device, seed, steps, scenesPerRun, owners);
+}
+
 void Oracle(AgcDriver::VulkanDevice& device) {
     const auto seed = OracleSeed();
     constexpr int steps = 160;
-    const auto warmed = RunOracle(device, seed, steps, 3);
-    Require(warmed * 4 >= steps * 3, "oracle: only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
-    std::printf("certified proofs: oracle seed %llu, %llu of %d events met a live certificate\n", static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps);
+    for (const bool owners : {false, true}) {
+        const auto before = GuestMemory::WriteIndexCounted();
+        const auto warmed = RunOracleWith(device, seed, steps, 3, owners);
+        const auto after = GuestMemory::WriteIndexCounted();
+        const auto dependencies = after.ownerDependencies - before.ownerDependencies;
+        const auto ownerBumps = after.ownerBumps + after.ownerFastBumps - before.ownerBumps - before.ownerFastBumps;
+        const char* mode = owners ? "with owners" : "without owners";
+        Require(warmed * 4 >= steps * 3, std::string("oracle ") + mode + ": only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
+        Require(owners ? dependencies != 0 && ownerBumps != 0 : dependencies == 0, std::string("oracle ") + mode + ": " + std::to_string(dependencies) + " owner dependencies and " + std::to_string(ownerBumps) + " owner bumps");
+        std::printf("certified proofs: oracle %s seed %llu, %llu of %d events met a live certificate, %llu owner dependencies, %llu owner bumps\n", mode, static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps, static_cast<unsigned long long>(dependencies), static_cast<unsigned long long>(ownerBumps));
+    }
 }
 
 void Mutants(AgcDriver::VulkanDevice& device) {
     using GuestMemory::CertificateMutant;
-    constexpr std::array<std::pair<CertificateMutant, const char*>, 6> mutants{{{CertificateMutant::HidePipelineCommitBumps, "a stale certificate after a pipelined store that bumps nothing"}, {CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing"}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing"}}};
-    for (const auto& [mutant, name] : mutants) {
+    struct Mutant {
+        CertificateMutant mutant;
+        const char* name;
+        bool owners;
+    };
+    constexpr std::array<Mutant, 8> mutants{{{CertificateMutant::HidePipelineCommitBumps, "a stale certificate after a pipelined store that bumps nothing", false}, {CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing", false}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write", false}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch", false}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change", false}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing", false}, {CertificateMutant::IgnoreOwners, "a stale certificate after a write into its owner", true}, {CertificateMutant::HideOwnerBumps, "a stale certificate after a write its owner never counts", true}}};
+    for (const auto& [mutant, name, owners] : mutants) {
         GuestMemory::SetCertificateMutantForTest(mutant);
         std::string caught;
         for (std::uint64_t attempt = 0; attempt < 4 && caught.empty(); ++attempt) {
             try {
-                RunOracle(device, OracleSeed() + attempt, 160, 3);
+                RunOracleWith(device, OracleSeed() + attempt, 160, 3, owners);
             } catch (const OracleFailure& failure) {
                 caught = failure.what();
             }
@@ -861,6 +887,7 @@ void Mutants(AgcDriver::VulkanDevice& device) {
 
 int main(int argc, char** argv) {
     try {
+        GuestMemory::SetWriteIndexCountingForTest(true);
 #ifdef _WIN32
         _putenv_s("APS5_CERTIFIED_PROOFS", "1");
 #else
