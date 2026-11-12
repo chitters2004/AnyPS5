@@ -11510,6 +11510,22 @@ public:
         recorder.LeaveRenderPassOpen(PassKey, Recorder::NoTiming, false, PassAccess{});
     }
 
+    void DrawThrough(Recorder& recorder, const DeviceFunctions& table) const {
+        const auto commands = recorder.StartDrawPass(PassKey, true, false, PassAccess{}).commands;
+        recorder.PrepareSampleSlot();
+        begin(commands);
+        {
+            const Recorder::EncodingWindow window(recorder);
+            recorder.GraphicsState().BindPipeline(context, pipeline, 0);
+            table.cmdDraw(commands, 3, 1, 0, 0);
+            recorder.NoteSampledDraw(commands);
+            table.cmdDraw(commands, 3, 1, 0, 0);
+            recorder.EndPassSamples();
+            table.cmdDraw(commands, 3, 1, 0, 0);
+        }
+        recorder.LeaveRenderPassOpen(PassKey, Recorder::NoTiming, false, PassAccess{});
+    }
+
     static constexpr std::uint64_t Samples = 64;
 
 private:
@@ -12750,6 +12766,70 @@ void graphicsStateTests(const Device& device) {
     statePipelines.clear();
     stateLog.clear();
     std::cout << "graphics state through the recorder passed (" << (suppressing ? "suppressing" : "unsuppressed") << ")\n";
+}
+
+void encodedSegmentCountTest(const Device& device, bool queriesHooked) {
+    auto context = device.GetContext();
+    DeviceFunctions table{};
+    FillDeviceFunctions(context, table);
+    if (!queriesHooked) {
+        table.cmdBeginQuery = nullptr;
+        table.cmdEndQuery = nullptr;
+    }
+    Recorder recorder(context, false, &table, context.queueFamily);
+    if (!recorder.Encodes()) return;
+    context.functions = &table;
+    CoverPass cover(context);
+    recorder.CountSamples();
+    const auto base = recorder.SamplesTotal();
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+    constexpr std::uint64_t passes = 4;
+    for (std::uint64_t i = 0; i < passes; ++i) cover.DrawThrough(recorder, table);
+    recorder.Submit();
+    recorder.Sync();
+    CommandEncoder::SetDelayForTesting({});
+    const auto counted = recorder.SamplesTotal() - base;
+    const std::string kind = queriesHooked ? "encoded" : "raw";
+    Require(counted != 0, "no samples were counted for draws inside " + kind + " occlusion segments");
+    if (context.occlusionQueryPrecise) Require(counted == passes * CoverPass::Samples, kind + " occlusion segments counted " + std::to_string(counted) + " samples, not the " + std::to_string(passes * CoverPass::Samples) + " of the one draw inside each");
+}
+
+bool encodedSegmentTests(const Device& device) {
+    const auto& context = device.GetContext();
+    DeviceFunctions table{};
+    FillDeviceFunctions(context, table);
+    Recorder recorder(context, false, &table, context.queueFamily);
+    if (!recorder.Encodes() || RuntimeSwitches::Set(RuntimeSwitch::NoRecordEncoder)) return false;
+    const bool adaptive = RuntimeSwitches::Set(RuntimeSwitch::NoAdaptiveEncoder);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, true);
+    recorder.CountSamples();
+    const auto base = recorder.SamplesTotal();
+    const auto before = Recorder::SampleDumpCounts().segments;
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(1)); });
+    constexpr std::uint32_t segments = 300;
+    for (std::uint32_t i = 0; i < segments; ++i) {
+        recorder.PrepareSampleSlot();
+        const auto commands = recorder.Commands();
+        const auto counts = recorder.EncoderCounts();
+        {
+            const Recorder::EncodingWindow window(recorder);
+            const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
+            table.cmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &barrier, 0, nullptr, 0, nullptr);
+            recorder.NoteSampledDraw(commands);
+            recorder.EndPassSamples();
+        }
+        Require(recorder.EncoderCounts().waits == counts.waits, "an occlusion segment in an encoding window waited for the encoder");
+        Require(recorder.EncoderCounts().commands == counts.commands + 3, "an occlusion segment's queries were not recorded in order through the encoder: " + std::to_string(recorder.EncoderCounts().commands - counts.commands) + " commands");
+    }
+    recorder.Submit();
+    recorder.Sync();
+    CommandEncoder::SetDelayForTesting({});
+    Require(Recorder::SampleDumpCounts().segments - before == segments, "the encoded occlusion segments were not all closed");
+    Require(recorder.SamplesTotal() == base, "occlusion segments without draws counted samples");
+    encodedSegmentCountTest(device, true);
+    encodedSegmentCountTest(device, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoAdaptiveEncoder, adaptive);
+    return true;
 }
 
 void cmaskPassTests(const Device& device, Recorder& recorder) {
@@ -17616,6 +17696,18 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--snapshot-read-into-staging-only") {
             if (!snapshotReadIntoStagingTests(device, recorder)) return 77;
             std::cout << "Snapshot read into staging tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--encoded-segments-only") {
+            if (!device.GetContext().bufferDeviceAddress) {
+                std::cout << "skipped, the device lacks buffer device addresses\n";
+                return 77;
+            }
+            if (!encodedSegmentTests(device)) {
+                std::cout << "skipped, commands are recorded inline\n";
+                return 77;
+            }
+            std::cout << "Encoded occlusion segment tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--uncounted-passes-only") {

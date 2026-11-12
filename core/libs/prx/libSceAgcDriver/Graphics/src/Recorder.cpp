@@ -1415,6 +1415,11 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores, DeviceFuncti
             if (encodedFunctions->cmdPipelineBarrier != nullptr) cmdPipelineBarrier = encodedFunctions->cmdPipelineBarrier;
             if (encodedFunctions->cmdPushConstants != nullptr) cmdPushConstants = encodedFunctions->cmdPushConstants;
             if (encodedFunctions->cmdDispatch != nullptr) cmdDispatch = encodedFunctions->cmdDispatch;
+            queriesEncoded = encodedFunctions->cmdBeginQuery != nullptr && encodedFunctions->cmdEndQuery != nullptr;
+            if (queriesEncoded) {
+                cmdBeginQuery = encodedFunctions->cmdBeginQuery;
+                cmdEndQuery = encodedFunctions->cmdEndQuery;
+            }
         }
     }
     if (!timelineSemaphores) return;
@@ -3358,16 +3363,16 @@ void Recorder::takeSegmentPool(Batch& batch) {
 }
 
 void Recorder::beginSegment(Batch& batch) {
-    quiesce();
+    if (!queriesEncoded) quiesce();
     Require(batch.segments != VK_NULL_HANDLE && batch.segmentNext < SegmentSlots, "an occlusion segment begins without a reset query slot");
     batch.segmentSlot = batch.segmentNext++;
-    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
+    function(cmdBeginQuery, "vkCmdBeginQuery")(batch.commands.Get(queriesEncoded ? BatchCommands::Use::Interposed : BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot, context.occlusionQueryPrecise ? VK_QUERY_CONTROL_PRECISE_BIT : 0u);
     batch.segmentActive = true;
 }
 
 void Recorder::endSegment(Batch& batch, std::source_location where) {
-    quiesce(where);
-    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands.Get(BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot);
+    if (!queriesEncoded) quiesce(where);
+    function(cmdEndQuery, "vkCmdEndQuery")(batch.commands.Get(queriesEncoded ? BatchCommands::Use::Interposed : BatchCommands::Use::Quiesced), batch.segments, batch.segmentSlot);
     batch.segmentActive = false;
     pendingSamples.push_back({batch.segmentPool, batch.segments, batch.segmentSlot});
     segmentsClosed.fetch_add(1, std::memory_order_relaxed);

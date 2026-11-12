@@ -109,6 +109,40 @@ VKAPI_ATTR void VKAPI_CALL FakeEndRenderPass(VkCommandBuffer commands) {
     Log(commands, "end");
 }
 
+VKAPI_ATTR void VKAPI_CALL FakeCopyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    std::string text = "copy " + std::to_string(Raw(source)) + " " + std::to_string(Raw(destination));
+    for (std::uint32_t index = 0; index < count; ++index) text += " " + std::to_string(regions[index].srcOffset) + ">" + std::to_string(regions[index].dstOffset) + ":" + std::to_string(regions[index].size);
+    Log(commands, text);
+}
+
+std::string ImageCopies(std::uint32_t count, const VkBufferImageCopy* regions) {
+    std::string text;
+    for (std::uint32_t index = 0; index < count; ++index) text += " " + std::to_string(regions[index].bufferOffset) + "@" + std::to_string(regions[index].imageExtent.width) + "x" + std::to_string(regions[index].imageExtent.height);
+    return text;
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCopyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    Log(commands, "to-image " + std::to_string(Raw(source)) + " " + std::to_string(Raw(destination)) + " " + std::to_string(layout) + ImageCopies(count, regions));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeCopyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    Log(commands, "to-buffer " + std::to_string(Raw(source)) + " " + std::to_string(layout) + " " + std::to_string(Raw(destination)) + ImageCopies(count, regions));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeClearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t count, const VkImageSubresourceRange* ranges) {
+    std::string text = "clear " + std::to_string(Raw(image)) + " " + std::to_string(layout) + " " + std::to_string(color->uint32[0]) + "," + std::to_string(color->uint32[3]);
+    for (std::uint32_t index = 0; index < count; ++index) text += " " + std::to_string(ranges[index].baseMipLevel) + "+" + std::to_string(ranges[index].levelCount);
+    Log(commands, text);
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeBeginQuery(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t query, VkQueryControlFlags flags) {
+    Log(commands, "begin-query " + std::to_string(Raw(pool)) + " " + std::to_string(query) + " " + std::to_string(flags));
+}
+
+VKAPI_ATTR void VKAPI_CALL FakeEndQuery(VkCommandBuffer commands, VkQueryPool pool, std::uint32_t query) {
+    Log(commands, "end-query " + std::to_string(Raw(pool)) + " " + std::to_string(query));
+}
+
 DeviceFunctions FakeTable() {
     DeviceFunctions table{};
     table.cmdDraw = &FakeDraw;
@@ -119,6 +153,12 @@ DeviceFunctions FakeTable() {
     table.cmdBindDescriptorSets = &FakeBindDescriptorSets;
     table.cmdPipelineBarrier = &FakePipelineBarrier;
     table.cmdUpdateBuffer = &FakeUpdateBuffer;
+    table.cmdCopyBuffer = &FakeCopyBuffer;
+    table.cmdCopyBufferToImage = &FakeCopyBufferToImage;
+    table.cmdCopyImageToBuffer = &FakeCopyImageToBuffer;
+    table.cmdClearColorImage = &FakeClearColorImage;
+    table.cmdBeginQuery = &FakeBeginQuery;
+    table.cmdEndQuery = &FakeEndQuery;
     table.cmdBeginRenderPass = &FakeBeginRenderPass;
     table.cmdEndRenderPass = &FakeEndRenderPass;
     return table;
@@ -447,6 +487,58 @@ void LargeRecordsSpanChunks() {
     Compare(expected, "records larger than a chunk");
 }
 
+void RecordEveryPacked(DeviceFunctions& table, VkCommandBuffer commands, std::uint32_t round, std::vector<std::string>& expected) {
+    VkBufferCopy copies[2]{{round, 16 + round, 4}, {32, 48, 8 + round}};
+    table.cmdCopyBuffer(commands, Handle<VkBuffer>(1), Handle<VkBuffer>(2), 2, copies);
+    expected.push_back("copy 1 2 " + std::to_string(round) + ">" + std::to_string(16 + round) + ":4 32>48:" + std::to_string(8 + round));
+    std::uint8_t bytes[3]{static_cast<std::uint8_t>(round), 9, 8};
+    table.cmdUpdateBuffer(commands, Handle<VkBuffer>(3), 4 * round, 3, bytes);
+    expected.push_back("update 3 " + std::to_string(4 * round) + " " + std::to_string(round) + " 9 8");
+    VkBufferImageCopy regions[1]{};
+    regions[0].bufferOffset = 256 * round;
+    regions[0].imageExtent = {8 + round, 4, 1};
+    table.cmdCopyBufferToImage(commands, Handle<VkBuffer>(4), Handle<VkImage>(5), VK_IMAGE_LAYOUT_GENERAL, 1, regions);
+    expected.push_back("to-image 4 5 1 " + std::to_string(256 * round) + "@" + std::to_string(8 + round) + "x4");
+    table.cmdCopyImageToBuffer(commands, Handle<VkImage>(5), VK_IMAGE_LAYOUT_GENERAL, Handle<VkBuffer>(6), 1, regions);
+    expected.push_back("to-buffer 5 1 6 " + std::to_string(256 * round) + "@" + std::to_string(8 + round) + "x4");
+    VkClearColorValue color{};
+    color.uint32[0] = round;
+    color.uint32[3] = 7;
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, round, 1, 0, 1};
+    table.cmdClearColorImage(commands, Handle<VkImage>(7), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &range);
+    expected.push_back("clear 7 1 " + std::to_string(round) + ",7 " + std::to_string(round) + "+1");
+    table.cmdBeginQuery(commands, Handle<VkQueryPool>(8), round, 1);
+    expected.push_back("begin-query 8 " + std::to_string(round) + " 1");
+    table.cmdEndQuery(commands, Handle<VkQueryPool>(8), round);
+    expected.push_back("end-query 8 " + std::to_string(round));
+    copies[0] = {};
+    bytes[0] = 0;
+    regions[0] = {};
+    color = {};
+}
+
+void TransfersAndQueriesInAWindowNeverWait() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x46);
+    const auto attached = Attached(device, table);
+    auto& encoder = *attached;
+    const auto commands = Handle<VkCommandBuffer>(0xa00);
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(5)); });
+    std::vector<std::string> expected;
+    for (std::uint32_t round = 0; round < 4; ++round) {
+        encoder.Open(commands, RecordingOf(commands));
+        table.cmdDraw(commands, round, 1, 0, 0);
+        expected.push_back("draw " + std::to_string(round) + " 1 0 0");
+        RecordEveryPacked(table, commands, round, expected);
+        Require(encoder.Counts().waits == 0, "a transfer or query command in a window waited for the encoder");
+        encoder.Close();
+    }
+    encoder.Quiesce();
+    CommandEncoder::SetDelayForTesting({});
+    Compare({{commands, expected}}, "transfers and queries in a window");
+}
+
 void UnwindingSettlesQueuedRecording() {
     Reset();
     auto table = FakeTable();
@@ -639,7 +731,8 @@ void WaitsAreAttributedToTheirCallSites() {
     Require(encoder.ProfilesSites(), "the encoder does not profile its wait sites with APS5_PROFILE_ENCODER=1");
     const auto first = Handle<VkCommandBuffer>(0x1500);
     const auto second = Handle<VkCommandBuffer>(0x1580);
-    const std::uint32_t word = 7;
+    const VkMemoryBarrier link{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    const VkMemoryBarrier chained{VK_STRUCTURE_TYPE_MEMORY_BARRIER, &link, 1, 2};
     CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(2)); });
     const auto repeated = std::source_location::current();
     const auto once = std::source_location::current();
@@ -654,7 +747,7 @@ void WaitsAreAttributedToTheirCallSites() {
     table.cmdDraw(first, 2, 1, 0, 0);
     encoder.Quiesce(once);
     table.cmdDraw(first, 3, 1, 0, 0);
-    table.cmdUpdateBuffer(first, Handle<VkBuffer>(0x1600), 0, sizeof(word), &word);
+    table.cmdPipelineBarrier(first, 1, 2, 0, 1, &chained, 0, nullptr, 0, nullptr);
     table.cmdDraw(first, 4, 1, 0, 0);
     AgcDriver::Graphics::BeforeCommandLookup(device, lookup);
     table.cmdDraw(first, 5, 1, 0, 0);
@@ -670,7 +763,7 @@ void WaitsAreAttributedToTheirCallSites() {
     const auto sites = encoder.WaitsBySite();
     RequireSite(sites, Site::At(Wait::Quiesce, repeated), 2, 2);
     RequireSite(sites, Site::At(Wait::Quiesce, once), 1, 1);
-    RequireSite(sites, Site{Wait::Direct, "cmdUpdateBuffer", 0}, 1, 1);
+    RequireSite(sites, Site{Wait::Direct, "cmdPipelineBarrier", 0}, 1, 1);
     RequireSite(sites, Site::At(Wait::Lookup, lookup), 1, 1);
     const std::uint64_t heldFlush = CommandEncoder::PostsChunks() ? 1 : 0;
     RequireSite(sites, Site{Wait::Behind, "cmdDraw", 0}, 1, heldFlush);
@@ -988,6 +1081,89 @@ void ReplayFailureNeedsNoAllocation() {
     CommandEncoder::SetDelayForTesting({});
     Require(Reports([&] { RecordingOf(failing).Finish(); }), "a failed replay was not kept after its failure was stored without allocating");
     Compare({{healthy, {"draw 2 1 0 0"}}}, "a replay after a failure stored without allocating");
+}
+
+void PackedRecordsSkipAFailedRecording() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x50);
+    const auto failing = Handle<VkCommandBuffer>(0x1400);
+    const auto healthy = Handle<VkCommandBuffer>(0x1480);
+    const auto attached = Attached(device, table);
+    auto& encoder = *attached;
+    std::atomic<int> failures{1};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (failures.fetch_sub(1) > 0) throw std::runtime_error("injected replay failure");
+    });
+    encoder.Open(failing, RecordingOf(failing));
+    table.cmdDraw(failing, 1, 1, 0, 0);
+    encoder.Close();
+    encoder.Quiesce();
+    Require(RecordingOf(failing).Failed(), "the injected replay failure was not stored in its recording");
+    std::vector<std::string> expected;
+    std::vector<std::string> dropped;
+    for (std::uint32_t round = 0; round < 3; ++round) {
+        encoder.Open(failing, RecordingOf(failing));
+        RecordEveryPacked(table, failing, round, dropped);
+        encoder.Open(healthy, RecordingOf(healthy));
+        RecordEveryPacked(table, healthy, round, expected);
+        encoder.Close();
+        RecordEveryPacked(table, failing, round + 8, dropped);
+        encoder.Close();
+    }
+    encoder.Quiesce();
+    CommandEncoder::SetDelayForTesting({});
+    Require(Recorded(failing) == 0, "the encoder recorded " + std::to_string(Recorded(failing)) + " of " + std::to_string(dropped.size()) + " packed transfer and query commands into a recording after a replay into it failed");
+    Require(Reports([&] { RecordingOf(failing).Report(); }), "a failed replay followed by packed records was not reported");
+    Require(!RecordingOf(healthy).Failed(), "another recording's failed replay marked a healthy recording failed");
+    Compare({{healthy, expected}}, "packed records in another recording after a failed replay");
+}
+
+void QueriesKeepOrderWithTheirRecording() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x51);
+    const auto first = Handle<VkCommandBuffer>(0x1500);
+    const auto second = Handle<VkCommandBuffer>(0x1580);
+    CommandEncoder::SetDelayForTesting([] {
+        thread_local std::mt19937 delay(17);
+        const auto pause = delay() % 4;
+        if (pause == 1) std::this_thread::yield();
+        if (pause == 2) std::this_thread::sleep_for(std::chrono::microseconds(delay() % 300));
+    });
+    std::map<VkCommandBuffer, std::vector<std::string>> expected;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto query = [&](VkCommandBuffer commands, std::uint32_t slot) {
+            table.cmdBeginQuery(commands, Handle<VkQueryPool>(9), slot, 0);
+            expected[commands].push_back("begin-query 9 " + std::to_string(slot) + " 0");
+            table.cmdDraw(commands, slot, 1, 0, 0);
+            expected[commands].push_back("draw " + std::to_string(slot) + " 1 0 0");
+            table.cmdEndQuery(commands, Handle<VkQueryPool>(9), slot);
+            expected[commands].push_back("end-query 9 " + std::to_string(slot));
+        };
+        for (std::uint32_t round = 0; round < 200; ++round) {
+            const auto outer = round % 2 == 0 ? first : second;
+            const auto inner = round % 2 == 0 ? second : first;
+            encoder.Open(outer, RecordingOf(outer));
+            table.cmdBeginQuery(outer, Handle<VkQueryPool>(8), round, 1);
+            expected[outer].push_back("begin-query 8 " + std::to_string(round) + " 1");
+            table.cmdDraw(outer, 1000 + round, 1, 0, 0);
+            expected[outer].push_back("draw " + std::to_string(1000 + round) + " 1 0 0");
+            encoder.Open(inner, RecordingOf(inner));
+            query(inner, 2 * round);
+            encoder.Close();
+            table.cmdEndQuery(outer, Handle<VkQueryPool>(8), round);
+            expected[outer].push_back("end-query 8 " + std::to_string(round));
+            encoder.Close();
+            query(outer, 2 * round + 1);
+        }
+        encoder.Quiesce();
+        Require(!RecordingOf(first).Failed() && !RecordingOf(second).Failed(), "a recording with queries was marked failed");
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Compare(expected, "queries around nested windows of two recordings");
 }
 
 std::uint64_t PostsBy(const CommandEncoder::Statistics& counts, CommandEncoder::PostCause cause) {
@@ -1508,6 +1684,9 @@ void RunSuite() {
     EveryCommandOfTheTableIsInterposed();
     NestedWindowKeepsOrder();
     LargeRecordsSpanChunks();
+        TransfersAndQueriesInAWindowNeverWait();
+        PackedRecordsSkipAFailedRecording();
+        QueriesKeepOrderWithTheirRecording();
     UnwindingSettlesQueuedRecording();
     OwnersOutliveTheUnwindDrain();
     ForeignThreadCannotProduceIntoAnOpenWindow();

@@ -148,19 +148,8 @@ VKAPI_ATTR void VKAPI_CALL plain(VkCommandBuffer commands, A... arguments) {
 }
 
 template<std::size_t S, auto Member, typename Name, typename... A>
-VKAPI_ATTR void VKAPI_CALL direct(VkCommandBuffer commands, A... arguments) {
-    if (auto* encoder = deferring<S>(commands, Name::Text()); encoder != nullptr && !encoder->Direct(Name::Text())) return;
-    CommandEncoder::Unwrap(slots()[S].real.*Member)(commands, arguments...);
-}
-
-template<std::size_t S, auto Member, typename Name, typename... A>
 constexpr auto plainFor(void(VKAPI_PTR*)(VkCommandBuffer, A...)) {
     return &plain<S, Member, Name, A...>;
-}
-
-template<std::size_t S, auto Member, typename Name, typename... A>
-constexpr auto directFor(void(VKAPI_PTR*)(VkCommandBuffer, A...)) {
-    return &direct<S, Member, Name, A...>;
 }
 
 template<typename T>
@@ -307,6 +296,97 @@ VKAPI_ATTR void VKAPI_CALL pipelineBarrier(VkCommandBuffer commands, VkPipelineS
     CommandEncoder::Unwrap(slots()[S].real.cmdPipelineBarrier)(commands, source, destination, dependencies, memory, memoryBarriers, buffers, bufferBarriers, images, imageBarriers);
 }
 
+struct CopyBufferHeader {
+    VkBuffer source;
+    VkBuffer destination;
+    std::uint32_t count;
+};
+
+template<std::size_t S>
+VKAPI_ATTR void VKAPI_CALL copyBuffer(VkCommandBuffer commands, VkBuffer source, VkBuffer destination, std::uint32_t count, const VkBufferCopy* regions) {
+    if (auto* encoder = deferring<S>(commands, "cmdCopyBuffer")) {
+        encoder->Emplace([](const std::byte* payload, VkCommandBuffer target, const DeviceFunctions& functions) {
+            const auto header = unpack<CopyBufferHeader>(payload);
+            const auto* at = payload + aligned(sizeof(CopyBufferHeader));
+            CommandEncoder::Unwrap(functions.cmdCopyBuffer)(target, header.source, header.destination, header.count, arrayAt<VkBufferCopy>(at, header.count));
+        }, CopyBufferHeader{source, destination, count}, std::span(regions, count));
+        return;
+    }
+    CommandEncoder::Unwrap(slots()[S].real.cmdCopyBuffer)(commands, source, destination, count, regions);
+}
+
+struct UpdateBufferHeader {
+    VkBuffer buffer;
+    VkDeviceSize offset;
+    std::uint32_t size;
+};
+
+template<std::size_t S>
+VKAPI_ATTR void VKAPI_CALL updateBuffer(VkCommandBuffer commands, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
+    if (auto* encoder = deferring<S>(commands, "cmdUpdateBuffer")) {
+        encoder->Emplace([](const std::byte* payload, VkCommandBuffer target, const DeviceFunctions& functions) {
+            const auto header = unpack<UpdateBufferHeader>(payload);
+            const auto* at = payload + aligned(sizeof(UpdateBufferHeader));
+            CommandEncoder::Unwrap(functions.cmdUpdateBuffer)(target, header.buffer, header.offset, header.size, arrayAt<std::byte>(at, header.size));
+        }, UpdateBufferHeader{buffer, offset, static_cast<std::uint32_t>(size)}, std::span(static_cast<const std::byte*>(data), static_cast<std::size_t>(size)));
+        return;
+    }
+    CommandEncoder::Unwrap(slots()[S].real.cmdUpdateBuffer)(commands, buffer, offset, size, data);
+}
+
+struct BufferImageHeader {
+    VkBuffer buffer;
+    VkImage image;
+    VkImageLayout layout;
+    std::uint32_t count;
+};
+
+template<std::size_t S>
+VKAPI_ATTR void VKAPI_CALL copyBufferToImage(VkCommandBuffer commands, VkBuffer source, VkImage destination, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    if (auto* encoder = deferring<S>(commands, "cmdCopyBufferToImage")) {
+        encoder->Emplace([](const std::byte* payload, VkCommandBuffer target, const DeviceFunctions& functions) {
+            const auto header = unpack<BufferImageHeader>(payload);
+            const auto* at = payload + aligned(sizeof(BufferImageHeader));
+            CommandEncoder::Unwrap(functions.cmdCopyBufferToImage)(target, header.buffer, header.image, header.layout, header.count, arrayAt<VkBufferImageCopy>(at, header.count));
+        }, BufferImageHeader{source, destination, layout, count}, std::span(regions, count));
+        return;
+    }
+    CommandEncoder::Unwrap(slots()[S].real.cmdCopyBufferToImage)(commands, source, destination, layout, count, regions);
+}
+
+template<std::size_t S>
+VKAPI_ATTR void VKAPI_CALL copyImageToBuffer(VkCommandBuffer commands, VkImage source, VkImageLayout layout, VkBuffer destination, std::uint32_t count, const VkBufferImageCopy* regions) {
+    if (auto* encoder = deferring<S>(commands, "cmdCopyImageToBuffer")) {
+        encoder->Emplace([](const std::byte* payload, VkCommandBuffer target, const DeviceFunctions& functions) {
+            const auto header = unpack<BufferImageHeader>(payload);
+            const auto* at = payload + aligned(sizeof(BufferImageHeader));
+            CommandEncoder::Unwrap(functions.cmdCopyImageToBuffer)(target, header.image, header.layout, header.buffer, header.count, arrayAt<VkBufferImageCopy>(at, header.count));
+        }, BufferImageHeader{destination, source, layout, count}, std::span(regions, count));
+        return;
+    }
+    CommandEncoder::Unwrap(slots()[S].real.cmdCopyImageToBuffer)(commands, source, layout, destination, count, regions);
+}
+
+struct ClearColorHeader {
+    VkImage image;
+    VkImageLayout layout;
+    VkClearColorValue color;
+    std::uint32_t count;
+};
+
+template<std::size_t S>
+VKAPI_ATTR void VKAPI_CALL clearColorImage(VkCommandBuffer commands, VkImage image, VkImageLayout layout, const VkClearColorValue* color, std::uint32_t count, const VkImageSubresourceRange* ranges) {
+    if (auto* encoder = deferring<S>(commands, "cmdClearColorImage")) {
+        encoder->Emplace([](const std::byte* payload, VkCommandBuffer target, const DeviceFunctions& functions) {
+            const auto header = unpack<ClearColorHeader>(payload);
+            const auto* at = payload + aligned(sizeof(ClearColorHeader));
+            CommandEncoder::Unwrap(functions.cmdClearColorImage)(target, header.image, header.layout, &header.color, header.count, arrayAt<VkImageSubresourceRange>(at, header.count));
+        }, ClearColorHeader{image, layout, *color, count}, std::span(ranges, count));
+        return;
+    }
+    CommandEncoder::Unwrap(slots()[S].real.cmdClearColorImage)(commands, image, layout, color, count, ranges);
+}
+
 struct BeginPassHeader {
     VkRenderPassBeginInfo info;
     VkSubpassContents contents;
@@ -365,18 +445,11 @@ void install(DeviceFunctions& table) {
         }; \
         table.member = plainFor<S, &DeviceFunctions::member, Name>(CommandEncoder::Unwrap(table.member)); \
     }
-#define APS5_DIRECT(member) \
-    if (CommandEncoder::Unwrap(table.member) != nullptr) { \
-        struct Name { \
-            static constexpr const char* Text() { return #member; } \
-        }; \
-        table.member = directFor<S, &DeviceFunctions::member, Name>(CommandEncoder::Unwrap(table.member)); \
-    }
 #define APS5_CUSTOM(member, function) \
     if (CommandEncoder::Unwrap(table.member) != nullptr) table.member = &function<S>
     APS5_CUSTOM(cmdPipelineBarrier, pipelineBarrier);
-    APS5_DIRECT(cmdCopyBuffer);
-    APS5_DIRECT(cmdUpdateBuffer);
+    APS5_CUSTOM(cmdCopyBuffer, copyBuffer);
+    APS5_CUSTOM(cmdUpdateBuffer, updateBuffer);
     APS5_PLAIN(cmdFillBuffer);
     APS5_PLAIN(cmdBindPipeline);
     APS5_CUSTOM(cmdBindDescriptorSets, bindDescriptorSets);
@@ -409,11 +482,12 @@ void install(DeviceFunctions& table) {
     APS5_PLAIN(cmdDrawIndexed);
     APS5_PLAIN(cmdDrawIndirect);
     APS5_PLAIN(cmdDrawIndexedIndirect);
-    APS5_DIRECT(cmdCopyBufferToImage);
-    APS5_DIRECT(cmdCopyImageToBuffer);
-    APS5_DIRECT(cmdClearColorImage);
+    APS5_CUSTOM(cmdCopyBufferToImage, copyBufferToImage);
+    APS5_CUSTOM(cmdCopyImageToBuffer, copyImageToBuffer);
+    APS5_CUSTOM(cmdClearColorImage, clearColorImage);
+    APS5_PLAIN(cmdBeginQuery);
+    APS5_PLAIN(cmdEndQuery);
 #undef APS5_PLAIN
-#undef APS5_DIRECT
 #undef APS5_CUSTOM
 }
 
