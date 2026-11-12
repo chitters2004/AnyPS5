@@ -323,6 +323,15 @@ void ResidencyIsCountedPerTag() {
     Require(untimed.TakeCounters().residency[0].items == 0, "an untimed ring counted residency");
 }
 
+void ReclaimKeepsTheItemPushedIntoAFreedSlot() {
+    constexpr std::uint64_t items = 200000;
+    SequenceRing ring(Small(2));
+    std::uint64_t ran = 0;
+    for (std::uint64_t i = 0; i < items; ++i) ring.Push([&ran] { ++ran; }, {});
+    ring.Drain();
+    Require(ran == items, "an item pushed into a slot the preparer had just freed was cleared before it ran");
+}
+
 void PreparedWorkIsReleasedByTheProducer() {
     SequenceRing ring(Small(4));
     auto held = std::make_shared<int>(1);
@@ -353,6 +362,7 @@ int main() {
         OneProducerOnly();
         WaitingItemsAreVisibleNewestFirst();
         PreparedWorkIsReleasedByTheProducer();
+        ReclaimKeepsTheItemPushedIntoAFreedSlot();
         ResidencyIsCountedPerTag();
         FirstFailureIsReportedAtOnce();
         std::cout << "sequence ring tests passed\n";
