@@ -83,8 +83,8 @@ std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock, std::u
         waitPrepared(index - slots.size() + 1);
         fullWaits.fetch_add(1, std::memory_order_relaxed);
         fullWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
-        Reclaim();
     }
+    Reclaim();
     auto& slot = slots[index & mask];
     const auto sequence = issued.load(std::memory_order_relaxed) + 1;
     slot.sequence = sequence;
