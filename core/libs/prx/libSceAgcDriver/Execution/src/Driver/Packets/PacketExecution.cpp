@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/AbCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -446,7 +447,7 @@ void Driver::execute(const Submission& submission) {
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
             if (Graphics::AbConfigured()) {
-                static const auto abClock = std::chrono::steady_clock::now();
+                static const auto abClock = (InstallAbCounters(), std::chrono::steady_clock::now());
                 std::vector<std::string> abLines;
                 {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);

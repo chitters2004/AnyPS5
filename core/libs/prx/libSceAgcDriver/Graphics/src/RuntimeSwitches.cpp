@@ -258,6 +258,8 @@ struct AbState {
     std::array<bool, SwitchCount> environment{};
 };
 
+std::atomic<AbObserver> abObserver{nullptr};
+
 AbState& Ab() {
     static AbState* state = [] {
         auto* created = new AbState();
@@ -294,6 +296,10 @@ bool AbConfigured() {
     return configured;
 }
 
+void SetAbObserver(AbObserver observer) {
+    abObserver.store(observer, std::memory_order_release);
+}
+
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     if (!AbConfigured()) return {};
     auto& state = Ab();
@@ -302,6 +308,7 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     char text[512];
     const auto& config = state.schedule->Settings();
     const auto step = state.schedule->AtPresent(present, seconds);
+    if (const auto observe = abObserver.load(std::memory_order_acquire)) observe(step.event, step.b ? 'B' : 'A', step.phase, present, seconds);
     if (step.event == AbSchedule::Event::None) return lines;
     if (step.event == AbSchedule::Event::Begin) {
         if (step.phase == 0) {

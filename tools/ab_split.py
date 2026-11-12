@@ -11,7 +11,12 @@ later. Each periodic report covers the time since the previous report of its kin
 only when the previous report of its kind came after phase k's settled line and the report came before phase k+1
 began. Presents per 10 s and frame time come from the [ab] lines (settled line to the next phase's begin), GPU busy
 and idle gaps per frame from [present], GPU time per present from [gputime] (APS5_PROFILE_GPU), the committer and
-drains from [draw] pipelined, unlocked hook waits from [syncwait] (APS5_PROFILE_DRAW). The noise column compares
+drains from [draw] pipelined, unlocked hook waits from [syncwait] (APS5_PROFILE_DRAW). The driver also prints one
+"[ab-counters] phase <arm> <k> ..." line when phase k ends, from counters that run without APS5_PROFILE_DRAW: they cover
+exactly the settled part of the phase and give the committer's busy time and microseconds per committed draw, its
+waits, each traced thread's busy and waiting time (queue workers, the draw finisher; "threads=none" when the trace
+totals were not recording, so run with APS5_TRACE_SUMMARY_EVERY), the GPU's busy time and the flip interval p50 and
+p90. The noise column compares
 each B phase with the mean of its neighbouring A phases, which cancels a linear drift: mean difference, standard
 error, standard deviation and count. With several arms (APS5_AB=<s>:<arm>|<arm>...), phase A is the environment's
 settings and the arms B, C, ... follow it in turn; each arm is compared with A, its noise with the two A phases that
@@ -19,6 +24,7 @@ bracket its cycle, and --spread (implied with several arms) adds each side's pha
 deviation. A requested program's phase metric is omitted if a report lists 12 programs
 without it: the list may be truncated, so the program's time is unknown."""
 
+COUNTERS = re.compile(r"^\[ab-counters\] phase ([A-Z]) (\d+) (.*)$")
 PHASE = re.compile(r"^\[ab\] phase ([A-Z]) (\d+) (begins|settled) at present (\d+) \(t ([\d.]+) s\)")
 ARM = re.compile(r"; ([A-Z]): ")
 KINDS = (("present", "[present] "), ("gputime", "[gputime] "), ("draw", "[draw] pipelined"), ("syncwait", "[syncwait] "))
@@ -80,6 +86,12 @@ def parse_report(kind, text):
     return None
 
 
+def parse_counters(text):
+    counters = {key: finite(float(value)) for key, value in re.findall(r" ?([\w.]+)=(-?[\d.]+)", text)}
+    counters["recorded"] = "threads=none" not in text
+    return counters
+
+
 def read_log(lines):
     config, phases, current = None, [], None
     previous = {kind: None for kind, _ in KINDS}
@@ -89,6 +101,13 @@ def read_log(lines):
             if config is not None or phases:
                 raise ValueError("multiple A/B runs in one log; split the captures before comparing phases")
             config = text
+            continue
+        counters = COUNTERS.match(text)
+        if counters:
+            for phase in reversed(phases):
+                if phase["kind"] == counters.group(1) and phase["index"] == int(counters.group(2)):
+                    phase["counters"] = parse_counters(counters.group(3))
+                    break
             continue
         match = PHASE.match(text)
         if match:
@@ -105,7 +124,7 @@ def read_log(lines):
                         raise ValueError("phase began before the previous phase boundary")
                     current["end"] = point
 
-                current = {"kind": kind, "index": index, "begin": point, "settled": None, "end": None,
+                current = {"kind": kind, "index": index, "begin": point, "settled": None, "end": None, "counters": None,
                            "reports": {name: [] for name, _ in KINDS}}
                 phases.append(current)
 
@@ -135,8 +154,43 @@ def weighted(rows, value, weight):
     return finite_sum(row[value] * row[weight] for row in rows) / total if total else None
 
 
-def metrics(phase, programs, classes):
+THREAD_METRICS = (("busy_ms", "busy %", True), ("idle_ms", "idle %", True), ("memory_wait_ms", "memory wait ms/present", False),
+                  ("lock_wait_ms", "GPU lock wait ms/present", False), ("gpu_wait_ms", "GPU wait ms/present", False), ("jobs", "jobs/present", False))
+
+
+def counter_metrics(counters):
     out = {}
+    wall, presents = counters.get("wall_ms", 0.0), counters.get("presents", 0.0)
+    if presents:
+        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms",
+                       "GPU busy ms/present": "gpu_busy_ms", "GPU idle gaps ms/present": "gpu_gap_ms", "draws/present": "draws"}
+        for name, key in per_present.items():
+            if key in counters:
+                out[name] = counters[key] / presents
+    for name in ("flip_p50_ms", "flip_p90_ms"):
+        if name in counters:
+            out["flip " + name[5:8] + " ms"] = counters[name]
+    if wall and "commit_ms" in counters:
+        out["committer busy %"] = 100 * counters["commit_ms"] / wall
+    if counters.get("draws"):
+        out["committer us/draw"] = 1000 * counters["draw_commit_ms"] / counters["draws"]
+    for key, value in counters.items():
+        match = re.fullmatch(r"t\.(.+)\.(\w+)", key)
+        if not match:
+            continue
+        thread = match.group(1).replace("_", " ")
+        for suffix, name, percent in THREAD_METRICS:
+            if match.group(2) != suffix:
+                continue
+            if percent and wall:
+                out[f"{thread} {name}"] = 100 * value / wall
+            elif not percent and presents:
+                out[f"{thread} {name}"] = value / presents
+    return out
+
+
+def metrics(phase, programs, classes):
+    out = counter_metrics(phase["counters"]) if phase.get("counters") else {}
     if phase["settled"] is not None and phase["end"] is not None and phase["end"][1] > phase["settled"][1]:
         presents, seconds = phase["end"][0] - phase["settled"][0], phase["end"][1] - phase["settled"][1]
         out["presents/10s"] = presents / seconds * 10
