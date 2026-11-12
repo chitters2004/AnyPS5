@@ -54,6 +54,27 @@ void WriteCheckpointMarker(const Context& context, VkCommandBuffer commands, std
 void WriteNvCheckpointToken(const Context& context, VkCommandBuffer commands, std::uint64_t token, std::uint32_t queue);
 
 namespace {
+
+std::string PassTimingTag(const State& state) {
+    std::string tag;
+    char text[96];
+    std::size_t colors = 0;
+    if (state.hasColorTarget) {
+        for (const auto& color : state.colors) {
+            if (color.address == 0) continue;
+            std::snprintf(text, sizeof(text), "%sc%u@%ux%u:0x%llx", tag.empty() ? "" : ",", static_cast<unsigned>(color.format), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.address));
+            tag += text;
+            ++colors;
+        }
+    }
+    if (state.depth.has_value()) {
+        std::snprintf(text, sizeof(text), "%sd%u@%ux%u:0x%llx", tag.empty() ? "" : ",", static_cast<unsigned>(state.depth->format), state.depth->extent.width, state.depth->extent.height, static_cast<unsigned long long>(state.depth->address));
+        tag += text;
+    }
+    std::snprintf(text, sizeof(text), "%scolors=%zu,depth=%c%c,samples=%u,extent=%ux%u,layers=%u", tag.empty() ? "" : ",", colors, state.depthTest ? 't' : '-', state.depthWrite ? 'w' : '-', state.depth.has_value() ? state.depth->samples : 1u, state.renderExtent.width, state.renderExtent.height, state.renderLayers);
+    tag += text;
+    return tag;
+}
 enum class VkDrawKind : std::size_t { Direct, Indexed, Indirect, Mesh, Count };
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(VkDrawKind::Count)> vkDrawCounts{};
 void CountVkDraw(VkDrawKind kind) {
@@ -2864,6 +2885,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (drawTiming != Recorder::NoTiming && Recorder::GpuRangeDumpEnabled()) recorder->TagGpuTiming(drawTiming, PassTimingTag(state));
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -3845,6 +3867,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (drawTiming != Recorder::NoTiming && Recorder::GpuRangeDumpEnabled()) recorder->TagGpuTiming(drawTiming, PassTimingTag(state));
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());

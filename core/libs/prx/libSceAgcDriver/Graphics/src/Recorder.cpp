@@ -2232,7 +2232,10 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+std::uint32_t MaxTimedRanges() {
+    static const std::uint32_t cap = std::getenv("APS5_PROFILE_GPU_RANGES") != nullptr ? 4096u : 512u;
+    return cap;
+}
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2261,6 +2264,78 @@ AgcDriver::Mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
+AgcDriver::Mutex timingTagMutex;
+std::vector<std::string> timingTags{std::string{}};
+std::map<std::string, std::uint32_t, std::less<>> timingTagIds;
+
+struct RangeDump {
+    std::FILE* file = nullptr;
+    std::uint64_t bytes = 0;
+    std::uint64_t limit = 0;
+    std::size_t tagsWritten = 1;
+    bool stopped = false;
+};
+
+RangeDump* rangeDumpOpened = nullptr;
+
+const char* RangeDumpPath() {
+    static const char* path = std::getenv("APS5_PROFILE_GPU_RANGES");
+    return path != nullptr && *path != '\0' ? path : nullptr;
+}
+
+RangeDump& RangeDumpFile(double period) {
+    static RangeDump dump = [period] {
+        RangeDump opened;
+        const char* mib = std::getenv("APS5_PROFILE_GPU_RANGES_MIB");
+        opened.limit = (mib != nullptr ? std::strtoull(mib, nullptr, 10) : 1024ull) << 20u;
+        opened.file = std::fopen(RangeDumpPath(), "wb");
+        if (opened.file == nullptr) {
+            AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] cannot open %s; no ranges are written\n", RangeDumpPath());
+            opened.stopped = true;
+            return opened;
+        }
+        opened.bytes += static_cast<std::uint64_t>(std::fprintf(opened.file, "aps5-gpu-ranges 1 period_ns %.9g\n", period));
+        return opened;
+    }();
+    rangeDumpOpened = &dump;
+    return dump;
+}
+
+void DumpPresent(std::uint64_t serial) {
+    std::lock_guard lock(timingMutex);
+    if (rangeDumpOpened == nullptr || rangeDumpOpened->stopped) return;
+    const auto now = static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    rangeDumpOpened->bytes += static_cast<std::uint64_t>(std::fprintf(rangeDumpOpened->file, "present %llu read_ns %lld\n", static_cast<unsigned long long>(serial), now));
+}
+
+void DumpBatchRanges(std::uint64_t serial, std::uint32_t queue, std::uint32_t dropped, const std::vector<std::uint64_t>& keys, const std::vector<std::uint64_t>& bytes, const std::vector<std::uint32_t>& tags, const std::vector<std::uint32_t>& passes, const std::vector<std::uint64_t>& stamps, std::uint32_t batchTiming, double period) {
+    auto& dump = RangeDumpFile(period);
+    if (dump.stopped) return;
+    {
+        std::lock_guard lock(timingTagMutex);
+        for (; dump.tagsWritten < timingTags.size(); ++dump.tagsWritten) dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "tag %zu %s\n", dump.tagsWritten, timingTags[dump.tagsWritten].c_str()));
+    }
+    const auto readNs = static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "batch %llu queue %u read_ns %lld ranges %zu dropped %u\n", static_cast<unsigned long long>(serial), queue, readNs, keys.size(), dropped));
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        const auto key = keys[i];
+        char name[48];
+        if (i == batchTiming) std::snprintf(name, sizeof(name), "batch");
+        else if (key >= Recorder::ClassKey(Recorder::CommandClass::DispatchLeading) && key < Recorder::ClassKey(Recorder::CommandClass::Count)) std::snprintf(name, sizeof(name), "class:%s", CommandClassNames[key - Recorder::ClassKey(Recorder::CommandClass::DispatchLeading)]);
+        else if ((key & Recorder::DrawTimingFlag) != 0) std::snprintf(name, sizeof(name), "draw:0x%llx", static_cast<unsigned long long>(key & ~Recorder::DrawTimingFlag));
+        else std::snprintf(name, sizeof(name), "program:0x%llx", static_cast<unsigned long long>(key));
+        const long long pass = passes[i] == Recorder::NoTiming ? -1 : static_cast<long long>(passes[i]);
+        dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "range %zu %s tag %u pass %lld ticks %llu %llu bytes %llu\n", i, name, tags[i], pass, static_cast<unsigned long long>(stamps[i * 2]), static_cast<unsigned long long>(stamps[i * 2 + 1]), static_cast<unsigned long long>(bytes[i])));
+    }
+    std::fflush(dump.file);
+    if (dump.bytes >= dump.limit) {
+        std::fprintf(dump.file, "stopped at %llu bytes\n", static_cast<unsigned long long>(dump.bytes));
+        std::fclose(dump.file);
+        dump.file = nullptr;
+        dump.stopped = true;
+        AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] %s reached APS5_PROFILE_GPU_RANGES_MIB; later ranges are not written\n", RangeDumpPath());
+    }
+}
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -2315,8 +2390,23 @@ void reportBarriers() {
 }
 
 bool Recorder::GpuTimingEnabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr;
+    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr || RangeDumpPath() != nullptr;
     return enabled;
+}
+
+bool Recorder::GpuRangeDumpEnabled() {
+    return RangeDumpPath() != nullptr;
+}
+
+void Recorder::TagGpuTiming(std::uint32_t index, std::string_view tag) {
+    if (index == NoTiming || open == nullptr || index >= open->timedTags.size() || !GpuRangeDumpEnabled()) return;
+    std::lock_guard lock(timingTagMutex);
+    auto found = timingTagIds.find(tag);
+    if (found == timingTagIds.end()) {
+        found = timingTagIds.emplace(std::string(tag), static_cast<std::uint32_t>(timingTags.size())).first;
+        timingTags.emplace_back(tag);
+    }
+    open->timedTags[index] = found->second;
 }
 
 bool Recorder::BatchStampsEnabled() {
@@ -2398,7 +2488,8 @@ void Recorder::NoteAccess(CommandClass which, const Access& access) {
 
 void Recorder::CountPresent() {
     timingPresents.fetch_add(1, std::memory_order_relaxed);
-    presentSerial.fetch_add(1, std::memory_order_relaxed);
+    const auto serial = presentSerial.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (GpuRangeDumpEnabled()) DumpPresent(serial);
     ReferenceStorage::Shared().ReleaseIdle();
 }
 
@@ -2450,7 +2541,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;
     const auto commands = open->commands;
-    const std::uint32_t queryCount = full ? MaxTimedRanges * 2 : 2;
+    const std::uint32_t queryCount = full ? MaxTimedRanges() * 2 : 2;
     if (open->queries == VK_NULL_HANDLE) {
         if (!full && !sparePools.empty()) {
             open->queries = sparePools.back();
@@ -2468,11 +2559,15 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     }
     if (open->timedKeys.size() >= queryCount / 2) {
         timingDropped.fetch_add(1, std::memory_order_relaxed);
+        ++open->timedDropped;
         return NoTiming;
     }
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    open->timedTags.push_back(0);
+    open->timedPasses.push_back(open->passTiming);
+    if (key == ClassKey(CommandClass::Draw)) open->passTiming = index;
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2482,6 +2577,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
+    if (index == open->passTiming) open->passTiming = NoTiming;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
 }
 
@@ -3123,6 +3219,10 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
         return;
     }
+    if (GpuRangeDumpEnabled()) {
+        std::lock_guard dumpLock(timingMutex);
+        DumpBatchRanges(batch.serial, batch.queue, batch.timedDropped, batch.timedKeys, batch.timedBytes, batch.timedTags, batch.timedPasses, stamps, batch.batchTiming, period);
+    }
     static auto lastReport = std::chrono::steady_clock::now();
     // The union of the timed ranges (class ranges nest program ranges: a copy's transfer inside
     // its class range) against the batch span gives what no range covers.
@@ -3176,7 +3276,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges());
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" %s x%llu %.0fms", Recorder::TimingKeyLabel(hot[i].first).c_str(), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
