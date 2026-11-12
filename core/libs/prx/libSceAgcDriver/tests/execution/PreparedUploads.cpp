@@ -236,6 +236,15 @@ struct Outcome {
     std::uint64_t stageAAdopted() const { return after.stageAAdopted - before.stageAAdopted; }
     std::uint64_t stageAStale() const { return after.stageAStale - before.stageAStale; }
     std::uint64_t stageAStaleStaging() const { return after.stageAStaleStaging - before.stageAStaleStaging; }
+    std::uint64_t stageAStaleBy(AgcDriver::Graphics::PreparedStaleness reason) const {
+        const auto index = static_cast<std::size_t>(reason);
+        return after.stageAStaleBy[index] - before.stageAStaleBy[index];
+    }
+    std::uint64_t stageAStaleReasons() const {
+        std::uint64_t total = 0;
+        for (std::size_t reason = 0; reason < AgcDriver::Graphics::PreparedStalenessCount; ++reason) total += after.stageAStaleBy[reason] - before.stageAStaleBy[reason];
+        return total;
+    }
     std::uint64_t stageAUnused() const { return after.stageAUnused - before.stageAUnused; }
     std::uint64_t predictedHits() const { return after.stageAPredictedHit - before.stageAPredictedHit; }
     std::uint64_t regionsPrepared() const { return after.regionsPrepared - before.regionsPrepared; }
@@ -260,6 +269,7 @@ Outcome DrawOnce(Change change, std::size_t vertexOffset, bool writeVerticesFirs
     outcome.colors = Colors();
     outcome.written = WrittenPixels(outcome.colors);
     Require(Armed.load() == Change::None, "prepared uploads: the armed change never ran between preparation and commit");
+    Require(outcome.stageAStaleReasons() == outcome.stageAStale(), "prepared uploads: a stale stage A was not counted under exactly one reason");
     Require(outcome.after.stageAVerifyDiffered == outcome.before.stageAVerifyDiffered && outcome.after.regionVerifyDiffered == outcome.before.regionVerifyDiffered, "prepared uploads: APS5_VERIFY_EARLY_UPLOADS found an adopted stage A or region copy that differs from the committer's own");
     return outcome;
 }
@@ -338,6 +348,7 @@ int main() {
         const auto remapped = DrawOnce(Change::Registry, 0x2400);
         Print("allocation registry changed after preparation", remapped);
         Require(remapped.stageAStale() == 1 && remapped.stageAAdopted() == 0 && remapped.regionsAdopted() == 0, "prepared uploads: a stage A or region prepared under another registry generation was adopted");
+        Require(remapped.stageAStaleBy(AgcDriver::Graphics::PreparedStaleness::Registry) == 1, "prepared uploads: a stage A refused for a registry change was counted under another reason");
         Require(remapped.written == Width * Height, "prepared uploads: the draw built again after the registry changed left pixels cleared");
 
         const auto queued = DrawOnce(Change::None, 0x2500, true);

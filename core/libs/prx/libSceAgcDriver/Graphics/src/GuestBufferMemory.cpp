@@ -4037,6 +4037,7 @@ void ClearImageMirrors(VkDevice device) {
         state.failed.clear();
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
+        ++state.version;
     }
 }
 

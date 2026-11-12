@@ -234,6 +234,7 @@ struct UploadCounters {
     std::atomic<std::uint64_t> stageAAdopted{0};
     std::atomic<std::uint64_t> stageAStale{0};
     std::atomic<std::uint64_t> stageAStaleStaging{0};
+    std::array<std::atomic<std::uint64_t>, PreparedStalenessCount> stageAStaleBy{};
     std::atomic<std::uint64_t> stageAUnused{0};
     std::atomic<std::uint64_t> stageAPredictedHit{0};
     std::atomic<std::uint64_t> stageARefused{0};
@@ -265,6 +266,7 @@ void countedUpload(std::atomic<std::uint64_t>& total, const char* scope, std::ui
     PerformanceTrace::CountOwnedDraw(scope, amount);
 }
 
+constexpr std::array<const char*, PreparedStalenessCount> StaleNames{"UploadPrep.stage_a_current", "UploadPrep.stage_a_stale_unusable", "UploadPrep.stage_a_stale_registry", "UploadPrep.stage_a_stale_forget", "UploadPrep.stage_a_stale_recorder", "UploadPrep.stage_a_stale_mirrors", "UploadPrep.stage_a_stale_image_views", "UploadPrep.stage_a_stale_staging_decisions"};
 constexpr std::array<const char*, PreparedRefusalCount> RegionRefusalNames{"UploadPrep.regions_refused_size", "UploadPrep.regions_refused_inaccessible", "UploadPrep.regions_refused_forget", "UploadPrep.regions_refused_pending", "UploadPrep.regions_refused_unwatched", "UploadPrep.regions_refused_snapshot_changed", "UploadPrep.regions_refused_failed"};
 
 enum class StagingRole : std::size_t { Preparer, Committer };
@@ -916,9 +918,11 @@ std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& conte
         countedUpload(total.stageAStaleStaging, "UploadPrep.stage_a_stale_staging");
         return nullptr;
     }
-    if (!resources.stageA->PreparedDrawCurrent(deviceStaging)) {
+    if (const auto staleness = resources.stageA->PreparedDrawStaleness(deviceStaging); staleness != PreparedStaleness::Current) {
         resources.stageA.reset();
         countedUpload(total.stageAStale, "UploadPrep.stage_a_stale");
+        const auto reason = static_cast<std::size_t>(staleness);
+        countedUpload(total.stageAStaleBy[reason], StaleNames[reason]);
         return nullptr;
     }
     countedUpload(total.stageAAdopted, "UploadPrep.stage_a_adopted");
@@ -971,6 +975,7 @@ PreparedUploadCounts PreparedUploadCounters() {
     counts.stageAAdopted = total.stageAAdopted.load(std::memory_order_relaxed);
     counts.stageAStale = total.stageAStale.load(std::memory_order_relaxed);
     counts.stageAStaleStaging = total.stageAStaleStaging.load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < PreparedStalenessCount; ++reason) counts.stageAStaleBy[reason] = total.stageAStaleBy[reason].load(std::memory_order_relaxed);
     counts.stageAUnused = total.stageAUnused.load(std::memory_order_relaxed);
     counts.stageAPredictedHit = total.stageAPredictedHit.load(std::memory_order_relaxed);
     counts.stageARefused = total.stageARefused.load(std::memory_order_relaxed);

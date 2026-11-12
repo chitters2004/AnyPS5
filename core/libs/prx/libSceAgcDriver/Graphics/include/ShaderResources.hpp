@@ -217,6 +217,9 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+enum class PreparedStaleness : std::uint8_t { Current, Unusable, Registry, Forget, Recorder, Mirrors, ImageViews, StagingDecisions, Count };
+inline constexpr std::size_t PreparedStalenessCount = static_cast<std::size_t>(PreparedStaleness::Count);
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -232,7 +235,7 @@ public:
     bool Completed() const { return completed; }
     struct PreparedOffDevice {};
     ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deviceStaging, PreparedOffDevice);
-    bool PreparedDrawCurrent(bool deviceStaging) const;
+    PreparedStaleness PreparedDrawStaleness(bool deviceStaging) const;
     bool PreparedStaging() const { return preparedStaging; }
     void CompleteDraw(std::span<const CompiledShader> shaders);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> OffDeviceCopies() const { return guestMemory.OffDeviceCopies(); }

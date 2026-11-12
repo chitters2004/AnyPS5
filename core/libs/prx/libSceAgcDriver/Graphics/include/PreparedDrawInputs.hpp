@@ -135,6 +135,7 @@ struct PreparedUploadCounts {
     std::uint64_t stageAAdopted = 0;
     std::uint64_t stageAStale = 0;
     std::uint64_t stageAStaleStaging = 0;
+    std::array<std::uint64_t, PreparedStalenessCount> stageAStaleBy{};
     std::uint64_t stageAUnused = 0;
     std::uint64_t stageAPredictedHit = 0;
     std::uint64_t stageARefused = 0;

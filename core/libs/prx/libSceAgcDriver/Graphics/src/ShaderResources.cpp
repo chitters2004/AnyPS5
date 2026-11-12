@@ -1992,10 +1992,15 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
     }
 }
 
-bool ShaderResources::PreparedDrawCurrent(bool deviceStaging) const {
-    if (!preparedDraw || completed || preparedStaging != deviceStaging) return false;
-    if (preparedRegistry != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparedForget != GuestMemory::ForgetSerial() || preparedRecorder != Recorder::Active()) return false;
-    return preparedMirrors == MirrorsVersion() && registeredImageViewsCurrent(registeredImageViews) && guestMemory.StagingDecisionsCurrent();
+PreparedStaleness ShaderResources::PreparedDrawStaleness(bool deviceStaging) const {
+    if (!preparedDraw || completed || preparedStaging != deviceStaging) return PreparedStaleness::Unusable;
+    if (preparedRegistry != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return PreparedStaleness::Registry;
+    if (preparedForget != GuestMemory::ForgetSerial()) return PreparedStaleness::Forget;
+    if (preparedRecorder != Recorder::Active()) return PreparedStaleness::Recorder;
+    if (preparedMirrors != MirrorsVersion()) return PreparedStaleness::Mirrors;
+    if (!registeredImageViewsCurrent(registeredImageViews)) return PreparedStaleness::ImageViews;
+    if (!guestMemory.StagingDecisionsCurrent()) return PreparedStaleness::StagingDecisions;
+    return PreparedStaleness::Current;
 }
 
 void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders) {
