@@ -5056,6 +5056,39 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+void drawSnapshotEmptyFragmentSetTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt);
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        vertex.bindings.push_back(data);
+        const ColorTarget target{};
+        ShaderResources resources(context, vertex, fragment, target, 0, 0);
+        Require(resources.SplitSets() == context.graphicsPipelineLibrary, "a fragment program without bindings did not split the descriptor sets under graphics pipeline libraries");
+        const std::array<std::uint32_t, 4> movedWords{5, 6, 7, 8};
+        const ShaderResources::MovedBuffer moved{0, 0, 16, movedWords};
+        const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+        Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
+        Require(draw->allocation.set != VK_NULL_HANDLE, "the draw snapshot allocated no vertex set");
+        Require(draw->fragmentAllocation.set == VK_NULL_HANDLE, "the draw snapshot allocated a fragment set for a fragment program without bindings");
+        RuntimeSwitches::Assign(RuntimeSwitch::KeepEmptyFragmentSet, true);
+        const auto kept = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+        RuntimeSwitches::Assign(RuntimeSwitch::KeepEmptyFragmentSet, false);
+        Require(kept != nullptr && (kept->fragmentAllocation.set != VK_NULL_HANDLE) == resources.SplitSets(), "APS5_KEEP_EMPTY_FRAGMENT_SET did not allocate the split fragment set");
+        snapshots.Sync();
+    }
+    recorder.Activate();
+}
+
 void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorder) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using ShaderRecompiler::DescriptorKind;
@@ -16050,6 +16083,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             drawSnapshotTableSetTests(device, recorder);
+            drawSnapshotEmptyFragmentSetTests(device, recorder);
             imageTableFirstLayerRevalidateTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
@@ -16121,6 +16155,7 @@ int main(int argc, char** argv) {
         drawSnapshotReuseTests(device, recorder);
         drawDescriptorWriteTests(device, recorder);
         drawSnapshotTableSetTests(device, recorder);
+        drawSnapshotEmptyFragmentSetTests(device, recorder);
         imageTableFirstLayerRevalidateTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);

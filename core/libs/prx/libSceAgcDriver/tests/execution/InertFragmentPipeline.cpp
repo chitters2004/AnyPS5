@@ -2,7 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +34,8 @@ using ShaderRecompiler::ShaderStage;
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
 alignas(4096) std::array<std::uint8_t, Width * Height * 2> Stencil{};
 alignas(256) constexpr std::array<std::uint32_t, 64> NullPixelCode{0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 7> BufferPixelCode{0x7e0a0280u, 0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+alignas(256) constexpr std::array<float, 4> BufferColor{1.0f, 1.0f, 1.0f, 1.0f};
 alignas(256) constexpr std::array<std::uint32_t, 8> ExportDepth{0x7e0002f2, 0xf800100f, 0x00000000, 0x7e0202ff, 0x3e800000, 0xf8001881, 0x00000001, 0xbf810000};
 
 const std::vector<std::array<float, 4>>& HalfTriangle() {
@@ -41,7 +45,12 @@ const std::vector<std::array<float, 4>>& HalfTriangle() {
     return vertices;
 }
 
-ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t vertexPush, bool exports, bool depthExport) {
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
+}
+
+ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t vertexPush, bool exports, bool depthExport, std::span<const std::uint32_t> userWords = {}) {
     const auto target = device.Target();
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     pixel.wave32 = true;
@@ -56,6 +65,7 @@ ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, 
     pixel.depthExportMin = 0.0f;
     pixel.depthExportMax = 1.0f;
     std::vector<std::uint32_t> userData(4, 0u);
+    std::copy(userWords.begin(), userWords.end(), userData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
@@ -157,6 +167,10 @@ private:
     AgcDriver::Graphics::Context context;
 };
 
+std::uint64_t SetsAllocated(AgcDriver::VulkanDevice& device) {
+    return AgcDriver::VulkanDeviceTestAccess::ContextOf(device).descriptorCache->Counters().sets;
+}
+
 std::uint32_t Equal(AgcDriver::VulkanDevice& device, const Shaders& full, const ShaderRecompiler::RecompileResult& plain, float depth) {
     return Draw(device, full, plain, {.color = true, .depthTest = true, .depthWrite = false, .depthCompare = VK_COMPARE_OP_EQUAL, .depth = depth});
 }
@@ -229,6 +243,35 @@ int main() {
         Draw(*device, full, null, {.color = true, .depthTest = false});
         const auto colored = AgcDriver::Graphics::TakeInertFragmentCounts();
         Require(colored.omitted == 0u && colored.kept == 1u, "an inert draw with a writable color attachment dropped its fragment stage");
+
+        const auto colorBuffer = BufferDescriptor(BufferColor.data(), 16u, 1u);
+        const auto reading = CompilePixel(*device, BufferPixelCode, full.vertexPush, true, false, colorBuffer);
+        Require(!AgcDriver::Graphics::InertFragment(reading), "a buffer-reading pixel program is inert");
+        Require(!reading.bindings.empty(), "the buffer-reading pixel program has no descriptor binding");
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> readingStages{{{ShaderStage::Vertex, &full.vertex, 0}, {ShaderStage::Fragment, &reading, PixelPushOffset(full.vertexPush, device->Target())}}};
+        Require(AgcDriver::Graphics::SplitsSets(context, readingStages) == context.graphicsPipelineLibrary, "a buffer-reading pixel program did not split the descriptor sets under graphics pipeline libraries");
+        Reset(*device, full, plain);
+        const Pass depthOnly{.depthTest = true, .depthWrite = true, .depth = 0.5f};
+        for (int round = 0; round < 2; ++round) {
+            Draw(*device, full, null, depthOnly, false);
+            Draw(*device, full, reading, {.depthTest = true, .depthWrite = true, .depth = 0.25f}, false);
+        }
+        Draw(*device, full, null, depthOnly);
+        Require(Equal(*device, full, plain, 0.5f) == Covered, "a pass that switched between an inert depth-only pipeline and a buffer-reading one left other depth than its last draw");
+        Require(Draw(*device, full, reading, {.color = true, .depthTest = false}) == Covered, "the buffer-reading pixel program did not read its color from its fragment set");
+        const auto inertBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, null, depthOnly);
+        const auto inertSets = SetsAllocated(*device) - inertBefore;
+        const auto readingBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, reading, depthOnly);
+        const auto readingSets = SetsAllocated(*device) - readingBefore;
+        Require(readingSets - inertSets == (context.graphicsPipelineLibrary ? 4u : 0u), "draws whose fragment program has no bindings allocated a fragment descriptor set");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::KeepEmptyFragmentSet, true);
+        const auto keptBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, null, depthOnly);
+        const auto keptSets = SetsAllocated(*device) - keptBefore;
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::KeepEmptyFragmentSet, false);
+        Require(keptSets == readingSets, "APS5_KEEP_EMPTY_FRAGMENT_SET did not allocate the empty fragment set again");
 
         const bool timed = AgcDriver::Graphics::Recorder::GpuTimingEnabled();
         if (timed) {
