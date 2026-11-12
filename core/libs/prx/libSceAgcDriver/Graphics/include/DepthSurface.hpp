@@ -96,9 +96,8 @@ struct HtileBindReads {
     std::uint64_t gpuDecisions = 0;
     std::uint64_t gpuDecided = 0;
     std::uint64_t pendingReads = 0;
-    std::uint64_t readOnly = 0;
-    std::uint64_t created = 0;
-    std::uint64_t stencilPlane = 0;
+    std::uint64_t readOnlyDecisions = 0;
+    std::uint64_t createdDecisions = 0;
     std::uint64_t unpublished = 0;
     std::uint64_t unsupported = 0;
     std::uint64_t unreduced = 0;

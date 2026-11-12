@@ -2934,9 +2934,8 @@ struct HtileBindCounters {
     std::atomic<std::uint64_t> gpuDecisions{0};
     std::atomic<std::uint64_t> gpuDecided{0};
     std::atomic<std::uint64_t> pendingReads{0};
-    std::atomic<std::uint64_t> readOnly{0};
-    std::atomic<std::uint64_t> created{0};
-    std::atomic<std::uint64_t> stencilPlane{0};
+    std::atomic<std::uint64_t> readOnlyDecisions{0};
+    std::atomic<std::uint64_t> createdDecisions{0};
     std::atomic<std::uint64_t> unpublished{0};
     std::atomic<std::uint64_t> unsupported{0};
     std::atomic<std::uint64_t> unreduced{0};
@@ -3542,7 +3541,7 @@ DepthSurface* findDepthSurface(const Context& context, const DepthTarget& target
 
 HtileBindReads HtileBindReadCounts() {
     const auto& counters = htileBindCounters();
-    return {counters.gpuDecisions.load(std::memory_order_relaxed), counters.gpuDecided.load(std::memory_order_relaxed), counters.pendingReads.load(std::memory_order_relaxed), counters.readOnly.load(std::memory_order_relaxed), counters.created.load(std::memory_order_relaxed), counters.stencilPlane.load(std::memory_order_relaxed), counters.unpublished.load(std::memory_order_relaxed), counters.unsupported.load(std::memory_order_relaxed), counters.unreduced.load(std::memory_order_relaxed)};
+    return {counters.gpuDecisions.load(std::memory_order_relaxed), counters.gpuDecided.load(std::memory_order_relaxed), counters.pendingReads.load(std::memory_order_relaxed), counters.readOnlyDecisions.load(std::memory_order_relaxed), counters.createdDecisions.load(std::memory_order_relaxed), counters.unpublished.load(std::memory_order_relaxed), counters.unsupported.load(std::memory_order_relaxed), counters.unreduced.load(std::memory_order_relaxed)};
 }
 
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
@@ -3566,24 +3565,16 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         lock.lock();
         surface = findDepthSurface(context, target);
         if (!decision.undecided) break;
-        auto& counters = htileBindCounters();
-        if (surface == nullptr) {
-            counters.created.fetch_add(1, std::memory_order_relaxed);
-        } else if (!depthWritten) {
-            counters.readOnly.fetch_add(1, std::memory_order_relaxed);
-        } else if (target.htileStencil && surface->StencilMirrorable() && !stencilWritten) {
-            counters.stencilPlane.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            lock.unlock();
-            reduction = reduceHtileOnGpu(context, target);
-            lock.lock();
-            if (reduction.has_value() && findDepthSurface(context, target) == surface) break;
-            reduction.reset();
-            counters.unreduced.fetch_add(1, std::memory_order_relaxed);
-        }
+        lock.unlock();
+        reduction = reduceHtileOnGpu(context, target);
+        lock.lock();
+        if (reduction.has_value() && findDepthSurface(context, target) == surface) break;
+        reduction.reset();
+        htileBindCounters().unreduced.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
         gpu.unlock();
     }
+    const VkImageAspectFlags htileMayClear = reduction.has_value() ? VK_IMAGE_ASPECT_DEPTH_BIT | (target.htileStencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u) : htileCleared;
     const bool cleared = takeClearedHtile(target);
     const bool created = surface == nullptr;
     if (!created) surface->ProveOverwrite();
@@ -3634,7 +3625,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     const auto stencilOwner = stencilOwners().find({context.device, target.stencilAddress});
     const bool stencilRebound = stencilOwner == stencilOwners().end() || stencilOwner->second.surface != surface;
     takePlanes(*surface, created, htileCleared | (cleared ? VK_IMAGE_ASPECT_DEPTH_BIT : 0u));
-    if (cleared || htileCleared != 0u) surface->expanded = false;
+    if (cleared || htileMayClear != 0u) surface->expanded = false;
     if (created && !inherits && target.htileAddress == 0) surface->TakeStorage();
     if (cleared && (!created || inherits)) {
         if (target.samples != 1u && (!created || !surface->samplingActive)) surface->sampling.Refuse("native multisample depth fast-clear transition is not implemented");
@@ -3645,7 +3636,12 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
-    if (reduction.has_value()) applyHtileDecision(*surface, target, *reduction);
+    if (reduction.has_value()) {
+        applyHtileDecision(*surface, target, *reduction);
+        auto& counters = htileBindCounters();
+        if (!depthWritten) counters.readOnlyDecisions.fetch_add(1, std::memory_order_relaxed);
+        if (created) counters.createdDecisions.fetch_add(1, std::memory_order_relaxed);
+    }
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
@@ -3661,14 +3657,14 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
             other->DropMirror();
         }
     }
-    if ((depthWritten || cleared) && mirrorable(target)) {
+    if ((depthWritten || cleared || (htileMayClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0u) && mirrorable(target)) {
         const auto plane = target.address;
         const auto planeBytes = surface->MirrorBytes();
         surface->NoteDepthWork();
         surface->MarkAllStale(planeBytes);
         noteStalePlane(plane, plane + planeBytes);
     }
-    if (stencilWritten || created || stencilRebound) surface->MarkStencilStale();
+    if (stencilWritten || created || stencilRebound || (htileMayClear & VK_IMAGE_ASPECT_STENCIL_BIT) != 0u) surface->MarkStencilStale();
     drawnDepth = surface;
     return surface->view;
 }
