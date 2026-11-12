@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SerialFrontiers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -157,6 +159,7 @@ public:
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
+    void OnDiscard(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -298,6 +301,7 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    const SerialFrontiers& Frontiers() const { return frontiers; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -415,6 +419,10 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void FailNextFenceWaitsForTest(unsigned count);
+    void LatchFailure(std::exception_ptr error) noexcept;
+    bool Latched() const { return latched.load(std::memory_order_acquire); }
+    void RethrowLatched() const;
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -473,6 +481,7 @@ public:
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
+    static void RefuseWhenPoisoned();
     VkDevice Device() const { return context.device; }
     std::uint64_t Id() const { return id; }
     static bool Alive(std::uint64_t id);
@@ -662,6 +671,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
+        std::vector<std::function<void()>> discards;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -906,7 +916,9 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void cancelSuffix() noexcept;
     void removeLabels(Batch& batch);
+    void runDiscards(Batch& batch) noexcept;
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
@@ -943,6 +955,13 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    VkSemaphore terminal = VK_NULL_HANDLE;
+    std::atomic<bool> terminalReleased{false};
+    std::atomic<bool> latched{false};
+    mutable std::mutex latchMutex;
+    std::exception_ptr latchedError;
+    void releaseTerminal() noexcept;
+    void waitedThrough(std::uint64_t serial) const;
     VkSemaphore submitHold = VK_NULL_HANDLE;
     std::uint64_t submitHoldValue = 0;
     struct ProgressWatcher;
@@ -985,6 +1004,7 @@ private:
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    SerialFrontiers frontiers;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;

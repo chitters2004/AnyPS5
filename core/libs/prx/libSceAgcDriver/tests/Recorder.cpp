@@ -633,6 +633,19 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelines = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelines) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilityFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
             if (hasExtension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &portabilityFeatures};
@@ -682,6 +695,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timelines() const { return timelines; }
     const Context& GetContext() const { return context; }
     DeviceFunctions* UseFunctionTable() {
         FillDeviceFunctions(context, functions);
@@ -747,6 +761,7 @@ private:
     bool graphics = false;
     std::mutex settleMutex;
     bool nullDescriptors = false;
+    bool timelines = false;
     DeviceFunctions functions{};
     bool memoryBudget = false;
 };
@@ -1809,6 +1824,237 @@ void completionWaitTests(const Device& device, Recorder& recorder) {
     recorder.AfterCompletions(base + 4u, cpuValue, 8, 0, false);
     CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
     Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: a reader of a label stored behind a completion did not wait for that store");
+}
+
+void latchedWaitTests(const Device& device) {
+    if (!device.Timelines()) {
+        std::cout << "timeline semaphores unavailable: latched wait tests not run\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    const auto waitFor = [](const std::function<void()>& wait, std::chrono::milliseconds before, const std::function<void()>& release) {
+        std::atomic<bool> done{false};
+        std::string message;
+        std::thread waiter([&] {
+            try {
+                wait();
+            } catch (const std::exception& error) {
+                message = error.what();
+            }
+            done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(before);
+        const bool early = done.load(std::memory_order_acquire);
+        release();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!done.load(std::memory_order_acquire)) {
+            std::cerr << "a waiter on a batch that will never be submitted was not woken by the latch\n";
+            std::_Exit(1);
+        }
+        waiter.join();
+        return std::pair{early, message};
+    };
+    {
+        Recorder recorder(context, true);
+        std::unique_lock gpu(GpuMutex());
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        recorder.Submit();
+        const auto submitted = recorder.Submissions();
+        gpu.unlock();
+        recorder.WaitSerial(submitted);
+        const auto [early, message] = waitFor([&] { recorder.WaitSerial(submitted + 3); }, std::chrono::milliseconds(50), [&] { recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss"))); });
+        Require(!early, "a wait for a batch that was never submitted returned before the latch");
+        Require(message == "injected device loss", "a waiter woken by the latch did not get the latched error ('" + message + "')");
+        recorder.WaitSerial(submitted);
+        Require(recorder.WaitSerialFor(submitted, 1'000'000'000ull), "a completed batch's wait failed after the latch");
+        std::string bounded;
+        try {
+            static_cast<void>(recorder.WaitSerialFor(submitted + 3, 60'000'000'000ull));
+        } catch (const std::exception& error) {
+            bounded = error.what();
+        }
+        Require(bounded == "injected device loss", "a bounded wait after the latch did not get the latched error ('" + bounded + "')");
+        gpu.lock();
+        std::string synced;
+        try {
+            recorder.Sync();
+        } catch (const std::exception& error) {
+            synced = error.what();
+        }
+        Require(synced == "injected device loss" && recorder.Idle(), "a batch was finished as completed after the latch ('" + synced + "')");
+    }
+    {
+        auto recorder = std::make_unique<Recorder>(context, true);
+        auto* const waited = recorder.get();
+        const auto [early, message] = waitFor([waited] { waited->WaitSerial(2); }, std::chrono::milliseconds(50), [&] {
+            std::lock_guard gpu(GpuMutex());
+            recorder.reset();
+        });
+        Require(!early, "a wait for a batch that was never submitted returned before the teardown ('" + message + "')");
+        Require(message.find("torn down") != std::string::npos, "a waiter woken by the teardown did not say so ('" + message + "')");
+    }
+}
+
+void suffixCancellationTests(const Device& device) {
+    using AgcDriver::Graphics::BatchState;
+    if (!device.Timelines()) {
+        std::cout << "timeline semaphores unavailable: suffix cancellation tests not run\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore hold = VK_NULL_HANDLE;
+    Require(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &hold) == VK_SUCCESS, "create the submit hold semaphore");
+    constexpr int Batches = 4;
+    std::array<int, Batches> completed{};
+    std::array<int, Batches> discarded{};
+    std::atomic<bool> released{false};
+    bool discardedAfterRelease = false;
+    std::string failure;
+    std::string refused;
+    std::string submitted;
+    std::vector<std::uint64_t> serials;
+    auto writers = std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>();
+    std::vector<std::shared_ptr<ShaderResources>> listed;
+    std::thread releaser;
+    std::array<std::uint32_t, 4> labelled{};
+    const auto labelAddress = reinterpret_cast<std::uint64_t>(labelled.data());
+    const std::array<std::byte, 4> labelValue{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    {
+        Recorder recorder(context, true);
+        std::unique_lock gpu(GpuMutex());
+        recorder.Sync();
+        for (int index = 0; index < Batches; ++index) {
+            RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            auto token = std::make_shared<int>(index);
+            listed.emplace_back(token, reinterpret_cast<ShaderResources*>(token.get()));
+            ListCopiedWriter(recorder, writers, listed.back(), [&completed, index] { ++completed[index]; }, true);
+            recorder.OnDiscard([&, index] {
+                ++discarded[index];
+                if (index == 2) discardedAfterRelease = released.load(std::memory_order_acquire);
+            });
+            serials.push_back(recorder.Frontiers().Newest());
+            if (index == 1) recorder.NoteLabel(labelAddress, labelValue, 1, 0);
+            if (index == 2) recorder.NotePendingWrite(labelAddress + 8, 8);
+            if (index == 2) recorder.HoldNextSubmit(hold, 1);
+            if (index + 1 < Batches) recorder.Submit();
+        }
+        Require(writers->size() == Batches, "a copied writer was not listed");
+        releaser = std::thread([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            released.store(true, std::memory_order_release);
+            VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR};
+            signal.semaphore = hold;
+            signal.value = 1;
+            static_cast<void>(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal));
+        });
+        Recorder::FailNextFenceWaitsForTest(1);
+        try {
+            recorder.FinishUpTo(serials[0]);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        Recorder::FailNextFenceWaitsForTest(0);
+        Require(failure.find("vkWaitForFences") != std::string::npos, "the injected fence failure did not fail the finish ('" + failure + "')");
+        Require(recorder.Latched(), "a fence failure did not latch the recorder");
+        const auto& frontiers = recorder.Frontiers();
+        for (int index = 0; index + 1 < Batches; ++index) Require(frontiers.State(serials[index]) == BatchState::Failed, "a submitted batch at or after the failed one was not marked failed");
+        Require(frontiers.State(serials[3]) == BatchState::Reserved, "the open batch was cancelled while it could still be recording");
+        Require(frontiers.Through(BatchState::Completed) == serials[0] - 1, "the completed frontier passed the failed batch");
+        Require(discardedAfterRelease, "a cancelled batch was released while the GPU could still run it");
+        for (int index = 0; index + 1 < Batches; ++index) Require(completed[index] == 0 && discarded[index] == 1, "a cancelled batch ran a completion or did not run its discard actions exactly once");
+        Require(writers->size() == 1 && writers->front() == listed[3], "a cancelled batch's copied writer stayed listed");
+        Require(!recorder.PendingLabelIn(labelAddress, 4) && !recorder.PendingWriteOverlaps(labelAddress + 8, 8), "a cancelled batch's label or pending write could still be published to a host access");
+        try {
+            static_cast<void>(recorder.Commands());
+        } catch (const std::exception& error) {
+            refused = error.what();
+        }
+        Require(refused == failure, "a latched recorder accepted new commands ('" + refused + "')");
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            submitted = error.what();
+        }
+        Require(submitted == failure, "a latched recorder submitted its open batch ('" + submitted + "')");
+        Require(frontiers.State(serials[3]) == BatchState::Cancelled && frontiers.Terminal() == serials[3], "the poisoned open batch was not cancelled");
+        Require(completed[3] == 0 && discarded[3] == 1 && writers->empty(), "the poisoned open batch ran a completion or kept its copied writer listed");
+        Require(recorder.Idle(), "a latched recorder kept a batch after its cancellation");
+    }
+    releaser.join();
+    context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, hold, nullptr);
+    std::cout << "Suffix cancellation tests passed\n";
+}
+
+void latchedCompletionTests(const Device& device) {
+    using AgcDriver::Graphics::BatchState;
+    const auto& context = device.GetContext();
+    const auto caught = [](const std::function<void()>& step) -> std::string {
+        try {
+            step();
+            return {};
+        } catch (const std::exception& error) {
+            return error.what();
+        }
+    };
+    Recorder recorder(context, true);
+    std::unique_lock gpu(GpuMutex());
+    recorder.CountSamples();
+    int completed = 0;
+    int discarded = 0;
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    recorder.OnComplete([&] { ++completed; });
+    recorder.OnDiscard([&] { ++discarded; });
+    recorder.Submit();
+    const auto serial = recorder.Submissions();
+    recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+    const auto finished = caught([&] { recorder.FinishUpTo(serial); });
+    Require(finished == "injected device loss", "a batch whose fence reported success after the latch was finished as completed ('" + finished + "')");
+    Require(completed == 0 && discarded == 1 && recorder.Frontiers().State(serial) == BatchState::Failed, "a completion ran after the latch, or the batch was not discarded as failed");
+    const auto samples = caught([&] { static_cast<void>(recorder.SamplesTotal()); });
+    Require(samples == "injected device loss", "a latched recorder read query results ('" + samples + "')");
+    auto* previous = Recorder::Active();
+    recorder.Activate();
+    const auto refused = caught([] { Recorder::RefuseWhenPoisoned(); });
+    if (previous != nullptr) previous->Activate();
+    Require(refused == "injected device loss", "a host write-back was not refused by the latched active recorder ('" + refused + "')");
+    std::cout << "Latched completion tests passed\n";
+}
+
+void serialFrontierTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::Graphics::BatchState;
+    const auto& context = device.GetContext();
+    const auto record = [&] { RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT); };
+    recorder.Sync();
+    const auto& frontiers = recorder.Frontiers();
+    const auto start = recorder.Submissions();
+    Require(frontiers.Newest() == start && frontiers.Through(BatchState::Submitted) == start && frontiers.Through(BatchState::Completed) == start, "an idle recorder's frontiers do not equal its submissions");
+    record();
+    Require(frontiers.Newest() == start + 1 && frontiers.State(start + 1) == BatchState::Reserved, "an open batch did not reserve the next serial");
+    recorder.Submit();
+    Require(frontiers.Through(BatchState::Submitted) == start + 1 && frontiers.State(start + 1) == BatchState::Submitted, "a submitted batch did not move the submitted frontier");
+    record();
+    recorder.Submit();
+    recorder.Sync();
+    Require(frontiers.Through(BatchState::Completed) == start + 2 && frontiers.Terminal() == start + 2, "synced batches did not move the completed frontier");
+    record();
+    recorder.FailNextSubmitsForTest(1);
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    Require(failed, "the injected submit failure did not fail the submit");
+    Require(frontiers.Newest() == start + 2 && recorder.Submissions() == start + 2, "a batch discarded before its submit kept its reserved serial");
+    record();
+    Require(frontiers.Newest() == start + 3, "the batch after a discarded one did not reuse its serial");
+    recorder.Submit();
+    recorder.Sync();
+    Require(recorder.Submissions() == start + 3 && frontiers.Through(BatchState::Completed) == start + 3, "the batch after a discarded one did not complete under its reserved serial");
 }
 
 template<typename Lock>
@@ -6358,6 +6604,20 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
         Require(!sources[0].shadow && sources[0].begin == 2 * unit && sources[0].end == 3 * unit && sources[0].buffer == import->buffer && sources[0].offset == 2 * unit, "the import piece before the fresh unit is wrong");
         Require(sources[1].shadow && sources[1].begin == 3 * unit && sources[1].end == 4 * unit && sources[1].buffer == half->buffer && sources[1].offset == half->offset && sources[1].slab == half->slab, "the fresh unit's piece does not read the slab");
         Require(!sources[2].shadow && sources[2].begin == 4 * unit && sources[2].end == 5 * unit, "the import piece after the fresh unit is wrong");
+    }
+    {
+        Recorder poisoned(context, true);
+        poisoned.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+        auto* previous = Recorder::Active();
+        poisoned.Activate();
+        std::string refused;
+        try {
+            static_cast<void>(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Hook));
+        } catch (const std::exception& error) {
+            refused = error.what();
+        }
+        if (previous != nullptr) previous->Activate();
+        Require(refused == "injected device loss" && AnyShadowedOverlaps(unit3, unit), "a shadow unit was published, or dropped, under a latched recorder ('" + refused + "')");
     }
     // A whole publish: the untouched half keeps the seed (the import's bytes), the other the
     // retile's; the copy stamps nothing, and a second publish copies nothing.
@@ -16324,6 +16584,12 @@ int main(int argc, char** argv) {
         hostImportUnmapTests(device, recorder);
         drawSnapshotPatchTests(device);
         drawSnapshotEpochTests(device);
+        gpu.lock();
+        serialFrontierTests(device, recorder);
+        gpu.unlock();
+        latchedWaitTests(device);
+        suffixCancellationTests(device);
+        latchedCompletionTests(device);
         gpu.lock();
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);
