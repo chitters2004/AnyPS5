@@ -844,8 +844,35 @@ void CheckExclusionSources() {
     Require(CompareSiteBytesForTest(firstLine) == Page && CompareSiteBytesForTest(secondLine) == Page, "compared bytes were not attributed to their call sites");
 }
 
+void BenchCompare(const char* arm) {
+    constexpr int Calls = 20000;
+    std::vector<std::byte> expected(Page);
+    std::memcpy(expected.data(), reinterpret_cast<const void*>(Base), Page);
+    double best = std::numeric_limits<double>::max();
+    bool same = true;
+    for (int round = 0; round < 3; ++round) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) same = EqualsCommittedUnsynced(Base, expected) && same;
+        best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+    }
+    Require(same, "bench: the compared page differs");
+    std::cout << "bench EqualsCommittedUnsynced of an equal 4 KiB page, " << arm << ", best of 3 x 20000: " << best << " ns per call (wall clock)\n";
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--compare-bench") {
+#ifdef _WIN32
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            BenchCompare("not profiled");
+            return 0;
+        }
         if (argc == 2 && std::string(argv[1]) == "--sources") {
 #ifdef _WIN32
             _putenv_s("APS5_PROFILE_DRAW", "1");
@@ -858,6 +885,7 @@ int main(int argc, char** argv) {
             std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
 #endif
             CheckExclusionSources();
+            BenchCompare("compare sites counted (APS5_PROFILE_DRAW)");
             std::cout << "exclusion source test passed\n";
             return 0;
         }
