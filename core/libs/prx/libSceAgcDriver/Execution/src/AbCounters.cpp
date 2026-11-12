@@ -32,7 +32,8 @@ AbSample Take(std::uint64_t present, double seconds) {
     sample.gpuBusyMs = counts.gpuBusyMs;
     sample.gpuGapMs = counts.gpuGapMs;
     const auto totals = DriverDetail::DrawPipeline::Queue0().LifetimeTotals();
-    sample.committer = {totals.commits, totals.commitNs, totals.drawCommits, totals.drawNs, totals.enqueued, totals.fullWaitNs, totals.wakes, totals.drains, totals.drainWaitNs};
+    const auto finisherDrains = DriverDetail::DrawFinisher::DrainWaitTotals();
+    sample.committer = {totals.commits, totals.commitNs, totals.drawCommits, totals.drawNs, totals.enqueued, totals.fullWaitNs, totals.wakes, totals.drains, totals.drainWaitNs, finisherDrains.first, finisherDrains.second};
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (auto threads = PerformanceTrace::ThreadTotals()) {
             sample.threads = std::move(*threads);

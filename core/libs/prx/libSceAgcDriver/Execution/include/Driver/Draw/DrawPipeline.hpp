@@ -179,6 +179,7 @@ public:
     std::uint64_t Bypass();
     DrawPipeline::QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
     void Drain();
+    static std::pair<std::uint64_t, std::uint64_t> DrainWaitTotals();
     void Settle();
     void ReleaseRan();
     void RethrowFailure();

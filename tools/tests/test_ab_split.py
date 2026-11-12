@@ -279,6 +279,7 @@ class AbSplitTests(unittest.TestCase):
         self.assertAlmostEqual(first["committer us/draw"], 100.0)
         self.assertAlmostEqual(first["committer busy %"], 4.5)
         self.assertAlmostEqual(first["committer ms/present"], 4.5)
+        self.assertAlmostEqual(first["committer idle %"], 95.5)
         self.assertAlmostEqual(first["committer room wait ms/present"], 0.2)
         self.assertAlmostEqual(first["committer drain wait ms/present"], 0.3)
         self.assertAlmostEqual(first["draws/present"], 3.0)
