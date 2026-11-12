@@ -492,6 +492,7 @@ WriteChange WriteChangeOf(WriteBumpSource source) {
     case WriteBumpSource::Pending: return WriteChange::Authority;
     case WriteBumpSource::Unwatch:
     case WriteBumpSource::Import: return WriteChange::Capability;
+    case WriteBumpSource::Mirror: return WriteChange::Mirror;
     default: return WriteChange::Identity;
     }
 }

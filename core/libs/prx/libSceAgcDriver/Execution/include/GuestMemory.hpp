@@ -79,7 +79,7 @@ bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
 enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Mirror, Depth, Count };
-enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Count };
+enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Mirror, Count };
 constexpr std::uint32_t WriteChangeBit(WriteChange change) {
     return std::uint32_t{1} << static_cast<unsigned>(change);
 }

@@ -496,18 +496,23 @@ void CheckCrowdedKey() {
 }
 
 void CheckProducerBumps() {
-    const auto mirrors = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Identity));
+    const auto mirrors = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Mirror));
+    const auto guest = Subscribe(Base + 40 * Block, 2);
     const auto bytes = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Bytes));
     const auto mirrorSeen = ObserveSubscription(*mirrors);
     const auto bytesSeen = ObserveSubscription(*bytes);
+    const auto guestSeen = ObserveSubscription(*guest);
     BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Mirror);
     BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Depth);
     Require(ObserveSubscription(*mirrors) == mirrorSeen && ObserveSubscription(*bytes) == bytesSeen, "a producer bump of a disjoint range moved a subscription");
     BumpWrites(Base + 41 * Block, 4, WriteBumpSource::Depth);
-    Require(ObserveSubscription(*mirrors) == mirrorSeen, "a depth bump moved a subscription to identity changes only");
+    Require(ObserveSubscription(*mirrors) == mirrorSeen, "a depth bump moved a subscription to mirror changes only");
     Require(ObserveSubscription(*bytes) != bytesSeen, "a depth bump of the range did not move a subscription to byte changes");
+    const auto guestAfterDepth = ObserveSubscription(*guest);
+    Require(guestAfterDepth != guestSeen, "a depth bump of the range did not move a subscription to every guest change");
     BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Mirror);
-    Require(ObserveSubscription(*mirrors) != mirrorSeen, "a mirror bump of the range did not move a subscription to identity changes");
+    Require(ObserveSubscription(*mirrors) != mirrorSeen, "a mirror bump of the range did not move a subscription to mirror changes");
+    Require(ObserveSubscription(*guest) == guestAfterDepth, "a mirror bump moved a subscription to guest memory changes");
     bool refused = false;
     try {
         BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Driver);
