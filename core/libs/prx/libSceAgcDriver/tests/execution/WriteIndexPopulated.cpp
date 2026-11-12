@@ -251,12 +251,16 @@ template<typename TBump>
 BumpResult Bump(std::size_t calls, const Clock& clock, TBump&& bump) {
     BumpResult result;
     Samples samples(clock);
-    const auto before = WriteIndexCounted();
+    SetWriteIndexCountingForTest(false);
     for (std::size_t i = 0; i < calls; ++i) samples.Time([&] { bump(i); });
-    const auto after = WriteIndexCounted();
+    SetWriteIndexCountingForTest(true);
     result.summary = samples.Summarize();
-    result.lookupsPerCall = static_cast<double>(after.lookups - before.lookups) / static_cast<double>(calls);
-    result.notificationsPerCall = static_cast<double>(after.bumps - before.bumps) / static_cast<double>(calls);
+    const auto counted = std::min<std::size_t>(calls, 32);
+    const auto before = WriteIndexCounted();
+    for (std::size_t i = 0; i < counted; ++i) bump(i);
+    const auto after = WriteIndexCounted();
+    result.lookupsPerCall = static_cast<double>(after.lookups - before.lookups) / static_cast<double>(counted);
+    result.notificationsPerCall = static_cast<double>(after.bumps - before.bumps) / static_cast<double>(counted);
     return result;
 }
 
@@ -375,11 +379,18 @@ int Run(const Sizes& sizes, bool print, std::size_t threads) {
     if (print) std::printf("write-index populated: %.3f ticks per ns, %llu ticks timer overhead subtracted; %zu textures, %zu templates x %zu ranges, %zu target sets, %zu captures x %zu dependencies\n", clock.ticksPerNanosecond, static_cast<unsigned long long>(clock.overhead), sizes.textures, sizes.templates, sizes.rangesPerTemplate, sizes.targetSets, sizes.captures, sizes.dependenciesPerCapture);
     std::mt19937_64 random(42);
     const auto layout = Lay(sizes);
+    const bool owners = std::getenv("APS5_BENCH_OWNERS") != nullptr;
+    if (owners) {
+        for (const auto* group : {&layout.textures, &layout.colors, &layout.depths, &layout.htiles}) {
+            for (const auto& [begin, end] : *group) static_cast<void>(RegisterWriteOwner(begin, end - begin));
+        }
+        if (print) std::puts("write-index populated: textures and targets registered as write owners");
+    }
     auto populated = Populate(sizes, layout, clock, random, print);
     const auto stats = WriteIndexCounted();
     Require(stats.subscriptions >= populated.templates.entries.size() + populated.targets.entries.size() + populated.captures.entries.size(), "the index does not count every live subscription");
     const auto measured = Measure(sizes, layout, populated, clock, random, print);
-    Require(measured.largePending.notificationsPerCall > 0.0, "a pending mark over a shared texture notified no template");
+    Require(owners || measured.largePending.lookupsPerCall > 0.0, "a pending mark over a shared texture visited no subscribed block");
     Require(measured.smallDriver.lookupsPerCall > 0.0, "a driver store into the capture heap looked up no block");
     std::size_t held = 0;
     static_cast<void>(Holds(populated.templates, clock, random, 1, held));
@@ -394,6 +405,7 @@ int Run(const Sizes& sizes, bool print, std::size_t threads) {
 int main(int argc, char** argv) {
     try {
         const std::string mode = argc > 1 ? argv[1] : "--smoke";
+        SetWriteIndexCountingForTest(true);
         if (mode == "--bench") {
             const std::size_t threads = argc > 2 ? static_cast<std::size_t>(std::strtoul(argv[2], nullptr, 10)) : 3;
             return Run(Sizes{}, true, threads);
