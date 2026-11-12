@@ -9,6 +9,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -592,7 +593,120 @@ void CheckDomainOrder() {
     Require(mutantRead, "the reversed domain order mutant survived");
 }
 
+bool OwnerBumpVoids() {
+    const auto owner = RegisterWriteOwner(Base + 100 * Block, 4 * Block);
+    const auto subscription = Subscribe(Base + 101 * Block, 1, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(CertificateHolds(*subscription, certificate, 0), "a certificate on an owner did not hold with nothing changed");
+    Pending(Base + 103 * Block);
+    const bool voided = !CertificateHolds(*subscription, certificate, 0);
+    UnregisterWriteOwner(owner);
+    return voided;
+}
+
+void CheckOwners() {
+    const auto dependenciesBefore = WriteIndexCounted().ownerDependencies;
+    const auto first = RegisterWriteOwner(Base + 100 * Block, 4 * Block);
+    const auto second = RegisterWriteOwner(Base + 110 * Block, 2 * Block);
+    const auto inside = Subscribe(Base + 101 * Block, 1, WriteChangeAll, false);
+    const auto other = Subscribe(Base + 110 * Block, 1, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 101 * Block, 1, WriteChangeBit(WriteChange::Identity), false);
+    Require(WriteIndexCounted().ownerDependencies == dependenciesBefore + 3, "subscriptions inside owners did not take owner dependencies");
+    auto certificate = CertifySubscription(*inside, 0);
+    const auto otherCertificate = CertifySubscription(*other, 0);
+    const auto maskedCertificate = CertifySubscription(*masked, 0);
+    Pending(Base + 104 * Block + 16);
+    Require(CertificateHolds(*inside, certificate, 0), "a bump beside an owner voided a certificate inside it");
+    const auto fastBefore = WriteIndexCounted().ownerFastBumps;
+    Pending(Base + 103 * Block);
+    Require(WriteIndexCounted().ownerFastBumps == fastBefore + 1, "a bump inside an owner with no handle subscribers took the block walk");
+    Require(!CertificateHolds(*inside, certificate, 0), "a bump inside an owner left a certificate on that owner standing");
+    Require(CertificateHolds(*other, otherCertificate, 0), "a bump inside one owner voided a certificate on another");
+    Require(CertificateHolds(*masked, maskedCertificate, 0), "a bump outside the type mask voided a certificate on its owner");
+    {
+        const auto straddling = Subscribe(Base + 99 * Block, 2, WriteChangeAll, false);
+        const auto seen = ObserveSubscription(*straddling);
+        const auto fast = WriteIndexCounted().ownerFastBumps;
+        Pending(Base + 100 * Block + 8);
+        Require(ObserveSubscription(*straddling) != seen, "a bump inside an owner missed a subscription that straddles the owner's start");
+        Require(WriteIndexCounted().ownerFastBumps == fast, "a bump inside an owner with a straddling subscriber took the fast path");
+    }
+    const auto fast = WriteIndexCounted().ownerFastBumps;
+    Pending(Base + 102 * Block);
+    Require(WriteIndexCounted().ownerFastBumps == fast + 1, "the owner kept counting a straddling subscriber after it was released");
+    const auto early = Subscribe(Base + 120 * Block, 1, WriteChangeAll, false);
+    const auto third = RegisterWriteOwner(Base + 120 * Block, 2 * Block);
+    const auto earlySeen = ObserveSubscription(*early);
+    Pending(Base + 120 * Block + 16);
+    Require(ObserveSubscription(*early) != earlySeen, "a bump inside an owner registered after a subscription missed that subscription");
+    certificate = CertifySubscription(*inside, 0);
+    NoteGpuPending(Base + 104 * Block - 8, 16);
+    Require(!CertificateHolds(*inside, certificate, 0), "a bump across an owner's end left a certificate on that owner standing");
+    certificate = CertifySubscription(*inside, 0);
+    UnregisterWriteOwner(first);
+    Require(!CertificateHolds(*inside, certificate, 0), "a certificate on an owner held after the owner was unregistered");
+    UnregisterWriteOwner(second);
+    UnregisterWriteOwner(third);
+    Require(OwnerBumpVoids(), "a bump inside an owner left its certificate standing");
+    for (const auto mutant : {CertificateMutant::IgnoreOwners, CertificateMutant::HideOwnerBumps}) {
+        SetCertificateMutantForTest(mutant);
+        const bool caught = OwnerBumpVoids();
+        SetCertificateMutantForTest(CertificateMutant::None);
+        Require(!caught, "the owner test does not catch an owner mutant");
+    }
+}
+
+bool ThrowsOnRegister(std::uint64_t base, std::uint64_t bytes) {
+    try {
+        UnregisterWriteOwner(RegisterWriteOwner(base, bytes));
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
+}
+
+bool ObservationWithOwnerHolds() {
+    const WriteOwner owner(Base + 80 * Block, 2 * Block);
+    try {
+        CheckWithoutHistory();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+void CheckOwnerObservation() {
+    Require(ObservationWithOwnerHolds(), "the observation contract failed for subscriptions inside an owner");
+    SetCertificateMutantForTest(CertificateMutant::ObserveIgnoresOwners);
+    const bool mutantHolds = ObservationWithOwnerHolds();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(!mutantHolds, "the observation contract test does not catch an observation that ignores owners");
+    auto owner = std::make_unique<WriteOwner>(Base + 130 * Block, 2 * Block);
+    const auto subscription = Subscribe(Base + 130 * Block, 1, WriteChangeAll, false);
+    const auto seen = ObserveSubscription(*subscription);
+    Require(ObserveSubscription(*subscription) == seen, "observing an owner-backed subscription twice with nothing written moved it");
+    Pending(Base + 131 * Block);
+    const auto bumped = ObserveSubscription(*subscription);
+    Require(bumped != seen && ObserveSubscription(*subscription) == bumped, "an observe, bump, observe sequence on an owner-backed subscription did not move exactly once");
+    owner.reset();
+    const auto dead = ObserveSubscription(*subscription);
+    Require(dead != bumped && ObserveSubscription(*subscription) != dead, "an owner-backed subscription read as unchanged after its owner was unregistered");
+    Require(ThrowsOnRegister(~std::uint64_t{0} - Block, 2 * Block), "a write owner range that wraps around the address space was registered");
+    Require(!ThrowsOnRegister(Base + 140 * Block, Block), "a plain write owner range was refused");
+}
+
+void CheckCountingOff() {
+    const auto subscription = Subscribe(Base + 150 * Block, 1, WriteChangeAll, false);
+    SetWriteIndexCountingForTest(false);
+    const auto before = WriteIndexCounted();
+    Pending(Base + 150 * Block);
+    const auto after = WriteIndexCounted();
+    SetWriteIndexCountingForTest(true);
+    Require(after.calls == before.calls && after.bumps == before.bumps && after.lookups == before.lookups, "a bump updated the shared write index counters with counting off");
+}
+
 void CheckWriteIndex() {
+    SetWriteIndexCountingForTest(true);
     CheckObserveAndArm();
     CheckHistoryOutlivesTheArmedBit();
     CheckTypeMask();
@@ -605,6 +719,9 @@ void CheckWriteIndex() {
     CheckProducerBumps();
     CheckProducerDomains();
     CheckDomainOrder();
+    CheckOwners();
+    CheckOwnerObservation();
+    CheckCountingOff();
 }
 }
 

@@ -91,21 +91,45 @@ constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
 }
 struct WriteCertificate {
     std::uint64_t version = 0;
+    std::uint64_t owners = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
 };
 bool WriteIndexEnabled();
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false);
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false, bool owned = true);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
 std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
 std::uint64_t DomainVersion(WriteDomain domain);
 void BumpDomainVersion(WriteDomain domain);
 void BumpWrites(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source);
+std::uint64_t RegisterWriteOwner(std::uint64_t base, std::uint64_t bytes);
+void UnregisterWriteOwner(std::uint64_t owner);
+class WriteOwner {
+public:
+    WriteOwner() = default;
+    WriteOwner(std::uint64_t base, std::uint64_t bytes) : handle(RegisterWriteOwner(base, bytes)) {}
+    WriteOwner(const WriteOwner&) = delete;
+    WriteOwner& operator=(const WriteOwner&) = delete;
+    WriteOwner(WriteOwner&& other) noexcept : handle(std::exchange(other.handle, 0)) {}
+    WriteOwner& operator=(WriteOwner&& other) noexcept {
+        if (this != &other) {
+            UnregisterWriteOwner(handle);
+            handle = std::exchange(other.handle, 0);
+        }
+        return *this;
+    }
+    ~WriteOwner() { UnregisterWriteOwner(handle); }
+    std::uint64_t Handle() const { return handle; }
+
+private:
+    std::uint64_t handle = 0;
+};
 WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners };
 void SetCertificateMutantForTest(CertificateMutant mutant);
+void SetWriteIndexCountingForTest(bool counting);
 using DomainReadObserver = void (*)(WriteDomain domain);
 void SetDomainReadObserverForTest(DomainReadObserver observer);
 class CoveredCommitScope {
@@ -138,6 +162,9 @@ struct WriteIndexStats {
     std::uint64_t sweepFailures = 0;
     std::uint64_t overflows = 0;
     std::uint64_t lookupNanoseconds = 0;
+    std::uint64_t ownerBumps = 0;
+    std::uint64_t ownerFastBumps = 0;
+    std::uint64_t ownerDependencies = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
     std::array<std::array<std::uint64_t, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };

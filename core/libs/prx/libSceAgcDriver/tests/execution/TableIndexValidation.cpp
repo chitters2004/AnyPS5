@@ -500,6 +500,7 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
 
 int main(int argc, char** argv) {
     try {
+        GuestMemory::SetWriteIndexCountingForTest(true);
 #ifdef _WIN32
         _putenv_s("APS5_TABLE_INDEX", "1");
 #else

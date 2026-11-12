@@ -546,6 +546,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         const auto guestBytes = geometry.guestBytes;
         AgcDriver::LiveResourceRing::Instance().Note(descriptor.baseAddress, guestBytes, "texture");
+        if (guestBytes != 0 && (GuestMemory::WriteIndexEnabled() || CertifiedProofs())) owner = GuestMemory::WriteOwner(descriptor.baseAddress, guestBytes);
         const auto slabBytes = geometry.layerBytes;
         const auto snapshotSize = staging != nullptr ? staging->Bytes().size() : snapshot.size();
         Require(clear == nullptr || !packedSlabs.has_value(), "a cleared texture takes no snapshot, so it has no committed slabs");
@@ -1759,6 +1760,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
+        if (guestBytes != 0 && (GuestMemory::WriteIndexEnabled() || CertifiedProofs())) owner = GuestMemory::WriteOwner(descriptor.baseAddress, guestBytes);
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.

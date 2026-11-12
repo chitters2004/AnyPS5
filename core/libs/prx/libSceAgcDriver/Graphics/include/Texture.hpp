@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -177,6 +178,7 @@ private:
     bool repackCopy = false;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
     std::uint32_t copyTexelsPerElement = 4;
+    GuestMemory::WriteOwner owner;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
@@ -769,6 +771,7 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
+    GuestMemory::WriteOwner owner;
     std::vector<std::byte> original;
     struct ComparedRange {
         std::uint64_t address = 0;

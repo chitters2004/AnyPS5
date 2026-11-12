@@ -4288,7 +4288,7 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
             entry.known = true;
         }
     }
-    writeSubscription = GuestMemory::SubscribeWrites(ranges, GuestMemory::WriteChangeAll, GuestMemory::WriteIndexEnabled());
+    writeSubscription = GuestMemory::SubscribeWrites(ranges, GuestMemory::WriteChangeAll, GuestMemory::WriteIndexEnabled(), !RuntimeSwitches::Set(RuntimeSwitch::NoWriteOwners));
 }
 
 void ShaderResources::subscribeBuilt(std::span<const CompiledShader> shaders) {
