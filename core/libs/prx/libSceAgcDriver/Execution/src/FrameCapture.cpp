@@ -6,6 +6,7 @@
 #include <cstring>
 #include <future>
 #include <iterator>
+#include <memory>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -386,7 +387,7 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
     }
 
     const auto memoryPath = directory / FrameCaptureWriter::MemoryName;
-    std::ifstream memory(memoryPath, std::ios::binary);
+    memory.open(memoryPath, std::ios::binary);
     requireCapture(memory.is_open(), "cannot open " + memoryPath.string());
     memory.seekg(0, std::ios::end);
     const auto size = static_cast<std::uint64_t>(memory.tellg());
@@ -460,14 +461,15 @@ bool FrameCaptureReader::Truncated() const {
 void FrameCaptureReader::Read(const FrameMemoryChunk& chunk, std::span<std::byte> destination) const {
     requireCapture(chunk.kind != FrameMemoryKind::Range, "a range chunk has no bytes");
     requireCapture(destination.size() == chunk.bytes, "destination size does not match the chunk");
-    const auto path = directory / FrameCaptureWriter::MemoryName;
-    std::ifstream memory(path, std::ios::binary);
-    requireCapture(memory.is_open(), "cannot open " + path.string());
-    std::vector<std::byte> compressed(chunk.compressedBytes);
-    memory.seekg(static_cast<std::streamoff>(chunk.offset));
-    memory.read(reinterpret_cast<char*>(compressed.data()), static_cast<std::streamsize>(compressed.size()));
-    requireCapture(memory.good(), "cannot read " + path.string());
-    const auto written = ZSTD_decompress(destination.data(), destination.size(), compressed.data(), compressed.size());
+    const auto compressed = std::make_unique_for_overwrite<std::byte[]>(chunk.compressedBytes);
+    {
+        const std::scoped_lock lock(memoryMutex);
+        memory.clear();
+        memory.seekg(static_cast<std::streamoff>(chunk.offset));
+        memory.read(reinterpret_cast<char*>(compressed.get()), static_cast<std::streamsize>(chunk.compressedBytes));
+        requireCapture(memory.good(), "cannot read " + (directory / FrameCaptureWriter::MemoryName).string());
+    }
+    const auto written = ZSTD_decompress(destination.data(), destination.size(), compressed.get(), chunk.compressedBytes);
     requireCapture(ZSTD_isError(written) == 0, std::string("zstd: ") + ZSTD_getErrorName(written));
     requireCapture(written == chunk.bytes, "chunk at " + std::to_string(chunk.address) + " decompressed to the wrong size");
 }

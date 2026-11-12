@@ -127,6 +127,8 @@ public:
 
 private:
     std::filesystem::path directory;
+    mutable std::mutex memoryMutex;
+    mutable std::ifstream memory;
     std::vector<FrameCall> calls;
     std::vector<FrameMemoryChunk> chunks;
     std::string header;
