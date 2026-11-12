@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -57,6 +58,39 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+
+enum class ComparedKind : std::uint8_t { Texture, Table, DrawInput, Count };
+constexpr std::size_t ComparedSourceColumns = static_cast<std::size_t>(GuestMemory::ExclusionSource::Count) + 1;
+std::array<std::array<ProfileCounter, ComparedSourceColumns>, static_cast<std::size_t>(ComparedKind::Count)> comparedSources;
+
+bool ComparedSourcesCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return counted;
+}
+
+void CountComparedSources(ComparedKind kind, std::uint64_t address, std::size_t bytes) {
+    if (!ComparedSourcesCounted()) return;
+    auto& row = comparedSources[static_cast<std::size_t>(kind)];
+    const auto mask = GuestMemory::UnwatchedSources(address, bytes);
+    if (mask == 0) row.back().Add();
+    for (std::size_t source = 0; source + 1 < ComparedSourceColumns; ++source) {
+        if ((mask & (std::uint32_t{1} << source)) != 0) row[source].Add();
+    }
+}
+
+std::string ComparedSourcesText() {
+    constexpr std::array<const char*, static_cast<std::size_t>(ComparedKind::Count)> kinds{"textures", "tables", "draw-inputs"};
+    std::string text;
+    for (std::size_t kind = 0; kind < kinds.size(); ++kind) {
+        text += std::string(kind == 0 ? " " : "; ") + kinds[kind] + ":";
+        for (std::size_t source = 0; source < ComparedSourceColumns; ++source) {
+            const auto count = comparedSources[kind][source].Take();
+            if (count == 0) continue;
+            text += " " + std::string(source + 1 < ComparedSourceColumns ? GuestMemory::ExclusionSourceName(static_cast<GuestMemory::ExclusionSource>(source)) : "never-excluded") + " " + std::to_string(count);
+        }
+    }
+    return text;
+}
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
@@ -4612,6 +4646,7 @@ void reportCertifiedProofs() {
     const auto inputs = CertifiedDrawInputsCounted();
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified draw inputs (10 s): %llu served by a certificate (%llu after a sweep), %llu missed, %llu certificates issued, %llu refused as unwatched\n", static_cast<unsigned long long>(inputs.hits - reportedInputs.hits), static_cast<unsigned long long>(inputs.sweeps - reportedInputs.sweeps), static_cast<unsigned long long>(inputs.misses - reportedInputs.misses), static_cast<unsigned long long>(inputs.certified - reportedInputs.certified), static_cast<unsigned long long>(inputs.unwatched - reportedInputs.unwatched));
     reportedInputs = inputs;
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] compared ranges by exclusion source (10 s):%s\n", ComparedSourcesText().c_str());
     reported = now;
     reportedFlips = flips;
 }
@@ -4641,6 +4676,7 @@ bool CertifiedDrawInputs() {
 
 std::optional<RangeCertificate> CertifyRange(std::uint64_t address, std::size_t bytes) {
     if (!GuestMemory::Watched(address, bytes)) {
+        CountComparedSources(ComparedKind::DrawInput, address, bytes);
         DrawInputCounters().unwatched.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
@@ -4765,6 +4801,7 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
             continue;
         }
         if (!GuestMemory::Watched(begin, static_cast<std::size_t>(bytes))) {
+            CountComparedSources(ComparedKind::Texture, begin, static_cast<std::size_t>(bytes));
             comparedTextures.push_back(i);
             continue;
         }
@@ -4788,6 +4825,7 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
                 ranges.emplace_back(base, base + size);
                 for (auto block = GuestMemory::WriteBlockOf(base); block <= GuestMemory::WriteBlockOf(base + size - 1); ++block) subscribedBlocks.emplace_back(block, TableSpanElement);
             } else if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(size))) {
+                CountComparedSources(ComparedKind::Table, base, static_cast<std::size_t>(size));
                 std::vector<std::byte> copy(static_cast<std::size_t>(size));
                 std::memcpy(copy.data(), reinterpret_cast<const void*>(base), copy.size());
                 comparedTableSpans.emplace_back(base, std::move(copy));

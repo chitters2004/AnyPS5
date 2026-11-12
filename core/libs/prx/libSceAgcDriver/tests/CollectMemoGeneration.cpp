@@ -799,8 +799,66 @@ void CheckWriteIndex() {
 }
 }
 
+bool HasSource(std::uint64_t address, std::size_t bytes, ExclusionSource source) {
+    return (UnwatchedSources(address, bytes) & (std::uint32_t{1} << static_cast<unsigned>(source))) != 0;
+}
+
+bool ExplicitUnwatchNamed(std::uint64_t address) {
+    Unwatch(address, Page);
+    return HasSource(address, Page, ExclusionSource::Explicit);
+}
+
+void CheckExclusionSources() {
+    const auto explicitAt = Base + 40 * Page;
+    Require(ExplicitUnwatchNamed(explicitAt), "an explicit unwatch was not attributed");
+    Require(!HasSource(explicitAt + Page, Page, ExclusionSource::Explicit), "a page next to an explicit unwatch was attributed");
+    const auto importAt = Base + 48 * Page;
+    Require(ImportWatched(importAt, 2 * Page, [] { return true; }, false), "the compared import failed");
+    Require(HasSource(importAt, 2 * Page, ExclusionSource::ComparedImport) && !HasSource(importAt, 2 * Page, ExclusionSource::Explicit), "a compared import was not attributed as one");
+    Require(ExplicitUnwatchNamed(importAt) && !HasSource(importAt, Page, ExclusionSource::ComparedImport) && HasSource(importAt + Page, Page, ExclusionSource::ComparedImport), "a later exclusion did not replace the source of its own pages only");
+#ifndef _WIN32
+    const auto walkAt = Base + 56 * Page;
+    {
+        const std::lock_guard lock(Fake().mutex);
+        Fake().failWalks = true;
+    }
+    const bool imported = ImportWatched(walkAt, Page, [] { return true; }, true);
+    {
+        const std::lock_guard lock(Fake().mutex);
+        Fake().failWalks = false;
+    }
+    Require(imported && HasSource(walkAt, Page, ExclusionSource::ImportWalk), "an import whose walk failed was not attributed to the walk");
+#endif
+    SetCertificateMutantForTest(CertificateMutant::DropExclusionSources);
+    const bool caught = !ExplicitUnwatchNamed(Base + 60 * Page);
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(caught, "dropping exclusion sources still attributed the unwatch, so the case tests nothing");
+    std::vector<std::byte> expected(Page);
+    std::memcpy(expected.data(), reinterpret_cast<const void*>(Base), Page);
+    const auto firstLine = static_cast<std::uint32_t>(__LINE__ + 1);
+    Require(EqualsCommitted(Base, expected), "the first compared site differs");
+    const auto secondLine = static_cast<std::uint32_t>(__LINE__ + 1);
+    Require(EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)) && EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)), "the second compared site differs");
+    Require(CompareSiteBytesForTest(firstLine) == Page && CompareSiteBytesForTest(secondLine) == Page, "compared bytes were not attributed to their call sites");
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--sources") {
+#ifdef _WIN32
+            _putenv_s("APS5_PROFILE_DRAW", "1");
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            setenv("APS5_PROFILE_DRAW", "1", 1);
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            CheckExclusionSources();
+            std::cout << "exclusion source test passed\n";
+            return 0;
+        }
         const bool writeIndexOnly = argc == 2 && std::string(argv[1]) == "--write-index";
 #ifdef _WIN32
         if (!WriteWatched()) {
