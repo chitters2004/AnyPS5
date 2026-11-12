@@ -118,7 +118,6 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
-    stageCapture.userDataUse = capture->userDataUse;
     stageCapture.linkedCode = linkedCode;
     stageCapture.convertedSamples = invocation.Request().context.convertedSamples;
     stageCapture.layerRowSamples = invocation.Request().context.layerRowSamples;
@@ -248,7 +247,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
             const bool relocatable = decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0);
-            tagVariantRuns(*variant, regions, stageCapture.userDataUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
+            const ShaderRecompiler::SrtUserDataUse emptyUse;
+            tagVariantRuns(*variant, regions, stageCapture.capture != nullptr ? stageCapture.capture->userDataUse : emptyUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
             if (relocatable) tagUserValueWords(*variant, programs[i]);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
