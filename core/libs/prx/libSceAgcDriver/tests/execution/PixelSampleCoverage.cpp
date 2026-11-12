@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -430,9 +431,9 @@ int main() {
         Expect(*device, PixelInputBit(PixelInput::SampleCoverage), 0u, "SAMPLE_COVERAGE alone");
         Expect(*device, PixelInputBit(PixelInput::PerspectiveCenter) | PixelInputBit(PixelInput::SampleCoverage), 2u, "SAMPLE_COVERAGE after the perspective center");
         Expect(*device, PixelInputBit(PixelInput::Ancillary) | PixelInputBit(PixelInput::SampleCoverage), 1u, "SAMPLE_COVERAGE after ANCILLARY");
-        if (!ExpectMerged(*device)) std::puts("merged coverage not tested: the device lacks VK_NV_framebuffer_mixed_samples with merged coverage reduction");
-        if (const auto skipped = ExpectTruncated(*device); !skipped.empty()) std::printf("truncated coverage not tested: %s\n", skipped.c_str());
-        if (const auto skipped = ExpectOneFragment(*device); !skipped.empty()) std::printf("one-fragment coverage not tested: %s\n", skipped.c_str());
+        if (!ExpectMerged(*device)) NotTested("merged coverage not tested: the device lacks VK_NV_framebuffer_mixed_samples with merged coverage reduction");
+        if (const auto skipped = ExpectTruncated(*device); !skipped.empty()) NotTested("truncated coverage not tested: ", skipped);
+        if (const auto skipped = ExpectOneFragment(*device); !skipped.empty()) NotTested("one-fragment coverage not tested: ", skipped);
         std::puts("pixel sample coverage tests passed");
         return 0;
     } catch (const std::exception& error) {

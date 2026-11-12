@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -341,7 +342,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
         return device.FillBuffer(AddressOf(keys + offset), bytes, pattern);
     };
     if (!fill(0, KeyBytes, 0x5a)) {
-        std::puts("the key range has no host import: pending key fills are not tested");
+        NotTested("the key range has no host import: pending key fills are not tested");
         return;
     }
     if (watched && !AgcDriver::GuestMemory::Watched(AddressOf(block), BlockBytes)) {
@@ -776,7 +777,7 @@ void RunClearKeepsSnapshot(AgcDriver::VulkanDevice& device, std::uint8_t* block)
     const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
     Require(image != nullptr, "clear snapshot: the written surface has no pending image");
     if (AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
-        std::puts("the unwatched block is write-watched: the fast-clear snapshot is not tested");
+        NotTested("the unwatched block is write-watched: the fast-clear snapshot is not tested");
         StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
         device.WaitIdle();
         return;
@@ -845,7 +846,7 @@ void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
     Require(image != nullptr, "import window: the written surface has no pending image");
     if (!AgcDriver::GuestMemory::Watched(surface, SurfaceBytes)) {
-        std::puts("host imports are compared, not watched: the import window is not tested");
+        NotTested("host imports are compared, not watched: the import window is not tested");
         StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
         device.WaitIdle();
         return;
@@ -889,7 +890,7 @@ void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const auto image = StorageTexture::FindPending(address, BlockBytes);
     Require(image != nullptr && image->GuestBytes() == BlockBytes, "hinted import: the two-block image has no pending results");
     if (Watched(address, BlockBytes)) {
-        std::puts("the write-watched image stayed watched: its untracked hint is not tested");
+        NotTested("the write-watched image stayed watched: its untracked hint is not tested");
         StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
         device.WaitIdle();
         return;
@@ -1100,7 +1101,7 @@ int main(int argc, char** argv) {
             RunHintedImport(*device, hinted->Data());
 #endif
         } else {
-            std::puts("guest memory has no write watch: a write-watched surface is not tested");
+            NotTested("guest memory has no write watch: a write-watched surface is not tested");
         }
         std::puts("DCC keys first write tests passed");
         return 0;

@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -1196,7 +1197,7 @@ const char* DccComparedImportTests(AgcDriver::VulkanDevice& device, std::uint32_
                 Draw(device, target, false, Float32Export, Program(written, Float32Export, 1u), false, true);
             } catch (const std::runtime_error& error) {
                 if (mode >= 7 && mode != 11 && std::string_view(error.what()) == deviceLimit) {
-                    std::printf("8 samples, %s: the FMASK passed the initial import checks, then %s, so its reuse is not tested\n", fmaskCase, error.what());
+                    NotTested("8 samples, ", fmaskCase, ": the FMASK passed the initial import checks, then ", error.what(), ", so its reuse is not tested");
                     programCount = 0;
                     continue;
                 }

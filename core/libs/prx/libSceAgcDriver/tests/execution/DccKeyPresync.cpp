@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -371,7 +372,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         if (!device->CanWaitUnlocked()) {
-            std::puts("skipped, the device has no timeline semaphores: the pre-sync is not tested");
+            NotTested("skipped, the device has no timeline semaphores: the pre-sync is not tested");
             return VulkanTestSkipped;
         }
         GuestBlock locked;

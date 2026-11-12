@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -281,7 +282,7 @@ void RunPendingWriteBack(AgcDriver::VulkanDevice& device, const GuestBlock& bloc
     const auto& context = device.graphicsContext();
     if (AgcDriver::Graphics::HostImportCovers(context, AddressOf(block.Texels(13)), TextureBytes) || !AgcDriver::Graphics::AnyPendingCpuWrites(context) || Row(block.Texels(13)) != old) {
         device.WaitIdle();
-        std::puts("a dispatch's write-back over a table entry was not left pending: a table used over a pending write-back is not tested");
+        NotTested("a dispatch's write-back over a table entry was not left pending: a table used over a pending write-back is not tested");
         return;
     }
     const auto sampled = Dispatch(device, result, 13);
@@ -296,11 +297,11 @@ void RunViewedStore(AgcDriver::VulkanDevice& device, const GuestBlock& block, co
     const auto& context = device.graphicsContext();
     if (context.hostImportAlignment == 0 || AgcDriver::Graphics::HostImportFor(context, AddressOf(block.Table()), BlockBytes) == nullptr) {
         Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "image table reuse: storage-viewed entries require host imports");
-        std::puts("host imports are unavailable: a table of storage-viewed entries is not tested");
+        NotTested("host imports are unavailable: a table of storage-viewed entries is not tested");
         return;
     }
     if (!AgcDriver::GuestMemory::WriteWatched()) {
-        std::puts("guest memory has no write watch: a table of storage-viewed entries is not tested");
+        NotTested("guest memory has no write watch: a table of storage-viewed entries is not tested");
         return;
     }
     for (std::uint32_t texture = 0; texture < Records; ++texture) {
@@ -367,7 +368,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     thread.join();
     const auto poolsNow = device.graphicsContext().descriptorCache->Counters();
     chained = poolsNow.dedicatedPools + poolsNow.reusedSets == pools.dedicatedPools + pools.reusedSets;
-    if (chained) std::puts("the table's descriptor set fits the shared pool chain: kept table sets are not tested");
+    if (chained) NotTested("the table's descriptor set fits the shared pool chain: kept table sets are not tested");
     Require(unbumped[0] == Row(block.Texels(3)) && unbumped[1] == Row(block.Texels(3)), "image table reuse: a thread without a collect epoch sampled the wrong entry");
     Expect(before, 0, 2, "a thread without a collect epoch");
 
@@ -378,7 +379,7 @@ void RunTests(AgcDriver::VulkanDevice& device, const GuestBlock& block, const Gu
     Require(Dispatch(device, result, 5) == Row(block.Texels(5)), "image table reuse: the third dispatch of the epoch sampled the wrong entry");
     if (!watched) {
         Expect(before, 0, 3, "guest memory without a write watch");
-        std::puts("guest memory has no write watch: image table reuse is not tested");
+        NotTested("guest memory has no write watch: image table reuse is not tested");
         return;
     }
     Expect(before, 2, 1, "three dispatches of one table in one epoch");

@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
@@ -130,7 +131,7 @@ int main() {
             }
             spinDispatches *= 2u;
         }
-        std::cout << "the producer's label always reached memory before the table was filled: gated dispatch capture not tested\n";
+        NotTested("the producer's label always reached memory before the table was filled: gated dispatch capture not tested");
         AgcDriverShutdown_nid_postfix();
         return VulkanTestSkipped;
     } catch (const std::exception& error) {

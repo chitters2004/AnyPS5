@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -565,12 +566,12 @@ bool resourceCacheTests(Context context, const std::string& mode) {
 
 void viewTests(const Context& context) {
     if (context.hostImportAlignment == 0) {
-        std::puts("host imports unavailable: views of storage images not tested");
+        NotTested("host imports unavailable: views of storage images not tested");
         return;
     }
     Block block(context);
     if (HostImportFor(context, block.Surface(0), BlockBytes) == nullptr) {
-        std::puts("host import of the texture block refused: views of storage images not tested");
+        NotTested("host import of the texture block refused: views of storage images not tested");
         return;
     }
     const auto before = TextureCacheUsage();
@@ -761,7 +762,7 @@ void snapshotTests(const Context& context) {
     const auto tiny = Sampled(context, block.Surface(0), TinySide);
     const auto guestBytes = DescribeSurface(Resource(block.Surface(0), TinySide)).guestBytes;
     if (tiny->AllocationBytes() >= guestBytes) {
-        std::printf("the 16x16 snapshot's image takes %llu bytes, not less than its %llu guest bytes: counting the allocation alone not tested\n", static_cast<unsigned long long>(tiny->AllocationBytes()), static_cast<unsigned long long>(guestBytes));
+        NotTested("the 16x16 snapshot's image takes ", tiny->AllocationBytes(), " bytes, not less than its ", guestBytes, " guest bytes: counting the allocation alone not tested");
         return;
     }
     Require(TextureCacheUsage().sampledBytes == tiny->AllocationBytes(), "a snapshot whose " + std::to_string(tiny->AllocationBytes()) + "-byte image is smaller than its " + std::to_string(guestBytes) + " guest bytes counted " + std::to_string(TextureCacheUsage().sampledBytes) + " bytes, not its allocation");
@@ -782,7 +783,7 @@ void recycleTests(const Context& context) {
     Require(third != second, "the replaced snapshot's size-equal buffer was not reread from guest memory");
     Require(Sampled(context, address) == third, "an unchanged surface did not serve its remade snapshot");
     if (!context.textureCompressionBC) {
-        std::puts("BC compressed textures unavailable: a big fast-cleared snapshot taking the parked spare of its size not tested");
+        NotTested("BC compressed textures unavailable: a big fast-cleared snapshot taking the parked spare of its size not tested");
         return;
     }
     constexpr std::uint32_t BigSide = Side * 2;
@@ -799,7 +800,7 @@ void recycleTests(const Context& context) {
 
 void spareAgeTests(const Context& context) {
     if (!context.textureCompressionBC) {
-        std::puts("BC compressed textures unavailable: spare snapshot expiry and reuse not tested");
+        NotTested("BC compressed textures unavailable: spare snapshot expiry and reuse not tested");
         return;
     }
     Block block(context);

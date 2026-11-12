@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -157,7 +158,7 @@ void RunStampedBlocks(AgcDriver::VulkanDevice& device, GuestBlock& guest) {
     const auto base = guest.Address();
     Dispatch(device, 32, guest.Data());
     if (!GuestMemory::Watched(base, 2 * BlockBytes)) {
-        std::printf("host imports are compared, not watched: stamped blocks at 0x%llx not tested\n", static_cast<unsigned long long>(base));
+        NotTested("host imports are compared, not watched: stamped blocks at 0x", std::hex, base, std::dec, " not tested");
         return;
     }
     for (int use = 0; use < 2; ++use) {

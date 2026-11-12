@@ -1,3 +1,4 @@
+#include "NotTested.hpp"
 #include "BdaShader.hpp"
 #include "ColorTransferTests.hpp"
 #include "HostImportFailure.hpp"
@@ -259,7 +260,7 @@ int main(int argc, char** argv) {
         buffer.Bytes()[255] = std::byte{0x5a};
         Require(buffer.Bytes()[255] == std::byte{0x5a}, "real BDA buffer mapping failed");
         if (device->RunsOnCpu()) {
-            std::cout << "CPU Vulkan device: BDA read and multi-dword write execution not tested\n";
+            NotTested("CPU Vulkan device: BDA read and multi-dword write execution not tested");
         } else {
             RunBdaExecutionTests(device->GetContext());
         }

@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -136,7 +137,7 @@ void CheckCachedImage(AgcDriver::VulkanDevice& device, bool sampled, bool draw) 
     Require(revalidate(&proof), "the unchanged image resources failed their initial proof");
     if (std::getenv("APS5_NO_FAST_REVALIDATE") == nullptr) {
         if (AgcDriver::GuestMemory::Watched(address, Side * Side * 4u)) Require(proof.path == ShaderResources::ProofPath::Fast, "the fixture did not exercise the fast image proof");
-        else std::puts("image memory is compared, not watched: fast image proof not tested; checking the image guards through the full proof");
+        else NotTested("image memory is compared, not watched: fast image proof not tested; checking the image guards through the full proof");
     }
     ColorTarget target{};
     target.address = address + BlockBytes;

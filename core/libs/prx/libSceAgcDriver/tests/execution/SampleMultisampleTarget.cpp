@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -736,7 +737,7 @@ void CheckNativeIndices(AgcDriver::VulkanDevice& device, const Block& source, co
 void CheckOverwrittenTarget(AgcDriver::VulkanDevice& device) {
     Block reused(4u * BlockBytes, true);
     if (!AgcDriver::GuestMemory::Watched(reused.Address(), reused.bytes)) {
-        std::puts("overwritten target retirement not tested: the guest block is not write-watched");
+        NotTested("overwritten target retirement not tested: the guest block is not write-watched");
         return;
     }
     const auto color = DecodeTarget(reused);
@@ -784,7 +785,7 @@ bool Refused(std::uint64_t address, std::size_t bytes, const char* access) {
 void CheckClaimedTargets(AgcDriver::VulkanDevice& device) {
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_2_BIT) == 0 || (context.limits.framebufferStencilSampleCounts & VK_SAMPLE_COUNT_2_BIT) == 0) {
-        std::puts("claimed target retirement not tested: the device cannot render two-sample color and stencil");
+        NotTested("claimed target retirement not tested: the device cannot render two-sample color and stencil");
         return;
     }
     const auto bindStencil = [&](const Block& plane, const Block& depth) {
@@ -843,7 +844,7 @@ void CheckClaimedTargets(AgcDriver::VulkanDevice& device) {
         AgcDriver::Graphics::ClearDepthSurfaces(context.device);
         Require(refused, "a 2x target that a dispatch stored to after a D32S8 target's stencil plane was bound over it is not guarded");
     } else {
-        std::puts("a dispatch's store after a claim not tested: storage image multisampling unavailable");
+        NotTested("a dispatch's store after a claim not tested: storage image multisampling unavailable");
     }
     {
         Block fmask(BlockBytes);
@@ -1416,7 +1417,7 @@ int NativeVertexInput(std::unique_ptr<AgcDriver::VulkanDevice>& device) {
     } releaseDevice{device};
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
     if (context.hostImportAlignment == 0u) {
-        std::puts("native vertex input not tested: host imports unavailable");
+        NotTested("native vertex input not tested: host imports unavailable");
         return VulkanTestSkipped;
     }
     const auto color = DecodeTarget(source);
@@ -1732,7 +1733,7 @@ int main(int argc, char** argv) {
         Block integer(4u * BlockBytes);
         Block signedFill(BlockBytes);
         if ((AgcDriver::VulkanDeviceTestAccess::ContextOf(*device).limits.sampledImageIntegerSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0) {
-            std::puts("DIM 2D reads of 4x 8_8_8_8_UINT and 8_8_8_8_SINT targets not tested: sampledImageIntegerSampleCounts lacks VK_SAMPLE_COUNT_4_BIT");
+            NotTested("DIM 2D reads of 4x 8_8_8_8_UINT and 8_8_8_8_SINT targets not tested: sampledImageIntegerSampleCounts lacks VK_SAMPLE_COUNT_4_BIT");
         } else {
             Draw(*device, TargetState(DecodeUintTarget(integer)), 0, 2u, Uint8PixelCode);
             const auto integerSamples = LoadSamples(*device, integer, Format8888Uint);

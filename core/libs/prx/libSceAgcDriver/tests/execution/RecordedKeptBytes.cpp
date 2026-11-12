@@ -1,3 +1,4 @@
+#include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -283,7 +284,7 @@ bool SnapshotDraws(AgcDriver::VulkanDevice& device, GuestBuffer& pixels) {
     auto& recorder = ActiveRecorder();
     Require(recorder.Recording(), "recorded kept bytes: the snapshot draw was not left in the open batch");
     if (recorder.ReusableDrawSnapshot(AddressOf(vertices.Data()), BufferBytes) == nullptr) {
-        std::puts("the draw took no reusable snapshot (no host import, or the buffer is not write-watched): draw snapshots are not tested");
+        NotTested("the draw took no reusable snapshot (no host import, or the buffer is not write-watched): draw snapshots are not tested");
         device.WaitIdle();
         return false;
     }
@@ -309,7 +310,7 @@ int main() {
         ResidentTarget(*device, pixels);
         CopiedDraw(*device, pixels);
         const bool snapshots = SnapshotDraws(*device, pixels);
-        std::printf("recorded kept bytes tests passed%s\n", snapshots ? "" : " (draw snapshots not tested)");
+        std::printf("recorded kept bytes tests passed%s\n", snapshots ? "" : " (without draw snapshots)");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

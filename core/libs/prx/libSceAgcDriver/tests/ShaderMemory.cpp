@@ -1,3 +1,4 @@
+#include "NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -5777,7 +5778,7 @@ void verifyPointerTableUnwrittenReuse() {
     auto* root = AllocateWatchedTable(Bytes);
     const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(root));
     if (AgcDriver::GuestMemory::CollectWrites(base, Bytes) == 0) {
-        std::puts("pointer table unwritten reuse: guest memory has no write watch, not tested");
+        NotTested("pointer table unwritten reuse: guest memory has no write watch, not tested");
         return;
     }
     static std::array<std::uint32_t, 8> keys{};
