@@ -308,6 +308,42 @@ bool EncodedMasks(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkCo
     return true;
 }
 
+bool FallbackAfterEncodedState(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkColorComponentFlags all, VkColorComponentFlags redBlue) {
+    using namespace AgcDriver::Graphics;
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the device has no active recorder");
+    if (!recorder->Encodes()) return false;
+    const auto context = device.graphicsContext();
+    const auto shaders = Stages(device, compiled);
+    const std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const bool configured = RuntimeSwitches::Set(RuntimeSwitch::NoDrawOps);
+    struct Restore {
+        bool configured;
+        ~Restore() { RuntimeSwitches::Assign(RuntimeSwitch::NoDrawOps, configured); }
+    } restore{configured};
+    const MaskTrace trace(context);
+    const auto continued = [] { return DrawPassTotals()[0].passesContinued; };
+    AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, shaders);
+    const auto passes = continued();
+    const auto breaks = DrawPassBreaks();
+    const auto before = DrawOpsTotals();
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawOps, true);
+    AgcDriver::Graphics::Draw(context, StateFor(redBlue, true, false), FullScreen, shaders);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawOps, false);
+    AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, shaders);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawOps, true);
+    const auto sets = MaskSets.load();
+    AgcDriver::Graphics::Draw(context, StateFor(redBlue, true, false), FullScreen, shaders);
+    ExpectSets(sets, 1u, "a fallback draw after an encoded draw state record");
+    Require(continued() == passes + 3u, "the fallback, encoded and fallback draws did not all continue the open pass; breaks:" + BreaksSince(breaks));
+    const auto after = DrawOpsTotals();
+    Require(after.recorded - before.recorded == 1u && after.fallbacks - before.fallbacks == 2u, "the draws between fallback and encoded state recorded " + std::to_string(after.recorded - before.recorded) + " draw state records and " + std::to_string(after.fallbacks - before.fallbacks) + " fallbacks, not 1 and 2");
+    recorder->Submit();
+    recorder->Sync();
+    ExpectMasks({redBlue}, "a fallback draw after an encoded draw state record changed the color write mask");
+    return true;
+}
+
 bool EncodedSets(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Shaders& empty, VkColorComponentFlags all) {
     using namespace AgcDriver::Graphics;
     auto* recorder = Recorder::Active();
@@ -384,10 +420,11 @@ int main() {
         if (dynamic) Require(SameCounters(counters, after), "draws that differ only in their color write mask built or linked another pipeline: linked " + std::to_string(counters.linked) + " -> " + std::to_string(after.linked) + ", fragment output libraries " + std::to_string(counters.built[3]) + " -> " + std::to_string(after.built[3]));
         const bool multisampled = (device->graphicsContext().limits.framebufferColorSampleCounts & Samples) != 0;
         const bool encoded = dynamic && multisampled && EncodedMasks(*device, compiled, all, redBlue);
+        const bool fallback = dynamic && multisampled && FallbackAfterEncodedState(*device, compiled, all, redBlue);
         const bool encodedSets = EncodedSets(*device, compiled, Compile(*device, EmptyStorage), all);
         if (dynamic && multisampled) RecordedMasks(*device, compiled, all, redBlue);
         const bool fresh = dynamic && multisampled && FreshRecorderDraws(*device, compiled, all);
-        std::printf("color write mask tests passed (%s, %s, %s, %s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color", encoded ? "encoded draw state" : "encoded draw state skipped", encodedSets ? "encoded descriptor sets" : "encoded descriptor sets skipped", fresh ? "a fresh encoding recorder" : "a fresh encoding recorder skipped");
+        std::printf("color write mask tests passed (%s, %s, %s, %s, %s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color", encoded ? "encoded draw state" : "encoded draw state skipped", fallback ? "fallback after encoded state" : "fallback after encoded state skipped", encodedSets ? "encoded descriptor sets" : "encoded descriptor sets skipped", fresh ? "a fresh encoding recorder" : "a fresh encoding recorder skipped");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
