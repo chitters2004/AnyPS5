@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -589,6 +590,60 @@ std::vector<std::byte> TexelBytes(float value) {
     return {bytes.begin(), bytes.end()};
 }
 
+bool RecordedPendingVoids(AgcDriver::VulkanDevice& device) {
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "recorded");
+    GuestBlocks memory(2u * BlockBytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory.base);
+    using Note = std::function<void(AgcDriver::Graphics::Recorder&, std::uint64_t)>;
+    const std::array<std::pair<const char*, Note>, 5> notes{{
+        {"NotePendingWrite", [](auto& recorder, std::uint64_t address) { recorder.NotePendingWrite(address, 64); }},
+        {"NotePendingFill", [](auto& recorder, std::uint64_t address) { recorder.NotePendingFill(address, 64, 0x5a); }},
+        {"NotePendingWordFill", [](auto& recorder, std::uint64_t address) { recorder.NotePendingWordFill(address, 64, 0x12345678u); }},
+        {"NotePendingWrites", [](auto& recorder, std::uint64_t address) {
+             const std::array ranges{std::pair<std::uint64_t, std::uint64_t>{address, address + 64}};
+             recorder.NotePendingWrites(ranges);
+         }},
+        {"AfterCompletions on an in-flight batch", [](auto& recorder, std::uint64_t address) {
+             static_cast<void>(recorder.Commands());
+             recorder.Submit();
+             const std::uint32_t label = 7;
+             recorder.AfterCompletions(address, std::as_bytes(std::span(&label, 1)), 1, 0, false);
+         }},
+    }};
+    bool voided = true;
+    for (std::size_t i = 0; i < notes.size(); ++i) {
+        const auto target = base + i * 4096u;
+        const auto beside = base + BlockBytes + i * 4096u;
+        const std::array targetRange{std::pair<std::uint64_t, std::uint64_t>{target, target + 64}};
+        const std::array besideRange{std::pair<std::uint64_t, std::uint64_t>{beside, beside + 64}};
+        const auto targetSubscription = GuestMemory::SubscribeWrites(targetRange);
+        const auto besideSubscription = GuestMemory::SubscribeWrites(besideRange);
+        const auto targetCertificate = GuestMemory::CertifySubscription(*targetSubscription, 0);
+        const auto besideCertificate = GuestMemory::CertifySubscription(*besideSubscription, 0);
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto* recorder = AgcDriver::Graphics::Recorder::Active();
+            Require(recorder != nullptr, "recorded: no active recorder after a draw");
+            notes[i].second(*recorder, target);
+        }
+        Require(GuestMemory::CertificateHolds(*besideSubscription, besideCertificate, 0), std::string("recorded: ") + notes[i].first + " voided a certificate on another block");
+        if (GuestMemory::CertificateHolds(*targetSubscription, targetCertificate, 0)) voided = false;
+    }
+    device.WaitIdle();
+    return voided;
+}
+
+void Recorded(AgcDriver::VulkanDevice& device) {
+    Require(RecordedPendingVoids(device), "recorded: a recorded pending GPU write left a certificate on its range standing");
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::HideRecordedPendingBumps);
+    const bool caught = RecordedPendingVoids(device);
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::None);
+    Require(!caught, "recorded: hiding recorded pending bumps kept every certificate voided, so the case tests nothing");
+    std::printf("certified proofs: recorded pending writes void certificates on their range only\n");
+}
+
 void NonDraw(AgcDriver::VulkanDevice& device) {
     using AgcDriver::DriverDetail::DrawPipeline;
     using AgcDriver::Graphics::RuntimeSwitch;
@@ -916,7 +971,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 18> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 19> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
