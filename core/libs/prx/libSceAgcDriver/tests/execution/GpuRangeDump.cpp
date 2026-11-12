@@ -198,7 +198,7 @@ int main() {
                     Require(tags.contains(range.tag), "a draw class range has no declared pass tag");
                     const auto& tag = tags.at(range.tag);
                     const auto colorField = "c" + std::to_string(static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM)) + "@" + std::to_string(Width) + "x" + std::to_string(Height) + ":0x";
-                    Require(tag.find(colorField) != std::string::npos && tag.find("colors=1,") != std::string::npos && tag.find("extent=64x16") != std::string::npos, "the pass tag does not describe the color target: " + tag);
+                    Require(tag.find(colorField) != std::string::npos && tag.find("colors=1,") != std::string::npos && tag.find(",samples=1,") != std::string::npos && tag.find("extent=64x16") != std::string::npos, "the pass tag does not describe the color target: " + tag);
                 }
                 if (range.name.rfind("draw:0x", 0) == 0) {
                     ++draws;
