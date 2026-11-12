@@ -1132,6 +1132,81 @@ void testEmittedValuesAreNumberedWithinTheirDominators() {
     check(unchanged == numbered, "value numbering changed an already numbered module");
 }
 
+constexpr const char* EmittedLocalsModule = R"(OpCapability Shader
+OpCapability SignedZeroInfNanPreserve
+OpExtension "SPV_KHR_float_controls"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %index
+OpExecutionMode %main LocalSize 1 1 1
+OpExecutionMode %main SignedZeroInfNanPreserve 32
+OpDecorate %index BuiltIn LocalInvocationIndex
+OpDecorate %Buffer Block
+OpMemberDecorate %Buffer 0 Offset 0
+OpDecorate %storage DescriptorSet 0
+OpDecorate %storage Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%pair = OpTypeStruct %uint %uint
+%pairPtr = OpTypePointer Function %pair
+%uintPtr = OpTypePointer Function %uint
+%inputPtr = OpTypePointer Input %uint
+%privatePtr = OpTypePointer Private %uint
+%Buffer = OpTypeStruct %uint
+%bufPtr = OpTypePointer StorageBuffer %Buffer
+%bufUint = OpTypePointer StorageBuffer %uint
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%two = OpConstant %uint 2
+%true = OpConstantTrue %bool
+%index = OpVariable %inputPtr Input
+%storage = OpVariable %bufPtr StorageBuffer
+%carried = OpVariable %privatePtr Private
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%local = OpVariable %pairPtr Function
+%flag = OpVariable %uintPtr Function
+%lane = OpLoad %uint %index
+%first = OpAccessChain %uintPtr %local %zero
+%second = OpAccessChain %uintPtr %local %one
+OpStore %first %lane
+%doubled = OpIMul %uint %lane %two
+OpStore %second %doubled
+OpStore %carried %doubled
+OpStore %flag %one
+OpSelectionMerge %merge None
+OpBranchConditional %true %taken %skipped
+%taken = OpLabel
+OpBranch %merge
+%skipped = OpLabel
+OpStore %flag %two
+OpBranch %merge
+%merge = OpLabel
+%a = OpLoad %uint %first
+%b = OpLoad %uint %second
+%f = OpLoad %uint %flag
+%c = OpLoad %uint %carried
+%sum = OpIAdd %uint %a %b
+%partial = OpIAdd %uint %sum %f
+%total = OpIAdd %uint %partial %c
+%out = OpAccessChain %bufUint %storage %zero
+OpStore %out %total
+OpReturn
+OpFunctionEnd
+)";
+
+void testEmittedLocalsBecomeValues(bool optimizationEnabled) {
+    if (!optimizationEnabled) return;
+    try {
+        const auto output = ShaderRecompiler::ValidateAndOptimizeSpirv(assemble(EmittedLocalsModule), Vulkan11, Spirv13, false);
+        check(opcodeCount(output, spv::OpAccessChain) == 1u && opcodeCount(output, spv::OpLoad) == 1u, "a private or function-scope composite local was not promoted to values");
+        check(opcodeCount(output, spv::OpPhi) == 0u && opcodeCount(output, spv::OpBranchConditional) == 0u, "a local stored in a constant-false arm was not folded");
+    } catch (const std::exception& error) {
+        check(false, std::string("emitted locals: ") + error.what());
+    }
+}
+
 int main() {
     const char* mode = std::getenv("APS5_SPIRV_OPT");
     const bool optimizationEnabled = mode == nullptr || std::string(mode) != "none";
@@ -1150,6 +1225,7 @@ int main() {
     testSpecializedPrivateCompositeTableLoad();
     testBallotsMergedIntoOneBlockShareOneBallot(optimizationEnabled);
     testEmittedValuesAreNumberedWithinTheirDominators();
+    testEmittedLocalsBecomeValues(optimizationEnabled);
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;
