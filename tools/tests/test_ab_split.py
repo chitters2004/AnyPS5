@@ -292,6 +292,16 @@ class AbSplitTests(unittest.TestCase):
         self.assertEqual((first["flip p50 ms"], first["flip p90 ms"]), (99.5, 110.25))
         self.assertEqual(result["phases"][3]["metrics"], {})
 
+    def test_finisher_drain_sites_are_read_per_present_and_per_drain(self):
+        counters = ab_split.parse_counters("[ab-counters] phase A 0 wall_ms=1000.000 presents=10 finisher_room_wait_ms=4.000 fd.lookup.n=40 fd.lookup.ms=25.000 fd.lookup.queued=600 fd.packet.n=5 fd.packet.ms=2.000 fd.packet.queued=0 threads=none")
+        out = ab_split.counter_metrics(counters)
+        self.assertAlmostEqual(out["finisher room wait ms/present"], 0.4)
+        self.assertAlmostEqual(out["finisher drain lookup ms/present"], 2.5)
+        self.assertAlmostEqual(out["finisher drain lookup drains/present"], 4.0)
+        self.assertAlmostEqual(out["finisher drain lookup queued/drain"], 15.0)
+        self.assertAlmostEqual(out["finisher drain packet queued/drain"], 0.0)
+        self.assertNotIn("finisher drain end ms/present", out)
+
     def test_counter_lines_compare_an_arm_with_its_bracketing_control(self):
         rows = {row["metric"]: row for row in ab_split.split(counter_log())["metrics"]}
         row = rows["committer us/draw"]

@@ -301,7 +301,7 @@ void Driver::execute(const Submission& submission) {
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
             const bool sequencedStore = pipelined && !predicated && opcode == 0x83 && DrawFinisher::Sequenced() && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor);
             const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || sequencedStore || keepsDrawPipeline(packet, header, opcode));
-            if (!beside) DrawFinisher::Get().Drain();
+            if (!beside) DrawFinisher::Get().Drain(DrawFinisher::PacketWaitSite(packet));
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
                 if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
@@ -619,7 +619,7 @@ void Driver::execute(const Submission& submission) {
     }
 
     if (submission.queue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::End, !ownsHandOffs);
-    if (submission.queue == 0 && !ownsHandOffs) DrawFinisher::Get().Drain();
+    if (submission.queue == 0 && !ownsHandOffs) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::End);
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

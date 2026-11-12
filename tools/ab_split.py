@@ -162,7 +162,7 @@ def counter_metrics(counters):
     out = {}
     wall, presents = counters.get("wall_ms", 0.0), counters.get("presents", 0.0)
     if presents:
-        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms", "finisher drain wait ms/present": "finisher_drain_wait_ms",
+        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms", "finisher drain wait ms/present": "finisher_drain_wait_ms", "finisher room wait ms/present": "finisher_room_wait_ms",
                        "GPU busy ms/present": "gpu_busy_ms", "GPU idle gaps ms/present": "gpu_gap_ms", "draws/present": "draws"}
         for name, key in per_present.items():
             if key in counters:
@@ -175,6 +175,17 @@ def counter_metrics(counters):
         out["committer idle %"] = 100 - out["committer busy %"]
     if counters.get("draws"):
         out["committer us/draw"] = 1000 * counters["draw_commit_ms"] / counters["draws"]
+    for key, value in counters.items():
+        match = re.fullmatch(r"fd\.(\w+)\.(n|ms|queued)", key)
+        if not match:
+            continue
+        site, field = match.group(1), match.group(2)
+        if field == "ms" and presents:
+            out[f"finisher drain {site} ms/present"] = value / presents
+        elif field == "n" and presents:
+            out[f"finisher drain {site} drains/present"] = value / presents
+        elif field == "queued" and counters.get(f"fd.{site}.n"):
+            out[f"finisher drain {site} queued/drain"] = value / counters[f"fd.{site}.n"]
     for key, value in counters.items():
         match = re.fullmatch(r"t\.(.+)\.(\w+)", key)
         if not match:
