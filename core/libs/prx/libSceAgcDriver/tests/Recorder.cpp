@@ -11503,7 +11503,7 @@ void barrierFusionTests(const Device& device) {
     DeviceBuffer dispatched(context, 256, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto dispatch = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::DispatchValue); };
     const BarrierMask dispatchTrailing = FusionTrace::DispatchNeeds;
-    const auto copy = [&](VkCommandBuffer commands) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), 0, 256, FusionTrace::CopyValue); };
+    const auto copy = [&](VkCommandBuffer commands, VkDeviceSize offset) { context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, dispatched.Handle(), offset, 128, FusionTrace::CopyValue); };
     int firstOwner = 0, secondOwner = 0;
     const std::array<Recorder::RunAccess, 1> firstRange{Recorder::RunAccess{0x100000, 0x110000, Recorder::RunAccessWritten}};
     const std::array<Recorder::RunAccess, 1> secondRange{Recorder::RunAccess{0x110000, 0x120000, Recorder::RunAccessWritten}};
@@ -11513,7 +11513,7 @@ void barrierFusionTests(const Device& device) {
         bool inRun = false;
         VkAccessFlags covered = 0;
         const auto commands = recorder.RunCommands(Recorder::WriteBackRunKey, owner, accesses, inRun, &covered);
-        copy(commands);
+        copy(commands, owner == &firstOwner ? 0 : 128);
         recorder.DeferDispatchBarrier(Recorder::WriteBackRunKey, std::span(&owner, 1), accesses, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
         return inRun;
     };
