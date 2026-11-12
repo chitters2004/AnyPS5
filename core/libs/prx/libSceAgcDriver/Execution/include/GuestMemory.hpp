@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <source_location>
 #include <span>
 #include <string>
@@ -139,7 +140,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters, DropExclusionSources };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters, DropExclusionSources, SkipTicketCollect, IgnoreTicketsInFlight };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 void SetWriteIndexCountingForTest(bool counting);
 void SetWriteOwnersIgnoredForTest(bool ignored);
@@ -194,6 +195,21 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+struct WriteTicket {
+    std::uint64_t sequence = 0;
+};
+WriteTicket ObserveTicket();
+bool UnchangedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteTicket ticket);
+enum class TicketRefusal : std::uint8_t { NoTicket, Unwatched, Stamped, InFlight, Count };
+struct WriteTicketStats {
+    std::uint64_t held = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(TicketRefusal::Count)> refused{};
+};
+WriteTicketStats WriteTicketsCounted();
+const char* TicketRefusalName(TicketRefusal refusal);
+void ForceWriteBumpForTest(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source);
+void DropTicketStampsForTest(std::optional<WriteBumpSource> source);
+void SetTicketStampHookForTest(void (*hook)());
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);

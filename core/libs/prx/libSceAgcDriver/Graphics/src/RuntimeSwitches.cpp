@@ -56,6 +56,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_WRITE_OWNERS",
     "APS5_WHOLE_PENDING_BUMPS",
     "APS5_NO_CERTIFIED_DRAW_INPUTS",
+    "APS5_WRITE_TICKETS",
 };
 
 struct SwitchValues {
