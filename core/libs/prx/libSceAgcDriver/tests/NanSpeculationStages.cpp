@@ -24,11 +24,19 @@ std::size_t Ballots(ShaderStageKind stage, std::uint32_t first) {
         context.pixel = ShaderPixelStageInfo{};
         context.pixel->wave32 = true;
     }
+    TessellationConfiguration tessellation{};
+    tessellation.inputControlPoints = 3u;
+    tessellation.outputControlPoints = 3u;
+    tessellation.domain = 1u;
+    tessellation.partitioning = 0u;
+    tessellation.outputTopology = 2u;
+    tessellation.patchesPerGroup = 1u;
+    if (stage == ShaderStageKind::Local || stage == ShaderStageKind::TessellationControl || stage == ShaderStageKind::TessellationEvaluation) context.vertex = ShaderVertexStageInfo{};
     TranslateOptions options{};
     options.stage = stage;
     options.waveSize = 32;
     options.userDataCount = 0;
-    options.inputInfo = BuildShaderStageInputInfo(stage, context, 32);
+    options.inputInfo = BuildShaderStageInputInfo(stage, context, 32, nullptr, &tessellation);
     const auto program = InstructionTranslator{}.Translate(decoded, cfg, options);
     std::size_t ballots = 0;
     for (const auto& block : program.Blocks()) {
@@ -52,6 +60,13 @@ int main() {
         constexpr std::uint32_t Nop = 0xbf800000u;
         const auto compute = Ballots(ShaderStageKind::Compute, AddF32) - Ballots(ShaderStageKind::Compute, Nop);
         const auto pixel = Ballots(ShaderStageKind::Pixel, AddF32) - Ballots(ShaderStageKind::Pixel, Nop);
+        for (const ShaderStageKind stage : {ShaderStageKind::Local, ShaderStageKind::TessellationControl, ShaderStageKind::TessellationEvaluation}) {
+            const auto ballots = Ballots(stage, AddF32) - Ballots(stage, Nop);
+            if (ballots != 0u) {
+                std::fprintf(stderr, "nan speculation stages: a tessellation-stage shader was speculated (%zu ballots); the hull lowering refuses any lane mask\n", ballots);
+                return 1;
+            }
+        }
         if (compute == 0u) {
             std::fprintf(stderr, "nan speculation stages: a compute v_add_f32 region was not speculated\n");
             return 1;
