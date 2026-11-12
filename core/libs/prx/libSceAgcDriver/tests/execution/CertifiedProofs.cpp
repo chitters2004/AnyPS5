@@ -515,7 +515,7 @@ void Verified(AgcDriver::VulkanDevice& device) {
 }
 
 
-constexpr std::array<GuestMemory::ProofBreak, 1> CoveredBreaks{GuestMemory::ProofBreak::MarkWritten};
+constexpr std::array<GuestMemory::ProofBreak, 2> CoveredBreaks{GuestMemory::ProofBreak::MarkWritten, GuestMemory::ProofBreak::OwnStore};
 
 bool UncoveredBreakVoids(AgcDriver::VulkanDevice& device, const std::string& what) {
     auto& scene = NewScene();
@@ -540,21 +540,30 @@ void Scope(AgcDriver::VulkanDevice& device) {
         Require((GuestMemory::CertificateBreakSerial() != certificates) != covered, std::string("scope: a ") + GuestMemory::ProofBreakName(source) + (covered ? " break voided certificates though its writes bump their ranges" : " break left certificates standing"));
     }
     Require(UncoveredBreakVoids(device, "scope"), "scope: an uncovered proof break kept the certificate");
-    const auto unrelatedStore = [&](const std::string& what) {
-        auto& scene = NewScene();
-        Build(device, scene);
-        Settle(device, scene, what);
-        GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.blocks.base), 256);
-        const auto outcome = Draw(device, scene, false);
-        Require(outcome.brightest == 255u, what + ": the draw after a driver store elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
-        return outcome;
-    };
-    auto outcome = unrelatedStore("scope (driver store elsewhere)");
-    Require(outcome.counts.proved == 1, "scope: a driver store to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
-    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
-    outcome = unrelatedStore("scope (driver store elsewhere, unscoped)");
-    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
-    Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE a driver store elsewhere kept the certificate (" + outcome.Describe() + ")");
+    const std::array<std::pair<const char*, std::function<void(std::uintptr_t)>>, 2> stores{{
+        {"a driver store", [](std::uintptr_t address) { GuestMemory::MarkWritten(address, 256); }},
+        {"an own store", [](std::uintptr_t address) {
+            const std::array<std::byte, 256> bytes{};
+            static_cast<void>(GuestMemory::StoreOwnBytes(address, bytes));
+        }},
+    }};
+    for (const auto& [kind, store] : stores) {
+        const auto storeElsewhere = [&](const std::string& what) {
+            auto& scene = NewScene();
+            Build(device, scene);
+            Settle(device, scene, what);
+            store(reinterpret_cast<std::uintptr_t>(scene.blocks.base));
+            const auto outcome = Draw(device, scene, false);
+            Require(outcome.brightest == 255u, what + ": the draw after " + kind + " elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
+            return outcome;
+        };
+        auto outcome = storeElsewhere(std::string("scope (") + kind + " elsewhere)");
+        Require(outcome.counts.proved == 1, std::string("scope: ") + kind + " to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
+        outcome = storeElsewhere(std::string("scope (") + kind + " elsewhere, unscoped)");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
+        Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, std::string("scope: with APS5_NO_CERTIFIED_PROOF_SCOPE ") + kind + " elsewhere kept the certificate (" + outcome.Describe() + ")");
+    }
     AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
     const bool unscoped = UncoveredBreakVoids(device, "scope (unscoped)");
     AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
@@ -623,7 +632,7 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
         };
         const char* event = "";
         bool cpuWrite = false;
-        switch (pick(9)) {
+        switch (pick(10)) {
         case 0:
         case 1: {
             event = "cpu write to the sampled texture";
@@ -683,6 +692,15 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
             AgcDriver::Graphics::ClearCachedTextures(device.Device());
             break;
         }
+        case 9: {
+            event = "own store";
+            if (oracle.readOnly) flipMapping(oracle);
+            const auto image = pick(2) == 0 ? oracle.selected : other();
+            oracle.values[image] = oracle.values[image] != 0.0f ? 0.0f : 1.0f;
+            std::vector<float> texels(TexelWidth * TexelHeight, oracle.values[image]);
+            static_cast<void>(GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(scene.Texels(image)), std::as_bytes(std::span(texels))));
+            break;
+        }
         default: {
             event = "depth surfaces change";
             AgcDriver::Graphics::ClearDepthSurfaces(device.Device());
@@ -708,7 +726,7 @@ void Oracle(AgcDriver::VulkanDevice& device) {
 
 void Mutants(AgcDriver::VulkanDevice& device) {
     using GuestMemory::CertificateMutant;
-    constexpr std::array<std::pair<CertificateMutant, const char*>, 4> mutants{{{CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing"}}};
+    constexpr std::array<std::pair<CertificateMutant, const char*>, 5> mutants{{{CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing"}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing"}}};
     for (const auto& [mutant, name] : mutants) {
         GuestMemory::SetCertificateMutantForTest(mutant);
         std::string caught;
