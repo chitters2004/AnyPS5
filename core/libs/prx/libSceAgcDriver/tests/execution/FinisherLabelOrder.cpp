@@ -150,7 +150,7 @@ int main() {
             std::cout << "profiled draw phases: " << totals.packets << " packets, " << totals.drawn << " drawn, " << totals.finished << " finished on the draw finisher, ms:" << phases << "\n";
             Require(totals.packets == Labels && totals.drawn == Labels, "profiling booked " + std::to_string(totals.packets) + " draw packets and " + std::to_string(totals.drawn) + " drawn, expected " + std::to_string(Labels));
             Require(handsOff ? totals.finished >= 1 && totals.finished <= Labels : totals.finished == 0, "profiling booked " + std::to_string(totals.finished) + " draws finished on the draw finisher with " + (handsOff ? "pipelined draws" : "no draw pipeline"));
-            Require(totals.ms[AgcDriver::DriverDetail::DrawRowGraphics] > 0.0, "profiling booked no Graphics::Draw time for the draws");
+            Require(totals.ms[AgcDriver::DriverDetail::DrawRowCapture] > 0.0, "profiling booked no capture time for the draws");
         }
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
