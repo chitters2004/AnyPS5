@@ -614,9 +614,6 @@ struct Replay {
                 std::memcpy(&header, bytes.data() + at - 4, sizeof(header));
                 if ((header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u) kept.push_back(at);
             }
-            for (const auto address : parked) {
-                if (address % 4 == 0 && address >= chunk->address && address + 4 <= chunk->address + bytes.size()) kept.push_back(static_cast<std::size_t>(address - chunk->address));
-            }
             std::ranges::sort(kept);
             kept.erase(std::ranges::unique(kept).begin(), kept.end());
             for (const auto at : kept) {
