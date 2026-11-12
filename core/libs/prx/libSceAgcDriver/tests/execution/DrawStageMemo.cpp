@@ -714,11 +714,51 @@ int BenchStageKeys() {
     return sink == 0 ? 1 : 0;
 }
 
+ShaderRecompiler::ShaderPixelStageInfo InterpolatingPixel(std::uint32_t beyondTheCount) {
+    ShaderRecompiler::ShaderPixelStageInfo pixel{};
+    pixel.interpolatorCount = 1;
+    pixel.interpolatorSettings[0] = 0x400u;
+    pixel.interpolatorSettings[1] = beyondTheCount;
+    pixel.inputAddr = 2;
+    pixel.hasPerspectiveCenterVgpr = true;
+    pixel.targetOutputMode[0] = 9;
+    pixel.targetExportMapping.fill(0xe4u);
+    return pixel;
+}
+
+alignas(256) constexpr std::array<std::uint32_t, 7> ReadsAttributeOneWithP0{0xc8120402u, 0xc8160502u, 0xc81a0602u, 0xc81e0702u, 0xf800180fu, 0x07060504u, 0xbf810000u};
+
+ShaderRecompiler::RecompileResult CompileInterpolatingPixel(std::uint32_t beyondTheCount) {
+    const ShaderRecompiler::SpirvTarget target{};
+    ShaderRecompiler::RecompileRequest request{};
+    request.shader = {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(ReadsAttributeOneWithP0.data()), ReadsAttributeOneWithP0, 0, {}};
+    request.context.waveSize = 64;
+    request.context.pixel = InterpolatingPixel(beyondTheCount);
+    request.target = target;
+    request.layout = PixelPushLayout(0u, target);
+    request.useCache = false;
+    return ShaderRecompiler::Recompile(request);
+}
+
+void InterpolatorSettingsBeyondTheCountAreKeyed() {
+    const auto zero = CompileInterpolatingPixel(0x000u);
+    const auto one = CompileInterpolatingPixel(0x300u);
+    ShaderSnapshot snapshot{};
+    RequestParts zeroParts;
+    zeroParts.stage = Stage::Fragment;
+    zeroParts.pixel = InterpolatingPixel(0x000u);
+    auto oneParts = zeroParts;
+    oneParts.pixel = InterpolatingPixel(0x300u);
+    Expect(zero.spirv == one.spirv || !(KeyOf(zeroParts, snapshot) == KeyOf(oneParts, snapshot)), "pixel stages whose interpolator settings beyond interpolatorCount differ compile differently but share a draw stage key");
+    std::printf("draw stage memo: a P0 read of attribute 1 with interpolatorCount 1 %s on the setting beyond the count, and the key follows it\n", zero.spirv == one.spirv ? "does not depend" : "depends");
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
     try {
         KeysFollowEveryInput();
         StageInfoKeysFollowEveryField();
+        InterpolatorSettingsBeyondTheCountAreKeyed();
         MemoStoresByWholeKey();
         {
             const auto device = OpenVulkanTestDevice();

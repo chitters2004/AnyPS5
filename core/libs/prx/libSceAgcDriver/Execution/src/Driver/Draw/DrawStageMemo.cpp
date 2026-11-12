@@ -54,12 +54,6 @@ public:
     template<typename TParent, typename TField>
     bool Member(const TParent&, const TField&) { return false; }
 
-    bool Member(const ShaderRecompiler::ShaderPixelStageInfo& pixel, const decltype(ShaderRecompiler::ShaderPixelStageInfo::interpolatorSettings)& settings) {
-        if (&settings != &pixel.interpolatorSettings) return false;
-        for (std::uint32_t i = 0; i < pixel.interpolatorCount; ++i) (*this)(settings[i]);
-        return true;
-    }
-
     bool Member(const ShaderRecompiler::ShaderVertexStageInfo& vertex, const decltype(ShaderRecompiler::ShaderVertexStageInfo::resources)& resources) {
         if (&resources != &vertex.resources) return false;
         for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) AggregateFields::HashLeaves(resources[r], *this);
