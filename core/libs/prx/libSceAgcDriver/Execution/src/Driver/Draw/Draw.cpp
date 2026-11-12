@@ -968,6 +968,20 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
     }
 
+    if (static const bool nameVariants = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr; nameVariants) {
+        static std::mutex namedMutex;
+        static std::set<std::uint64_t> named;
+        std::lock_guard namedLock(namedMutex);
+        for (std::size_t i = 0; i < programs.size() && i < programResults.size(); ++i) {
+            if (programResults[i] == nullptr || !named.insert(programResults[i]->variantId).second) continue;
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            for (const auto byte : std::as_bytes(programs[i].binary.code)) {
+                hash ^= std::to_integer<std::uint64_t>(byte);
+                hash *= 0x100000001b3ull;
+            }
+            std::fprintf(stderr, "[drawvariant] 0x%llx stage %d code 0x%llx dwords %zu hash %016llx\n", static_cast<unsigned long long>(programResults[i]->variantId), static_cast<int>(programs[i].binary.stage), static_cast<unsigned long long>(programs[i].binary.codeAddress), programs[i].binary.code.size(), static_cast<unsigned long long>(hash));
+        }
+    }
     if (stageDataVerified != 0) {
         std::lock_guard cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
@@ -1317,15 +1331,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
-        }
-    }
-    if (static const bool nameVariants = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr; nameVariants && stages.size() == programs.size()) {
-        static std::mutex namedMutex;
-        static std::set<std::uint64_t> named;
-        std::lock_guard namedLock(namedMutex);
-        for (std::size_t i = 0; i < stages.size(); ++i) {
-            if (stages[i].program == nullptr || !named.insert(stages[i].program->variantId).second) continue;
-            std::fprintf(stderr, "[drawvariant] 0x%llx stage %d code 0x%llx\n", static_cast<unsigned long long>(stages[i].program->variantId), static_cast<int>(stages[i].stage), static_cast<unsigned long long>(programs[i].binary.codeAddress));
         }
     }
     if (pipelined && (!drawParameters.indirect || pipelinedIndirect) && (tail.queue == nullptr || deferredLabels().labels.empty())) {
