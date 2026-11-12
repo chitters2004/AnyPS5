@@ -1064,6 +1064,28 @@ void ForeignSettlesFlushTheHeldChunkInOrder() {
     Compare({{commands, expected}}, "held chunks flushed by another thread");
 }
 
+void AnotherEncodersTableDefersIntoTheOpenWindow() {
+    Reset();
+    auto device = FakeTable();
+    auto second = FakeTable();
+    const auto handle = Handle<VkDevice>(0x5a);
+    const auto commands = Handle<VkCommandBuffer>(0x1a00);
+    const auto deviceEncoder = Attached(handle, device);
+    const auto secondEncoder = Attached(handle, second);
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(5)); });
+    secondEncoder->Open(commands, RecordingOf(commands));
+    second.cmdDraw(commands, 1, 1, 0, 0);
+    device.cmdDraw(commands, 2, 1, 0, 0);
+    second.cmdDraw(commands, 3, 1, 0, 0);
+    secondEncoder->Close();
+    secondEncoder->FinishBatch();
+    device.cmdDraw(commands, 4, 1, 0, 0);
+    CommandEncoder::SetDelayForTesting({});
+    secondEncoder->Quiesce();
+    deviceEncoder->Quiesce();
+    Compare({{commands, {"draw 1 1 0 0", "draw 2 1 0 0", "draw 3 1 0 0", "draw 4 1 0 0"}}}, "a call through another encoder's table inside an open window");
+}
+
 void RunSuite() {
     for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
     OtherThreadsRecordDirectlyWhileAWindowIsOpen();
@@ -1090,6 +1112,7 @@ void RunSuite() {
     WindowsShareAChunkUntilTheBatchEnds();
     ADirectCallWaitsForTheHeldChunk();
     ForeignSettlesFlushTheHeldChunkInOrder();
+    AnotherEncodersTableDefersIntoTheOpenWindow();
 }
 
 int main(int argc, char** argv) {
