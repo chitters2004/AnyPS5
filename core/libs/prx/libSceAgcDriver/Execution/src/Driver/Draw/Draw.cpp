@@ -810,7 +810,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 job.phaseMs[DrawRowEpilogue] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job.phaseLap).count();
                 addDrawPhases(job.phaseMs, false, job.captures, true);
             };
-            job.preparerTicket = DrawFinisher::Buffered() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::WriteTickets) && DrawFinisher::Get().OlderUnpublished() ? GuestMemory::ObserveTicket() : GuestMemory::WriteTicket{};
+            job.preparerTicket = DrawFinisher::PreparerTicket();
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");

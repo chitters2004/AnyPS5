@@ -174,6 +174,7 @@ public:
     static std::size_t Preparers();
     static std::string AbWindow(bool begins, char arm, std::uint64_t phase);
     struct PreparerReads {
+        std::uint64_t taken = 0;
         std::uint64_t validated = 0;
         std::uint64_t missed = 0;
         std::uint64_t refused = 0;
@@ -181,6 +182,9 @@ public:
     };
     static bool CheckPreparerReads(GuestMemory::WriteTicket ticket, std::span<const Range> ranges, std::span<const std::span<const std::byte>> captured, bool turnWaited);
     static PreparerReads PreparerReadsCounted();
+    static GuestMemory::WriteTicket PreparerTicket();
+    static void HoldNextItemForTest(std::function<void()> hold);
+    static void ClearHoldForTest();
     static bool VerifyPreparerReads();
     static bool Buffered();
     void AwaitTurn();

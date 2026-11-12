@@ -255,8 +255,13 @@ void PreparerGateCounts() {
     Require(clean.validated && !clean.threw, "the preparer gate refused a capture whose range nobody wrote after the ticket");
     const auto disjoint = CheckRead(guest, 0, captured, false, [&] { AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 8 * 65536, 4, AgcDriver::GuestMemory::WriteBumpSource::Driver); });
     Require(disjoint.validated && !disjoint.threw, "the preparer gate refused a capture after a write to another 64 KiB block");
-    const auto sameBytes = CheckRead(guest, 0, captured, true, [&] { AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address(), 4, AgcDriver::GuestMemory::WriteBumpSource::Driver); });
+    const auto sameBytes = CheckRead(guest, 0, captured, false, [&] { AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address(), 4, AgcDriver::GuestMemory::WriteBumpSource::Driver); });
     Require(!sameBytes.validated && !sameBytes.threw, "the preparer gate validated a capture whose range was stamped after the ticket, or failed a verified capture whose bytes are unchanged");
+    const auto waited = CheckRead(guest, 128, captured, true, [&] {
+        guest.Bytes()[128] = 0x33;
+        AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 128, 1, AgcDriver::GuestMemory::WriteBumpSource::Driver);
+    });
+    Require(waited.validated && !waited.threw, "the preparer gate checked a capture whose commit waited for its turn, which no older item can have changed since");
     const auto changed = CheckRead(guest, 64, captured, false, [&] {
         guest.Bytes()[64] = 0x22;
         AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 64, 1, AgcDriver::GuestMemory::WriteBumpSource::Driver);
@@ -266,9 +271,10 @@ void PreparerGateCounts() {
     const auto stampsAfter = AgcDriver::GuestMemory::WriteTicketsCounted();
     const auto stamped = static_cast<std::size_t>(TicketRefusal::Stamped);
     Require(after.validated - before.validated == 2 && after.missed - before.missed == 2 && after.refused - before.refused == 1 && after.changed - before.changed == (verify ? 1u : 0u), "the preparer gate counted " + std::to_string(after.validated - before.validated) + " validated, " + std::to_string(after.missed - before.missed) + " missed, " + std::to_string(after.refused - before.refused) + " refused and " + std::to_string(after.changed - before.changed) + " changed, not 2, 2, 1 and " + (verify ? "1" : "0"));
-    Require(stampsAfter.refused[stamped] - stampsBefore.refused[stamped] == 2, "the preparer gate's two misses were not both stamped refusals");
+    Require(stampsAfter.refused[stamped] - stampsBefore.refused[stamped] == 2, "the preparer gate's two misses were not both stamped refusals, or it asked for a proof of a capture whose commit waited for its turn");
+    Require(after.taken == before.taken && DrawFinisher::PreparerTicket().sequence == 0, "a thread that is not a ring preparer took a preparer write ticket");
     const auto line = DrawFinisher::AbWindow(true, 'A', 1);
-    const std::string expected = tickets ? "write tickets: 2 validated, 2 missed (no ticket 0, unwatched 0, stamped 2, in flight 0), 1 refused (turn waits)" + std::string(verify ? ", 1 changed (verified)" : "") : "write tickets off";
+    const std::string expected = tickets ? "write tickets: 0 taken, 2 validated, 2 missed (no ticket 0, unwatched 0, stamped 2, in flight 0), 1 refused (turn waits)" + std::string(verify ? ", 1 changed (verified)" : "") : "write tickets off";
     Require(line.find(expected) != std::string::npos, "the [ring-preparers] phase line does not carry the gate counts '" + expected + "': " + line);
     std::cout << "preparer read gate counted " << (tickets ? "with" : "without") << " write tickets" << (verify ? ", verified" : "") << '\n';
 }

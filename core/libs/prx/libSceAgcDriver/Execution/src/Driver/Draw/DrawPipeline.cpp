@@ -164,6 +164,7 @@ std::size_t DrawFinisher::Preparers() {
 namespace {
 
 struct PreparerReadCounters {
+    std::atomic<std::uint64_t> taken{0};
     std::atomic<std::uint64_t> validated{0};
     std::atomic<std::uint64_t> missed{0};
     std::atomic<std::uint64_t> refused{0};
@@ -175,18 +176,32 @@ PreparerReadCounters& preparerReads() {
     return counters;
 }
 
+struct ItemHold {
+    std::atomic<bool> armed{false};
+    std::mutex mutex;
+    std::function<void()> hold;
+};
+
+ItemHold& itemHold() {
+    static ItemHold held;
+    return held;
+}
+
 }
 
 bool DrawFinisher::CheckPreparerReads(GuestMemory::WriteTicket ticket, std::span<const Range> ranges, std::span<const std::span<const std::byte>> captured, bool turnWaited) {
     if (captured.size() != ranges.size()) throw std::logic_error("a preparer read check was given captured bytes that do not match its ranges");
+    auto& counters = preparerReads();
+    if (turnWaited) {
+        counters.refused.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
     const bool validated = GuestMemory::UnchangedSince(ranges, ticket);
     bool changed = false;
     if (!validated && VerifyPreparerReads()) {
         for (std::size_t index = 0; index < ranges.size() && !changed; ++index) changed = GuestMemory::CompareMapped(ranges[index].first, captured[index]) == GuestMemory::Compare::Differs;
     }
-    auto& counters = preparerReads();
     (validated ? counters.validated : counters.missed).fetch_add(1, std::memory_order_relaxed);
-    if (turnWaited) counters.refused.fetch_add(1, std::memory_order_relaxed);
     if (changed) {
         counters.changed.fetch_add(1, std::memory_order_relaxed);
         throw std::logic_error("a draw finisher preparer's captured guest reads changed between its capture and its draw's commit (APS5_VERIFY_PREPARER_READS)");
@@ -196,7 +211,28 @@ bool DrawFinisher::CheckPreparerReads(GuestMemory::WriteTicket ticket, std::span
 
 DrawFinisher::PreparerReads DrawFinisher::PreparerReadsCounted() {
     auto& counters = preparerReads();
-    return {counters.validated.load(std::memory_order_relaxed), counters.missed.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed), counters.changed.load(std::memory_order_relaxed)};
+    return {counters.taken.load(std::memory_order_relaxed), counters.validated.load(std::memory_order_relaxed), counters.missed.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed), counters.changed.load(std::memory_order_relaxed)};
+}
+
+GuestMemory::WriteTicket DrawFinisher::PreparerTicket() {
+    if (!Buffered() || !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::WriteTickets) || !Get().OlderUnpublished()) return {};
+    preparerReads().taken.fetch_add(1, std::memory_order_relaxed);
+    return GuestMemory::ObserveTicket();
+}
+
+void DrawFinisher::HoldNextItemForTest(std::function<void()> hold) {
+    auto& held = itemHold();
+    std::lock_guard lock(held.mutex);
+    if (held.armed.load(std::memory_order_relaxed)) throw std::logic_error("a draw finisher item hold was armed while another hold was still pending");
+    held.hold = std::move(hold);
+    held.armed.store(true, std::memory_order_release);
+}
+
+void DrawFinisher::ClearHoldForTest() {
+    auto& held = itemHold();
+    std::lock_guard lock(held.mutex);
+    held.armed.store(false, std::memory_order_relaxed);
+    held.hold = nullptr;
 }
 
 bool DrawFinisher::VerifyPreparerReads() {
@@ -232,7 +268,7 @@ std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
         };
         char gate[384];
         if (window.tickets) {
-            std::snprintf(gate, sizeof(gate), "; write tickets: %llu validated, %llu missed (no ticket %llu, unwatched %llu, stamped %llu, in flight %llu), %llu refused (turn waits)%s", static_cast<unsigned long long>(reads.validated - window.reads.validated), static_cast<unsigned long long>(reads.missed - window.reads.missed), refusedFor(GuestMemory::TicketRefusal::NoTicket), refusedFor(GuestMemory::TicketRefusal::Unwatched), refusedFor(GuestMemory::TicketRefusal::Stamped), refusedFor(GuestMemory::TicketRefusal::InFlight), static_cast<unsigned long long>(reads.refused - window.reads.refused), VerifyPreparerReads() ? (", " + std::to_string(reads.changed - window.reads.changed) + " changed (verified)").c_str() : "");
+            std::snprintf(gate, sizeof(gate), "; write tickets: %llu taken, %llu validated, %llu missed (no ticket %llu, unwatched %llu, stamped %llu, in flight %llu), %llu refused (turn waits)%s", static_cast<unsigned long long>(reads.taken - window.reads.taken), static_cast<unsigned long long>(reads.validated - window.reads.validated), static_cast<unsigned long long>(reads.missed - window.reads.missed), refusedFor(GuestMemory::TicketRefusal::NoTicket), refusedFor(GuestMemory::TicketRefusal::Unwatched), refusedFor(GuestMemory::TicketRefusal::Stamped), refusedFor(GuestMemory::TicketRefusal::InFlight), static_cast<unsigned long long>(reads.refused - window.reads.refused), VerifyPreparerReads() ? (", " + std::to_string(reads.changed - window.reads.changed) + " changed (verified)").c_str() : "");
         } else {
             std::snprintf(gate, sizeof(gate), "; write tickets off");
         }
@@ -468,6 +504,19 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
     finisherProducer = true;
+    if (itemHold().armed.load(std::memory_order_relaxed)) {
+        auto& hold = itemHold();
+        std::unique_lock lock(hold.mutex);
+        if (hold.armed.load(std::memory_order_relaxed)) {
+            auto first = std::exchange(hold.hold, nullptr);
+            hold.armed.store(false, std::memory_order_relaxed);
+            lock.unlock();
+            job = [first = std::move(first), job = std::move(job)] {
+                first();
+                job();
+            };
+        }
+    }
     if (Sequenced()) {
         ring->Push(std::move(job), std::move(held), GuestMemory::GpuMutex().HeldByThisThread(), tag);
         return;
@@ -1087,6 +1136,7 @@ void DrawPipeline::run() {
 }
 
 void DrawPipeline::Stop() {
+    DrawFinisher::ClearHoldForTest();
     std::thread committer;
     {
         std::lock_guard lock(mutex);
