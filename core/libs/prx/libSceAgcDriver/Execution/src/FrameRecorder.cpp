@@ -582,7 +582,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             if (length == FrameCaptureWriter::BlockBytes) {
                 const auto hash = contentHash(std::span<const std::byte>(bytes).subspan(offset, length));
                 const auto [known, inserted] = recordedBlocks.try_emplace(at, hash);
-                same = !inserted && known->second == hash && std::ranges::any_of(unattributed, [&](const auto& span) { return span.first <= at && at + length <= span.second; });
+                same = !inserted && known->second == hash;
                 known->second = hash;
             } else {
                 recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
