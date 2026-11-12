@@ -11,11 +11,17 @@ later. Each periodic report covers the time since the previous report of its kin
 only when the previous report of its kind came after phase k's settled line and the report came before phase k+1
 began. Presents per 10 s and frame time come from the [ab] lines (settled line to the next phase's begin), GPU busy
 and idle gaps per frame from [present], GPU time per present from [gputime] (APS5_PROFILE_GPU), the committer and
-drains from [draw] pipelined, unlocked hook waits from [syncwait] (APS5_PROFILE_DRAW). The noise column compares
+drains from [draw] pipelined, unlocked hook waits from [syncwait] (APS5_PROFILE_DRAW). The driver also prints one
+"[ab-counters] phase A|B <k> ..." line when phase k ends, from counters that run without APS5_PROFILE_DRAW: they cover
+exactly the settled part of the phase and give the committer's busy time and microseconds per committed draw, its
+waits, each traced thread's busy and waiting time (queue workers, the draw finisher; "threads=none" when the trace
+totals were not recording, so run with APS5_TRACE_SUMMARY_EVERY), the GPU's busy time and the flip interval p50 and
+p90. The noise column compares
 each B phase with the mean of its neighbouring A phases, which cancels a linear drift: mean difference, standard
-error, standard deviation and count. A requested program's phase metric is omitted if a report lists 12 programs
+error, standard deviation and count; --spread adds each side's phase count and phase-to-phase standard deviation. A requested program's phase metric is omitted if a report lists 12 programs
 without it: the list may be truncated, so the program's time is unknown."""
 
+COUNTERS = re.compile(r"^\[ab-counters\] phase ([AB]) (\d+) (.*)$")
 PHASE = re.compile(r"^\[ab\] phase ([AB]) (\d+) (begins|settled) at present (\d+) \(t ([\d.]+) s\)")
 KINDS = (("present", "[present] "), ("gputime", "[gputime] "), ("draw", "[draw] pipelined"), ("syncwait", "[syncwait] "))
 
@@ -76,6 +82,12 @@ def parse_report(kind, text):
     return None
 
 
+def parse_counters(text):
+    counters = {key: finite(float(value)) for key, value in re.findall(r" ?([\w.]+)=(-?[\d.]+)", text)}
+    counters["recorded"] = "threads=none" not in text
+    return counters
+
+
 def read_log(lines):
     config, phases, current = None, [], None
     previous = {kind: None for kind, _ in KINDS}
@@ -85,6 +97,13 @@ def read_log(lines):
             if config is not None or phases:
                 raise ValueError("multiple A/B runs in one log; split the captures before comparing phases")
             config = text
+            continue
+        counters = COUNTERS.match(text)
+        if counters:
+            for phase in reversed(phases):
+                if phase["kind"] == counters.group(1) and phase["index"] == int(counters.group(2)):
+                    phase["counters"] = parse_counters(counters.group(3))
+                    break
             continue
         match = PHASE.match(text)
         if match:
@@ -101,7 +120,7 @@ def read_log(lines):
                         raise ValueError("phase began before the previous phase boundary")
                     current["end"] = point
 
-                current = {"kind": kind, "index": index, "begin": point, "settled": None, "end": None,
+                current = {"kind": kind, "index": index, "begin": point, "settled": None, "end": None, "counters": None,
                            "reports": {name: [] for name, _ in KINDS}}
                 phases.append(current)
 
@@ -131,8 +150,43 @@ def weighted(rows, value, weight):
     return finite_sum(row[value] * row[weight] for row in rows) / total if total else None
 
 
-def metrics(phase, programs, classes):
+THREAD_METRICS = (("busy_ms", "busy %", True), ("idle_ms", "idle %", True), ("memory_wait_ms", "memory wait ms/present", False),
+                  ("lock_wait_ms", "GPU lock wait ms/present", False), ("gpu_wait_ms", "GPU wait ms/present", False), ("jobs", "jobs/present", False))
+
+
+def counter_metrics(counters):
     out = {}
+    wall, presents = counters.get("wall_ms", 0.0), counters.get("presents", 0.0)
+    if presents:
+        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms",
+                       "GPU busy ms/present": "gpu_busy_ms", "GPU idle gaps ms/present": "gpu_gap_ms", "draws/present": "draws"}
+        for name, key in per_present.items():
+            if key in counters:
+                out[name] = counters[key] / presents
+    for name in ("flip_p50_ms", "flip_p90_ms"):
+        if name in counters:
+            out["flip " + name[5:8] + " ms"] = counters[name]
+    if wall and "commit_ms" in counters:
+        out["committer busy %"] = 100 * counters["commit_ms"] / wall
+    if counters.get("draws"):
+        out["committer us/draw"] = 1000 * counters["draw_commit_ms"] / counters["draws"]
+    for key, value in counters.items():
+        match = re.fullmatch(r"t\.(.+)\.(\w+)", key)
+        if not match:
+            continue
+        thread = match.group(1).replace("_", " ")
+        for suffix, name, percent in THREAD_METRICS:
+            if match.group(2) != suffix:
+                continue
+            if percent and wall:
+                out[f"{thread} {name}"] = 100 * value / wall
+            elif not percent and presents:
+                out[f"{thread} {name}"] = value / presents
+    return out
+
+
+def metrics(phase, programs, classes):
+    out = counter_metrics(phase["counters"]) if phase.get("counters") else {}
     if phase["settled"] is not None and phase["end"] is not None and phase["end"][1] > phase["settled"][1]:
         presents, seconds = phase["end"][0] - phase["settled"][0], phase["end"][1] - phase["settled"][1]
         out["presents/10s"] = presents / seconds * 10
@@ -176,6 +230,13 @@ def noise(values, phases):
     return {"mean": mean, "se": sd / math.sqrt(len(differences)), "sd": sd, "n": len(differences)}
 
 
+def spread(values):
+    if len(values) < 2:
+        return None
+    mean = finite_sum(values) / len(values)
+    return math.sqrt(finite_sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+
 def split_report(lines, programs, classes):
     config, phases = read_log(lines)
     if not phases:
@@ -190,7 +251,8 @@ def split_report(lines, programs, classes):
         if a and b:
             mean_a, mean_b = finite_sum(a) / len(a), finite_sum(b) / len(b)
             rows.append({"metric": name, "a": mean_a, "b": mean_b, "change": mean_b - mean_a,
-                         "change_pct": (mean_b / mean_a - 1) * 100 if mean_a else None, "noise": noise(values, phases)})
+                         "change_pct": (mean_b / mean_a - 1) * 100 if mean_a else None, "noise": noise(values, phases),
+                         "a_phases": len(a), "a_sd": spread(a), "b_phases": len(b), "b_sd": spread(b)})
     return {"config": config,
             "phases": [{"kind": phase["kind"], "index": phase["index"], "begin_present": phase["begin"][0],
                         "settled_present": phase["settled"][0] if phase["settled"] else None,
@@ -207,7 +269,13 @@ def split(lines, programs=(), classes=()):
         raise ValueError("A/B statistic exceeds the finite numeric range") from error
 
 
-def text_report(result):
+def side(mean, phases, sd):
+    return f"{mean:>10.2f} {phases:>3} " + ("     -" if sd is None else f"{sd:>6.2f}")
+
+
+def text_report(result, show_spread=False):
+    if show_spread:
+        return spread_report(result)
     lines = [result["config"] or "[ab] configuration line missing", "",
              "phase  begin / settled / end   clean reports (present/gputime/draw/syncwait)  presents/10s"]
     for phase in result["phases"]:
@@ -231,6 +299,31 @@ def text_report(result):
     return "\n".join(lines) + "\n"
 
 
+def spread_report(result):
+    lines = [result["config"] or "[ab] configuration line missing", "",
+             "phase  begin / settled / end   clean reports (present/gputime/draw/syncwait)  presents/10s"]
+    for phase in result["phases"]:
+        settled = "-" if phase["settled_present"] is None else phase["settled_present"]
+        end = "-" if phase["end_present"] is None else phase["end_present"]
+        reports = "/".join(str(phase["clean_reports"][name]) for name, _ in KINDS)
+        rate = phase["metrics"].get("presents/10s")
+        lines.append(f"{phase['kind']} {phase['index']:<3} {phase['begin_present']:>7} / {settled:>7} / {end:>7}   {reports:<45}  "
+                     + ("unfinished" if rate is None else f"{rate:.2f}"))
+    lines.extend(["", f"{'metric':<30} arm {'A':>10} {'n':>3} {'SD':>6} {'arm':>10} {'n':>3} {'SD':>6} {'arm-A':>10} {'arm/A-1':>8}   arm vs bracketing A: mean +- SE (SD, n)"])
+    for row in result["metrics"]:
+        spread_noise = row["noise"]
+        if spread_noise is None:
+            text = "-"
+        elif spread_noise["n"] == 1:
+            text = f"{spread_noise['mean']:+.2f} (n 1)"
+        else:
+            text = f"{spread_noise['mean']:+.2f} +- {spread_noise['se']:.2f} (SD {spread_noise['sd']:.2f}, n {spread_noise['n']})"
+        percent = "n/a" if row["change_pct"] is None else f"{row['change_pct']:+.1f}%"
+        lines.append(f"{row['metric']:<30} {row.get('arm', 'B'):>3} {side(row['a'], row['a_phases'], row['a_sd'])} "
+                     f"{side(row['b'], row['b_phases'], row['b_sd'])} {row['change']:>+10.2f} {percent:>8}   {text}")
+    return "\n".join(lines) + "\n"
+
+
 def program_key(value):
     if not re.fullmatch(r"0x[0-9a-fA-F]+", value):
         raise argparse.ArgumentTypeError("must be a hexadecimal program key such as 0x1000")
@@ -243,10 +336,11 @@ def main(arguments=None):
     parser.add_argument("--program", action="append", type=program_key, default=[], help="also report this [gputime] program key per present (repeatable)")
     parser.add_argument("--class", dest="classes", action="append", default=[], help="also report this [gputime] command class per present (repeatable)")
     parser.add_argument("--json", action="store_true", help="print the phases and metrics as JSON")
+    parser.add_argument("--spread", action="store_true", help="also print each side's phase count and phase-to-phase standard deviation (always shown with several arms)")
     options = parser.parse_args(arguments)
     with Path(options.log).open(encoding="utf-8-sig", errors="replace") as source:
         result = split(source, options.program, options.classes)
-    sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else text_report(result))
+    sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else text_report(result, options.spread))
     return 0
 
 

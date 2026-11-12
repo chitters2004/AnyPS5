@@ -33,6 +33,10 @@ public:
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
     enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
 
+    struct Totals {
+        std::uint64_t commits = 0, commitNs = 0, drawCommits = 0, drawNs = 0, enqueued = 0, fullWaitNs = 0, wakes = 0, drains = 0, drainWaitNs = 0;
+    };
+
     static DrawPipeline& Queue0();
     static std::size_t Depth();
     static std::size_t QueuedItems();
@@ -51,6 +55,7 @@ public:
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const;
+    Totals LifetimeTotals();
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -118,6 +123,7 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
     std::uint64_t depthSum = 0;
+    Totals reported;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 

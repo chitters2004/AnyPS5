@@ -95,8 +95,15 @@ void schedule() {
     Require(begin.event == Event::Begin && begin.phase == 0 && !begin.b, "a start in seconds did not begin phase A");
 }
 
+std::string observed;
+
+void Observe(AbSchedule::Event event, char arm, std::uint64_t phase, std::uint64_t present, double seconds) {
+    observed += std::to_string(static_cast<int>(event)) + arm + std::to_string(phase) + '@' + std::to_string(present) + ':' + std::to_string(static_cast<int>(seconds * 10)) + ' ';
+}
+
 void glue() {
     Require(AgcDriver::Graphics::AbConfigured(), "APS5_AB is not seen");
+    AgcDriver::Graphics::SetAbObserver(&Observe);
     Require(AgcDriver::Graphics::AbAtPresent(1, 0.0).empty(), "the A/B printed before its start");
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, false);
     auto lines = AgcDriver::Graphics::AbAtPresent(3, 1.0);
@@ -111,6 +118,10 @@ void glue() {
     lines = AgcDriver::Graphics::AbAtPresent(7, 11.5);
     Require(lines.size() == 1 && lines[0] == "[ab] phase A 2 begins at present 7 (t 11.500 s): APS5_NO_BARRIER_BATCH set\n", "phase A did not come back");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "phase A did not restore the environment's setting");
+    Require(observed == "0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0B1@6:70 1A2@7:115 ", "the A/B observer did not see every present with its event and arm: " + observed);
+    AgcDriver::Graphics::SetAbObserver(nullptr);
+    AgcDriver::Graphics::AbAtPresent(8, 12.0);
+    Require(observed.size() == std::string("0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0B1@6:70 1A2@7:115 ").size(), "a removed A/B observer was still called");
 }
 
 int refused() {
