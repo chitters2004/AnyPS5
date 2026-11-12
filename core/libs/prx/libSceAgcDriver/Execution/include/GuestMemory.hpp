@@ -9,6 +9,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <source_location>
 #include <span>
 #include <string>
 #include <utility>
@@ -36,10 +37,10 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination);
-bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
+bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site = std::source_location::current());
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
-bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site = std::source_location::current());
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address
@@ -67,6 +68,9 @@ void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> 
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+enum class ExclusionSource : std::uint8_t { ComparedImport, ImportWalk, CollectFailed, Explicit, Count };
+const char* ExclusionSourceName(ExclusionSource source);
+std::uint32_t UnwatchedSources(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool UnwatchWritesProven();
@@ -135,7 +139,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters, DropExclusionSources };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 void SetWriteIndexCountingForTest(bool counting);
 void SetWriteOwnersIgnoredForTest(bool ignored);
@@ -250,6 +254,7 @@ void SetConsumedWalkHookForTest(void (*hook)());
 void SetConsumeCapacityForTest(std::size_t runs);
 std::uint64_t ConsumeCompactionsForTest();
 std::uint64_t ConservativeInvalidationsForTest();
+std::uint64_t CompareSiteBytesForTest(std::uint32_t line);
 void WalkCountersForTest(std::uint64_t* values, std::size_t count);
 void SetReleasedWalksForTest(bool released);
 void IgnorePageWritesForTest(std::uint64_t address, std::size_t bytes);

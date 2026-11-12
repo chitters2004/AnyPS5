@@ -73,6 +73,7 @@ struct DrawInputCopy {
     std::uint64_t registryGeneration = 0;
     Recorder::OwnedDrawInputProof owned;
     std::span<std::byte> Bytes() const;
+    std::optional<RangeCertificate> certified;
 };
 enum class TargetResidency : std::uint8_t { Multisampled, Resident, Copied, LinearImport };
 bool ResidentTargetsEnabled();

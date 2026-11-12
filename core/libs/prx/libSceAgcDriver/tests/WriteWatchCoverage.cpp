@@ -12,6 +12,14 @@ int main() {
         using AgcDriver::GuestMemory::WriteWatchCoverage;
         constexpr std::uint64_t base = 0x200000000;
         constexpr std::size_t block = 65536;
+        AgcDriver::GuestMemory::UnwatchSources sources;
+        sources.Assign(base, base + 4 * block, 1);
+        sources.Assign(base + block, base + 2 * block, 2);
+        require(sources.Mask(base, base + block) == 2u && sources.Mask(base + block, base + 2 * block) == 4u && sources.Mask(base + 2 * block, base + 4 * block) == 2u, "a later source did not replace the earlier one over its own range only");
+        require(sources.Mask(base + block - 1, base + block + 1) == 6u && sources.Ranges() == 3, "a range across two sources does not report both");
+        sources.Erase(base + block + 4096, base + 3 * block);
+        require(sources.Mask(base + block + 4096, base + 3 * block) == 0u && sources.Mask(base + block, base + block + 4096) == 4u && sources.Mask(base + 3 * block, base + 4 * block) == 2u, "an erase did not split the ranges it cut");
+        require(sources.Mask(base - block, base) == 0u && sources.Mask(base + 4 * block, base + 5 * block) == 0u && sources.Mask(base, base) == 0u, "memory outside every exclusion reports a source");
         WriteWatchCoverage coverage;
         require(!coverage.Covers(base, 1), "an uninitialized arena is watched");
         coverage.Initialize(base, 4 * block + 1);
