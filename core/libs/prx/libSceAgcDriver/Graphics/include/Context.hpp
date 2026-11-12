@@ -17,6 +17,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -136,6 +137,7 @@ public:
 
 private:
     friend struct Context;
+    friend class CommandEncoder;
     TFunction function = nullptr;
 };
 
@@ -188,6 +190,7 @@ struct DeviceFunctions {
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
+void BeforeCommandLookup(VkDevice device, std::source_location where = std::source_location::current());
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
@@ -358,14 +361,16 @@ struct Context {
     VertexBufferFormats* vertexFormats = nullptr;
 
     template<typename TFunction>
-    TFunction Function(FunctionName name) const {
+    TFunction Function(FunctionName name, std::source_location where = std::source_location::current()) const {
+        beforeLookup(name.Value(), where);
         return lookup<TFunction>(name.Value());
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
     template<typename TFunction>
-    TFunction Resolved(TFunction DeviceFunctions::*member, FunctionName name) const {
+    TFunction Resolved(TFunction DeviceFunctions::*member, FunctionName name, std::source_location where = std::source_location::current()) const {
         if (functions != nullptr && functions->*member != nullptr) return functions->*member;
+        beforeLookup(name.Value(), where);
         return lookup<TFunction>(name.Value());
     }
 
@@ -541,6 +546,10 @@ struct Context {
 private:
     friend class CommandState;
     friend void FillDeviceFunctions(const Context& context, DeviceFunctions& functions);
+
+    void beforeLookup(const char* name, std::source_location where) const {
+        if (name[0] == 'v' && name[1] == 'k' && name[2] == 'C' && name[3] == 'm' && name[4] == 'd') BeforeCommandLookup(device, where);
+    }
 
     template<typename TFunction>
     TFunction lookup(const char* name) const {

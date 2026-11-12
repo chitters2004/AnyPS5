@@ -2834,6 +2834,7 @@ std::shared_ptr<std::shared_ptr<const void>> reserveSpaceKeep(Recorder& recorder
 
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, const std::shared_ptr<Pipeline>& pipeline, const std::shared_ptr<Framebuffer>& framebuffer, DrawInputs& inputs, std::span<const std::shared_ptr<StorageTexture>> residents, std::span<const std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
     std::shared_ptr<DeviceBuffer> scratchOwner(std::move(scratch));
+    const auto unwindGuard = recorder.UnwindGuard();
     recorder.ReserveRetention(4 + inputs.vertexBuffers.size() + residents.size() + (scratchOwner != nullptr ? 1u : 0u));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profile) resources->ProbeEffectRepeat(recorder);
@@ -3253,6 +3254,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    std::vector<std::shared_ptr<void>> reorderKept;
+    std::optional<Recorder::EncodingWindow> encoding(std::in_place, *recorder);
+    const auto unwindGuard = recorder->UnwindGuard();
     if (continued) {
         InCommitPhase(CommitPhase::RecordBeginContinue, [&] { record.pipeline->Continue(recording, state, record.masked); });
     } else {
@@ -3288,9 +3292,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // layout, which a lean draw renders in: no transitions.
         BeginCommitPhase(CommitPhase::RecordBeginOrder);
         if (!record.reordered.empty()) {
-            std::vector<std::shared_ptr<void>> kept;
-            RecordSampleOrder(context, recording, record.reorderPass, record.reordered, true, kept);
-            for (auto& object : kept) recorder->Keep(std::move(object));
+            RecordSampleOrder(context, recording, record.reorderPass, record.reordered, true, reorderKept);
+            for (auto& object : reorderKept) recorder->Keep(std::move(object));
         }
         BeginCommitPhase(CommitPhase::RecordBeginStaged);
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
@@ -3340,6 +3343,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(recording, state, record.masked);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
+    encoding.reset();
     recorder->EndGpuTiming(eachDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (state.tessellationCapture != nullptr) {
