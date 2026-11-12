@@ -126,7 +126,7 @@ void TestReport() {
         const auto committed = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while ((pipeline.CommitBreaks(DrawPipeline::CommitKind::DmaWrite, true) == 0 || pipeline.CommitBreaks(DrawPipeline::CommitKind::Seal, false) == 0) && std::chrono::steady_clock::now() < committed) std::this_thread::yield();
         Check(AgcDriver::GuestMemory::CertificateBreakSerial() - certificateBreaks == 2, "a commit kind with an unknown effect did not void certificates");
-        pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
+        pipeline.Enqueue(DrawPipeline::CommitKind::Draw, [&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
         DrawPipeline::NoteDbClear(true, false, DrawPipeline::DbClearBlocker::Unproven, 0x410d900);
@@ -134,7 +134,7 @@ void TestReport() {
         DrawPipeline::NoteDbClear(true, true, DrawPipeline::DbClearBlocker::Unproven, 0x410d900);
         DrawPipeline::NoteDbClear(false, true, DrawPipeline::DbClearBlocker::SampleMask, 0x2000);
         std::this_thread::sleep_until(reportAfter);
-        pipeline.Enqueue([] {}, {}, 0, {}, {}, true);
+        pipeline.Enqueue(DrawPipeline::CommitKind::IndirectDraw, [] {}, {}, 0, {}, {}, true);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -160,6 +160,9 @@ void TestReport() {
     std::cout << clears << '\n';
     Check(clears == "[dbclear] (10 s): 4 rect-list draws with a DB_RENDER_CONTROL clear (depth 2, stencil 1, both 1); first blocker of a native clear: "
                     "stencil test on a depth-only clear 1, partial sample mask 1, layered target 0, rectangle not proven 2; vertex programs: 0x410d900 x3 0x2000 x1", "the DB clear counters differ");
+    const auto totals = pipeline.LifetimeTotals();
+    Check(totals.enqueued >= 4 && totals.commits == totals.enqueued && totals.drawCommits == 2, "the lifetime totals lost what the report printed and reset");
+    Check(totals.commitNs >= 9'000'000'000ull && totals.drawNs >= 9'000'000'000ull && totals.drawNs <= totals.commitNs, "the lifetime totals lost the commits' time");
 }
 
 void TestDbClearBlockers() {
