@@ -41,6 +41,11 @@ on:
         required: false
         default: true
         type: boolean
+      fresh_base:
+        description: Run the base jobs even when an earlier run already holds a result for the same base sha and test set
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       ref:
@@ -73,6 +78,10 @@ on:
         required: false
         default: true
         type: boolean
+      fresh_base:
+        required: false
+        default: false
+        type: boolean
       tag:
         description: Prefix for artifact names and for the job names of a caller, such as memo-
         required: false
@@ -88,11 +97,19 @@ env:
     -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
+  # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
+  REUSE_VERSION: 1
+  VVL_VERSION: 1.4.363.1
+  MESA_VERSION: 26.2.6
+  WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       has_linux: ${{ steps.plan.outputs.has_linux }}
@@ -102,6 +119,8 @@ jobs:
       win_matrix: ${{ steps.plan.outputs.win_matrix }}
       ref_sha: ${{ steps.plan.outputs.ref_sha }}
       base_sha: ${{ steps.plan.outputs.base_sha }}
+      reuse_notes: ${{ steps.plan.outputs.reuse_notes }}
+      reuse_any: ${{ steps.plan.outputs.reuse_any }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -115,6 +134,11 @@ jobs:
           JOBS: ${{ inputs.jobs }}
           REF: ${{ inputs.ref }}
           MUTANTS: ${{ inputs.mutants }}
+          TESTS: ${{ inputs.tests }}
+          REDUCED: ${{ inputs.reduced }}
+          FRESH_BASE: ${{ inputs.fresh_base }}
+          REPOSITORY: ${{ inputs.repository || github.repository }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           ref_sha=$(git rev-parse HEAD)
@@ -130,7 +154,48 @@ jobs:
           if [ -n "$MUTANTS" ]; then
             patches=$(git ls-tree -r --name-only "$ref_sha" -- "${MUTANTS%/}/" | grep '\.patch$' || true)
           fi
-          export ref_sha base_sha patches
+          # Refs of the integration stack family share a ccache of their own, so they stop evicting the other branches' objects.
+          stack=""
+          if printf '%s' "$REF" | grep -Eq '^(refs/heads/)?(draft/)?cloud/integration/'; then
+            stack=stack
+          elif printf '%s' "$REF" | grep -Eq '^[0-9a-f]{7,40}$' && [ -n "$(git for-each-ref --points-at "$ref_sha" refs/remotes/origin/draft/cloud/integration/ refs/remotes/origin/cloud/integration/)" ]; then
+            stack=stack
+          fi
+          echo "cache family: ${stack:-shared}"
+          # Reuse the base result of an earlier run for the same base sha, test set and tool versions.
+          # The artifact base-reuse-<os>-<key> is uploaded only by a base job that finished successfully.
+          # The result is downloaded and checked here, so a missing or broken artifact falls back to running the base job.
+          reuse_notes=""
+          reuse_linux=false
+          reuse_windows=false
+          key_linux=""
+          key_windows=""
+          mkdir -p reuse/out
+          for os in linux windows; do
+            case "$os" in linux) wanted=linux-gate ;; windows) wanted=windows ;; esac
+            case ",$(printf '%s' "$JOBS" | tr -d ' ')," in *",$wanted,"*) ;; *) continue ;; esac
+            key=$(printf '%s\n' "v$REUSE_VERSION" "$os" "$REPOSITORY" "$base_sha" "$TESTS" "$MUTANTS" "$REDUCED" "$VVL_VERSION" "$MESA_VERSION" "$WINLIBS_ZIP" | sha256sum | cut -c1-24)
+            eval "key_$os=$key"
+            if [ "$FRESH_BASE" = true ]; then reuse_notes="$reuse_notes$os: fresh_base requested; "; continue; fi
+            found=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=base-reuse-$os-$key&per_page=20" \
+              --jq "[.artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID)] | sort_by(.created_at) | reverse | .[0] | select(. != null) | (.id|tostring) + \" \" + (.workflow_run.id|tostring)" || true)
+            if [ -z "$found" ]; then reuse_notes="$reuse_notes$os: no earlier base result; "; continue; fi
+            art_id=${found% *}; from_run=${found#* }
+            mkdir -p "reuse/$os-dl"
+            if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$art_id/zip" > "reuse/$os.zip" && unzip -q -o "reuse/$os.zip" -d "reuse/$os-dl" && [ -f "reuse/$os-dl/result.json" ]; then
+              mkdir -p "reuse/out/$os"
+              cp -r "reuse/$os-dl/." "reuse/out/$os/"
+              echo "$from_run" > "reuse/out/$os/from-run.txt"
+              eval "reuse_$os=true"
+              reuse_notes="$reuse_notes$os: base result of run $from_run; "
+            else
+              reuse_notes="$reuse_notes$os: artifact $art_id of run $from_run could not be downloaded, running the base; "
+            fi
+          done
+          echo "reuse notes: $reuse_notes"
+          echo "reuse_notes=$reuse_notes" >> "$GITHUB_OUTPUT"
+          echo "reuse_any=$([ "$reuse_linux$reuse_windows" = falsefalse ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
+          export ref_sha base_sha patches stack reuse_linux reuse_windows key_linux key_windows
           python3 - <<'PY'
           import json, os, re
           jobs = {j.strip() for j in os.environ["JOBS"].split(",") if j.strip()}
@@ -139,12 +204,16 @@ jobs:
               raise SystemExit(f"unknown jobs: {sorted(unknown)}")
           ref_sha, base_sha = os.environ["ref_sha"], os.environ["base_sha"]
           plain_restore = "plain-base"
+          # Not "plain-ref-stack": a restore key is a prefix, so plain-ref would also restore the stack's cache.
+          family = os.environ["stack"]
+          ref_key = "plain-stack-ref" if family else "plain-ref"
           include = []
           if "linux-gate" in jobs:
-              include.append(dict(id="gate-ref", kind="gate", side="ref", sha=ref_sha, group="plain",
-                                  cache_key="plain-ref", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
-              include.append(dict(id="gate-base", kind="gate", side="base", sha=base_sha, group="plain",
-                                  cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+              include.append(dict(id="gate-ref", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
+                                  cache_key=ref_key, cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+              if os.environ["reuse_linux"] != "true":
+                  include.append(dict(id="gate-base", kind="gate", side="base", sha=base_sha, group="plain", cache_family="", reuse_name="base-reuse-linux-" + os.environ["key_linux"],
+                                      cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
           for san in ("asan", "tsan"):
               if san in jobs:
                   include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
@@ -170,15 +239,23 @@ jobs:
               out.write("report=" + ("true" if jobs - {"warm", "bundle"} else "false") + "\n")
               win = []
               if "windows" in jobs:
-                  win += [dict(id="windows-ref", kind="gate", side="ref", sha=ref_sha), dict(id="windows-base", kind="gate", side="base", sha=base_sha)]
+                  win.append(dict(id="windows-ref", kind="gate", side="ref", sha=ref_sha, cache_family=family))
+                  if os.environ["reuse_windows"] != "true":
+                      win.append(dict(id="windows-base", kind="gate", side="base", sha=base_sha, cache_family="", reuse_name="base-reuse-windows-" + os.environ["key_windows"]))
               if "warm" in jobs:
-                  win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha))
+                  win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha, cache_family=""))
               if "bundle" in jobs:
-                  win.append(dict(id="windows-bundle", kind="bundle", side="ref", sha=ref_sha))
+                  win.append(dict(id="windows-bundle", kind="bundle", side="ref", sha=ref_sha, cache_family=""))
               out.write("win_matrix=" + json.dumps({"include": win}) + "\n")
               out.write("ref_sha=" + ref_sha + "\nbase_sha=" + base_sha + "\n")
           print(json.dumps(include, indent=1))
           PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ steps.plan.outputs.reuse_any == 'true' }}
+        with:
+          name: result-${{ inputs.tag }}reused
+          path: reuse/out/
+          if-no-files-found: error
 
   linux:
     needs: plan
@@ -198,7 +275,6 @@ jobs:
       REDUCED: ${{ inputs.reduced }}
       CCACHE_COMPILERCHECK: content
       CCACHE_SLOPPINESS: pch_defines,time_macros
-      VVL_VERSION: 1.4.363.1
       VVL_SHA256: b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8
       VVL_DIR: /home/runner/vvl
     steps:
@@ -546,6 +622,14 @@ jobs:
               else echo "mutant killed"; fi ;;
           esac
           exit $fail
+      - name: Keep the base result for later runs
+        if: ${{ success() && matrix.side == 'base' && matrix.kind == 'gate' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.reuse_name }}
+          path: result/
+          retention-days: 14
+          if-no-files-found: error
 
   windows:
     needs: plan
@@ -558,13 +642,10 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.win_matrix) }}
     env:
       WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
-      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
       TESTS: ${{ inputs.tests }}
       REDUCED: ${{ inputs.reduced }}
       CCACHE_COMPILERCHECK: content
-      VVL_VERSION: 1.4.363.1
       VVL_SDK_SHA256: c02932bd9a968b22d404536108adaacac908c081cd6b0113f5bfefc523dd0a6a
-      MESA_VERSION: 26.2.6
       MESA_SHA256: b2e00615feaba45942343c265cc8c5f576142ca682c1ac6661922d4b72492877
     defaults:
       run:
@@ -647,7 +728,7 @@ jobs:
           key: ${{ steps.vk-cache.outputs.cache-primary-key }}
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
-          key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side }}
+          key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
           restore-keys: windows-base
           max-size: 4G
           save: ${{ inputs.save_cache && 'true' || 'false' }}
@@ -938,6 +1019,14 @@ jobs:
           if [ "$LIBS_OUTCOME" != success ]; then echo "::error::the build failed"; exit 1; fi
           if [ "$KIND" = warm ] || [ "$KIND" = bundle ]; then exit 0; fi
           if [ "${TEST_RC:-1}" != 0 ]; then echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base"; fi
+      - name: Keep the base result for later runs
+        if: ${{ success() && matrix.side == 'base' && matrix.kind == 'gate' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.reuse_name }}
+          path: result/
+          retention-days: 14
+          if-no-files-found: error
 
   report:
     needs: [plan, linux, windows]
@@ -950,6 +1039,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}
+      REUSE_NOTES: ${{ needs.plan.outputs.reuse_notes }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -1034,6 +1124,14 @@ jobs:
                   "Install the pinned Khronos validation layer and Vulkan loader from the LunarG SDK",
                   "Fetch Mesa lavapipe and the pinned LunarG loader and validation layer")
           w("## Fork CI report")
+          reuse_notes = os.environ.get("REUSE_NOTES", "")
+          if reuse_notes:
+              w(f"Base results: {reuse_notes}")
+          reused = {}
+          for path in glob.glob("results/**/from-run.txt", recursive=True):
+              reused[json.load(open(os.path.join(os.path.dirname(path), "result.json")))["id"]] = open(path).read().strip()
+          for rid, run in sorted(reused.items()):
+              w(f"- {rid}: REUSED from run {run} (https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run}); the base job was not run")
           w("| job | total | steps | ccache hits / misses | build rc | test rc |")
           w("| - | - | - | - | - | - |")
           prefix = os.environ.get("TAG", "").rstrip("-")
@@ -1181,6 +1279,7 @@ jobs:
                   summary[label] = dict(collections.Counter(pair[0]["tests"].values()), ran=len(pair[0]["tests"]),
                                         vuid_lines=pair[0]["vuid_lines"], base_vuid_lines=pair[1]["vuid_lines"] if pair[1] else None,
                                         sha=pair[0]["sha"], base=pair[1]["sha"] if pair[1] else None)
+          summary["reused_base"] = reused
           json.dump(summary, open("summary.json", "w"), indent=1)
           raise SystemExit(1 if bad else 0)
           PY
