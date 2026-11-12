@@ -98,7 +98,7 @@ env:
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
   # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
-  REUSE_VERSION: 1
+  REUSE_VERSION: 2
   VVL_VERSION: 1.4.363.1
   MESA_VERSION: 26.2.6
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
@@ -239,7 +239,12 @@ jobs:
               out.write("report=" + ("true" if jobs - {"warm", "bundle"} else "false") + "\n")
               win = []
               if "windows" in jobs:
-                  win.append(dict(id="windows-ref", kind="gate", side="ref", sha=ref_sha, cache_family=family))
+                  # The test step of the ref dominates the job (about 16 min of agc_.* on 4 cores), so two runners each take
+                  # every second test by ctest number (ctest -I n,,2); the report merges the shards. The base stays one job:
+                  # its result is normally reused. Only the first shard saves the compiler cache.
+                  for shard in (1, 2):
+                      win.append(dict(id=f"windows-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, cache_family=family, shard=shard,
+                                      shard_save="true" if shard == 1 else "false"))
                   if os.environ["reuse_windows"] != "true":
                       win.append(dict(id="windows-base", kind="gate", side="base", sha=base_sha, cache_family="", reuse_name="base-reuse-windows-" + os.environ["key_windows"]))
               if "warm" in jobs:
@@ -731,7 +736,7 @@ jobs:
           key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
           restore-keys: windows-base
           max-size: 4G
-          save: ${{ inputs.save_cache && 'true' || 'false' }}
+          save: ${{ inputs.save_cache && matrix.shard_save != 'false' && 'true' || 'false' }}
           evict-old-files: 7d
       - id: ffmpeg-cache
         uses: actions/cache/restore@v6
@@ -837,11 +842,14 @@ jobs:
           VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
           VK_LOADER_DEBUG: layer
           ANYPS5_NO_SHADER_CACHE: 1
+          SHARD: ${{ matrix.shard }}
         run: |
           export PATH="/c/winlibs/mingw64/bin:/c/vk:$PATH"
           if [ "${VK_DEVICE:-0}" = 1 ]; then export ANYPS5_REQUIRE_VULKAN=1; fi
           set +e
-          ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
+          # An empty SHARD runs every selected test; SHARD n runs the tests whose ctest number is n modulo 2.
+          select=(); no_tests=error; if [ -n "$SHARD" ]; then select=(-I "$SHARD,,2"); fi; if [ "$SHARD" = 2 ]; then no_tests=ignore; fi
+          ctest --test-dir build -R "$TESTS" "${select[@]}" -V --no-tests=$no_tests --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
           echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
           exit 0
       - name: Assemble the gate bundle
@@ -1112,6 +1120,40 @@ jobs:
                   replay[os.path.basename(rp)] = collections.Counter(VUID.findall(read(rp)))
               data["replay"] = replay
               results[data["id"]] = data
+          # Merge the shards of one side (windows-ref-s1, windows-ref-s2) into the single result windows-ref.
+          shards = collections.defaultdict(list)
+          raw = {}
+          for rid in list(results):
+              m = re.match(r"^(.*)-s\d+$", rid)
+              if m:
+                  raw[rid] = results.pop(rid)
+                  shards[m[1]].append(raw[rid])
+          for rid, parts in shards.items():
+              m = dict(parts[0])
+              m["id"] = rid
+              m["tests"] = {}
+              for part in parts:
+                  m["tests"].update(part["tests"])
+              m["total"] = sum(p["total"] or 0 for p in parts) if any(p["total"] is not None for p in parts) else None
+              m["per_test"] = collections.defaultdict(collections.Counter)
+              m["vuid_ids"] = collections.Counter()
+              m["replay"] = {}
+              for part in parts:
+                  for n, ids in part["per_test"].items():
+                      m["per_test"][n].update(ids)
+                  m["vuid_ids"].update(part["vuid_ids"])
+                  m["replay"].update({f"{part['id']}-{k}": v for k, v in part["replay"].items()})
+              for k in ("vuid_lines", "missing", "inserts", "pnext"):
+                  m[k] = sum(p[k] for p in parts)
+              m["build_rc"] = max((p["build_rc"] or 0) for p in parts) if all(p["build_rc"] is not None for p in parts) else None
+              rcs = [p["test_rc"] for p in parts]
+              m["test_rc"] = None if None in rcs else max(rcs)
+              m["layer_proof"] = all(p["layer_proof"] for p in parts)
+              m["vk_device"] = all(p["vk_device"] for p in parts)
+              m["skips"] = "\n".join(p["skips"] for p in parts)
+              w_note = f"{rid}: merged {len(parts)} shards ({', '.join(p['id'] for p in parts)})"
+              print(w_note)
+              results[rid] = m
           jobs = json.load(open("jobs.json"))["jobs"]
           from datetime import datetime
           def dur(a, b):
@@ -1144,7 +1186,7 @@ jobs:
               steps = "; ".join(f"{s['name'].split(' ')[0] if len(s['name']) > 24 else s['name']} {dur(s['started_at'], s['completed_at'])}"
                                 for s in job["steps"] if s["name"] in KEEP)
               key = job["name"].split(" ", 1)[-1]
-              r = results.get(key, {})
+              r = results.get(key) or raw.get(key, {})
               st = r.get("stats", "")
               hits = re.search(r"Hits:\s+(\d+) / (\d+)", st)
               miss = re.search(r"Misses:\s+(\d+)", st)
