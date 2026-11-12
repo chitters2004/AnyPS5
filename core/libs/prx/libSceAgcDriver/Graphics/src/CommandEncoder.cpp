@@ -566,6 +566,7 @@ bool CommandEncoder::post() noexcept {
     if (filling == nullptr || filling->records == 0) return false;
     commandCount.fetch_add(filling->records, std::memory_order_relaxed);
     postCount.fetch_add(1, std::memory_order_relaxed);
+    if (filling->recording != nullptr) filling->recording->held.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(queueMutex);
         auto* chunk = std::exchange(filling, nullptr);
@@ -589,6 +590,25 @@ bool CommandEncoder::Direct(const char* command) noexcept {
 
 void CommandEncoder::Settle(WaitSite site) noexcept {
     await(site, false);
+}
+
+void CommandEncoder::Release(Recording& recording, std::source_location where) noexcept {
+    const bool flushed = filling != nullptr && filling->recording == &recording && post();
+    if (recording.Acknowledged()) {
+        if (flushed) note(WaitSite::At(Wait::Release, where), 0, false, true);
+        return;
+    }
+    refuseEncoderThread();
+    const auto start = std::chrono::steady_clock::now();
+    for (;;) {
+        const auto seen = executed.load(std::memory_order_acquire);
+        if (recording.Acknowledged()) break;
+        executed.wait(seen, std::memory_order_acquire);
+    }
+    const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    waitCount.fetch_add(1, std::memory_order_relaxed);
+    waitNs.fetch_add(ns, std::memory_order_relaxed);
+    note(WaitSite::At(Wait::Release, where), ns, true, flushed);
 }
 
 void CommandEncoder::await(const WaitSite& site, bool flushed) noexcept {
@@ -707,6 +727,7 @@ void CommandEncoder::run() {
             std::lock_guard lock(queueMutex);
             chunk->next = std::exchange(spare, chunk);
         }
+        recording.held.fetch_sub(1, std::memory_order_release);
         executed.fetch_add(1, std::memory_order_release);
         executed.notify_all();
     }
@@ -740,7 +761,7 @@ std::string CommandEncoder::Report(const std::vector<SiteWaits>& sites, std::siz
 }
 
 std::string CommandEncoder::Describe(const WaitSite& site) {
-    static constexpr std::array<const char*, 11> kinds{"quiesce", "settle", "open", "close", "lookup", "direct", "behind", "chunk pool", "teardown", "unwind", "other sites"};
+    static constexpr std::array<const char*, 12> kinds{"quiesce", "settle", "open", "close", "lookup", "direct", "behind", "chunk pool", "teardown", "unwind", "release", "other sites"};
     std::string text = kinds[static_cast<std::size_t>(site.kind)];
     if (site.detail == nullptr) return text;
     text += ' ';
