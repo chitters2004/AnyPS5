@@ -123,6 +123,15 @@ private:
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 
+struct PreparedHandleHint {
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    const void* table = nullptr;
+    std::uint64_t version = 0;
+    bool convertedSamples = false;
+    bool layerRowSamples = false;
+    bool probe = false;
+};
+
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
