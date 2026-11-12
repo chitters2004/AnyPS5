@@ -978,6 +978,35 @@ void testUnchangedBlocksLeftOut(const std::filesystem::path& tool) {
     check(replayed(tool, capture, bulk.base, Bytes) == expected, "the replay lost the bytes of a block the capture left out as unchanged");
 }
 
+void testStoreAfterGpuCopy(const std::filesystem::path& tool) {
+    constexpr std::size_t CopyBytes = 32u << 20;
+    constexpr std::size_t ChunkBytes = CopyBytes / 2;
+    constexpr std::size_t Stored = 64;
+    constexpr std::size_t Probe = CopyBytes / 2;
+    const auto layout = allocate();
+    const auto big = allocate(2 * CopyBytes);
+    auto* const source = big.base;
+    auto* const target = big.base + CopyBytes;
+    for (std::size_t index = 0; index < CopyBytes; ++index) source[index] = static_cast<std::byte>((index * 11 + 7) & 0xff);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    flip();
+    auto graphics = commands(layout.firstCommands);
+    for (std::size_t offset = 0; offset < CopyBytes; offset += ChunkBytes) sceAgcDcbDmaData(&graphics, 0, DmaMemory, 0, at(target + offset), DmaMemory, 0, at(source + offset), ChunkBytes, 0, 1, 0);
+    writeDone(graphics, layout.label);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(graphics.cursor_up - layout.firstCommands), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "graphics submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    std::vector<std::byte> expected(source + Probe, source + Probe + DataBytes);
+    check(equal(target + Probe, expected), "the driver did not run the copy");
+    std::memset(target + Probe, 0xa5, Stored);
+    std::memset(expected.data(), 0xa5, Stored);
+    flip();
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    check(replayed(tool, checkCapture(0), target + Probe, DataBytes) == expected, "the replay lost a CPU store made over a block after a copy wrote it");
+}
+
 void testFillRewrittenByTitle(const std::filesystem::path& tool) {
     constexpr std::uint32_t Filled = 0x5a5a5a5au;
     constexpr std::uint32_t Stored = 0x77u;
@@ -1107,9 +1136,9 @@ void testFillClearedBeforeRange(const std::filesystem::path& tool) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"store_idle", testStoreAfterGatedCopyIdle}, {"store_idle_rewind", testStoreAfterRewoundCopyIdle}, {"store_idle_unwatched", testUnwatchedStoreBeforeReservation}, {"store_second_wait", testStoreBeforeSecondWaitOnGate}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unchanged_blocks", testUnchangedBlocksLeftOut}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"store_idle", testStoreAfterGatedCopyIdle}, {"store_idle_rewind", testStoreAfterRewoundCopyIdle}, {"store_idle_unwatched", testUnwatchedStoreBeforeReservation}, {"store_second_wait", testStoreBeforeSecondWaitOnGate}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unchanged_blocks", testUnchangedBlocksLeftOut}, {"store_after_copy", testStoreAfterGpuCopy}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|store_idle|store_idle_rewind|store_idle_unwatched|store_second_wait|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unchanged_blocks|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|store_idle|store_idle_rewind|store_idle_unwatched|store_second_wait|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unchanged_blocks|store_after_copy|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
         return 2;
     }
     int status = 0;

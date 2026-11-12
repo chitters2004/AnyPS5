@@ -591,10 +591,12 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             bool same = false;
             if (length == FrameCaptureWriter::BlockBytes) {
                 const auto hash = pieceHashes[piece];
+                const std::lock_guard recordedLock(recordedMutex);
                 const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
                 same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
                 known->second = {hash, stamps[piece]};
             } else {
+                const std::lock_guard recordedLock(recordedMutex);
                 recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
             }
             if (same) {
@@ -618,8 +620,55 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     writer->WriteCall(call);
 }
 
+void FrameRecorder::noteGpuCopy(std::uint64_t destination, std::uint64_t bytes, bool landed) {
+    if (bytes < FrameCaptureWriter::BlockBytes) return;
+    if (landed) {
+        seedProduced(destination, destination + bytes);
+        return;
+    }
+    const std::lock_guard lock(producedMutex);
+    producedPending.emplace_back(destination, destination + bytes);
+}
+
+void FrameRecorder::noteGpuBatchLanded(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> landed;
+    {
+        const std::lock_guard lock(producedMutex);
+        if (producedPending.empty()) return;
+        for (auto pending = producedPending.begin(); pending != producedPending.end();) {
+            const bool whole = std::any_of(writes.begin(), writes.end(), [&](const auto& write) { return write.first <= pending->first && pending->second <= write.second; });
+            if (whole) {
+                landed.push_back(*pending);
+                pending = producedPending.erase(pending);
+            } else {
+                ++pending;
+            }
+        }
+    }
+    for (const auto& [begin, end] : landed) seedProduced(begin, end);
+}
+
+// The blocks a copy wrote whole now hold what a replay that runs the copy again produces, so they count
+// as recorded: a later delta leaves one out until a store changes its bytes (hash) or its stamp.
+void FrameRecorder::seedProduced(std::uint64_t begin, std::uint64_t end) {
+    constexpr std::uint64_t block = FrameCaptureWriter::BlockBytes;
+    std::vector<std::byte> bytes(block);
+    for (auto at = (begin + block - 1) & ~(block - 1); at + block <= end; at += block) {
+        const auto stamp = GuestMemory::NewestStamp(at, block);
+        readGuest(at, bytes);
+        const auto hash = contentHash(bytes);
+        const std::lock_guard lock(recordedMutex);
+        recordedBlocks[at] = {hash, stamp};
+        seededBytes += block;
+    }
+}
+
 void FrameRecorder::endGpuStores() {
     notingGpuStores = false;
+    {
+        const std::lock_guard lock(producedMutex);
+        producedPending.clear();
+    }
     std::lock_guard lock(gpuStoresMutex);
     gpuWords.clear();
     gpuFills.clear();
@@ -720,12 +769,14 @@ void FrameRecorder::snapshot(const Range& range) {
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
         if (!range.readable || ((range.access & FrameRangeAccess::Writable) == 0 && range.kind != FrameRangeKind::Watched && range.kind != FrameRangeKind::Unwatched)) continue;
         for (std::size_t offset = 0; (range.address + at + offset) % FrameCaptureWriter::BlockBytes == 0 && offset + FrameCaptureWriter::BlockBytes <= bytes.size(); offset += FrameCaptureWriter::BlockBytes) {
+            const std::lock_guard lock(recordedMutex);
             recordedBlocks[range.address + at + offset] = {contentHash(std::span<const std::byte>(bytes).subspan(offset, FrameCaptureWriter::BlockBytes)), stamps[offset / FrameCaptureWriter::BlockBytes]};
         }
     }
 }
 
 void FrameRecorder::forgetBlocks(std::uint64_t begin, std::uint64_t end) {
+    const std::lock_guard lock(recordedMutex);
     for (auto block = begin & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1}; block < end; block += FrameCaptureWriter::BlockBytes) recordedBlocks.erase(block);
 }
 
@@ -834,9 +885,9 @@ void FrameRecorder::finish() {
     writer->WriteCall(end);
     writeReferenceFrames();
     writer->Finish(header());
-    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored, %.1f MiB unchanged and left out, in %s\n", static_cast<unsigned long long>(recordedFrames),
+    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored, %.1f MiB unchanged and left out ; %.1f MiB of copy output counted as recorded, in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
-                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), static_cast<double>(elidedBytes) / (1024.0 * 1024.0), directory.string().c_str());
+                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), static_cast<double>(elidedBytes) / (1024.0 * 1024.0), static_cast<double>(seededBytes.load()) / (1024.0 * 1024.0), directory.string().c_str());
     writer.reset();
     endGpuStores();
     state = State::Done;
@@ -853,7 +904,7 @@ std::string FrameRecorder::header() const {
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes) + ",\"host_only_sample_bytes\":" + std::to_string(hostOnlySampleBytes);
-    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"elided_bytes\":" + std::to_string(elidedBytes) + ",\"gpu_store_bytes\":" + std::to_string(gpuStoreBytes);
+    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"elided_bytes\":" + std::to_string(elidedBytes) + ",\"seeded_bytes\":" + std::to_string(seededBytes.load()) + ",\"gpu_store_bytes\":" + std::to_string(gpuStoreBytes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;

@@ -52,6 +52,16 @@ public:
     static void NoteGpuFill(std::uint64_t address, std::uint64_t bytes, const std::array<std::uint32_t, 4>& pattern) {
         if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteGpuFill(address, bytes, pattern);
     }
+    // A copy the driver or the GPU makes over [destination, destination + bytes): a replay that runs
+    // the copy again produces the same bytes, so a block it wrote whole need not be recorded while it
+    // still holds them. `landed` is a store already made (a CPU copy); otherwise the bytes land when
+    // the batch that wrote the range finishes (NoteGpuBatchLanded).
+    static void NoteGpuCopy(std::uint64_t destination, std::uint64_t bytes, bool landed) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteGpuCopy(destination, bytes, landed);
+    }
+    static void NoteGpuBatchLanded(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes) {
+        if (notingGpuStores.load(std::memory_order_relaxed)) Active()->noteGpuBatchLanded(writes);
+    }
     void RewindTailFlips(std::uint64_t flips);
 
 private:
@@ -96,6 +106,9 @@ private:
     void noteGpuStore(std::uint64_t address, std::span<const std::byte> bytes);
     void noteGpuFill(std::uint64_t address, std::uint64_t bytes, const std::array<std::uint32_t, 4>& pattern);
     void endGpuStores();
+    void noteGpuCopy(std::uint64_t destination, std::uint64_t bytes, bool landed);
+    void noteGpuBatchLanded(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes);
+    void seedProduced(std::uint64_t begin, std::uint64_t end);
     void forgetGpuStores(std::uint64_t begin, std::uint64_t end);
     void keepTitleWords(std::uint64_t address, std::span<const std::byte> bytes, std::vector<std::pair<std::size_t, std::size_t>>& runs, bool zero);
     void writeReferenceFrames();
@@ -125,6 +138,10 @@ private:
         std::uint64_t stamp;
     };
     std::unordered_map<std::uint64_t, RecordedBlock> recordedBlocks;
+    std::mutex recordedMutex;
+    std::mutex producedMutex;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> producedPending;
+    std::atomic<std::uint64_t> seededBytes{0};
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint64_t, std::uint64_t>> unwatchedHashes;
     inline static std::atomic<bool> notingGpuStores{false};
     std::mutex gpuStoresMutex;

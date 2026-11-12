@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -4879,6 +4880,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] deferred write-back failed: %s\n", error.what());
             }
         }
+        // The batch's writes have landed and stay published until this finish ends: a capture reads them
+        // here, inside the completion scope where the flush hook makes no pending-write wait.
+        AgcDriver::FrameRecorder::NoteGpuBatchLanded(batch->writes);
     }
     if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
     if (profile) holdCounters.completions += batch->completions.size();
