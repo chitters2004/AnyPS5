@@ -445,10 +445,15 @@ void Driver::execute(const Submission& submission) {
             if (Graphics::AbConfigured()) {
                 static const auto abClock = std::chrono::steady_clock::now();
                 std::vector<std::string> abLines;
+                Graphics::AbSchedule::Step abStep;
                 {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                    abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
+                    abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count(), &abStep);
+                }
+                if (abStep.event != Graphics::AbSchedule::Event::None) {
+                    const auto window = DrawFinisher::AbWindow(abStep.event == Graphics::AbSchedule::Event::Begin, abStep.b ? 'B' : 'A', abStep.phase);
+                    if (!window.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s", window.c_str());
                 }
                 for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
             }

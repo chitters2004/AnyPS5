@@ -65,6 +65,7 @@ public:
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
     static bool HeldReads(std::uint64_t address, std::size_t bytes);
+    static bool HoldForOlderReads();
     static std::uint64_t HeldReadQueries();
     void ReleaseRunningReads();
     QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
@@ -158,6 +159,7 @@ public:
     static bool OnFinisherThread();
     static bool Sequenced();
     static std::size_t Preparers();
+    static std::string AbWindow(bool begins, char arm, std::uint64_t phase);
     static bool Buffered();
     void AwaitTurn();
     bool OlderUnpublished();

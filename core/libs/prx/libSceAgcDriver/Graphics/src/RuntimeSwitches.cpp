@@ -191,7 +191,7 @@ bool AbConfigured() {
     return configured;
 }
 
-std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
+std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds, AbSchedule::Step* taken) {
     if (!AbConfigured()) return {};
     auto& state = Ab();
     std::lock_guard lock(state.mutex);
@@ -199,6 +199,7 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     char text[512];
     const auto& config = state.schedule->Settings();
     const auto step = state.schedule->AtPresent(present, seconds);
+    if (taken != nullptr) *taken = step;
     if (step.event == AbSchedule::Event::None) return lines;
     if (step.event == AbSchedule::Event::Begin) {
         if (step.phase == 0) {
