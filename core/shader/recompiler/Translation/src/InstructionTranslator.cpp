@@ -589,6 +589,30 @@ bool NanSpeculationRestorable(const IrBlock& block, std::size_t firstInstruction
     return std::none_of(std::next(instructions.begin(), static_cast<std::ptrdiff_t>(firstInstruction)), instructions.end(), [](const IrValue* write) { return !SpeculationReader(write->Opcode()).has_value() && WritesSpeculationState(write->Opcode()); });
 }
 
+bool NanSpeculationLaneLocal(const IrBlock& block, std::size_t firstInstruction) {
+    const auto& instructions = block.Instructions();
+    return std::none_of(std::next(instructions.begin(), static_cast<std::ptrdiff_t>(firstInstruction)), instructions.end(), [](const IrValue* value) {
+        switch (value->Opcode()) {
+            case IrOpcode::ReadFirstLane:
+            case IrOpcode::ReadLane:
+            case IrOpcode::Ballot:
+            case IrOpcode::DppMoveU32:
+            case IrOpcode::DppUpdateU32:
+            case IrOpcode::WqmU64:
+            case IrOpcode::Permlane16U32:
+            case IrOpcode::SwizzleU32:
+            case IrOpcode::WindowLaneGuard:
+            case IrOpcode::FPInterpolateF32:
+            case IrOpcode::FPInterpolateF16:
+            case IrOpcode::InterpolateHostP1:
+            case IrOpcode::InterpolateHostP2:
+                return true;
+            default:
+                return false;
+        }
+    });
+}
+
 IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const ControlFlowGraph& cfg, const TranslateOptions& options) const {
     validateTranslateOptions(options);
     if (cfg.linkEscapeWaveSize == options.waveSize) {
@@ -738,7 +762,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
     };
     const auto regionsOf = [&](const BasicBlock& source) {
         std::vector<SpeculationRegion> regions;
-        if (!speculation.enabled || UsesTessellationLanes(options.stage) || options.stage == ShaderStageKind::Pixel || source.terminator.loopHeader || relativeBlocks.contains(source.id)) return regions;
+        if (!speculation.enabled || UsesTessellationLanes(options.stage) || ((speculation.stageMask >> static_cast<std::uint32_t>(options.stage)) & 1u) == 0u || source.terminator.loopHeader || relativeBlocks.contains(source.id)) return regions;
         std::uint32_t index = source.instructionBegin;
         while (index < source.instructionEnd) {
             if (!pureVector(decoded.instructions[index])) {
@@ -891,7 +915,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
             context.SetNanFast(false);
             IrValue* seen = context.TakeNanSeen();
-            const bool declined = seen != nullptr && !NanSpeculationRestorable(fast, before);
+            const bool declined = seen != nullptr && (!NanSpeculationRestorable(fast, before) || (options.stage == ShaderStageKind::Pixel && !NanSpeculationLaneLocal(fast, before)));
             if (declined) {
                 while (instructions.size() > before) {
                     IrValue* dropped = instructions.back();
@@ -933,7 +957,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             }
             IrBuilder fastIr(program);
             fastIr.SetInsertionPoint(fast);
-            IrValue& condition = context.WaveAny(*seen);
+            IrValue& condition = options.stage == ShaderStageKind::Pixel ? *seen : context.WaveAny(*seen);
             (void)fastIr.Emit(IrOpcode::Reference, IrType::Void, {&condition});
             blockInfos[currentIndex].condition = &condition;
             IrBlock& exact = *blocks[region->exactIndex];
