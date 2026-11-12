@@ -254,6 +254,13 @@ void testCaptureAndReplay(const std::filesystem::path& tool, bool pipelines) {
     std::size_t passes = 0;
     for (auto found = repeated.find("\"frames\":2,\"p50\""); found != std::string::npos; found = repeated.find("\"frames\":2,\"p50\"", found + 1)) ++passes;
     check(passes == 3, "the repeated replay did not replay both frames in each of three passes: " + repeated);
+    const auto cpuOnly = replay("--cpu-only --repeat 3", capture / "cpu only output.json");
+    std::size_t cpuPasses = 0;
+    for (auto found = cpuOnly.find("\"frames\":2,\"p50\""); found != std::string::npos; found = cpuOnly.find("\"frames\":2,\"p50\"", found + 1)) ++cpuPasses;
+    check(cpuPasses == 3, "--cpu-only did not replay both frames in each of three passes: " + cpuOnly);
+    check(cpuOnly.find("\"frames_compared\":0,") != std::string::npos && cpuOnly.find("\"cpu_only\":true}") != std::string::npos, "--cpu-only compared frames or did not report itself: " + cpuOnly);
+    check(cpuOnly.find("\"pace_timeouts\":0,") != std::string::npos, "--cpu-only paced the replay: " + cpuOnly);
+    check(repeated.find("\"cpu_only\":false}") != std::string::npos, "a normal replay reported cpu_only: " + repeated);
 }
 
 void testConcurrentCopies(const std::filesystem::path& tool) {
