@@ -48,6 +48,7 @@ struct DrawStageRecord {
     DrawStageKey key;
     bool convertedSamples = false;
     bool layerRowSamples = false;
+    PreparedHandleHint prepared;
     std::shared_ptr<DispatchVariant> variant;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};

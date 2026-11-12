@@ -1033,7 +1033,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         programPush[i] = matched[i]->push.get();
                         memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                     } else {
-                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, stageRequest ? &*stageRequest : nullptr));
+                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, stageRequest ? &*stageRequest : nullptr, memoPending[i] != nullptr ? &memoPending[i]->prepared : nullptr));
                         if (!rejected.empty()) return DrawVerdict::Rejected;
                         programResults[i] = compiledStages.back().get();
                         programPush[i] = stageCaptures[i].push.get();

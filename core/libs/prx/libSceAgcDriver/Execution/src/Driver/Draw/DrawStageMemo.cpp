@@ -480,8 +480,10 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
         break;
     }
     drawStageMemoCounters.Add(DrawStageMemoCount::Stale);
+    auto hint = found->prepared;
     drawStageMemo.Erase(found);
     pend();
+    pending->prepared = std::move(hint);
     charge(DrawStageMemoCount::MissNanoseconds);
     return nullptr;
 }
@@ -496,6 +498,7 @@ void Driver::memoizeDrawStages(const std::vector<std::shared_ptr<DrawStageRecord
             continue;
         }
         record->variant = fresh[i];
+        record->prepared = capture.prepared;
         record->spans = DrawStageSpans(fresh[i]->runs);
         drawStageMemoCounters.Add(DrawStageMemoCount::Inserts);
         const auto evicted = drawStageMemo.Insert(record);

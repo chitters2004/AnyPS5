@@ -66,6 +66,7 @@ public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
     static bool Admits(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key);
     static PreparedShaderInvocation Adopt(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle);
+    static PreparedShaderInvocation AdoptValidated(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle);
     const RecompileRequest& Request() const { return request; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
     std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, std::vector<std::byte>* sharedPush = nullptr) const;

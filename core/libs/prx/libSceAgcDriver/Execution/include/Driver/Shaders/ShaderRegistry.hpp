@@ -168,6 +168,7 @@ struct PreparedShaderState {
     std::vector<std::weak_ptr<const ShaderSnapshot>> fragments;
     bool rectangleRequested = false;
     bool deferred = false;
+    std::uint64_t entriesVersion = 0;
 };
 struct PreparedShaders : PreparedShaderState {
     struct DeferredAbi {
@@ -348,10 +349,20 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
 ShaderRecompiler::RectListShaders DrawRectangle(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint64_t vertexId, std::uint64_t fragmentId, const ShaderRecompiler::SpirvTarget& target);
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request);
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool* linkedCode = nullptr);
+struct PreparedHandleHint;
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool* linkedCode = nullptr, const PreparedHandleHint* hint = nullptr, PreparedHandleHint* matched = nullptr);
 void ApplyPreparedSampleModes(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::GuestContext& context);
 std::uint64_t InvocationKeyRebuilds();
+struct PreparedHandleHintCounts {
+    std::uint64_t served = 0;
+    std::uint64_t refusedVersion = 0;
+    std::uint64_t refusedModes = 0;
+    std::uint64_t refusedOther = 0;
+};
+PreparedHandleHintCounts PreparedHandleHints();
 void MarkConvertedSamplesBetweenScopesForTest();
+void MarkLayerRowSamplesBeforeLookupForTest();
+void MovePreparedTableForTest();
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::PreparedShaderInvocation& invocation);
 
 }
