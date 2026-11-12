@@ -201,7 +201,9 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
             run();
         });
     }
-    if (sleeping) wake.NotifyOne();
+    const bool wakeFinisher = sleeping;
+    lock.unlock();
+    if (wakeFinisher) wake.NotifyOne();
 }
 
 void DrawFinisher::run() {
@@ -225,12 +227,14 @@ void DrawFinisher::run() {
         } catch (...) {
             error = std::current_exception();
         }
-        std::lock_guard lock(mutex);
-        if (error != nullptr && failure == nullptr) failure = error;
-        ran.push_back(std::move(jobs.front()));
-        jobs.pop_front();
-        pending.pop_front();
-        outstanding.fetch_sub(1, std::memory_order_release);
+        {
+            std::lock_guard lock(mutex);
+            if (error != nullptr && failure == nullptr) failure = error;
+            ran.push_back(std::move(jobs.front()));
+            jobs.pop_front();
+            pending.pop_front();
+            outstanding.fetch_sub(1, std::memory_order_release);
+        }
         idle.NotifyAll();
     }
 }
@@ -378,14 +382,15 @@ void DrawPipeline::enqueue(Item item) {
         });
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (committerWaiting) {
-        ++wakes;
-        wake.NotifyOne();
-    }
+    const bool wakeCommitter = committerWaiting;
+    if (wakeCommitter) ++wakes;
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
-    const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (profile || stats) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    }
+    lock.unlock();
+    if (wakeCommitter) wake.NotifyOne();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -470,7 +475,7 @@ void DrawPipeline::run() {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
         }
-        std::lock_guard lock(mutex);
+        std::unique_lock lock(mutex);
         countWrites(items.front().writes, false);
         const auto kindIndex = static_cast<std::size_t>(items.front().kind);
         kindCommits[kindIndex].fetch_add(1, std::memory_order_relaxed);
@@ -483,7 +488,9 @@ void DrawPipeline::run() {
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0 && (items.empty() || items.size() <= resumeAt)) idle.NotifyAll();
+        const bool wakeIdle = idleWaiters != 0 && (items.empty() || items.size() <= resumeAt);
+        lock.unlock();
+        if (wakeIdle) idle.NotifyAll();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
