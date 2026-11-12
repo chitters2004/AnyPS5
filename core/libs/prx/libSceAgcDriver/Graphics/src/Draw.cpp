@@ -1335,6 +1335,15 @@ std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters
     return *writers;
 }
 
+void ListCopiedWriter(Recorder& recorder, const std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>>& writers, const std::shared_ptr<ShaderResources>& resources, std::function<void()> completion, bool listed) {
+    recorder.OnComplete([resources, writers, completion = std::move(completion)] {
+        writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
+        completion();
+    });
+    recorder.OnDiscard([resources, writers] { writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end()); });
+    if (listed) writers->push_back(resources);
+}
+
 const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
@@ -2526,12 +2535,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         // As VulkanDevice::dispatch lists its copied writers: delisted before the write-back
         // (one that fails must not keep indirect dispatches on the CPU), listed after the
         // registration (a throw there leaves nothing behind).
-        auto writers = DrawCopiedWriters();
-        recorder.OnComplete([resources, writers] {
-            writers->erase(std::remove(writers->begin(), writers->end(), resources), writers->end());
-            resources->WriteBackBuffers();
-        });
-        writers->push_back(resources);
+        ListCopiedWriter(recorder, DrawCopiedWriters(), resources, [resources] { resources->WriteBackBuffers(); }, true);
         GuestMemory::BreakProofs();
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });

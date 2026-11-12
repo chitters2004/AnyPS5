@@ -519,6 +519,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void FailNextFenceWaitsForTest(unsigned count);
     void LatchFailure(std::exception_ptr error) noexcept;
     bool Latched() const { return latched.load(std::memory_order_acquire); }
     void RethrowLatched() const;
@@ -1014,7 +1015,9 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void cancelSuffix() noexcept;
     void removeLabels(Batch& batch);
+    void runDiscards(Batch& batch) noexcept;
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);

@@ -1908,6 +1908,93 @@ void latchedWaitTests(const Device& device) {
     }
 }
 
+void suffixCancellationTests(const Device& device) {
+    using AgcDriver::Graphics::BatchState;
+    if (!device.Timelines()) {
+        std::cout << "timeline semaphores unavailable: suffix cancellation tests not run\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    VkSemaphoreTypeCreateInfoKHR type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO_KHR};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE_KHR;
+    VkSemaphoreCreateInfo info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &type};
+    VkSemaphore hold = VK_NULL_HANDLE;
+    Require(context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &hold) == VK_SUCCESS, "create the submit hold semaphore");
+    constexpr int Batches = 4;
+    std::array<int, Batches> completed{};
+    std::array<int, Batches> discarded{};
+    std::atomic<bool> released{false};
+    bool discardedAfterRelease = false;
+    std::string failure;
+    std::string refused;
+    std::string submitted;
+    std::vector<std::uint64_t> serials;
+    auto writers = std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>();
+    std::vector<std::shared_ptr<ShaderResources>> listed;
+    std::thread releaser;
+    {
+        Recorder recorder(context, true);
+        std::unique_lock gpu(GpuMutex());
+        recorder.Sync();
+        for (int index = 0; index < Batches; ++index) {
+            RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            auto token = std::make_shared<int>(index);
+            listed.emplace_back(token, reinterpret_cast<ShaderResources*>(token.get()));
+            ListCopiedWriter(recorder, writers, listed.back(), [&completed, index] { ++completed[index]; }, true);
+            recorder.OnDiscard([&, index] {
+                ++discarded[index];
+                if (index == 2) discardedAfterRelease = released.load(std::memory_order_acquire);
+            });
+            serials.push_back(recorder.Frontiers().Newest());
+            if (index == 2) recorder.HoldNextSubmit(hold, 1);
+            if (index + 1 < Batches) recorder.Submit();
+        }
+        Require(writers->size() == Batches, "a copied writer was not listed");
+        releaser = std::thread([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            released.store(true, std::memory_order_release);
+            VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR};
+            signal.semaphore = hold;
+            signal.value = 1;
+            static_cast<void>(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal));
+        });
+        Recorder::FailNextFenceWaitsForTest(1);
+        try {
+            recorder.FinishUpTo(serials[0]);
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        Recorder::FailNextFenceWaitsForTest(0);
+        Require(failure.find("vkWaitForFences") != std::string::npos, "the injected fence failure did not fail the finish ('" + failure + "')");
+        Require(recorder.Latched(), "a fence failure did not latch the recorder");
+        const auto& frontiers = recorder.Frontiers();
+        for (int index = 0; index + 1 < Batches; ++index) Require(frontiers.State(serials[index]) == BatchState::Failed, "a submitted batch at or after the failed one was not marked failed");
+        Require(frontiers.State(serials[3]) == BatchState::Reserved, "the open batch was cancelled while it could still be recording");
+        Require(frontiers.Through(BatchState::Completed) == serials[0] - 1, "the completed frontier passed the failed batch");
+        Require(discardedAfterRelease, "a cancelled batch was released while the GPU could still run it");
+        for (int index = 0; index + 1 < Batches; ++index) Require(completed[index] == 0 && discarded[index] == 1, "a cancelled batch ran a completion or did not run its discard actions exactly once");
+        Require(writers->size() == 1 && writers->front() == listed[3], "a cancelled batch's copied writer stayed listed");
+        try {
+            static_cast<void>(recorder.Commands());
+        } catch (const std::exception& error) {
+            refused = error.what();
+        }
+        Require(refused == failure, "a latched recorder accepted new commands ('" + refused + "')");
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            submitted = error.what();
+        }
+        Require(submitted == failure, "a latched recorder submitted its open batch ('" + submitted + "')");
+        Require(frontiers.State(serials[3]) == BatchState::Cancelled && frontiers.Terminal() == serials[3], "the poisoned open batch was not cancelled");
+        Require(completed[3] == 0 && discarded[3] == 1 && writers->empty(), "the poisoned open batch ran a completion or kept its copied writer listed");
+        Require(recorder.Idle(), "a latched recorder kept a batch after its cancellation");
+    }
+    releaser.join();
+    context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, hold, nullptr);
+    std::cout << "Suffix cancellation tests passed\n";
+}
+
 void serialFrontierTests(const Device& device, Recorder& recorder) {
     using AgcDriver::Graphics::BatchState;
     const auto& context = device.GetContext();
@@ -17026,6 +17113,7 @@ int main(int argc, char** argv) {
         serialFrontierTests(device, recorder);
         gpu.unlock();
         latchedWaitTests(device);
+        suffixCancellationTests(device);
         gpu.lock();
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);
