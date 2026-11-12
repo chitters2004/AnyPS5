@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ShaderDiskCache.hpp"
@@ -13803,8 +13804,8 @@ void recordedDrawRetentionTests() {
         if (allocation) pool->Put(*allocation);
         return returned;
     };
-    Require(!available(retentionIndex, sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "recorded indices were recycled before completion");
-    Require(!available(retentionVertex, sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), "recorded vertices were recycled before completion");
+    Require(!available(retentionIndex, sizeof(indices), DrawInputUsage), "recorded indices were recycled before completion");
+    Require(!available(retentionVertex, sizeof(vertices), DrawInputUsage), "recorded vertices were recycled before completion");
     auto pipeline = recipe->pipeline.lock();
     Require(pipeline != nullptr, "recorded pipeline expired");
     for (std::uint32_t size = 17; size < 30; ++size) pipeline->AcquireFramebuffer({}, {}, {size, size});
@@ -13819,8 +13820,8 @@ void recordedDrawRetentionTests() {
         throw std::runtime_error("retention completion failure");
     });
     recorder.Sync();
-    Require(available(retentionIndex, sizeof(indices), VK_BUFFER_USAGE_INDEX_BUFFER_BIT), "recorded indices survived completion");
-    Require(available(retentionVertex, sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT), "recorded vertices survived completion");
+    Require(available(retentionIndex, sizeof(indices), DrawInputUsage), "recorded indices survived completion");
+    Require(available(retentionVertex, sizeof(vertices), DrawInputUsage), "recorded vertices survived completion");
     Require(recipe->pipeline.expired() && recipe->framebuffer.expired() && recipe->templateRef.expired(), "recorded owners survived completion");
 
     mock.deferFences = true;

@@ -220,10 +220,6 @@ bool returnStashed(VkDevice device, std::size_t bytes, VkBufferUsageFlags usage,
     return true;
 }
 
-VkBufferUsageFlags usageOf(Recorder::SnapshotUse use) {
-    return use == Recorder::SnapshotUse::Vertex || use == Recorder::SnapshotUse::PaddedVertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
-}
-
 struct UploadCounters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> notReady{0};
@@ -470,7 +466,7 @@ public:
         std::uint32_t maxIndex = 0;
         if (draw.indexed) {
             const auto bytes = static_cast<std::size_t>(draw.indexCount) * draw.indexSize;
-            const auto index = countedCopy(draw.indexAddress, bytes, indexUse, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, bytes);
+            const auto index = countedCopy(draw.indexAddress, bytes, indexUse, DrawInputUsage, bytes);
             if (!index) return;
             auto& range = ranges[*index];
             const auto highest = HighestDrawIndex(range.buffer->Bytes().first(bytes), draw.indexSize, skipRestart);
@@ -488,13 +484,13 @@ public:
         }
         if (attributes.empty() || layout == nullptr) return;
         const auto planned = PlanDrawVertexFetches(colorTarget, draw, attributes, *layout, maxIndex);
-        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(countedCopy(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, static_cast<std::size_t>(end - begin)));
+        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(countedCopy(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, DrawInputUsage, static_cast<std::size_t>(end - begin)));
         for (const auto solo : planned.soloFetches) {
             const auto& fetch = planned.fetches[solo];
             const auto bytes = static_cast<std::size_t>(fetch.end - fetch.begin);
             const auto readable = ZeroPaddedReadableBytes(fetch.begin, planned.fetchValid[solo], fetch.stride);
             if (readable == 0 || readable > std::numeric_limits<std::uint32_t>::max()) continue;
-            if (const auto index = countedCopy(fetch.begin, bytes, Recorder::SnapshotUse::PaddedVertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, readable)) ranges[*index].derived = static_cast<std::uint32_t>(readable);
+            if (const auto index = countedCopy(fetch.begin, bytes, Recorder::SnapshotUse::PaddedVertex, DrawInputUsage, readable)) ranges[*index].derived = static_cast<std::uint32_t>(readable);
         }
     }
 
@@ -875,12 +871,12 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
 }
 
 VkMemoryPropertyFlags DrawInputMemoryProperties(const Context& context, Recorder::SnapshotUse use) {
-    return use == Recorder::SnapshotUse::Vertex ? context.SnapshotProperties() : HostBufferProperties;
+    return use == Recorder::SnapshotUse::Vertex || use == Recorder::SnapshotUse::PaddedVertex ? context.SnapshotProperties() : HostBufferProperties;
 }
 
 std::shared_ptr<Buffer> NewDrawInputBuffer(const Context& context, std::size_t bytes, Recorder::SnapshotUse use) {
     StagingCost cost;
-    auto buffer = stagingBuffer(context, bytes, usageOf(use), DrawInputMemoryProperties(context, use), DrawInputSourcesTimed(), cost);
+    auto buffer = stagingBuffer(context, bytes, DrawInputUsage, DrawInputMemoryProperties(context, use), DrawInputSourcesTimed(), cost);
     countStaging(StagingRole::Committer, cost);
     return buffer;
 }
