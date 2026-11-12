@@ -1430,7 +1430,49 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores, DeviceFuncti
     if (result != VK_SUCCESS) {
         std::fprintf(stderr, "[gpu] timeline semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(result));
         timeline = VK_NULL_HANDLE;
+        return;
     }
+    if (context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &terminal) != VK_SUCCESS) terminal = VK_NULL_HANDLE;
+}
+
+void Recorder::LatchFailure(std::exception_ptr error) noexcept {
+    {
+        std::lock_guard lock(latchMutex);
+        if (latchedError == nullptr) latchedError = error;
+    }
+    latched.store(true, std::memory_order_release);
+    releaseTerminal();
+}
+
+void Recorder::RethrowLatched() const {
+    if (!Latched()) return;
+    std::exception_ptr error;
+    {
+        std::lock_guard lock(latchMutex);
+        error = latchedError;
+    }
+    if (error != nullptr) std::rethrow_exception(error);
+    throw std::runtime_error("AGC graphics: the recorder failed");
+}
+
+void Recorder::releaseTerminal() noexcept {
+    if (terminal == VK_NULL_HANDLE || terminalReleased.exchange(true, std::memory_order_acq_rel)) return;
+    VkSemaphoreSignalInfoKHR signal{VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO_KHR};
+    signal.semaphore = terminal;
+    signal.value = 1;
+    try {
+        static_cast<void>(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal));
+    } catch (...) {
+    }
+}
+
+void Recorder::waitedThrough(std::uint64_t serial) const {
+    if (terminal == VK_NULL_HANDLE) return;
+    std::uint64_t value = 0;
+    Check(context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR")(context.device, timeline, &value), "vkGetSemaphoreCounterValueKHR recorder");
+    if (value >= serial) return;
+    RethrowLatched();
+    throw std::runtime_error("AGC graphics: the recorder was torn down before batch " + std::to_string(serial) + " completed");
 }
 
 Recorder::~Recorder() {
@@ -1462,8 +1504,7 @@ Recorder::~Recorder() {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.erase(std::remove(liveRecorders.begin(), liveRecorders.end(), id), liveRecorders.end());
     }
-    // Sync() above completed every batch, so every timeline wait in progress on this recorder
-    // returns now; the semaphore is destroyed only once they all left it.
+    releaseTerminal();
     while (WaitersOf(id).load(std::memory_order_acquire) != 0) std::this_thread::yield();
     // The kept objects of every batch this thread finished (Sync() above included) belong to the
     // device that is going away: destroyed now, here (no hand-off: nothing should stay in flight
@@ -1486,7 +1527,7 @@ Recorder::~Recorder() {
     if (changedCopyPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, changedCopyPipeline, nullptr);
     if (changedCopyLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, changedCopyLayout, nullptr);
     if (sampleCounterState > 0) {
-        samplesPassed.store(SamplesTotal(), std::memory_order_release);
+        if (!Latched()) samplesPassed.store(SamplesTotal(), std::memory_order_release);
         if (samplePools != nullptr) std::static_pointer_cast<SamplePoolCache>(samplePools)->close();
         if (segmentPools != nullptr) std::static_pointer_cast<SamplePoolCache>(segmentPools)->close();
         context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, samplePipeline, nullptr);
@@ -1504,6 +1545,8 @@ Recorder::~Recorder() {
     // Sync() above waited for every batch, so no submission still signals the timeline.
     if (timeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
     timeline = VK_NULL_HANDLE;
+    if (terminal != VK_NULL_HANDLE) context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, terminal, nullptr);
+    terminal = VK_NULL_HANDLE;
     if (encoderPool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, encoderPool, nullptr);
     encoderPool = VK_NULL_HANDLE;
 }
@@ -3117,6 +3160,7 @@ void Recorder::CountSamples() {
 
 std::uint64_t Recorder::SamplesTotal() {
     if (sampleCounterState <= 0) return samplesPassed.load(std::memory_order_acquire);
+    RethrowLatched();
     if (segmentMode() && !Idle()) Sync();
     std::uint64_t total = 0;
     std::memcpy(&total, sampleCounter->Bytes().data(), sizeof(total));
@@ -5176,6 +5220,12 @@ void Recorder::Submit() {
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+        try {
+            Check(result, "vkQueueSubmit recorder");
+        } catch (...) {
+            LatchFailure(std::current_exception());
+            throw;
+        }
     }
     Check(result, "vkQueueSubmit recorder");
     if (batch->guestWork) LibcRunReportMilestone_nid_no_patch(2);
@@ -5241,11 +5291,14 @@ struct RestoreSyncSite {
 // The timeline wait itself, on handles copied out of the recorder: the caller holds no mutex, and
 // the recorder may be torn down meanwhile (its destructor waits for the registered waiters to
 // leave after completing every batch, so the handles stay valid until this returns).
-VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+VkResult WaitTimeline(VkDevice device, VkSemaphore timeline, VkSemaphore terminal, PFN_vkWaitSemaphoresKHR waitSemaphores, std::uint64_t serial) {
+    const std::array<VkSemaphore, 2> semaphores{timeline, terminal};
+    const std::array<std::uint64_t, 2> values{serial, 1};
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
-    wait.semaphoreCount = 1;
-    wait.pSemaphores = &timeline;
-    wait.pValues = &serial;
+    wait.flags = terminal != VK_NULL_HANDLE ? VK_SEMAPHORE_WAIT_ANY_BIT_KHR : 0;
+    wait.semaphoreCount = terminal != VK_NULL_HANDLE ? 2u : 1u;
+    wait.pSemaphores = semaphores.data();
+    wait.pValues = values.data();
     auto result = waitSemaphores(device, &wait, 5'000'000'000ull);
     for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
         // As for the fence wait in finish(): a hung batch is reported every 5 s.
@@ -5263,25 +5316,30 @@ void Recorder::WaitSerial(std::uint64_t serial) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const UnlockedWaiter waiter{id};
-    const auto result = WaitTimeline(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
+    const auto result = WaitTimeline(context.device, timeline, terminal, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"), serial);
     if (profile) {
         unlockedWaits.fetch_add(1, std::memory_order_relaxed);
         unlockedWaitedUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     }
     Check(result, "vkWaitSemaphoresKHR recorder");
+    waitedThrough(serial);
 }
 
 bool Recorder::WaitSerialFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     PerformanceTimer frameTiming("Recorder.WaitSerialFor");
     if (timeline == VK_NULL_HANDLE || serial == 0) return false;
     const UnlockedWaiter waiter{id};
+    const std::array<VkSemaphore, 2> semaphores{timeline, terminal};
+    const std::array<std::uint64_t, 2> values{serial, 1};
     VkSemaphoreWaitInfoKHR wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO_KHR};
-    wait.semaphoreCount = 1;
-    wait.pSemaphores = &timeline;
-    wait.pValues = &serial;
+    wait.flags = terminal != VK_NULL_HANDLE ? VK_SEMAPHORE_WAIT_ANY_BIT_KHR : 0;
+    wait.semaphoreCount = terminal != VK_NULL_HANDLE ? 2u : 1u;
+    wait.pSemaphores = semaphores.data();
+    wait.pValues = values.data();
     const auto result = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR")(context.device, &wait, timeoutNanos);
     if (result == VK_TIMEOUT) return false;
     Check(result, "vkWaitSemaphoresKHR submission progress");
+    waitedThrough(serial);
     return true;
 }
 
@@ -5482,6 +5540,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     const auto myId = id;
     const auto device = context.device;
     const auto semaphore = timeline;
+    const auto terminalSemaphore = terminal;
     const auto waitSemaphores = context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR");
     // The site entry is taken under the mutex (the table is only touched under it; entries are
     // appended, never removed, so the index stays valid across the release).
@@ -5520,7 +5579,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         // Registered before the release: a teardown can only start once the mutex is free.
         const UnlockedWaiter waiter{myId};
         mutex.unlock();
-        result = WaitTimeline(device, semaphore, waitSemaphores, targetSerial);
+        result = WaitTimeline(device, semaphore, terminalSemaphore, waitSemaphores, targetSerial);
         // Read before the relock: the GPU wait, not the wait for the mutex behind it.
         if (profile || trace) waited = std::chrono::steady_clock::now();
     }
@@ -5567,6 +5626,7 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
         return true;
     }
     Check(result, "vkWaitSemaphoresKHR recorder");
+    waitedThrough(targetSerial);
     // The completions up to the target, under the mutex again; the fences are signaled, so the
     // waits inside finish() return at once (charged to the same site entry). Another thread may
     // have finished some meanwhile.
@@ -5692,7 +5752,12 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         if (result != VK_SUCCESS) {
             frontiers.Mark(batch->serial, BatchState::Failed);
             release(*batch);
-            Check(result, "vkWaitForFences recorder");
+            try {
+                Check(result, "vkWaitForFences recorder");
+            } catch (...) {
+                LatchFailure(std::current_exception());
+                throw;
+            }
         }
     }
     frontiers.Mark(batch->serial, BatchState::Completed);

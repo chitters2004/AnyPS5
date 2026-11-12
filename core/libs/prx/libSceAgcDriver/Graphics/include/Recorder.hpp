@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <array>
 #include <deque>
+#include <exception>
 #include <mutex>
 #include <functional>
 #include <list>
@@ -587,6 +588,9 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    void LatchFailure(std::exception_ptr error) noexcept;
+    bool Latched() const { return latched.load(std::memory_order_acquire); }
+    void RethrowLatched() const;
     // Whether the lock-free pending-write snapshot (open, in-flight and finishing batches) overlaps
     // the range: false means no recorded work writes it, so a wait on it has nothing to submit.
     static bool SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes);
@@ -1198,6 +1202,13 @@ private:
 
     Context context;
     VkSemaphore timeline = VK_NULL_HANDLE;
+    VkSemaphore terminal = VK_NULL_HANDLE;
+    std::atomic<bool> terminalReleased{false};
+    std::atomic<bool> latched{false};
+    mutable std::mutex latchMutex;
+    std::exception_ptr latchedError;
+    void releaseTerminal() noexcept;
+    void waitedThrough(std::uint64_t serial) const;
     VkSemaphore submitHold = VK_NULL_HANDLE;
     std::uint64_t submitHoldValue = 0;
     struct ProgressWatcher;
