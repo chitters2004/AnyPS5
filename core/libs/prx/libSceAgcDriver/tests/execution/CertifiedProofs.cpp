@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -425,6 +427,65 @@ void UnwatchRange(AgcDriver::VulkanDevice& device) {
     outcome = Draw(device, scene);
     Require(outcome.counts.proved == 0 && outcome.brightest == 0u, "unwatch: a write next to the unwatched texture was missed (" + outcome.Describe() + ")");
     Require(outcome.Uncertified(AgcDriver::Graphics::UncertifiedCause::Refused) == 1 && outcome.UncertifiedRefused(CertifyRefusal::ComparedTextures) == 1, "unwatch: the use after a refusal was not counted as uncertified for compared textures (" + outcome.Describe() + ")");
+}
+
+std::pair<bool, bool> LayerMarkVoids(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    constexpr std::uint32_t side = 128;
+    GuestBlocks memory(4u * BlockBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory.base);
+    auto context = device.graphicsContext();
+    TextureDetiler detiler(context);
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.depthOrLastArray = 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.imageLayers == 2 && geometry.layerBytes == BlockBytes, "layers: the image does not hold two 64 KiB slices");
+    const auto slice = [&](std::uint32_t layer) {
+        const auto begin = address + geometry.GuestLayerOffset(layer);
+        return std::array{std::pair<std::uint64_t, std::uint64_t>{begin, begin + geometry.layerBytes}};
+    };
+    const auto marked = GuestMemory::SubscribeWrites(slice(0));
+    const auto other = GuestMemory::SubscribeWrites(slice(1));
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto markedCertificate = GuestMemory::CertifySubscription(*marked, 0);
+    const auto otherCertificate = GuestMemory::CertifySubscription(*other, 0);
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "layers: no active recorder");
+    static_cast<void>(recorder->Commands());
+    recorder->Keep(image);
+    image->MarkSliceDirty(0);
+    const bool markedVoided = !GuestMemory::CertificateHolds(*marked, markedCertificate, 0);
+    const bool otherHeld = GuestMemory::CertificateHolds(*other, otherCertificate, 0);
+    image->WriteBack();
+    recorder->Submit();
+    recorder->Sync();
+    return {markedVoided, otherHeld};
+}
+
+void Layers(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const auto [voided, held] = LayerMarkVoids(device);
+    Require(voided, "layers: a layer pending mark left a certificate on that layer standing");
+    Require(held, "layers: a layer pending mark voided a certificate on another layer");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::WholePendingBumps, true);
+    const auto [wholeVoided, wholeHeld] = LayerMarkVoids(device);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::WholePendingBumps, false);
+    Require(wholeVoided && !wholeHeld, "layers: with APS5_WHOLE_PENDING_BUMPS a layer pending mark kept the other layer's certificate, so the case tests nothing");
+    std::printf("certified proofs: a layer pending mark voids certificates on its layer only\n");
 }
 
 bool SceneWatched(AgcDriver::VulkanDevice& device) {
@@ -983,7 +1044,7 @@ int main(int argc, char** argv) {
             std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
             return VulkanTestSkipped;
         }
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 19> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 20> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
