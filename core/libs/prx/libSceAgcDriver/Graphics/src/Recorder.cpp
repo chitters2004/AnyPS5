@@ -4024,6 +4024,26 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     return found->second.buffer;
 }
 
+std::shared_ptr<Buffer> Recorder::CertifiedDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, VkDeviceSize* offset) {
+    auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
+    if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use || !found->second.certified.has_value()) return {};
+    if (found->second.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || !RangeCertificateHolds(context, *found->second.certified)) {
+        found->second.certified.reset();
+        return {};
+    }
+    auto& recency = drawSnapshotPools[SnapshotPool(use)].recency;
+    recency.splice(recency.end(), recency, found->second.recent);
+    if (derived != nullptr) *derived = found->second.derived;
+    if (offset != nullptr) *offset = found->second.offset;
+    return found->second.buffer;
+}
+
+void Recorder::RecertifyDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use) {
+    const auto found = drawSnapshots.find({address, use, bytes});
+    if (found == drawSnapshots.end() || found->second.certified.has_value() || !found->second.owned.words.empty()) return;
+    found->second.certified = CertifyRange(address, bytes);
+}
+
 std::shared_ptr<Buffer> Recorder::containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -4102,7 +4122,7 @@ static void OwnedDrawTraceCount(const char* name, std::uint64_t amount = 1) {
     PerformanceTrace::CountOwnedDraw(name, amount);
 }
 
-void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, bool ownedInsertion, VkDeviceSize offset) {
+void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, bool ownedInsertion, VkDeviceSize offset, std::optional<RangeCertificate> certified) {
     const bool storage = use == SnapshotUse::Storage;
     const auto budget = storage ? DrawSnapshotBudget : DrawInputBudget;
     const auto maxEntries = storage ? DrawSnapshotEntries : DrawInputEntries;
@@ -4130,7 +4150,7 @@ void Recorder::KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::u
             shadow.resize(bytes);
             std::memcpy(shadow.data(), reinterpret_cast<const void*>(address), bytes);
         }
-        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, std::move(shadow), {}, offset});
+        drawSnapshots.emplace(key, DrawSnapshot{generation, registryGeneration, std::prev(pool.recency.end()), std::move(buffer), derived, std::move(shadow), {}, offset, std::move(certified)});
     } catch (...) {
         pool.recency.pop_back();
         throw;

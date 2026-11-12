@@ -4608,10 +4608,80 @@ void reportCertifiedProofs() {
     reportedPendingBumps = pendingBumps;
     const auto perFrame = [&](std::uint64_t count) { return frames == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(frames); };
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified proofs (10 s): %llu proved (%llu after a sweep), %llu certificates issued; misses:%s; refused:%s; verify: %llu checked, %llu disagreed; index bumps: %llu calls touching %llu subscriptions over %llu frames, %.1f calls and %.1f subscriptions per frame, %.1f ms\n", static_cast<unsigned long long>(now.proved - reported.proved), static_cast<unsigned long long>(now.swept - reported.swept), static_cast<unsigned long long>(now.issued - reported.issued), misses.c_str(), refusals.c_str(), static_cast<unsigned long long>(now.verified - reported.verified), static_cast<unsigned long long>(now.disagreed - reported.disagreed), static_cast<unsigned long long>(index.calls), static_cast<unsigned long long>(index.bumps), static_cast<unsigned long long>(frames), perFrame(index.calls), perFrame(index.bumps), static_cast<double>(index.lookupNanoseconds) / 1e6);
+    static CertifiedDrawInputCounts reportedInputs{};
+    const auto inputs = CertifiedDrawInputsCounted();
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified draw inputs (10 s): %llu served by a certificate (%llu after a sweep), %llu missed, %llu certificates issued, %llu refused as unwatched\n", static_cast<unsigned long long>(inputs.hits - reportedInputs.hits), static_cast<unsigned long long>(inputs.sweeps - reportedInputs.sweeps), static_cast<unsigned long long>(inputs.misses - reportedInputs.misses), static_cast<unsigned long long>(inputs.certified - reportedInputs.certified), static_cast<unsigned long long>(inputs.unwatched - reportedInputs.unwatched));
+    reportedInputs = inputs;
     reported = now;
     reportedFlips = flips;
 }
 
+}
+
+namespace {
+
+struct CertifiedDrawInputCounters {
+    std::atomic<std::uint64_t> hits{0};
+    std::atomic<std::uint64_t> sweeps{0};
+    std::atomic<std::uint64_t> misses{0};
+    std::atomic<std::uint64_t> certified{0};
+    std::atomic<std::uint64_t> unwatched{0};
+};
+
+CertifiedDrawInputCounters& DrawInputCounters() {
+    static CertifiedDrawInputCounters counters;
+    return counters;
+}
+
+}  // namespace
+
+bool CertifiedDrawInputs() {
+    return CertifiedProofs() && !RuntimeSwitches::Set(RuntimeSwitch::NoCertifiedDrawInputs);
+}
+
+std::optional<RangeCertificate> CertifyRange(std::uint64_t address, std::size_t bytes) {
+    if (!GuestMemory::Watched(address, bytes)) {
+        DrawInputCounters().unwatched.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    RangeCertificate certificate;
+    certificate.pending = StorageTexture::PendingSerial();
+    certificate.depth = DepthSurfacesSerial();
+    certificate.epoch = GuestMemory::ThreadCollectEpoch();
+    const std::array range{std::pair<std::uint64_t, std::uint64_t>{address, address + bytes}};
+    certificate.subscription = GuestMemory::SubscribeWrites(range);
+    if (certificate.subscription == nullptr) return std::nullopt;
+    certificate.certificate = GuestMemory::CertifySubscription(*certificate.subscription, CertifiedDomains());
+    DrawInputCounters().certified.fetch_add(1, std::memory_order_relaxed);
+    return certificate;
+}
+
+bool RangeCertificateHolds(const Context& context, RangeCertificate& certificate) {
+    auto& counters = DrawInputCounters();
+    const auto miss = [&] {
+        counters.misses.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (DepthPlanesStale()) {
+        for (const auto& [begin, end] : GuestMemory::SubscriptionSpans(*certificate.subscription)) {
+            if (!FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)).empty()) return miss();
+        }
+    }
+    const auto epoch = GuestMemory::ThreadCollectEpoch();
+    if (epoch == 0 || epoch != certificate.epoch) {
+        counters.sweeps.fetch_add(1, std::memory_order_relaxed);
+        if (!GuestMemory::SweepSubscription(*certificate.subscription)) return miss();
+    }
+    if (!GuestMemory::CertificateHolds(*certificate.subscription, certificate.certificate, CertifiedDomains())) return miss();
+    if (StorageTexture::PendingSerial() != certificate.pending || DepthSurfacesSerial() != certificate.depth || AnyPendingCpuWrites(context)) return miss();
+    certificate.epoch = epoch;
+    counters.hits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+CertifiedDrawInputCounts CertifiedDrawInputsCounted() {
+    auto& counters = DrawInputCounters();
+    return {counters.hits.load(std::memory_order_relaxed), counters.sweeps.load(std::memory_order_relaxed), counters.misses.load(std::memory_order_relaxed), counters.certified.load(std::memory_order_relaxed), counters.unwatched.load(std::memory_order_relaxed)};
 }
 
 bool CertifiedProofs() {

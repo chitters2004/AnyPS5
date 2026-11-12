@@ -1667,6 +1667,16 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     copy.bytes = bytes;
     const bool vertex = use == Recorder::SnapshotUse::Vertex;
     DrawInputSlice spare;
+    const bool certify = recorder != nullptr && bytes != 0 && CertifiedDrawInputs();
+    if (certify) {
+        copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->CertifiedDrawSnapshot(address, bytes, use, &copy.derived, &copy.offset); });
+        if (copy.buffer != nullptr) {
+            copy.reused = true;
+            CountCommit(vertex ? CommitCounter::InputVertexCopySnapshot : CommitCounter::InputIndexCopySnapshot);
+            counted(DrawInputSource::SnapshotReused);
+            return copy;
+        }
+    }
     if (recorder != nullptr && bytes != 0) {
         InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, bytes); });
 #ifdef _WIN32
@@ -1689,6 +1699,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             if (!copy.owned.words.empty()) CountCommit(vertex ? CommitCounter::InputVertexCopyArmed : CommitCounter::InputIndexCopyArmed);
         }
         if (copy.buffer != nullptr) {
+            if (certify) recorder->RecertifyDrawSnapshot(address, bytes, use);
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopySnapshot : CommitCounter::InputIndexCopySnapshot);
             counted(DrawInputSource::SnapshotReused);
@@ -1704,6 +1715,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
                 return copy;
             }
         }
+        if (certify && copy.generation != 0) copy.certified = CertifyRange(address, bytes);
     }
     CountCommit(vertex ? CommitCounter::InputVertexCopyFresh : CommitCounter::InputIndexCopyFresh);
     auto slice = spare.buffer != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputSlice(context, bytes, use); });
@@ -1773,7 +1785,7 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
         if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.bytes, copy.owned, copy.buffer, use, derived, copy.offset);
         return;
     }
-    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.buffer, use, derived, false, copy.offset);
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.buffer, use, derived, false, copy.offset, copy.certified);
 }
 
 std::span<std::byte> DrawInputCopy::Bytes() const {

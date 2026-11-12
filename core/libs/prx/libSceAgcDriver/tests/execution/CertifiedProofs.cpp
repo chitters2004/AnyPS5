@@ -435,6 +435,64 @@ void ThrowAfterConsume() {
     if (std::exchange(ThrowOnConsume, false)) throw std::runtime_error("invalidate: the consume hook threw");
 }
 
+struct InputRun {
+    bool hit = false;
+    bool storeSeen = false;
+    bool markSeen = false;
+    std::uint64_t certifiedHits = 0;
+};
+
+InputRun CertifiedInputs(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t size = 256;
+    GuestBlocks memory(BlockBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory.base);
+    auto* words = reinterpret_cast<std::uint32_t*>(memory.base);
+    for (std::uint32_t i = 0; i < size / sizeof(std::uint32_t); ++i) words[i] = i * 7u;
+    auto context = device.graphicsContext();
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "inputs: no active recorder");
+    const auto equalsGuest = [&](const DrawInputCopy& copy) { return copy.Bytes().size() == size && std::memcmp(copy.Bytes().data(), memory.base, size) == 0; };
+    const auto copyKept = [&] {
+        auto copy = CopyDrawInput(context, recorder, address, size, 4, Use::Index32);
+        Require(equalsGuest(copy), "inputs: a draw input copy differs from guest memory");
+        KeepDrawInput(recorder, address, copy, Use::Index32, 0);
+        return copy;
+    };
+    InputRun run;
+    const auto before = CertifiedDrawInputsCounted().hits;
+    GuestMemory::BumpCollectEpoch();
+    static_cast<void>(copyKept());
+    run.hit = copyKept().reused && CertifiedDrawInputsCounted().hits == before + 1;
+    words[3] = 0xdeadu;
+    GuestMemory::BumpCollectEpoch();
+    run.storeSeen = !copyKept().reused;
+    static_cast<void>(copyKept());
+    GuestMemory::MarkWritten(address + 64, 4);
+    run.markSeen = !copyKept().reused;
+    run.certifiedHits = CertifiedDrawInputsCounted().hits - before;
+    return run;
+}
+
+void Inputs(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const auto run = CertifiedInputs(device);
+    Require(run.hit, "inputs: an unchanged draw input was not served by its certificate");
+    Require(run.storeSeen, "inputs: a certified draw input outlived a CPU store in a new epoch");
+    Require(run.markSeen, "inputs: a certified draw input outlived a stamped GPU store");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedDrawInputs, true);
+    const auto off = CertifiedInputs(device);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedDrawInputs, false);
+    Require(off.certifiedHits == 0 && off.storeSeen && off.markSeen, "inputs: APS5_NO_CERTIFIED_DRAW_INPUTS did not return draw inputs to the collect path");
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::HideMarkWrittenBumps);
+    const auto mutant = CertifiedInputs(device);
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::None);
+    Require(!mutant.markSeen, "inputs: hiding the bumps of a stamped GPU store still voided the certified draw input, so the case tests nothing");
+    std::printf("certified proofs: draw inputs served %llu times by certificates, CPU and GPU stores void them, the switch returns them to the collect path\n", static_cast<unsigned long long>(run.certifiedHits));
+}
+
 bool InvalidationVoids() {
     GuestBlocks memory(2u * BlockBytes);
     const auto base = reinterpret_cast<std::uint64_t>(memory.base);
@@ -1089,7 +1147,7 @@ int main(int argc, char** argv) {
             std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
             return VulkanTestSkipped;
         }
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 21> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"invalidate", &Invalidate}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 22> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"invalidate", &Invalidate}, {"inputs", &Inputs}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
