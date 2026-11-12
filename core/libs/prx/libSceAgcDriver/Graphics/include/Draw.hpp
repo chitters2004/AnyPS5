@@ -192,6 +192,12 @@ std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision();
 // `rewritten` counts a GPU-side draw whose records were copied and patched with a constant.
 enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, IndexRange, IndexLimitUnknown, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
+struct DrawOpsCounts {
+    std::uint64_t recorded = 0;
+    std::uint64_t fallbacks = 0;
+};
+void CountDrawOps(bool recorded);
+DrawOpsCounts DrawOpsTotals();
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
 void CountEmptyIndirectDraw(double readMs);
 std::uint64_t EmptyIndirectDrawCount();

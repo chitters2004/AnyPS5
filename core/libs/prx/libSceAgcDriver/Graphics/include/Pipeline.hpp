@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <array>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -30,6 +31,45 @@ private:
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     std::vector<VkImageView> views;
 };
+
+struct DrawStateOps {
+    static constexpr std::size_t MaxMasks = 8;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    std::uint32_t maskCount = 0;
+    std::array<VkColorComponentFlags, MaxMasks> masks{};
+    bool stencilReference = false;
+    std::uint32_t stencilReferenceValue = 0;
+    bool library = false;
+    VkCullModeFlags cullMode = 0;
+    VkFrontFace frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    VkBool32 depthTest = VK_FALSE;
+    VkBool32 depthWrite = VK_FALSE;
+    VkCompareOp depthCompare = VK_COMPARE_OP_ALWAYS;
+    VkBool32 depthBoundsTest = VK_FALSE;
+    VkBool32 stencilTest = VK_FALSE;
+    std::array<VkStencilOpState, 2> stencil{};
+    bool depthBias = false;
+    float depthBiasConstant = 0.0f;
+    float depthBiasClamp = 0.0f;
+    float depthBiasSlope = 0.0f;
+    bool depthBounds = false;
+    float minDepthBounds = 0.0f;
+    float maxDepthBounds = 1.0f;
+    std::uint32_t setCount = 0;
+    std::array<VkDescriptorSet, 2> sets{};
+    std::array<std::uint32_t, 2> firstSets{};
+    std::uint32_t pushCount = 0;
+    std::array<VkShaderStageFlags, 2> pushStages{};
+    std::array<std::uint32_t, 2> pushOffsets{};
+    std::array<std::uint32_t, 2> pushSizes{};
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+};
+
+void RunDrawStateOps(const DrawStateOps& ops, VkCommandBuffer commands, const DeviceFunctions& functions);
+bool CanRunDrawStateOps(const DrawStateOps& ops, const DeviceFunctions& functions);
 
 // The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
 // scissor, depth bounds and depth bias are dynamic state set at Begin, so pipelines are shared by draws that differ only there
@@ -66,6 +106,9 @@ public:
     bool FragmentStageOmitted() const { return fragmentOmitted; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void ContinueOps(DrawStateOps& ops, const State& state, const State* masked = nullptr) const;
+    void PushOps(DrawStateOps& ops, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    DrawStateOps DrawOps(const State& state, const State* masked, std::array<VkDescriptorSet, 2> sets, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 

@@ -50,6 +50,7 @@ enum class RuntimeSwitch : std::size_t {
     NoCertifiedDrawInputs,
     NoRecordEncoder,
     EncoderPostChunks,
+    NoDrawOps,
     Count,
 };
 

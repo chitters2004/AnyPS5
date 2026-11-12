@@ -1456,6 +1456,17 @@ void ListCopiedWriter(Recorder& recorder, const std::shared_ptr<std::vector<std:
     if (listed) writers->push_back(resources);
 }
 
+static std::atomic<std::uint64_t> drawOpsRecorded{0};
+static std::atomic<std::uint64_t> drawOpsFallbacks{0};
+
+void CountDrawOps(bool recorded) {
+    (recorded ? drawOpsRecorded : drawOpsFallbacks).fetch_add(1, std::memory_order_relaxed);
+}
+
+DrawOpsCounts DrawOpsTotals() {
+    return {drawOpsRecorded.load(std::memory_order_relaxed), drawOpsFallbacks.load(std::memory_order_relaxed)};
+}
+
 const char* IndirectDrawPathName(IndirectDrawPath path) {
     return IndirectDrawPathNames[static_cast<std::size_t>(path)];
 }
@@ -2987,7 +2998,7 @@ void recordStencilReplay(const Context& context, CommandState& recording, const 
     }
 }
 
-void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0) {
+std::pair<std::array<std::byte, PipelinePushConstantBytes>, VkShaderStageFlags> assembleDrawPush(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments, bool restartTable, std::uint32_t meshLayerStride) {
     auto block = InCommitPhase(CommitPhase::RecordLocal, [&] {
         auto assembled = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
         if (bytes == nullptr) {
@@ -3013,8 +3024,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
             std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
             stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
         }
-        pipeline.PushConstants(commands, stages, block);
-        return;
+        return {block, stages};
     }
     const auto firstVertex = draw.indirect ? draw.indirect->vertexConstant : draw.firstVertex;
     const auto firstInstance = draw.indirect ? draw.indirect->instanceConstant : draw.firstInstance;
@@ -3022,7 +3032,20 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     if (state.tessellationCapture != nullptr) words = {static_cast<std::uint32_t>(capturedItems), static_cast<std::uint32_t>(capturedItems >> 32u), 0u, 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
-    pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
+    return {block, stages | VK_SHADER_STAGE_MESH_BIT_EXT};
+}
+
+void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false, std::uint32_t meshLayerStride = 0) {
+    const auto [block, pushStages] = assembleDrawPush(state, draw, shaders, resources, bytes, stages, meshArguments, restartTable, meshLayerStride);
+    pipeline.PushConstants(commands, pushStages, block);
+}
+
+void runDrawStateOpsRecord(const std::byte* payload, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    RunDrawStateOps(*std::launder(reinterpret_cast<const DrawStateOps*>(payload)), commands, functions);
+}
+
+bool DrawOpsEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoDrawOps);
 }
 
 // The record of a draw whose targets are all resident (`lean`: recorded into the device's open
@@ -3261,7 +3284,25 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::vector<std::shared_ptr<void>> reorderKept;
     std::optional<Recorder::EncodingWindow> encoding(std::in_place, *recorder);
     const auto unwindGuard = recorder->UnwindGuard();
-    if (continued) {
+    const bool functionLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
+    auto* opsEncoder = continued && !functionLds && !UsesMeshWindow(shaders) && DrawOpsEnabled() ? recorder->DeferringEncoder(commands) : nullptr;
+    bool stateRecorded = false;
+    if (opsEncoder != nullptr) {
+        InCommitPhase(CommitPhase::RecordBeginContinue, [&] {
+            const auto sets = drawBindings != nullptr ? std::array{drawBindings->allocation.set, drawBindings->fragmentAllocation.set} : resources.DrawUseSets(drawUse.get());
+            const auto [block, pushStages] = assembleDrawPush(state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
+            const auto ops = record.pipeline->DrawOps(state, record.masked, sets, pushStages, block);
+            if (CanRunDrawStateOps(ops, opsEncoder->Real())) {
+                opsEncoder->Emplace(&runDrawStateOpsRecord, ops);
+                recording.Invalidate();
+                stateRecorded = true;
+                CountDrawOps(true);
+            } else {
+                record.pipeline->Continue(recording, state, record.masked);
+            }
+        });
+    } else if (continued) {
+        CountDrawOps(false);
         InCommitPhase(CommitPhase::RecordBeginContinue, [&] { record.pipeline->Continue(recording, state, record.masked); });
     } else {
         BeginCommitPhase(CommitPhase::RecordBeginProxies);
@@ -3307,19 +3348,19 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     BeginCommitPhase(CommitPhase::RecordBind);
-    if (drawBindings != nullptr) {
+    if (!stateRecorded && drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
         if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
         if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
-    } else {
+    } else if (!stateRecorded) {
         resources.BindDrawUse(commands, record.pipeline->Layout(), drawUse.get());
     }
-    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
+    if (functionLds) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     BeginCommitPhase(CommitPhase::RecordPush);
-    pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
+    if (!stateRecorded) pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     BeginCommitPhase(CommitPhase::RecordCommands);
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;

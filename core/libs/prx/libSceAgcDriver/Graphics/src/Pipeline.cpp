@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "RuntimeAbi.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -1011,6 +1012,120 @@ void Pipeline::Continue(CommandState& recording, const State& state, const State
     if (depthBias) recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
+}
+
+void Pipeline::ContinueOps(DrawStateOps& ops, const State& state, const State* masked) const {
+    if (optimized != nullptr) optimized->Schedule();
+    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    ops.pipeline = best != VK_NULL_HANDLE ? best : pipeline;
+    ops.layout = layout;
+    ops.viewport = state.viewport;
+    ops.scissor = state.scissor;
+    ops.maskCount = 0;
+    if (context.dynamicColorWriteMask && !state.blends.empty()) {
+        const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), false);
+        ops.maskCount = static_cast<std::uint32_t>(state.blends.size());
+        std::copy_n(masks.begin(), ops.maskCount, ops.masks.begin());
+    }
+    ops.stencilReference = state.stencilReplayReference.has_value();
+    ops.stencilReferenceValue = state.stencilReplayReference.value_or(0u);
+    ops.library = libraries;
+    const bool depth = state.depth.has_value();
+    ops.depthBias = depthBias;
+    ops.depthBiasConstant = depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f;
+    ops.depthBiasClamp = depthBias ? state.depthBiasClamp : 0.0f;
+    ops.depthBiasSlope = depthBias ? state.depthBiasSlope : 0.0f;
+    ops.depthBounds = depthBounds;
+    ops.minDepthBounds = depthBounds ? state.minDepthBounds : 0.0f;
+    ops.maxDepthBounds = depthBounds ? state.maxDepthBounds : 1.0f;
+    if (!libraries) return;
+    ops.cullMode = state.cullMode;
+    ops.frontFace = state.frontFace;
+    ops.depthTest = depth && state.depthTest;
+    ops.depthWrite = depth && state.depthWrite;
+    ops.depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
+    ops.depthBoundsTest = depthBounds;
+    ops.stencilTest = depth && state.stencilTest;
+    ops.stencil = {depth ? state.stencilFront : VkStencilOpState{}, depth ? state.stencilBack : VkStencilOpState{}};
+}
+
+void Pipeline::PushOps(DrawStateOps& ops, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    ops.pushCount = 0;
+    if (stages == 0) return;
+    std::copy(bytes.begin(), bytes.end(), ops.push.begin());
+    if (dynamicRendering) {
+        if ((stages & ~VK_SHADER_STAGE_FRAGMENT_BIT) != 0) {
+            ops.pushStages[ops.pushCount] = pushStagesOf(context);
+            ops.pushOffsets[ops.pushCount] = 0;
+            ops.pushSizes[ops.pushCount++] = PipelinePushSlotBytes;
+        }
+        if ((stages & VK_SHADER_STAGE_FRAGMENT_BIT) != 0) {
+            ops.pushStages[ops.pushCount] = VK_SHADER_STAGE_FRAGMENT_BIT;
+            ops.pushOffsets[ops.pushCount] = PipelinePushSlotBytes;
+            ops.pushSizes[ops.pushCount++] = PipelinePushSlotBytes;
+        }
+        return;
+    }
+    ops.pushCount = 1;
+    ops.pushStages = {stages, 0};
+    ops.pushOffsets = {0, 0};
+    ops.pushSizes = {PipelinePushSlotBytes, 0};
+}
+
+bool CanRunDrawStateOps(const DrawStateOps& ops, const DeviceFunctions& functions) {
+    const bool common = CommandEncoder::Unwrap(functions.cmdBindPipeline) != nullptr && CommandEncoder::Unwrap(functions.cmdSetViewport) != nullptr && CommandEncoder::Unwrap(functions.cmdSetScissor) != nullptr && functions.cmdBindDescriptorSets != nullptr && functions.cmdPushConstants != nullptr;
+    const bool masks = ops.maskCount == 0 || CommandEncoder::Unwrap(functions.cmdSetColorWriteMask) != nullptr;
+    const bool reference = (!ops.stencilReference && !ops.library) || CommandEncoder::Unwrap(functions.cmdSetStencilReference) != nullptr;
+    const bool fixed = (!ops.depthBias && !ops.library) || CommandEncoder::Unwrap(functions.cmdSetDepthBias) != nullptr;
+    const bool bounds = (!ops.depthBounds && !ops.library) || CommandEncoder::Unwrap(functions.cmdSetDepthBounds) != nullptr;
+    const bool library = !ops.library || (CommandEncoder::Unwrap(functions.cmdSetCullMode) != nullptr && CommandEncoder::Unwrap(functions.cmdSetFrontFace) != nullptr && CommandEncoder::Unwrap(functions.cmdSetDepthTestEnable) != nullptr && CommandEncoder::Unwrap(functions.cmdSetDepthWriteEnable) != nullptr && CommandEncoder::Unwrap(functions.cmdSetDepthCompareOp) != nullptr && CommandEncoder::Unwrap(functions.cmdSetDepthBoundsTestEnable) != nullptr && CommandEncoder::Unwrap(functions.cmdSetStencilTestEnable) != nullptr && CommandEncoder::Unwrap(functions.cmdSetStencilOp) != nullptr && CommandEncoder::Unwrap(functions.cmdSetStencilCompareMask) != nullptr && CommandEncoder::Unwrap(functions.cmdSetStencilWriteMask) != nullptr);
+    return common && masks && reference && fixed && bounds && library;
+}
+
+DrawStateOps Pipeline::DrawOps(const State& state, const State* masked, std::array<VkDescriptorSet, 2> sets, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    DrawStateOps ops;
+    ContinueOps(ops, state, masked);
+    const std::array<std::uint32_t, 2> firstSets{0, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet};
+    for (std::size_t index = 0; index < sets.size(); ++index) {
+        if (sets[index] == VK_NULL_HANDLE) continue;
+        ops.sets[ops.setCount] = sets[index];
+        ops.firstSets[ops.setCount++] = firstSets[index];
+    }
+    PushOps(ops, stages, bytes);
+    return ops;
+}
+
+void RunDrawStateOps(const DrawStateOps& ops, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    CommandEncoder::Unwrap(functions.cmdBindPipeline)(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ops.pipeline);
+    CommandEncoder::Unwrap(functions.cmdSetViewport)(commands, 0, 1, &ops.viewport);
+    CommandEncoder::Unwrap(functions.cmdSetScissor)(commands, 0, 1, &ops.scissor);
+    if (ops.maskCount != 0) CommandEncoder::Unwrap(functions.cmdSetColorWriteMask)(commands, 0, ops.maskCount, ops.masks.data());
+    if (ops.stencilReference) CommandEncoder::Unwrap(functions.cmdSetStencilReference)(commands, VK_STENCIL_FACE_FRONT_AND_BACK, ops.stencilReferenceValue);
+    if (ops.library) {
+        CommandEncoder::Unwrap(functions.cmdSetCullMode)(commands, ops.cullMode);
+        CommandEncoder::Unwrap(functions.cmdSetFrontFace)(commands, ops.frontFace);
+        CommandEncoder::Unwrap(functions.cmdSetDepthBias)(commands, ops.depthBiasConstant, ops.depthBiasClamp, ops.depthBiasSlope);
+        CommandEncoder::Unwrap(functions.cmdSetDepthBounds)(commands, ops.minDepthBounds, ops.maxDepthBounds);
+        CommandEncoder::Unwrap(functions.cmdSetDepthTestEnable)(commands, ops.depthTest);
+        CommandEncoder::Unwrap(functions.cmdSetDepthWriteEnable)(commands, ops.depthWrite);
+        CommandEncoder::Unwrap(functions.cmdSetDepthCompareOp)(commands, ops.depthCompare);
+        CommandEncoder::Unwrap(functions.cmdSetDepthBoundsTestEnable)(commands, ops.depthBoundsTest);
+        CommandEncoder::Unwrap(functions.cmdSetStencilTestEnable)(commands, ops.stencilTest);
+        const bool shared = std::memcmp(&ops.stencil[0], &ops.stencil[1], sizeof(ops.stencil[0])) == 0;
+        const std::array<VkStencilFaceFlags, 2> faces{shared ? VkStencilFaceFlags{VK_STENCIL_FACE_FRONT_AND_BACK} : VkStencilFaceFlags{VK_STENCIL_FACE_FRONT_BIT}, VK_STENCIL_FACE_BACK_BIT};
+        for (std::size_t face = 0; face < (shared ? 1u : faces.size()); ++face) {
+            const auto& op = ops.stencil[face];
+            CommandEncoder::Unwrap(functions.cmdSetStencilOp)(commands, faces[face], op.failOp, op.passOp, op.depthFailOp, op.compareOp);
+            CommandEncoder::Unwrap(functions.cmdSetStencilCompareMask)(commands, faces[face], op.compareMask);
+            CommandEncoder::Unwrap(functions.cmdSetStencilWriteMask)(commands, faces[face], op.writeMask);
+            CommandEncoder::Unwrap(functions.cmdSetStencilReference)(commands, faces[face], op.reference);
+        }
+    } else {
+        if (ops.depthBias) CommandEncoder::Unwrap(functions.cmdSetDepthBias)(commands, ops.depthBiasConstant, ops.depthBiasClamp, ops.depthBiasSlope);
+        if (ops.depthBounds) CommandEncoder::Unwrap(functions.cmdSetDepthBounds)(commands, ops.minDepthBounds, ops.maxDepthBounds);
+    }
+    for (std::uint32_t index = 0; index < ops.setCount; ++index) functions.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ops.layout, ops.firstSets[index], 1, &ops.sets[index], 0, nullptr);
+    for (std::uint32_t index = 0; index < ops.pushCount; ++index) functions.cmdPushConstants(commands, ops.layout, ops.pushStages[index], ops.pushOffsets[index], ops.pushSizes[index], ops.push.data() + ops.pushOffsets[index]);
 }
 
 void Pipeline::setLibraryState(CommandState& recording, const State& state) const {

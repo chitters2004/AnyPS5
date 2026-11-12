@@ -668,6 +668,7 @@ public:
     bool BeginEncoding(std::source_location where = std::source_location::current());
     void EndEncoding(std::source_location where = std::source_location::current());
     bool Encodes() const { return encoder != nullptr; }
+    CommandEncoder* DeferringEncoder(VkCommandBuffer commands) const { return encoder != nullptr && encoder->Defers(commands) ? encoder.get() : nullptr; }
     CommandEncoder::UnwindQuiesce UnwindGuard(std::source_location where = std::source_location::current()) const { return CommandEncoder::UnwindQuiesce(encoder.get(), where); }
     class EncodingWindow {
     public:
