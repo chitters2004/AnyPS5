@@ -13,7 +13,7 @@
 namespace AgcDriver {
 
 struct AbCommitterTotals {
-    std::uint64_t commits = 0, commitNs = 0, drawCommits = 0, drawNs = 0, enqueued = 0, fullWaitNs = 0, wakes = 0, drains = 0, drainWaitNs = 0;
+    std::uint64_t commits = 0, commitNs = 0, drawCommits = 0, drawNs = 0, enqueued = 0, fullWaitNs = 0, wakes = 0, drains = 0, drainWaitNs = 0, finisherDrains = 0, finisherDrainWaitNs = 0;
 };
 
 struct AbSample {
@@ -58,6 +58,8 @@ public:
         count("wakes", b.wakes - a.wakes);
         count("drains", b.drains - a.drains);
         number("drain_wait_ms", ms(b.drainWaitNs - a.drainWaitNs));
+        count("finisher_drains", b.finisherDrains - a.finisherDrains);
+        number("finisher_drain_wait_ms", ms(b.finisherDrainWaitNs - a.finisherDrainWaitNs));
         bool recorded = false;
         for (std::size_t index = 0; index < to.threads.size(); ++index) {
             const auto before = index < from.threads.size() && from.threads[index].name == to.threads[index].name ? std::span<const TraceThread::Total>(from.threads[index].totals) : std::span<const TraceThread::Total>();

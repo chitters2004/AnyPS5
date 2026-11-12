@@ -456,7 +456,7 @@ void AbCountersLine() {
     from.present = 100;
     from.gpuBusyMs = 1000;
     from.gpuGapMs = 100;
-    from.committer = {100, 10'000'000, 80, 8'000'000, 100, 1'000'000, 5, 2, 3'000'000};
+    from.committer = {100, 10'000'000, 80, 8'000'000, 100, 1'000'000, 5, 2, 3'000'000, 4, 1'000'000};
     from.threads = {{"queue worker 0x0", {{"Driver.Packet", nullptr, milliseconds(100), 5}, {"Driver.Packet", "memory_wait", milliseconds(10), 1}, {"Driver.WorkerWait", nullptr, milliseconds(20), 3}}},
                     {"draw finisher", {{"Driver.DrawFinish", nullptr, milliseconds(30), 4}}},
                     {"presenter", {{"Driver.Present", nullptr, milliseconds(5), 1}}}};
@@ -465,7 +465,7 @@ void AbCountersLine() {
     to.present = 580;
     to.gpuBusyMs = 13000;
     to.gpuGapMs = 400;
-    to.committer = {300, 40'000'000, 250, 30'000'000, 310, 6'000'000, 25, 12, 13'000'000};
+    to.committer = {300, 40'000'000, 250, 30'000'000, 310, 6'000'000, 25, 12, 13'000'000, 14, 9'000'000};
     to.threads = {{"queue worker 0x0", {{"Driver.Packet", nullptr, milliseconds(600), 25}, {"Driver.Packet", "memory_wait", milliseconds(50), 4}, {"Driver.WorkerWait", nullptr, milliseconds(120), 9}, {"GpuMutex.wait", nullptr, milliseconds(7), 2}}},
                   {"draw finisher", {{"Driver.DrawFinish", nullptr, milliseconds(530), 49}}},
                   {"presenter", {{"Driver.Present", nullptr, milliseconds(5), 1}}}};
@@ -478,7 +478,7 @@ void AbCountersLine() {
     Check(has(" wall_ms=15000.000") && has(" presents=480") && has(" flip_p50_ms=30.000") && has(" flip_p90_ms=30.000"), "the A/B window counters differ");
     Check(has(" gpu_busy_ms=12000.000") && has(" gpu_gap_ms=300.000"), "the A/B GPU counters differ");
     Check(has(" commits=200") && has(" commit_ms=30.000") && has(" draws=170") && has(" draw_commit_ms=22.000"), "the A/B committer counters are not the phase's difference");
-    Check(has(" enqueued=210") && has(" room_wait_ms=5.000") && has(" wakes=20") && has(" drains=10") && has(" drain_wait_ms=10.000"), "the A/B queue counters are not the phase's difference");
+    Check(has(" enqueued=210") && has(" room_wait_ms=5.000") && has(" wakes=20") && has(" drains=10") && has(" drain_wait_ms=10.000") && has(" finisher_drains=10") && has(" finisher_drain_wait_ms=8.000"), "the A/B queue counters are not the phase's difference");
     Check(has(" t.queue_worker_0x0.busy_ms=500.000") && has(" t.queue_worker_0x0.idle_ms=100.000") && has(" t.queue_worker_0x0.memory_wait_ms=40.000") && has(" t.queue_worker_0x0.lock_wait_ms=7.000"), "the A/B worker counters are not the phase's difference");
     Check(has(" t.draw_finisher.busy_ms=500.000") && has(" t.draw_finisher.jobs=45"), "the A/B finisher counters are not the phase's difference");
     Check(!has("t.presenter") && !has("threads=none"), "a thread without work in the phase was listed or the threads were called unrecorded");

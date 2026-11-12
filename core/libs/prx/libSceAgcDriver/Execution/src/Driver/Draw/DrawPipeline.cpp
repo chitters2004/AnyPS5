@@ -239,12 +239,26 @@ void DrawFinisher::Settle() {
     idle.wait(lock, [&] { return jobs.empty(); });
 }
 
+namespace {
+std::atomic<std::uint64_t> finisherDrainWaits{0};
+std::atomic<std::uint64_t> finisherDrainWaitNs{0};
+}
+
+std::pair<std::uint64_t, std::uint64_t> DrawFinisher::DrainWaitTotals() {
+    return {finisherDrainWaits.load(std::memory_order_relaxed), finisherDrainWaitNs.load(std::memory_order_relaxed)};
+}
+
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const auto start = Busy() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (start != std::chrono::steady_clock::time_point{}) {
+        finisherDrainWaits.fetch_add(1, std::memory_order_relaxed);
+        finisherDrainWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 

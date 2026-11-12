@@ -158,7 +158,7 @@ def counter_metrics(counters):
     out = {}
     wall, presents = counters.get("wall_ms", 0.0), counters.get("presents", 0.0)
     if presents:
-        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms",
+        per_present = {"committer ms/present": "commit_ms", "committer room wait ms/present": "room_wait_ms", "committer drain wait ms/present": "drain_wait_ms", "finisher drain wait ms/present": "finisher_drain_wait_ms",
                        "GPU busy ms/present": "gpu_busy_ms", "GPU idle gaps ms/present": "gpu_gap_ms", "draws/present": "draws"}
         for name, key in per_present.items():
             if key in counters:
@@ -168,6 +168,7 @@ def counter_metrics(counters):
             out["flip " + name[5:8] + " ms"] = counters[name]
     if wall and "commit_ms" in counters:
         out["committer busy %"] = 100 * counters["commit_ms"] / wall
+        out["committer idle %"] = 100 - out["committer busy %"]
     if counters.get("draws"):
         out["committer us/draw"] = 1000 * counters["draw_commit_ms"] / counters["draws"]
     for key, value in counters.items():
