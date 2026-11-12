@@ -495,6 +495,76 @@ void CheckCrowdedKey() {
     for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription missed a bump after its neighbours were released and replaced");
 }
 
+void CheckProducerBumps() {
+    const auto mirrors = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Identity));
+    const auto bytes = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Bytes));
+    const auto mirrorSeen = ObserveSubscription(*mirrors);
+    const auto bytesSeen = ObserveSubscription(*bytes);
+    BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Mirror);
+    BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Depth);
+    Require(ObserveSubscription(*mirrors) == mirrorSeen && ObserveSubscription(*bytes) == bytesSeen, "a producer bump of a disjoint range moved a subscription");
+    BumpWrites(Base + 41 * Block, 4, WriteBumpSource::Depth);
+    Require(ObserveSubscription(*mirrors) == mirrorSeen, "a depth bump moved a subscription to identity changes only");
+    Require(ObserveSubscription(*bytes) != bytesSeen, "a depth bump of the range did not move a subscription to byte changes");
+    BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Mirror);
+    Require(ObserveSubscription(*mirrors) != mirrorSeen, "a mirror bump of the range did not move a subscription to identity changes");
+    bool refused = false;
+    try {
+        BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Driver);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    Require(refused, "BumpWrites accepted a source the index owns");
+}
+
+void CheckProducerDomains() {
+    const auto subscription = Subscribe(Base + 60 * Block, 1);
+    constexpr std::uint32_t mask = WriteDomainBit(WriteDomain::Depth) | WriteDomainBit(WriteDomain::Mirror);
+    auto certificate = CertifySubscription(*subscription, mask);
+    BumpDomainVersion(WriteDomain::Depth);
+    Require(!CertificateHolds(*subscription, certificate, mask), "a certificate held after its depth domain moved");
+    Require(CertificateHolds(*subscription, certificate, WriteDomainBit(WriteDomain::Mirror)), "a depth domain bump broke a certificate on the mirror domain only");
+    certificate = CertifySubscription(*subscription, mask);
+    BumpDomainVersion(WriteDomain::Mirror);
+    Require(!CertificateHolds(*subscription, certificate, mask), "a certificate held after its mirror domain moved");
+    for (const auto domain : {WriteDomain::Proof, WriteDomain::Unwatch, WriteDomain::Mapping, WriteDomain::CertifiedProof}) {
+        bool refused = false;
+        try {
+            BumpDomainVersion(domain);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "BumpDomainVersion accepted a domain the index owns");
+    }
+}
+
+std::vector<WriteDomain> domainReads;
+
+void RecordDomainRead(WriteDomain domain) {
+    domainReads.push_back(domain);
+}
+
+bool MirrorReadAfterMappingMoved() {
+    const auto subscription = Subscribe(Base + 70 * Block, 1);
+    constexpr std::uint32_t mask = WriteDomainBit(WriteDomain::Mapping) | WriteDomainBit(WriteDomain::Mirror);
+    const auto certificate = CertifySubscription(*subscription, mask);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 98 * Block), static_cast<std::size_t>(Block));
+    domainReads.clear();
+    SetDomainReadObserverForTest(RecordDomainRead);
+    const bool held = CertificateHolds(*subscription, certificate, mask);
+    SetDomainReadObserverForTest(nullptr);
+    Require(!held, "a certificate held after a mapping change");
+    return std::find(domainReads.begin(), domainReads.end(), WriteDomain::Mirror) != domainReads.end();
+}
+
+void CheckDomainOrder() {
+    Require(!MirrorReadAfterMappingMoved(), "CertificateHolds read the mirror domain after the mapping domain had failed");
+    SetCertificateMutantForTest(CertificateMutant::ReverseDomainOrder);
+    const bool mutantRead = MirrorReadAfterMappingMoved();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(mutantRead, "the reversed domain order mutant survived");
+}
+
 void CheckWriteIndex() {
     CheckObserveAndArm();
     CheckHistoryOutlivesTheArmedBit();
@@ -504,6 +574,9 @@ void CheckWriteIndex() {
     CheckBackingKeys();
     CheckBackingProbesAreBounded();
     CheckDomains();
+    CheckProducerBumps();
+    CheckProducerDomains();
+    CheckDomainOrder();
 }
 }
 

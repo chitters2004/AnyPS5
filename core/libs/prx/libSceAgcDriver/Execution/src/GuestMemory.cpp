@@ -325,7 +325,7 @@ bool brokenSource(WriteBumpSource source) {
         const char* text = std::getenv("APS5_TABLE_INDEX_BREAK");
         if (text == nullptr) return flags;
         const std::string value(text);
-        constexpr std::array<const char*, static_cast<std::size_t>(WriteBumpSource::Count)> names{"cpu", "driver", "pending", "unwatch", "forget", "release", "import"};
+        constexpr std::array<const char*, static_cast<std::size_t>(WriteBumpSource::Count)> names{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "mirror", "depth"};
         for (std::size_t i = 0; i < names.size(); ++i) flags[i] = value.find(names[i]) != std::string::npos;
         return flags;
     }();
@@ -363,6 +363,8 @@ Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource sourc
 }
 
 std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
+std::atomic<DomainReadObserver> domainReadObserver{nullptr};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteDomain::Count)> producerDomains{};
 thread_local bool storeBumpsMuted = false;
 
 class StoreBumpsMute {
@@ -484,7 +486,8 @@ void releaseSubscription(WriteSubscription* subscription) {
 WriteChange WriteChangeOf(WriteBumpSource source) {
     switch (source) {
     case WriteBumpSource::Cpu:
-    case WriteBumpSource::Driver: return WriteChange::Bytes;
+    case WriteBumpSource::Driver:
+    case WriteBumpSource::Depth: return WriteChange::Bytes;
     case WriteBumpSource::Pending: return WriteChange::Authority;
     case WriteBumpSource::Unwatch:
     case WriteBumpSource::Import: return WriteChange::Capability;
@@ -527,8 +530,20 @@ std::uint64_t DomainVersion(WriteDomain domain) {
     case WriteDomain::Unwatch: return UnwatchSerial();
     case WriteDomain::Mapping: return GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     case WriteDomain::CertifiedProof: return CertificateBreakSerial();
+    case WriteDomain::Depth:
+    case WriteDomain::Mirror: return producerDomains[static_cast<std::size_t>(domain)].load(std::memory_order_acquire);
     default: return 0;
     }
+}
+
+void BumpDomainVersion(WriteDomain domain) {
+    require(domain == WriteDomain::Depth || domain == WriteDomain::Mirror, "BumpDomainVersion takes only a producer-owned domain");
+    producerDomains[static_cast<std::size_t>(domain)].fetch_add(1, std::memory_order_acq_rel);
+}
+
+void BumpWrites(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+    require(source == WriteBumpSource::Depth || source == WriteBumpSource::Mirror, "BumpWrites takes only a producer-owned source");
+    bumpSubscriptions(address, bytes, source);
 }
 
 namespace {
@@ -553,6 +568,10 @@ void SetCertificateMutantForTest(CertificateMutant mutant) {
     certificateMutant.store(mutant, std::memory_order_release);
 }
 
+void SetDomainReadObserverForTest(DomainReadObserver observer) {
+    domainReadObserver.store(observer, std::memory_order_release);
+}
+
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask) {
     const auto domains = readDomains(domainMask);
     std::uint32_t missed = 0;
@@ -568,9 +587,14 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
     if (mutant == CertificateMutant::HideUnwatch) domainMask &= ~WriteDomainBit(WriteDomain::Unwatch);
     if (mutant == CertificateMutant::HideMapping) domainMask &= ~WriteDomainBit(WriteDomain::Mapping);
     if (mutant == CertificateMutant::HideCertifiedProof) domainMask &= ~WriteDomainBit(WriteDomain::CertifiedProof);
-    const auto domains = readDomains(domainMask);
-    for (std::size_t i = 0; i < domains.size(); ++i) {
-        if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) return false;
+    const auto observer = domainReadObserver.load(std::memory_order_relaxed);
+    const bool reversed = mutant == CertificateMutant::ReverseDomainOrder;
+    for (std::size_t step = 0; step < certificate.domains.size(); ++step) {
+        const auto i = reversed ? certificate.domains.size() - 1 - step : step;
+        if ((domainMask & (std::uint32_t{1} << i)) == 0) continue;
+        const auto domain = static_cast<WriteDomain>(i);
+        if (observer != nullptr) observer(domain);
+        if (DomainVersion(domain) != certificate.domains[i]) return false;
     }
     return mutant == CertificateMutant::IgnoreVersion || subscription.version.load(std::memory_order_acquire) == certificate.version;
 }

@@ -3454,7 +3454,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     GuestMemory::ResetWriteIndexCounts();
     {
         constexpr std::array<const char*, GuestMemory::WriteBumpSizeBuckets> SizeNames{"4K", "16K", "64K", "256K", "1M", "4M", "more"};
-        constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> Names{"cpu", "driver", "pending", "unwatch", "forget", "release", "import"};
+        constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> Names{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "mirror", "depth"};
         std::string sizes;
         for (std::size_t i = 0; i < Names.size(); ++i) {
             for (std::size_t k = 0; k < SizeNames.size(); ++k) {
@@ -3464,7 +3464,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         AgcDriver::ProfilePrint_nid_no_patch("[rescache] write index bump sizes (10 s):%s\n", sizes.c_str());
     }
     std::string sources;
-    constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> SourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import"};
+    constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> SourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "mirror", "depth"};
     for (std::size_t i = 0; i < SourceNames.size(); ++i) sources += " " + std::string(SourceNames[i]) + " " + std::to_string(index.bySource[i]);
     static std::array<std::uint64_t, IndexCountCount> reported{};
     std::array<std::uint64_t, IndexCountCount> counts{};
