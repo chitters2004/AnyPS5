@@ -68,7 +68,7 @@ private:
 };
 
 bool AbConfigured();
-std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
+std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds, AbSchedule::Step* taken = nullptr);
 
 }
 
