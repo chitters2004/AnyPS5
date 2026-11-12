@@ -13,6 +13,8 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <cstdio>
 #include <cstdlib>
@@ -526,25 +528,68 @@ bool DrawPipeline::PreparerDirect() {
     return preparerDirect();
 }
 
+namespace {
+
+template<typename T>
+class OutboxPool {
+public:
+    std::vector<T>* Take() {
+        std::lock_guard lock(mutex);
+        if (free.empty()) {
+            owned.push_back(std::make_unique<std::vector<T>>());
+            return owned.back().get();
+        }
+        auto* box = free.back();
+        free.pop_back();
+        return box;
+    }
+    void Return(std::vector<T>* box) {
+        box->clear();
+        std::lock_guard lock(mutex);
+        free.push_back(box);
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::unique_ptr<std::vector<T>>> owned;
+    std::vector<std::vector<T>*> free;
+};
+
+template<typename T>
+OutboxPool<T>& Outboxes() {
+    static auto* pool = new OutboxPool<T>();
+    return *pool;
+}
+
+}
+
 SequenceRing::Publish DrawPipeline::TakePreparerOutbox() {
     preparerDirect() = false;
     auto& outbox = preparerOutbox();
     if (outbox.empty()) return {};
-    auto items = std::make_shared<std::vector<Item>>(std::move(outbox));
-    outbox.clear();
-    return [items](bool keep) {
+    auto* box = Outboxes<Item>().Take();
+    box->swap(outbox);
+    return [box](bool keep) {
+        struct Return {
+            std::vector<Item>* box;
+            ~Return() { Outboxes<Item>().Return(box); }
+        } returned{box};
         if (!keep) return;
         auto& pipeline = Queue0();
-        for (auto& item : *items) pipeline.admit(std::move(item));
+        for (auto& item : *box) pipeline.admit(std::move(item));
     };
 }
 
 void DrawPipeline::FlushPreparerOutbox() {
     preparerDirect() = true;
-    auto items = std::move(preparerOutbox());
-    preparerOutbox().clear();
+    thread_local std::vector<Item> flushing;
+    flushing.swap(preparerOutbox());
+    struct Clear {
+        std::vector<Item>& items;
+        ~Clear() { items.clear(); }
+    } cleared{flushing};
     auto& pipeline = Queue0();
-    for (auto& item : items) pipeline.admit(std::move(item));
+    for (auto& item : flushing) pipeline.admit(std::move(item));
 }
 
 bool DrawPipeline::SeesQueuedWrites() {
