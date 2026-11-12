@@ -2404,7 +2404,7 @@ void Recorder::beginBatch() {
             static std::atomic<std::uint64_t> traceIds{0};
             open->traceId = traceIds.fetch_add(1, std::memory_order_relaxed) + 1;
         }
-        TraceBatchTag = open->traceId;
+        SetTraceBatchTag(open->traceId);
         // The whole-batch range: its start stamp waits for the previous batches like any
         // bottom-of-pipe stamp, so it marks when this batch's execution began.
         if (BatchStampsEnabled()) open->batchTiming = beginTiming(BatchTimingKey);

@@ -14,7 +14,6 @@ void PerformanceTrace::CountOwnedDraw(const char* scope, std::uint64_t amount) {
 std::uint64_t PerformanceTrace::OwnedDrawUnbound() {
     return ownedDrawUnbound.load(std::memory_order_relaxed);
 }
-thread_local TraceThread* PerformanceTrace::local = nullptr;
 thread_local const char* PerformanceTrace::localName = nullptr;
 std::atomic<TraceThread* (*)()> PerformanceTrace::binder{nullptr};
 
@@ -25,7 +24,7 @@ extern "C" bool AgcDriverTraceRecording_nid_postfix() {
 }
 
 extern "C" AgcDriver::TraceThread* AgcDriverTraceThread_nid_postfix() {
-    if (auto* thread = AgcDriver::PerformanceTrace::local) return thread;
+    if (auto* thread = AgcDriver::PerformanceTrace::Local()) return thread;
     const auto bind = AgcDriver::PerformanceTrace::binder.load(std::memory_order_acquire);
     return bind != nullptr ? bind() : nullptr;
 }
