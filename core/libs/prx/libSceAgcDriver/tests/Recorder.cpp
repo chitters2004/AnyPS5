@@ -13839,6 +13839,31 @@ int recordedCpuUploadTests(const Device& device, Recorder& previous, bool ring) 
             Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, 0}), what + "the re-upload's layout transition does not wait for a draw recorded earlier in its batch that rendered to the image");
             Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0}), what + "the re-upload's layout transition does not make a draw's color writes to the image available first");
             expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x20 / 255.0f, (what + "a dispatch sampling the image re-uploaded after a draw into it").c_str());
+            {
+                const auto commands = recorder.Commands();
+                VkImageMemoryBarrier toDraw{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toDraw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                toDraw.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                toDraw.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.image = firstImage->Image();
+                toDraw.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDraw);
+                FusionTrace::events.clear();
+                cover.DrawInto(recorder.GraphicsState(), firstImage->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM));
+            }
+            paint(first, 0x60);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, true);
+            firstImage->Refresh();
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, false);
+            Require(FusionTrace::DrawBeforeCopyInto(firstImage->Image()), what + "the draw into the image and the waited re-upload's copy after it were not both traced");
+            auto waitedTransition = FusionTrace::ImageBarrierBeforeCopyInto(firstImage->Image());
+            waitedTransition.dstStage = 0;
+            Require(Covers(waitedTransition, BarrierMask{VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, 0}), what + "the waited re-upload's layout transition does not wait for a draw submitted before it that rendered to the image");
+            Require(Covers(waitedTransition, BarrierMask{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0}), what + "the waited re-upload's layout transition does not make a draw's color writes to the image available first");
+            expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x60 / 255.0f, (what + "a dispatch sampling the image after a waited re-upload over a draw into it").c_str());
         }
         recorder.Sync();
     }
