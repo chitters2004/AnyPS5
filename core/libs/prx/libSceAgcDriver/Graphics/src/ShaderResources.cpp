@@ -1969,6 +1969,48 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deviceStaging, PreparedOffDevice) : context(context), guestMemory(context) {
+    drawBuild = true;
+    const bool addressTables = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && std::ranges::any_of(shader.program->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }); });
+    if (addressTables) throw OffDeviceRefusal("the draw maps guest memory through address tables");
+    if (deviceStaging) guestMemory.AllowDeviceStaging();
+    preparedDraw = true;
+    preparedStaging = deviceStaging;
+    preparedRegistry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    preparedForget = GuestMemory::ForgetSerial();
+    if ((preparedForget & 1u) != 0) throw OffDeviceRefusal("guest memory is being forgotten");
+    preparedRecorder = Recorder::Active();
+    preparedMirrors = MirrorsVersion();
+    guestMemory.PrepareOffDevice(true);
+    prepareAddressBindings(shaders, snapshots);
+    if (usesBda) throw OffDeviceRefusal("the draw maps guest memory through address tables");
+    buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
+    guestMemory.PrepareOffDevice(false);
+    if (preparedRegistry != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparedForget != GuestMemory::ForgetSerial()) {
+        release();
+        throw OffDeviceRefusal("the registry changed during stage A");
+    }
+}
+
+PreparedStaleness ShaderResources::PreparedDrawStaleness(bool deviceStaging) const {
+    if (!preparedDraw || completed || preparedStaging != deviceStaging) return PreparedStaleness::Unusable;
+    if (preparedRegistry != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return PreparedStaleness::Registry;
+    if (preparedForget != GuestMemory::ForgetSerial()) return PreparedStaleness::Forget;
+    if (preparedRecorder != Recorder::Active()) return PreparedStaleness::Recorder;
+    if (preparedMirrors != MirrorsVersion()) return PreparedStaleness::Mirrors;
+    if (!registeredImageViewsCurrent(registeredImageViews)) return PreparedStaleness::ImageViews;
+    if (!guestMemory.StagingDecisionsCurrent()) return PreparedStaleness::StagingDecisions;
+    return PreparedStaleness::Current;
+}
+
+void ShaderResources::CompleteDraw(std::span<const CompiledShader> shaders) {
+    Require(preparedDraw && !completed, "a draw's shader resources completed twice or without stage A");
+    buildComplete();
+    if (!GuestMemory::WriteIndexEnabled()) return;
+    countIndex(IndexBuilds);
+    subscribeBuilt(shaders);
+}
+
 namespace {
 
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).

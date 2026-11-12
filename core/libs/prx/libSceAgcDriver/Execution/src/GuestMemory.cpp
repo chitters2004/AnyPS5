@@ -3806,7 +3806,24 @@ void GpuMutexType::acquired() {
     }
 }
 
+namespace {
+
+thread_local bool deviceLockForbidden = false;
+
+void requireDeviceLockAllowed() {
+    if (deviceLockForbidden) throw std::runtime_error("GuestMemory::GpuMutex taken on a thread that prepares work off the device lock");
+}
+
+}
+
+DeviceLockForbiddenScope::DeviceLockForbiddenScope() : previous(std::exchange(deviceLockForbidden, true)) {}
+
+DeviceLockForbiddenScope::~DeviceLockForbiddenScope() {
+    deviceLockForbidden = previous;
+}
+
 bool GpuMutexType::try_lock() {
+    requireDeviceLockAllowed();
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
         acquired();
@@ -3874,6 +3891,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    requireDeviceLockAllowed();
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {

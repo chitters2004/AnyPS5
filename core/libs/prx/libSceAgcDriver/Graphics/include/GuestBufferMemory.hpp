@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -169,6 +170,12 @@ struct RegisteredPiece {
 };
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
+struct OffDeviceRefusal : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+std::uint64_t MirrorsVersion();
+VkBufferUsageFlags RegionCopyUsage(bool addressable);
+
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces = nullptr);
 std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 
@@ -387,6 +394,9 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    void PrepareOffDevice(bool off) { offDevice = off; }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> OffDeviceCopies() const;
+    std::vector<std::uint64_t> RegionSignature() const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -574,6 +584,7 @@ private:
     void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly);
     static bool servesView(const Region& region, std::uint64_t view);
     static bool sparseHeapCandidate(const Region& region);
+    bool adoptPreparedCopy(Region& region, bool addressable);
     bool bindSparseMirror(Region& region, const GuestAllocations::Lease& lease);
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
@@ -631,6 +642,7 @@ private:
     bool prepared = false;
     bool uploaded = false;
     bool committed = false;
+    bool offDevice = false;
     mutable std::uint64_t directWritesGeneration = 0;
 };
 

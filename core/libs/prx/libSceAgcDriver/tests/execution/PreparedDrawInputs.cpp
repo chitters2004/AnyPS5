@@ -341,6 +341,18 @@ void NoPreparersCopyOnTheCommitter() {
     Require(outcome.written == Width * Height, "prepared draw inputs: the draw copied on the committer left pixels cleared");
 }
 
+void StashedCopiesOutliveNoDevice() {
+    AgcDriver::Graphics::SetDrawInputPreparers(1);
+    Pool = AllocateWatched(PoolBytes);
+    GuestAllocations::Mutation().Add(Pool, PoolBytes, true, true, true);
+    const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+    const auto fresh = DrawOnce(Change::None);
+    const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+    Print("vertices in a block no draw imported yet, before the driver shuts down", fresh);
+    Require(fresh.written == Width * Height, "prepared draw inputs: the draw from a newly registered block left pixels cleared");
+    Require(after.stashReturned > before.stashReturned, "prepared draw inputs: no unused copy was kept for recycling, so the shutdown after this draw proves nothing");
+}
+
 }
 
 int main() {
@@ -374,6 +386,7 @@ int main() {
         IndirectRecordIndicesChangedAfterPreparation();
         EmptyFetchSkipDrawsTheSame();
         NoPreparersCopyOnTheCommitter();
+        StashedCopiesOutliveNoDevice();
         AgcDriver::Graphics::SetPreparedDrawInputsHook(nullptr);
         std::puts("prepared draw inputs: copies made before the commit are adopted only while the CPU left their ranges unchanged");
         AgcDriverShutdown_nid_postfix();

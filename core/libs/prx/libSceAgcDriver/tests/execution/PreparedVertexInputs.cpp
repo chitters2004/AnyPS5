@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -29,6 +30,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -190,6 +199,7 @@ struct Outcome {
     std::uint64_t reprepared = 0;
     std::uint64_t prepared = 0;
     std::uint64_t copied = 0;
+    std::uint64_t spares = 0;
 };
 
 Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit, bool indirect = false, std::span<const std::uint16_t> indices = Indices) {
@@ -214,7 +224,7 @@ Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, 
     device.WaitIdle();
     const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
     constexpr auto copied = static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied);
-    Outcome outcome{CenterCovered(), after.adopted - before.adopted, after.reprepared - before.reprepared, after.prepared - before.prepared, after.sources[copied] - before.sources[copied]};
+    Outcome outcome{CenterCovered(), after.adopted - before.adopted, after.reprepared - before.reprepared, after.prepared - before.prepared, after.sources[copied] - before.sources[copied], after.spareReused - before.spareReused};
     return outcome;
 }
 
@@ -242,7 +252,7 @@ int main() {
     setenv("APS5_NO_DRAW_INPUTS_IN_PLACE", "1", 1);
 #endif
     try {
-        const auto device = OpenVulkanTestDevice();
+        auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         IndexBlock = AllocateWatched(Block);
         VertexBlock = AllocateWatched(Block);
@@ -252,8 +262,12 @@ int main() {
         AgcDriver::Graphics::SetDrawInputPreparers(1);
         const auto programs = Compile(*device);
 
+        const auto ringBefore = AgcDriver::Graphics::DrawInputRingCounters();
         const auto unchanged = DrawPrepared(*device, *programs, [] {});
+        const auto ringAfter = AgcDriver::Graphics::DrawInputRingCounters();
         Print("unchanged inputs", unchanged);
+        std::printf("unchanged inputs: %llu ring slices, %llu ring chunks made\n", static_cast<unsigned long long>(ringAfter.slices - ringBefore.slices), static_cast<unsigned long long>(ringAfter.chunks - ringBefore.chunks));
+        Require(ringAfter.slices - ringBefore.slices == 2, "prepared vertex inputs: the preparer did not copy the index and vertex ranges into ring slices");
         Require(unchanged.prepared == 2 && unchanged.adopted == 2 && unchanged.reprepared == 0 && unchanged.copied == 0, "prepared vertex inputs: an unchanged draw did not adopt its prepared index and vertex copies");
         Require(unchanged.covered, "prepared vertex inputs: the draw with adopted inputs did not cover the center");
 
@@ -261,6 +275,11 @@ int main() {
         Print("vertices moved off the target after preparation", moved);
         Require(moved.adopted == 1 && moved.reprepared == 1 && moved.copied == 1, "prepared vertex inputs: a vertex range the CPU wrote after preparation was adopted, or the untouched index range was not");
         Require(!moved.covered, "prepared vertex inputs: the draw used the vertices prepared before the CPU moved them off the target");
+        Require(moved.spares == 1, "prepared vertex inputs: the committer did not copy the refused vertex range into the buffer its preparation left");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, true);
+        const auto movedFresh = DrawPrepared(*device, *programs, [] { WriteVertices(4.0f); });
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, false);
+        Require(movedFresh.spares == 0 && movedFresh.copied == 1 && !movedFresh.covered, "prepared vertex inputs: with recycling off the refused range was not copied into a buffer of its own");
 
         const auto degenerate = DrawPrepared(*device, *programs, [] { WriteIndices(Degenerate); });
         Print("indices made degenerate after preparation", degenerate);
@@ -338,6 +357,85 @@ int main() {
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
         Require(again.adopted == 2 && again.covered, "prepared vertex inputs: an unchanged draw after the others did not adopt both copies");
+        const auto epochState = DrawState();
+        const AgcDriver::Pm4::DrawParameters epochDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+        const auto prepareUnused = [&](std::uint64_t firstEpoch) {
+            const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+            for (const auto epoch : {firstEpoch, firstEpoch, firstEpoch + 1u}) {
+                auto job = device->PrepareDrawInputsAhead(epochState, epochDraw, programs->shaders, epoch);
+                Require(job != nullptr, "prepared vertex inputs: a draw with a collect epoch was not prepared");
+                AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+                const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+            }
+            const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+            return std::array<std::uint64_t, 3>{after.epochFollows - before.epochFollows, after.stashHits[0] - before.stashHits[0], after.stashReturned - before.stashReturned};
+        };
+        const auto ringSlices = AgcDriver::Graphics::DrawInputRingCounters().slices;
+        const auto sliced = prepareUnused((std::uint64_t{1} << 62u) - 8u);
+        std::printf("three unused preparations in ring slices: %llu ring slices, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices), static_cast<unsigned long long>(sliced[1]), static_cast<unsigned long long>(sliced[2]));
+        Require(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices == 6 && sliced[1] == 0 && sliced[2] == 0, "prepared vertex inputs: preparations of ring-sized ranges did not take ring slices, or put slices in the stash of whole buffers");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRing, true);
+        const auto recycled = prepareUnused(std::uint64_t{1} << 62u);
+        std::printf("three unused preparations in epochs E, E and E+1: %llu epoch follows, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(recycled[0]), static_cast<unsigned long long>(recycled[1]), static_cast<unsigned long long>(recycled[2]));
+        Require(recycled[0] == 2, "prepared vertex inputs: the preparer did not follow each new collect epoch of its draws exactly once");
+        Require(recycled[1] == 4 && recycled[2] == 6, "prepared vertex inputs: the unused copies of a preparation did not stage the next preparations of the same ranges");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, true);
+        const auto fresh = prepareUnused((std::uint64_t{1} << 62u) + 8u);
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRecycling, false);
+        Require(fresh[1] == 0 && fresh[2] == 0, "prepared vertex inputs: staging buffers were recycled with APS5_NO_DRAW_INPUT_RECYCLING set");
+        const auto afterRecycling = DrawPrepared(*device, *programs, [] {});
+        Require(afterRecycling.adopted == 2 && afterRecycling.covered, "prepared vertex inputs: a draw whose copies were staged in recycled buffers did not adopt both or drew wrong");
+        {
+            const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+            using Use = AgcDriver::Graphics::Recorder::SnapshotUse;
+            const auto mapped = AgcDriver::Graphics::DrawInputMemoryProperties(context, Use::Vertex);
+            const auto host = AgcDriver::Graphics::DrawInputMemoryProperties(context, Use::Index16);
+            Require(AgcDriver::Graphics::DrawInputMemoryProperties(context, Use::PaddedVertex) == mapped, "prepared vertex inputs: a zero-padded vertex fetch, which the CPU only writes, is not in the snapshot memory class");
+            Require(mapped == context.SnapshotProperties() && mapped != host, "prepared vertex inputs: the device offers no memory class for vertex copies apart from host memory, so keeping the class cannot be tested");
+            static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 20u));
+            constexpr std::size_t vertexBytes = Triangle.size() * 16u;
+            const auto beforeMismatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            const auto mismatched = AgcDriver::Graphics::NewDrawInputBuffer(context, vertexBytes, Use::Index16);
+            const auto afterMismatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            const auto matched = AgcDriver::Graphics::NewDrawInputBuffer(context, vertexBytes, Use::Vertex);
+            const auto afterMatch = AgcDriver::Graphics::PreparedDrawInputCounters();
+            std::printf("recycled %zu-byte vertex buffers: an index request, host class, took %llu from the stash (properties 0x%x), a vertex request took %llu (properties 0x%x, the snapshot class is 0x%x)\n", vertexBytes, static_cast<unsigned long long>(afterMismatch.stashHits[1] - beforeMismatch.stashHits[1]), mismatched->Properties(), static_cast<unsigned long long>(afterMatch.stashHits[1] - afterMismatch.stashHits[1]), matched->Properties(), mapped);
+            Require(afterMismatch.stashHits[1] == beforeMismatch.stashHits[1] && mismatched->Properties() == host, "prepared vertex inputs: a host-class index request reused a recycled buffer of the snapshot memory class");
+            Require(afterMatch.stashHits[1] == afterMismatch.stashHits[1] + 1 && matched->Properties() == mapped, "prepared vertex inputs: the recycled vertex copy did not keep its snapshot memory class, or a vertex request did not reuse it");
+            const auto hitKey = AgcDriver::Graphics::DrawResourceCacheKey(context, epochState, epochDraw, programs->shaders);
+            Require(!hitKey.empty(), "prepared vertex inputs: the draw has no resource cache key, so a cache hit cannot be predicted for it");
+            bool predicted = true;
+            auto cachedBuild = AgcDriver::Graphics::PrepareDrawResourcesOffDevice(context, epochState, epochDraw, programs->shaders, {}, predicted);
+            Require(!predicted && cachedBuild != nullptr, "prepared vertex inputs: a cache hit was predicted for a key the resource cache does not hold");
+            auto& cache = AgcDriver::Graphics::SharedResourceCache();
+            cache.Insert(hitKey, cachedBuild);
+            Require(cache.Peek(hitKey) != nullptr, "prepared vertex inputs: the resource cache refused the entry the predicted hit needs");
+            const auto findsBefore = AgcDriver::Graphics::ResourceCache::Finds();
+            const auto touchesBefore = AgcDriver::Graphics::ResourceCache::Touches();
+            const auto uploadsBefore = AgcDriver::Graphics::PreparedUploadCounters();
+            {
+                auto job = device->PrepareDrawResourcesAhead(nullptr, epochState, epochDraw, programs->shaders, {}, (std::uint64_t{1} << 62u) + 12u);
+                Require(job != nullptr, "prepared vertex inputs: the draw's resources were not queued for preparation");
+                const auto pin = std::make_shared<int>(0);
+                AgcDriver::Graphics::SubmitPreparedDrawResources(job, pin);
+                AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+                const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+            }
+            const auto uploadsAfter = AgcDriver::Graphics::PreparedUploadCounters();
+            std::printf("draw whose resources the cache holds: %llu predicted hits, %llu stage A builds, %llu cache finds and %llu touches by the prediction\n", static_cast<unsigned long long>(uploadsAfter.stageAPredictedHit - uploadsBefore.stageAPredictedHit), static_cast<unsigned long long>(uploadsAfter.stageAPrepared - uploadsBefore.stageAPrepared), static_cast<unsigned long long>(AgcDriver::Graphics::ResourceCache::Finds() - findsBefore), static_cast<unsigned long long>(AgcDriver::Graphics::ResourceCache::Touches() - touchesBefore));
+            Require(uploadsAfter.stageAPredictedHit - uploadsBefore.stageAPredictedHit == 1 && uploadsAfter.stageAPrepared == uploadsBefore.stageAPrepared, "prepared vertex inputs: a preparer built stage A for a draw whose resources the cache holds");
+            Require(AgcDriver::Graphics::ResourceCache::Finds() == findsBefore && AgcDriver::Graphics::ResourceCache::Touches() == touchesBefore, "prepared vertex inputs: predicting the cache hit found or touched the entry, which reorders the cache and its counts");
+            cache.Remove(hitKey, cachedBuild.get());
+            cachedBuild.reset();
+        }
+
+        const auto beforeTeardown = AgcDriver::Graphics::PreparedDrawInputCounters();
+        static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 16u));
+        Require(AgcDriver::Graphics::PreparedDrawInputCounters().stashReturned > beforeTeardown.stashReturned, "prepared vertex inputs: no unused copy was kept for recycling, so destroying the device after it proves nothing");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRing, false);
+        Require(AgcDriver::Graphics::DrawInputRingCounters().outstanding != 0, "prepared vertex inputs: no ring chunk is in use, so destroying the device after the ring proves nothing");
+        device.reset();
+        AgcDriver::Graphics::SetDrawInputPreparers(0);
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
     } catch (const std::exception& error) {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -4036,6 +4037,7 @@ void ClearImageMirrors(VkDevice device) {
         state.failed.clear();
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
+        ++state.version;
     }
 }
 
@@ -6362,6 +6364,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
         if (mirror == nullptr) {
             const auto range = fixedImageRange(region.begin, region.end);
             if (range != nullptr && (region.begin - range->address) % context.limits.minStorageBufferOffsetAlignment == 0) {
+                if (offDevice) throw OffDeviceRefusal("an image mirror would be made");
                 std::vector<RefreshBlock> unused;
                 mirror = acquireMirror(context, range, unused, false);
                 if (mirror != nullptr) sweepMirrors();
@@ -6451,12 +6454,59 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     // GuestMemory::Read stores pending GPU results first (the flush hook locks for itself).
     for (auto& region : regions) {
         if (region.pending || region.mirror != nullptr || region.direct != nullptr) continue;
-        if (sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)))) {
+        if (sparseHeapCandidate(region) || (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) || (offDevice && (region.hostBacked || region.writable))) {
             region.pending = true;
             continue;
         }
+        if (adoptPreparedCopy(region, addressable)) continue;
         copyRegion(region, addressable);
     }
+}
+
+bool GuestBufferMemory::adoptPreparedCopy(Region& region, bool addressable) {
+    if (region.sparse || region.bufferEnd != 0 || region.buffer != nullptr || !(region.hostBacked || region.writable)) return false;
+    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+    std::shared_ptr<Buffer> spare;
+    auto adopted = AdoptPreparedRegion(context, Recorder::Active(), region.begin, bytes, RegionCopyUsage(addressable), &spare);
+    if (adopted == nullptr) {
+        if (spare != nullptr) region.buffer = std::move(spare);
+        return false;
+    }
+    region.buffer = std::move(adopted);
+    if (region.writable && WritesOverlap(region.begin, bytes)) region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
+    region.snapshot.clear();
+    return true;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::OffDeviceCopies() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> copies;
+    if (!prepared || uploaded) return copies;
+    for (const auto& region : regions) {
+        if (!region.pending || region.mirror != nullptr || region.direct != nullptr || region.buffer != nullptr || region.sparse || region.bufferEnd != 0 || sparseHeapCandidate(region) || !(region.hostBacked || region.writable)) continue;
+        copies.emplace_back(region.begin, region.end);
+    }
+    return copies;
+}
+
+std::vector<std::uint64_t> GuestBufferMemory::RegionSignature() const {
+    std::vector<std::uint64_t> signature;
+    signature.reserve(regions.size() * 3u);
+    for (const auto& region : regions) {
+        signature.push_back(region.begin);
+        signature.push_back(region.end);
+        signature.push_back((region.writable ? 1u : 0u) | (region.hostBacked ? 2u : 0u) | (region.sparse ? 4u : 0u) | (region.atomic ? 8u : 0u) | (region.sparseHeap ? 16u : 0u) | (region.mirror != nullptr ? 32u : 0u));
+    }
+    return signature;
+}
+
+std::uint64_t MirrorsVersion() {
+    auto& state = Mirrors();
+    std::lock_guard lock(state.mutex);
+    return state.version;
+}
+
+VkBufferUsageFlags RegionCopyUsage(bool addressable) {
+    return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
 }
 
 void GuestBufferMemory::completeSpaceWrites() const {
@@ -6693,6 +6743,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             region.buffer.reset();
             region.deviceLocal = false;
         }
+        if (adoptPreparedCopy(region, addressable)) continue;
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         copyRegion(region, addressable);
         if (profile) copyUs += microsecondsSince(copyStart);
@@ -6734,7 +6785,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto bytes = region.end - region.begin;
-    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | (addressable ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+    const auto usage = RegionCopyUsage(addressable);
     std::uint64_t readBytes = 0;
     bool inImport = false;
     if (profile && context.hostImportAlignment != 0) {

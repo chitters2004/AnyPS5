@@ -1209,6 +1209,7 @@ struct VulkanDevice::State {
             Graphics::ClearRetainedSpaces(device);
             Graphics::ClearCachedTextures(device);
             Graphics::ClearSnapshotCopies(device);
+            Graphics::ClearDrawInputStash(device);
             Graphics::ClearImageMirrors(device);
             Graphics::ClearHostImports(device);
             Graphics::ClearResidentRanges(device);
@@ -4979,9 +4980,13 @@ bool VulkanDevice::DrawInputsInPlace() const {
     return state->drawInputsInPlace;
 }
 
-std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const {
+std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t epoch) const {
     if (state->drawInputsInPlace || (draw.indirect && !draw.indexed)) return nullptr;
-    return Graphics::PrepareDrawInputsAhead(graphicsContext(), graphics, draw, shaders);
+    return Graphics::PrepareDrawInputsAhead(graphicsContext(), graphics, draw, shaders, epoch);
+}
+
+std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawResourcesAhead(std::shared_ptr<Graphics::PreparedDrawInputs> job, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t epoch) const {
+    return Graphics::PrepareDrawResourcesAhead(std::move(job), graphicsContext(), graphics, draw, shaders, snapshots, epoch);
 }
 
 namespace {

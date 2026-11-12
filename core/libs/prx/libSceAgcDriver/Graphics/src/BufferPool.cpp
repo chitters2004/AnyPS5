@@ -17,6 +17,14 @@ namespace AgcDriver::Graphics {
 namespace {
 
 thread_local std::uint64_t imageMemoryReleasedBytes = 0;
+thread_local std::uint64_t lockWaitNanoseconds = 0;
+
+void lockTimed(AgcDriver::Mutex& mutex) noexcept {
+    if (mutex.try_lock()) return;
+    const auto start = std::chrono::steady_clock::now();
+    mutex.lock();
+    lockWaitNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 class MemoryAllocationError : public std::runtime_error {
 public:
@@ -422,10 +430,15 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
+std::uint64_t BufferPool::ThreadLockWaitNanoseconds() noexcept {
+    return lockWaitNanoseconds;
+}
+
 std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const char* category, bool hostPlaced) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto capacity = Capacity(bytes);
-    std::lock_guard lock(mutex);
+    lockTimed(mutex);
+    std::lock_guard lock(mutex, std::adopt_lock);
     ++clock;
     if (profile) {
         static auto lastReport = std::chrono::steady_clock::now();
@@ -603,7 +616,8 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
     try {
-        std::lock_guard lock(mutex);
+        lockTimed(mutex);
+        std::lock_guard lock(mutex, std::adopt_lock);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
         if (allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);

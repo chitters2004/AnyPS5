@@ -217,6 +217,9 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+enum class PreparedStaleness : std::uint8_t { Current, Unusable, Registry, Forget, Recorder, Mirrors, ImageViews, StagingDecisions, Count };
+inline constexpr std::size_t PreparedStalenessCount = static_cast<std::size_t>(PreparedStaleness::Count);
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -230,6 +233,13 @@ public:
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     void Complete();
     bool Completed() const { return completed; }
+    struct PreparedOffDevice {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deviceStaging, PreparedOffDevice);
+    PreparedStaleness PreparedDrawStaleness(bool deviceStaging) const;
+    bool PreparedStaging() const { return preparedStaging; }
+    void CompleteDraw(std::span<const CompiledShader> shaders);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> OffDeviceCopies() const { return guestMemory.OffDeviceCopies(); }
+    std::vector<std::uint64_t> RegionSignature() const { return guestMemory.RegionSignature(); }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
@@ -915,6 +925,12 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    bool preparedDraw = false;
+    bool preparedStaging = false;
+    std::uint64_t preparedRegistry = 0;
+    std::uint64_t preparedForget = 0;
+    std::uint64_t preparedMirrors = 0;
+    const Recorder* preparedRecorder = nullptr;
     std::chrono::steady_clock::time_point phaseStart;
 };
 

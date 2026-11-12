@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
@@ -727,6 +728,7 @@ private:
 
     void release() noexcept {
         if (context.device != VK_NULL_HANDLE) ClearHostImports(context.device);
+        if (context.device != VK_NULL_HANDLE) ClearDrawInputStash(context.device);
         if (context.settlePool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.settlePool, nullptr);
         if (context.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.pool, nullptr);
         context.bufferPool.reset();
@@ -5659,6 +5661,10 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+bool SameDrawInput(const DrawInputCopy& first, const DrawInputCopy& second) {
+    return first.buffer == second.buffer && first.offset == second.offset;
+}
+
 void paddedVertexSnapshotTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     using AgcDriver::Graphics::CopyZeroPaddedDrawInput;
@@ -5681,7 +5687,7 @@ void paddedVertexSnapshotTests(const Device& device) {
     constexpr std::size_t padded = 2 * 65536;
     constexpr std::size_t valid = 64;
     const auto contentIs = [&](const DrawInputCopy& copy, std::size_t readable) {
-        const auto held = copy.buffer->Bytes();
+        const auto held = copy.Bytes();
         if (held.size() != padded) return false;
         for (std::size_t i = 0; i < padded; ++i) {
             if (held[i] != (i < readable ? guest[i] : std::byte{0})) return false;
@@ -5691,17 +5697,17 @@ void paddedVertexSnapshotTests(const Device& device) {
     const auto first = CopyZeroPaddedDrawInput(context, address, padded, valid, 16);
     Require(!first.reused && contentIs(first, valid), "the first padded vertex copy is wrong");
     const auto again = CopyZeroPaddedDrawInput(context, address, padded, valid, 16);
-    Require(again.reused && again.buffer == first.buffer, "an unchanged padded vertex input was copied again");
+    Require(again.reused && SameDrawInput(again, first), "an unchanged padded vertex input was copied again");
     guest[65536 + 8] = std::byte{0x22};
     const auto padding = CopyZeroPaddedDrawInput(context, address, padded, valid, 16);
-    Require(padding.reused && padding.buffer == first.buffer && contentIs(padding, valid), "a store past the valid bytes discarded the padded copy");
+    Require(padding.reused && SameDrawInput(padding, first) && contentIs(padding, valid), "a store past the valid bytes discarded the padded copy");
     guest[8] = std::byte{0x33};
     const auto stored = CopyZeroPaddedDrawInput(context, address, padded, valid, 16);
-    Require(!stored.reused && stored.buffer != first.buffer && contentIs(stored, valid), "a padded vertex copy outlived a store to its valid bytes");
+    Require(!stored.reused && !SameDrawInput(stored, first) && contentIs(stored, valid), "a padded vertex copy outlived a store to its valid bytes");
     const auto shorter = CopyZeroPaddedDrawInput(context, address, padded, valid / 2, 16);
     Require(!shorter.reused && contentIs(shorter, valid / 2), "a padded copy was reused for fewer valid bytes");
     const auto longer = CopyZeroPaddedDrawInput(context, address, padded * 2, valid / 2, 16);
-    Require(!longer.reused && longer.buffer->Bytes().size() == padded * 2, "a padded copy was reused for a longer fetch");
+    Require(!longer.reused && longer.Bytes().size() == padded * 2, "a padded copy was reused for a longer fetch");
     Require(cache.ReusableDrawSnapshot(address, padded, Recorder::SnapshotUse::Vertex) == nullptr, "a padded copy served an unpadded vertex input");
 }
 
@@ -5890,7 +5896,7 @@ void ownedDrawInputTests(const Device& device, Recorder& recorder) {
     Require(InPlaceDrawInput(context, address, size, 4) == nullptr, "the copied input fixture was bound in place");
     const auto copy = [&](Use use = Use::Index32, std::size_t length = 256, std::size_t offset = 0) {
         auto result = CopyDrawInput(context, &recorder, address + offset, length, 4, use);
-        Require(result.buffer != nullptr && result.buffer->Bytes().size() == length && std::memcmp(result.buffer->Bytes().data(), static_cast<const std::byte*>(block) + offset, length) == 0, "the owned draw input has stale bytes");
+        Require(result.buffer != nullptr && result.Bytes().size() == length && std::memcmp(result.Bytes().data(), static_cast<const std::byte*>(block) + offset, length) == 0, "the owned draw input has stale bytes");
         Require(result.generation == 0, "the untracked copy acquired a tracked generation");
         return result;
     };
@@ -5902,7 +5908,7 @@ void ownedDrawInputTests(const Device& device, Recorder& recorder) {
     keep(first);
     const auto second = copy();
     Require(second.reused == reusable, "an unchanged untracked draw input was copied again");
-    if (reusable) Require(second.buffer == first.buffer && second.derived == 189, "an owned index lost its buffer or highest index");
+    if (reusable) Require(SameDrawInput(second, first) && second.derived == 189, "an owned index lost its buffer or highest index");
     BumpCollectEpoch();
     Require(copy().reused == reusable, "a collect epoch lost an unchanged owned input");
     words[5] = 0xdead;
@@ -6023,23 +6029,23 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     const auto address = reinterpret_cast<std::uint64_t>(block);
     constexpr std::size_t size = 256;
     const auto equalsGuest = [&](const DrawInputCopy& copy) {
-        const auto contents = copy.buffer->Bytes();
+        const auto contents = copy.Bytes();
         return contents.size() == size && std::memcmp(contents.data(), block, size) == 0;
     };
     const auto first = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
     Require(!first.reused && first.generation != 0 && equalsGuest(first), "the first draw input copy is wrong");
     KeepDrawInput(&recorder, address, first, Use::Index32, 189);
     const auto second = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
-    Require(second.reused && second.buffer == first.buffer && second.derived == 189, "an unchanged draw input was copied again");
+    Require(second.reused && SameDrawInput(second, first) && second.derived == 189, "an unchanged draw input was copied again");
     const auto vertex = CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex);
     const auto narrow = CopyDrawInput(context, &recorder, address, size, 2, Use::Index16);
     Require(!vertex.reused && !narrow.reused && equalsGuest(vertex) && equalsGuest(narrow), "a draw input reused another use's copy");
     KeepDrawInput(&recorder, address, vertex, Use::Vertex, 0);
-    Require(CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex).buffer == vertex.buffer && CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).buffer == first.buffer, "the uses' copies displaced each other");
+    Require(SameDrawInput(CopyDrawInput(context, &recorder, address, size, 1, Use::Vertex), vertex) && SameDrawInput(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32), first), "the uses' copies displaced each other");
     Require(!CopyDrawInput(context, nullptr, address, size, 4, Use::Index32).reused, "a draw input was reused without a recorder");
     words[5] = 0xdead;
     const auto stored = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
-    Require(!stored.reused && stored.buffer != first.buffer && equalsGuest(stored), "a draw input outlived a CPU store");
+    Require(!stored.reused && !SameDrawInput(stored, first) && equalsGuest(stored), "a draw input outlived a CPU store");
     KeepDrawInput(&recorder, address, stored, Use::Index32, 0xdead);
     Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).derived == 0xdead, "the new copy was not kept");
     MarkWritten(address + 128, 4);
@@ -6059,10 +6065,10 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "a draw input outlived a registry mutation");
     const auto pool = address + 8192;
     const auto whole = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
-    Require(!whole.reused && std::memcmp(whole.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
+    Require(!whole.reused && std::memcmp(whole.Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "the vertex pool copy is wrong");
     KeepDrawInput(&recorder, pool, whole, Use::Vertex, 0);
     const auto prefix = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(prefix.reused && prefix.buffer == whole.buffer, "a shorter vertex read did not reuse the longer snapshot");
+    Require(prefix.reused && SameDrawInput(prefix, whole), "a shorter vertex read did not reuse the longer snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 16384, 1, Use::Vertex).reused, "a longer vertex read reused a shorter snapshot");
     Require(!CopyDrawInput(context, &recorder, pool + 4, 4096, 1, Use::Vertex).reused, "a vertex read at another address reused the snapshot");
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer vertex snapshot");
@@ -6071,12 +6077,12 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(!CopyDrawInput(context, &recorder, pool, 4096, 4, Use::Index32).reused, "an index read reused a longer index snapshot");
     words[(8192 + 8192 + 16) / 4] = 0xbeef;
     const auto prefixAfter = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(std::memcmp(prefixAfter.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
+    Require(std::memcmp(prefixAfter.Bytes().data(), reinterpret_cast<const void*>(pool), 4096) == 0, "a shorter vertex read after a store got other bytes");
     const auto after = CopyDrawInput(context, &recorder, pool, 12288, 1, Use::Vertex);
-    Require(!after.reused && std::memcmp(after.buffer->Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "a vertex read over the store reused the old bytes");
+    Require(!after.reused && std::memcmp(after.Bytes().data(), reinterpret_cast<const void*>(pool), 12288) == 0, "a vertex read over the store reused the old bytes");
     KeepDrawInput(&recorder, pool, after, Use::Vertex, 0);
     const auto small = CopyDrawInput(context, &recorder, pool, 4096, 1, Use::Vertex);
-    Require(small.reused && small.buffer == after.buffer, "the new vertex snapshot does not serve shorter reads");
+    Require(small.reused && SameDrawInput(small, after), "the new vertex snapshot does not serve shorter reads");
     recorder.Sync();
 }
 
@@ -6086,7 +6092,7 @@ void drawInputMemoryTests(const Device& device) {
     const auto copy = CopyDrawInput(device.GetContext(), nullptr, reinterpret_cast<std::uint64_t>(indices.data()), sizeof(indices), 4, Recorder::SnapshotUse::Index32);
     indices[9] = 0x10000;
     Require((copy.buffer->Properties() & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0, "an index copy left host memory, so its highest index would be scanned from the guest instead of the copy");
-    Require(HighestDrawIndex(copy.buffer->Bytes(), 4, false) == 63u, "the highest index of an index copy followed a later store to the guest");
+    Require(HighestDrawIndex(copy.Bytes(), 4, false) == 63u, "the highest index of an index copy followed a later store to the guest");
 }
 
 void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied = false) {
@@ -12072,6 +12078,109 @@ void barRingTests(const Device& device) {
     std::cout << "BAR ring tests passed\n";
 }
 
+void drawInputRingTests(const Device& device) {
+    using Use = Recorder::SnapshotUse;
+    auto context = device.GetContext();
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, false);
+    const auto start = DrawInputRingCounters();
+    auto first = NewDrawInputSlice(context, 100, Use::Vertex);
+    auto second = NewDrawInputSlice(context, 200, Use::Vertex);
+    auto index = NewDrawInputSlice(context, 64, Use::Index16);
+    Require(first.ring && second.ring && index.ring, "a draw input copy within the slice limit got no ring slice");
+    Require(first.buffer.get() == second.buffer.get() && second.offset >= first.offset + 100 && second.offset % DrawInputRingAlignment == 0 && first.offset % DrawInputRingAlignment == 0, "consecutive draw input slices did not share their chunk at aligned, disjoint offsets");
+    Require(first.Bytes().size() == 100 && first.Bytes().data() == first.buffer->Bytes().data() + first.offset, "a draw input slice does not span its own bytes of the chunk");
+    Require(first.buffer->Properties() == DrawInputMemoryProperties(context, Use::Vertex) && index.buffer->Properties() == DrawInputMemoryProperties(context, Use::Index16), "a draw input slice is not in its use's memory class");
+    if (DrawInputMemoryProperties(context, Use::Vertex) != DrawInputMemoryProperties(context, Use::Index16)) Require(index.buffer.get() != first.buffer.get(), "slices of two memory classes share a chunk");
+    const auto oversize = NewDrawInputSlice(context, DrawInputRingSliceLimit + 1, Use::Vertex);
+    Require(!oversize.ring && oversize.offset == 0 && oversize.buffer->Bytes().size() == DrawInputRingSliceLimit + 1, "a copy over the slice limit did not get a buffer of its own");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, true);
+    const auto switched = NewDrawInputSlice(context, 100, Use::Vertex);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, false);
+    Require(!switched.ring && switched.buffer.get() != first.buffer.get(), "a draw input copy took a ring slice with APS5_NO_DRAW_INPUT_RING set");
+
+    Recorder recorder(context);
+    const auto keptBefore = recorder.OpenKeptBytes();
+    const auto usesBefore = first.buffer.use_count();
+    recorder.Retain(first.buffer);
+    recorder.Retain(second.buffer);
+    Require(recorder.OpenKeptBytes() == keptBefore && first.buffer.use_count() == usesBefore + 1, "a batch retained a ring chunk once per slice or counted its bytes, instead of holding it once per batch");
+    const auto released = [&](const std::function<bool()>& done) {
+        recorder.FlushDeferredReleases();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return done();
+    };
+    recorder.Submit();
+    recorder.Sync();
+    Require(released([&] { return first.buffer.use_count() == usesBefore; }), "a completed batch still holds its ring chunk");
+
+    const auto turnovers = [] {
+        const auto counts = DrawInputRingCounters();
+        return counts.chunks + counts.recycled;
+    };
+    const auto roll = [&](Use use, const Buffer* avoid, std::size_t chunks) {
+        const auto from = turnovers();
+        bool reused = false;
+        for (std::size_t i = 0; turnovers() < from + chunks; ++i) {
+            Require(i < 64 * chunks * (DrawInputRingChunk / DrawInputRingSliceLimit), "the ring did not turn over to a new chunk");
+            const auto slice = NewDrawInputSlice(context, DrawInputRingSliceLimit, use);
+            Require(slice.ring, "a ring slice was refused while rolling the ring");
+            std::fill(slice.Bytes().begin(), slice.Bytes().end(), std::byte{0xa5});
+            if (slice.buffer.get() == avoid && turnovers() > from) reused = true;
+        }
+        return reused;
+    };
+
+    auto held = NewDrawInputSlice(context, 4096, Use::Vertex);
+    auto* const snapshotChunk = held.buffer.get();
+    std::fill(held.Bytes().begin(), held.Bytes().end(), std::byte{0x5a});
+    auto* const heldBytes = held.Bytes().data();
+    constexpr std::uint64_t snapshotAddress = 0x7000000;
+    recorder.KeepDrawSnapshot(snapshotAddress, 4096, 1, 1, held.buffer, Use::Vertex, 0, false, held.offset);
+    held = {};
+    first = {};
+    second = {};
+    const auto beforeSnapshot = DrawInputRingCounters();
+    const bool reusedUnderSnapshot = roll(Use::Vertex, snapshotChunk, 8);
+    const bool intact = std::all_of(heldBytes, heldBytes + 4096, [](std::byte value) { return value == std::byte{0x5a}; });
+    const auto underSnapshot = DrawInputRingCounters();
+    std::printf("draw input ring, chunk held by a kept snapshot: %llu chunk turnovers recycled %llu chunks and made %llu, snapshot chunk reused %s, its bytes %s\n", 8ull, static_cast<unsigned long long>(underSnapshot.recycled - beforeSnapshot.recycled), static_cast<unsigned long long>(underSnapshot.chunks - beforeSnapshot.chunks), reusedUnderSnapshot ? "yes" : "no", intact ? "intact" : "overwritten");
+    Require(!reusedUnderSnapshot && intact, "a ring chunk was reused while a kept draw snapshot still held a slice of it");
+    Require(underSnapshot.chunks - beforeSnapshot.chunks <= 1 && underSnapshot.recycled - beforeSnapshot.recycled >= 7, "a chunk nothing held was not reused at once: the ring made new chunks instead");
+    const auto replaced = DrawInputRingCounters();
+    recorder.KeepDrawSnapshot(snapshotAddress, 4096, 2, 1, NewDrawInputBuffer(context, 4096, Use::Vertex), Use::Vertex, 0, false, 0);
+    Require(DrawInputRingCounters().returned - replaced.returned == 1, "replacing the kept snapshot did not return its ring chunk");
+
+    auto inFlight = NewDrawInputSlice(context, 4096, Use::Vertex);
+    auto* const batchChunk = inFlight.buffer.get();
+    recorder.Retain(inFlight.buffer);
+    inFlight = {};
+    recorder.Submit();
+    const bool reusedInFlight = roll(Use::Vertex, batchChunk, 8);
+    Require(!reusedInFlight, "a ring chunk was reused while a submitted batch still held a slice of it");
+    const auto beforeSync = DrawInputRingCounters();
+    recorder.Sync();
+    Require(released([&] { return DrawInputRingCounters().returned > beforeSync.returned; }), "the ring chunk of a completed batch was not returned");
+
+    std::vector<DrawInputSlice> pinned;
+    const auto beforeCap = DrawInputRingCounters();
+    for (std::size_t i = 0; i < 4 * (DrawInputRingPinnedLimit / DrawInputRingSliceLimit); ++i) {
+        auto slice = NewDrawInputSlice(context, DrawInputRingSliceLimit, Use::Vertex);
+        if (!slice.ring) break;
+        if (pinned.empty() || pinned.back().buffer.get() != slice.buffer.get()) pinned.push_back(std::move(slice));
+    }
+    const auto capped = DrawInputRingCounters();
+    std::printf("draw input ring: %zu chunks pinned by one slice each before the cap, %llu requests capped\n", pinned.size(), static_cast<unsigned long long>(capped.capped - beforeCap.capped));
+    Require(capped.capped - beforeCap.capped == 1 && capped.outstanding * DrawInputRingChunk >= DrawInputRingPinnedLimit && pinned.size() <= DrawInputRingPinnedLimit / DrawInputRingChunk, "the ring did not stop at its pinned-bytes limit");
+    pinned.clear();
+    static_cast<void>(roll(Use::Vertex, nullptr, 2));
+    index = {};
+    ClearDrawInputStash(context.device);
+    const auto end = DrawInputRingCounters();
+    Require(end.slices > start.slices && end.bytes > start.bytes, "the ring's slices and bytes were not counted");
+    std::cout << "draw input ring tests passed\n";
+}
+
 std::uint32_t uncountedGraphicsBinds = 0;
 PFN_vkCmdBindPipeline uncountedRealBind = nullptr;
 
@@ -17181,6 +17290,11 @@ int main(int argc, char** argv) {
 
         if (argc == 2 && std::string_view(argv[1]) == "--bar-ring-only") {
             barRingTests(device);
+            return 0;
+        }
+
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-input-ring-only") {
+            drawInputRingTests(device);
             return 0;
         }
 

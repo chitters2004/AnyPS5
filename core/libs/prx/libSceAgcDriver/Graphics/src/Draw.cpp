@@ -1663,7 +1663,9 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         CountDrawInputSource(source, bytes, timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u);
     };
     DrawInputCopy copy;
+    copy.bytes = bytes;
     const bool vertex = use == Recorder::SnapshotUse::Vertex;
+    DrawInputSlice spare;
     if (recorder != nullptr && bytes != 0) {
         InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, bytes); });
 #ifdef _WIN32
@@ -1671,7 +1673,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 #else
         constexpr bool owned = false;
 #endif
-        if (owned) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived); });
+        if (owned) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, &copy.offset); });
         if (copy.buffer != nullptr) {
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopyOwned : CommitCounter::InputIndexCopyOwned);
@@ -1680,7 +1682,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
-        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived); });
+        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &copy.offset); });
         else if (owned) {
             copy.owned = InCommitPhase(CommitPhase::InputsArm, [&] { return recorder->ArmOwnedDrawInput(address, bytes); });
             if (!copy.owned.words.empty()) CountCommit(vertex ? CommitCounter::InputVertexCopyArmed : CommitCounter::InputIndexCopyArmed);
@@ -1692,8 +1694,9 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
         if (copy.generation != 0) {
-            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes); })) {
-                copy.buffer = std::move(adopted->buffer);
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes, &spare); })) {
+                copy.buffer = std::move(adopted->slice.buffer);
+                copy.offset = adopted->slice.offset;
                 copy.derived = adopted->derived;
                 copy.prepared = true;
                 counted(DrawInputSource::Adopted);
@@ -1702,8 +1705,10 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
     }
     CountCommit(vertex ? CommitCounter::InputVertexCopyFresh : CommitCounter::InputIndexCopyFresh);
-    copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return vertex ? std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, context.SnapshotProperties()) : std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDEX_BUFFER_BIT); });
-    InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.buffer->Bytes(), alignment); });
+    auto slice = spare.buffer != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputSlice(context, bytes, use); });
+    copy.buffer = std::move(slice.buffer);
+    copy.offset = slice.offset;
+    InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.Bytes(), alignment); });
     counted(DrawInputSource::Copied);
     return copy;
 }
@@ -1719,13 +1724,15 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     const auto readable = InCommitPhase(CommitPhase::InputsValidate, [&] { return ZeroPaddedReadableBytes(address, validBytes, stride); });
     if (readable != 0) InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, readable); });
     DrawInputCopy copy;
+    copy.bytes = bytes;
+    DrawInputSlice spare;
     auto* recorder = context.recorder;
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
     if (keep) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, readable); });
         std::uint32_t keptReadable = 0;
-        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable); });
+        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable, 0, &copy.offset); });
         if (copy.buffer != nullptr && keptReadable == readable) {
             copy.reused = true;
             CountCommit(CommitCounter::InputVertexPaddedReused);
@@ -1733,23 +1740,27 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
             return copy;
         }
         copy.buffer = nullptr;
+        copy.offset = 0;
         if (copy.generation != 0) {
-            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable); })) {
-                copy.buffer = std::move(adopted->buffer);
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable, &spare); })) {
+                copy.buffer = std::move(adopted->slice.buffer);
+                copy.offset = adopted->slice.offset;
                 copy.prepared = true;
-                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
+                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset);
                 counted(DrawInputSource::Adopted);
                 return copy;
             }
         }
     }
-    copy.buffer = InCommitPhase(CommitPhase::InputsAlloc, [&] { return std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT); });
-    const auto span = copy.buffer->Bytes();
+    auto slice = spare.buffer != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputSlice(context, bytes, Recorder::SnapshotUse::PaddedVertex); });
+    copy.buffer = std::move(slice.buffer);
+    copy.offset = slice.offset;
+    const auto span = copy.Bytes();
     InCommitPhase(CommitPhase::InputsLocal, [&] {
         GuestMemory::Read(address, span.subspan(0, readable), 1);
         std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
     });
-    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable)); });
+    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset); });
     counted(DrawInputSource::Copied);
     return copy;
 }
@@ -1758,10 +1769,14 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     if (recorder == nullptr || copy.reused || copy.buffer == nullptr) return;
     const CommitPhaseScope keep(CommitPhase::InputsKeep);
     if (copy.generation == 0) {
-        if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.buffer->Bytes().size(), copy.owned, copy.buffer, use, derived);
+        if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.bytes, copy.owned, copy.buffer, use, derived, copy.offset);
         return;
     }
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.buffer, use, derived, false, copy.offset);
+}
+
+std::span<std::byte> DrawInputCopy::Bytes() const {
+    return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
@@ -2145,7 +2160,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            if (!copy.prepared) highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart); });
+            if (!copy.prepared) highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.Bytes(), draw.indexSize, skipRestart); });
             else if (!skipRestart) highest = copy.derived;
             else if (copy.derived != 0) highest = copy.derived - 1u;
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -2172,6 +2187,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 import = nullptr;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
+                copy.bytes = static_cast<std::size_t>(indexBytes);
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
@@ -2181,7 +2197,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.maxIndex = *highest;
         if (skipRestart && state.stages.mesh && (state.stages.mesh->inputPrimitive == 5 || state.stages.mesh->inputPrimitive == 6)) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {
@@ -2191,6 +2207,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else {
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
+            inputs.indexOffset = copy.offset;
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
@@ -2247,15 +2264,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
-        rangeOffsets.push_back(0);
+        rangeOffsets.push_back(copy.offset);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    std::vector<VkDeviceSize> soloOffsets(fetches.size(), 0);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
         soloHandles[f] = copy.buffer->Handle();
+        soloOffsets[f] = copy.offset;
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     BeginCommitPhase(CommitPhase::InputsLayout);
@@ -2269,7 +2288,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto f = fetchOf[i];
         if (isSolo[f]) {
             inputs.vertexHandles.push_back(soloHandles[f]);
-            inputs.vertexOffsets[i] = 0;
+            inputs.vertexOffsets[i] = soloOffsets[f];
             continue;
         }
         const auto j = plannedOf[f];
@@ -2401,6 +2420,26 @@ bool drawStagingEnabled() {
     return !disabled;
 }
 
+std::atomic<bool> lastDrawDeviceStaging{true};
+
+bool verifyEarlyUploads() {
+    static const bool verify = std::getenv("APS5_VERIFY_EARLY_UPLOADS") != nullptr;
+    return verify;
+}
+
+std::shared_ptr<ShaderResources> adoptedOrBuilt(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool deviceStaging) {
+    lastDrawDeviceStaging.store(deviceStaging, std::memory_order_relaxed);
+    if (auto prepared = AdoptPreparedDrawResources(context, deviceStaging)) {
+        if (verifyEarlyUploads()) {
+            const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging, ShaderResources::PreparedOffDevice{});
+            CountPreparedDrawResourcesVerified(fresh.RegionSignature() != prepared->RegionSignature() || fresh.OffDeviceCopies() != prepared->OffDeviceCopies());
+        }
+        prepared->CompleteDraw(shaders);
+        return prepared;
+    }
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging);
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, const DrawPlan& plan, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
@@ -2501,7 +2540,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         CountCommit(CommitCounter::ResolveBuilds);
-        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled()); });
+        resolved.resources = InCommitPhase(CommitPhase::ResolveBuild, [&] { return adoptedOrBuilt(context, state, draw, shaders, snapshots, indexBytes, recordable && drawStagingEnabled()); });
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -5402,6 +5441,23 @@ VkDrawCounts TakeVkDrawCounts() {
     counts.indirect = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Indirect)].exchange(0, std::memory_order_relaxed);
     counts.mesh = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Mesh)].exchange(0, std::memory_order_relaxed);
     return counts;
+}
+
+std::vector<std::uint32_t> DrawResourceCacheKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    const bool keyed = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (!keyed) return {};
+    return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey, nullptr);
+}
+
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit) {
+    const auto key = DrawResourceCacheKey(context, state, draw, shaders);
+    predictedHit = !key.empty() && SharedResourceCache().Peek(key) != nullptr;
+    if (predictedHit) return nullptr;
+    const auto indexBytes = static_cast<std::size_t>(static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, snapshots, lastDrawDeviceStaging.load(std::memory_order_relaxed), ShaderResources::PreparedOffDevice{});
 }
 
 }

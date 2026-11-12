@@ -286,7 +286,9 @@ void fixedReadOnlyRangeMirrorTests(const Context& context, const BdaTestAccess& 
         registerImage(other, false);
         registerImage(image, true);
     }
+    const auto version = MirrorsVersion();
     ClearImageMirrors(copying.device);
+    Require(MirrorsVersion() != version, "clearing the image mirrors kept the mirror version, so a draw prepared over a cleared mirror would still be adopted");
     upload(copying, reinterpret_cast<std::uintptr_t>(WritableImageBytes.data()), 64, false, 0, "a guest buffer inside the main image's writable pages is mirrored as a fixed range");
     ClearImageMirrors(copying.device);
     {
