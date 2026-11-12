@@ -215,7 +215,7 @@ double seconds(Clock::duration elapsed) {
 }
 
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
-    if (local != nullptr) return;
+    if (Local() != nullptr) return;
     if (!Configured()) {
         localName = name;
         return;
@@ -225,7 +225,7 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     auto bound = std::make_unique<TraceThread>(name, presentCount, windowed ? capacity : 0, buffering);
     auto& state = session();
     std::lock_guard lock(state.mutex);
-    local = bound.get();
+    SetLocal(bound.get());
     state.threads.push_back(std::move(bound));
 }
 
@@ -234,9 +234,9 @@ TraceThread* PerformanceTrace::bindNamed() {
     auto bound = std::make_unique<TraceThread>(localName, presentCount, 0, buffering);
     auto& state = session();
     std::lock_guard lock(state.mutex);
-    local = bound.get();
+    SetLocal(bound.get());
     state.threads.push_back(std::move(bound));
-    return local;
+    return Local();
 }
 
 void PerformanceTrace::SetOverlayTotals(bool on) {
@@ -385,7 +385,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     std::size_t presenter = 0;
     state.windowBase.resize(state.threads.size());
     for (std::size_t index = 0; index < state.threads.size(); ++index) {
-        if (state.threads[index].get() == local) presenter = index;
+        if (state.threads[index].get() == Local()) presenter = index;
         snapshots.push_back(state.threads[index]->Collect());
         snapshots.back().totals = TraceFormat::Since(snapshots.back().totals, state.windowBase[index]);
     }
