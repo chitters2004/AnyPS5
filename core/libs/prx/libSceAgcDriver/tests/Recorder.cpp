@@ -1900,7 +1900,8 @@ void latchedWaitTests(const Device& device) {
     }
     {
         auto recorder = std::make_unique<Recorder>(context, true);
-        const auto [early, message] = waitFor([&] { recorder->WaitSerial(2); }, std::chrono::milliseconds(50), [&] {
+        auto* const waited = recorder.get();
+        const auto [early, message] = waitFor([waited] { waited->WaitSerial(2); }, std::chrono::milliseconds(50), [&] {
             std::lock_guard gpu(GpuMutex());
             recorder.reset();
         });
