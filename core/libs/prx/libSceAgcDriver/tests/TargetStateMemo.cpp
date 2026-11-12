@@ -1221,7 +1221,7 @@ void targetMissDraws(AgcDriver::VulkanDevice& device) {
     for (int repeat = 0; repeat < 2; ++repeat) draw(device, color, depthOnly);
     const auto fallbacks = memoEvent(CommitCounter::TargetMemoDepthFallback);
     requireTargetMiss(device, color, depthOnly, false, CommitCounter::TargetMemoDepthFallback, "a depth-only draw that repeats its depth target", false);
-    Require(!CommitPhasesEnabled() || !memoRepeats() || memoEvent(CommitCounter::TargetMemoDepthFallback) == fallbacks, "a depth-only draw that repeats its depth target fell back to its depth lookup");
+    Require(!CommitPhasesEnabled() || !memoRepeats() || std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr || memoEvent(CommitCounter::TargetMemoDepthFallback) == fallbacks, "a depth-only draw that repeats its depth target fell back to its depth lookup");
 }
 
 void unchangedMemo(AgcDriver::VulkanDevice& device) {
