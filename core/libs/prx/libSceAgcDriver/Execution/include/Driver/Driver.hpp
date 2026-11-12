@@ -118,6 +118,7 @@ public:
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     static void reportSkip(const char* kind, const std::string& what);
     DrawEntryCounters DrawCacheCounters();
+    DrawPhaseTotals DrawPhaseTotalsForTest();
     OverlayDriverCounters OverlayCounters();
     EntryCounters DispatchCacheCounters();
     struct DispatchCacheFootprint {
@@ -263,7 +264,7 @@ private:
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();
-    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures);
+    void addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, bool drawn, std::uint64_t captures, bool finished = false);
     void noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
     void noteLabelPass(std::span<const std::uint32_t> packet, std::uint32_t queue);
     void noteLabelIssue(std::span<const std::uint32_t> packet, std::uint32_t queue);
@@ -512,6 +513,7 @@ private:
 
     AgcDriver::Mutex drawPhasesMutex;
     DrawPhaseTotals drawPhaseTotals;
+    DrawPhaseTotals drawPhaseCumulative;
 
     std::map<std::uint32_t, QueueState> queues;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
