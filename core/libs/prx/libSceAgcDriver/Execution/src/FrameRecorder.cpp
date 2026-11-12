@@ -555,6 +555,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
         any = true;
     }
     std::vector<std::uint64_t> stamps;
+    std::vector<std::uint64_t> pieceHashes;
     for (const auto& [begin, end] : blocks) {
         bytes.resize(static_cast<std::size_t>(end - begin));
         stamps.clear();
@@ -562,9 +563,15 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             stamps.push_back(GuestMemory::NewestStamp(at, static_cast<std::size_t>(std::min<std::uint64_t>(end - at, FrameCaptureWriter::BlockBytes - at % FrameCaptureWriter::BlockBytes))));
         }
         readGuest(begin, bytes);
+        pieceHashes.clear();
+        for (std::size_t offset = 0; offset < bytes.size();) {
+            const auto length = std::min<std::size_t>(bytes.size() - offset, FrameCaptureWriter::BlockBytes - (begin + offset) % FrameCaptureWriter::BlockBytes);
+            pieceHashes.push_back(contentHash(std::span<const std::byte>(bytes).subspan(offset, length)));
+            offset += length;
+        }
         if (accepted == completed && !GuestMemory::Watched(begin, bytes.size())) {
             const auto key = std::pair{begin, static_cast<std::uint64_t>(bytes.size())};
-            const auto sample = std::pair{contentHash(bytes), accepted};
+            const auto sample = std::pair{contentHash(std::as_bytes(std::span(pieceHashes))), accepted};
             const auto found = unwatchedHashes.find(key);
             if (found != unwatchedHashes.end() && found->second == sample) continue;
             forget(begin, end);
@@ -583,7 +590,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             const auto length = std::min<std::size_t>(bytes.size() - offset, FrameCaptureWriter::BlockBytes - at % FrameCaptureWriter::BlockBytes);
             bool same = false;
             if (length == FrameCaptureWriter::BlockBytes) {
-                const auto hash = contentHash(std::span<const std::byte>(bytes).subspan(offset, length));
+                const auto hash = pieceHashes[piece];
                 const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
                 same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
                 known->second = {hash, stamps[piece]};
@@ -846,7 +853,7 @@ std::string FrameRecorder::header() const {
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes) + ",\"host_only_sample_bytes\":" + std::to_string(hostOnlySampleBytes);
-    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"gpu_store_bytes\":" + std::to_string(gpuStoreBytes);
+    text += ",\"memory_groups\":" + std::to_string(deltaGroups) + ",\"delta_bytes\":" + std::to_string(deltaBytes) + ",\"elided_bytes\":" + std::to_string(elidedBytes) + ",\"gpu_store_bytes\":" + std::to_string(gpuStoreBytes);
     text += ",\"capture_seconds\":" + std::to_string(std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt).count());
     text += ",\"env\":{";
     bool first = true;

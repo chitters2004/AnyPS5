@@ -952,6 +952,32 @@ void testGpuFillRestoredToCachedValue(const std::filesystem::path& tool) {
     check(value == 0, "the replay lost a CPU restore matching the cached bytes after an intervening GPU fill");
 }
 
+void testUnchangedBlocksLeftOut(const std::filesystem::path& tool) {
+    constexpr std::size_t Bytes = 65536;
+    const auto bulk = allocate();
+    const auto other = allocate();
+    std::vector<std::byte> expected(Bytes);
+    for (std::size_t index = 0; index < Bytes; ++index) expected[index] = static_cast<std::byte>((index * 7 + 3) & 0xff);
+    std::memcpy(bulk.base, expected.data(), Bytes);
+    AgcDriver::GuestMemory::Unwatch(at(bulk.base), Bytes);
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    flip();
+    other.base[0] = std::byte{1};
+    flip();
+    other.base[1] = std::byte{2};
+    flip();
+    AgcDriverWaitIdle_nid_postfix();
+    const auto capture = checkCapture(0);
+    const FrameCaptureReader reader(capture);
+    const auto header = reader.Header();
+    const auto key = std::string("\"elided_bytes\":");
+    const auto found = header.find(key);
+    check(found != std::string::npos, "the capture header does not count the blocks left out: " + header);
+    check(std::stoull(header.substr(found + key.size())) >= Bytes, "the capture recorded an unwatched block again that no store had changed since the snapshot: " + header);
+    check(replayed(tool, capture, bulk.base, Bytes) == expected, "the replay lost the bytes of a block the capture left out as unchanged");
+}
+
 void testFillRewrittenByTitle(const std::filesystem::path& tool) {
     constexpr std::uint32_t Filled = 0x5a5a5a5au;
     constexpr std::uint32_t Stored = 0x77u;
@@ -1081,9 +1107,9 @@ void testFillClearedBeforeRange(const std::filesystem::path& tool) {
 int main(int argc, char** argv) {
     const std::string mode = argc == 3 ? argv[2] : "";
     const std::map<std::string, void (*)(const std::filesystem::path&)> rewound{
-        {"rewind_store", testStoreAfterGatedCopy}, {"store_idle", testStoreAfterGatedCopyIdle}, {"store_idle_rewind", testStoreAfterRewoundCopyIdle}, {"store_idle_unwatched", testUnwatchedStoreBeforeReservation}, {"store_second_wait", testStoreBeforeSecondWaitOnGate}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
+        {"rewind_store", testStoreAfterGatedCopy}, {"store_idle", testStoreAfterGatedCopyIdle}, {"store_idle_rewind", testStoreAfterRewoundCopyIdle}, {"store_idle_unwatched", testUnwatchedStoreBeforeReservation}, {"store_second_wait", testStoreBeforeSecondWaitOnGate}, {"rewind_copy", testCopyInFlightAtDelta}, {"rewind_compute", testComputeWaitBehindRewind}, {"rewind_release", testReleaseDuringDelta}, {"rewind_fill", testFilledRewindTail}, {"rewind_split", testRewindFilledAcrossChunks}, {"wait_label", testLabelFromLaterSubmission}, {"gpu_store", testGpuStoreBehindRewind}, {"gpu_fill", testFillRewrittenByTitle}, {"gpu_restore_cached", testGpuFillRestoredToCachedValue}, {"unchanged_blocks", testUnchangedBlocksLeftOut}, {"unwatched_start", testInitiallyUnwatchedTitleStores}, {"unwatched_late", testLaterUnwatchedTitleStores}, {"unwatched_shared", testSharedTitleStores}, {"gpu_cleared", testFillClearedBeforeRange}, {"fence_reuse", testFenceReused}, {"busy_queue", testQueueBusyPastPacing}};
     if (argc != 2 && !(argc == 3 && (mode == "concurrent" || mode == "pipelines" || mode == "reservation_error" || mode == "rewind" || rewound.contains(mode)))) {
-        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|store_idle|store_idle_rewind|store_idle_unwatched|store_second_wait|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
+        std::fprintf(stderr, "usage: agc_driver_frame_replay_tests <agc_frame_replay> [concurrent|pipelines|reservation_error|rewind|rewind_store|store_idle|store_idle_rewind|store_idle_unwatched|store_second_wait|rewind_copy|rewind_compute|rewind_release|rewind_fill|rewind_split|wait_label|gpu_store|gpu_fill|gpu_restore_cached|unchanged_blocks|unwatched_start|unwatched_late|unwatched_shared|gpu_cleared|fence_reuse|busy_queue]\n");
         return 2;
     }
     int status = 0;
