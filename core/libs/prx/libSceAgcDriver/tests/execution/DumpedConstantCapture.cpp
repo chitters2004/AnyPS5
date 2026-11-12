@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -204,12 +205,7 @@ int CpuWriteAfterTheDumpIsRead() {
     Append(dump, 0x37, {0x00100200u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 1});
     Packet dumpPacket{dump.data(), static_cast<std::uint32_t>(dump.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&dumpPacket) == 0, "cpu write after the dump: the dump submission failed");
-    volatile const std::uint32_t* landed = reinterpret_cast<volatile const std::uint32_t*>(block.Data() + LabelOffset);
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (*landed != 1) {
-        Require(std::chrono::steady_clock::now() < deadline, "cpu write after the dump: the label after the dump never landed");
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
+    Require(AgcDriverTests::WaitForLabel(block.Data() + LabelOffset, 1u, std::chrono::seconds(10), std::chrono::microseconds(100)), "cpu write after the dump: the label after the dump never landed");
     const auto stored = AgcDriver::Graphics::Recorder::StoreCounts().stores - storesBefore;
     const auto rewritten = std::bit_cast<std::uint32_t>(0.5f);
     std::memcpy(block.Data() + TableOffset, &rewritten, sizeof(rewritten));

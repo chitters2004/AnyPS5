@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -167,11 +168,7 @@ int LabelPass(AgcDriver::VulkanDevice& device, const GuestBlock& records, std::s
         device.ReapRecorded(epoch);
         Require(Recorder::PendingCompletionStores() == 0 && Recorder::PendingWriteBackCompletions() == 0, what + ": completions outlived the reap of their batch");
     }
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (*label != LabelValue) {
-        Require(std::chrono::steady_clock::now() < deadline, what + ": the label never landed");
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
+    Require(AgcDriverTests::WaitForLabel(label, LabelValue, std::chrono::seconds(10), std::chrono::microseconds(100)), what + ": the label never landed");
     const std::uint32_t seen = *stored;
     Require(seen == GpuValue, what + ": the label is visible but the record holds " + Hex(seen) + ", the dispatch stored " + Hex(GpuValue));
     *stored = CpuValue;

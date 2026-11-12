@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #include <array>
 #include <algorithm>
 #include <atomic>
@@ -362,10 +363,7 @@ void submit(std::uint32_t queue, const std::vector<std::uint32_t>& words) {
 
 std::chrono::milliseconds waitFor(volatile std::uint32_t* address, std::uint32_t value, const char* message) {
     const auto start = std::chrono::steady_clock::now();
-    while (*address != value) {
-        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
-        std::this_thread::sleep_for(std::chrono::microseconds(100));
-    }
+    check(AgcDriverTests::WaitForLabel(address, value, std::chrono::seconds(10), std::chrono::microseconds(100)), message);
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start);
 }
 

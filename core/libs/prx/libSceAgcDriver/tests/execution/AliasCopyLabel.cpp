@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -117,11 +118,7 @@ int main() {
             }
             device->SubmitRecorded(true);
         }
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        while (*label != LabelValue) {
-            Require(std::chrono::steady_clock::now() < deadline, "the label after the image copy never landed");
-            std::this_thread::yield();
-        }
+        Require(AgcDriverTests::WaitForLabel(label, LabelValue, std::chrono::seconds(10)), "the label after the image copy never landed");
         std::vector<std::uint8_t> seen(destination, destination + SurfaceBytes);
 
         std::vector<std::byte> expected(SurfaceBytes);

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
@@ -68,11 +69,7 @@ int main() {
                 }
                 device->SubmitRecorded(true);
             }
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-            while (*label != value) {
-                Require(std::chrono::steady_clock::now() < deadline, "the label after the copy never landed");
-                std::this_thread::yield();
-            }
+            Require(AgcDriverTests::WaitForLabel(label, value, std::chrono::seconds(10)), "the label after the copy never landed");
             std::memcpy(seen.data(), destination, CopyBytes);
             std::size_t stale = 0;
             for (std::size_t at = 0; at < CopyBytes; ++at) stale += seen[at] != Pattern(round, at);

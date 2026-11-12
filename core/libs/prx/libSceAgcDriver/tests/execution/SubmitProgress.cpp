@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -36,11 +37,7 @@ void Release(std::vector<std::uint32_t>& words, const void* label, std::uint32_t
     words.insert(words.end(), {0xc0064900u, 0x514u, (2u << 29u) | (interrupt << 24u), Low(label), High(label), value, 0u, 0u});
 }
 void Await(const std::uint32_t* label, std::uint32_t value) {
-    const auto deadline = std::chrono::steady_clock::now() + CompletionDeadline;
-    while (*static_cast<const volatile std::uint32_t*>(label) != value) {
-        Require(std::chrono::steady_clock::now() < deadline, "submission lost its real GPU completion store");
-        std::this_thread::yield();
-    }
+    Require(AgcDriverTests::WaitForLabel(label, value, CompletionDeadline), "submission lost its real GPU completion store");
     AgcDriverWaitIdle_nid_postfix();
 }
 }

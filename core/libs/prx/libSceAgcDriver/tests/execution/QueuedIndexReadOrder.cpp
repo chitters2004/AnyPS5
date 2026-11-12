@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -282,15 +283,11 @@ void LandPool() {
 
 void WaitForWord(std::uint64_t address, std::uint32_t value, const char* what) {
     const auto start = std::chrono::steady_clock::now();
-    const auto deadline = start + std::chrono::seconds(10);
-    while (*reinterpret_cast<const volatile std::uint32_t*>(address) != value) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            char message[256];
-            std::snprintf(message, sizeof(message), "queued index read: %s: 0x%08llx held 0x%08x after %.1f s, expected 0x%08x", what, static_cast<unsigned long long>(address), *reinterpret_cast<const volatile std::uint32_t*>(address), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), value);
-            Require(false, message);
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+    const auto* word = reinterpret_cast<const std::uint32_t*>(address);
+    if (AgcDriverTests::WaitForLabel(word, value, std::chrono::seconds(10), std::chrono::milliseconds(1))) return;
+    char message[256];
+    std::snprintf(message, sizeof(message), "queued index read: %s: 0x%08llx held 0x%08x after %.1f s, expected 0x%08x", what, static_cast<unsigned long long>(address), AgcDriverTests::LoadLabel(word), std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(), value);
+    Require(false, message);
 }
 
 std::atomic<bool> GateOpen{true};

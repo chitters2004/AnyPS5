@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libSceAgcDriver/tests/LabelWait.hpp"
 #include <limits>
 #include <string_view>
 #include <barrier>
@@ -725,11 +726,7 @@ class WaitingOutput final : public AgcDriver::IVideoOutput {
 public:
     WaitingOutput(Frames& frames, const std::uint32_t* label) : frames(frames), label(label) {}
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
-        const auto deadline = Clock::now() + std::chrono::seconds(2);
-        while (*static_cast<const volatile std::uint32_t*>(label) == 0) {
-            check(Clock::now() < deadline, "a blocking driver call prevented the later memory update");
-            std::this_thread::yield();
-        }
+        check(AgcDriverTests::WaitForLabel(label, [](std::uint32_t word) { return word != 0; }, std::chrono::seconds(2)), "a blocking driver call prevented the later memory update");
         return std::make_shared<ReplayFlip>(frames);
     }
     void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
