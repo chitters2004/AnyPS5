@@ -180,15 +180,18 @@ public:
         if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, PAGE_READWRITE, bytes);
 #else
         constexpr std::uintptr_t alignment = 65536;
-        void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        if (mapped != MAP_FAILED) {
+        constexpr std::uint32_t arenaReadWrite = 0x04;
+        if (GuestArena::GuestArenaAvailable_nid_postfix()) {
+            block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, alignment));
+            if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, bytes, arenaReadWrite, bytes);
+        } else if (void* mapped = mmap(nullptr, bytes + alignment, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); mapped != MAP_FAILED) {
             const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
             const auto aligned = (begin + alignment - 1) & ~(alignment - 1);
             if (aligned != begin) munmap(mapped, aligned - begin);
             if (aligned + bytes != begin + bytes + alignment) munmap(reinterpret_cast<void*>(aligned + bytes), begin + alignment - aligned);
             block = reinterpret_cast<std::uint8_t*>(aligned);
-            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
         }
+        if (block != nullptr) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, bytes);
 #endif
         Require(block != nullptr, "village draw cost: cannot allocate a guest block");
         std::memset(block, 0, bytes);
