@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -293,6 +294,15 @@ HeapMirrorHold HeapMirrorsWithin(std::uint64_t begin, std::uint64_t end);
 void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
+enum class MirrorProducer : std::uint8_t { Acquire, Rebuild, Evict, ImportRelease, Clear, Count };
+void SetMirrorBumpSkippedForTest(MirrorProducer producer, bool skipped);
+inline constexpr std::uint32_t ImageMirrorDomains = GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mirror);
+struct MirrorCertificate {
+    std::shared_ptr<GuestMemory::WriteSubscription> subscription;
+    GuestMemory::WriteCertificate certificate;
+};
+MirrorCertificate CertifyImageMirrors(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool ImageMirrorsHold(const MirrorCertificate& certified);
 void ClearHostImports(VkDevice device);
 
 struct RetainedAddressSpace {

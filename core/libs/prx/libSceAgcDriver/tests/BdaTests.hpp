@@ -20,6 +20,7 @@ bool RunSparseBufferHoleTests(const AgcDriver::Graphics::Context& context, const
 void RunHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access, bool throughImport);
 void RunSparseHeapMirrorUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 void RunSparseHeapMirrorBudgetTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
+void RunMirrorEvictionCertificateTests(const AgcDriver::Graphics::Context& context);
 void RunHeapMirrorRunUnwatchTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);
 void RunAddressCopyCapTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access, bool remembered, int frames);
 void RunHeapMirrorReferenceSizeTests(const AgcDriver::Graphics::Context& context, const BdaTestAccess& access);

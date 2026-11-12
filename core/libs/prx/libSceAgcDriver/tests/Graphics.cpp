@@ -13799,6 +13799,17 @@ int main(int argc, char** argv) {
             Require(mock.live == 0, "the sparse heap mirror unwatch test leaked Vulkan objects");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--mirror-eviction-certificates") {
+            {
+                mock = MockVulkan{};
+                auto context = mockContext();
+                context.bufferDeviceAddress = true;
+                context.limits.maxStorageBufferRange = 1u << 27;
+                RunMirrorEvictionCertificateTests(context);
+            }
+            Require(mock.live == 0, "the mirror eviction certificate test leaked Vulkan objects");
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--sparse-heap-mirror-budget") {
             {
                 mock = MockVulkan{};

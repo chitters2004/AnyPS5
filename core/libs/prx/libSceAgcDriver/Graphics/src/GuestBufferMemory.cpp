@@ -2729,6 +2729,20 @@ ImageMirrors& Mirrors() {
     return mirrors;
 }
 
+std::atomic<std::uint32_t> skippedMirrorBumps{0};
+
+bool mirrorBumpSkipped(MirrorProducer producer) {
+    return (skippedMirrorBumps.load(std::memory_order_relaxed) & (std::uint32_t{1} << static_cast<unsigned>(producer))) != 0;
+}
+
+void bumpMirror(MirrorProducer producer, const ImageMirror& mirror) {
+    if (!mirrorBumpSkipped(producer)) GuestMemory::BumpWrites(mirror.base, mirror.bytes, GuestMemory::WriteBumpSource::Mirror);
+}
+
+void bumpMirrorDomain(MirrorProducer producer) {
+    if (!mirrorBumpSkipped(producer)) GuestMemory::BumpDomainVersion(GuestMemory::WriteDomain::Mirror);
+}
+
 using SnapshotCopies = Detail::SnapshotCopies;
 
 SnapshotCopies& SnapshotCopyCache() {
@@ -3376,6 +3390,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
             state.heapBytes = 0;
             state.device = context.device;
             ++state.version;
+            bumpMirrorDomain(MirrorProducer::Clear);
         }
         if (state.failed.contains(selected.address)) return nullptr;
         const auto found = state.entries.find(selected.address);
@@ -3426,6 +3441,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
                 stale = std::move(found->second);
                 state.entries.erase(found);
                 ++state.version;
+                bumpMirror(MirrorProducer::Evict, *stale);
             }
             return nullptr;
         }
@@ -3470,10 +3486,14 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         std::lock_guard lock(state.mutex);
         ++state.rebuilds;
         mirror->serial = (1ull << 63u) | ++state.serials;
-        if (const auto found = state.entries.find(selected.address); found != state.entries.end() && found->second->heap) unlistMirror(state, *found->second);
+        const auto replaced = state.entries.find(selected.address);
+        const auto previous = replaced != state.entries.end() ? replaced->second : nullptr;
+        if (previous != nullptr && previous->heap) unlistMirror(state, *previous);
         mirror->listed = true;
         state.entries[selected.address] = mirror;
         ++state.version;
+        bumpMirror(previous != nullptr ? MirrorProducer::Rebuild : MirrorProducer::Acquire, *mirror);
+        if (previous != nullptr && (previous->base != mirror->base || previous->bytes != mirror->bytes)) bumpMirror(MirrorProducer::Rebuild, *previous);
         return mirror;
     }
     try {
@@ -3514,10 +3534,14 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     ++state.rebuilds;
     mirror->serial = (1ull << 63u) | ++state.serials;
     // A replaced mirror lives on in the regions of recorded work that bound it.
-    if (const auto found = state.entries.find(selected.address); found != state.entries.end() && found->second->heap) unlistMirror(state, *found->second);
+    const auto replaced = state.entries.find(selected.address);
+    const auto previous = replaced != state.entries.end() ? replaced->second : nullptr;
+    if (previous != nullptr && previous->heap) unlistMirror(state, *previous);
     mirror->listed = heap;
     state.entries[selected.address] = mirror;
     ++state.version;
+    bumpMirror(previous != nullptr ? MirrorProducer::Rebuild : MirrorProducer::Acquire, *mirror);
+    if (previous != nullptr && (previous->base != mirror->base || previous->bytes != mirror->bytes)) bumpMirror(MirrorProducer::Rebuild, *previous);
     return mirror;
 }
 
@@ -3549,7 +3573,10 @@ void sweepMirrors(std::uint64_t neededBytes, std::uint64_t protectAddress) {
     auto& state = Mirrors();
     std::vector<std::shared_ptr<ImageMirror>> dropped;
     std::lock_guard lock(state.mutex);
-    if (released) ++state.version;
+    if (released) {
+        ++state.version;
+        bumpMirrorDomain(MirrorProducer::Evict);
+    }
     if (neededBytes == 0 && space != nullptr && state.pinnedSpace == space->serial && state.pinnedVersion == state.version) return;
     if (neededBytes != 0 && state.heapBytes + neededBytes > heapMirrorBudget()) {
         if (auto cached = Spaces().current.exchange(nullptr); cached != nullptr) {
@@ -3570,6 +3597,7 @@ void sweepMirrors(std::uint64_t neededBytes, std::uint64_t protectAddress) {
             continue;
         }
         if (it->second->heap) unlistMirror(state, *it->second);
+        bumpMirror(MirrorProducer::Evict, *it->second);
         dropped.push_back(std::move(it->second));
         it = state.entries.erase(it);
         ++state.version;
@@ -3605,6 +3633,7 @@ void sweepMirrors(std::uint64_t neededBytes, std::uint64_t protectAddress) {
                 }
             }
             unlistMirror(state, *victim->second);
+            bumpMirror(MirrorProducer::Evict, *victim->second);
             dropped.push_back(std::move(victim->second));
             state.entries.erase(victim);
             ++state.version;
@@ -3648,6 +3677,7 @@ void releaseImportedMirrors(const Context& context, std::span<const std::pair<st
             ++state.heapImported;
             state.heapImportedBytes += mirror->accounted;
             unlistMirror(state, *mirror);
+            bumpMirror(MirrorProducer::ImportRelease, *mirror);
             released.push_back(std::move(it->second));
             it = state.entries.erase(it);
             ++state.version;
@@ -4035,7 +4065,26 @@ void ClearImageMirrors(VkDevice device) {
         state.failed.clear();
         state.heapBytes = 0;
         state.device = VK_NULL_HANDLE;
+        ++state.version;
+        bumpMirrorDomain(MirrorProducer::Clear);
     }
+}
+
+void SetMirrorBumpSkippedForTest(MirrorProducer producer, bool skipped) {
+    const auto bit = std::uint32_t{1} << static_cast<unsigned>(producer);
+    if (skipped) skippedMirrorBumps.fetch_or(bit, std::memory_order_relaxed);
+    else skippedMirrorBumps.fetch_and(~bit, std::memory_order_relaxed);
+}
+
+MirrorCertificate CertifyImageMirrors(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    MirrorCertificate certified;
+    certified.subscription = GuestMemory::SubscribeWrites(ranges, GuestMemory::WriteChangeBit(GuestMemory::WriteChange::Mirror));
+    certified.certificate = GuestMemory::CertifySubscription(*certified.subscription, ImageMirrorDomains);
+    return certified;
+}
+
+bool ImageMirrorsHold(const MirrorCertificate& certified) {
+    return certified.subscription != nullptr && GuestMemory::CertificateHolds(*certified.subscription, certified.certificate, ImageMirrorDomains);
 }
 
 void ClearHostImports(VkDevice device) {

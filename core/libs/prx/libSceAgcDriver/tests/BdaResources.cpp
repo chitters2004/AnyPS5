@@ -1,5 +1,6 @@
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -233,6 +234,34 @@ const void* testImageBase(const void* inside) {
 #endif
 }
 
+struct MirrorWatch {
+    MirrorCertificate mirror;
+    std::shared_ptr<AgcDriver::GuestMemory::WriteSubscription> bytes;
+    AgcDriver::GuestMemory::WriteCertificate bytesCertificate;
+};
+
+MirrorWatch watchMirror(std::uintptr_t address, std::size_t bytes) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{address, address + bytes}}};
+    MirrorWatch watch;
+    watch.mirror = CertifyImageMirrors(ranges);
+    watch.bytes = AgcDriver::GuestMemory::SubscribeWrites(ranges, AgcDriver::GuestMemory::WriteChangeBit(AgcDriver::GuestMemory::WriteChange::Bytes));
+    watch.bytesCertificate = AgcDriver::GuestMemory::CertifySubscription(*watch.bytes, 0);
+    Require(ImageMirrorsHold(watch.mirror), "a fresh image mirror certificate does not hold");
+    return watch;
+}
+
+void expectMirrorBump(const MirrorWatch& watch, const char* producer) {
+    const auto misses = AgcDriver::GuestMemory::CertificateMisses(*watch.mirror.subscription, watch.mirror.certificate, ImageMirrorDomains);
+    Require(!ImageMirrorsHold(watch.mirror) && (misses & AgcDriver::GuestMemory::CertificateVersionMissed) != 0, std::string("the image mirror certificate of a range survived its mirror's ") + producer);
+    Require(AgcDriver::GuestMemory::CertificateHolds(*watch.bytes, watch.bytesCertificate, 0), std::string("a bytes-only certificate of the range broke at its mirror's ") + producer);
+}
+
+void expectMirrorDomain(const MirrorWatch& watch, const char* producer) {
+    const auto misses = AgcDriver::GuestMemory::CertificateMisses(*watch.mirror.subscription, watch.mirror.certificate, ImageMirrorDomains);
+    Require(!ImageMirrorsHold(watch.mirror) && (misses & AgcDriver::GuestMemory::WriteDomainBit(AgcDriver::GuestMemory::WriteDomain::Mirror)) != 0, std::string("the image mirror domain did not move at ") + producer);
+    Require(AgcDriver::GuestMemory::CertificateHolds(*watch.bytes, watch.bytesCertificate, 0), std::string("a bytes-only certificate of the range broke at ") + producer);
+}
+
 void fixedReadOnlyRangeMirrorTests(const Context& context, const BdaTestAccess& access) {
     auto copying = context;
     copying.hostImportAlignment = 0;
@@ -257,7 +286,9 @@ void fixedReadOnlyRangeMirrorTests(const Context& context, const BdaTestAccess& 
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     }
     const auto constants = reinterpret_cast<std::uintptr_t>(FixedImageConstants.data());
+    const auto acquired = watchMirror(constants, 64);
     upload(copying, constants, 64, true, 1, "a guest buffer inside the main image's read-only pages is copied instead of mirrored");
+    expectMirrorBump(acquired, "acquire");
     {
 #ifdef _WIN32
         const auto* inOther = reinterpret_cast<const void*>(&GetTickCount);
@@ -286,14 +317,32 @@ void fixedReadOnlyRangeMirrorTests(const Context& context, const BdaTestAccess& 
         registerImage(other, false);
         registerImage(image, true);
     }
+    const auto cleared = watchMirror(constants, 64);
     ClearImageMirrors(copying.device);
+    expectMirrorDomain(cleared, "ClearImageMirrors");
     upload(copying, reinterpret_cast<std::uintptr_t>(WritableImageBytes.data()), 64, false, 0, "a guest buffer inside the main image's writable pages is mirrored as a fixed range");
     ClearImageMirrors(copying.device);
+    {
+        const auto remapped = watchMirror(constants, 64);
+        std::array<std::byte, 4096> elsewhere{};
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(elsewhere.data(), elsewhere.size(), true, true, true);
+        }
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(elsewhere.data());
+        }
+        const auto misses = AgcDriver::GuestMemory::CertificateMisses(*remapped.mirror.subscription, remapped.mirror.certificate, ImageMirrorDomains);
+        Require(!ImageMirrorsHold(remapped.mirror) && (misses & AgcDriver::GuestMemory::WriteDomainBit(AgcDriver::GuestMemory::WriteDomain::Mapping)) != 0, "an image mirror certificate held across a registry change: the mapping domain, which proves a mirror's range has not expired, was not checked");
+    }
+    const auto unregistered = watchMirror(constants, 64);
     {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
         GuestAllocations::GuestAllocationsUnregisterImage_nid_postfix(mutation, image);
         GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
     }
+    Require(!ImageMirrorsHold(unregistered.mirror), "an image mirror certificate held after the image's range left the registry: the mapping domain was not checked before the mirror domain");
     constexpr std::size_t page = 4096;
     void* block = ::operator new(page, std::align_val_t{page});
     std::memset(block, 0x5c, page);
@@ -2931,9 +2980,11 @@ void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access
     Require(build(context) != 0, "the heap range is missing from the BDA table of a build without host imports");
     const auto mirrored = MirrorCounters();
     Require(mirrored.heapMirrors == before.heapMirrors + 1 && mirrored.heapBytes == before.heapBytes + bytes, "a range built without host imports was not heap mirrored");
+    const auto released = watchMirror(address, bytes);
     Require(build(importing) != 0 && HostImportCovers(importing, address, bytes), "the heap mirrored range was not imported once imports were available");
     const auto imported = MirrorCounters();
     Require(imported.heapMirrors == before.heapMirrors && imported.heapBytes == before.heapBytes, "a heap mirror outlived the host import that serves its range");
+    expectMirrorBump(released, "release for a host import");
     Require(build(importing) != 0 && MirrorCounters().heapMirrors == before.heapMirrors && MirrorCounters().rebuilds == imported.rebuilds, "an imported range was heap mirrored again");
     static_cast<std::uint8_t*>(block)[bytes / 2] = 0x22;
     const auto device = build(context);
@@ -3952,6 +4003,78 @@ void RunSparseHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess
     releaseSparse(guest, reserved);
 #endif
     std::cout << "an address-based build keeps and refreshes a sparse heap's mirror once its range has left the write watch\n";
+}
+
+void RunMirrorEvictionCertificateTests(const Context& context) {
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t reserved = 4 * block;
+    constexpr std::size_t committed = 2 * block;
+#ifdef _WIN32
+    if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
+        std::cout << "guest arena unavailable or not write-watched: image mirror certificates over evicted heap mirrors not tested\n";
+        return;
+    }
+    const auto make = [&] {
+        auto* guest = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(reserved, block));
+        Require(guest != nullptr, "cannot allocate a heap in the guest arena");
+        GuestArena::GuestArenaCommit_nid_postfix(guest, committed, PAGE_READWRITE, block);
+        return guest;
+    };
+#else
+    if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+        std::cout << "write watch unavailable: image mirror certificates over evicted heap mirrors not tested\n";
+        return;
+    }
+    const auto make = [&] {
+        auto* guest = reserveSparse(reserved, committed);
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(guest, reserved);
+        return guest;
+    };
+#endif
+    std::array<std::byte*, 2> heaps{make(), make()};
+    for (auto* guest : heaps) {
+        std::memset(guest, 0x5a, committed);
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsAdd_nid_postfix(mutation, guest, reserved, true, true, true);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    const auto mirrorHeap = [&](std::byte* guest) {
+        GuestBufferMemory memory(context);
+        memory.AddWritable(reinterpret_cast<std::uintptr_t>(guest), reserved);
+        memory.Upload(false);
+        memory.WriteBack();
+    };
+    const auto before = MirrorCounters();
+    mirrorHeap(heaps[0]);
+    const auto first = MirrorCounters();
+    Require(first.heapMirrors == before.heapMirrors + 1, "the first heap was not heap mirrored");
+    const auto evicted = watchMirror(reinterpret_cast<std::uintptr_t>(heaps[0]), reserved);
+    AgcDriver::GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(heaps[0]) + 64, 16);
+    Require(ImageMirrorsHold(evicted.mirror) && !AgcDriver::GuestMemory::CertificateHolds(*evicted.bytes, evicted.bytesCertificate, 0), "a CPU store into a mirrored heap broke the image mirror certificate, or did not reach the bytes-only one: mirror-only consumers must ignore content bumps");
+    SetHeapMirrorBudget(first.heapBytes);
+    mirrorHeap(heaps[1]);
+    SetHeapMirrorBudget(0);
+    const auto second = MirrorCounters();
+    Require(second.evictions == first.evictions + 1 && second.heapMirrors == first.heapMirrors, "the second heap did not evict the first heap's mirror past the heap mirror budget");
+    const auto misses = AgcDriver::GuestMemory::CertificateMisses(*evicted.mirror.subscription, evicted.mirror.certificate, ImageMirrorDomains);
+    Require(!ImageMirrorsHold(evicted.mirror) && (misses & AgcDriver::GuestMemory::CertificateVersionMissed) != 0, "the image mirror certificate of a range survived its mirror's eviction");
+    for (auto* guest : heaps) {
+        auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
+        GuestAllocations::GuestAllocationsRemove_nid_postfix(mutation, guest);
+        GuestAllocations::GuestAllocationsEnd_nid_postfix(mutation);
+    }
+    ClearImageMirrors(context.device);
+    ClearSnapshotCopies(context.device);
+    for (auto* guest : heaps) {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(guest, reserved);
+        GuestArena::GuestArenaRelease_nid_postfix(guest, reserved);
+#else
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(guest, reserved);
+        releaseSparse(guest, reserved);
+#endif
+    }
+    std::cout << "image mirror certificates break at a heap mirror's eviction\n";
 }
 
 void RunSparseHeapMirrorBudgetTests(const Context& context, const BdaTestAccess& access) {
