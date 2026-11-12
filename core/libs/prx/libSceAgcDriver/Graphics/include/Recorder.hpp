@@ -159,6 +159,7 @@ public:
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
+    void OnDiscard(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -418,6 +419,7 @@ public:
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
+    static void FailNextFenceWaitsForTest(unsigned count);
     void LatchFailure(std::exception_ptr error) noexcept;
     bool Latched() const { return latched.load(std::memory_order_acquire); }
     void RethrowLatched() const;
@@ -667,6 +669,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
+        std::vector<std::function<void()>> discards;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -911,7 +914,9 @@ private:
     // `source` is the CountSync source the wait is attributed to.
     void finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow = false);
     void discard(std::unique_ptr<Batch> batch) noexcept;
+    void cancelSuffix() noexcept;
     void removeLabels(Batch& batch);
+    void runDiscards(Batch& batch) noexcept;
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
