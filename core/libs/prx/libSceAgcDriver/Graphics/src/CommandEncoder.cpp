@@ -533,10 +533,7 @@ std::byte* CommandEncoder::reserve(Run run, std::size_t bytes) {
         try {
             if (filling->bytes.size() < std::max(ChunkBytes, need)) filling->bytes.resize(std::max(ChunkBytes, need));
         } catch (...) {
-            auto* chunk = std::exchange(filling, nullptr);
-            std::lock_guard lock(queueMutex);
-            chunk->next = std::exchange(spare, chunk);
-            throw;
+            filling->bytes.resize(std::max(ChunkBytes, need));
         }
         filling->used = 0;
         filling->records = 0;
