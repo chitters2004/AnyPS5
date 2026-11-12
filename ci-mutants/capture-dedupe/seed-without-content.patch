@@ -1,0 +1,22 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
+index 06fe88bca67..89feb3b229a 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
+@@ -593,7 +593,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
+                 const auto hash = pieceHashes[piece];
+                 const std::lock_guard recordedLock(recordedMutex);
+                 const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
+-                same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
++                same = !inserted && (known->second.hash == hash || known->second.hash == ~std::uint64_t{0}) && known->second.stamp == stamps[piece];
+                 known->second = {hash, stamps[piece]};
+             } else {
+                 const std::lock_guard recordedLock(recordedMutex);
+@@ -658,7 +658,7 @@ void FrameRecorder::seedProduced(std::uint64_t begin, std::uint64_t end) {
+         readGuest(at, bytes);
+         const auto hash = contentHash(bytes);
+         const std::lock_guard lock(recordedMutex);
+-        recordedBlocks[at] = {hash, stamp};
++        recordedBlocks[at] = {~std::uint64_t{0}, stamp};
+         seededBytes += block;
+     }
+ }

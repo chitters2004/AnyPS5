@@ -1,13 +1,13 @@
 diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
-index ddb9574c9d9..f13651bad97 100644
+index 06fe88bca67..2bee3dd8b37 100644
 --- a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
 +++ b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
-@@ -592,7 +592,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
-             if (length == FrameCaptureWriter::BlockBytes) {
+@@ -593,7 +593,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
                  const auto hash = pieceHashes[piece];
+                 const std::lock_guard recordedLock(recordedMutex);
                  const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
 -                same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
 +                same = !inserted && known->second.hash == hash;
                  known->second = {hash, stamps[piece]};
              } else {
-                 recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
+                 const std::lock_guard recordedLock(recordedMutex);
