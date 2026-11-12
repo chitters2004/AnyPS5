@@ -11302,6 +11302,42 @@ public:
         EndRenderPass(context, commands);
     }
 
+    void DrawInto(CommandState& recording, VkImageView view) {
+        const auto commands = recording.Commands();
+        if (context.graphicsPipelineLibrary) {
+            VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+            attachment.imageView = view;
+            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+            rendering.renderArea = {{0, 0}, {8, 8}};
+            rendering.layerCount = 1;
+            rendering.colorAttachmentCount = 1;
+            rendering.pColorAttachments = &attachment;
+            context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+        } else {
+            VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            framebufferInfo.renderPass = renderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = &view;
+            framebufferInfo.width = 8;
+            framebufferInfo.height = 8;
+            framebufferInfo.layers = 1;
+            VkFramebuffer drawn = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &drawn), "vkCreateFramebuffer cover target");
+            drawnFramebuffers.push_back(drawn);
+            VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            info.renderPass = renderPass;
+            info.framebuffer = drawn;
+            info.renderArea = {{0, 0}, {8, 8}};
+            context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &info, VK_SUBPASS_CONTENTS_INLINE);
+        }
+        recording.BindPipeline(context, pipeline, 0);
+        context.Function<PFN_vkCmdDraw>("vkCmdDraw")(commands, 3, 1, 0, 0);
+        EndRenderPass(context, commands);
+    }
+
     static constexpr std::uint64_t Samples = 64;
 
 private:
@@ -11344,6 +11380,8 @@ private:
         if (fragment != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device, fragment, nullptr);
         if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device, layout, nullptr);
         if (framebuffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(device, framebuffer, nullptr);
+        for (const auto drawn : drawnFramebuffers) context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(device, drawn, nullptr);
+        drawnFramebuffers.clear();
         if (renderPass != VK_NULL_HANDLE) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(device, renderPass, nullptr);
         pipeline = VK_NULL_HANDLE;
         vertex = fragment = VK_NULL_HANDLE;
@@ -11356,6 +11394,7 @@ private:
     mutable bool transitioned = false;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> drawnFramebuffers;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vertex = VK_NULL_HANDLE;
     VkShaderModule fragment = VK_NULL_HANDLE;
@@ -11364,11 +11403,12 @@ private:
 
 namespace FusionTrace {
 
-enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch, Copy };
+enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch, Copy, ImageCopy };
 
 struct Event {
     Kind kind;
     BarrierMask mask;
+    std::vector<std::pair<VkImage, VkAccessFlags>> images{};
 };
 
 std::vector<Event> events;
@@ -11382,6 +11422,7 @@ PFN_vkCmdEndRenderPass realEndPass = nullptr;
 PFN_vkCmdEndRenderingKHR realEndRendering = nullptr;
 PFN_vkCmdDraw realDraw = nullptr;
 PFN_vkCmdFillBuffer realFill = nullptr;
+PFN_vkCmdCopyBufferToImage realCopyToImage = nullptr;
 
 VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
     BarrierMask mask{source, destination, 0, 0};
@@ -11390,7 +11431,9 @@ VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer commands, VkPipelineStageFlag
         mask.dstAccess |= memory[i].dstAccessMask;
     }
     mask.changesLayout = imageCount != 0 || bufferCount != 0;
-    events.push_back({Kind::Barrier, mask});
+    std::vector<std::pair<VkImage, VkAccessFlags>> barred;
+    for (std::uint32_t i = 0; i < imageCount; ++i) barred.emplace_back(images[i].image, images[i].srcAccessMask);
+    events.push_back({Kind::Barrier, mask, std::move(barred)});
     realBarrier(commands, source, destination, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
 }
 
@@ -11424,6 +11467,11 @@ VKAPI_ATTR void VKAPI_CALL Fill(VkCommandBuffer commands, VkBuffer buffer, VkDev
     realFill(commands, buffer, offset, bytes, value);
 }
 
+VKAPI_ATTR void VKAPI_CALL CopyToImage(VkCommandBuffer commands, VkBuffer source, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    events.push_back({Kind::ImageCopy, {}, {{image, 0}}});
+    realCopyToImage(commands, source, image, layout, count, regions);
+}
+
 template<typename TFunction>
 PFN_vkVoidFunction Wrap(VkDevice device, const char* name, TFunction& real, TFunction wrapper) {
     real = reinterpret_cast<TFunction>(realProc(device, name));
@@ -11439,6 +11487,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice device, const char* name)
     if (wanted == "vkCmdEndRenderingKHR" || wanted == "vkCmdEndRendering") return Wrap(device, name, realEndRendering, &EndRendering);
     if (wanted == "vkCmdDraw") return Wrap(device, name, realDraw, &Draw);
     if (wanted == "vkCmdFillBuffer") return Wrap(device, name, realFill, &Fill);
+    if (wanted == "vkCmdCopyBufferToImage") return Wrap(device, name, realCopyToImage, &CopyToImage);
     return realProc(device, name);
 }
 
@@ -11462,7 +11511,7 @@ void CheckOracle(const std::string& scenario) {
     std::size_t afterCommand = 0;
     for (std::size_t i = 0; i < events.size(); ++i) {
         const auto kind = events[i].kind;
-        if (kind == Kind::Barrier) continue;
+        if (kind == Kind::Barrier || kind == Kind::ImageCopy) continue;
         if (kind == Kind::Begin) Require(CoveredBetween(afterCommand, i, PassStartNeeds), scenario + ": a render pass began without a barrier after the previous command that orders earlier writes before it");
         for (std::size_t end = 0; end < i; ++end) {
             if (events[end].kind == Kind::End) Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
@@ -11471,6 +11520,29 @@ void CheckOracle(const std::string& scenario) {
         }
         afterCommand = i + 1;
     }
+}
+
+BarrierMask ImageBarrierBeforeCopyInto(VkImage image) {
+    for (std::size_t copy = 0; copy < events.size(); ++copy) {
+        if (events[copy].kind != Kind::ImageCopy || events[copy].images.front().first != image) continue;
+        for (std::size_t at = copy; at-- > 0;) {
+            if (events[at].kind != Kind::Barrier) continue;
+            for (const auto& [barred, access] : events[at].images) {
+                if (barred == image) return {events[at].mask.srcStage, events[at].mask.dstStage, access, 0};
+            }
+        }
+        return {};
+    }
+    return {};
+}
+
+bool DrawBeforeCopyInto(VkImage image) {
+    bool drawn = false;
+    for (const auto& event : events) {
+        if (event.kind == Kind::Draw) drawn = true;
+        if (event.kind == Kind::ImageCopy && event.images.front().first == image) return drawn;
+    }
+    return false;
 }
 
 std::size_t BarriersAfterDispatch() {
@@ -13662,6 +13734,9 @@ void expectRed(float got, float want, const char* what) {
 
 int recordedCpuUploadTests(const Device& device, Recorder& previous, bool ring) {
     auto context = device.GetContext();
+    context.functions = nullptr;
+    FusionTrace::realProc = context.deviceProc;
+    context.deviceProc = &FusionTrace::Proc;
     context.hostImportAlignment = 0;
     context.dmaBufImport = false;
     SyncedDetiler detiler(context);
@@ -13739,6 +13814,31 @@ int recordedCpuUploadTests(const Device& device, Recorder& previous, bool ring) 
             Require(recorder.Recording(), what + "the refresh upload was not recorded into the open batch");
             expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x80 / 255.0f, (what + "a dispatch sampling the image in the batch that re-uploaded it").c_str());
             Require(std::to_integer<std::uint8_t>(earlier.Bytes()[0]) == 0x40, what + "the re-upload overwrote the image before a reader recorded earlier in its batch read it");
+            CoverPass cover(context);
+            {
+                const auto commands = recorder.Commands();
+                VkImageMemoryBarrier toDraw{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toDraw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                toDraw.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                toDraw.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.image = firstImage->Image();
+                toDraw.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDraw);
+                FusionTrace::events.clear();
+                cover.DrawInto(recorder.GraphicsState(), firstImage->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM));
+            }
+            paint(first, 0x20);
+            firstImage->Refresh();
+            Require(recorder.Recording(), what + "the upload after a draw into the image was not recorded into the open batch");
+            Require(FusionTrace::DrawBeforeCopyInto(firstImage->Image()), what + "the draw into the image and the re-upload's copy after it were not both traced");
+            auto transition = FusionTrace::ImageBarrierBeforeCopyInto(firstImage->Image());
+            transition.dstStage = 0;
+            Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, 0}), what + "the re-upload's layout transition does not wait for a draw recorded earlier in its batch that rendered to the image");
+            Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0}), what + "the re-upload's layout transition does not make a draw's color writes to the image available first");
+            expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x20 / 255.0f, (what + "a dispatch sampling the image re-uploaded after a draw into it").c_str());
         }
         recorder.Sync();
     }
