@@ -59,9 +59,11 @@ std::string PassTimingTag(const State& state) {
     std::string tag;
     char text[96];
     std::size_t colors = 0;
+    std::uint32_t samples = state.depth.has_value() ? state.depth->samples : 1u;
     if (state.hasColorTarget) {
         for (const auto& color : state.colors) {
             if (color.address == 0) continue;
+            samples = std::max(samples, color.samples);
             std::snprintf(text, sizeof(text), "%sc%u@%ux%u:0x%llx", tag.empty() ? "" : ",", static_cast<unsigned>(color.format), color.extent.width, color.extent.height, static_cast<unsigned long long>(color.address));
             tag += text;
             ++colors;
@@ -71,7 +73,7 @@ std::string PassTimingTag(const State& state) {
         std::snprintf(text, sizeof(text), "%sd%u@%ux%u:0x%llx", tag.empty() ? "" : ",", static_cast<unsigned>(state.depth->format), state.depth->extent.width, state.depth->extent.height, static_cast<unsigned long long>(state.depth->address));
         tag += text;
     }
-    std::snprintf(text, sizeof(text), "%scolors=%zu,depth=%c%c,samples=%u,extent=%ux%u,layers=%u", tag.empty() ? "" : ",", colors, state.depthTest ? 't' : '-', state.depthWrite ? 'w' : '-', state.depth.has_value() ? state.depth->samples : 1u, state.renderExtent.width, state.renderExtent.height, state.renderLayers);
+    std::snprintf(text, sizeof(text), "%scolors=%zu,depth=%c%c,samples=%u,extent=%ux%u,layers=%u", tag.empty() ? "" : ",", colors, state.depthTest ? 't' : '-', state.depthWrite ? 'w' : '-', samples, state.renderExtent.width, state.renderExtent.height, state.renderLayers);
     tag += text;
     return tag;
 }
