@@ -55,11 +55,15 @@ public:
     StderrCapture& operator=(const StderrCapture&) = delete;
 
     std::string ReadReport() const {
+        return ReadLine("[draw] pipelined ");
+    }
+
+    std::string ReadLine(std::string_view prefix) const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
             std::ifstream file(path, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            const auto begin = text.find("[draw] pipelined ");
+            const auto begin = text.find(prefix);
             if (begin != std::string::npos) {
                 const auto end = text.find('\n', begin);
                 if (end != std::string::npos) return text.substr(begin, end - begin);
@@ -89,6 +93,10 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
+        pipeline.Enqueue(DrawPipeline::CommitKind::DmaWrite, [] {}, {{0x3000, 0x3010}}, 0, {}, {}, false);
+        pipeline.Enqueue(DrawPipeline::CommitKind::Seal, [] {}, {}, 0, {}, {}, false);
+        const auto committed = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while ((pipeline.CommitBreaks(DrawPipeline::CommitKind::DmaWrite, true) == 0 || pipeline.CommitBreaks(DrawPipeline::CommitKind::Seal, false) == 0) && std::chrono::steady_clock::now() < committed) std::this_thread::yield();
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
@@ -107,6 +115,9 @@ void TestReport() {
     Check(Count(report, " stores held") == 1, "pipeline held-store counters were printed more than once");
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
+    Check(pipeline.CommitBreaks(DrawPipeline::CommitKind::DmaWrite, true) == 1 && pipeline.CommitBreaks(DrawPipeline::CommitKind::DmaWrite, false) == 0, "a non-draw commit with declared writes was not counted by kind as declared");
+    Check(pipeline.CommitBreaks(DrawPipeline::CommitKind::Seal, false) == 1 && pipeline.CommitBreaks(DrawPipeline::CommitKind::Seal, true) == 0, "a non-draw commit without declared writes was not counted by kind as undeclared");
+    Check(capture.ReadLine("[commit-breaks] ") == "[commit-breaks] proof breaks after non-draw commits by kind (10 s): dmawrite 1 (1 with declared writes) seal 1 (0 with declared writes)", "the per-kind proof-break line is missing or wrong");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
 }
 
