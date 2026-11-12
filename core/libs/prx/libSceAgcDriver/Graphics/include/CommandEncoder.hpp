@@ -25,7 +25,7 @@ namespace AgcDriver::Graphics {
 class CommandEncoder {
 public:
     using Run = void (*)(const std::byte* payload, VkCommandBuffer commands, const DeviceFunctions& functions);
-    enum class Wait : std::uint8_t { Quiesce, Settle, Open, Close, Lookup, Direct, Behind, ChunkPool, Teardown, Unwind, OtherSites };
+    enum class Wait : std::uint8_t { Quiesce, Settle, Open, Close, Lookup, Direct, Behind, ChunkPool, Teardown, Unwind, Release, OtherSites };
     struct WaitSite {
         Wait kind = Wait::OtherSites;
         const char* detail = nullptr;
@@ -53,6 +53,7 @@ public:
         void Finish() {
             if (Failed()) refuse();
         }
+        bool Acknowledged() const { return held.load(std::memory_order_acquire) == 0; }
 
     private:
         friend class CommandEncoder;
@@ -60,6 +61,7 @@ public:
         [[noreturn]] void refuse();
         std::exception_ptr error;
         std::atomic<bool> failed{false};
+        std::atomic<std::uint32_t> held{0};
         bool reported = false;
     };
     enum class PostCause : std::uint8_t { Window, Full, Recording, Await, Foreign, BatchEnd, Count };
@@ -78,6 +80,7 @@ public:
     bool Direct(const char* command) noexcept;
     void Settle(std::source_location where = std::source_location::current()) noexcept { Settle(WaitSite::At(Wait::Settle, where)); }
     void Settle(WaitSite site) noexcept;
+    void Release(Recording& recording, std::source_location where = std::source_location::current()) noexcept;
     [[noreturn]] static void RefuseForeignProducer();
     bool OpenOnThisThread() const { return target.load(std::memory_order_acquire) != VK_NULL_HANDLE && owner.load(std::memory_order_relaxed) == std::this_thread::get_id(); }
     bool Defers(VkCommandBuffer commands) const {

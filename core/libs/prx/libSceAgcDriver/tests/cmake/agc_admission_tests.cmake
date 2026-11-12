@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_admission_tests tests/Admission.cpp)
+    target_include_directories(agc_admission_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(agc_admission_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_admission_tests)
+    add_test(NAME agc_admission COMMAND agc_admission_tests)
+    set_tests_properties(agc_admission PROPERTIES TIMEOUT 20)
+endif()
