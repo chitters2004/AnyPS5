@@ -4047,6 +4047,10 @@ struct CertifiedCounts {
     std::atomic<std::uint64_t> epochServed{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
     std::atomic<std::uint64_t> proofMissUnattributed{0};
+    std::array<std::atomic<std::uint64_t>, GateMissSets> certifiedGateSets{};
+    std::array<std::atomic<std::uint64_t>, EpochGateMissSets> epochGateSets{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PendingBump::Count)> pendingMissSources{};
+    std::atomic<std::uint64_t> pendingMissUnattributed{0};
 };
 
 CertifiedCounts& Certified() {
@@ -4105,6 +4109,31 @@ void reportCertifiedProofs() {
     const auto breaks = GuestMemory::ProofBreakCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified causes (10 s): uncertified uses by cause:%s; refused by reason:%s; voided by miss:%s; served by epoch reuse while uncertified %llu; proof misses by break source since the certificate:%s, unattributed %llu; proof breaks by source:%s\n", list(now.uncertified, reported.uncertified, UncertifiedCauseNames).c_str(), list(now.uncertifiedRefused, reported.uncertifiedRefused, CertifyRefusalNames).c_str(), list(now.uncertifiedVoided, reported.uncertifiedVoided, CertifiedMissNames).c_str(), static_cast<unsigned long long>(now.epochServed - reported.epochServed), list(now.proofMissSources, reported.proofMissSources, breakNames).c_str(), static_cast<unsigned long long>(now.proofMissUnattributed - reported.proofMissUnattributed), list(breaks, reportedBreaks, breakNames).c_str());
     reportedBreaks = breaks;
+    const auto gateSets = [](const auto& current, const auto& previous, std::size_t gates, const auto& name) {
+        std::vector<std::pair<std::uint64_t, std::size_t>> counted;
+        for (std::size_t set = 0; set < current.size(); ++set) {
+            if (current[set] != previous[set]) counted.push_back({current[set] - previous[set], set});
+        }
+        std::sort(counted.rbegin(), counted.rend());
+        std::string text;
+        for (std::size_t i = 0; i < counted.size() && i < 12; ++i) {
+            std::string named;
+            for (std::size_t gate = 0; gate < gates; ++gate) {
+                if ((counted[i].second & (std::size_t{1} << gate)) == 0) continue;
+                named += (named.empty() ? "" : "+") + std::string(name(gate));
+            }
+            text += " " + (named.empty() ? std::string("none") : named) + " " + std::to_string(counted[i].first);
+        }
+        return text;
+    };
+    std::array<const char*, static_cast<std::size_t>(PendingBump::Count)> pendingNames{};
+    for (std::size_t i = 0; i < pendingNames.size(); ++i) pendingNames[i] = PendingBumpName(static_cast<PendingBump>(i));
+    static std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> reportedPendingBumps{};
+    const auto pendingBumps = PendingBumpCounts();
+    const auto certifiedSets = gateSets(now.certifiedGateSets, reported.certifiedGateSets, static_cast<std::size_t>(GateMiss::Count), [](std::size_t gate) { return GateMissName(static_cast<GateMiss>(gate)); });
+    const auto epochSets = gateSets(now.epochGateSets, reported.epochGateSets, static_cast<std::size_t>(EpochGateMiss::Count), [](std::size_t gate) { return EpochGateMissName(static_cast<EpochGateMiss>(gate)); });
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] joint gates (10 s): certified misses by failed gates:%s; epoch-proof misses by failed gates:%s; pending misses by bump source since the certificate:%s, unattributed %llu; pending bumps by source:%s\n", certifiedSets.c_str(), epochSets.c_str(), list(now.pendingMissSources, reported.pendingMissSources, pendingNames).c_str(), static_cast<unsigned long long>(now.pendingMissUnattributed - reported.pendingMissUnattributed), list(pendingBumps, reportedPendingBumps, pendingNames).c_str());
+    reportedPendingBumps = pendingBumps;
     const auto perFrame = [&](std::uint64_t count) { return frames == 0 ? 0.0 : static_cast<double>(count) / static_cast<double>(frames); };
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] certified proofs (10 s): %llu proved (%llu after a sweep), %llu certificates issued; misses:%s; refused:%s; verify: %llu checked, %llu disagreed; index bumps: %llu calls touching %llu subscriptions over %llu frames, %.1f calls and %.1f subscriptions per frame, %.1f ms\n", static_cast<unsigned long long>(now.proved - reported.proved), static_cast<unsigned long long>(now.swept - reported.swept), static_cast<unsigned long long>(now.issued - reported.issued), misses.c_str(), refusals.c_str(), static_cast<unsigned long long>(now.verified - reported.verified), static_cast<unsigned long long>(now.disagreed - reported.disagreed), static_cast<unsigned long long>(index.calls), static_cast<unsigned long long>(index.bumps), static_cast<unsigned long long>(frames), perFrame(index.calls), perFrame(index.bumps), static_cast<double>(index.lookupNanoseconds) / 1e6);
     reported = now;
@@ -4133,7 +4162,23 @@ CertifiedProofOutcomes CertifiedProofOutcomesCounted() {
     outcomes.epochServed = counts.epochServed.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < outcomes.proofMissSources.size(); ++i) outcomes.proofMissSources[i] = counts.proofMissSources[i].load(std::memory_order_relaxed);
     outcomes.proofMissUnattributed = counts.proofMissUnattributed.load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.certifiedGateSets.size(); ++i) outcomes.certifiedGateSets[i] = counts.certifiedGateSets[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.epochGateSets.size(); ++i) outcomes.epochGateSets[i] = counts.epochGateSets[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < outcomes.pendingMissSources.size(); ++i) outcomes.pendingMissSources[i] = counts.pendingMissSources[i].load(std::memory_order_relaxed);
+    outcomes.pendingMissUnattributed = counts.pendingMissUnattributed.load(std::memory_order_relaxed);
     return outcomes;
+}
+
+const char* GateMissName(GateMiss gate) {
+    constexpr std::array<const char*, static_cast<std::size_t>(GateMiss::Count)> names{"depth-planes", "sweep", "version", "proof", "unwatch", "mapping", "pending", "depth-surfaces", "cpu-writers", "audit", "imports"};
+    const auto index = static_cast<std::size_t>(gate);
+    return index < names.size() ? names[index] : "invalid";
+}
+
+const char* EpochGateMissName(EpochGateMiss gate) {
+    constexpr std::array<const char*, static_cast<std::size_t>(EpochGateMiss::Count)> names{"epoch", "proof", "pending"};
+    const auto index = static_cast<std::size_t>(gate);
+    return index < names.size() ? names[index] : "invalid";
 }
 
 namespace {
@@ -4488,6 +4533,13 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (!certified) epochServed = true;
             return true;
         }
+        if (provedEpoch != 0 && GuestMemory::ProofBreaksCounted()) {
+            std::uint32_t set = 0;
+            if (epoch == 0 || provedEpoch != epoch) set |= EpochGateMissBit(EpochGateMiss::Epoch);
+            if (provedProof != proof) set |= EpochGateMissBit(EpochGateMiss::Proof);
+            if (provedPending != pending) set |= EpochGateMissBit(EpochGateMiss::Pending);
+            Certified().epochGateSets[set].fetch_add(1, std::memory_order_relaxed);
+        }
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
@@ -4760,6 +4812,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             noteUncertified(UncertifiedCause::Refused, *refusal);
         } else {
             if (GuestMemory::ProofBreaksCounted()) certifiedBreaks = GuestMemory::ProofBreakCounts();
+            if (PendingBumpsCounted()) certifiedPendingBumps = PendingBumpCounts();
             certificate = issued;
             certifiedPending = serialBefore;
             certifiedDepth = depthBefore;
@@ -4804,8 +4857,31 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
         if (epochServed) counts.epochServed.fetch_add(1, std::memory_order_relaxed);
         return std::nullopt;
     }
-    const auto miss = [&](CertifiedMiss reason) -> std::optional<bool> {
+    const auto gates = [&](GateMiss trigger) {
+        auto set = GateMissBit(trigger);
+        const auto missed = GuestMemory::CertificateMisses(*writeSubscription, certificate, CertifiedDomains());
+        if ((missed & GuestMemory::CertificateVersionMissed) != 0) set |= GateMissBit(GateMiss::Version);
+        if ((missed & (GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Proof) | GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::CertifiedProof))) != 0) set |= GateMissBit(GateMiss::Proof);
+        if ((missed & GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Unwatch)) != 0) set |= GateMissBit(GateMiss::Unwatch);
+        if ((missed & GuestMemory::WriteDomainBit(GuestMemory::WriteDomain::Mapping)) != 0) set |= GateMissBit(GateMiss::Mapping);
+        if (StorageTexture::PendingSerial() != certifiedPending) set |= GateMissBit(GateMiss::Pending);
+        if (DepthSurfacesSerial() != certifiedDepth) set |= GateMissBit(GateMiss::DepthSurfaces);
+        if (AnyPendingCpuWrites(context)) set |= GateMissBit(GateMiss::CpuWriters);
+        return set;
+    };
+    const auto miss = [&](CertifiedMiss reason, GateMiss trigger) -> std::optional<bool> {
         countCertifiedMiss(reason);
+        if (GuestMemory::ProofBreaksCounted()) Certified().certifiedGateSets[gates(trigger)].fetch_add(1, std::memory_order_relaxed);
+        if (reason == CertifiedMiss::Pending && PendingBumpsCounted()) {
+            const auto bumps = PendingBumpCounts();
+            bool attributed = false;
+            for (std::size_t i = 0; i < bumps.size(); ++i) {
+                if (bumps[i] == certifiedPendingBumps[i]) continue;
+                Certified().pendingMissSources[i].fetch_add(1, std::memory_order_relaxed);
+                attributed = true;
+            }
+            if (!attributed) Certified().pendingMissUnattributed.fetch_add(1, std::memory_order_relaxed);
+        }
         if (reason == CertifiedMiss::Proof && GuestMemory::ProofBreaksCounted()) {
             const auto breaks = GuestMemory::ProofBreakCounts();
             bool attributed = false;
@@ -4823,17 +4899,20 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
     };
     if (DepthPlanesStale()) {
         for (const auto& [begin, end] : GuestMemory::SubscriptionSpans(*writeSubscription)) {
-            if (!FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)).empty()) return miss(CertifiedMiss::DepthSurfaces);
+            if (!FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)).empty()) return miss(CertifiedMiss::DepthSurfaces, GateMiss::DepthPlanes);
         }
     }
     const auto epoch = GuestMemory::ThreadCollectEpoch();
     const bool sweep = epoch == 0 || epoch != certifiedEpoch;
-    if (sweep && !GuestMemory::SweepSubscription(*writeSubscription)) return miss(CertifiedMiss::Sweep);
-    if (!GuestMemory::CertificateHolds(*writeSubscription, certificate, CertifiedDomains())) return miss(domainMiss(certificate));
-    if (StorageTexture::PendingSerial() != certifiedPending) return miss(CertifiedMiss::Pending);
-    if (DepthSurfacesSerial() != certifiedDepth) return miss(CertifiedMiss::DepthSurfaces);
-    if (AnyPendingCpuWrites(context)) return miss(CertifiedMiss::CpuWriters);
-    if (TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || (walkImportGeneration != HostImportSetGeneration() && ImportAuditAdmitted()))) return miss(CertifiedMiss::Audit);
+    if (sweep && !GuestMemory::SweepSubscription(*writeSubscription)) return miss(CertifiedMiss::Sweep, GateMiss::Sweep);
+    if (!GuestMemory::CertificateHolds(*writeSubscription, certificate, CertifiedDomains())) {
+        const auto reason = domainMiss(certificate);
+        return miss(reason, reason == CertifiedMiss::Unwatch ? GateMiss::Unwatch : reason == CertifiedMiss::Mapping ? GateMiss::Mapping : reason == CertifiedMiss::Proof ? GateMiss::Proof : GateMiss::Version);
+    }
+    if (StorageTexture::PendingSerial() != certifiedPending) return miss(CertifiedMiss::Pending, GateMiss::Pending);
+    if (DepthSurfacesSerial() != certifiedDepth) return miss(CertifiedMiss::DepthSurfaces, GateMiss::DepthSurfaces);
+    if (AnyPendingCpuWrites(context)) return miss(CertifiedMiss::CpuWriters, GateMiss::CpuWriters);
+    if (TemplateAuditDue(lastFullWalk) && (AuditEveryInterval() || (walkImportGeneration != HostImportSetGeneration() && ImportAuditAdmitted()))) return miss(CertifiedMiss::Audit, GateMiss::Audit);
     certifiedEpoch = epoch;
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
     thread_local std::uint64_t certifiedUses = 0;
@@ -4847,7 +4926,7 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
         return ok;
     }
     const auto serial = StorageTexture::PendingSerial();
-    if (proveImports() != ProofFailure::None) return miss(CertifiedMiss::Imports);
+    if (proveImports() != ProofFailure::None) return miss(CertifiedMiss::Imports, GateMiss::Imports);
     if (const auto failure = recordStaging(); failure != ProofFailure::None) {
         if (report != nullptr) *report = {ProofPath::Fast, failure};
         certified = false;

@@ -267,6 +267,10 @@ AgcDriver::Graphics::CertifiedProofOutcomes Since(const AgcDriver::Graphics::Cer
     delta.epochServed = after.epochServed - before.epochServed;
     for (std::size_t i = 0; i < delta.proofMissSources.size(); ++i) delta.proofMissSources[i] = after.proofMissSources[i] - before.proofMissSources[i];
     delta.proofMissUnattributed = after.proofMissUnattributed - before.proofMissUnattributed;
+    for (std::size_t i = 0; i < delta.certifiedGateSets.size(); ++i) delta.certifiedGateSets[i] = after.certifiedGateSets[i] - before.certifiedGateSets[i];
+    for (std::size_t i = 0; i < delta.epochGateSets.size(); ++i) delta.epochGateSets[i] = after.epochGateSets[i] - before.epochGateSets[i];
+    for (std::size_t i = 0; i < delta.pendingMissSources.size(); ++i) delta.pendingMissSources[i] = after.pendingMissSources[i] - before.pendingMissSources[i];
+    delta.pendingMissUnattributed = after.pendingMissUnattributed - before.pendingMissUnattributed;
     return delta;
 }
 
@@ -570,6 +574,57 @@ void Scope(AgcDriver::VulkanDevice& device) {
     Require(unscoped, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE an uncovered proof break kept the certificate");
 }
 
+void Joint(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::GateMiss;
+    using AgcDriver::Graphics::GateMissBit;
+    using AgcDriver::Graphics::PendingBump;
+    using AgcDriver::Graphics::StorageTexture;
+    if (!GuestMemory::ProofBreaksCounted() || !AgcDriver::Graphics::PendingBumpsCounted()) {
+        std::puts("joint: skipped without APS5_PROFILE_DRAW");
+        return;
+    }
+    const auto onlySet = [](const Outcome& outcome, std::uint32_t set) {
+        std::uint64_t others = 0;
+        for (std::size_t i = 0; i < outcome.counts.certifiedGateSets.size(); ++i) {
+            if (i != set) others += outcome.counts.certifiedGateSets[i];
+        }
+        return outcome.counts.certifiedGateSets[set] == 1 && others == 0;
+    };
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "joint");
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    StorageTexture::BumpPendingSerial(PendingBump::Shadowed);
+    auto outcome = Draw(device, scene, false);
+    RequireMissed(outcome, "joint", 255u);
+    Require(onlySet(outcome, GateMissBit(GateMiss::Proof) | GateMissBit(GateMiss::Pending)), "joint: a miss after an uncovered proof break and a pending bump was not counted once with both gates (" + outcome.Describe() + ")");
+    Settle(device, scene, "joint (after)");
+    StorageTexture::BumpPendingSerial(PendingBump::Shadowed);
+    outcome = Draw(device, scene, false);
+    RequireMissed(outcome, "joint (pending only)", 255u);
+    Require(onlySet(outcome, GateMissBit(GateMiss::Pending)), "joint: a miss after a pending bump alone was not counted once with only the pending gate (" + outcome.Describe() + ")");
+    Require(outcome.counts.pendingMissSources[static_cast<std::size_t>(PendingBump::Shadowed)] == 1 && outcome.counts.pendingMissUnattributed == 0, "joint: a pending miss was not attributed to its bump source (" + outcome.Describe() + ")");
+    if (!AgcDriver::Graphics::ShaderResources::EpochProofs()) {
+        std::puts("joint: epoch gate skipped without APS5_DRAW_PIPELINE");
+        return;
+    }
+    using AgcDriver::Graphics::EpochGateMiss;
+    using AgcDriver::Graphics::EpochGateMissBit;
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CertifiedProofs, false);
+    static_cast<void>(Draw(device, scene, true, false));
+    static_cast<void>(Draw(device, scene, false, false));
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    outcome = Draw(device, scene, true, false);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CertifiedProofs, true);
+    const auto both = EpochGateMissBit(EpochGateMiss::Epoch) | EpochGateMissBit(EpochGateMiss::Proof);
+    std::uint64_t withBoth = 0;
+    for (std::size_t set = 0; set < outcome.counts.epochGateSets.size(); ++set) {
+        if ((set & both) == both) withBoth += outcome.counts.epochGateSets[set];
+    }
+    Require(withBoth == 1, "joint: an epoch-proof miss after a new epoch and a proof break was not counted with both gates");
+    Require(Brightest() == 255u, "joint: the draws around the epoch-gate check sampled the wrong texels");
+}
+
 struct OracleScene {
     Scene* scene = nullptr;
     std::array<float, Images> values{};
@@ -770,7 +825,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 16> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 17> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

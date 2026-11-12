@@ -553,6 +553,16 @@ void SetCertificateMutantForTest(CertificateMutant mutant) {
     certificateMutant.store(mutant, std::memory_order_release);
 }
 
+std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask) {
+    const auto domains = readDomains(domainMask);
+    std::uint32_t missed = 0;
+    for (std::size_t i = 0; i < domains.size(); ++i) {
+        if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) missed |= std::uint32_t{1} << i;
+    }
+    if (subscription.version.load(std::memory_order_acquire) != certificate.version) missed |= CertificateVersionMissed;
+    return missed;
+}
+
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask) {
     const auto mutant = certificateMutant.load(std::memory_order_relaxed);
     if (mutant == CertificateMutant::HideUnwatch) domainMask &= ~WriteDomainBit(WriteDomain::Unwatch);

@@ -421,6 +421,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         kindText += item;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
+    std::string breakText;
+    for (std::size_t i = 0; i < kindBreaks.size(); ++i) {
+        std::array<std::uint64_t, 2> now{kindBreaks[i][0].load(std::memory_order_relaxed), kindBreaks[i][1].load(std::memory_order_relaxed)};
+        const auto none = now[0] - reportedKindBreaks[i][0];
+        const auto declared = now[1] - reportedKindBreaks[i][1];
+        reportedKindBreaks[i] = now;
+        if (none + declared == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu (%llu with declared writes)", KindNames[i], static_cast<unsigned long long>(none + declared), static_cast<unsigned long long>(declared));
+        breakText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[commit-breaks] proof breaks after non-draw commits by kind (10 s):%s\n", breakText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -429,12 +441,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 
+std::uint64_t DrawPipeline::CommitBreaks(CommitKind kind, bool declaredWrites) const {
+    return kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].load(std::memory_order_relaxed);
+}
+
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        auto kind = CommitKind::Other;
+        bool declaredWrites = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -444,6 +462,8 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            kind = items.front().kind;
+            declaredWrites = !items.front().writes.empty();
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -451,7 +471,11 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::PipelineCommit);
+            if (!isDraw) {
+                GuestMemory::BreakProofs(GuestMemory::ProofBreak::PipelineCommit);
+                static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+                if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
