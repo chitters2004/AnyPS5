@@ -593,6 +593,15 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
                 const auto hash = pieceHashes[piece];
                 const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
                 same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
+                if (!same && !inserted && known->second.hash == hash) {
+                    static int shown = 0;
+                    static std::uint64_t count = 0;
+                    ++count;
+                    if (shown < 6 && (count % 512) == 1) { ++shown; std::fprintf(stderr, "[diag-stamp] block 0x%llx content equal but stamp %llu -> %llu (n=%llu) watched=%d accepted=%llu completed=%llu
+", static_cast<unsigned long long>(at), static_cast<unsigned long long>(known->second.stamp), static_cast<unsigned long long>(stamps[piece]), static_cast<unsigned long long>(count), GuestMemory::Watched(at, length) ? 1 : 0, static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(completed)); }
+                }
+                static int noRecord = 0; if (inserted && ++noRecord <= 4) std::fprintf(stderr, "[diag-stamp] block 0x%llx had no record (stamp %llu)
+", static_cast<unsigned long long>(at), static_cast<unsigned long long>(stamps[piece]));
                 known->second = {hash, stamps[piece]};
             } else {
                 recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
