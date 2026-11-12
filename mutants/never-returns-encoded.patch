@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
+index 7a05a1f7d7d..a36803d0581 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
+@@ -594,7 +594,7 @@ bool CommandEncoder::decline(std::source_location where) noexcept {
+ bool CommandEncoder::Admit(Handoff handoff, std::source_location where) {
+     if (handoff == Handoff::Never) {
+         policy = Policy{};
+-        return decline(where);
++        return true;
+     }
+     if (handoff == Handoff::Always) {
+         policy = Policy{};
