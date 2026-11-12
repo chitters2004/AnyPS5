@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_serial_frontiers_tests tests/SerialFrontiers.cpp)
+    target_include_directories(agc_serial_frontiers_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(agc_serial_frontiers_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_serial_frontiers_tests)
+    add_test(NAME agc_serial_frontiers COMMAND agc_serial_frontiers_tests)
+    set_tests_properties(agc_serial_frontiers PROPERTIES TIMEOUT 20)
+endif()
