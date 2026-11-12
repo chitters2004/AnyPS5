@@ -19,6 +19,8 @@
 #include <map>
 #include <array>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <cstdio>
 #include <cstdlib>
@@ -115,6 +117,11 @@ DrawFinisher& DrawFinisher::Get() {
             options.pause = &SpinPause;
             options.timed = pipelineStats();
             options.threadCpu = &ThreadCpuNanos;
+            options.preparers = Preparers();
+            if (options.preparers > 1) {
+                options.single = [] { return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SingleRingPreparer); };
+                options.outbox = [] { return DrawPipeline::TakePreparerOutbox(); };
+            }
             options.failed = [](std::exception_ptr error) {
                 try {
                     std::rethrow_exception(error);
@@ -143,6 +150,65 @@ bool DrawFinisher::Sequenced() {
 
 SequenceRing& DrawFinisher::Ring() {
     return *ring;
+}
+
+std::size_t DrawFinisher::Preparers() {
+    static const std::size_t preparers = [] {
+        const char* text = std::getenv("APS5_RING_PREPARERS");
+        if (text == nullptr) return std::size_t{1};
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 1, 8));
+    }();
+    return Sequenced() ? preparers : 1;
+}
+
+std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
+    struct Window {
+        std::mutex mutex;
+        std::optional<SequenceRing::Totals> since;
+        char arm = 'A';
+        bool single = false;
+        std::uint64_t phase = 0;
+    };
+    static Window window;
+    if (!Sequenced()) return {};
+    const auto totals = Get().Ring().CurrentTotals();
+    std::lock_guard lock(window.mutex);
+    std::string line;
+    if (begins && window.since.has_value()) {
+        const auto& since = *window.since;
+        const auto jobs = totals.worked - since.worked;
+        const auto perJob = [&](std::uint64_t ns) { return jobs == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(jobs); };
+        char text[512];
+        std::snprintf(text, sizeof(text), "[ring-preparers] phase %c %llu (settled to next begin): %zu preparers%s, %llu jobs at %.2f us CPU and %.2f us wall each, %llu items published by another preparer, %llu turn waits (%.1f ms)\n", window.arm, static_cast<unsigned long long>(window.phase), Preparers(), window.single ? " (single-preparer switch on)" : "", static_cast<unsigned long long>(jobs), perJob(totals.busyCpuNs - since.busyCpuNs), perJob(totals.busyWallNs - since.busyWallNs), static_cast<unsigned long long>(totals.publishedForOthers - since.publishedForOthers), static_cast<unsigned long long>(totals.turnWaits - since.turnWaits), static_cast<double>(totals.turnWaitNs - since.turnWaitNs) / 1e6);
+        line = text;
+        window.since.reset();
+    }
+    if (!begins) {
+        window.since = totals;
+        window.arm = arm;
+        window.phase = phase;
+        window.single = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SingleRingPreparer);
+    }
+    return line;
+}
+
+bool DrawFinisher::Buffered() {
+    return Preparers() > 1 && OnFinisherThread();
+}
+
+void DrawFinisher::AwaitTurn() {
+    if (!Buffered() || DrawPipeline::PreparerDirect()) return;
+    try {
+        ring->AwaitTurn();
+    } catch (...) {
+        DrawPipeline::TakePreparerOutbox();
+        throw;
+    }
+    DrawPipeline::FlushPreparerOutbox();
+}
+
+bool DrawFinisher::OlderUnpublished() {
+    return Buffered() && ring->AnyOlderNewestFirst([](const Pending&) { return true; });
 }
 
 bool DrawFinisher::Producing() {
@@ -177,9 +243,16 @@ bool DrawFinisher::Overlap() {
     return Graphics::DrawPipelineEnabled();
 }
 
+template<typename TVisit>
+bool DrawFinisher::visitPending(TVisit&& visit) {
+    if (Producing()) return ring->AnyNewestFirst(visit);
+    if (Buffered()) return ring->AnyOlderNewestFirst(visit);
+    return false;
+}
+
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
+    if (Sequenced()) return Busy() && visitPending([&](const Pending& held) { return held.unknown || heldOverlaps(held, begin, end); });
     if (!Busy() || !Producing()) return false;
-    if (Sequenced()) return ring->AnyNewestFirst([&](const Pending& held) { return held.unknown || heldOverlaps(held, begin, end); });
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -191,11 +264,11 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !Producing()) return LabelLookup::NotHeld;
+    if (!Busy() || (!Producing() && !Buffered())) return LabelLookup::NotHeld;
     const auto end = address + bytes;
     if (Sequenced()) {
         auto lookup = LabelLookup::NotHeld;
-        ring->AnyNewestFirst([&](const Pending& held) {
+        visitPending([&](const Pending& held) {
             if (held.unknown) {
                 lookup = LabelLookup::Unknown;
                 return true;
@@ -226,9 +299,9 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !Producing()) return false;
+    if (!Busy() || (!Producing() && !Buffered())) return false;
     if (Sequenced()) {
-        return ring->AnyNewestFirst([&](const Pending& held) {
+        return visitPending([&](const Pending& held) {
             return held.unknown || std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return heldOverlaps(held, range.first, range.second); });
         });
     }
@@ -300,10 +373,10 @@ void DrawFinisher::Enqueue(Job job) {
 }
 
 DrawPipeline::QueuedWrite DrawFinisher::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
-    if (!Busy() || !Producing()) return DrawPipeline::QueuedWrite::None;
+    if (!Busy() || (!Producing() && !Buffered())) return DrawPipeline::QueuedWrite::None;
     const auto end = address + bytes;
     auto answer = DrawPipeline::QueuedWrite::None;
-    ring->AnyNewestFirst([&](const Pending& held) {
+    visitPending([&](const Pending& held) {
         if (held.unknown) {
             answer = DrawPipeline::QueuedWrite::Unknown;
             return true;
@@ -473,6 +546,84 @@ bool& DrawPipeline::Active() {
     return active;
 }
 
+std::vector<DrawPipeline::Item>& DrawPipeline::preparerOutbox() {
+    thread_local std::vector<Item> outbox;
+    return outbox;
+}
+
+bool& DrawPipeline::preparerDirect() {
+    thread_local bool direct = false;
+    return direct;
+}
+
+bool DrawPipeline::PreparerDirect() {
+    return preparerDirect();
+}
+
+namespace {
+
+template<typename T>
+class OutboxPool {
+public:
+    std::vector<T>* Take() {
+        std::lock_guard lock(mutex);
+        if (free.empty()) {
+            owned.push_back(std::make_unique<std::vector<T>>());
+            return owned.back().get();
+        }
+        auto* box = free.back();
+        free.pop_back();
+        return box;
+    }
+    void Return(std::vector<T>* box) {
+        box->clear();
+        std::lock_guard lock(mutex);
+        free.push_back(box);
+    }
+
+private:
+    std::mutex mutex;
+    std::vector<std::unique_ptr<std::vector<T>>> owned;
+    std::vector<std::vector<T>*> free;
+};
+
+template<typename T>
+OutboxPool<T>& Outboxes() {
+    static auto* pool = new OutboxPool<T>();
+    return *pool;
+}
+
+}
+
+SequenceRing::Publish DrawPipeline::TakePreparerOutbox() {
+    preparerDirect() = false;
+    auto& outbox = preparerOutbox();
+    if (outbox.empty()) return {};
+    auto* box = Outboxes<Item>().Take();
+    box->swap(outbox);
+    return [box](bool keep) {
+        struct Return {
+            std::vector<Item>* box;
+            ~Return() { Outboxes<Item>().Return(box); }
+        } returned{box};
+        if (!keep) return;
+        auto& pipeline = Queue0();
+        for (auto& item : *box) pipeline.admit(std::move(item));
+    };
+}
+
+void DrawPipeline::FlushPreparerOutbox() {
+    preparerDirect() = true;
+    thread_local std::vector<Item> flushing;
+    flushing.swap(preparerOutbox());
+    struct Clear {
+        std::vector<Item>& items;
+        ~Clear() { items.clear(); }
+    } cleared{flushing};
+    auto& pipeline = Queue0();
+    for (auto& item : flushing) pipeline.admit(std::move(item));
+}
+
 bool DrawPipeline::SeesQueuedWrites() {
     return Active() || DrawFinisher::OnFinisherThread();
 }
@@ -585,6 +736,10 @@ void DrawPipeline::enqueue(Item item) {
     auto& finisher = DrawFinisher::Get();
     if (DrawFinisher::OnFinisherThread()) {
         item.sequence = SequenceRing::Running();
+        if (DrawFinisher::Buffered() && !preparerDirect()) {
+            preparerOutbox().push_back(std::move(item));
+            return;
+        }
     } else if (Active()) {
         if (!item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
         if (DrawFinisher::Busy()) {
@@ -597,6 +752,10 @@ void DrawPipeline::enqueue(Item item) {
             const auto tag = static_cast<std::uint8_t>(1 + static_cast<std::size_t>(item.kind));
             finisher.Enqueue([this, item = std::move(item)]() mutable {
                 item.sequence = SequenceRing::Running();
+                if (DrawFinisher::Buffered() && !preparerDirect()) {
+                    preparerOutbox().push_back(std::move(item));
+                    return;
+                }
                 admit(std::move(item));
             }, std::move(held), tag);
             return;
@@ -718,7 +877,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
             std::snprintf(item, sizeof(item), " %s %llu (%.1f us, longest %.1f us)", tag == 0 ? "prepare" : tag - 1 < KindNames.size() ? KindNames[tag - 1] : "other", static_cast<unsigned long long>(residency.items), static_cast<double>(residency.totalNs) / 1e3 / static_cast<double>(residency.items), static_cast<double>(residency.longestNs) / 1e3);
             residencyText += item;
         }
-        AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; %zu preparers, %llu items published by another preparer, %llu turn waits (%.1f ms); committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), DrawFinisher::Preparers(), static_cast<unsigned long long>(ring.publishedForOthers), static_cast<unsigned long long>(ring.turnWaits), static_cast<double>(ring.turnWaitNs) / 1e6, static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
     }
     {
         struct Finisher {
@@ -892,6 +1051,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     else DrawFinisher::Get().RethrowFailure();
+    DrawFinisher::Get().AwaitTurn();
     if (!Busy()) {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -923,6 +1083,7 @@ void DrawPipeline::DrainThrough(std::span<const Range> reads, CaptureSite site, 
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(DrainReason::Capture)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     else DrawFinisher::Get().RethrowFailure();
+    DrawFinisher::Get().AwaitTurn();
     const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(mutex);
     std::size_t last = items.size();
@@ -960,9 +1121,21 @@ std::uint64_t DrawPipeline::DrainRequestsByOpcode(std::uint32_t opcode) {
     return Queue0().drainRequests[std::min<std::uint32_t>(opcode, 0x100)].load(std::memory_order_relaxed);
 }
 
+bool DrawPipeline::HoldForOlderReads() {
+    if (!DrawFinisher::Buffered() || preparerDirect() || !DrawFinisher::Get().OlderUnpublished()) return false;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) return true;
+    DrawFinisher::Get().AwaitTurn();
+    return false;
+}
+
 bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
     if (bytes == 0 || unordered) return false;
+    if (HoldForOlderReads()) {
+        heldReadQueries.Add(1);
+        heldReadHits.Add(1);
+        return true;
+    }
     const auto end = address + bytes;
     auto& pipeline = Queue0();
     std::lock_guard lock(pipeline.mutex);
@@ -992,6 +1165,7 @@ std::uint64_t DrawPipeline::DrainRequestsByReason(DrainReason reason) {
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
+    if (DrawFinisher::Buffered() && !preparerDirect() && !preparerOutbox().empty()) throw std::logic_error("a draw finisher preparer looked up queued writes after buffering its own commit items, which that lookup cannot see");
     if (DrawFinisher::Overlap()) {
         std::uint64_t held = 0;
         const auto lookup = DrawFinisher::Get().PendingLabel(address, bytes, held);
@@ -1012,6 +1186,7 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
 }
 
 DrawPipeline::QueuedWrite DrawPipeline::StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out) {
+    if (DrawFinisher::Buffered() && !preparerDirect() && !preparerOutbox().empty()) throw std::logic_error("a draw finisher preparer looked up queued writes after buffering its own commit items, which that lookup cannot see");
     const auto end = address + bytes;
     auto answer = QueuedWrite::None;
     if (DrawFinisher::Overlap() && DrawFinisher::Sequenced()) {
@@ -1057,6 +1232,7 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
 }
 
 bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
+    if (DrawFinisher::Buffered() && !preparerDirect() && !preparerOutbox().empty()) throw std::logic_error("a draw finisher preparer looked up queued writes after buffering its own commit items, which that lookup cannot see");
     const auto overlaps = [&reads](const std::vector<Range>& writes) {
         return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
@@ -1071,7 +1247,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap()) || DrawFinisher::Get().OlderUnpublished();
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

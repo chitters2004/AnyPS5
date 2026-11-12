@@ -246,6 +246,111 @@ void FullRingHoldsTheProducer() {
     Require(log.committed == log.expected, "items behind a full ring committed out of order");
 }
 
+void PreparerWaitsForAnOlderUnpublishedWrite() {
+    if (!DrawFinisher::Sequenced() || DrawFinisher::Preparers() < 2) return;
+    Log log;
+    Gate gate;
+    gate.Close();
+    Draw(log, 0, &gate);
+    std::atomic<bool> checked{false};
+    std::atomic<bool> overlapped{false};
+    std::atomic<bool> seen{false};
+    std::atomic<bool> committedFirst{false};
+    DrawFinisher::Pending held;
+    held.unknown = false;
+    log.expected.emplace_back(Kind::Draw, 1);
+    DrawFinisher::Get().Enqueue([&] {
+        auto& pipeline = DrawPipeline::Queue0();
+        overlapped.store(!gate.open.load(std::memory_order_acquire), std::memory_order_release);
+        seen.store(pipeline.StoredBytes(Base + 0x1800, 4, {}) == DrawPipeline::QueuedWrite::Unknown, std::memory_order_release);
+        pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        {
+            std::lock_guard lock(log.mutex);
+            committedFirst.store(!log.committed.empty() && log.committed.front() == std::make_pair(Kind::Draw, 0), std::memory_order_release);
+        }
+        checked.store(true, std::memory_order_release);
+        pipeline.Enqueue(Kind::Draw, [&log] { log.Commit(Kind::Draw, 1); }, {}, 0, {}, {}, true);
+    }, std::move(held));
+    std::thread opener([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        gate.Open();
+    });
+    struct JoinOnExit {
+        std::thread& thread;
+        ~JoinOnExit() {
+            if (thread.joinable()) thread.join();
+        }
+    } joiner{opener};
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    opener.join();
+    Require(checked.load() && overlapped.load(), "a second preparer did not run while the older draw was held");
+    Require(seen.load(), "a preparer did not see the writes of an older draw that was prepared but not yet published");
+    Require(committedFirst.load(), "a preparer's drain returned before the older draw it waited on was committed");
+    Require(log.committed == log.expected, "draws prepared by several preparers committed out of order");
+}
+
+void OlderBufferedReadsHoldAYoungerFlush() {
+    if (!DrawFinisher::Sequenced() || DrawFinisher::Preparers() < 2) return;
+    Log log;
+    Gate gate;
+    gate.Close();
+    constexpr std::uint64_t Reads = Base + 0x7000;
+    std::atomic<bool> checked{false};
+    std::atomic<bool> overlapped{false};
+    std::atomic<bool> safe{false};
+    DrawFinisher::Pending olderHeld;
+    olderHeld.unknown = false;
+    log.expected.emplace_back(Kind::Draw, 0);
+    DrawFinisher::Get().Enqueue([&] {
+        DrawPipeline::Queue0().Enqueue(Kind::Draw, [&log] { log.Commit(Kind::Draw, 0); }, {}, 0, {}, {{Reads, Reads + 0x100}}, true);
+        gate.Pass();
+    }, std::move(olderHeld));
+    DrawFinisher::Pending youngerHeld;
+    youngerHeld.unknown = false;
+    log.expected.emplace_back(Kind::Draw, 1);
+    DrawFinisher::Get().Enqueue([&] {
+        overlapped.store(!gate.open.load(std::memory_order_acquire), std::memory_order_release);
+        const bool held = DrawPipeline::HeldReads(Reads + 0x40, 4);
+        bool committed = false;
+        {
+            std::lock_guard lock(log.mutex);
+            committed = !log.committed.empty();
+        }
+        safe.store(held || committed, std::memory_order_release);
+        checked.store(true, std::memory_order_release);
+        DrawPipeline::Queue0().Enqueue(Kind::Draw, [&log] { log.Commit(Kind::Draw, 1); }, {}, 0, {}, {}, true);
+    }, std::move(youngerHeld));
+    std::thread opener([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        gate.Open();
+    });
+    struct JoinOnExit {
+        std::thread& thread;
+        ~JoinOnExit() {
+            if (thread.joinable()) thread.join();
+        }
+    } joiner{opener};
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    opener.join();
+    Require(checked.load() && overlapped.load(), "a second preparer did not run while the older draw was held");
+    Require(safe.load(), "a younger preparer was told no queued draw reads a range that an older buffered draw reads, so a flush could land before that draw");
+    Require(log.committed == log.expected, "draws prepared by several preparers committed out of order");
+}
+
+void AbWindowReportsTheSettledPhase() {
+    if (!DrawFinisher::Sequenced() || std::getenv("APS5_PIPELINE_STATS") == nullptr) return;
+    Log log;
+    Require(DrawFinisher::AbWindow(true, 'A', 0).empty(), "an A/B phase that never settled reported a window");
+    Require(DrawFinisher::AbWindow(false, 'B', 1).empty(), "a settled A/B phase reported before it ended");
+    for (int index = 0; index < 4; ++index) Draw(log, index);
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    const auto line = DrawFinisher::AbWindow(true, 'A', 2);
+    const auto jobs = std::to_string(4) + " jobs";
+    Require(line.starts_with("[ring-preparers] phase B 1 ") && line.find(jobs) != std::string::npos, "the A/B window did not report the settled phase's jobs: " + line);
+    Require(DrawFinisher::AbWindow(true, 'B', 3).empty(), "an A/B window was reported twice");
+    Require(log.committed == log.expected, "draws around the A/B window committed out of order");
+}
+
 void FailedPrepareReachesTheWorker() {
     Log log;
     DrawFinisher::Get().Enqueue([] { throw std::runtime_error("prepare failed"); }, {});
@@ -292,6 +397,9 @@ int main() {
         IdleDrainRethrowsAFailedPreparation();
         ResidencyIsCountedByKind();
         FullRingHoldsTheProducer();
+        PreparerWaitsForAnOlderUnpublishedWrite();
+        OlderBufferedReadsHoldAYoungerFlush();
+        AbWindowReportsTheSettledPhase();
         DriverThreadsAreNamed();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;

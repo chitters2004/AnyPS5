@@ -5594,6 +5594,7 @@ void StorageTexture::awaitStoredSave(const std::vector<bool>* layers) {
 
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason, bool waited) {
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
+    if (AgcDriver::DriverDetail::DrawPipeline::HoldForOlderReads()) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     if (PublishShadow(address, bytes, scope, PublishReasonFor(reason), waited) == 0) return false;
     waitForIdlePublish(reason);

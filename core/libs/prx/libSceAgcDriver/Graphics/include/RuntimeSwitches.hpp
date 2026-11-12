@@ -48,6 +48,7 @@ enum class RuntimeSwitch : std::size_t {
     NoWriteOwners,
     WholePendingBumps,
     NoCertifiedDrawInputs,
+    SingleRingPreparer,
     Count,
 };
 
@@ -100,7 +101,7 @@ private:
 };
 
 bool AbConfigured();
-std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
+std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds, AbSchedule::Step* taken = nullptr);
 
 }
 

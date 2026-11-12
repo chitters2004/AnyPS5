@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdlib>
+#include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
@@ -171,6 +173,7 @@ void Driver::recordQueuedLabelsBeforeRead(std::uint32_t queue) {
 bool Driver::recordQueuedLabelsAfterCapture(std::uint32_t queue, std::span<const ShaderRecompiler::MemoryRegion> regions) {
     const auto& labels = deferredLabels().labels;
     if (labels.empty()) return false;
+    if (DrawFinisher::OnFinisherThread()) throw std::logic_error("a draw finisher preparer holds deferred labels, so a capture retry would draw without the worker's queue");
     for (const auto& label : labels) {
         for (const auto& region : regions) {
             if (label.address < region.guestAddress + region.bytes.size() && region.guestAddress < label.address + label.size) {

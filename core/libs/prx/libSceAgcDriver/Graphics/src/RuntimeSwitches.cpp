@@ -56,6 +56,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_WRITE_OWNERS",
     "APS5_WHOLE_PENDING_BUMPS",
     "APS5_NO_CERTIFIED_DRAW_INPUTS",
+    "APS5_SINGLE_RING_PREPARER",
 };
 
 struct SwitchValues {
@@ -99,6 +100,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_WRITE_OWNERS") != nullptr,
             std::getenv("APS5_WHOLE_PENDING_BUMPS") != nullptr,
             std::getenv("APS5_NO_CERTIFIED_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_SINGLE_RING_PREPARER") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -294,7 +296,7 @@ bool AbConfigured() {
     return configured;
 }
 
-std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
+std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds, AbSchedule::Step* taken) {
     if (!AbConfigured()) return {};
     auto& state = Ab();
     std::lock_guard lock(state.mutex);
@@ -302,6 +304,7 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     char text[512];
     const auto& config = state.schedule->Settings();
     const auto step = state.schedule->AtPresent(present, seconds);
+    if (taken != nullptr) *taken = step;
     if (step.event == AbSchedule::Event::None) return lines;
     if (step.event == AbSchedule::Event::Begin) {
         if (step.phase == 0) {
