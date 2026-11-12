@@ -744,6 +744,35 @@ void RepeatedOwnAttachmentDrawsBecomeRecipeHits() {
     std::puts("draw plans: I7f, repeats of a draw served into its own attachments become exact recipe hits");
 }
 
+void CopiedTargetsAreHandedToTheFullPath() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto run = [](const GuestBlock& target, bool usePlans) {
+        const Look first{.colour = 1.0f, .blended = true, .blendConstant = 0.625f};
+        const Look second{.colour = 0.5f, .blended = true, .blendConstant = 0.625f};
+        const std::unique_ptr<FullPath> fullPath = usePlans ? nullptr : std::make_unique<FullPath>();
+        Draw(target, first);
+        Draw(target, first);
+        Switches::Assign(RuntimeSwitch::NoResidentTargets, true);
+        const auto counts = Measure(target, second);
+        Switches::Assign(RuntimeSwitch::NoResidentTargets, false);
+        return counts;
+    };
+    GuestBlock planned;
+    GuestBlock full;
+    const auto counts = run(planned, true);
+    static_cast<void>(run(full, false));
+    Report("I7g a target the draw copies", counts);
+    std::printf("I7g handed %llu\n", static_cast<unsigned long long>(counts[DrawPlanCount::HandedTargets]));
+    ExpectNoHitsWhileOff(counts);
+    const bool ownAttachments = PlansOn() && std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr && std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    if (ownAttachments) Expect(counts[DrawPlanCount::Hits] == 0 && counts[DrawPlanCount::HandedTargets] == 1, "a plan hit with APS5_NO_RESIDENT_TARGETS set did not resolve its target with copies and hand it to the full path");
+    const auto pixels = Pixels(planned);
+    Expect(Drawn(pixels), "the draw into a copied target wrote nothing");
+    Expect(pixels == Pixels(full), "a draw whose target was copied differs from the full path's");
+    std::puts("draw plans: I7g, a plan hit whose target is copied hands it to the full path");
+}
+
 void PlansRefuseTemplatesWithOtherSetLayouts() {
     GuestBlock planned;
     GuestBlock reference;
@@ -936,6 +965,7 @@ int main(int argc, char** argv) {
         PlansRefuseTemplatesWithOtherSetLayouts();
         PlansDrawIntoTheirOwnDepth();
         RepeatedOwnAttachmentDrawsBecomeRecipeHits();
+        CopiedTargetsAreHandedToTheFullPath();
         PlannedSceneMatchesFullPath();
         SharedPushDonorsDrawTheirOwnPush();
         IndexedPlansFollowTheirIndexRange();

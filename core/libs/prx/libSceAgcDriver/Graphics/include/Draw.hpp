@@ -232,6 +232,7 @@ void SetSpaceKeepFailuresForTest(std::uint32_t count);
 void SetDrawStopAfterResolveForTest(DrawStopForTest stop);
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMissDrawsForTest();
+std::uint64_t CopiedTargetResolutionsForTest();
 
 }
 

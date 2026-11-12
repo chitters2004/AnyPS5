@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -1253,7 +1254,25 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 14> R3Scenarios{{
+void noResidentTargetsSkipTheMemo(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    const auto copied = CopiedTargetResolutionsForTest();
+    Switches::Assign(RuntimeSwitch::NoResidentTargets, true);
+    draw(device, color);
+    Switches::Assign(RuntimeSwitch::NoResidentTargets, false);
+    Require(CopiedTargetResolutionsForTest() == copied + 1, "a repeated draw with APS5_NO_RESIDENT_TARGETS set took its targets from the memo instead of copying them");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a repeated draw whose targets were copied");
+    draw(device, color);
+    Require(CopiedTargetResolutionsForTest() == copied + 1, "a draw after APS5_NO_RESIDENT_TARGETS was cleared still copied its targets");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a resident draw after copied ones");
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15> R3Scenarios{{
+    {"no-resident", noResidentTargetsSkipTheMemo},
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
     {"resident-dcc", residentDccClear},

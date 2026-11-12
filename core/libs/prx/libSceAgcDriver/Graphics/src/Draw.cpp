@@ -3713,6 +3713,7 @@ TargetMemo& ThreadTargetMemo() {
 }
 thread_local std::uint64_t targetMemoBuilds = 0;
 thread_local std::uint64_t targetMissDraws = 0;
+thread_local std::uint64_t copiedTargetResolutions = 0;
 std::atomic<const TargetMemo*> targetMemoOwner{nullptr};
 
 bool ownsTargetMemo(TargetMemo& memo) {
@@ -3838,13 +3839,14 @@ bool TargetsPlanRecordable(const State& state, int dumpLimit) {
 
 TargetResolution ResolveDrawTargets(const Context& context, const State& state, std::uint64_t shape, int dumpLimit, DrawOutcome& outcome, DrawTimer& timer, bool profile, ResolvedTargets& resolved) {
     resolved.planRecordable = TargetsPlanRecordable(state, dumpLimit);
+    const bool residentTargets = !RuntimeSwitches::Set(RuntimeSwitch::NoResidentTargets);
     auto& targets = resolved.targets;
     auto& targetViews = resolved.views;
     targets.resize(state.colors.size());
     static_cast<void>(ownsTargetMemo(ThreadTargetMemo()));
     const auto targetProof = currentTargetProof(context);
     auto admissionProof = targetProof;
-    bool repeatedColors = InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatColors(context, state, targetProof, targets, targetViews); });
+    bool repeatedColors = residentTargets && InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatColors(context, state, targetProof, targets, targetViews); });
     const auto prepareColors = [&] {
         targets.clear();
         targets.resize(state.colors.size());
@@ -3884,8 +3886,6 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
             if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
             constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             timer.phase(PhaseSetup);
-            // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
-            static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
             static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
             const bool linearResident = residentLinear && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
             BeginCommitPhase(CommitPhase::Targets);
@@ -3987,7 +3987,7 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
         noteColorMemo(ColorMemoEvent::DepthFallback);
         return InCommitPhase(CommitPhase::TargetsDepthPrep, [&] { return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state)); });
     };
-    auto depthView = InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatDepth(context, state, repeatedColors ? &targetProof : nullptr); });
+    auto depthView = residentTargets ? InCommitPhase(CommitPhase::TargetsMemo, [&] { return repeatDepth(context, state, repeatedColors ? &targetProof : nullptr); }) : VkImageView{VK_NULL_HANDLE};
     bool repeatedDepth = state.depth && depthView != VK_NULL_HANDLE;
     if (state.depth && !repeatedDepth) depthView = prepareDepth();
     if (repeatedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !colorProofMatches(targetProof, currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.resident->Cached(); }))) {
@@ -4047,6 +4047,7 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
     if (resolved.targetMiss) ++targetMissDraws;
     if (repeatedColors && (!state.depth || repeatedDepth)) return TargetResolution::Repeated;
     const bool copies = std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr && !binding.multisampled; });
+    if (copies) ++copiedTargetResolutions;
     return copies ? TargetResolution::ResolvedWithCopies : TargetResolution::Resolved;
 }
 
@@ -5370,6 +5371,10 @@ std::uint64_t TargetMemoBuildsForTest() {
 
 std::uint64_t TargetMissDrawsForTest() {
     return targetMissDraws;
+}
+
+std::uint64_t CopiedTargetResolutionsForTest() {
+    return copiedTargetResolutions;
 }
 
 std::uint64_t AddressDrawReuseVerifications() {
