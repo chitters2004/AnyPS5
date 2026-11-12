@@ -177,7 +177,7 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, Count };
+enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, PipelineCommitCovered, Count };
 const char* ProofBreakName(ProofBreak source);
 void BreakProofs(ProofBreak source = ProofBreak::Unlabelled);
 bool ProofBreakVoidsCertificates(ProofBreak source);

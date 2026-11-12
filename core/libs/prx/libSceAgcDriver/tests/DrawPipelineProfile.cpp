@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitEffects.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <chrono>
 #include <cstdio>
 #include <exception>
@@ -84,6 +86,21 @@ std::size_t Count(std::string_view text, std::string_view value) {
     return count;
 }
 
+void TestCommitEffects() {
+    using namespace AgcDriver::DriverDetail;
+    for (std::size_t i = 0; i < static_cast<std::size_t>(DrawPipeline::CommitKind::Count); ++i) {
+        const auto kind = static_cast<DrawPipeline::CommitKind>(i);
+        const auto effects = CommitEffects(kind);
+        Check(effects != 0, "a commit kind has no row in the effects table");
+        if ((effects & CommitEffectBit(CommitEffect::Unknown)) != 0) Check(!CommitCovered(kind), "a commit kind with an unknown effect breaks proofs as covered");
+    }
+    Check(CommitEffectsCovered(DeliveredCommitEffects), "effects that all reach a bump were not covered");
+    Check(!CommitEffectsCovered(CommitEffectBit(CommitEffect::CompleteWrites) | CommitEffectBit(CommitEffect::Unknown)), "an unknown effect was covered by a delivered one");
+    Check(!CommitEffectsCovered(CommitEffectBit(CommitEffect::CompleteWrites) | CommitEffectBit(CommitEffect::BoundedWrites)), "bounded writes were covered without a bump");
+    Check(!CommitEffectsCovered(CommitEffectBit(CommitEffect::CacheReplacement)), "a cache replacement was covered without a bump");
+    Check(!CommitEffectsCovered(0), "an empty row was covered");
+}
+
 void TestReport() {
     using AgcDriver::DriverDetail::DrawPipeline;
     auto& pipeline = DrawPipeline::Queue0();
@@ -93,10 +110,12 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
+        const auto certificateBreaks = AgcDriver::GuestMemory::CertificateBreakSerial();
         pipeline.Enqueue(DrawPipeline::CommitKind::DmaWrite, [] {}, {{0x3000, 0x3010}}, 0, {}, {}, false);
         pipeline.Enqueue(DrawPipeline::CommitKind::Seal, [] {}, {}, 0, {}, {}, false);
         const auto committed = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         while ((pipeline.CommitBreaks(DrawPipeline::CommitKind::DmaWrite, true) == 0 || pipeline.CommitBreaks(DrawPipeline::CommitKind::Seal, false) == 0) && std::chrono::steady_clock::now() < committed) std::this_thread::yield();
+        Check(AgcDriver::GuestMemory::CertificateBreakSerial() - certificateBreaks == 2, "a commit kind with an unknown effect did not void certificates");
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
@@ -125,6 +144,7 @@ void TestReport() {
 
 int main() {
     try {
+        TestCommitEffects();
         TestReport();
         std::cout << "Draw pipeline profile passed\n";
         return 0;

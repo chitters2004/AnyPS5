@@ -2533,11 +2533,11 @@ std::uint64_t CollectEpochBumps() {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 std::atomic<std::uint64_t> certificateBreakSerial{1};
-constexpr std::uint32_t CertificateCoveredBreaks = (std::uint32_t{1} << static_cast<unsigned>(ProofBreak::MarkWritten)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreak::OwnStore));
+constexpr std::uint32_t CertificateCoveredBreaks = (std::uint32_t{1} << static_cast<unsigned>(ProofBreak::MarkWritten)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreak::OwnStore)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreak::PipelineCommitCovered));
 thread_local bool proofThread = false;
 const bool proofBreaksCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ProofBreak::Count)> proofBreaks{};
-constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakNames{"unlabelled", "own-store", "mark-written", "gpu-lock", "write-changed", "write-changed-if-held", "completion-store", "completion-action", "written-back", "copied-writer", "pipeline-commit", "resource-writes"};
+constexpr std::array<const char*, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakNames{"unlabelled", "own-store", "mark-written", "gpu-lock", "write-changed", "write-changed-if-held", "completion-store", "completion-action", "written-back", "copied-writer", "pipeline-commit", "resource-writes", "pipeline-commit-covered"};
 }
 
 const char* ProofBreakName(ProofBreak source) {
