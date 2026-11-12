@@ -793,6 +793,7 @@ if(BUILD_TESTING)
         endif()
         agc_add_default_test(${agcTest})
     endforeach()
+    set_tests_properties(agc_driver_packed_f16_lane_modifiers PROPERTIES TIMEOUT 300)
 endif()
 
 foreach(agcExecutionTestName IN LISTS ANYPS5_AGC_EXECUTION_TESTS)
