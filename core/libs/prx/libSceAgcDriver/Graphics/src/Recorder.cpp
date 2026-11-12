@@ -1891,6 +1891,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
         CountBarriers(CommandClass::Draw);
     }
     if (pass.afterPass) pass.afterPass(open->commands);
+    if (pass.timing != NoTiming && pass.timing < open->timedBreaks.size()) open->timedBreaks[pass.timing] = by;
     EndGpuTiming(pass.timing);
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
@@ -2479,6 +2480,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
     open->timedDraws.push_back({});
+    open->timedBreaks.push_back(PassBreak::Continued);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -3175,6 +3177,9 @@ void Recorder::readGpuTiming(Batch& batch) {
             if (inert != 0 && draws[static_cast<std::size_t>(DrawFragment::Run)] == 0) {
                 ++drawFragments.inertRanges;
                 drawFragments.inertMs += ns / 1e6;
+                const auto by = static_cast<std::size_t>(batch.timedBreaks[i]);
+                ++drawFragments.inertBreakRanges[by];
+                drawFragments.inertBreakMs[by] += ns / 1e6;
             }
         }
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
@@ -3204,8 +3209,17 @@ void Recorder::readGpuTiming(Batch& batch) {
             if (key == ClassKey(CommandClass::Draw) && drawFragments.draws != drawFragmentsReported.draws) {
                 const auto ranges = drawFragments.inertRanges - drawFragmentsReported.inertRanges;
                 const auto ms = drawFragments.inertMs - drawFragmentsReported.inertMs;
-                std::snprintf(text, sizeof(text), " draw-inert x%llu %.1fms 0.0MiB (per present x%.1f %.2fms 0.00MiB; of x%llu draws x%llu inert fragment, x%llu without the stage)", static_cast<unsigned long long>(ranges), ms, static_cast<double>(ranges) * perPresent, ms * perPresent, static_cast<unsigned long long>(drawFragments.draws - drawFragmentsReported.draws), static_cast<unsigned long long>(drawFragments.inert - drawFragmentsReported.inert), static_cast<unsigned long long>(drawFragments.omitted - drawFragmentsReported.omitted));
-                classes += text;
+                std::string ended;
+                for (std::size_t by = 0; by < PassBreakCount; ++by) {
+                    const auto count = drawFragments.inertBreakRanges[by] - drawFragmentsReported.inertBreakRanges[by];
+                    if (count == 0) continue;
+                    char part[96];
+                    std::snprintf(part, sizeof(part), "%s %s x%llu %.1fms", ended.empty() ? "; ended by" : ",", PassBreakNames[by], static_cast<unsigned long long>(count), drawFragments.inertBreakMs[by] - drawFragmentsReported.inertBreakMs[by]);
+                    ended += part;
+                }
+                char inertText[512];
+                std::snprintf(inertText, sizeof(inertText), " draw-inert x%llu %.1fms 0.0MiB (per present x%.1f %.2fms 0.00MiB; of x%llu draws x%llu inert fragment, x%llu without the stage%s)", static_cast<unsigned long long>(ranges), ms, static_cast<double>(ranges) * perPresent, ms * perPresent, static_cast<unsigned long long>(drawFragments.draws - drawFragmentsReported.draws), static_cast<unsigned long long>(drawFragments.inert - drawFragmentsReported.inert), static_cast<unsigned long long>(drawFragments.omitted - drawFragmentsReported.omitted), ended.c_str());
+                classes += inertText;
                 drawFragmentsReported = drawFragments;
             }
         } else {

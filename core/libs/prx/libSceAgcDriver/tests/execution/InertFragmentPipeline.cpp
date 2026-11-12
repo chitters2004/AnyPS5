@@ -33,6 +33,8 @@ using ShaderRecompiler::ShaderStage;
 
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
 alignas(4096) std::array<std::uint8_t, Width * Height * 2> Stencil{};
+alignas(4096) std::array<float, Width * Height * 2> OtherDepth{};
+alignas(4096) std::array<std::uint8_t, Width * Height * 2> OtherStencil{};
 alignas(256) constexpr std::array<std::uint32_t, 64> NullPixelCode{0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 7> BufferPixelCode{0x7e0a0280u, 0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf800180fu, 0x03020100u, 0xbf810000u};
 alignas(256) constexpr std::array<float, 4> BufferColor{1.0f, 1.0f, 1.0f, 1.0f};
@@ -89,6 +91,7 @@ struct Pass {
     float minBound = 0.0f;
     float maxBound = 1.0f;
     std::uint16_t sampleMask = 0xffffu;
+    bool otherDepth = false;
 };
 
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
@@ -109,7 +112,7 @@ std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const
         state.blend.colorWriteMask = 15;
         state.blends = {state.blend};
     }
-    state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(Depth.data()), reinterpret_cast<std::uintptr_t>(Stencil.data()), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0, 0, false};
+    state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(pass.otherDepth ? OtherDepth.data() : Depth.data()), reinterpret_cast<std::uintptr_t>(pass.otherDepth ? OtherStencil.data() : Stencil.data()), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0, 0, false};
     state.depthTest = pass.depthTest;
     state.depthWrite = pass.depthWrite;
     state.depthCompare = pass.depthCompare;
@@ -286,6 +289,16 @@ int main() {
             Require(after.omitted - before.omitted == (kept ? 0u : 4u), "the [gputime] draw ranges did not count the draws recorded without the fragment stage");
             Require(after.inertRanges - before.inertRanges == 3u, "the [gputime] inert-only draw ranges were not the passes made of inert fragment draws alone");
             Require(after.inertMs > before.inertMs, "the [gputime] inert-only draw ranges took no GPU time");
+            const auto ended = [](const auto& totals, const auto& earlier, AgcDriver::Graphics::PassBreak by) { return totals.inertBreakRanges[static_cast<std::size_t>(by)] - earlier.inertBreakRanges[static_cast<std::size_t>(by)]; };
+            using Break = AgcDriver::Graphics::PassBreak;
+            Require(ended(after, before, Break::NewBatch) == 3u, "the [gputime] inert-only draw ranges were not told to end at their batch's wait");
+            const auto keyBefore = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f}, false);
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f, .otherDepth = true}, false);
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f, .otherDepth = true});
+            const auto keyAfter = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(ended(keyAfter, keyBefore, Break::Command) == 1u && ended(keyAfter, keyBefore, Break::NewBatch) == 1u, "the [gputime] inert-only draw range of a pass left for another depth target did not end by command, or the last one by its batch");
+            Require(keyAfter.inertRanges - keyBefore.inertRanges == 2u, "the [gputime] inert-only draw ranges did not count both passes of the depth target change");
             const auto syncBefore = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
             for (int i = 0; i < 3; ++i) Draw(*device, full, plain, {.color = true, .depthTest = false});
             const auto syncAfter = AgcDriver::Graphics::Recorder::DrawFragmentTimes();

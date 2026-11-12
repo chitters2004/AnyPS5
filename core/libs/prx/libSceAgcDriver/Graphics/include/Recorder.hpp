@@ -583,6 +583,8 @@ public:
         std::uint64_t omitted = 0;
         std::uint64_t inertRanges = 0;
         double inertMs = 0;
+        std::array<std::uint64_t, PassBreakCount> inertBreakRanges{};
+        std::array<double, PassBreakCount> inertBreakMs{};
         std::uint64_t syncRanges = 0;
         double syncMs = 0;
     };
@@ -685,6 +687,7 @@ private:
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         std::vector<std::array<std::uint32_t, static_cast<std::size_t>(DrawFragment::Count)>> timedDraws;
+        std::vector<PassBreak> timedBreaks;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
