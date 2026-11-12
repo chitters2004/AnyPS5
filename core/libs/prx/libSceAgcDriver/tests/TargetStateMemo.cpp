@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -125,6 +126,7 @@ struct DrawOptions {
     std::uint32_t colorWriteMask = 15;
     bool prepareOnly = false;
     bool changePadding = false;
+    bool noColor = false;
 };
 
 void setDescriptorPadding(ColorTarget& color, DepthTarget* depth, std::uint8_t padding) {
@@ -151,6 +153,10 @@ void draw(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawO
     state.color = color;
     state.colors = {color};
     state.hasColorTarget = true;
+    if (options.noColor) {
+        state.colors.clear();
+        state.hasColorTarget = false;
+    }
     state.depth = options.depth;
     if (options.changePadding) {
         static std::uint8_t padding = 0;
@@ -1171,6 +1177,49 @@ void descriptorIdentity() {
     Require(depth == depthOther, "depth descriptor identity compares NaNs numerically");
 }
 
+bool memoRepeats() {
+    static const bool repeats = std::getenv("APS5_NO_TARGET_MEMO") == nullptr && std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    return repeats;
+}
+
+std::uint64_t memoEvent(CommitCounter counter) {
+    return ReadCommitPhases().counters[static_cast<std::size_t>(counter)];
+}
+
+void requireTargetMiss(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, bool miss, CommitCounter path, const std::string& what, bool taken = true) {
+    const auto before = TargetMissDrawsForTest();
+    const auto pathBefore = memoEvent(path);
+    draw(device, color, options);
+    const auto misses = TargetMissDrawsForTest() - before;
+    const std::uint64_t expected = miss || !memoRepeats() ? 1u : 0u;
+    Require(misses == expected, what + " counted " + std::to_string(misses) + " target misses, expected " + std::to_string(expected));
+    Require(!taken || !CommitPhasesEnabled() || !memoRepeats() || memoEvent(path) != pathBefore, what + " did not take its target memo path");
+}
+
+void targetMissDraws(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color, {.prepareOnly = true});
+    requireTargetMiss(device, color, {.prepareOnly = true}, false, CommitCounter::TargetMemoAccept, "a draw that repeats its color target");
+    AgcDriver::GuestMemory::BreakProofs();
+    requireTargetMiss(device, color, {.prepareOnly = true}, true, CommitCounter::TargetMemoProofs, "a color target after a proof break");
+    ClearDepthSurfaces(device.Device());
+    arm(device, color, {.prepareOnly = true});
+    auto depth = depthTarget(true);
+    requireTargetMiss(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, true, CommitCounter::TargetMemoPostDepthInvalidated, "a repeated color target invalidated by its new depth surface");
+    arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
+    requireTargetMiss(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, false, CommitCounter::TargetMemoAccept, "a draw that repeats its color and depth targets");
+    depth.clearDepth = 0.375f;
+    requireTargetMiss(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, true, CommitCounter::TargetMemoAcceptWithDepthMiss, "a repeated color target beside a depth descriptor miss");
+    depth.clearDepth = 0.25f;
+    const DrawOptions depthOnly{.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true, .noColor = true};
+    requireTargetMiss(device, color, depthOnly, true, CommitCounter::TargetMemoDepthFallback, "a depth-only draw whose depth target missed");
+    for (int repeat = 0; repeat < 2; ++repeat) draw(device, color, depthOnly);
+    const auto fallbacks = memoEvent(CommitCounter::TargetMemoDepthFallback);
+    requireTargetMiss(device, color, depthOnly, false, CommitCounter::TargetMemoDepthFallback, "a depth-only draw that repeats its depth target", false);
+    Require(!CommitPhasesEnabled() || !memoRepeats() || memoEvent(CommitCounter::TargetMemoDepthFallback) == fallbacks, "a depth-only draw that repeats its depth target fell back to its depth lookup");
+}
+
 void unchangedMemo(AgcDriver::VulkanDevice& device) {
     descriptorIdentity();
     const auto color = colorTarget();
@@ -1201,7 +1250,7 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 13> R3Scenarios{{
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 14> R3Scenarios{{
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
     {"resident-dcc", residentDccClear},
@@ -1214,7 +1263,8 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 13>
     {"msaa", colorMemoWithMsaaDepth},
     {"proof", colorMemoProofBreak},
     {"metadata", colorMetadataDepthAlias},
-    {"eviction", colorMemoResidentEviction}
+    {"eviction", colorMemoResidentEviction},
+    {"target-miss", targetMissDraws}
 }};
 
 const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 31> Scenarios{{
