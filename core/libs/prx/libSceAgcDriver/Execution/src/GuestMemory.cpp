@@ -366,6 +366,7 @@ std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
 std::atomic<DomainReadObserver> domainReadObserver{nullptr};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteDomain::Count)> producerDomains{};
 thread_local bool storeBumpsMuted = false;
+thread_local bool coveredCommitMuted = false;
 
 class StoreBumpsMute {
 public:
@@ -384,7 +385,7 @@ private:
 
 bool storeBumpsMutedForTest() {
     const auto mutant = certificateMutant.load(std::memory_order_relaxed);
-    return (mutant == CertificateMutant::HideMarkWrittenBumps || mutant == CertificateMutant::HideOwnStoreBumps) && storeBumpsMuted;
+    return ((mutant == CertificateMutant::HideMarkWrittenBumps || mutant == CertificateMutant::HideOwnStoreBumps) && storeBumpsMuted) || (mutant == CertificateMutant::HidePipelineCommitBumps && coveredCommitMuted);
 }
 
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
@@ -570,6 +571,14 @@ void SetCertificateMutantForTest(CertificateMutant mutant) {
 
 void SetDomainReadObserverForTest(DomainReadObserver observer) {
     domainReadObserver.store(observer, std::memory_order_release);
+}
+
+CoveredCommitScope::CoveredCommitScope(bool covered) : muted(covered && certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HidePipelineCommitBumps) {
+    if (muted) coveredCommitMuted = true;
+}
+
+CoveredCommitScope::~CoveredCommitScope() {
+    if (muted) coveredCommitMuted = false;
 }
 
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask) {

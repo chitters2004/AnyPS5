@@ -104,10 +104,20 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 using DomainReadObserver = void (*)(WriteDomain domain);
 void SetDomainReadObserverForTest(DomainReadObserver observer);
+class CoveredCommitScope {
+public:
+    explicit CoveredCommitScope(bool covered);
+    ~CoveredCommitScope();
+    CoveredCommitScope(const CoveredCommitScope&) = delete;
+    CoveredCommitScope& operator=(const CoveredCommitScope&) = delete;
+
+private:
+    bool muted;
+};
 using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
 void SetWriteBackingResolver(WriteBackingResolver resolver);
 std::span<const std::pair<std::uint64_t, std::uint64_t>> SubscriptionSpans(const WriteSubscription& subscription);

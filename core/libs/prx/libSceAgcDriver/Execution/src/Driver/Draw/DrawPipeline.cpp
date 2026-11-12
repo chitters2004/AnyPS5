@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -471,9 +472,13 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
-            if (commit != nullptr) (*commit)();
+            const bool covered = !isDraw && CommitCovered(kind) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoCoveredCommits);
+            {
+                const GuestMemory::CoveredCommitScope scope(covered);
+                if (commit != nullptr) (*commit)();
+            }
             if (!isDraw) {
-                GuestMemory::BreakProofs(CommitCovered(kind) ? GuestMemory::ProofBreak::PipelineCommitCovered : GuestMemory::ProofBreak::PipelineCommit);
+                GuestMemory::BreakProofs(covered ? GuestMemory::ProofBreak::PipelineCommitCovered : GuestMemory::ProofBreak::PipelineCommit);
                 static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
                 if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }
