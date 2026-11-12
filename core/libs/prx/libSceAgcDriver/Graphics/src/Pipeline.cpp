@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "RuntimeAbi.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -991,6 +992,113 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state, const Stat
     if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
+}
+
+void Pipeline::ContinueOps(DrawStateOps& ops, const State& state, const State* masked) const {
+    if (optimized != nullptr) optimized->Schedule();
+    const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
+    ops.pipeline = best != VK_NULL_HANDLE ? best : pipeline;
+    ops.layout = layout;
+    ops.viewport = state.viewport;
+    ops.scissor = state.scissor;
+    ops.maskCount = 0;
+    if (context.dynamicColorWriteMask && !state.blends.empty()) {
+        const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), false);
+        ops.maskCount = static_cast<std::uint32_t>(state.blends.size());
+        std::copy_n(masks.begin(), ops.maskCount, ops.masks.begin());
+    }
+    ops.stencilReference = state.stencilReplayReference.has_value();
+    ops.stencilReferenceValue = state.stencilReplayReference.value_or(0u);
+    ops.library = libraries;
+    const bool depth = state.depth.has_value();
+    ops.depthBias = depthBias;
+    ops.depthBiasConstant = depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f;
+    ops.depthBiasClamp = depthBias ? state.depthBiasClamp : 0.0f;
+    ops.depthBiasSlope = depthBias ? state.depthBiasSlope : 0.0f;
+    ops.depthBounds = depthBounds;
+    ops.minDepthBounds = depthBounds ? state.minDepthBounds : 0.0f;
+    ops.maxDepthBounds = depthBounds ? state.maxDepthBounds : 1.0f;
+    if (!libraries) return;
+    ops.cullMode = state.cullMode;
+    ops.frontFace = state.frontFace;
+    ops.depthTest = depth && state.depthTest;
+    ops.depthWrite = depth && state.depthWrite;
+    ops.depthCompare = depth ? state.depthCompare : VK_COMPARE_OP_ALWAYS;
+    ops.depthBoundsTest = depthBounds;
+    ops.stencilTest = depth && state.stencilTest;
+    ops.stencil = {depth ? state.stencilFront : VkStencilOpState{}, depth ? state.stencilBack : VkStencilOpState{}};
+}
+
+void Pipeline::PushOps(DrawStateOps& ops, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    ops.pushCount = 0;
+    if (stages == 0) return;
+    std::copy(bytes.begin(), bytes.end(), ops.push.begin());
+    if (dynamicRendering) {
+        ops.pushCount = 2;
+        ops.pushStages = {pushStagesOf(context), VK_SHADER_STAGE_FRAGMENT_BIT};
+        ops.pushOffsets = {0, PipelinePushSlotBytes};
+        ops.pushSizes = {PipelinePushSlotBytes, PipelinePushSlotBytes};
+        return;
+    }
+    ops.pushCount = 1;
+    ops.pushStages = {stages, 0};
+    ops.pushOffsets = {0, 0};
+    ops.pushSizes = {PipelinePushSlotBytes, 0};
+}
+
+bool CanRunDrawStateOps(const DrawStateOps& ops, const DeviceFunctions& functions) {
+    const bool common = functions.cmdBindPipeline != nullptr && functions.cmdSetViewport != nullptr && functions.cmdSetScissor != nullptr && functions.cmdBindDescriptorSets != nullptr && functions.cmdPushConstants != nullptr;
+    const bool masks = ops.maskCount == 0 || functions.cmdSetColorWriteMask != nullptr;
+    const bool reference = (!ops.stencilReference && !ops.library) || functions.cmdSetStencilReference != nullptr;
+    const bool fixed = (!ops.depthBias && !ops.library) || functions.cmdSetDepthBias != nullptr;
+    const bool bounds = (!ops.depthBounds && !ops.library) || functions.cmdSetDepthBounds != nullptr;
+    const bool library = !ops.library || (functions.cmdSetCullMode != nullptr && functions.cmdSetFrontFace != nullptr && functions.cmdSetDepthTestEnable != nullptr && functions.cmdSetDepthWriteEnable != nullptr && functions.cmdSetDepthCompareOp != nullptr && functions.cmdSetDepthBoundsTestEnable != nullptr && functions.cmdSetStencilTestEnable != nullptr && functions.cmdSetStencilOp != nullptr && functions.cmdSetStencilCompareMask != nullptr && functions.cmdSetStencilWriteMask != nullptr);
+    return common && masks && reference && fixed && bounds && library;
+}
+
+DrawStateOps Pipeline::DrawOps(const State& state, const State* masked, std::array<VkDescriptorSet, 2> sets, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    DrawStateOps ops;
+    ContinueOps(ops, state, masked);
+    const std::array<std::uint32_t, 2> firstSets{0, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet};
+    for (std::size_t index = 0; index < sets.size(); ++index) {
+        if (sets[index] == VK_NULL_HANDLE) continue;
+        ops.sets[ops.setCount] = sets[index];
+        ops.firstSets[ops.setCount++] = firstSets[index];
+    }
+    PushOps(ops, stages, bytes);
+    return ops;
+}
+
+void RunDrawStateOps(const DrawStateOps& ops, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    functions.cmdBindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ops.pipeline);
+    functions.cmdSetViewport(commands, 0, 1, &ops.viewport);
+    functions.cmdSetScissor(commands, 0, 1, &ops.scissor);
+    if (ops.maskCount != 0) functions.cmdSetColorWriteMask(commands, 0, ops.maskCount, ops.masks.data());
+    if (ops.stencilReference) functions.cmdSetStencilReference(commands, VK_STENCIL_FACE_FRONT_AND_BACK, ops.stencilReferenceValue);
+    if (ops.library) {
+        functions.cmdSetCullMode(commands, ops.cullMode);
+        functions.cmdSetFrontFace(commands, ops.frontFace);
+        functions.cmdSetDepthBias(commands, ops.depthBiasConstant, ops.depthBiasClamp, ops.depthBiasSlope);
+        functions.cmdSetDepthBounds(commands, ops.minDepthBounds, ops.maxDepthBounds);
+        functions.cmdSetDepthTestEnable(commands, ops.depthTest);
+        functions.cmdSetDepthWriteEnable(commands, ops.depthWrite);
+        functions.cmdSetDepthCompareOp(commands, ops.depthCompare);
+        functions.cmdSetDepthBoundsTestEnable(commands, ops.depthBoundsTest);
+        functions.cmdSetStencilTestEnable(commands, ops.stencilTest);
+        const std::array<VkStencilFaceFlags, 2> faces{VK_STENCIL_FACE_FRONT_BIT, VK_STENCIL_FACE_BACK_BIT};
+        for (std::size_t face = 0; face < faces.size(); ++face) {
+            const auto& op = ops.stencil[face];
+            functions.cmdSetStencilOp(commands, faces[face], op.failOp, op.passOp, op.depthFailOp, op.compareOp);
+            functions.cmdSetStencilCompareMask(commands, faces[face], op.compareMask);
+            functions.cmdSetStencilWriteMask(commands, faces[face], op.writeMask);
+            functions.cmdSetStencilReference(commands, faces[face], op.reference);
+        }
+    } else {
+        if (ops.depthBias) functions.cmdSetDepthBias(commands, ops.depthBiasConstant, ops.depthBiasClamp, ops.depthBiasSlope);
+        if (ops.depthBounds) functions.cmdSetDepthBounds(commands, ops.minDepthBounds, ops.maxDepthBounds);
+    }
+    for (std::uint32_t index = 0; index < ops.setCount; ++index) functions.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, ops.layout, ops.firstSets[index], 1, &ops.sets[index], 0, nullptr);
+    for (std::uint32_t index = 0; index < ops.pushCount; ++index) functions.cmdPushConstants(commands, ops.layout, ops.pushStages[index], ops.pushOffsets[index], ops.pushSizes[index], ops.push.data() + ops.pushOffsets[index]);
 }
 
 void Pipeline::setLibraryState(VkCommandBuffer commands, const State& state) const {

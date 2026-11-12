@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
@@ -278,6 +279,31 @@ void RecordedMasks(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkC
     recorder.Sync();
 }
 
+bool EncodedMasks(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkColorComponentFlags all, VkColorComponentFlags redBlue) {
+    using namespace AgcDriver::Graphics;
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the device has no active recorder");
+    if (!recorder->Encodes()) return false;
+    const auto context = device.graphicsContext();
+    const auto shaders = Stages(device, compiled);
+    const std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto continued = [] { return DrawPassTotals()[0].passesContinued; };
+    AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, shaders);
+    const auto passes = continued();
+    const auto breaks = DrawPassBreaks();
+    const auto before = DrawOpsTotals();
+    AgcDriver::Graphics::Draw(context, StateFor(redBlue, true, false), FullScreen, shaders);
+    Require(continued() == passes + 1u, "the encoded draw with another color write mask did not continue the open pass; breaks:" + BreaksSince(breaks));
+    const auto after = DrawOpsTotals();
+    const bool ops = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawOps);
+    const auto recorded = after.recorded - before.recorded;
+    const auto fallbacks = after.fallbacks - before.fallbacks;
+    Require(recorded == (ops ? 1u : 0u) && fallbacks == (ops ? 0u : 1u), "the continued encoded draw recorded " + std::to_string(recorded) + " draw state records and " + std::to_string(fallbacks) + " fallbacks with APS5_NO_DRAW_OPS " + (ops ? "unset" : "set"));
+    recorder->Submit();
+    recorder->Sync();
+    return true;
+}
+
 }
 
 int main() {
@@ -307,8 +333,9 @@ int main() {
         const auto after = AgcDriver::Graphics::PipelineLibraryCountersOf(vkDevice);
         if (dynamic) Require(SameCounters(counters, after), "draws that differ only in their color write mask built or linked another pipeline: linked " + std::to_string(counters.linked) + " -> " + std::to_string(after.linked) + ", fragment output libraries " + std::to_string(counters.built[3]) + " -> " + std::to_string(after.built[3]));
         const bool multisampled = (device->graphicsContext().limits.framebufferColorSampleCounts & Samples) != 0;
+        const bool encoded = dynamic && multisampled && EncodedMasks(*device, compiled, all, redBlue);
         if (dynamic && multisampled) RecordedMasks(*device, compiled, all, redBlue);
-        std::printf("color write mask tests passed (%s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color");
+        std::printf("color write mask tests passed (%s, %s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color", encoded ? "encoded draw state" : "encoded draw state skipped");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
