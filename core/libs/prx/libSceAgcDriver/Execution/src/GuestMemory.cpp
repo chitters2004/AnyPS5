@@ -2531,10 +2531,12 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> walkClosure(std::uint64_t f
 
 // Takes the tracker mutex; under APS5_PROFILE_DRAW an acquisition that found it held is counted
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
+struct ActiveTrackerLockSlot {};
+
 class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock), previous(activeLock()) {
-        activeLock() = this;
+        ActiveSlot::Set(this);
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (!profile) {
             lock.lock();
@@ -2548,12 +2550,11 @@ public:
     }
     ~TrackerLock() {
         if (lock.owns_lock()) publish();
-        if (activeLock() == this) activeLock() = previous;
+        if (activeLock() == this) ActiveSlot::Set(previous);
     }
 
-    static TrackerLock*& activeLock() {
-        thread_local TrackerLock* active = nullptr;
-        return active;
+    static TrackerLock* activeLock() {
+        return ActiveSlot::Get();
     }
 
     std::vector<std::pair<std::uint64_t, std::uint64_t>> AwaitWalks(std::uint64_t first, std::uint64_t stop, bool walk = false) {
@@ -2630,6 +2631,8 @@ private:
 
     WriteTracker& tracker;
     std::unique_lock<AgcDriver::Mutex> lock;
+    using ActiveSlot = HostThreadSlot<TrackerLock*, ActiveTrackerLockSlot>;
+
     TrackerLock* previous = nullptr;
 };
 
