@@ -42,6 +42,7 @@
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "HostImportLifetime.hpp"
+#include "NotTested.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "SampleLod_spv.h"
 #include "BufferUpdate_spv.h"
@@ -1535,7 +1536,7 @@ void overlappedRangeTests(Recorder& recorder) {
 void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: address space pending writes not tested\n";
+        NotTested("host imports unavailable: address space pending writes not tested");
         return;
     }
     constexpr std::size_t bytes = 0x10000;
@@ -1566,7 +1567,7 @@ void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
     if (regions < count) {
         registry(false);
         ::operator delete(block, std::align_val_t{65536});
-        std::cout << "the registered ranges are not served in place: address space pending writes not tested\n";
+        NotTested("the registered ranges are not served in place: address space pending writes not tested");
         return;
     }
     const std::array<std::byte, 4> value{std::byte{0x5a}, std::byte{0xa5}, std::byte{0x5a}, std::byte{0xa5}};
@@ -2213,7 +2214,7 @@ void keyProofTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, bytes);
     if (block == nullptr) {
-        std::cout << "no write watching: key proofs not tested\n";
+        NotTested("no write watching: key proofs not tested");
         return;
     }
     struct Release {
@@ -2279,7 +2280,7 @@ void targetKeyProofTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 65536;
     void* block = AllocateWatched(bytes, bytes);
     if (block == nullptr) {
-        std::cout << "no write watching: target key proofs not tested\n";
+        NotTested("no write watching: target key proofs not tested");
         return;
     }
     struct Release {
@@ -2395,7 +2396,7 @@ void closeRaceTests(const Device& device, Recorder& recorder) {
 void storeRunTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: store runs not tested\n";
+        NotTested("host imports unavailable: store runs not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -2413,7 +2414,7 @@ void storeRunTests(const Device& device, Recorder& recorder) {
     }
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
-        std::cout << "host import of the store test block refused: store runs not tested\n";
+        NotTested("host import of the store test block refused: store runs not tested");
         return;
     }
     const bool perBatch = std::getenv("APS5_LABEL_RUNS_INLINE") == nullptr && std::getenv("APS5_NO_LABEL_RUNS") == nullptr && std::getenv("APS5_NO_LABEL_BATCHING") == nullptr;
@@ -2484,7 +2485,7 @@ bool deferredSettleTests(const Device& device) {
     constexpr std::size_t unit = 65536;
     constexpr std::size_t settledBytes = std::size_t{1} << 20;
     if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit || context.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: deferred settles not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: deferred settles not tested");
         return false;
     }
     const auto registerRange = [](void* block, std::size_t bytes) {
@@ -2516,7 +2517,7 @@ bool deferredSettleTests(const Device& device) {
     const auto* settled = HostImportFor(context, largeAddress, settledBytes);
     Require(settled != nullptr, "(d) the 1 MiB import was refused");
     if (settled->unwatched) {
-        std::cout << "this device compares every Windows import: deferred settles not tested\n";
+        NotTested("this device compares every Windows import: deferred settles not tested");
         unregisterRange(large);
         HostImportFor(context, largeAddress, settledBytes);
         return false;
@@ -2690,13 +2691,13 @@ bool settleWriteOrderTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t unit = 65536;
     if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit || context.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: settle write order not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: settle write order not tested");
         return false;
     }
     std::unique_lock gpu(GpuMutex());
     PrepareImportWatch(context);
     if (!settledImportsWatchPrivate(context)) {
-        std::cout << "this device compares every Windows import: settle write order not tested\n";
+        NotTested("this device compares every Windows import: settle write order not tested");
         return false;
     }
     void* block = AllocateWatched(unit, unit);
@@ -2861,13 +2862,13 @@ bool settleFirstUseTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t unit = 65536;
     if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit || context.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: the first use of a settled import not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: the first use of a settled import not tested");
         return false;
     }
     std::unique_lock gpu(GpuMutex());
     PrepareImportWatch(context);
     if (!settledImportsWatchPrivate(context)) {
-        std::cout << "this device compares every Windows import: the first use of a settled import not tested\n";
+        NotTested("this device compares every Windows import: the first use of a settled import not tested");
         return false;
     }
     Require(!settleFirstUseRaced(context, 4096), "(f) the import returned to the write watch while its earlier main-queue reads were still in flight");
@@ -2881,13 +2882,13 @@ bool settleEarlierImportTests(const Device& device) {
     constexpr std::size_t unit = 65536;
     constexpr int copies = 4096;
     if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit || context.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: an earlier import's first use after a settled import's return not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: an earlier import's first use after a settled import's return not tested");
         return false;
     }
     std::unique_lock gpu(GpuMutex());
     PrepareImportWatch(context);
     if (!settledImportsWatchPrivate(context)) {
-        std::cout << "this device compares every Windows import: an earlier import's first use after a settled import's return not tested\n";
+        NotTested("this device compares every Windows import: an earlier import's first use after a settled import's return not tested");
         return false;
     }
     void* pair = AllocateWatched(2 * unit, unit);
@@ -2948,13 +2949,13 @@ bool settleRetireTests(const Device& device) {
     constexpr std::size_t unit = 65536;
     constexpr int rounds = 64;
     if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit || context.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: imports retired during their settle read not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: imports retired during their settle read not tested");
         return false;
     }
     std::unique_lock gpu(GpuMutex());
     PrepareImportWatch(context);
     if (!settledImportsWatchPrivate(context)) {
-        std::cout << "this device compares every Windows import: imports retired during their settle read not tested\n";
+        NotTested("this device compares every Windows import: imports retired during their settle read not tested");
         return false;
     }
     void* pair = AllocateWatched(2 * unit, unit);
@@ -3021,13 +3022,13 @@ bool settleStorageImageTests(const Device& device) {
     constexpr std::size_t unit = 65536;
     constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
     if (base.hostImportAlignment == 0 || base.hostImportAlignment > unit || base.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "host imports within 64 KiB, a settle queue or write watching unavailable: a settled import under a storage image not tested\n";
+        NotTested("host imports within 64 KiB, a settle queue or write watching unavailable: a settled import under a storage image not tested");
         return false;
     }
     std::unique_lock gpu(GpuMutex());
     PrepareImportWatch(base);
     if (!settledImportsWatchPrivate(base)) {
-        std::cout << "this device compares every Windows import: a settled import under a storage image not tested\n";
+        NotTested("this device compares every Windows import: a settled import under a storage image not tested");
         return false;
     }
     void* block = AllocateWatched(unit, unit);
@@ -3122,14 +3123,14 @@ bool settleInitialDccTests(const Device& device) {
     constexpr std::size_t unit = 65536;
     constexpr std::size_t tail = 0x4000;
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics() || base.hostImportAlignment == 0 || base.hostImportAlignment > tail || base.settleQueue == VK_NULL_HANDLE || !WriteWatched()) {
-        std::cout << "4x color targets, graphics, host imports within 16 KiB, a settle queue or write watching unavailable: an initial multisampled DCC import over a pending settle not tested\n";
+        NotTested("4x color targets, graphics, host imports within 16 KiB, a settle queue or write watching unavailable: an initial multisampled DCC import over a pending settle not tested");
         return false;
     }
     {
         std::lock_guard gpu(GpuMutex());
         PrepareImportWatch(base);
         if (!settledImportsWatchPrivate(base)) {
-            std::cout << "this device compares every Windows import: an initial multisampled DCC import over a pending settle not tested\n";
+            NotTested("this device compares every Windows import: an initial multisampled DCC import over a pending settle not tested");
             return false;
         }
     }
@@ -3195,7 +3196,7 @@ bool settleInitialDccTests(const Device& device) {
         const bool fmaskAlone = kind == Case::PendingFmaskAlone;
         const bool eightSamples = kind == Case::PendingFmask || fmaskAlone;
         if (eightSamples && (!base.storageImageMultisample || (base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_8_BIT) == 0)) {
-            std::cout << "(m) 8x color or multisampled storage images unavailable: an initial FMASK import over a pending settle not tested\n";
+            NotTested("(m) 8x color or multisampled storage images unavailable: an initial FMASK import over a pending settle not tested");
             return;
         }
         const bool partial = kind == Case::PartialBlock || kind == Case::ComparedNeighbour;
@@ -3413,7 +3414,7 @@ bool settleInitialDccTests(const Device& device) {
 void remappedImportTests(const Device& device) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: remapped imports not tested\n";
+        NotTested("host imports unavailable: remapped imports not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -3429,7 +3430,7 @@ void remappedImportTests(const Device& device) {
         mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the remap test block refused: remapped imports not tested\n";
+        NotTested("host import of the remap test block refused: remapped imports not tested");
         return;
     }
     const auto first = HostImportSerial(context, address, bytes, true);
@@ -3651,7 +3652,7 @@ void hostImportRetirementTests(const Device& device) {
 void secondMappingImportTests(const Device& device) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: imports after a second mapping not tested\n";
+        NotTested("host imports unavailable: imports after a second mapping not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -3670,7 +3671,7 @@ void secondMappingImportTests(const Device& device) {
     Require(sceKernelMapDirectMemory(&release.mapping, bytes, 0x33, 0, release.physical, bytes) == 0, "map the second mapping test backing");
     const auto address = reinterpret_cast<std::uint64_t>(release.mapping);
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of singly mapped direct memory refused: imports after a second mapping not tested\n";
+        NotTested("host import of singly mapped direct memory refused: imports after a second mapping not tested");
         return;
     }
     const auto first = HostImportSerial(context, address, bytes, true);
@@ -4016,7 +4017,7 @@ int hostImportCutTests(const Device& device) {
 void movedMetadataTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: moved DCC metadata not tested\n";
+        NotTested("host imports unavailable: moved DCC metadata not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -4051,7 +4052,7 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the moved metadata block refused: moved DCC metadata not tested\n";
+        NotTested("host import of the moved metadata block refused: moved DCC metadata not tested");
         return;
     }
     TextureDetiler detiler(base);
@@ -4113,7 +4114,7 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
 void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: views past the last mip not tested\n";
+        NotTested("host imports unavailable: views past the last mip not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -4144,7 +4145,7 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the past-last-mip block refused: views past the last mip not tested\n";
+        NotTested("host import of the past-last-mip block refused: views past the last mip not tested");
         return;
     }
     TextureDetiler detiler(base);
@@ -4198,7 +4199,7 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: resource read notes not tested\n";
+        NotTested("host imports unavailable: resource read notes not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -4215,7 +4216,7 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the test block refused: resource read notes not tested\n";
+        NotTested("host import of the test block refused: resource read notes not tested");
         return;
     }
     const auto element = address + 4096;
@@ -4471,7 +4472,7 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
 bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: read and written staging not tested\n";
+        NotTested("host imports unavailable: read and written staging not tested");
         return false;
     }
     constexpr std::size_t bytes = 40u << 20u;
@@ -4488,7 +4489,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
         mutation.Add(block, bytes, true, true, true);
     }
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the test block refused: read and written staging not tested\n";
+        NotTested("host import of the test block refused: read and written staging not tested");
         return false;
     }
     const auto boundInPlace = [&](std::uint64_t element, std::size_t elementBytes, bool read) {
@@ -4605,7 +4606,7 @@ bool sparseRunImportTests(const Device& device, bool copied) {
     PrepareImportWatch(context);
     SetHostImportWindow(unit);
     if (HostImportFor(context, address, unit) == nullptr) {
-        std::cout << "host import of the sparse run heap refused: sparse run imports not tested\n";
+        NotTested("host import of the sparse run heap refused: sparse run imports not tested");
         return false;
     }
     Recorder recorder(context);
@@ -4731,12 +4732,12 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     constexpr std::size_t bytes = 65536;
     if (alignment < 8 || alignment > 256) {
-        std::cout << "storage buffer offset alignment " << alignment << ": misaligned draw regions not tested\n";
+        NotTested("storage buffer offset alignment ", alignment, ": misaligned draw regions not tested");
         return;
     }
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: misaligned draw regions not tested\n";
+        NotTested("host imports or write watching unavailable: misaligned draw regions not tested");
         return;
     }
     struct Release {
@@ -4763,7 +4764,7 @@ void misalignedRegionTests(const Device& device, Recorder& recorder) {
     } unregister{context, block};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
-        std::cout << "host import of the watched block refused: misaligned draw regions not tested\n";
+        NotTested("host import of the watched block refused: misaligned draw regions not tested");
         return;
     }
     constexpr std::uint32_t offset = 4096 + 4;
@@ -4818,11 +4819,11 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto alignment = context.limits.minStorageBufferOffsetAlignment;
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: misaligned draw snapshots not tested\n";
+        NotTested("host imports unavailable: misaligned draw snapshots not tested");
         return;
     }
     if (alignment < 8 || alignment > 256) {
-        std::cout << "storage buffer offset alignment " << alignment << ": misaligned draw snapshots not tested\n";
+        NotTested("storage buffer offset alignment ", alignment, ": misaligned draw snapshots not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -4851,7 +4852,7 @@ void misalignedSnapshotTests(const Device& device, Recorder& recorder) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the test block refused: misaligned draw snapshots not tested\n";
+        NotTested("host import of the test block refused: misaligned draw snapshots not tested");
         return;
     }
     constexpr std::uint32_t outer = 4096;
@@ -5003,7 +5004,7 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     auto context = base;
     context.detiler = &detiler;
     if (context.imageTableCapacity < 2u) {
-        std::cout << "image tables unavailable: draw snapshot table sets not tested\n";
+        NotTested("image tables unavailable: draw snapshot table sets not tested");
         return;
     }
     constexpr std::uint32_t width = 4;
@@ -5089,7 +5090,7 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
         ~Clear() { recorder.Sync(); ClearCachedTextures(context.device); }
     } clear{context, recorder};
     if (context.imageTableCapacity < 1u) {
-        std::cout << "image tables unavailable: image table first-layer revalidation not tested\n";
+        NotTested("image tables unavailable: image table first-layer revalidation not tested");
         return;
     }
     constexpr std::uint32_t width = 4;
@@ -5148,7 +5149,7 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: draw snapshot reuse not tested\n";
+        NotTested("host imports or write watching unavailable: draw snapshot reuse not tested");
         return;
     }
     const ReadOnlyImportWatch watch(context);
@@ -5174,11 +5175,11 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: draw snapshot reuse not tested\n";
+        NotTested("host import of the watched block refused: draw snapshot reuse not tested");
         return;
     }
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: draw snapshot reuse not tested\n";
+        NotTested("host imports are compared, not watched: draw snapshot reuse not tested");
         return;
     }
     const auto element = address + 4096;
@@ -5243,7 +5244,7 @@ void drawSnapshotPatchTests(const Device& device) {
     std::unique_lock gpu(GpuMutex());
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: snapshot patching not tested\n";
+        NotTested("host imports or write watching unavailable: snapshot patching not tested");
         return;
     }
     struct Release {
@@ -5269,11 +5270,11 @@ void drawSnapshotPatchTests(const Device& device) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: snapshot patching not tested\n";
+        NotTested("host import of the watched block refused: snapshot patching not tested");
         return;
     }
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: snapshot patching not tested\n";
+        NotTested("host imports are compared, not watched: snapshot patching not tested");
         return;
     }
     constexpr std::size_t elementOffset = 4096;
@@ -5350,7 +5351,7 @@ void drawSnapshotEpochTests(const Device& device) {
     std::unique_lock gpu(GpuMutex());
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports unavailable: draw snapshot reuse within a collect epoch not tested\n";
+        NotTested("host imports unavailable: draw snapshot reuse within a collect epoch not tested");
         return;
     }
     struct Release {
@@ -5376,7 +5377,7 @@ void drawSnapshotEpochTests(const Device& device) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the block refused: draw snapshot reuse within a collect epoch not tested\n";
+        NotTested("host import of the block refused: draw snapshot reuse within a collect epoch not tested");
         return;
     }
     constexpr std::size_t elementOffset = 4096;
@@ -5449,7 +5450,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 3 * 1024 * 1024;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: draw snapshot cap not tested\n";
+        NotTested("host imports or write watching unavailable: draw snapshot cap not tested");
         return;
     }
     struct Release {
@@ -5474,7 +5475,7 @@ void drawSnapshotCapTests(const Device& device, Recorder& recorder) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: draw snapshot cap not tested\n";
+        NotTested("host import of the watched block refused: draw snapshot cap not tested");
         return;
     }
     const auto smallAddress = address + 4096;
@@ -5623,7 +5624,7 @@ void drawSnapshotEvictionTests(const Device& device) {
     constexpr std::size_t bytes = 65536;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "write watching unavailable: draw snapshot eviction not tested\n";
+        NotTested("write watching unavailable: draw snapshot eviction not tested");
         return;
     }
     struct Release {
@@ -5662,7 +5663,7 @@ void paddedVertexSnapshotTests(const Device& device) {
     constexpr std::size_t bytes = 4 * 65536;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "write watching unavailable: padded vertex snapshots not tested\n";
+        NotTested("write watching unavailable: padded vertex snapshots not tested");
         return;
     }
     struct Release {
@@ -5707,7 +5708,7 @@ void containingSnapshotTests(const Device& device) {
     constexpr std::size_t bytes = 131072;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "write watching unavailable: containing draw snapshots not tested\n";
+        NotTested("write watching unavailable: containing draw snapshots not tested");
         return;
     }
     struct Release {
@@ -5768,13 +5769,13 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const auto limit = ShaderResources::DrawUploadLimit();
     if (limit < 256 || limit > 16384) {
-        std::cout << "draw upload limit outside 256..16384 bytes: draw snapshot uploads not tested\n";
+        NotTested("draw upload limit outside 256..16384 bytes: draw snapshot uploads not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: draw snapshot uploads not tested\n";
+        NotTested("host imports or write watching unavailable: draw snapshot uploads not tested");
         return;
     }
     struct Release {
@@ -5799,7 +5800,7 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: draw snapshot uploads not tested\n";
+        NotTested("host import of the watched block refused: draw snapshot uploads not tested");
         return;
     }
     const std::array<std::uint64_t, 3> elements{address + 4096, address + 8192, address + 32768};
@@ -6007,7 +6008,7 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 65536;
     void* block = WriteWatched() ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "write watching unavailable: draw input reuse not tested\n";
+        NotTested("write watching unavailable: draw input reuse not tested");
         return;
     }
     struct Release {
@@ -6082,7 +6083,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
     constexpr std::size_t bytes = 65536;
     void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
     if (block == nullptr) {
-        std::cout << "host imports or write watching unavailable: in-place draw inputs not tested\n";
+        NotTested("host imports or write watching unavailable: in-place draw inputs not tested");
         return;
     }
     const ReadOnlyImportWatch watch(context);
@@ -6107,7 +6108,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
         }
     } unregister{context, block};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the watched block refused: in-place draw inputs not tested\n";
+        NotTested("host import of the watched block refused: in-place draw inputs not tested");
         return;
     }
     context.recorder = &recorder;
@@ -6146,7 +6147,7 @@ void drawInputInPlaceTests(const Device& device, Recorder& recorder, bool copied
     recorder.Sync();
     Require(!recorder.PendingReadOverlaps(vertices, 256), "an in-place draw input's read outlived its batch");
     if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: kept highest indices not tested\n";
+        NotTested("host imports are compared, not watched: kept highest indices not tested");
         return;
     }
     const auto indices = address + 20480;
@@ -6200,7 +6201,7 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
         return true;
     }
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: unit shadows not tested\n";
+        NotTested("host imports unavailable: unit shadows not tested");
         return false;
     }
     constexpr std::uint64_t unit = 65536;
@@ -6234,11 +6235,11 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
     } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr) {
-        std::cout << "host import of the shadow test block refused: unit shadows not tested\n";
+        NotTested("host import of the shadow test block refused: unit shadows not tested");
         return false;
     }
     if (!Watched(address, bytes)) {
-        std::cout << "host imports are compared, not watched: unit shadows not tested\n";
+        NotTested("host imports are compared, not watched: unit shadows not tested");
         return false;
     }
     Require(import->base == address && import->bytes == bytes, "the import does not cover the block");
@@ -6501,7 +6502,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
     } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || !Watched(address, bytes)) {
-        std::cout << "host import of the idle publish test block refused or not watched: idle publish wait not tested\n";
+        NotTested("host import of the idle publish test block refused or not watched: idle publish wait not tested");
         return;
     }
     recorder.Sync();
@@ -6549,7 +6550,7 @@ void idlePublishWaitTests(const Device& device, Recorder& recorder) {
 bool untrackedForgetTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: untracked comparison memo not tested\n";
+        NotTested("host imports unavailable: untracked comparison memo not tested");
         return false;
     }
     constexpr std::uint32_t side = 256;
@@ -6588,11 +6589,11 @@ bool untrackedForgetTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, other};
     if (HostImportFor(base, address, surfaceBytes) == nullptr) {
-        std::cout << "host import of the surface refused: untracked comparison memo not tested\n";
+        NotTested("host import of the surface refused: untracked comparison memo not tested");
         return false;
     }
     if (AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
-        std::cout << "the surface is write-watched: untracked comparison memo not tested\n";
+        NotTested("the surface is write-watched: untracked comparison memo not tested");
         return false;
     }
     const char* mode = std::getenv("APS5_WRITE_WATCH_IMPORTS");
@@ -6641,7 +6642,7 @@ bool untrackedForgetTests(const Device& device, Recorder& recorder) {
 void storageRefreshTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: storage refresh not tested\n";
+        NotTested("host imports unavailable: storage refresh not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -6652,7 +6653,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     if (watched) {
         block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
-            std::cout << "no write watching: storage refresh in watched memory not tested\n";
+            NotTested("no write watching: storage refresh in watched memory not tested");
             return;
         }
     } else {
@@ -6686,7 +6687,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     } unregister{base, block, address};
     const auto* import = HostImportFor(base, address, bytes);
     if (import == nullptr) {
-        std::cout << "host import of the storage refresh block refused: storage refresh not tested\n";
+        NotTested("host import of the storage refresh block refused: storage refresh not tested");
         return;
     }
     if (watched && !AgcDriver::GuestMemory::Watched(address, bytes)) std::cout << "host imports are compared, not watched: storage refresh in watched memory runs as unwatched\n";
@@ -7382,14 +7383,14 @@ bool completionStoreShadowTests(const Device& device, Recorder& recorder) {
 bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: written buffer order not tested\n";
+        NotTested("host imports unavailable: written buffer order not tested");
         return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t bytes = side * side * 4;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: written buffer order not tested\n";
+        NotTested("no write watching: written buffer order not tested");
         return false;
     }
     std::memset(block, 0x55, bytes);
@@ -7411,7 +7412,7 @@ bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the written buffer order block refused: written buffer order not tested\n";
+        NotTested("host import of the written buffer order block refused: written buffer order not tested");
         return false;
     }
     std::cout << "written buffer order: host imports are " << (AgcDriver::GuestMemory::Watched(address, bytes) ? "watched" : "compared") << "\n";
@@ -7479,7 +7480,7 @@ bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
 void hostImportUnmapTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: import unmap lifetime not tested\n";
+        NotTested("host imports unavailable: import unmap lifetime not tested");
         return;
     }
     const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
@@ -7537,7 +7538,7 @@ void hostImportUnmapTests(const Device& device, Recorder& recorder) {
         mutation.Remove(block);
         allocation.registered = false;
         allocation.Release();
-        std::cout << "host import refused: import unmap lifetime not tested\n";
+        NotTested("host import refused: import unmap lifetime not tested");
         return;
     }
     bool retiredBeforeRelease = false;
@@ -7564,7 +7565,7 @@ void hostImportUnmapTests(const Device& device, Recorder& recorder) {
 void parkedImportUnmapTests(const Device& device) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: parked import unmap not tested\n";
+        NotTested("host imports unavailable: parked import unmap not tested");
         return;
     }
     const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
@@ -7603,7 +7604,7 @@ void parkedImportUnmapTests(const Device& device) {
         mutation.Remove(block);
         if (replacement) ClearHostImports(replacement->GetContext().device);
         release();
-        std::cout << "host import refused: parked import unmap not tested\n";
+        NotTested("host import refused: parked import unmap not tested");
         return;
     }
     bool unmapped = false;
@@ -7629,7 +7630,7 @@ void parkedImportUnmapTests(const Device& device) {
 void windowImportUnmapTests(const Device& device) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: window import unmap not tested\n";
+        NotTested("host imports unavailable: window import unmap not tested");
         return;
     }
     const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(65536u, context.hostImportAlignment));
@@ -7665,7 +7666,7 @@ void windowImportUnmapTests(const Device& device) {
         GuestAllocations::Mutation mutation;
         mutation.Remove(block);
         release();
-        std::cout << "host import refused: window import unmap not tested\n";
+        NotTested("host import refused: window import unmap not tested");
         return;
     }
     auto* tail = static_cast<std::byte*>(block) + 2u * window;
@@ -7693,16 +7694,16 @@ void windowImportUnmapTests(const Device& device) {
 #ifndef _WIN32
 bool dmaBufImportProbeTests(const Context& context) {
     if (context.hostImportAlignment == 0 || !AgcDriver::GuestMemory::WriteWatched()) {
-        std::cout << "host imports or write watching unavailable: the dma-buf import probe not tested\n";
+        NotTested("host imports or write watching unavailable: the dma-buf import probe not tested");
         return false;
     }
     if (!context.dmaBufImport) {
-        std::cout << "dma-buf imports unavailable: the dma-buf import probe not tested\n";
+        NotTested("dma-buf imports unavailable: the dma-buf import probe not tested");
         return false;
     }
     const int udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
     if (udmabuf < 0) {
-        std::cout << "/dev/udmabuf is not accessible: the dma-buf import probe not tested\n";
+        NotTested("/dev/udmabuf is not accessible: the dma-buf import probe not tested");
         return false;
     }
     close(udmabuf);
@@ -7721,7 +7722,7 @@ void importWatchTests(const Device& device) {
     Require(PrepareImportWatch(context) == ImportWatch::Unwatch, "Windows host imports stayed watched by default");
     std::cout << "import watch decisions: Windows host imports through views use comparisons\n";
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
-        std::cout << "host imports or write watching unavailable: the Windows import probe not tested\n";
+        NotTested("host imports or write watching unavailable: the Windows import probe not tested");
         return;
     }
     if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) {
@@ -7736,7 +7737,7 @@ void importWatchTests(const Device& device) {
     Require(probe.writtenAfterSettle == 0 || PrepareImportWatch(context) == ImportWatch::Unwatch, "(w) a settled import kept reporting writes and stayed watched");
 #else
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
-        std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
+        NotTested("host imports or write watching unavailable: import watch decisions not tested");
         return;
     }
     const auto probe = ProbeImportWriteProtection(context);
@@ -7833,7 +7834,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
     std::cout << "a range leaving the watch: Linux write watch only\n";
 #else
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: a range leaving the watch not tested\n";
+        NotTested("host imports unavailable: a range leaving the watch not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -7842,7 +7843,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = surfaceBytes + 65536;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: a range leaving the watch not tested\n";
+        NotTested("no write watching: a range leaving the watch not tested");
         return;
     }
     struct Release {
@@ -7906,7 +7907,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
         image->MarkDirty();
         const auto* import = HostImportFor(base, address, bytes);
         if (import == nullptr) {
-            std::cout << "host import of the stale generation block refused: a range leaving the watch not tested\n";
+            NotTested("host import of the stale generation block refused: a range leaving the watch not tested");
             recorder.Sync();
             return;
         }
@@ -7946,7 +7947,7 @@ bool FailPendingCollect(std::uintptr_t, std::size_t, void (*)(void*, std::uintpt
 bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: results pending after a block left the watch not tested\n";
+        NotTested("host imports unavailable: results pending after a block left the watch not tested");
         return false;
     }
     constexpr std::size_t unit = 65536;
@@ -7979,7 +7980,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
         const std::string cause = !large && late ? "its bytes differ from the copy taken at its upload" : write == Write::LateUnwatchedWrite || (large && unwatchedWrite) ? "its bytes no longer match the hash taken when its range left the watch" : unwatchedWrite ? "its bytes differ from the copy taken at its upload" : write == Write::BeforeUnwatch || write == Write::LateBeforeUnwatch ? (large ? "the write watch saw CPU writes to it after its generation, before its range left the watch" : "its bytes differ from the copy taken at its upload") : write == Write::UnwatchedWithoutHook || write == Write::LateWithoutHook ? "no hash of its bytes was taken for its current generation" : write == Write::PendingWithoutHook ? "its results became pending while its range was watched, and its bytes were not saved when the range left the watch" : "its range left the watch through the unwatch hook without its CPU writes proven";
         void* block = AllocateWatched(surfaceBytes, unit);
         if (block == nullptr) {
-            std::cout << "no write watching: results pending after a block left the watch not tested\n";
+            NotTested("no write watching: results pending after a block left the watch not tested");
             return false;
         }
         auto* memory = static_cast<std::uint8_t*>(block);
@@ -8043,7 +8044,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             const bool onPath = AgcDriver::GuestMemory::Watched(address, surfaceBytes) && HostImportFor(context, address, surfaceBytes) != nullptr;
 #ifdef _WIN32
             if (!onPath) {
-                std::cout << "the image's host import left its memory unwatched: results pending after a block left the watch not tested\n";
+                NotTested("the image's host import left its memory unwatched: results pending after a block left the watch not tested");
                 return false;
             }
 #else
@@ -8323,7 +8324,7 @@ struct GateWatchdog {
 
 bool GateUnavailable(const Context& context, const char* what) {
     if (context.hostImportAlignment != 0 && AgcDriver::GuestMemory::WriteWatched()) return false;
-    std::cout << "host imports or write watching unavailable: " << what << " not tested\n";
+    NotTested("host imports or write watching unavailable: ", what, " not tested");
     return true;
 }
 
@@ -8637,7 +8638,7 @@ void SignalUnwatchHook(std::uint64_t address, std::size_t bytes) {
 bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: the unwatch hook's lock order at a map-time import not tested\n";
+        NotTested("host imports unavailable: the unwatch hook's lock order at a map-time import not tested");
         return false;
     }
     constexpr std::uint32_t side = 1024;
@@ -8655,7 +8656,7 @@ bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
     } restore{base, decided};
     void* block = AllocateWatched(surfaceBytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: the unwatch hook's lock order at a map-time import not tested\n";
+        NotTested("no write watching: the unwatch hook's lock order at a map-time import not tested");
         return false;
     }
     std::memset(block, 0x5a, surfaceBytes);
@@ -8749,7 +8750,7 @@ bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
 void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: write-back padding not tested\n";
+        NotTested("host imports unavailable: write-back padding not tested");
         return;
     }
     struct Case {
@@ -8801,7 +8802,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
         if (watched) {
             block = AllocateWatched(bytes, 65536);
             if (block == nullptr) {
-                std::cout << "no write watching: write-back padding in watched memory not tested\n";
+                NotTested("no write watching: write-back padding in watched memory not tested");
                 return;
             }
         } else {
@@ -8836,7 +8837,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             }
         } unregister{base, block, blockAddress, bytes, watched};
         if (HostImportFor(base, blockAddress, bytes) == nullptr) {
-            std::cout << "host import of the write-back padding block refused: write-back padding not tested\n";
+            NotTested("host import of the write-back padding block refused: write-back padding not tested");
             return;
         }
         TextureDetiler detiler(base);
@@ -8919,7 +8920,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
 void splitWriteBackTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0 || 4096 % base.hostImportAlignment != 0) {
-        std::cout << "host imports unavailable: the split write-back not tested\n";
+        NotTested("host imports unavailable: the split write-back not tested");
         return;
     }
     struct Case {
@@ -9078,7 +9079,7 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
 void dccMipWriteBackTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0 || 65536 % base.hostImportAlignment != 0) {
-        std::cout << "host imports unavailable: the DCC mip chain write-back not tested\n";
+        NotTested("host imports unavailable: the DCC mip chain write-back not tested");
         return;
     }
     struct Case {
@@ -9189,7 +9190,7 @@ void dccMipWriteBackTests(const Device& device, Recorder& recorder) {
 void writeBackBlockTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0 || 65536 % base.hostImportAlignment != 0) {
-        std::cout << "host imports unavailable: write-back blocks not tested\n";
+        NotTested("host imports unavailable: write-back blocks not tested");
         return;
     }
     constexpr std::size_t piece = 65536;
@@ -9296,11 +9297,11 @@ void writeBackBlockTests(const Device& device, Recorder& recorder) {
 bool flushWaitMipChainTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "skipped, host imports are unavailable: the flush wait over a DCC mip chain not tested\n";
+        NotTested("skipped, host imports are unavailable: the flush wait over a DCC mip chain not tested");
         return false;
     }
     if (65536 % base.hostImportAlignment != 0) {
-        std::cout << "skipped, the host import alignment " << base.hostImportAlignment << " does not divide 64 KiB: the flush wait over a DCC mip chain not tested\n";
+        NotTested("skipped, the host import alignment ", base.hostImportAlignment, " does not divide 64 KiB: the flush wait over a DCC mip chain not tested");
         return false;
     }
     const std::string what = "flush wait over a DCC mip chain: ";
@@ -9381,7 +9382,7 @@ bool flushWaitMipChainTests(const Device& device, Recorder& recorder) {
 void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0 || !base.singlePassStorage) {
-        std::cout << "host imports or storage access without a format unavailable: single-pass storage moves not tested\n";
+        NotTested("host imports or storage access without a format unavailable: single-pass storage moves not tested");
         return;
     }
     struct Case {
@@ -9445,7 +9446,7 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
 #endif
             }
             if (block == nullptr) {
-                std::cout << "no write watching: single-pass storage moves in watched memory not tested\n";
+                NotTested("no write watching: single-pass storage moves in watched memory not tested");
                 return;
             }
             auto* memory = static_cast<std::uint8_t*>(block);
@@ -9483,7 +9484,7 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
                 }
             } unregister{base, block, address, bytes, watched};
             if (HostImportFor(base, address, bytes) == nullptr) {
-                std::cout << "host import refused: single-pass storage moves not tested\n";
+                NotTested("host import refused: single-pass storage moves not tested");
                 return;
             }
             TextureDetiler detiler(base);
@@ -9774,7 +9775,7 @@ void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool f
 bool refreshProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: refresh proofs not tested\n";
+        NotTested("host imports unavailable: refresh proofs not tested");
         return false;
     }
     constexpr std::uint32_t side = 256;
@@ -9783,7 +9784,7 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = surfaceBytes + 65536;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: refresh proofs not tested\n";
+        NotTested("no write watching: refresh proofs not tested");
         return false;
     }
     auto* texels = static_cast<std::uint8_t*>(block);
@@ -9808,7 +9809,7 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "no watched host import: refresh proofs not tested\n";
+        NotTested("no watched host import: refresh proofs not tested");
         return false;
     }
     TextureDetiler detiler(base);
@@ -9898,18 +9899,18 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
 bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: refreshes over a pending key store not tested\n";
+        NotTested("host imports unavailable: refreshes over a pending key store not tested");
         return false;
     }
     if (!KeyFastPath()) {
-        std::cout << "key fast path off: refreshes over a pending key store not tested\n";
+        NotTested("key fast path off: refreshes over a pending key store not tested");
         return false;
     }
     const auto decided = PrepareImportWatch(base);
 #ifndef _WIN32
     const auto probe = ProbeImportWriteProtection(base);
     if (probe.failure != nullptr || probe.writtenAfterSubmit != 0) {
-        std::cout << "the device reports watched host memory written after a GPU read: refreshes over a pending key store not tested\n";
+        NotTested("the device reports watched host memory written after a GPU read: refreshes over a pending key store not tested");
         return false;
     }
 #endif
@@ -9926,7 +9927,7 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
     constexpr std::uint64_t draws = 16;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: refreshes over a pending key store not tested\n";
+        NotTested("no write watching: refreshes over a pending key store not tested");
         return false;
     }
     struct Release {
@@ -9955,7 +9956,7 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "no watched host import: refreshes over a pending key store not tested\n";
+        NotTested("no watched host import: refreshes over a pending key store not tested");
         return false;
     }
     TextureDetiler detiler(base);
@@ -10081,7 +10082,7 @@ bool repeatedNeighbourStoreTests(const Device& device, Recorder& recorder) {
         }
 #endif
         if (imported && base.hostImportAlignment == 0) {
-            std::cout << "host imports unavailable: repeated neighbour stores over a watched host import not tested\n";
+            NotTested("host imports unavailable: repeated neighbour stores over a watched host import not tested");
             continue;
         }
         const auto decided = PrepareImportWatch(base);
@@ -10094,7 +10095,7 @@ bool repeatedNeighbourStoreTests(const Device& device, Recorder& recorder) {
         const std::string what = imported ? "over a watched host import" : "over watched memory";
         void* block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
-            std::cout << "no write watching: repeated neighbour stores " << what << " not tested\n";
+            NotTested("no write watching: repeated neighbour stores ", what, " not tested");
             continue;
         }
         auto* memory = static_cast<std::uint8_t*>(block);
@@ -10192,7 +10193,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
         }
 #endif
         if (imported && base.hostImportAlignment == 0) {
-            std::cout << "host imports unavailable: unchanged CPU stamps over a watched host import not tested\n";
+            NotTested("host imports unavailable: unchanged CPU stamps over a watched host import not tested");
             continue;
         }
         const auto decided = PrepareImportWatch(base);
@@ -10206,7 +10207,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
             const std::string what = std::string(changed ? "a CPU store that changed a byte" : "a CPU store that left the bytes as they were") + (imported ? " over a watched host import" : " over watched memory");
             void* block = AllocateWatched(bytes, 65536);
             if (block == nullptr) {
-                std::cout << "no write watching: unchanged CPU stamps not tested\n";
+                NotTested("no write watching: unchanged CPU stamps not tested");
                 return;
             }
             auto* memory = static_cast<std::uint8_t*>(block);
@@ -10299,7 +10300,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
 
 bool rewrittenBlockTests(const Device& device, Recorder& recorder) {
     if (!AgcDriver::GuestMemory::WriteWatched()) {
-        std::cout << "no write watching: rewritten blocks not tested\n";
+        NotTested("no write watching: rewritten blocks not tested");
         return false;
     }
     const auto& base = device.GetContext();
@@ -10543,7 +10544,7 @@ bool idleWriteBackRaceTests(const Device& device, Recorder& recorder, bool direc
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
     const std::string what = direct ? "GPU-mapped direct memory" : "watched memory";
     if (direct && base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: idle store of a dead 3D image over memory the CPU refilled in " << what << " not tested\n";
+        NotTested("host imports unavailable: idle store of a dead 3D image over memory the CPU refilled in ", what, " not tested");
         return false;
     }
     struct Backing {
@@ -10603,16 +10604,16 @@ bool idleWriteBackRaceTests(const Device& device, Recorder& recorder, bool direc
     resource.dstSelW = 7;
     Require(DescribeSurface(resource).guestBytes == surfaceBytes, "(v) unexpected surface size");
     if (direct && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
-        std::cout << "GPU-mapped direct memory is not write-watched here: idle store of a dead 3D image over memory the CPU refilled in " << what << " not tested\n";
+        NotTested("GPU-mapped direct memory is not write-watched here: idle store of a dead 3D image over memory the CPU refilled in ", what, " not tested");
         return false;
     }
     Require(AgcDriver::GuestMemory::Watched(address, surfaceBytes), "(v) " + what + " is not watched");
     if (direct && HostImportFor(context, address, surfaceBytes) == nullptr) {
-        std::cout << "host import of the direct memory refused: idle store of a dead 3D image over memory the CPU refilled in " << what << " not tested\n";
+        NotTested("host import of the direct memory refused: idle store of a dead 3D image over memory the CPU refilled in ", what, " not tested");
         return false;
     }
     if (direct && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
-        std::cout << "the host import of the direct memory took it out of the write watch (its imports are compared): idle store of a dead 3D image over memory the CPU refilled in " << what << " not tested\n";
+        NotTested("the host import of the direct memory took it out of the write watch (its imports are compared): idle store of a dead 3D image over memory the CPU refilled in ", what, " not tested");
         return false;
     }
     Require(direct || HostImportFor(context, address, surfaceBytes) == nullptr, "(v) watched memory was imported although host imports are off for it");
@@ -10689,7 +10690,7 @@ bool keptUnitSettleTests(const Device& device, Recorder& recorder, bool direct) 
     constexpr std::array<std::uint8_t, 4> blue{0, 0, 255, 255};
     const std::string what = direct ? "GPU-mapped direct memory" : "watched memory";
     if (direct && base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: units stored next to a unit kept for the CPU in " << what << " not tested\n";
+        NotTested("host imports unavailable: units stored next to a unit kept for the CPU in ", what, " not tested");
         return false;
     }
     struct Backing {
@@ -10748,16 +10749,16 @@ bool keptUnitSettleTests(const Device& device, Recorder& recorder, bool direct) 
     resource.dstSelW = 7;
     Require(DescribeSurface(resource).guestBytes == surfaceBytes, "(k) unexpected surface size");
     if (direct && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
-        std::cout << "GPU-mapped direct memory is not write-watched here: units stored next to a unit kept for the CPU in " << what << " not tested\n";
+        NotTested("GPU-mapped direct memory is not write-watched here: units stored next to a unit kept for the CPU in ", what, " not tested");
         return false;
     }
     Require(AgcDriver::GuestMemory::Watched(address, surfaceBytes), "(k) " + what + " is not watched");
     if (direct && HostImportFor(context, address, surfaceBytes) == nullptr) {
-        std::cout << "host import of the direct memory refused: units stored next to a unit kept for the CPU in " << what << " not tested\n";
+        NotTested("host import of the direct memory refused: units stored next to a unit kept for the CPU in ", what, " not tested");
         return false;
     }
     if (direct && !AgcDriver::GuestMemory::Watched(address, surfaceBytes)) {
-        std::cout << "the host import of the direct memory took it out of the write watch (its imports are compared): units stored next to a unit kept for the CPU in " << what << " not tested\n";
+        NotTested("the host import of the direct memory took it out of the write watch (its imports are compared): units stored next to a unit kept for the CPU in ", what, " not tested");
         return false;
     }
     Require(direct || HostImportFor(context, address, surfaceBytes) == nullptr, "(k) watched memory was imported although host imports are off for it");
@@ -10813,7 +10814,7 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
     return;
 #endif
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: generation baseline over a pending store not tested\n";
+        NotTested("host imports unavailable: generation baseline over a pending store not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -10829,7 +10830,7 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
     for (const bool pending : {false, true}) {
         void* block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
-            std::cout << "no write watching: generation baseline over a pending store not tested\n";
+            NotTested("no write watching: generation baseline over a pending store not tested");
             return;
         }
         std::memset(block, 0x5a, bytes);
@@ -10892,11 +10893,11 @@ bool importWindowTests(const Device& device, Recorder& recorder) {
 #ifdef _WIN32
     static_cast<void>(recorder);
     static_cast<void>(base);
-    std::cout << "the import window: Linux write watch only, not tested\n";
+    NotTested("the import window: Linux write watch only, not tested");
     return false;
 #else
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: the import window not tested\n";
+        NotTested("host imports unavailable: the import window not tested");
         return false;
     }
     constexpr std::uint32_t side = 256;
@@ -10905,7 +10906,7 @@ bool importWindowTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = surfaceBytes + 65536;
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: the import window not tested\n";
+        NotTested("no write watching: the import window not tested");
         return false;
     }
     struct Release {
@@ -10915,7 +10916,7 @@ bool importWindowTests(const Device& device, Recorder& recorder) {
     Require(ProbeImportWriteProtection(base).failure == nullptr, "(w) the import probe failed");
     const auto decided = PrepareImportWatch(base);
     if (decided == ImportWatch::Unwatch) {
-        std::cout << "host imports are compared, not watched: the import window not tested\n";
+        NotTested("host imports are compared, not watched: the import window not tested");
         return false;
     }
     SetImportWatch(base, ImportWatch::Watch);
@@ -10975,7 +10976,7 @@ bool importWindowTests(const Device& device, Recorder& recorder) {
         image->MarkDirty();
         const auto* import = HostImportFor(base, address, bytes);
         if (import == nullptr) {
-            std::cout << "host import of the import window block refused: the import window not tested\n";
+            NotTested("host import of the import window block refused: the import window not tested");
             recorder.Sync();
             return false;
         }
@@ -11389,7 +11390,7 @@ void inPassSampleDumpTests(Recorder& recorder, const Context& context, const Cov
 bool pendingKeyStoreTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: pending key stores not tested\n";
+        NotTested("host imports unavailable: pending key stores not tested");
         return false;
     }
     constexpr std::size_t surfaceBytes = 65536;
@@ -11420,7 +11421,7 @@ bool pendingKeyStoreTests(const Device& device, Recorder& recorder) {
         }
     } unregister{context, block, address};
     if (HostImportFor(context, address, bytes) == nullptr) {
-        std::cout << "host import of the pending key store block refused: pending key stores not tested\n";
+        NotTested("host import of the pending key store block refused: pending key stores not tested");
         return false;
     }
     recorder.Sync();
@@ -11487,7 +11488,7 @@ bool shadowedKeyStoreTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
     if (!UnitShadowEnabled() || context.hostImportAlignment == 0) {
-        std::cout << "unit shadows or host imports unavailable: keys under a unit shadow not tested\n";
+        NotTested("unit shadows or host imports unavailable: keys under a unit shadow not tested");
         return false;
     }
     constexpr std::uint64_t unit = 65536;
@@ -11530,7 +11531,7 @@ bool shadowedKeyStoreTests(const Device& device, Recorder& recorder) {
     } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || !Watched(address, bytes)) {
-        std::cout << "the shadowed key block is not imported and watched: keys under a unit shadow not tested\n";
+        NotTested("the shadowed key block is not imported and watched: keys under a unit shadow not tested");
         return false;
     }
     recorder.Sync();
@@ -11587,7 +11588,7 @@ bool shadowedKeyStoreTests(const Device& device, Recorder& recorder) {
 void sampleDumpTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress) {
-        std::cout << "host imports or buffer device addresses unavailable: occlusion counter dumps on the GPU not tested\n";
+        NotTested("host imports or buffer device addresses unavailable: occlusion counter dumps on the GPU not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -11619,7 +11620,7 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     } unregister{context, block, address};
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) {
-        std::cout << "host import of the occlusion counter block refused: occlusion counter dumps on the GPU not tested\n";
+        NotTested("host import of the occlusion counter block refused: occlusion counter dumps on the GPU not tested");
         return;
     }
     const auto target = import->address + (address - import->base);
@@ -11647,7 +11648,7 @@ void sampleDumpTests(const Device& device, Recorder& recorder) {
     Require(recorder.QueuesSampleDumps(), "occlusion dumps are recorded at once, not queued with the batch's stores");
     queuedSampleDumpTests(recorder, *import, words, address, target);
     if (!device.Graphics()) {
-        std::cout << "the test queue has no graphics: occlusion dumps inside a render pass not tested\n";
+        NotTested("the test queue has no graphics: occlusion dumps inside a render pass not tested");
         return;
     }
     CoverPass cover(context);
@@ -11751,7 +11752,7 @@ void cmaskPassTests(const Device& device, Recorder& recorder) {
 void metadataPassTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: resident metadata passes not tested\n";
+        NotTested("host imports unavailable: resident metadata passes not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -11785,7 +11786,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the metadata pass block refused: resident metadata passes not tested\n";
+        NotTested("host import of the metadata pass block refused: resident metadata passes not tested");
         return;
     }
     TextureDetiler detiler(base);
@@ -11934,7 +11935,7 @@ void imageMemoTests(const Device& device, Recorder& recorder) {
     TextureCache textureCache(context);
     context.textureCache = &textureCache;
     if (!device.NullDescriptors()) {
-        std::cout << "nullDescriptor unavailable: image memo not tested\n";
+        NotTested("nullDescriptor unavailable: image memo not tested");
         return;
     }
     context.nullDescriptors = true;
@@ -12061,7 +12062,7 @@ void dataRefreshTests(const Device& device, Recorder& recorder) {
 void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.NullDescriptors()) {
-        std::cout << "4x color targets or nullDescriptor unavailable: multisampled target guest access not tested\n";
+        NotTested("4x color targets or nullDescriptor unavailable: multisampled target guest access not tested");
         return;
     }
     constexpr std::uint32_t side = 64;
@@ -12369,7 +12370,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
 void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.NullDescriptors()) {
-        std::cout << "4x color targets or nullDescriptor unavailable: repeated storage surface guard not tested\n";
+        NotTested("4x color targets or nullDescriptor unavailable: repeated storage surface guard not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -12472,7 +12473,7 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
 void oneFragmentFmaskGuardTests(const Device& device) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
-        std::cout << "nullDescriptor unavailable: one-fragment FMASK guard not tested\n";
+        NotTested("nullDescriptor unavailable: one-fragment FMASK guard not tested");
         return;
     }
     constexpr std::uint32_t side = 64;
@@ -12572,7 +12573,7 @@ void oneFragmentFmaskGuardTests(const Device& device) {
 void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if ((base.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || base.hostImportAlignment == 0) {
-        std::cout << "4x color targets or host imports unavailable: FMASK decompress not tested\n";
+        NotTested("4x color targets or host imports unavailable: FMASK decompress not tested");
         return;
     }
     constexpr std::uint32_t side = 128;
@@ -12673,7 +12674,7 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
     namespace GuestMemory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
     if ((context.limits.framebufferColorSampleCounts & VK_SAMPLE_COUNT_4_BIT) == 0 || !device.Graphics()) {
-        std::cout << "4x color targets or graphics unavailable: CB resolves into tiled targets not tested\n";
+        NotTested("4x color targets or graphics unavailable: CB resolves into tiled targets not tested");
         return;
     }
     context.hostImportAlignment = 0;
@@ -12769,7 +12770,7 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
 void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
-        std::cout << "nullDescriptor unavailable: depth surface fast proof not tested\n";
+        NotTested("nullDescriptor unavailable: depth surface fast proof not tested");
         return;
     }
     constexpr std::uint32_t side = 64;
@@ -12970,7 +12971,7 @@ void expectRed(float got, float want, const char* what) {
 bool minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
-        std::cout << "VK_EXT_image_view_min_lod unavailable: minimum LOD clamp not tested\n";
+        NotTested("VK_EXT_image_view_min_lod unavailable: minimum LOD clamp not tested");
         return false;
     }
     TextureDetiler detiler(context);
@@ -13302,7 +13303,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
         const auto limit = std::min<std::uint32_t>(context.limits.maxImageArrayLayers, 2048u);
         const auto layers = limit + 1u + (limit & 1u);
         if (!device.NullDescriptors() || layers > context.limits.maxImageDimension2D / 2u) {
-            std::cout << "nullDescriptor unavailable, or a 1D array past maxImageArrayLayers needs more than maxImageDimension2D rows: a dropped snapshot laid out as rows of a 2D image not tested\n";
+            NotTested("nullDescriptor unavailable, or a 1D array past maxImageArrayLayers needs more than maxImageDimension2D rows: a dropped snapshot laid out as rows of a 2D image not tested");
         } else {
             const auto rowsWords = [&](std::uint64_t address) {
                 auto words = linearTextureWords(address, 8, 1, 56);
@@ -13349,7 +13350,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
         }
     }
     if (!context.textureCompressionBC) {
-        std::cout << "BC compressed textures unavailable: dropped snapshots beside a spare snapshot vector not tested\n";
+        NotTested("BC compressed textures unavailable: dropped snapshots beside a spare snapshot vector not tested");
         return true;
     }
     constexpr std::size_t bigBytes = std::size_t{512} * 512 * 4;
@@ -13582,7 +13583,7 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
         const std::string what = tileMode == TextureTileMode::kLinear ? "a linear two-slice image" : "a tiled two-slice image";
         void* block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
-            std::cout << "no write watching: slice dirty marking not tested\n";
+            NotTested("no write watching: slice dirty marking not tested");
             return;
         }
         auto* memory = static_cast<std::uint8_t*>(block);
@@ -14422,7 +14423,7 @@ void descriptorPoolTests(const Device& device) {
 void keysFillTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: DCC key fills not tested\n";
+        NotTested("host imports unavailable: DCC key fills not tested");
         return;
     }
     constexpr std::uint32_t side = 256;
@@ -14458,7 +14459,7 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the key fill block refused: DCC key fills not tested\n";
+        NotTested("host import of the key fill block refused: DCC key fills not tested");
         return;
     }
     TextureDetiler detiler(base);
@@ -14554,7 +14555,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     const auto& base = device.GetContext();
     const std::string what = watched ? "clear-key hand-over (watched)" : "clear-key hand-over";
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: " << what << " not tested\n";
+        NotTested("host imports unavailable: ", what, " not tested");
         return false;
     }
     constexpr std::size_t surfaceA = 256 * 256 * 4;
@@ -14565,7 +14566,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     const auto decided = PrepareImportWatch(base);
 #ifndef _WIN32
     if (watched && decided == ImportWatch::Unwatch) {
-        std::cout << "host imports are compared on this device: " << what << " not tested\n";
+        NotTested("host imports are compared on this device: ", what, " not tested");
         return false;
     }
 #endif
@@ -14573,7 +14574,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     if (watched) {
         block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
-            std::cout << "no write watching: " << what << " not tested\n";
+            NotTested("no write watching: ", what, " not tested");
             return false;
         }
     } else {
@@ -14612,11 +14613,11 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         }
     } unregister{base, block, address, watched};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the clear-key hand-over block refused: " << what << " not tested\n";
+        NotTested("host import of the clear-key hand-over block refused: ", what, " not tested");
         return false;
     }
     if (watched && !AgcDriver::GuestMemory::Watched(address, bytes)) {
-        std::cout << "the imported block left the write watch: " << what << " not tested\n";
+        NotTested("the imported block left the write watch: ", what, " not tested");
         return false;
     }
     TextureDetiler detiler(base);
@@ -14832,7 +14833,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
 bool denormalClearTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
-        std::cout << "host imports unavailable: denormal fill clears not tested\n";
+        NotTested("host imports unavailable: denormal fill clears not tested");
         return false;
     }
     constexpr std::uint32_t side = 64;
@@ -14862,7 +14863,7 @@ bool denormalClearTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address};
     if (HostImportFor(base, address, bytes) == nullptr) {
-        std::cout << "host import of the denormal clear block refused: denormal fill clears not tested\n";
+        NotTested("host import of the denormal clear block refused: denormal fill clears not tested");
         return false;
     }
     TextureDetiler detiler(base);

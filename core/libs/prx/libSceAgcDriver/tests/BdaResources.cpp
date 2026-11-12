@@ -1,4 +1,5 @@
 #include "BdaTests.hpp"
+#include "NotTested.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -2897,7 +2898,7 @@ void partialHeapImportBudgetTests(const Context& context, const BdaTestAccess& a
 
 void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: heap mirrors of imported ranges not tested\n";
+        NotTested("guest arena unavailable or not write-watched: heap mirrors of imported ranges not tested");
         return;
     }
     constexpr std::size_t bytes = 1u << 20u;
@@ -2953,7 +2954,7 @@ void importedHeapMirrorTests(const Context& context, const BdaTestAccess& access
 void retiredImportWatchTests(const Context& context) {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: the write watch of retired imports not tested\n";
+        NotTested("guest arena unavailable or not write-watched: the write watch of retired imports not tested");
         return;
     }
     constexpr std::size_t piece = 65536;
@@ -3011,7 +3012,7 @@ void retiredImportWatchTests(const Context& context) {
 void importedFreshTests(const Context& context) {
 #ifndef _WIN32
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: imported never-collected pages not tested\n";
+        NotTested("write watch unavailable: imported never-collected pages not tested");
         return;
     }
     constexpr std::size_t blockBytes = 65536;
@@ -3030,7 +3031,7 @@ void importedFreshTests(const Context& context) {
     };
     registry(true);
     if (HostImportFor(importing, base, blockBytes) == nullptr) {
-        std::cout << "the never-collected block was not imported: imported never-collected pages not tested\n";
+        NotTested("the never-collected block was not imported: imported never-collected pages not tested");
     } else {
         const auto gpuWrite = AgcDriver::GuestMemory::MarkWritten(base, 4);
         Require(gpuWrite != 0, "a GPU write into an imported never-collected block was not stamped");
@@ -3050,7 +3051,7 @@ void importedFreshTests(const Context& context) {
 void importWatchTests() {
 #ifndef _WIN32
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: import watch not tested\n";
+        NotTested("write watch unavailable: import watch not tested");
         return;
     }
     constexpr std::size_t bytes = 4 * 65536;
@@ -3128,7 +3129,7 @@ void importWatchTests() {
 void sparseImportedHeapTests(const Context& context, const BdaTestAccess& access) {
 #ifndef _WIN32
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: sparse imported heaps not tested\n";
+        NotTested("write watch unavailable: sparse imported heaps not tested");
         return;
     }
     constexpr std::size_t bytes = 65536;
@@ -3216,7 +3217,7 @@ void sparseImportedHeapTests(const Context& context, const BdaTestAccess& access
 
 void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: heap mirrors not tested\n";
+        NotTested("guest arena unavailable or not write-watched: heap mirrors not tested");
         return;
     }
     constexpr std::size_t bytes = 2 * 65536;
@@ -3758,12 +3759,12 @@ void RunHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess& acce
     constexpr std::size_t busyBytes = block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: heap mirrors leaving the write watch not tested\n";
+        NotTested("guest arena unavailable or not write-watched: heap mirrors leaving the write watch not tested");
         return;
     }
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: heap mirrors leaving the write watch not tested\n";
+        NotTested("write watch unavailable: heap mirrors leaving the write watch not tested");
         return;
     }
 #endif
@@ -3890,7 +3891,7 @@ void RunSparseHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess
     constexpr std::size_t committed = 32 * block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: sparse heap mirrors leaving the write watch not tested\n";
+        NotTested("guest arena unavailable or not write-watched: sparse heap mirrors leaving the write watch not tested");
         return;
     }
     auto* guest = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(reserved, block));
@@ -3898,7 +3899,7 @@ void RunSparseHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess
     GuestArena::GuestArenaCommit_nid_postfix(guest, committed, PAGE_READWRITE, block);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: sparse heap mirrors leaving the write watch not tested\n";
+        NotTested("write watch unavailable: sparse heap mirrors leaving the write watch not tested");
         return;
     }
     auto* guest = reserveSparse(reserved, committed);
@@ -3960,7 +3961,7 @@ void RunSparseHeapMirrorBudgetTests(const Context& context, const BdaTestAccess&
     constexpr std::size_t committed = 80 * block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: sparse heaps past the heap mirror budget not tested\n";
+        NotTested("guest arena unavailable or not write-watched: sparse heaps past the heap mirror budget not tested");
         return;
     }
     auto* guest = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(reserved, block));
@@ -3968,7 +3969,7 @@ void RunSparseHeapMirrorBudgetTests(const Context& context, const BdaTestAccess&
     GuestArena::GuestArenaCommit_nid_postfix(guest, committed, PAGE_READWRITE, block);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: sparse heaps past the heap mirror budget not tested\n";
+        NotTested("write watch unavailable: sparse heaps past the heap mirror budget not tested");
         return;
     }
     auto* guest = reserveSparse(reserved, committed);
@@ -4016,7 +4017,7 @@ void RunHeapMirrorReferenceSizeTests(const Context& context, const BdaTestAccess
     constexpr std::size_t heapBytes = 4 * block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: heap mirror reference sizes not tested\n";
+        NotTested("guest arena unavailable or not write-watched: heap mirror reference sizes not tested");
         return;
     }
     auto* guest = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(heapBytes, block));
@@ -4024,7 +4025,7 @@ void RunHeapMirrorReferenceSizeTests(const Context& context, const BdaTestAccess
     GuestArena::GuestArenaCommit_nid_postfix(guest, heapBytes, PAGE_READWRITE, heapBytes);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: heap mirror reference sizes not tested\n";
+        NotTested("write watch unavailable: heap mirror reference sizes not tested");
         return;
     }
     void* mapping = mmap(nullptr, heapBytes + block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -4078,7 +4079,7 @@ void RunHeapMirrorRunUnwatchTests(const Context& context, const BdaTestAccess& a
     constexpr std::size_t allocated = 2 * heapBytes + block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: a heap run leaving the write watch not tested\n";
+        NotTested("guest arena unavailable or not write-watched: a heap run leaving the write watch not tested");
         return;
     }
     auto* guest = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(allocated, block));
@@ -4086,7 +4087,7 @@ void RunHeapMirrorRunUnwatchTests(const Context& context, const BdaTestAccess& a
     GuestArena::GuestArenaCommit_nid_postfix(guest, allocated, PAGE_READWRITE, allocated);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: a heap run leaving the write watch not tested\n";
+        NotTested("write watch unavailable: a heap run leaving the write watch not tested");
         return;
     }
     void* mapping = mmap(nullptr, allocated + block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -4154,12 +4155,12 @@ void RunAddressCopyCapTests(const Context& context, const BdaTestAccess& access,
     constexpr std::size_t busyBytes = block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: the address copy cap not tested\n";
+        NotTested("guest arena unavailable or not write-watched: the address copy cap not tested");
         return;
     }
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: the address copy cap not tested\n";
+        NotTested("write watch unavailable: the address copy cap not tested");
         return;
     }
 #endif
@@ -4285,12 +4286,12 @@ void RunAddressCopyCapMirrorTests(const Context& context, const BdaTestAccess& a
     constexpr std::size_t mirroredBytes = 16 * block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: imports yielding to the address copy cap not tested\n";
+        NotTested("guest arena unavailable or not write-watched: imports yielding to the address copy cap not tested");
         return;
     }
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: imports yielding to the address copy cap not tested\n";
+        NotTested("write watch unavailable: imports yielding to the address copy cap not tested");
         return;
     }
 #endif
@@ -4383,12 +4384,12 @@ void RunUnwatchedMirrorImportTests(const Context& context, const BdaTestAccess& 
     constexpr std::size_t rangeBytes = 16 * block;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: imports of heaps whose mirror left the write watch not tested\n";
+        NotTested("guest arena unavailable or not write-watched: imports of heaps whose mirror left the write watch not tested");
         return;
     }
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: imports of heaps whose mirror left the write watch not tested\n";
+        NotTested("write watch unavailable: imports of heaps whose mirror left the write watch not tested");
         return;
     }
 #endif
@@ -4488,7 +4489,7 @@ void sparseJoinedHeapMirrorTests(const Context& context, const BdaTestAccess& ac
     constexpr std::size_t page = 65536;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: sparse heap mirrors over adjacent ranges not tested\n";
+        NotTested("guest arena unavailable or not write-watched: sparse heap mirrors over adjacent ranges not tested");
         return;
     }
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(reserved, page);
@@ -4497,7 +4498,7 @@ void sparseJoinedHeapMirrorTests(const Context& context, const BdaTestAccess& ac
     GuestArena::GuestArenaCommit_nid_postfix(guest + half, page, PAGE_READWRITE, page);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: sparse heap mirrors over adjacent ranges not tested\n";
+        NotTested("write watch unavailable: sparse heap mirrors over adjacent ranges not tested");
         return;
     }
     void* mapping = mmap(nullptr, reserved + page, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -4570,7 +4571,7 @@ void joinedHeapMirrorPartialImportTests(const Context& context, const BdaTestAcc
     constexpr std::size_t page = 65536;
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: joined heap mirrors under a partial import not tested\n";
+        NotTested("guest arena unavailable or not write-watched: joined heap mirrors under a partial import not tested");
         return;
     }
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(reserved, half);
@@ -4578,7 +4579,7 @@ void joinedHeapMirrorPartialImportTests(const Context& context, const BdaTestAcc
     GuestArena::GuestArenaCommit_nid_postfix(guest, committed, PAGE_READWRITE, page);
 #else
     if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
-        std::cout << "write watch unavailable: joined heap mirrors under a partial import not tested\n";
+        NotTested("write watch unavailable: joined heap mirrors under a partial import not tested");
         return;
     }
     void* mapping = mmap(nullptr, reserved + half, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -4679,7 +4680,7 @@ void joinedHeapMirrorPartialImportTests(const Context& context, const BdaTestAcc
 void sparseHeapMirrorTests(const Context& context, const BdaTestAccess& access) {
 #ifdef _WIN32
     if (!GuestArena::GuestArenaAvailable_nid_postfix() || !GuestArena::GuestArenaWriteWatched_nid_postfix()) {
-        std::cout << "guest arena unavailable or not write-watched: sparse heap mirrors not tested\n";
+        NotTested("guest arena unavailable or not write-watched: sparse heap mirrors not tested");
         return;
     }
     constexpr std::size_t reserved = 64u << 20u;
