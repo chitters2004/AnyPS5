@@ -1220,6 +1220,31 @@ void targetMissDraws(AgcDriver::VulkanDevice& device) {
     Require(!CommitPhasesEnabled() || !memoRepeats() || memoEvent(CommitCounter::TargetMemoDepthFallback) == fallbacks, "a depth-only draw that repeats its depth target fell back to its depth lookup");
 }
 
+void memoBench(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    const auto depth = depthTarget(true);
+    for (const bool withDepth : {false, true}) {
+        DrawOptions options{.prepareOnly = true};
+        if (withDepth) {
+            options.depth = depth;
+            options.compare = VK_COMPARE_OP_ALWAYS;
+        }
+        arm(device, color, options);
+        constexpr int Draws = 20000;
+        const auto before = ReadCommitPhases();
+        const auto start = std::chrono::steady_clock::now();
+        for (int draw = 0; draw < Draws; ++draw) ::draw(device, color, options);
+        const auto wall = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Draws;
+        const auto delta = ReadCommitPhases() - before;
+        std::printf("memo bench %s: %d draws, wall %.0f ns/draw, misses %llu\n", withDepth ? "colour+depth" : "colour", Draws, wall, static_cast<unsigned long long>(delta.counters[static_cast<std::size_t>(CommitCounter::TargetMemoInvalid)]));
+        for (std::size_t phase = 0; phase < delta.ns.size(); ++phase) {
+            if (delta.ns[phase] == 0) continue;
+            std::printf("  %-28s %8.1f ns/draw\n", CommitPhaseName(static_cast<CommitPhase>(phase)), static_cast<double>(delta.ns[phase]) / Draws);
+        }
+    }
+}
+
 void unchangedMemo(AgcDriver::VulkanDevice& device) {
     descriptorIdentity();
     const auto color = colorTarget();
@@ -1250,7 +1275,7 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 14> R3Scenarios{{
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15> R3Scenarios{{
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
     {"resident-dcc", residentDccClear},
@@ -1264,7 +1289,8 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 14>
     {"proof", colorMemoProofBreak},
     {"metadata", colorMetadataDepthAlias},
     {"eviction", colorMemoResidentEviction},
-    {"target-miss", targetMissDraws}
+    {"target-miss", targetMissDraws},
+    {"bench", memoBench}
 }};
 
 const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 31> Scenarios{{
