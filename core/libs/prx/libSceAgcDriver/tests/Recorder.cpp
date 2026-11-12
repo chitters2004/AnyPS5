@@ -636,6 +636,19 @@ public:
                 robustness.pNext = address.pNext;
                 address.pNext = &robustness;
             }
+            VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timelineFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            if (hasExtension(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &timelineFeatures};
+                function<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(context.physical, &features);
+                timelines = timelineFeatures.timelineSemaphore == VK_TRUE;
+            }
+            timelineFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR};
+            timelineFeatures.timelineSemaphore = VK_TRUE;
+            if (timelines) {
+                extensionsEnabled.push_back(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+                timelineFeatures.pNext = address.pNext;
+                address.pNext = &timelineFeatures;
+            }
             VkPhysicalDevicePortabilitySubsetFeaturesKHR portabilityFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PORTABILITY_SUBSET_FEATURES_KHR};
             if (hasExtension(VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME)) {
                 VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &portabilityFeatures};
@@ -686,6 +699,7 @@ public:
 
     ~Device() { release(); }
     bool NullDescriptors() const { return nullDescriptors; }
+    bool Timelines() const { return timelines; }
     const Context& GetContext() const { return context; }
     DeviceFunctions* UseFunctionTable() {
         FillDeviceFunctions(context, functions);
@@ -751,6 +765,7 @@ private:
     bool graphics = false;
     std::mutex settleMutex;
     bool nullDescriptors = false;
+    bool timelines = false;
     DeviceFunctions functions{};
     bool memoryBudget = false;
 };
@@ -1828,6 +1843,69 @@ void completionWaitTests(const Device& device, Recorder& recorder) {
     recorder.AfterCompletions(base + 4u, cpuValue, 8, 0, false);
     CompletePendingCpuWrites(device.GetContext(), base, sizeof(memory));
     Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: a reader of a label stored behind a completion did not wait for that store");
+}
+
+void latchedWaitTests(const Device& device) {
+    if (!device.Timelines()) {
+        std::cout << "timeline semaphores unavailable: latched wait tests not run\n";
+        return;
+    }
+    const auto& context = device.GetContext();
+    const auto waitFor = [](const std::function<void()>& wait, std::chrono::milliseconds before, const std::function<void()>& release) {
+        std::atomic<bool> done{false};
+        std::string message;
+        std::thread waiter([&] {
+            try {
+                wait();
+            } catch (const std::exception& error) {
+                message = error.what();
+            }
+            done.store(true, std::memory_order_release);
+        });
+        std::this_thread::sleep_for(before);
+        const bool early = done.load(std::memory_order_acquire);
+        release();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (!done.load(std::memory_order_acquire)) {
+            std::cerr << "a waiter on a batch that will never be submitted was not woken by the latch\n";
+            std::_Exit(1);
+        }
+        waiter.join();
+        return std::pair{early, message};
+    };
+    {
+        Recorder recorder(context, true);
+        std::unique_lock gpu(GpuMutex());
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        recorder.Submit();
+        const auto submitted = recorder.Submissions();
+        gpu.unlock();
+        recorder.WaitSerial(submitted);
+        const auto [early, message] = waitFor([&] { recorder.WaitSerial(submitted + 3); }, std::chrono::milliseconds(50), [&] { recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss"))); });
+        Require(!early, "a wait for a batch that was never submitted returned before the latch");
+        Require(message == "injected device loss", "a waiter woken by the latch did not get the latched error ('" + message + "')");
+        recorder.WaitSerial(submitted);
+        Require(recorder.WaitSerialFor(submitted, 1'000'000'000ull), "a completed batch's wait failed after the latch");
+        std::string bounded;
+        try {
+            static_cast<void>(recorder.WaitSerialFor(submitted + 3, 60'000'000'000ull));
+        } catch (const std::exception& error) {
+            bounded = error.what();
+        }
+        Require(bounded == "injected device loss", "a bounded wait after the latch did not get the latched error ('" + bounded + "')");
+        gpu.lock();
+        recorder.Sync();
+    }
+    {
+        auto recorder = std::make_unique<Recorder>(context, true);
+        const auto [early, message] = waitFor([&] { recorder->WaitSerial(2); }, std::chrono::milliseconds(50), [&] {
+            std::lock_guard gpu(GpuMutex());
+            recorder.reset();
+        });
+        Require(!early, "a wait for a batch that was never submitted returned before the teardown ('" + message + "')");
+        Require(message.find("torn down") != std::string::npos, "a waiter woken by the teardown did not say so ('" + message + "')");
+    }
 }
 
 void serialFrontierTests(const Device& device, Recorder& recorder) {
@@ -16946,6 +17024,9 @@ int main(int argc, char** argv) {
         drawSnapshotEpochTests(device);
         gpu.lock();
         serialFrontierTests(device, recorder);
+        gpu.unlock();
+        latchedWaitTests(device);
+        gpu.lock();
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);
         encoderRuntimeSwitchTests(device, recorder);
