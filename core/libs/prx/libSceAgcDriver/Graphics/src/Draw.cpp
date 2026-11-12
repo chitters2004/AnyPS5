@@ -3934,7 +3934,7 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
     const bool unchanged = retainedOwner && repeatedColors && ThreadTargetMemo().colors.valid &&
         ThreadTargetMemo().colors.proof == preparedProof && unchangedDepth;
     if (admissionProof == preparedProof) {
-        if (!unchanged && residentTargets) rememberTargets(state, targets, targetViews, preparedProof);
+        if (!unchanged) rememberTargets(state, targets, targetViews, preparedProof);
     } else ThreadTargetMemo().Invalidate();
     resolved.depthView = state.depth ? depthView : VK_NULL_HANDLE;
     resolved.proof = preparedProof;

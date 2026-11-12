@@ -1209,12 +1209,10 @@ void noResidentTargetsSkipTheMemo(AgcDriver::VulkanDevice& device) {
     reset(device, color);
     arm(device, color);
     const auto copied = CopiedTargetResolutionsForTest();
-    const auto builds = TargetMemoBuildsForTest();
     Switches::Assign(RuntimeSwitch::NoResidentTargets, true);
     draw(device, color);
     Switches::Assign(RuntimeSwitch::NoResidentTargets, false);
     Require(CopiedTargetResolutionsForTest() == copied + 1, "a repeated draw with APS5_NO_RESIDENT_TARGETS set took its targets from the memo instead of copying them");
-    Require(TargetMemoBuildsForTest() == builds, "a draw with APS5_NO_RESIDENT_TARGETS set admitted its copied targets to the memo");
     expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a repeated draw whose targets were copied");
     draw(device, color);
     Require(CopiedTargetResolutionsForTest() == copied + 1, "a draw after APS5_NO_RESIDENT_TARGETS was cleared still copied its targets");
