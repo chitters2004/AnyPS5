@@ -198,6 +198,32 @@ ShaderRecompiler::RecompileRequest DrawStageRequest(const DrawProgram& program, 
     return request;
 }
 
+void CompleteDrawStageRequest(ShaderRecompiler::RecompileRequest& request, const DrawProgram& program, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) request.context.pixel = pixel;
+    request.context.vertex = vertex;
+    request.context.memory = memory;
+    request.graphics->linkedPrograms = linked;
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Mesh) request.graphics->meshBarycentrics = meshBarycentrics;
+}
+
+void VerifySharedDrawStageRequest(const ShaderRecompiler::RecompileRequest& shared, const DrawProgram& program, std::uint32_t pushOffset, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const ShaderRecompiler::LinkedProgram> linked, const Pm4::DrawParameters& drawParameters, const ShaderRecompiler::SpirvTarget& target, std::uint64_t deviceSerial, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) {
+    auto fresh = DrawStageRequest(program, pushOffset, graphics, memory, linked, drawParameters, target, meshBarycentrics);
+    if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) fresh.context.pixel = pixel;
+    fresh.context.vertex = vertex;
+    ApplyPreparedSampleModes(*program.snapshot, program.codeOffset, fresh.context);
+    Graphics::Require((!shared.context.convertedSamples || fresh.context.convertedSamples) && (!shared.context.layerRowSamples || fresh.context.layerRowSamples), "APS5_VERIFY_DRAW_STAGE_MEMO: a shared stage request holds a sample mode its shader's preparation does not");
+    auto aligned = shared;
+    aligned.context.convertedSamples = fresh.context.convertedSamples;
+    aligned.context.layerRowSamples = fresh.context.layerRowSamples;
+    DrawStageKey sharedKey;
+    DrawStageKey freshKey;
+    const bool sharedKeyed = BuildDrawStageKey(aligned, *program.snapshot, program.codeOffset, deviceSerial, sharedKey);
+    const bool freshKeyed = BuildDrawStageKey(fresh, *program.snapshot, program.codeOffset, deviceSerial, freshKey);
+    Graphics::Require(sharedKeyed == freshKeyed && sharedKey == freshKey, "APS5_VERIFY_DRAW_STAGE_MEMO: a shared stage request keys differently from the request the capture would build");
+    Graphics::Require(shared.context.memory.data() == fresh.context.memory.data() && shared.context.memory.size() == fresh.context.memory.size(), "APS5_VERIFY_DRAW_STAGE_MEMO: a shared stage request reads other memory than the request the capture would build");
+    Graphics::Require(shared.graphics.has_value() && fresh.graphics.has_value() && shared.graphics->linkedPrograms.data() == fresh.graphics->linkedPrograms.data() && shared.graphics->linkedPrograms.size() == fresh.graphics->linkedPrograms.size() && shared.graphics->meshBarycentrics == fresh.graphics->meshBarycentrics, "APS5_VERIFY_DRAW_STAGE_MEMO: a shared stage request links other programs or barycentrics than the request the capture would build");
+}
+
 bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const ShaderSnapshot& snapshot, std::size_t codeOffset, std::uint64_t deviceSerial, DrawStageKey& key) {
     return BuildDrawStageKey(request, request.context.pixel ? &*request.context.pixel : nullptr, request.context.vertex ? &*request.context.vertex : nullptr, snapshot, codeOffset, deviceSerial, key);
 }
@@ -436,7 +462,7 @@ DrawStageProof Driver::proveDrawStage(DrawStageRecord& record, std::uint64_t pro
     return DrawStageProof::Compared;
 }
 
-std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uint32_t pushOffset, std::uint32_t queue, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, std::shared_ptr<DrawStageRecord>& pending) {
+std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uint32_t pushOffset, std::uint32_t queue, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, std::shared_ptr<DrawStageRecord>& pending, ShaderRecompiler::RecompileRequest* shared) {
     pending.reset();
     if (!drawStageMemoEnabled() || drawParameters.indirect) return nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -445,7 +471,9 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
         if (profile) drawStageMemoCounters.Add(nanoseconds, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
     };
     const auto& program = programs[i];
-    auto request = DrawStageRequest(program, pushOffset, graphics, {}, {}, drawParameters, localDevice->Target(), std::nullopt);
+    std::optional<ShaderRecompiler::RecompileRequest> own;
+    if (shared == nullptr) own.emplace(DrawStageRequest(program, pushOffset, graphics, {}, {}, drawParameters, localDevice->Target(), std::nullopt));
+    auto& request = shared != nullptr ? *shared : *own;
     ApplyPreparedSampleModes(*program.snapshot, program.codeOffset, request.context);
     const auto* stagePixel = program.binary.stage == ShaderRecompiler::ShaderStage::Fragment ? &pixel : nullptr;
     const auto* stageVertex = vertexInfos[i] ? &*vertexInfos[i] : nullptr;

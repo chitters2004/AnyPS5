@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -706,6 +707,30 @@ void ProofsFollowWriteStamps() {
 
 }
 
+void InvocationKeysFollowSampleModesBetweenScopes() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool before = Switches::Set(RuntimeSwitch::OneStageRequest);
+    Switches::Assign(RuntimeSwitch::OneStageRequest, true);
+    Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const std::array<float, 4> one{1.0f, 1.0f, 1.0f, 1.0f};
+    std::memcpy(scene.constants.Bytes(0), one.data(), sizeof(one));
+    const auto rebuilds = AgcDriver::DriverDetail::InvocationKeyRebuilds();
+    AgcDriver::DriverDetail::MarkConvertedSamplesBetweenScopesForTest();
+    Expect(Draw(scene, VertexCode.data(), TableOffset, true) == 255u, "the draw whose invocation saw a sample mode recorded between its lock scopes did not draw");
+    Expect(AgcDriver::DriverDetail::InvocationKeyRebuilds() == rebuilds + 1, "a sample mode recorded between an invocation's lock scopes did not rebuild its prepared key exactly once");
+    WriteTable(scene.tables, SecondTableOffset, scene.vertices, true);
+    Expect(Draw(scene, VertexCode.data(), SecondTableOffset, true) == 255u, "the draw after the recorded sample mode did not draw");
+    Expect(AgcDriver::DriverDetail::InvocationKeyRebuilds() == rebuilds + 1, "a sample mode already recorded before the first lock scope rebuilt a prepared key");
+    Switches::Assign(RuntimeSwitch::OneStageRequest, before);
+    std::puts("a sample mode recorded between an invocation's lock scopes rebuilds its prepared key once");
+}
+
 int BenchStageKeys() {
     ShaderSnapshot snapshot{};
     RequestParts pixelParts;
@@ -791,6 +816,7 @@ int main(int argc, char** argv) {
         MemoFollowsItsRuntimeSwitch();
         ProofsFollowWriteStamps();
         MemoizesOnlyStagesBuiltAsKeyed();
+        InvocationKeysFollowSampleModesBetweenScopes();
         AgcDriverShutdown_nid_postfix();
         std::puts("draw stage memo: hits, misses and invalidations follow the stage inputs");
         return 0;
