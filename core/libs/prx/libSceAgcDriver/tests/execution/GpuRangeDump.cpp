@@ -142,6 +142,7 @@ int main() {
             Require(AgcDriver::Graphics::Recorder::GpuTimingEnabled(), "APS5_PROFILE_GPU_RANGES did not turn GPU timing on");
             Draw(*device);
         }
+        AgcDriver::Graphics::Recorder::FlushGpuRangeDump();
         std::ifstream file(path);
         if (!file.good()) {
             std::puts("skipped: the draws were not recorded into a recorder batch on this device, so no range was timed");
@@ -184,7 +185,7 @@ int main() {
                 Require(range.index == batches.back().size(), "range lines are not in index order: " + line);
                 Require(range.end >= range.begin, "a range ends before it begins: " + line);
                 batches.back().push_back(range);
-            } else if (kind != "present") {
+            } else if (kind != "present" && kind != "lost") {
                 throw std::runtime_error("unknown line in the range file: " + line);
             }
         }

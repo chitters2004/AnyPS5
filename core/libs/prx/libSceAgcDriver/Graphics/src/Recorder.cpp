@@ -41,6 +41,7 @@
 #include <iterator>
 #include <limits>
 #include <map>
+#include <deque>
 #include <mutex>
 #include <new>
 #include <string>
@@ -2268,73 +2269,150 @@ AgcDriver::Mutex timingTagMutex;
 std::vector<std::string> timingTags{std::string{}};
 std::map<std::string, std::uint32_t, std::less<>> timingTagIds;
 
-struct RangeDump {
-    std::FILE* file = nullptr;
-    std::uint64_t bytes = 0;
-    std::uint64_t limit = 0;
-    std::size_t tagsWritten = 1;
-    bool stopped = false;
+struct RangeRecord {
+    bool present = false;
+    std::uint64_t serial = 0;
+    std::uint32_t queue = 0;
+    std::uint32_t dropped = 0;
+    long long readNs = 0;
+    std::uint32_t batchTiming = Recorder::NoTiming;
+    double period = 1.0;
+    std::vector<std::uint64_t> keys;
+    std::vector<std::uint64_t> bytes;
+    std::vector<std::uint32_t> tags;
+    std::vector<std::uint32_t> passes;
+    std::vector<std::uint64_t> stamps;
+    std::size_t Size() const { return sizeof(RangeRecord) + keys.size() * 40u; }
 };
 
-RangeDump* rangeDumpOpened = nullptr;
+struct RangeWriter {
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::deque<RangeRecord> queued;
+    std::size_t queuedBytes = 0;
+    std::uint64_t lost = 0;
+    std::uint64_t submitted = 0;
+    std::uint64_t written = 0;
+    std::condition_variable drained;
+    bool started = false;
+    bool stopped = false;
+};
 
 const char* RangeDumpPath() {
     static const char* path = std::getenv("APS5_PROFILE_GPU_RANGES");
     return path != nullptr && *path != '\0' ? path : nullptr;
 }
 
-RangeDump& RangeDumpFile(double period) {
-    static RangeDump dump = [period] {
-        RangeDump opened;
-        const char* mib = std::getenv("APS5_PROFILE_GPU_RANGES_MIB");
-        opened.limit = (mib != nullptr ? std::strtoull(mib, nullptr, 10) : 1024ull) << 20u;
-        opened.file = std::fopen(RangeDumpPath(), "wb");
-        if (opened.file == nullptr) {
-            AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] cannot open %s; no ranges are written\n", RangeDumpPath());
-            opened.stopped = true;
-            return opened;
+long long SteadyNs() {
+    return static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+RangeWriter& Writer() {
+    static auto* writer = new RangeWriter;
+    return *writer;
+}
+
+void WriteRangeRecords() {
+    auto& writer = Writer();
+    std::FILE* file = nullptr;
+    std::uint64_t written = 0;
+    const char* mib = std::getenv("APS5_PROFILE_GPU_RANGES_MIB");
+    const std::uint64_t limit = (mib != nullptr ? std::strtoull(mib, nullptr, 10) : 1024ull) << 20u;
+    std::size_t tagsWritten = 1;
+    std::deque<RangeRecord> taken;
+    for (;;) {
+        std::uint64_t lost = 0;
+        std::uint64_t through = 0;
+        {
+            std::unique_lock lock(writer.mutex);
+            writer.wake.wait(lock, [&] { return !writer.queued.empty() || writer.lost != 0; });
+            taken.swap(writer.queued);
+            writer.queuedBytes = 0;
+            lost = writer.lost;
+            writer.lost = 0;
+            through = writer.submitted;
         }
-        opened.bytes += static_cast<std::uint64_t>(std::fprintf(opened.file, "aps5-gpu-ranges 1 period_ns %.9g\n", period));
-        return opened;
-    }();
-    rangeDumpOpened = &dump;
-    return dump;
+        if (file == nullptr) {
+            file = std::fopen(RangeDumpPath(), "wb");
+            if (file == nullptr) {
+                AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] cannot open %s; no ranges are written\n", RangeDumpPath());
+                break;
+            }
+            written += static_cast<std::uint64_t>(std::fprintf(file, "aps5-gpu-ranges 1 period_ns %.9g\n", taken.empty() ? 1.0 : taken.front().period));
+        }
+        if (lost != 0) written += static_cast<std::uint64_t>(std::fprintf(file, "lost %llu records (the writer queue was full)\n", static_cast<unsigned long long>(lost)));
+        {
+            std::lock_guard lock(timingTagMutex);
+            for (; tagsWritten < timingTags.size(); ++tagsWritten) written += static_cast<std::uint64_t>(std::fprintf(file, "tag %zu %s\n", tagsWritten, timingTags[tagsWritten].c_str()));
+        }
+        for (const auto& record : taken) {
+            if (record.present) {
+                written += static_cast<std::uint64_t>(std::fprintf(file, "present %llu read_ns %lld\n", static_cast<unsigned long long>(record.serial), record.readNs));
+                continue;
+            }
+            written += static_cast<std::uint64_t>(std::fprintf(file, "batch %llu queue %u read_ns %lld ranges %zu dropped %u\n", static_cast<unsigned long long>(record.serial), record.queue, record.readNs, record.keys.size(), record.dropped));
+            for (std::size_t i = 0; i < record.keys.size(); ++i) {
+                const auto key = record.keys[i];
+                char name[48];
+                if (i == record.batchTiming) std::snprintf(name, sizeof(name), "batch");
+                else if (key >= Recorder::ClassKey(Recorder::CommandClass::DispatchLeading) && key < Recorder::ClassKey(Recorder::CommandClass::Count)) std::snprintf(name, sizeof(name), "class:%s", CommandClassNames[key - Recorder::ClassKey(Recorder::CommandClass::DispatchLeading)]);
+                else if ((key & Recorder::DrawTimingFlag) != 0) std::snprintf(name, sizeof(name), "draw:0x%llx", static_cast<unsigned long long>(key & ~Recorder::DrawTimingFlag));
+                else std::snprintf(name, sizeof(name), "program:0x%llx", static_cast<unsigned long long>(key));
+                const long long pass = record.passes[i] == Recorder::NoTiming ? -1 : static_cast<long long>(record.passes[i]);
+                written += static_cast<std::uint64_t>(std::fprintf(file, "range %zu %s tag %u pass %lld ticks %llu %llu bytes %llu\n", i, name, record.tags[i], pass, static_cast<unsigned long long>(record.stamps[i * 2]), static_cast<unsigned long long>(record.stamps[i * 2 + 1]), static_cast<unsigned long long>(record.bytes[i])));
+            }
+        }
+        taken.clear();
+        std::fflush(file);
+        {
+            std::lock_guard lock(writer.mutex);
+            writer.written = through;
+        }
+        writer.drained.notify_all();
+        if (written >= limit) {
+            std::fprintf(file, "stopped at %llu bytes\n", static_cast<unsigned long long>(written));
+            AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] %s reached APS5_PROFILE_GPU_RANGES_MIB; later ranges are not written\n", RangeDumpPath());
+            break;
+        }
+    }
+    if (file != nullptr) std::fclose(file);
+    {
+        std::lock_guard lock(writer.mutex);
+        writer.stopped = true;
+        writer.queued.clear();
+    }
+    writer.drained.notify_all();
+}
+
+void QueueRangeRecord(RangeRecord record) {
+    constexpr std::size_t MaxQueuedBytes = std::size_t{64} << 20u;
+    auto& writer = Writer();
+    std::lock_guard lock(writer.mutex);
+    if (writer.stopped) return;
+    if (!writer.started) {
+        writer.started = true;
+        std::thread(WriteRangeRecords).detach();
+    }
+    ++writer.submitted;
+    if (writer.queuedBytes + record.Size() > MaxQueuedBytes) {
+        ++writer.lost;
+    } else {
+        writer.queuedBytes += record.Size();
+        writer.queued.push_back(std::move(record));
+    }
+    writer.wake.notify_one();
 }
 
 void DumpPresent(std::uint64_t serial) {
-    std::lock_guard lock(timingMutex);
-    if (rangeDumpOpened == nullptr || rangeDumpOpened->stopped) return;
-    const auto now = static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    rangeDumpOpened->bytes += static_cast<std::uint64_t>(std::fprintf(rangeDumpOpened->file, "present %llu read_ns %lld\n", static_cast<unsigned long long>(serial), now));
+    RangeRecord record;
+    record.present = true;
+    record.serial = serial;
+    record.readNs = SteadyNs();
+    QueueRangeRecord(std::move(record));
 }
 
 void DumpBatchRanges(std::uint64_t serial, std::uint32_t queue, std::uint32_t dropped, const std::vector<std::uint64_t>& keys, const std::vector<std::uint64_t>& bytes, const std::vector<std::uint32_t>& tags, const std::vector<std::uint32_t>& passes, const std::vector<std::uint64_t>& stamps, std::uint32_t batchTiming, double period) {
-    auto& dump = RangeDumpFile(period);
-    if (dump.stopped) return;
-    {
-        std::lock_guard lock(timingTagMutex);
-        for (; dump.tagsWritten < timingTags.size(); ++dump.tagsWritten) dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "tag %zu %s\n", dump.tagsWritten, timingTags[dump.tagsWritten].c_str()));
-    }
-    const auto readNs = static_cast<long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
-    dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "batch %llu queue %u read_ns %lld ranges %zu dropped %u\n", static_cast<unsigned long long>(serial), queue, readNs, keys.size(), dropped));
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-        const auto key = keys[i];
-        char name[48];
-        if (i == batchTiming) std::snprintf(name, sizeof(name), "batch");
-        else if (key >= Recorder::ClassKey(Recorder::CommandClass::DispatchLeading) && key < Recorder::ClassKey(Recorder::CommandClass::Count)) std::snprintf(name, sizeof(name), "class:%s", CommandClassNames[key - Recorder::ClassKey(Recorder::CommandClass::DispatchLeading)]);
-        else if ((key & Recorder::DrawTimingFlag) != 0) std::snprintf(name, sizeof(name), "draw:0x%llx", static_cast<unsigned long long>(key & ~Recorder::DrawTimingFlag));
-        else std::snprintf(name, sizeof(name), "program:0x%llx", static_cast<unsigned long long>(key));
-        const long long pass = passes[i] == Recorder::NoTiming ? -1 : static_cast<long long>(passes[i]);
-        dump.bytes += static_cast<std::uint64_t>(std::fprintf(dump.file, "range %zu %s tag %u pass %lld ticks %llu %llu bytes %llu\n", i, name, tags[i], pass, static_cast<unsigned long long>(stamps[i * 2]), static_cast<unsigned long long>(stamps[i * 2 + 1]), static_cast<unsigned long long>(bytes[i])));
-    }
-    std::fflush(dump.file);
-    if (dump.bytes >= dump.limit) {
-        std::fprintf(dump.file, "stopped at %llu bytes\n", static_cast<unsigned long long>(dump.bytes));
-        std::fclose(dump.file);
-        dump.file = nullptr;
-        dump.stopped = true;
-        AgcDriver::ProfilePrint_nid_no_patch("[gpuranges] %s reached APS5_PROFILE_GPU_RANGES_MIB; later ranges are not written\n", RangeDumpPath());
-    }
+    QueueRangeRecord({false, serial, queue, dropped, SteadyNs(), batchTiming, period, keys, bytes, tags, passes, stamps});
 }
 
 bool DrawOrGpuProfiled() {
@@ -2396,6 +2474,13 @@ bool Recorder::GpuTimingEnabled() {
 
 bool Recorder::GpuRangeDumpEnabled() {
     return RangeDumpPath() != nullptr;
+}
+
+void Recorder::FlushGpuRangeDump() {
+    auto& writer = Writer();
+    std::unique_lock lock(writer.mutex);
+    const auto target = writer.submitted;
+    writer.drained.wait(lock, [&] { return writer.stopped || !writer.started || writer.written >= target; });
 }
 
 void Recorder::TagGpuTiming(std::uint32_t index, std::string_view tag) {
@@ -3220,7 +3305,6 @@ void Recorder::readGpuTiming(Batch& batch) {
         return;
     }
     if (GpuRangeDumpEnabled()) {
-        std::lock_guard dumpLock(timingMutex);
         DumpBatchRanges(batch.serial, batch.queue, batch.timedDropped, batch.timedKeys, batch.timedBytes, batch.timedTags, batch.timedPasses, stamps, batch.batchTiming, period);
     }
     static auto lastReport = std::chrono::steady_clock::now();

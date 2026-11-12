@@ -85,6 +85,8 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <map>
+#include <sstream>
 #include <iomanip>
 #include <future>
 #include <iostream>
@@ -1840,6 +1842,85 @@ int gpuTimingCompletionTests(const Device& device, bool incomplete) {
         }
     }
     std::cout << "GPU timing batch completion checked, incomplete=" << incomplete << '\n';
+    return 0;
+}
+
+int gpuRangeDumpTests(const Device& device) {
+    const auto& context = device.GetContext();
+    if (!device.Timestamps()) {
+        std::cout << "skipped, queue timestamp queries unavailable\n";
+        return 77;
+    }
+    const char* path = std::getenv("APS5_PROFILE_GPU_RANGES");
+    Require(path != nullptr && Recorder::GpuRangeDumpEnabled() && Recorder::GpuTimingEnabled(), "the range dump test requires APS5_PROFILE_GPU_RANGES");
+    constexpr int Rounds = 64;
+    {
+        std::unique_lock gpu(GpuMutex());
+        Recorder recorder(context);
+        recorder.Activate();
+        for (int round = 0; round < Rounds; ++round) {
+            const auto pass = recorder.BeginGpuTiming(Recorder::CommandClass::Draw);
+            Require(pass != Recorder::NoTiming, "the pass range was not allocated");
+            recorder.TagGpuTiming(pass, round % 2 == 0 ? "pass-even" : "pass-odd");
+            const auto draw = recorder.BeginInPassGpuTiming(Recorder::DrawTimingKey(0x77));
+            Require(draw != Recorder::NoTiming, "the in-pass range was not allocated");
+            recorder.EndGpuTiming(draw);
+            recorder.EndGpuTiming(pass);
+            const auto after = recorder.BeginGpuTiming(0x12345);
+            recorder.EndGpuTiming(after);
+            recorder.Submit();
+            recorder.Sync();
+        }
+    }
+    Recorder::FlushGpuRangeDump();
+    std::ifstream file(path);
+    Require(file.good(), "no range file was written");
+    std::string line;
+    std::getline(file, line);
+    Require(line.rfind("aps5-gpu-ranges 1 period_ns ", 0) == 0, "the range file has no header: " + line);
+    std::map<std::uint32_t, std::string> tags;
+    int batches = 0, passes = 0, draws = 0, programs = 0;
+    long long passIndex = -2;
+    std::uint64_t passBegin = 0, passEnd = 0;
+    while (std::getline(file, line)) {
+        std::istringstream fields(line);
+        std::string kind;
+        fields >> kind;
+        if (kind == "tag") {
+            std::uint32_t id = 0;
+            std::string text;
+            fields >> id >> text;
+            tags[id] = text;
+        } else if (kind == "batch") {
+            ++batches;
+            passIndex = -2;
+        } else if (kind == "range") {
+            std::size_t index = 0;
+            std::string name, word;
+            std::uint32_t tag = 0;
+            long long pass = 0;
+            std::uint64_t begin = 0, end = 0;
+            fields >> index >> name >> word >> tag >> word >> pass >> word >> begin >> end;
+            Require(!fields.fail() && end >= begin, "malformed range line: " + line);
+            if (name == "class:draw") {
+                ++passes;
+                Require(pass == -1 && tags.contains(tag) && tags[tag] == ((passes - 1) % 2 == 0 ? "pass-even" : "pass-odd"), "a pass range has the wrong tag or an enclosing pass: " + line);
+                passIndex = static_cast<long long>(index);
+                passBegin = begin;
+                passEnd = end;
+            } else if (name == "draw:0x77") {
+                ++draws;
+                Require(pass == passIndex && passBegin <= begin && end <= passEnd, "an in-pass range does not name its pass or lies outside it: " + line);
+            } else if (name == "program:0x12345") {
+                ++programs;
+                Require(pass == -1, "a range begun after its pass ended still names the pass: " + line);
+            }
+        } else if (kind == "lost") {
+            throw std::runtime_error("the writer lost records: " + line);
+        }
+    }
+    Require(batches >= Rounds && passes == Rounds && draws == Rounds && programs == Rounds, "the range file holds " + std::to_string(passes) + " passes, " + std::to_string(draws) + " draws and " + std::to_string(programs) + " programs of " + std::to_string(Rounds));
+    std::cout << "GPU range dump checked: " << batches << " batches\n";
     return 0;
 }
 
@@ -15801,6 +15882,7 @@ int main(int argc, char** argv) {
         Device& device = *created;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-range-dump-only") return gpuRangeDumpTests(device);
         if (argc == 2 && (std::string_view(argv[1]) == "--gpu-timing-complete-only" || std::string_view(argv[1]) == "--gpu-timing-incomplete-only")) {
             return gpuTimingCompletionTests(device, std::string_view(argv[1]) == "--gpu-timing-incomplete-only");
         }
