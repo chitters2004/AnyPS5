@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PERFORMANCETRACE_HPP
 
+#include "prx/libc/include/HostThreadSlot.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -176,7 +178,15 @@ private:
     Clock::duration begun{};
 };
 
-inline thread_local std::uint64_t TraceBatchTag = 0;
+struct TraceBatchTagSlot {};
+
+inline std::uint64_t TraceBatchTag() {
+    return HostThreadSlot<std::uint64_t, TraceBatchTagSlot>::Get();
+}
+
+inline void SetTraceBatchTag(std::uint64_t tag) {
+    HostThreadSlot<std::uint64_t, TraceBatchTagSlot>::Set(tag);
+}
 
 class TraceThread {
 public:
@@ -242,7 +252,7 @@ public:
             folded = {};
         }
         if (length < MinimumSlice) folded += length;
-        else append({scope, stage, begin, length, TraceBatchTag});
+        else append({scope, stage, begin, length, TraceBatchTag()});
     }
 
     void Count(const char* scope, std::uint64_t amount = 1) {
@@ -925,7 +935,9 @@ private:
     static std::atomic<std::uint64_t> ownedDrawUnbound;
     inline static std::atomic<bool> buffering{false};
     inline static std::atomic<std::uint64_t> presentCount{0};
-    static thread_local TraceThread* local;
+    struct LocalThreadSlot {};
+    static TraceThread* Local() { return HostThreadSlot<TraceThread*, LocalThreadSlot>::Get(); }
+    static void SetLocal(TraceThread* thread) { HostThreadSlot<TraceThread*, LocalThreadSlot>::Set(thread); }
     static thread_local const char* localName;
     static std::atomic<TraceThread* (*)()> binder;
     inline static std::mutex gpuMutex;
