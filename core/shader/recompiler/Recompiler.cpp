@@ -2254,6 +2254,11 @@ PreparedShaderInvocation PreparedShaderInvocation::Adopt(RecompileRequest&& requ
     return PreparedShaderInvocation(std::move(request), std::move(handle));
 }
 
+PreparedShaderInvocation PreparedShaderInvocation::AdoptValidated(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle) {
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    return PreparedShaderInvocation(std::move(request), std::move(handle));
+}
+
 PreparedShaderInvocation::PreparedShaderInvocation(RecompileRequest&& request, std::shared_ptr<const SourceHandle>&& handle) : request(std::move(request)), handle(std::move(handle)) {
     this->request.context.linkedCallFallbacks = this->handle->source->linkedCallFallbacks;
 }

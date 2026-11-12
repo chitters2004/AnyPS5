@@ -518,8 +518,10 @@ std::shared_ptr<DrawStageRecord> Driver::lookupDrawStage(std::size_t i, std::uin
         break;
     }
     drawStageMemoCounters.Add(DrawStageMemoCount::Stale);
+    auto hint = found->prepared;
     drawStageMemo.Erase(found);
     pend();
+    pending->prepared = std::move(hint);
     charge(DrawStageMemoCount::MissNanoseconds);
     return nullptr;
 }
