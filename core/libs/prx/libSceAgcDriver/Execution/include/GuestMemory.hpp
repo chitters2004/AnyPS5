@@ -78,30 +78,79 @@ void SetFreshCollectHook(FreshCollectHook hook);
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
-enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
-enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Count };
+enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Mirror, Depth, Count };
+enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Mirror, Count };
 constexpr std::uint32_t WriteChangeBit(WriteChange change) {
     return std::uint32_t{1} << static_cast<unsigned>(change);
 }
 constexpr std::uint32_t WriteChangeAll = WriteChangeBit(WriteChange::Bytes) | WriteChangeBit(WriteChange::Authority) | WriteChangeBit(WriteChange::Capability) | WriteChangeBit(WriteChange::Identity);
 WriteChange WriteChangeOf(WriteBumpSource source);
-enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, CertifiedProof, Count };
+enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, CertifiedProof, Depth, Mirror, Count };
 constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
     return std::uint32_t{1} << static_cast<unsigned>(domain);
 }
+constexpr std::size_t CertificateInlineOwners = 4;
 struct WriteCertificate {
     std::uint64_t version = 0;
+    std::uint64_t owners = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
+    const std::atomic<std::uint64_t>* cell = nullptr;
+    std::uint32_t typeMask = 0;
+    std::uint32_t ownerCount = 0;
+    std::array<std::uint64_t, CertificateInlineOwners> ownerHandles{};
+    std::uint32_t blockCount = 0;
+    bool handles = true;
+    std::array<const std::atomic<std::uint64_t>*, CertificateInlineOwners> blockChanges{};
 };
 bool WriteIndexEnabled();
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll);
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false, bool owned = true);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
 std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
 std::uint64_t DomainVersion(WriteDomain domain);
+void BumpDomainVersion(WriteDomain domain);
+void BumpWrites(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source);
+std::uint64_t RegisterWriteOwner(std::uint64_t base, std::uint64_t bytes);
+void UnregisterWriteOwner(std::uint64_t owner);
+class WriteOwner {
+public:
+    WriteOwner() = default;
+    WriteOwner(std::uint64_t base, std::uint64_t bytes) : handle(RegisterWriteOwner(base, bytes)) {}
+    WriteOwner(const WriteOwner&) = delete;
+    WriteOwner& operator=(const WriteOwner&) = delete;
+    WriteOwner(WriteOwner&& other) noexcept : handle(std::exchange(other.handle, 0)) {}
+    WriteOwner& operator=(WriteOwner&& other) noexcept {
+        if (this != &other) {
+            UnregisterWriteOwner(handle);
+            handle = std::exchange(other.handle, 0);
+        }
+        return *this;
+    }
+    ~WriteOwner() { UnregisterWriteOwner(handle); }
+    std::uint64_t Handle() const { return handle; }
+
+private:
+    std::uint64_t handle = 0;
+};
 WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps };
+constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
+std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters };
 void SetCertificateMutantForTest(CertificateMutant mutant);
+void SetWriteIndexCountingForTest(bool counting);
+void SetWriteOwnersIgnoredForTest(bool ignored);
+using DomainReadObserver = void (*)(WriteDomain domain);
+void SetDomainReadObserverForTest(DomainReadObserver observer);
+class CoveredCommitScope {
+public:
+    explicit CoveredCommitScope(bool covered);
+    ~CoveredCommitScope();
+    CoveredCommitScope(const CoveredCommitScope&) = delete;
+    CoveredCommitScope& operator=(const CoveredCommitScope&) = delete;
+
+private:
+    bool muted;
+};
 using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
 void SetWriteBackingResolver(WriteBackingResolver resolver);
 std::span<const std::pair<std::uint64_t, std::uint64_t>> SubscriptionSpans(const WriteSubscription& subscription);
@@ -110,6 +159,7 @@ bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t
 void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t generation);
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
+void NoteRecordedPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
 constexpr std::size_t WriteBumpSizeBuckets = 7;
 struct WriteIndexStats {
@@ -122,6 +172,10 @@ struct WriteIndexStats {
     std::uint64_t sweepFailures = 0;
     std::uint64_t overflows = 0;
     std::uint64_t lookupNanoseconds = 0;
+    std::uint64_t ownerBumps = 0;
+    std::uint64_t ownerFastBumps = 0;
+    std::uint64_t ownerDependencies = 0;
+    std::uint64_t blockDependencies = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
     std::array<std::array<std::uint64_t, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };
@@ -171,7 +225,7 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, Count };
+enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, PipelineCommitCovered, Count };
 const char* ProofBreakName(ProofBreak source);
 void BreakProofs(ProofBreak source = ProofBreak::Unlabelled);
 bool ProofBreakVoidsCertificates(ProofBreak source);

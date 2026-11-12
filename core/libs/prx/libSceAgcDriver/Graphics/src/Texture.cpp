@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -28,7 +29,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include <algorithm>
@@ -588,6 +588,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
 
         const auto guestBytes = geometry.guestBytes;
         AgcDriver::LiveResourceRing::Instance().Note(descriptor.baseAddress, guestBytes, "texture");
+        if (guestBytes != 0 && (GuestMemory::WriteIndexEnabled() || CertifiedProofs())) owner = GuestMemory::WriteOwner(descriptor.baseAddress, guestBytes);
         const auto slabBytes = geometry.layerBytes;
         const auto snapshotSize = staging != nullptr ? staging->Bytes().size() : snapshot.size();
         Require(clear == nullptr || !packedSlabs.has_value(), "a cleared texture takes no snapshot, so it has no committed slabs");
@@ -1803,6 +1804,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         arrayLayers = geometry.layers;
         const auto elementBytes = BytesPerElement(descriptor.format);
         guestBytes = geometry.guestBytes;
+        if (guestBytes != 0 && (GuestMemory::WriteIndexEnabled() || CertifiedProofs())) owner = GuestMemory::WriteOwner(descriptor.baseAddress, guestBytes);
         // Storage images in heaps the guest commits on demand only read and store committed pages.
         Require(!GuestMemory::CommittedRanges(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true).empty(), "storage texture has no committed guest pages");
         // Write stamps are per 64 KiB block, so only 64 KiB-aligned layer slices can be told apart.
@@ -4684,7 +4686,8 @@ std::uint64_t StorageTexture::PendingSinceSkips() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
-    if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
+    const auto markedBytes = count != 0 ? static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)) : std::size_t{0};
+    if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), markedBytes);
     if (auto& records = LayoutWrites(); layoutSerial == 0 || records.serial.load(std::memory_order_acquire) != layoutSerial) {
         std::lock_guard lock(records.mutex);
         if (records.byAddress.size() >= 65536u) records.byAddress.clear();
@@ -4695,7 +4698,8 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     } else {
         layoutStoresSkipped.store(layoutStoresSkipped.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
-    GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (count == 0 || RuntimeSwitches::Set(RuntimeSwitch::WholePendingBumps)) GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    else GuestMemory::NoteGpuPending(layerBegin(first), markedBytes);
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -4808,12 +4812,12 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent || newUnits) BumpPendingSerial();
+        if (wasLent || newUnits) BumpPendingSerial(wasLent ? PendingBump::MarkLent : PendingBump::Mark);
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
-    BumpPendingSerial();
+    BumpPendingSerial(PendingBump::Mark);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4825,7 +4829,7 @@ void StorageTexture::reconcilePending() {
     dirty = any;
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
-    BumpPendingSerial();
+    BumpPendingSerial(PendingBump::Reconcile);
 }
 
 bool StorageTexture::Dirty() const {
@@ -5059,7 +5063,7 @@ void StorageTexture::Flush(const char* reason) {
         if (!dirty) return;
         dirty = false;
         pending.textures.remove(this);
-        BumpPendingSerial();
+        BumpPendingSerial(PendingBump::Flush);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, reason);
@@ -5242,7 +5246,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         // Still pending for the adjacency rule of writeBack until each one is stored.
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-        if (!flush.empty()) BumpPendingSerial();
+        if (!flush.empty()) BumpPendingSerial(PendingBump::FlushStarted);
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
         }
@@ -5263,7 +5267,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             std::lock_guard lock(pending.mutex);
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::FlushEnded);
         }
     } unregister{flush};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
@@ -6290,9 +6294,31 @@ bool StorageTexture::OrderedFlushArmedForTest() {
     return GpuOrderedFlush();
 }
 
-void StorageTexture::BumpPendingSerial() {
+namespace {
+const bool pendingBumpsCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PendingBump::Count)> pendingBumps{};
+constexpr std::array<const char*, static_cast<std::size_t>(PendingBump::Count)> PendingBumpNames{"unlabelled", "mark-lent", "mark", "reconcile", "flush", "flush-started", "flush-ended", "discard", "clear-by-keys", "destroyed", "shadowed"};
+}
+
+const char* PendingBumpName(PendingBump source) {
+    const auto index = static_cast<std::size_t>(source);
+    return index < PendingBumpNames.size() ? PendingBumpNames[index] : "invalid";
+}
+
+bool PendingBumpsCounted() {
+    return pendingBumpsCounted;
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> PendingBumpCounts() {
+    std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> counts{};
+    for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = pendingBumps[i].load(std::memory_order_relaxed);
+    return counts;
+}
+
+void StorageTexture::BumpPendingSerial(PendingBump source) {
     pendingSerial.fetch_add(1, std::memory_order_release);
     HostThreadSlot<std::uint64_t, OwnPendingMovesSlot>::Set(OwnPendingMoves() + 1);
+    if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
@@ -6363,7 +6389,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             ++it;
         }
     }
-    if (discarded != 0) BumpPendingSerial();
+    if (discarded != 0) BumpPendingSerial(PendingBump::Discard);
     return discarded;
 }
 
@@ -6521,7 +6547,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::ClearByKeys);
         }
     }
     const auto commands = recorder->Commands();
@@ -7979,7 +8005,7 @@ StorageTexture::~StorageTexture() {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::Destroyed);
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -178,6 +179,7 @@ private:
     bool repackCopy = false;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
     std::uint32_t copyTexelsPerElement = 4;
+    GuestMemory::WriteOwner owner;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
@@ -266,6 +268,11 @@ private:
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+enum class PendingBump : std::uint8_t { Unlabelled, MarkLent, Mark, Reconcile, Flush, FlushStarted, FlushEnded, Discard, ClearByKeys, Destroyed, Shadowed, Count };
+const char* PendingBumpName(PendingBump source);
+bool PendingBumpsCounted();
+std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> PendingBumpCounts();
+
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     struct CreationHandOver {
@@ -344,7 +351,7 @@ public:
     static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
-    static void BumpPendingSerial();
+    static void BumpPendingSerial(PendingBump source = PendingBump::Unlabelled);
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -803,6 +810,7 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
+    GuestMemory::WriteOwner owner;
     std::vector<std::byte> original;
     struct ComparedRange {
         std::uint64_t address = 0;

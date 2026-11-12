@@ -1,11 +1,15 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -267,6 +271,10 @@ AgcDriver::Graphics::CertifiedProofOutcomes Since(const AgcDriver::Graphics::Cer
     delta.epochServed = after.epochServed - before.epochServed;
     for (std::size_t i = 0; i < delta.proofMissSources.size(); ++i) delta.proofMissSources[i] = after.proofMissSources[i] - before.proofMissSources[i];
     delta.proofMissUnattributed = after.proofMissUnattributed - before.proofMissUnattributed;
+    for (std::size_t i = 0; i < delta.certifiedGateSets.size(); ++i) delta.certifiedGateSets[i] = after.certifiedGateSets[i] - before.certifiedGateSets[i];
+    for (std::size_t i = 0; i < delta.epochGateSets.size(); ++i) delta.epochGateSets[i] = after.epochGateSets[i] - before.epochGateSets[i];
+    for (std::size_t i = 0; i < delta.pendingMissSources.size(); ++i) delta.pendingMissSources[i] = after.pendingMissSources[i] - before.pendingMissSources[i];
+    delta.pendingMissUnattributed = after.pendingMissUnattributed - before.pendingMissUnattributed;
     return delta;
 }
 
@@ -421,6 +429,118 @@ void UnwatchRange(AgcDriver::VulkanDevice& device) {
     Require(outcome.Uncertified(AgcDriver::Graphics::UncertifiedCause::Refused) == 1 && outcome.UncertifiedRefused(CertifyRefusal::ComparedTextures) == 1, "unwatch: the use after a refusal was not counted as uncertified for compared textures (" + outcome.Describe() + ")");
 }
 
+bool ThrowOnConsume = false;
+
+void ThrowAfterConsume() {
+    if (std::exchange(ThrowOnConsume, false)) throw std::runtime_error("invalidate: the consume hook threw");
+}
+
+bool InvalidationVoids() {
+    GuestBlocks memory(2u * BlockBytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory.base);
+    const auto bytes = static_cast<std::size_t>(2u * BlockBytes);
+    std::memset(memory.base, 0x11, bytes);
+    Require(GuestMemory::CollectWritesUncached(base, bytes) != 0, "invalidate: the fixture was not collected");
+    const GuestMemory::WriteOwner owner(base, BlockBytes);
+    const std::array ownedRange{std::pair<std::uint64_t, std::uint64_t>{base + 64, base + 128}};
+    const std::array blockRange{std::pair<std::uint64_t, std::uint64_t>{base + BlockBytes + 64, base + BlockBytes + 128}};
+    const auto owned = GuestMemory::SubscribeWrites(ownedRange);
+    const auto counted = GuestMemory::SubscribeWrites(blockRange);
+    const auto ownedCertificate = GuestMemory::CertifySubscription(*owned, 0);
+    const auto countedCertificate = GuestMemory::CertifySubscription(*counted, 0);
+    Require(ownedCertificate.ownerCount == 1 && countedCertificate.blockCount == 1, "invalidate: the subscriptions do not depend on an owner and a block counter");
+    Require(GuestMemory::CertificateHolds(*owned, ownedCertificate, 0) && GuestMemory::CertificateHolds(*counted, countedCertificate, 0), "invalidate: a certificate did not hold with nothing changed");
+    const auto invalidations = GuestMemory::ConservativeInvalidationsForTest();
+    memory.base[8u * 4096u] = std::uint8_t{0x22};
+    ThrowOnConsume = true;
+    GuestMemory::SetConsumedWalkHookForTest(&ThrowAfterConsume);
+    bool threw = false;
+    try {
+        static_cast<void>(GuestMemory::CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    GuestMemory::SetConsumedWalkHookForTest(nullptr);
+    Require(threw && GuestMemory::ConservativeInvalidationsForTest() == invalidations + 1, "invalidate: the throwing collect did not invalidate the tracker");
+    return !GuestMemory::CertificateHolds(*owned, ownedCertificate, 0) && !GuestMemory::CertificateHolds(*counted, countedCertificate, 0);
+}
+
+void Invalidate(AgcDriver::VulkanDevice&) {
+    Require(InvalidationVoids(), "invalidate: a conservative invalidation left a certificate on an owner or a block counter standing");
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::HideOverflowCounters);
+    const bool caught = InvalidationVoids();
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::None);
+    Require(!caught, "invalidate: hiding the counter bumps of an invalidation kept every certificate voided, so the case tests nothing");
+    std::printf("certified proofs: a conservative invalidation voids certificates on owners and block counters\n");
+}
+
+std::pair<bool, bool> LayerMarkVoids(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    constexpr std::uint32_t side = 128;
+    GuestBlocks memory(4u * BlockBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory.base);
+    auto context = device.graphicsContext();
+    TextureDetiler detiler(context);
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.depthOrLastArray = 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.imageLayers == 2 && geometry.layerBytes == BlockBytes, "layers: the image does not hold two 64 KiB slices");
+    const auto slice = [&](std::uint32_t layer) {
+        const auto begin = address + geometry.GuestLayerOffset(layer);
+        return std::array{std::pair<std::uint64_t, std::uint64_t>{begin, begin + geometry.layerBytes}};
+    };
+    const auto marked = GuestMemory::SubscribeWrites(slice(0));
+    const auto other = GuestMemory::SubscribeWrites(slice(1));
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    auto image = StorageTexture::Create(context, detiler, resource, 0);
+    const auto markedCertificate = GuestMemory::CertifySubscription(*marked, 0);
+    const auto otherCertificate = GuestMemory::CertifySubscription(*other, 0);
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "layers: no active recorder");
+    static_cast<void>(recorder->Commands());
+    recorder->Keep(image);
+    image->MarkSliceDirty(0);
+    const bool markedVoided = !GuestMemory::CertificateHolds(*marked, markedCertificate, 0);
+    const bool otherHeld = GuestMemory::CertificateHolds(*other, otherCertificate, 0);
+    image->WriteBack();
+    recorder->Submit();
+    recorder->Sync();
+    return {markedVoided, otherHeld};
+}
+
+void Layers(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const auto [voided, held] = LayerMarkVoids(device);
+    Require(voided, "layers: a layer pending mark left a certificate on that layer standing");
+    Require(held, "layers: a layer pending mark voided a certificate on another layer");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::WholePendingBumps, true);
+    const auto [wholeVoided, wholeHeld] = LayerMarkVoids(device);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::WholePendingBumps, false);
+    Require(wholeVoided && !wholeHeld, "layers: with APS5_WHOLE_PENDING_BUMPS a layer pending mark kept the other layer's certificate, so the case tests nothing");
+    std::printf("certified proofs: a layer pending mark voids certificates on its layer only\n");
+}
+
+bool SceneWatched(AgcDriver::VulkanDevice& device) {
+    auto& scene = NewScene();
+    Build(device, scene);
+    static_cast<void>(Draw(device, scene, true, false));
+    device.WaitIdle();
+    return GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.table.base), scene.table.bytes) && GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.textures.base), scene.textures.bytes);
+}
+
 void Causes(AgcDriver::VulkanDevice& device) {
     using AgcDriver::Graphics::UncertifiedCause;
     auto& scene = NewScene();
@@ -515,7 +635,7 @@ void Verified(AgcDriver::VulkanDevice& device) {
 }
 
 
-constexpr std::array<GuestMemory::ProofBreak, 1> CoveredBreaks{GuestMemory::ProofBreak::MarkWritten};
+constexpr std::array<GuestMemory::ProofBreak, 3> CoveredBreaks{GuestMemory::ProofBreak::MarkWritten, GuestMemory::ProofBreak::OwnStore, GuestMemory::ProofBreak::PipelineCommitCovered};
 
 bool UncoveredBreakVoids(AgcDriver::VulkanDevice& device, const std::string& what) {
     auto& scene = NewScene();
@@ -540,25 +660,181 @@ void Scope(AgcDriver::VulkanDevice& device) {
         Require((GuestMemory::CertificateBreakSerial() != certificates) != covered, std::string("scope: a ") + GuestMemory::ProofBreakName(source) + (covered ? " break voided certificates though its writes bump their ranges" : " break left certificates standing"));
     }
     Require(UncoveredBreakVoids(device, "scope"), "scope: an uncovered proof break kept the certificate");
-    const auto unrelatedStore = [&](const std::string& what) {
-        auto& scene = NewScene();
-        Build(device, scene);
-        Settle(device, scene, what);
-        GuestMemory::MarkWritten(reinterpret_cast<std::uintptr_t>(scene.blocks.base), 256);
-        const auto outcome = Draw(device, scene, false);
-        Require(outcome.brightest == 255u, what + ": the draw after a driver store elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
-        return outcome;
-    };
-    auto outcome = unrelatedStore("scope (driver store elsewhere)");
-    Require(outcome.counts.proved == 1, "scope: a driver store to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
-    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
-    outcome = unrelatedStore("scope (driver store elsewhere, unscoped)");
-    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
-    Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE a driver store elsewhere kept the certificate (" + outcome.Describe() + ")");
+    const std::array<std::pair<const char*, std::function<void(std::uintptr_t)>>, 2> stores{{
+        {"a driver store", [](std::uintptr_t address) { GuestMemory::MarkWritten(address, 256); }},
+        {"an own store", [](std::uintptr_t address) {
+            const std::array<std::byte, 256> bytes{};
+            static_cast<void>(GuestMemory::StoreOwnBytes(address, bytes));
+        }},
+    }};
+    for (const auto& [kind, store] : stores) {
+        const auto storeElsewhere = [&](const std::string& what) {
+            auto& scene = NewScene();
+            Build(device, scene);
+            Settle(device, scene, what);
+            store(reinterpret_cast<std::uintptr_t>(scene.blocks.base));
+            const auto outcome = Draw(device, scene, false);
+            Require(outcome.brightest == 255u, what + ": the draw after " + kind + " elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
+            return outcome;
+        };
+        auto outcome = storeElsewhere(std::string("scope (") + kind + " elsewhere)");
+        Require(outcome.counts.proved == 1, std::string("scope: ") + kind + " to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
+        outcome = storeElsewhere(std::string("scope (") + kind + " elsewhere, unscoped)");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
+        Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, std::string("scope: with APS5_NO_CERTIFIED_PROOF_SCOPE ") + kind + " elsewhere kept the certificate (" + outcome.Describe() + ")");
+    }
     AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, true);
     const bool unscoped = UncoveredBreakVoids(device, "scope (unscoped)");
     AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedProofScope, false);
     Require(unscoped, "scope: with APS5_NO_CERTIFIED_PROOF_SCOPE an uncovered proof break kept the certificate");
+}
+
+void PipelinedWrite(AgcDriver::DriverDetail::DrawPipeline::CommitKind kind, std::uintptr_t address, std::vector<std::byte> bytes) {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = DrawPipeline::Queue0();
+    const auto end = address + bytes.size();
+    pipeline.Enqueue(kind, [address, bytes = std::move(bytes)] { GuestMemory::Write(address, bytes, 4); }, {{address, end}});
+    pipeline.Drain(DrawPipeline::DrainReason::Flush);
+}
+
+std::vector<std::byte> TexelBytes(float value) {
+    std::vector<float> texels(TexelWidth * TexelHeight, value);
+    const auto bytes = std::as_bytes(std::span(texels));
+    return {bytes.begin(), bytes.end()};
+}
+
+bool RecordedPendingVoids(AgcDriver::VulkanDevice& device) {
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "recorded");
+    GuestBlocks memory(2u * BlockBytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory.base);
+    using Note = std::function<void(AgcDriver::Graphics::Recorder&, std::uint64_t)>;
+    const std::array<std::pair<const char*, Note>, 5> notes{{
+        {"NotePendingWrite", [](auto& recorder, std::uint64_t address) { recorder.NotePendingWrite(address, 64); }},
+        {"NotePendingFill", [](auto& recorder, std::uint64_t address) { recorder.NotePendingFill(address, 64, 0x5a); }},
+        {"NotePendingWordFill", [](auto& recorder, std::uint64_t address) { recorder.NotePendingWordFill(address, 64, 0x12345678u); }},
+        {"NotePendingWrites", [](auto& recorder, std::uint64_t address) {
+             const std::array ranges{std::pair<std::uint64_t, std::uint64_t>{address, address + 64}};
+             recorder.NotePendingWrites(ranges);
+         }},
+        {"AfterCompletions on an in-flight batch", [](auto& recorder, std::uint64_t address) {
+             static_cast<void>(recorder.Commands());
+             recorder.Submit();
+             const std::uint32_t label = 7;
+             recorder.AfterCompletions(address, std::as_bytes(std::span(&label, 1)), 1, 0, false);
+         }},
+    }};
+    bool voided = true;
+    for (std::size_t i = 0; i < notes.size(); ++i) {
+        const auto target = base + i * 4096u;
+        const auto beside = base + BlockBytes + i * 4096u;
+        const std::array targetRange{std::pair<std::uint64_t, std::uint64_t>{target, target + 64}};
+        const std::array besideRange{std::pair<std::uint64_t, std::uint64_t>{beside, beside + 64}};
+        const auto targetSubscription = GuestMemory::SubscribeWrites(targetRange);
+        const auto besideSubscription = GuestMemory::SubscribeWrites(besideRange);
+        const auto targetCertificate = GuestMemory::CertifySubscription(*targetSubscription, 0);
+        const auto besideCertificate = GuestMemory::CertifySubscription(*besideSubscription, 0);
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            auto* recorder = AgcDriver::Graphics::Recorder::Active();
+            Require(recorder != nullptr, "recorded: no active recorder after a draw");
+            notes[i].second(*recorder, target);
+        }
+        Require(GuestMemory::CertificateHolds(*besideSubscription, besideCertificate, 0), std::string("recorded: ") + notes[i].first + " voided a certificate on another block");
+        if (GuestMemory::CertificateHolds(*targetSubscription, targetCertificate, 0)) voided = false;
+    }
+    device.WaitIdle();
+    return voided;
+}
+
+void Recorded(AgcDriver::VulkanDevice& device) {
+    Require(RecordedPendingVoids(device), "recorded: a recorded pending GPU write left a certificate on its range standing");
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::HideRecordedPendingBumps);
+    const bool caught = RecordedPendingVoids(device);
+    GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::None);
+    Require(!caught, "recorded: hiding recorded pending bumps kept every certificate voided, so the case tests nothing");
+    std::printf("certified proofs: recorded pending writes void certificates on their range only\n");
+}
+
+void NonDraw(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const auto elsewhere = [&](DrawPipeline::CommitKind kind, const std::string& what) {
+        auto& scene = NewScene();
+        Build(device, scene);
+        Settle(device, scene, what);
+        PipelinedWrite(kind, reinterpret_cast<std::uintptr_t>(scene.blocks.base), std::vector<std::byte>(256));
+        const auto outcome = Draw(device, scene, false);
+        Require(outcome.brightest == 255u && outcome.counts.disagreed == 0, what + ": the draw after a pipelined store elsewhere sampled the wrong texels (" + outcome.Describe() + ")");
+        return outcome;
+    };
+    auto outcome = elsewhere(DrawPipeline::CommitKind::Store, "nondraw (store elsewhere)");
+    Require(outcome.counts.proved + outcome.counts.verified == 1, "nondraw: a pipelined store to a range the certificate does not subscribe voided it (" + outcome.Describe() + ")");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCoveredCommits, true);
+    outcome = elsewhere(DrawPipeline::CommitKind::Store, "nondraw (store elsewhere, switch set)");
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoCoveredCommits, false);
+    Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, "nondraw: with APS5_NO_COVERED_COMMITS a pipelined store elsewhere kept the certificate (" + outcome.Describe() + ")");
+    outcome = elsewhere(DrawPipeline::CommitKind::DmaFill, "nondraw (unaudited kind elsewhere)");
+    Require(outcome.counts.proved == 0 && outcome.Missed(CertifiedMiss::Proof) == 1, "nondraw: a pipelined commit of a kind with an unknown effect kept the certificate (" + outcome.Describe() + ")");
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "nondraw (store into the texture)");
+    PipelinedWrite(DrawPipeline::CommitKind::Store, reinterpret_cast<std::uintptr_t>(scene.Texels(Key)), TexelBytes(0.0f));
+    outcome = Draw(device, scene, false);
+    Require(outcome.counts.proved == 0 && outcome.brightest == 0u && outcome.counts.disagreed == 0, "nondraw: a pipelined store into the sampled texture kept the certificate or sampled stale texels (" + outcome.Describe() + ")");
+}
+
+void Joint(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::GateMiss;
+    using AgcDriver::Graphics::GateMissBit;
+    using AgcDriver::Graphics::PendingBump;
+    using AgcDriver::Graphics::StorageTexture;
+    if (!GuestMemory::ProofBreaksCounted() || !AgcDriver::Graphics::PendingBumpsCounted()) {
+        std::puts("joint: skipped without APS5_PROFILE_DRAW");
+        return;
+    }
+    const auto onlySet = [](const Outcome& outcome, std::uint32_t set) {
+        std::uint64_t others = 0;
+        for (std::size_t i = 0; i < outcome.counts.certifiedGateSets.size(); ++i) {
+            if (i != set) others += outcome.counts.certifiedGateSets[i];
+        }
+        return outcome.counts.certifiedGateSets[set] == 1 && others == 0;
+    };
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "joint");
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    StorageTexture::BumpPendingSerial(PendingBump::Shadowed);
+    auto outcome = Draw(device, scene, false);
+    RequireMissed(outcome, "joint", 255u);
+    Require(onlySet(outcome, GateMissBit(GateMiss::Proof) | GateMissBit(GateMiss::Pending)), "joint: a miss after an uncovered proof break and a pending bump was not counted once with both gates (" + outcome.Describe() + ")");
+    Settle(device, scene, "joint (after)");
+    StorageTexture::BumpPendingSerial(PendingBump::Shadowed);
+    outcome = Draw(device, scene, false);
+    RequireMissed(outcome, "joint (pending only)", 255u);
+    Require(onlySet(outcome, GateMissBit(GateMiss::Pending)), "joint: a miss after a pending bump alone was not counted once with only the pending gate (" + outcome.Describe() + ")");
+    Require(outcome.counts.pendingMissSources[static_cast<std::size_t>(PendingBump::Shadowed)] == 1 && outcome.counts.pendingMissUnattributed == 0, "joint: a pending miss was not attributed to its bump source (" + outcome.Describe() + ")");
+    if (!AgcDriver::Graphics::ShaderResources::EpochProofs()) {
+        std::puts("joint: epoch gate skipped without APS5_DRAW_PIPELINE");
+        return;
+    }
+    using AgcDriver::Graphics::EpochGateMiss;
+    using AgcDriver::Graphics::EpochGateMissBit;
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CertifiedProofs, false);
+    static_cast<void>(Draw(device, scene, true, false));
+    static_cast<void>(Draw(device, scene, false, false));
+    GuestMemory::BreakProofs(GuestMemory::ProofBreak::GpuLock);
+    outcome = Draw(device, scene, true, false);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::CertifiedProofs, true);
+    const auto both = EpochGateMissBit(EpochGateMiss::Epoch) | EpochGateMissBit(EpochGateMiss::Proof);
+    std::uint64_t withBoth = 0;
+    for (std::size_t set = 0; set < outcome.counts.epochGateSets.size(); ++set) {
+        if ((set & both) == both) withBoth += outcome.counts.epochGateSets[set];
+    }
+    Require(withBoth == 1, "joint: an epoch-proof miss after a new epoch and a proof break was not counted with both gates");
+    Require(Brightest() == 255u, "joint: the draws around the epoch-gate check sampled the wrong texels");
 }
 
 struct OracleScene {
@@ -567,6 +843,7 @@ struct OracleScene {
     std::uint32_t selected = Key;
     bool unwatched = false;
     bool readOnly = false;
+    std::vector<GuestMemory::WriteOwner> owners;
 };
 
 struct OracleFailure : std::runtime_error {
@@ -578,7 +855,7 @@ std::uint64_t OracleSeed() {
     return 0x5eedu;
 }
 
-std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun) {
+std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, bool owners) {
     std::mt19937_64 random(seed);
     const auto pick = [&](std::uint32_t count) { return static_cast<std::uint32_t>(random() % count); };
     std::vector<OracleScene> scenes;
@@ -587,6 +864,9 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
         oracle.scene = &NewScene();
         Build(device, *oracle.scene);
         for (std::uint32_t image = 0; image < Images; ++image) oracle.values[image] = image == Key ? 1.0f : 0.0f;
+        if (owners) {
+            for (std::uint32_t image = 0; image < Images; ++image) oracle.owners.emplace_back(reinterpret_cast<std::uintptr_t>(oracle.scene->Texels(image)), BlockBytes);
+        }
         return oracle;
     };
     for (int i = 0; i < scenesPerRun; ++i) scenes.push_back(fresh());
@@ -623,7 +903,7 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
         };
         const char* event = "";
         bool cpuWrite = false;
-        switch (pick(9)) {
+        switch (pick(12)) {
         case 0:
         case 1: {
             event = "cpu write to the sampled texture";
@@ -683,6 +963,23 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
             AgcDriver::Graphics::ClearCachedTextures(device.Device());
             break;
         }
+        case 9: {
+            event = "own store";
+            if (oracle.readOnly) flipMapping(oracle);
+            const auto image = pick(2) == 0 ? oracle.selected : other();
+            oracle.values[image] = oracle.values[image] != 0.0f ? 0.0f : 1.0f;
+            std::vector<float> texels(TexelWidth * TexelHeight, oracle.values[image]);
+            static_cast<void>(GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(scene.Texels(image)), std::as_bytes(std::span(texels))));
+            break;
+        }
+        case 10: {
+            event = "pipelined store";
+            if (oracle.readOnly) flipMapping(oracle);
+            const auto image = pick(2) == 0 ? oracle.selected : other();
+            oracle.values[image] = oracle.values[image] != 0.0f ? 0.0f : 1.0f;
+            PipelinedWrite(AgcDriver::DriverDetail::DrawPipeline::CommitKind::Store, reinterpret_cast<std::uintptr_t>(scene.Texels(image)), TexelBytes(oracle.values[image]));
+            break;
+        }
         default: {
             event = "depth surfaces change";
             AgcDriver::Graphics::ClearDepthSurfaces(device.Device());
@@ -698,24 +995,59 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
     return warmed;
 }
 
+enum class OracleMode { Handles, Owners, Blocks };
+
+std::uint64_t RunOracleWith(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, OracleMode mode) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    struct Restore {
+        ~Restore() {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, false);
+            GuestMemory::SetWriteOwnersIgnoredForTest(false);
+        }
+    } restore;
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, mode == OracleMode::Handles);
+    GuestMemory::SetWriteOwnersIgnoredForTest(mode == OracleMode::Blocks);
+    return RunOracle(device, seed, steps, scenesPerRun, mode == OracleMode::Owners);
+}
+
 void Oracle(AgcDriver::VulkanDevice& device) {
     const auto seed = OracleSeed();
     constexpr int steps = 160;
-    const auto warmed = RunOracle(device, seed, steps, 3);
-    Require(warmed * 4 >= steps * 3, "oracle: only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
-    std::printf("certified proofs: oracle seed %llu, %llu of %d events met a live certificate\n", static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps);
+    for (const auto oracleMode : {OracleMode::Handles, OracleMode::Owners, OracleMode::Blocks}) {
+        const auto before = GuestMemory::WriteIndexCounted();
+        const auto warmed = RunOracleWith(device, seed, steps, 3, oracleMode);
+        const auto after = GuestMemory::WriteIndexCounted();
+        const auto dependencies = after.ownerDependencies - before.ownerDependencies;
+        const auto blockDependencies = after.blockDependencies - before.blockDependencies;
+        const auto ownerBumps = after.ownerBumps + after.ownerFastBumps - before.ownerBumps - before.ownerFastBumps;
+        const char* mode = oracleMode == OracleMode::Handles ? "on handles" : oracleMode == OracleMode::Owners ? "with owners" : "on block counters";
+        const bool shaped = oracleMode == OracleMode::Handles ? dependencies == 0 && blockDependencies == 0 : oracleMode == OracleMode::Owners ? dependencies != 0 && ownerBumps != 0 : dependencies == 0 && blockDependencies != 0;
+        Require(warmed * 4 >= steps * 3, std::string("oracle ") + mode + ": only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
+        Require(shaped, std::string("oracle ") + mode + ": " + std::to_string(dependencies) + " owner dependencies, " + std::to_string(blockDependencies) + " block dependencies and " + std::to_string(ownerBumps) + " owner bumps");
+        std::printf("certified proofs: oracle %s seed %llu, %llu of %d events met a live certificate, %llu owner dependencies, %llu block dependencies, %llu owner bumps\n", mode, static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps, static_cast<unsigned long long>(dependencies), static_cast<unsigned long long>(blockDependencies), static_cast<unsigned long long>(ownerBumps));
+    }
 }
 
 void Mutants(AgcDriver::VulkanDevice& device) {
     using GuestMemory::CertificateMutant;
-    constexpr std::array<std::pair<CertificateMutant, const char*>, 4> mutants{{{CertificateMutant::IgnoreVersion, "a stale certificate after a write"}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch"}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change"}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing"}}};
-    for (const auto& [mutant, name] : mutants) {
+    struct Mutant {
+        CertificateMutant mutant;
+        const char* name;
+        OracleMode mode;
+    };
+    constexpr auto Handles = OracleMode::Handles;
+    constexpr auto Owners = OracleMode::Owners;
+    constexpr auto Blocks = OracleMode::Blocks;
+    constexpr std::array<Mutant, 12> mutants{{{CertificateMutant::HidePipelineCommitBumps, "a stale certificate after a pipelined store that bumps nothing", Handles}, {CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing", Handles}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write", Handles}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch", Handles}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change", Handles}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing", Handles}, {CertificateMutant::IgnoreOwners, "a stale certificate after a write into its owner", Owners}, {CertificateMutant::HideOwnerBumps, "a stale certificate after a write its owner never counts", Owners}, {CertificateMutant::CertificateDropsOwners, "a stale certificate that does not carry its owners", Owners}, {CertificateMutant::HideBlockBumps, "a stale certificate after a write its block never counts", Blocks}, {CertificateMutant::CertificateDropsBlocks, "a stale certificate that does not carry its blocks", Blocks}, {CertificateMutant::CertificateSkipsVersion, "a stale certificate on handles that skips its version", Handles}}};
+    for (const auto& [mutant, name, mode] : mutants) {
         GuestMemory::SetCertificateMutantForTest(mutant);
         std::string caught;
-        try {
-            RunOracle(device, OracleSeed(), 160, 3);
-        } catch (const OracleFailure& failure) {
-            caught = failure.what();
+        for (std::uint64_t attempt = 0; attempt < 4 && caught.empty(); ++attempt) {
+            try {
+                RunOracleWith(device, OracleSeed() + attempt, 160, 3, mode);
+            } catch (const OracleFailure& failure) {
+                caught = failure.what();
+            }
         }
         GuestMemory::SetCertificateMutantForTest(CertificateMutant::None);
         {
@@ -735,6 +1067,7 @@ void Mutants(AgcDriver::VulkanDevice& device) {
 
 int main(int argc, char** argv) {
     try {
+        GuestMemory::SetWriteIndexCountingForTest(true);
 #ifdef _WIN32
         _putenv_s("APS5_CERTIFIED_PROOFS", "1");
 #else
@@ -752,7 +1085,11 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 16> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        if (!SceneWatched(*device)) {
+            std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
+            return VulkanTestSkipped;
+        }
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 21> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"invalidate", &Invalidate}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

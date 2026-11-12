@@ -44,6 +44,9 @@ enum class RuntimeSwitch : std::size_t {
     NoStagingPrediction,
     OneStageRequest,
     StageHandleHints,
+    NoCoveredCommits,
+    NoWriteOwners,
+    WholePendingBumps,
     Count,
 };
 

@@ -80,6 +80,7 @@ public:
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
+    std::uint64_t CommitBreaks(CommitKind kind, bool declaredWrites) const;
 private:
     struct Item {
         Commit commit;
@@ -138,6 +139,8 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(CommitKind::Count)> kindBreaks{};
+    std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(CommitKind::Count)> reportedKindBreaks{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
