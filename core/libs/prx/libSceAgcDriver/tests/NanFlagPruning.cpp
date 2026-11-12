@@ -1,4 +1,6 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
+#include "Optimization/ConstantFolder.hpp"
+#include "Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/NanFlagPruner.hpp"
 #include <cstdint>
 #include <cstdio>
@@ -217,6 +219,20 @@ std::vector<Case> Cases() {
             b.check(Packed(b, kept), Both);
             b.prune();
             return Removed(vc) && !Removed(uc) && b.program.Metadata().nanSpeculationLaneWrites.empty();
+        }},
+        {"a branch condition the constant fold replaces still names a live value after dead code elimination", [](Builder& b) {
+            auto& compare = b.emit(IrOpcode::IEqual32, IrType::Bool, {&b.constant(1u), &b.constant(1u)});
+            b.emit(IrOpcode::Reference, IrType::Void, {&compare});
+            BlockInfo info;
+            info.id = 0;
+            info.terminator.kind = TerminatorKind::ConditionalBranch;
+            info.condition = &compare;
+            b.program.Metadata().blockInfo.push_back(info);
+            ConstantFolder{}.Fold(b.program);
+            DeadCodeEliminator{}.RemoveIdentities(b.program);
+            DeadCodeEliminator{}.Eliminate(b.program);
+            const IrValue* condition = b.program.Metadata().blockInfo.front().condition->Resolve();
+            return condition->Opcode() != IrOpcode::Unreachable && (condition->HasImmediate() || condition->Parent() != nullptr);
         }},
         {"a NaN check through an identity is pruned", [](Builder& b) {
             auto& v = b.emit(IrOpcode::FPMul16x2, IrType::U32, {&b.unknown(), &b.unknown()});
