@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -987,7 +988,9 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                     memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                     drawStageMemoCounters.Add(DrawStageMemoCount::ValidatedReused);
                 } else {
-                    const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i]) : nullptr;
+                    std::optional<ShaderRecompiler::RecompileRequest> stageRequest;
+                    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OneStageRequest)) stageRequest.emplace(DrawStageRequest(program, pushCursorBytes, graphics, {}, {}, drawParameters, localDevice->Target(), std::nullopt));
+                    const auto memoHit = stageEntries && candidate == dataCandidates[i].end() && stageData[i].compiled == nullptr ? lookupDrawStage(i, pushCursorBytes, submission.queue, programs, graphics, pixel, vertexInfos, drawParameters, localDevice, memoPending[i], stageRequest ? &*stageRequest : nullptr) : nullptr;
                     if (memoHit != nullptr && !verifyDrawStageMemo()) {
                         matched[i] = memoHit->variant;
                         stageCaptures[i].registeredViews = matched[i]->registeredViews;
@@ -997,7 +1000,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                         programResults[i] = matched[i]->compiled.get();
                         memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
                     } else {
-                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
+                        compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics, stageRequest ? &*stageRequest : nullptr));
                         if (!rejected.empty()) return DrawVerdict::Rejected;
                         programResults[i] = compiledStages.back().get();
                         if (memoHit != nullptr) verifyMemoStage(i, *memoHit->variant);
