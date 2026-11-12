@@ -727,6 +727,14 @@ bool LateOwnerSeesCountedSubscription() {
     return !CertificateHolds(*subscription, certificate, 0);
 }
 
+bool HandleBumpVoids() {
+    const auto subscription = Subscribe(Base + 230 * Block, 1);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(!certificate.handles || CertificateHolds(*subscription, certificate, 0), "a certificate on handles did not hold with nothing changed");
+    Pending(Base + 230 * Block + 64);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
 void CheckBlockCounters() {
     const auto subscription = Subscribe(Base + 202 * Block, 1, WriteChangeAll, false);
     const auto masked = Subscribe(Base + 202 * Block, 1, WriteChangeBit(WriteChange::Identity), false);
@@ -746,6 +754,11 @@ void CheckBlockCounters() {
     Pending(Base + (220 + CertificateInlineOwners) * Block);
     Require(!CertificateHolds(*wide, wideCertificate, 0), "a bump in the last block of a wide subscription left its certificate standing");
     Require(BlockBumpVoids(), "a bump inside a block left its certificate standing");
+    Require(!certificate.handles && HandleBumpVoids(), "a certificate on block counters read its version, or one on handles missed a bump");
+    SetCertificateMutantForTest(CertificateMutant::CertificateSkipsVersion);
+    const bool skipped = HandleBumpVoids();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(!skipped, "the handle test does not catch a certificate that skips its version");
     Require(LateOwnerSeesCountedSubscription(), "an owner registered after a subscription on block counters took the fast path past it");
     for (const auto mutant : {CertificateMutant::HideBlockBumps, CertificateMutant::CertificateDropsBlocks}) {
         SetCertificateMutantForTest(mutant);

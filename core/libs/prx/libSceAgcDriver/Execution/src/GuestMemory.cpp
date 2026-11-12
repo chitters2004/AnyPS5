@@ -743,6 +743,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
     WriteCertificate certificate;
     certificate.version = observeVersion(subscription);
     certificate.cell = subscription.version;
+    certificate.handles = !subscription.keys.empty() && certificateMutant.load(std::memory_order_relaxed) != CertificateMutant::CertificateSkipsVersion;
     certificate.typeMask = subscription.typeMask.load(std::memory_order_relaxed);
     certificate.ownerCount = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::CertificateDropsOwners ? 0u : static_cast<std::uint32_t>(subscription.ownerDependencies.size());
     if (certificate.ownerCount <= CertificateInlineOwners) std::copy_n(subscription.ownerDependencies.begin(), certificate.ownerCount, certificate.ownerHandles.begin());
@@ -824,6 +825,7 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
         const auto sum = ownerSum(dependencies, typeMask, live) + blockSum(blocks, typeMask);
         if (!live || sum != certificate.owners) return false;
     }
+    if (inlined && !certificate.handles) return true;
     const auto& version = inlined ? *certificate.cell : *subscription.version;
     return mutant == CertificateMutant::IgnoreVersion || version.load(std::memory_order_acquire) == certificate.version;
 }

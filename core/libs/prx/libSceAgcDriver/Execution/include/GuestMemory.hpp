@@ -99,6 +99,7 @@ struct WriteCertificate {
     std::uint32_t ownerCount = 0;
     std::array<std::uint64_t, CertificateInlineOwners> ownerHandles{};
     std::uint32_t blockCount = 0;
+    bool handles = true;
     std::array<const std::atomic<std::uint64_t>*, CertificateInlineOwners> blockChanges{};
 };
 bool WriteIndexEnabled();
@@ -134,7 +135,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 void SetWriteIndexCountingForTest(bool counting);
 void SetWriteOwnersIgnoredForTest(bool ignored);
