@@ -3035,6 +3035,50 @@ void CheckPreparerObservesInputs() {
     Require(freshWalks > 0 && freshWritten, "a range not observed in a new epoch was not walked, or its write was missed");
 }
 
+alignas(4096) const std::array<std::byte, 8192> ImageBytes{};
+
+void CheckPageStateMisses() {
+    Require(std::getenv("APS5_PROFILE_DRAW") != nullptr, "the page-state miss test needs APS5_PROFILE_DRAW");
+    Require(GuestArena::GuestArenaAvailable_nid_postfix(), "the page-state miss test needs the guest arena");
+    constexpr std::size_t bytes = 2 * Block;
+    constexpr std::uint32_t readWrite = 0x04;
+#ifdef _WIN32
+    void* outside = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    Require(outside != nullptr, "cannot map memory outside the guest arena");
+#else
+    void* outside = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(outside != MAP_FAILED, "cannot map memory outside the guest arena");
+#endif
+    Require(!GuestArena::GuestArenaContains_nid_postfix(outside, bytes), "the outside mapping landed in the guest arena");
+    void* inside = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block);
+    Require(inside != nullptr, "cannot allocate the arena block");
+    GuestArena::GuestArenaCommit_nid_postfix(inside, bytes, readWrite, bytes);
+    const auto describe = [](const void* pointer, std::size_t length, bool writable) {
+        const auto before = PageStateMissesForTest();
+        Require(DescribeCommitted(reinterpret_cast<std::uint64_t>(pointer), length, writable).whole, "a committed range was not described as accessible");
+        const auto after = PageStateMissesForTest();
+        return std::array<std::uint64_t, 3>{after[0] - before[0], after[1] - before[1], after[2] - before[2]};
+    };
+    for (int round = 0; round < 3; ++round) {
+        const auto missed = describe(outside, bytes, true);
+        Require(missed[2] != 0, "a lookup outside the arena and the image did not count as an outside miss");
+        Require(missed[0] == 0 && missed[1] == 0, "a lookup outside the arena counted as an arena or image miss");
+    }
+    describe(inside, bytes, true);
+    const auto arena = describe(inside, bytes, true);
+    Require(arena[0] == 0 && arena[1] == 0 && arena[2] == 0, "a repeated lookup in the guest arena queried the OS again");
+    describe(ImageBytes.data(), ImageBytes.size(), false);
+    const auto image = describe(ImageBytes.data(), ImageBytes.size(), false);
+    Require(image[0] == 0 && image[1] == 0 && image[2] == 0, "a repeated lookup in the main image queried the OS again");
+    GuestArena::GuestArenaReset_nid_postfix(inside, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(inside, bytes);
+#ifdef _WIN32
+    VirtualFree(outside, 0, MEM_RELEASE);
+#else
+    munmap(outside, bytes);
+#endif
+}
+
 void RunInputCollectBench(int inputs) {
     constexpr int Rounds = 20000;
     const auto bytes = static_cast<std::size_t>(inputs) * Block;
@@ -3080,6 +3124,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 3 && std::string_view(argv[1]) == "--input-collect-bench") {
             RunInputCollectBench(std::stoi(argv[2]));
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--page-state-misses") {
+            CheckPageStateMisses();
+            std::cout << "page-state miss counter tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--observed-inputs") {

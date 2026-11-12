@@ -190,6 +190,7 @@ void SetObservationHookForTest(void (*hook)(int point));
 void SetObservationServiceForTest(bool enabled);
 void DrainObservationServiceForTest();
 void SetConsumeStampHookForTest(void (*hook)());
+std::array<std::uint64_t, 3> PageStateMissesForTest();
 void SetConsumeCapacityForTest(std::size_t runs);
 std::uint64_t ConsumeCompactionsForTest();
 bool OnObservationServiceThread();

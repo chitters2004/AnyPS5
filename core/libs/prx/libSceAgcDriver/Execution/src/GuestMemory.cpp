@@ -622,6 +622,8 @@ std::atomic<std::uint64_t> claimWaitNanoseconds{0};
 std::atomic<std::uint64_t> unlockedWalks{0};
 std::atomic<std::uint64_t> fallbackWalks{0};
 ProfileCounter observedProofs;
+enum PageStateMissSpan : std::size_t { PageStateMissArena, PageStateMissImage, PageStateMissOutside, PageStateMissSpans };
+std::array<ProfileCounter, PageStateMissSpans> pageStateMisses;
 std::atomic<std::uint64_t> refusedGeneration{0};
 std::atomic<std::uint64_t> fallbackNanoseconds{0};
 std::atomic<std::uint64_t> serviceSweeps{0};
@@ -858,6 +860,7 @@ public:
         AgcDriver::ProfilePrint_nid_no_patch(" | observed proofs %llu", static_cast<unsigned long long>(observedProofs.Sum()));
         AgcDriver::ProfilePrint_nid_no_patch(" | epoch service sweeps %llu runs %llu walks %llu skipped %llu (%.2f ms), fallback walks %llu (%.2f ms)", static_cast<unsigned long long>(serviceSweeps.load()), static_cast<unsigned long long>(serviceRuns.load()), static_cast<unsigned long long>(serviceWalks.load()), static_cast<unsigned long long>(serviceSkips.load()), serviceNanoseconds.load() / 1e6, static_cast<unsigned long long>(fallbackWalks.load()), fallbackNanoseconds.load() / 1e6);
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
+        AgcDriver::ProfilePrint_nid_no_patch(" | page-state misses (OS queries): arena %llu image %llu outside %llu", static_cast<unsigned long long>(pageStateMisses[PageStateMissArena].Sum()), static_cast<unsigned long long>(pageStateMisses[PageStateMissImage].Sum()), static_cast<unsigned long long>(pageStateMisses[PageStateMissOutside].Sum()));
         {
             std::lock_guard lock(state.callersMutex);
             AgcDriver::ProfilePrint_nid_no_patch(" | read callers:");
@@ -1225,7 +1228,8 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
     const auto end = address + bytes;
     auto cursor = address;
     while (cursor < end) {
-        if (const auto* span = pages.spanOf(cursor)) {
+        const auto* span = pages.spanOf(cursor);
+        if (span != nullptr) {
             const auto value = span->load(cursor);
             if (value != 0) {
                 const auto next = span->runEnd(cursor, value, end);
@@ -1234,6 +1238,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                 continue;
             }
         }
+        if (MemoryProfiled()) pageStateMisses[span == nullptr ? PageStateMissOutside : span == &pages.image ? PageStateMissImage : PageStateMissArena].Add();
 #ifdef _WIN32
         const TimedAccess timed(CounterQuery, 0);
         MEMORY_BASIC_INFORMATION memory{};
@@ -3075,6 +3080,10 @@ bool UnwatchWritesProven() {
 
 void SetConsumeStampHookForTest(void (*hook)()) {
     consumeStampHook.store(hook, std::memory_order_release);
+}
+
+std::array<std::uint64_t, 3> PageStateMissesForTest() {
+    return {pageStateMisses[PageStateMissArena].Sum(), pageStateMisses[PageStateMissImage].Sum(), pageStateMisses[PageStateMissOutside].Sum()};
 }
 
 void SetConsumeCapacityForTest(std::size_t runs) {
