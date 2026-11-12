@@ -12,6 +12,7 @@
 #include "Optimization/RequestMemoryView.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "IntermediateRepresentation/IrBlock.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1345,6 +1346,68 @@ int runLoadingProcess() {
     require(!loaded.spirv.empty(), "the loaded SPIR-V is empty");
     std::cout << "second process loaded " << loaded.spirv.size() << " SPIR-V words from the disk cache\n";
     return 0;
+}
+
+void plantRequest(ComputeRequest& request, bool specialized) {
+    if (!specialized) request.code = {0xbf810000u};
+    request.request.shader = {ShaderStage::Compute, specialized ? 0x31000u : 0x32000u, request.code, 0, {}};
+    request.request.layout.pushConstantSizeBytes = specialized ? 128u : 0u;
+}
+
+std::filesystem::path plantedEntryPath(const RecompileRequest& request, std::vector<std::byte>& key) {
+    ShaderDiskCache::BuildKey(request, request.target.subgroupSize, key);
+    return ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key);
+}
+
+std::string recompileFailure(const RecompileRequest& request) {
+    try {
+        static_cast<void>(Recompile(request));
+    } catch (const std::exception& error) {
+        return error.what();
+    }
+    return {};
+}
+
+int runPlantedLoadingProcess() {
+    ComputeRequest specialized(true);
+    ComputeRequest unspecialized(true);
+    plantRequest(specialized, true);
+    plantRequest(unspecialized, false);
+    const auto specializedFailure = recompileFailure(specialized.request);
+    require(specializedFailure.find("SPIR-V validation before optimization failed") != std::string::npos, "a planted invalid module was specialized without a validation error: " + specializedFailure);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const auto failure = recompileFailure(unspecialized.request);
+        require(failure.find("SPIR-V validation failed") != std::string::npos, "a planted invalid module reached the caller unspecialized without a validation error: " + failure);
+    }
+    const auto totals = ShaderDiskCache::Totals();
+    require(totals.hits == 2 && totals.misses == 0, "the planted entries were not loaded (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
+    return 0;
+}
+
+void verifyPlantedInvalidModules(const char* self) {
+    for (const bool specialized : {true, false}) {
+        ComputeRequest request(true);
+        plantRequest(request, specialized);
+        const auto compiled = Recompile(request.request);
+        require((compiled.specializationId != 0u) == specialized, specialized ? "the planted push data request was not specialized" : "the planted request without push data was specialized");
+        ShaderDiskCache::Flush();
+        std::vector<std::byte> key;
+        const auto path = plantedEntryPath(request.request, key);
+        std::vector<std::byte> file;
+        require(ReadWholeFile(path, file), "cannot read the stored entry to plant");
+        CompiledVariant variant;
+        require(ShaderDiskCache::DecodeEntry(file, key, variant) == ShaderDiskCache::LoadStatus::Loaded, "cannot decode the stored entry to plant");
+        auto words = variant.artifact.spirv.Copy();
+        auto cursor = std::size_t{5};
+        while (cursor < words.size() && static_cast<spv::Op>(words[cursor] & 0xffffu) != spv::OpMemoryModel) cursor += words[cursor] >> 16u;
+        require(cursor < words.size(), "the stored module has no memory model");
+        const std::vector<std::uint32_t> memoryModel(words.begin() + static_cast<std::ptrdiff_t>(cursor), words.begin() + static_cast<std::ptrdiff_t>(cursor + (words[cursor] >> 16u)));
+        words.insert(words.begin() + static_cast<std::ptrdiff_t>(cursor), memoryModel.begin(), memoryModel.end());
+        variant.artifact.spirv = std::move(words);
+        require(WriteFileAtomically(path, ShaderDiskCache::EncodeEntry(key, variant)), "cannot write the planted entry");
+    }
+    const std::string command = "\"" + std::string(self) + "\" --load-planted";
+    require(std::system(command.c_str()) == 0, "the planted loading process failed");
 }
 
 void verifyAcrossProcesses(const char* self) {
@@ -2820,6 +2883,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--large-file") return runLargeFileWrite();
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
+        if (argc == 2 && std::string_view(argv[1]) == "--load-planted") return runPlantedLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--load-prebuilt") return runPrebuiltLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         if (argc == 2 && std::string_view(argv[1]).starts_with("--load-plan")) return runPlanLoadingProcess(argv[1]);
@@ -2844,6 +2908,9 @@ int main(int argc, char** argv) {
         verifyStore();
         verifyPersist();
         verifyAcrossProcesses(argv[0]);
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        verifyPlantedInvalidModules(argv[0]);
+#endif
         verifyPrebuiltAcrossProcesses(argv[0], directory);
         verifyPlanAcrossProcesses(argv[0]);
         verifyEmissionFailureMemo();

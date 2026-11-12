@@ -786,7 +786,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     const bool embedded = !result.vertexInputs.empty() && inputInfo.vertex != nullptr && inputInfo.vertex->fetchEmbedded;
     if (embedded) PrepareVertexInputSpecialization(result);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded);
+    result.spirv = ValidateAndOptimizeSpirv(result.spirv, request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets, !embedded, false, SpirvOutputValidation::Caller);
     if (embedded) {
         std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> classes{};
         for (std::uint32_t kind = 1u; kind < 3u; ++kind) {
@@ -887,7 +887,7 @@ std::vector<std::uint32_t> specializeWords(const CompiledShaderArtifact& artifac
     }
     materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, retained.empty());
+    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, retained.empty(), SpirvOutputValidation::Caller);
 #endif
     std::map<std::uint32_t, std::uint32_t> descriptorVariables;
     std::set<std::uint32_t> usedDescriptors;
@@ -1326,6 +1326,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.specialization = module->specialization;
         bindingPlan = &entry->bindings;
     } else {
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+        variant.unspecializedValidation.Run([&] { ValidateSpirv(artifact.spirv.Words(), request.target.vulkanVersion, request.target.spirvVersion, request.target.nonConstantImageOffsets); });
+#endif
         result.spirv = artifact.spirv;
     }
     const auto resolved = ResourceMaterializer::ResolveImageTablesShared(variant.info.info, snapshot, artifact.variantId);

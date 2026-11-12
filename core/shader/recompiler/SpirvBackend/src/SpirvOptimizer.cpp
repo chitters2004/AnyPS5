@@ -144,7 +144,7 @@ std::vector<std::uint32_t> CollapseBlockBallots(std::span<const std::uint32_t> s
     return collapsed;
 }
 
-std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize) {
+spv_target_env TargetEnvironment(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion) {
     spv_target_env environment;
     const auto apiVersion = vulkanVersion & ~0xfffu;
     std::uint32_t maxSpirvVersion = 0;
@@ -162,25 +162,60 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::u
     if (spirv.size() >= 5 && spirv[1] > spirvVersion) {
         throw std::runtime_error("SPIRV-Tools: module version exceeds requested SPIR-V target");
     }
-    std::string diagnostics;
-    const auto consumer = [&diagnostics](spv_message_level_t level, const char* source, const spv_position_t& position, const char* message) {
-        if (!diagnostics.empty()) diagnostics += '\n';
-        diagnostics += "level=" + std::to_string(static_cast<int>(level)) + " word=" + std::to_string(position.index);
-        if (source != nullptr && *source != '\0') diagnostics += " source=" + std::string(source);
-        if (message != nullptr) diagnostics += ": " + std::string(message);
-    };
-    spvtools::SpirvTools tools(environment);
-    if (!tools.IsValid()) throw std::runtime_error("SPIRV-Tools: cannot create validator");
-    tools.SetMessageConsumer(consumer);
-    spvtools::ValidatorOptions validatorOptions;
-    validatorOptions.SetAllowOffsetTextureOperand(allowOffsetTextureOperand);
-    validatorOptions.SetFriendlyNames(false);
-    if (!tools.Validate(spirv.data(), spirv.size(), validatorOptions)) {
-        throw std::runtime_error("SPIR-V validation before optimization failed:\n" + diagnostics);
+    return environment;
+}
+
+class SpirvValidator {
+public:
+    SpirvValidator(spv_target_env environment, bool allowOffsetTextureOperand) : tools(environment) {
+        if (!tools.IsValid()) throw std::runtime_error("SPIRV-Tools: cannot create validator");
+        tools.SetMessageConsumer(Consumer());
+        options.SetAllowOffsetTextureOperand(allowOffsetTextureOperand);
+        options.SetFriendlyNames(false);
     }
+
+    SpirvValidator(const SpirvValidator&) = delete;
+    SpirvValidator& operator=(const SpirvValidator&) = delete;
+
+    [[nodiscard]] spvtools::MessageConsumer Consumer() {
+        return [this](spv_message_level_t level, const char* source, const spv_position_t& position, const char* message) {
+            if (!diagnostics.empty()) diagnostics += '\n';
+            diagnostics += "level=" + std::to_string(static_cast<int>(level)) + " word=" + std::to_string(position.index);
+            if (source != nullptr && *source != '\0') diagnostics += " source=" + std::string(source);
+            if (message != nullptr) diagnostics += ": " + std::string(message);
+        };
+    }
+
+    void Require(std::span<const std::uint32_t> spirv, const char* failure) {
+        diagnostics.clear();
+        if (!tools.Validate(spirv.data(), spirv.size(), options)) throw std::runtime_error(std::string(failure) + ":\n" + diagnostics);
+    }
+
+    void Fail(const char* failure) const {
+        throw std::runtime_error(std::string(failure) + ":\n" + diagnostics);
+    }
+
+    void ClearDiagnostics() {
+        diagnostics.clear();
+    }
+
+    [[nodiscard]] const spvtools::ValidatorOptions& Options() const {
+        return options;
+    }
+
+private:
+    spvtools::SpirvTools tools;
+    spvtools::ValidatorOptions options;
+    std::string diagnostics;
+};
+
+std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize, SpirvOutputValidation output) {
+    const auto environment = TargetEnvironment(spirv, vulkanVersion, spirvVersion);
+    SpirvValidator validator(environment, allowOffsetTextureOperand);
+    validator.Require(spirv, "SPIR-V validation before optimization failed");
     if (!optimize) return CollapseBlockBallots(spirv);
     spvtools::Optimizer optimizer(environment);
-    optimizer.SetMessageConsumer(consumer);
+    optimizer.SetMessageConsumer(validator.Consumer());
     static const char* mode = std::getenv("APS5_SPIRV_OPT");
     if (mode != nullptr && std::string(mode) == "none") return CollapseBlockBallots(spirv);
     // The recompiler emits helpers (BDA lookup, fault reporting) as functions called from every memory
@@ -248,29 +283,23 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::u
     options.set_run_validator(false);
     options.set_preserve_bindings(true);
     options.set_preserve_spec_constants(!specialize);
-    options.set_validator_options(validatorOptions);
+    options.set_validator_options(validator.Options());
     std::vector<std::uint32_t> optimized;
-    diagnostics.clear();
-    if (!optimizer.Run(spirv.data(), spirv.size(), &optimized, options)) {
-        throw std::runtime_error("SPIR-V optimization failed:\n" + diagnostics);
-    }
+    validator.ClearDiagnostics();
+    if (!optimizer.Run(spirv.data(), spirv.size(), &optimized, options)) validator.Fail("SPIR-V optimization failed");
     optimized = CollapseBlockBallots(optimized);
-    diagnostics.clear();
-    if (!tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
-        throw std::runtime_error("SPIR-V validation after optimization failed:\n" + diagnostics);
-    }
+    if (output == SpirvOutputValidation::Validate) validator.Require(optimized, "SPIR-V validation after optimization failed");
     return optimized;
 }
 
-}
-
-std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize) {
-    if (StackHoldsOptimizer()) return ValidateAndOptimizeSpirvInline(spirv, vulkanVersion, spirvVersion, allowOffsetTextureOperand, optimize, specialize);
-    std::vector<std::uint32_t> result;
+template <typename Work>
+auto OnOptimizerStack(Work&& work) -> decltype(work()) {
+    if (StackHoldsOptimizer()) return work();
+    decltype(work()) result;
     std::exception_ptr failure;
     std::thread host([&] {
         try {
-            result = ValidateAndOptimizeSpirvInline(spirv, vulkanVersion, spirvVersion, allowOffsetTextureOperand, optimize, specialize);
+            result = work();
         } catch (...) {
             failure = std::current_exception();
         }
@@ -279,6 +308,20 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     host.join();
     if (failure) std::rethrow_exception(failure);
     return result;
+}
+
+}
+
+std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize, SpirvOutputValidation output) {
+    return OnOptimizerStack([&] { return ValidateAndOptimizeSpirvInline(spirv, vulkanVersion, spirvVersion, allowOffsetTextureOperand, optimize, specialize, output); });
+}
+
+void ValidateSpirv(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand) {
+    static_cast<void>(OnOptimizerStack([&] {
+        SpirvValidator validator(TargetEnvironment(spirv, vulkanVersion, spirvVersion), allowOffsetTextureOperand);
+        validator.Require(spirv, "SPIR-V validation failed");
+        return true;
+    }));
 }
 
 std::uint64_t OptimizerHostThreads() {

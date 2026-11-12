@@ -6,6 +6,7 @@
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include <cstddef>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -34,12 +35,38 @@ private:
     std::vector<BufferSubstitute> slots;
 };
 
+class OnceCheck {
+public:
+    OnceCheck() = default;
+    OnceCheck(const OnceCheck&) {}
+    OnceCheck& operator=(const OnceCheck&) {
+        return *this;
+    }
+
+    template <typename Check>
+    void Run(Check&& check) const {
+        std::call_once(once, [&] {
+            try {
+                check();
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        if (failure) std::rethrow_exception(failure);
+    }
+
+private:
+    mutable std::once_flag once;
+    mutable std::exception_ptr failure;
+};
+
 struct CompiledVariant {
     BindingLayout layout;
     CompiledShaderInfo info;
     CompiledBindingLayout bindings;
     CompiledShaderArtifact artifact;
     std::shared_ptr<BufferSubstituteTable> substitutes;
+    OnceCheck unspecializedValidation;
 };
 
 }
