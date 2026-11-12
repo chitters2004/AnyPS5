@@ -4,6 +4,7 @@
 #include "Translation/InstructionTranslator.hpp"
 #include "Translation/ShaderInputInfoBuilder.hpp"
 #include <cstdio>
+#include <initializer_list>
 #include <cstdlib>
 #include <exception>
 #include <vector>
@@ -45,6 +46,20 @@ std::size_t Ballots(ShaderStageKind stage, std::uint32_t first) {
     return ballots;
 }
 
+bool Restorable(std::initializer_list<IrOpcode> writes) {
+    IrProgram program;
+    IrBlock& block = program.CreateBlock();
+    program.BlockOrder().push_back(&block);
+    program.SetEntryBlock(block);
+    auto& unrelated = program.CreateValue(IrOpcode::LaneId, IrType::U32);
+    block.AppendInstruction(&unrelated);
+    for (const IrOpcode opcode : writes) {
+        auto& write = program.CreateValue(opcode, IrType::Void);
+        block.AppendInstruction(&write);
+    }
+    return NanSpeculationRestorable(block, 1u);
+}
+
 }
 
 int main() {
@@ -66,6 +81,10 @@ int main() {
                 std::fprintf(stderr, "nan speculation stages: a tessellation-stage shader was speculated (%zu ballots); the hull lowering refuses any lane mask\n", ballots);
                 return 1;
             }
+        }
+        if (!Restorable({IrOpcode::SetVectorRegister, IrOpcode::SetExec}) || Restorable({IrOpcode::SetVectorRegister, IrOpcode::StoreAddressU32}) || Restorable({IrOpcode::SetGotoVariable})) {
+            std::fprintf(stderr, "nan speculation stages: a region that writes state the exact arm cannot restore was not declined\n");
+            return 1;
         }
         if (compute == 0u) {
             std::fprintf(stderr, "nan speculation stages: a compute v_add_f32 region was not speculated\n");

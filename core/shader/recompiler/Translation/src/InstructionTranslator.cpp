@@ -584,6 +584,11 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
 
 }
 
+bool NanSpeculationRestorable(const IrBlock& block, std::size_t firstInstruction) {
+    const auto& instructions = block.Instructions();
+    return std::none_of(std::next(instructions.begin(), static_cast<std::ptrdiff_t>(firstInstruction)), instructions.end(), [](const IrValue* write) { return !SpeculationReader(write->Opcode()).has_value() && WritesSpeculationState(write->Opcode()); });
+}
+
 IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const ControlFlowGraph& cfg, const TranslateOptions& options) const {
     validateTranslateOptions(options);
     if (cfg.linkEscapeWaveSize == options.waveSize) {
@@ -880,11 +885,26 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             auto& instructions = fast.Instructions();
             const auto before = instructions.size();
             const auto state = context.SaveSpeculationState();
+            const auto checksBefore = program.Metadata().nanSpeculationChecks.size();
+            const auto laneWritesBefore = program.Metadata().nanSpeculationLaneWrites.size();
             context.SetNanFast(true);
             for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
             context.SetNanFast(false);
             IrValue* seen = context.TakeNanSeen();
-            if (seen == nullptr) {
+            const bool declined = seen != nullptr && !NanSpeculationRestorable(fast, before);
+            if (declined) {
+                while (instructions.size() > before) {
+                    IrValue* dropped = instructions.back();
+                    fast.RemoveInstruction(dropped);
+                    dropped->Invalidate();
+                }
+                program.Metadata().nanSpeculationChecks.resize(checksBefore);
+                program.Metadata().nanSpeculationLaneWrites.resize(laneWritesBefore);
+                context.RestoreSpeculationState(state);
+                for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
+                ++program.Metadata().nanSpeculationDeclines;
+            }
+            if (seen == nullptr || declined) {
                 IrBlock& merge = *blocks[region->mergeIndex];
                 std::erase(fast.Successors(), &merge);
                 std::erase(merge.Predecessors(), &fast);
@@ -904,10 +924,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             for (auto position = std::next(instructions.begin(), static_cast<std::ptrdiff_t>(before)); position != instructions.end(); ++position) {
                 IrValue* write = *position;
                 const auto reader = SpeculationReader(write->Opcode());
-                if (!reader.has_value()) {
-                    if (WritesSpeculationState(write->Opcode())) throw std::runtime_error("nan speculation region at pc " + std::to_string(decoded.instructions[region->begin].programCounter) + " writes state it cannot restore");
-                    continue;
-                }
+                if (!reader.has_value()) continue;
                 if (!restored.insert(SpeculationKey(*write)).second) continue;
                 IrValue& snapshot = program.CreateValue(*reader, IrOpcodeType(*reader));
                 for (std::size_t argument = 0; argument + 1u < write->ArgumentCount(); ++argument) snapshot.AddArgument(write->Argument(argument));

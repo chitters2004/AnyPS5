@@ -40,6 +40,7 @@ struct IrProgramMetadata {
     std::vector<IrValue*> dynamicReads;
     std::vector<NanSpeculationCheck> nanSpeculationChecks;
     std::vector<IrValue*> nanSpeculationLaneWrites;
+    std::uint32_t nanSpeculationDeclines = 0u;
     bool shaderInfoComplete = false;
     IrBindingLayout bindings;
     bool bindingLayoutComplete = false;
