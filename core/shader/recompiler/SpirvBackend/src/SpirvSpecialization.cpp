@@ -976,4 +976,54 @@ std::vector<std::uint32_t> SpecializeSpirv(std::span<const std::uint32_t> words)
     return Specialization(words).Run();
 }
 
+std::vector<std::uint32_t> RemoveUnusedDescriptorVariables(std::span<const std::uint32_t> words) {
+    if (words.size() < 5u || words[0] != spv::MagicNumber) throw std::runtime_error("invalid specialized SPIR-V module");
+    const auto bound = words[3];
+    std::vector<std::uint8_t> descriptor(bound, 0u);
+    std::vector<std::uint8_t> used(bound, 0u);
+    const auto instructionAt = [&](std::size_t cursor) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated specialized SPIR-V instruction");
+        return words.subspan(cursor, count);
+    };
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto instruction = instructionAt(cursor);
+        const auto op = SpirvInstructions::Opcode(instruction);
+        if (op == spv::OpDecorate && instruction.size() == 4u && instruction[2] == spv::DecorationBinding && instruction[1] < bound) descriptor[instruction[1]] = 1u;
+        if (op != spv::OpEntryPoint) {
+            SpirvInstructions::VisitIdOperands(instruction, 1u, [&](std::size_t index) {
+                if (instruction[index] < bound) used[instruction[index]] = 1u;
+            });
+        }
+        cursor += instruction.size();
+    }
+    const auto unused = [&](std::uint32_t id) { return id < bound && descriptor[id] != 0u && used[id] == 0u; };
+    std::vector<std::uint32_t> compact(words.begin(), words.begin() + 5);
+    compact.reserve(words.size());
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto instruction = instructionAt(cursor);
+        const auto op = SpirvInstructions::Opcode(instruction);
+        if (op == spv::OpEntryPoint) {
+            const auto start = compact.size();
+            std::size_t interfaceIndex = 3u;
+            for (; interfaceIndex < instruction.size(); ++interfaceIndex) {
+                const auto word = instruction[interfaceIndex];
+                if ((word & 0xffu) == 0u || (word & 0xff00u) == 0u || (word & 0xff0000u) == 0u || (word & 0xff000000u) == 0u) {
+                    ++interfaceIndex;
+                    break;
+                }
+            }
+            compact.insert(compact.end(), instruction.begin(), instruction.begin() + static_cast<std::ptrdiff_t>(std::min(interfaceIndex, instruction.size())));
+            for (auto index = interfaceIndex; index < instruction.size(); ++index) {
+                if (!unused(instruction[index])) compact.push_back(instruction[index]);
+            }
+            compact[start] = (static_cast<std::uint32_t>(compact.size() - start) << 16u) | spv::OpEntryPoint;
+        } else if (!((op == spv::OpVariable && instruction.size() >= 3u && unused(instruction[2])) || ((op == spv::OpDecorate || op == spv::OpName) && instruction.size() >= 2u && unused(instruction[1])))) {
+            compact.insert(compact.end(), instruction.begin(), instruction.end());
+        }
+        cursor += instruction.size();
+    }
+    return compact;
+}
+
 }

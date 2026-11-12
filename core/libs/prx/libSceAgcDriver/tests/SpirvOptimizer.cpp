@@ -1028,6 +1028,86 @@ void testSpecializedPrivateCompositeTableLoad() {
 
 }
 
+std::string descriptorUseModule(bool spirv14) {
+    const std::string interface = spirv14 ? " %stored %chained %unused %passed" : "";
+    return "OpCapability Shader\n"
+           "OpCapability VariablePointersStorageBuffer\n"
+           "OpMemoryModel Logical GLSL450\n"
+           "OpEntryPoint GLCompute %main \"main\"" + interface + "\n"
+           "OpExecutionMode %main LocalSize 1 1 1\n"
+           "OpName %stored \"stored\"\n"
+           "OpName %unused \"unused\"\n"
+           "OpDecorate %Block Block\n"
+           "OpMemberDecorate %Block 0 Offset 0\n"
+           "OpDecorate %stored DescriptorSet 0\n"
+           "OpDecorate %stored Binding 0\n"
+           "OpDecorate %chained DescriptorSet 0\n"
+           "OpDecorate %chained Binding 1\n"
+           "OpDecorate %unused DescriptorSet 0\n"
+           "OpDecorate %unused Binding 2\n"
+           "OpDecorate %passed DescriptorSet 0\n"
+           "OpDecorate %passed Binding 3\n"
+           "%void = OpTypeVoid\n"
+           "%fn = OpTypeFunction %void\n"
+           "%uint = OpTypeInt 32 0\n"
+           "%Block = OpTypeStruct %uint\n"
+           "%ptr = OpTypePointer StorageBuffer %Block\n"
+           "%uptr = OpTypePointer StorageBuffer %uint\n"
+           "%helperType = OpTypeFunction %void %ptr\n"
+           "%zero = OpConstant %uint 0\n"
+           "%seven = OpConstant %uint 7\n"
+           "%value = OpConstantComposite %Block %seven\n"
+           "%stored = OpVariable %ptr StorageBuffer\n"
+           "%chained = OpVariable %ptr StorageBuffer\n"
+           "%unused = OpVariable %ptr StorageBuffer\n"
+           "%passed = OpVariable %ptr StorageBuffer\n"
+           "%helper = OpFunction %void None %helperType\n"
+           "%param = OpFunctionParameter %ptr\n"
+           "%helperEntry = OpLabel\n"
+           "%field = OpAccessChain %uptr %param %zero\n"
+           "OpStore %field %seven\n"
+           "OpReturn\n"
+           "OpFunctionEnd\n"
+           "%main = OpFunction %void None %fn\n"
+           "%entry = OpLabel\n"
+           "OpStore %stored %value\n"
+           "%member = OpAccessChain %uptr %chained %zero\n"
+           "OpStore %member %seven\n"
+           "%call = OpFunctionCall %void %helper %passed\n"
+           "OpReturn\n"
+           "OpFunctionEnd\n";
+}
+
+void testUnusedDescriptorsAreRemovedAndUsedOnesKept() {
+    for (const bool spirv14 : {false, true}) {
+        spvtools::SpirvTools tools(spirv14 ? SPV_ENV_VULKAN_1_1_SPIRV_1_4 : SPV_ENV_VULKAN_1_1);
+        std::vector<std::uint32_t> words;
+        check(tools.Assemble(descriptorUseModule(spirv14), &words), "descriptor use module did not assemble");
+        const auto target = spirv14 ? 0x00010400u : 0x00010300u;
+        try {
+            static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(words, 0x00401000u, target, false, false));
+        } catch (const std::exception& error) {
+            check(false, std::string("the descriptor use module is invalid: ") + error.what());
+        }
+        const auto compacted = ShaderRecompiler::RemoveUnusedDescriptorVariables(words);
+        std::set<std::uint32_t> bindings;
+        std::size_t interface = 0;
+        for (std::size_t offset = 5; offset < compacted.size(); offset += compacted[offset] >> spv::WordCountShift) {
+            const auto op = compacted[offset] & spv::OpCodeMask;
+            if (op == spv::OpDecorate && compacted[offset + 2] == spv::DecorationBinding) bindings.insert(compacted[offset + 3]);
+            if (op == spv::OpEntryPoint) interface = (compacted[offset] >> spv::WordCountShift) - 5u;
+        }
+        check(bindings == std::set<std::uint32_t>{0u, 1u, 3u}, "compaction kept an unused descriptor or removed one used by a whole store, an access chain or a call argument");
+        check(opcodeCount(compacted, spv::OpVariable) == 3u && opcodeCount(compacted, spv::OpName) == 1u, "compaction left the unused descriptor's variable or name behind");
+        check(!spirv14 || interface == 3u, "compaction left the unused descriptor in the entry point interface");
+        try {
+            static_cast<void>(ShaderRecompiler::ValidateAndOptimizeSpirv(compacted, 0x00401000u, target, false, false));
+        } catch (const std::exception& error) {
+            check(false, std::string("the compacted module is invalid: ") + error.what());
+        }
+    }
+}
+
 int main() {
     const char* mode = std::getenv("APS5_SPIRV_OPT");
     const bool optimizationEnabled = mode == nullptr || std::string(mode) != "none";
@@ -1045,6 +1125,7 @@ int main() {
     testSharedBooleanConstantsKeepTheirValues();
     testSpecializedPrivateCompositeTableLoad();
     testBallotsMergedIntoOneBlockShareOneBallot(optimizationEnabled);
+    testUnusedDescriptorsAreRemovedAndUsedOnesKept();
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;
