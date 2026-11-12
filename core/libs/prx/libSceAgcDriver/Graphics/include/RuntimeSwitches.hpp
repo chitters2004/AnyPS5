@@ -25,6 +25,7 @@ enum class RuntimeSwitch : std::size_t {
     TableSnapshot,
     CertifiedProofs,
     NoCertifiedProofScope,
+    NoCoveredCommits,
     Count,
 };
 
