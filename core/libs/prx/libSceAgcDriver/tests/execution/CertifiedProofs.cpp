@@ -31,6 +31,8 @@
 #include <cstring>
 #include <functional>
 #include <iostream>
+#include <chrono>
+#include <limits>
 #include <stdexcept>
 #include <memory>
 #include <mutex>
@@ -491,6 +493,46 @@ void Inputs(AgcDriver::VulkanDevice& device) {
     GuestMemory::SetCertificateMutantForTest(GuestMemory::CertificateMutant::None);
     Require(!mutant.markSeen, "inputs: hiding the bumps of a stamped GPU store still voided the certified draw input, so the case tests nothing");
     std::printf("certified proofs: draw inputs served %llu times by certificates, CPU and GPU stores void them, the switch returns them to the collect path\n", static_cast<unsigned long long>(run.certifiedHits));
+}
+
+double ReuseNanoseconds(AgcDriver::VulkanDevice& device, bool certified) {
+    using namespace AgcDriver::Graphics;
+    using Use = Recorder::SnapshotUse;
+    constexpr std::size_t size = 4096;
+    constexpr int Calls = 20000;
+    constexpr int CallsPerEpoch = 32;
+    GuestBlocks memory(BlockBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory.base);
+    std::memset(memory.base, 0x5a, size);
+    auto context = device.graphicsContext();
+    std::lock_guard lock(GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "bench: no active recorder");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedDrawInputs, !certified);
+    GuestMemory::BumpCollectEpoch();
+    const auto first = CopyDrawInput(context, recorder, address, size, 4, Use::Index32);
+    KeepDrawInput(recorder, address, first, Use::Index32, 0);
+    const auto hitsBefore = CertifiedDrawInputsCounted().hits;
+    double best = std::numeric_limits<double>::max();
+    std::uint64_t reused = 0;
+    for (int round = 0; round < 3; ++round) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) {
+            if (call % CallsPerEpoch == 0) GuestMemory::BumpCollectEpoch();
+            reused += CopyDrawInput(context, recorder, address, size, 4, Use::Index32).reused ? 1u : 0u;
+        }
+        best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoCertifiedDrawInputs, false);
+    Require(reused == 3u * Calls, "bench: an unchanged draw input was copied again");
+    Require((CertifiedDrawInputsCounted().hits - hitsBefore == 3u * Calls) == certified, "bench: the arm did not take the path it measures");
+    return best;
+}
+
+void Bench(AgcDriver::VulkanDevice& device) {
+    const auto collected = ReuseNanoseconds(device, false);
+    const auto certified = ReuseNanoseconds(device, true);
+    std::printf("bench CopyDrawInput reuse of an unchanged 4 KiB index range, a collect epoch every 32 calls, best of 3 x 20000: collect path %.1f ns, certificate %.1f ns per call (wall clock)\n", collected, certified);
 }
 
 bool InvalidationVoids() {
@@ -1147,7 +1189,7 @@ int main(int argc, char** argv) {
             std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
             return VulkanTestSkipped;
         }
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 22> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"invalidate", &Invalidate}, {"inputs", &Inputs}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 23> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"invalidate", &Invalidate}, {"inputs", &Inputs}, {"bench", &Bench}, {"layers", &Layers}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);
