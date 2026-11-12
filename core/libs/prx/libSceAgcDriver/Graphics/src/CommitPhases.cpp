@@ -266,7 +266,6 @@ void CountCommit(CommitCounter counter, std::uint64_t amount) {
     counterValues[static_cast<std::size_t>(counter)].Add(amount);
     if (amount == 0) return;
     if (counter == CommitCounter::TargetRefreshSlow || counter == CommitCounter::OtherRefreshSlow) markShadow(phases, ShadowReason::TargetSlow);
-    else if (counter >= CommitCounter::TargetMemoInvalid && counter <= CommitCounter::TargetMemoMetadata) markShadow(phases, ShadowReason::TargetMiss);
     else if (counter == CommitCounter::InputIndexCopyFresh || counter == CommitCounter::InputVertexCopyFresh) markShadow(phases, ShadowReason::InputFresh);
 }
 

@@ -4139,7 +4139,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targets = prepared.targets;
     auto& targetViews = prepared.targetViews;
     ResolvedTargets resolvedTargets{targets, targetViews};
-    if (!takeHandedTargets(state, targets, targetViews)) static_cast<void>(ResolveDrawTargets(context, state, prepared.shape, dumpLimit, outcome, timer, profile, resolvedTargets));
+    if (!takeHandedTargets(state, targets, targetViews)) {
+        static_cast<void>(ResolveDrawTargets(context, state, prepared.shape, dumpLimit, outcome, timer, profile, resolvedTargets));
+        if (resolvedTargets.targetMiss) NoteShadowReason(ShadowReason::TargetMiss);
+    }
     timer.phase(PhasePrepare);
     BeginCommitPhase(CommitPhase::ResolveSetup);
     const bool recordDraws = RecordDraws();

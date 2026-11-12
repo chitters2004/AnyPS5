@@ -79,10 +79,10 @@ void TestCommandsBeforeRecordingArePreOps() {
 void TestPhaseAndCounterHooks() {
     RequireFirst(Draw([] { AgcDriver::Graphics::InCommitPhase(CommitPhase::ResolveBuild, [] {}); }), ShadowReason::TemplateBuilt, "a template build");
     RequireFirst(Draw([] { AgcDriver::Graphics::BeginCommitPhase(CommitPhase::RevalidateWalk); }), ShadowReason::TemplateWalk, "a revalidation walk");
-    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetMemoInvalid); }), ShadowReason::TargetMiss, "a target memo miss");
-    RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetMemoMetadata); }), ShadowReason::TargetMiss, "the last target memo miss cause");
-    RequireEligible(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetMemoAcceptWithDepthMiss); }), "a target memo accept");
-    RequireEligible(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetMemoPostDepthInvalidated); }), "a target memo event after its miss causes");
+    RequireFirst(Draw([] { AgcDriver::Graphics::NoteShadowReason(ShadowReason::TargetMiss); }), ShadowReason::TargetMiss, "a target miss");
+    for (auto counter = static_cast<std::size_t>(CommitCounter::TargetMemoAccept); counter <= static_cast<std::size_t>(CommitCounter::TargetMemoAvoidedRefreshLookups); ++counter) {
+        RequireEligible(Draw([counter] { AgcDriver::Graphics::CountCommit(static_cast<CommitCounter>(counter)); }), "target memo counter " + std::to_string(counter) + " counted as a target miss");
+    }
     RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::TargetRefreshSlow); }), ShadowReason::TargetSlow, "a slow target refresh");
     RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::OtherRefreshSlow); }), ShadowReason::TargetSlow, "a slow texture refresh");
     RequireFirst(Draw([] { AgcDriver::Graphics::CountCommit(CommitCounter::InputIndexCopyFresh); }), ShadowReason::InputFresh, "a fresh index copy");
