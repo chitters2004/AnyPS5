@@ -1132,6 +1132,61 @@ void testEmittedValuesAreNumberedWithinTheirDominators() {
     check(unchanged == numbered, "value numbering changed an already numbered module");
 }
 
+constexpr const char* PointerOutExtendedModule = R"(OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main"
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %Buffer Block
+OpMemberDecorate %Buffer 0 Offset 0
+OpDecorate %storage DescriptorSet 0
+OpDecorate %storage Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%int = OpTypeInt 32 1
+%float = OpTypeFloat 32
+%Buffer = OpTypeStruct %uint
+%bufPtr = OpTypePointer StorageBuffer %Buffer
+%bufUint = OpTypePointer StorageBuffer %uint
+%fnFloat = OpTypePointer Function %float
+%fnInt = OpTypePointer Function %int
+%zero = OpConstant %uint 0
+%value = OpConstant %float 2.5
+%clobber = OpConstant %float 9.0
+%clobberInt = OpConstant %int 9
+%storage = OpVariable %bufPtr StorageBuffer
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%frac = OpVariable %fnFloat Function
+%exp = OpVariable %fnInt Function
+%wholeA = OpExtInst %float %glsl Modf %value %frac
+%mantA = OpExtInst %float %glsl Frexp %value %exp
+OpStore %frac %clobber
+OpStore %exp %clobberInt
+%wholeB = OpExtInst %float %glsl Modf %value %frac
+%mantB = OpExtInst %float %glsl Frexp %value %exp
+%loadF = OpLoad %float %frac
+%loadE = OpLoad %int %exp
+%sum1 = OpFAdd %float %wholeA %wholeB
+%sum2 = OpFAdd %float %mantA %mantB
+%sum3 = OpFAdd %float %sum1 %sum2
+%sum4 = OpFAdd %float %sum3 %loadF
+%asUint = OpBitcast %uint %loadE
+%asFloat = OpConvertFToU %uint %sum4
+%out = OpIAdd %uint %asUint %asFloat
+%sa = OpAccessChain %bufUint %storage %zero
+OpStore %sa %out
+OpReturn
+OpFunctionEnd
+)";
+
+void testPointerOutExtendedInstructionsStayDistinct() {
+    const auto input = assemble(PointerOutExtendedModule);
+    const auto numbered = ShaderRecompiler::NumberSpirvValues(input);
+    check(opcodeCount(numbered, spv::OpExtInst) == 4u, "value numbering merged two extended instructions that write through a pointer operand");
+}
+
 int main() {
     const char* mode = std::getenv("APS5_SPIRV_OPT");
     const bool optimizationEnabled = mode == nullptr || std::string(mode) != "none";
@@ -1150,6 +1205,7 @@ int main() {
     testSpecializedPrivateCompositeTableLoad();
     testBallotsMergedIntoOneBlockShareOneBallot(optimizationEnabled);
     testEmittedValuesAreNumberedWithinTheirDominators();
+    testPointerOutExtendedInstructionsStayDistinct();
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;
