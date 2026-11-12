@@ -239,12 +239,26 @@ void DrawFinisher::Settle() {
     idle.wait(lock, [&] { return jobs.empty(); });
 }
 
+namespace {
+std::atomic<std::uint64_t> finisherDrainWaits{0};
+std::atomic<std::uint64_t> finisherDrainWaitNs{0};
+}
+
+std::pair<std::uint64_t, std::uint64_t> DrawFinisher::DrainWaitTotals() {
+    return {finisherDrainWaits.load(std::memory_order_relaxed), finisherDrainWaitNs.load(std::memory_order_relaxed)};
+}
+
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const auto start = Busy() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (start != std::chrono::steady_clock::time_point{}) {
+        finisherDrainWaits.fetch_add(1, std::memory_order_relaxed);
+        finisherDrainWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -385,8 +399,36 @@ void DrawPipeline::enqueue(Item item) {
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+DrawPipeline::Totals DrawPipeline::LifetimeTotals() {
+    std::lock_guard lock(mutex);
+    Totals totals = reported;
+    totals.commits += commits;
+    totals.commitNs += commitNs;
+    totals.enqueued += enqueued;
+    totals.fullWaitNs += fullWaitNs;
+    totals.wakes += wakes;
+    for (std::size_t i = 0; i < drains.size(); ++i) {
+        totals.drains += drains[i];
+        totals.drainWaitNs += drainWaitNs[i];
+    }
+    for (const auto kind : {CommitKind::Draw, CommitKind::IndirectDraw}) {
+        totals.drawCommits += kindCommits[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+        totals.drawNs += kindNs[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+    }
+    return totals;
+}
+
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     lastReport = now;
+    reported.commits += commits;
+    reported.commitNs += commitNs;
+    reported.enqueued += enqueued;
+    reported.fullWaitNs += fullWaitNs;
+    reported.wakes += wakes;
+    for (std::size_t i = 0; i < drains.size(); ++i) {
+        reported.drains += drains[i];
+        reported.drainWaitNs += drainWaitNs[i];
+    }
     std::string drainText;
     for (std::size_t i = 0; i < drains.size(); ++i) {
         char item[64];
@@ -415,6 +457,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     for (std::size_t i = 0; i < kindCommits.size(); ++i) {
         const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
         const auto ns = kindNs[i].exchange(0, std::memory_order_relaxed);
+        if (i == static_cast<std::size_t>(CommitKind::Draw) || i == static_cast<std::size_t>(CommitKind::IndirectDraw)) {
+            reported.drawCommits += count;
+            reported.drawNs += ns;
+        }
         if (count == 0) continue;
         char item[64];
         std::snprintf(item, sizeof(item), " %s %llu (%.1f us)", KindNames[i], static_cast<unsigned long long>(count), static_cast<double>(ns) / 1e3 / static_cast<double>(count));

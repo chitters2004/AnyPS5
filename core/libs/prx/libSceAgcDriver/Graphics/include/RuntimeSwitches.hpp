@@ -61,7 +61,10 @@ private:
     std::optional<double> firstSeconds;
 };
 
+using AbObserver = void (*)(AbSchedule::Event event, char arm, std::uint64_t phase, std::uint64_t present, double seconds);
+
 bool AbConfigured();
+void SetAbObserver(AbObserver observer);
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
 
 }

@@ -61,6 +61,26 @@ def log():
     return [line + "\n" for line in lines]
 
 
+def counters(kind, index, draw_ms, commit_ms=450.0, worker_busy=9000.0, recorded=True):
+    line = (f"[ab-counters] phase {kind} {index} wall_ms=10000.000 presents=100 flip_p50_ms=99.500 flip_p90_ms=110.250 gpu_busy_ms=3000.000 gpu_gap_ms=500.000 "
+            f"commits=400 commit_ms={commit_ms:.3f} draws=300 draw_commit_ms={draw_ms:.3f} enqueued=400 room_wait_ms=20.000 wakes=50 drains=10 drain_wait_ms=30.000")
+    if recorded:
+        line += f" t.queue_worker_0x0.busy_ms={worker_busy:.3f} t.queue_worker_0x0.idle_ms=500.000 t.queue_worker_0x0.memory_wait_ms=250.000 t.draw_finisher.busy_ms=4000.000 t.draw_finisher.jobs=250"
+    else:
+        line += " threads=none"
+    return line
+
+
+def counter_log():
+    lines = ["[ab] in-run A/B: phases of 30.0 s from present 100, settle 2.0 s; A: APS5_NO_BARRIER_BATCH set; B: APS5_NO_BARRIER_BATCH unset"]
+    for kind, index, begin, seconds, draw_ms, recorded in (("A", 0, 100, 10.0, 30.0, True), ("B", 1, 140, 40.0, 60.0, True), ("A", 2, 180, 70.0, 33.0, True)):
+        lines += [f"[ab] phase {kind} {index} begins at present {begin} (t {seconds:.3f} s): APS5_NO_BARRIER_BATCH",
+                  f"[ab] phase {kind} {index} settled at present {begin + 2} (t {seconds + 2:.3f} s)"]
+        lines.append(counters(kind, index, draw_ms, recorded=recorded))
+    lines.append("[ab] phase B 3 begins at present 220 (t 100.000 s): APS5_NO_BARRIER_BATCH unset")
+    return [line + "\n" for line in lines]
+
+
 class AbSplitTests(unittest.TestCase):
     def test_noise_uses_only_consecutive_phase_indices(self):
         for indices, expected in (((0, 1, 2), 30.0), ((0, 3, 4), 20.0),
@@ -180,6 +200,57 @@ class AbSplitTests(unittest.TestCase):
         self.assertAlmostEqual(busy["change_pct"], 25 / 105 * 100)
         self.assertEqual(busy["noise"], {"mean": 25.0, "se": None, "sd": None, "n": 1})
         self.assertAlmostEqual(rows["syncwait GPU ms/report"]["noise"]["mean"], 60.0 - 42.0)
+
+    def test_counter_lines_give_each_phase_its_per_thread_figures(self):
+        result = ab_split.split(counter_log())
+        first = result["phases"][0]["metrics"]
+        self.assertAlmostEqual(first["committer us/draw"], 100.0)
+        self.assertAlmostEqual(first["committer busy %"], 4.5)
+        self.assertAlmostEqual(first["committer ms/present"], 4.5)
+        self.assertAlmostEqual(first["committer idle %"], 95.5)
+        self.assertAlmostEqual(first["committer room wait ms/present"], 0.2)
+        self.assertAlmostEqual(first["committer drain wait ms/present"], 0.3)
+        self.assertAlmostEqual(first["draws/present"], 3.0)
+        self.assertAlmostEqual(first["queue worker 0x0 busy %"], 90.0)
+        self.assertAlmostEqual(first["queue worker 0x0 idle %"], 5.0)
+        self.assertAlmostEqual(first["queue worker 0x0 memory wait ms/present"], 2.5)
+        self.assertAlmostEqual(first["draw finisher busy %"], 40.0)
+        self.assertAlmostEqual(first["draw finisher jobs/present"], 2.5)
+        self.assertAlmostEqual(first["GPU busy ms/present"], 30.0)
+        self.assertEqual((first["flip p50 ms"], first["flip p90 ms"]), (99.5, 110.25))
+        self.assertEqual(result["phases"][3]["metrics"], {})
+
+    def test_counter_lines_compare_an_arm_with_its_bracketing_control(self):
+        rows = {row["metric"]: row for row in ab_split.split(counter_log())["metrics"]}
+        row = rows["committer us/draw"]
+        self.assertAlmostEqual(row["a"], 105.0)
+        self.assertAlmostEqual(row["b"], 200.0)
+        self.assertAlmostEqual(row["noise"]["mean"], 200.0 - 105.0)
+        self.assertEqual((row["a_phases"], row["b_phases"]), (2, 1))
+        self.assertAlmostEqual(row["a_sd"], 10.0 / 2 ** 0.5)
+        self.assertIsNone(row["b_sd"])
+
+    def test_a_phase_without_trace_totals_has_committer_figures_only(self):
+        lines = [counters("A", 0, 30.0, recorded=False) + "\n" if line.startswith("[ab-counters] phase A 0") else line for line in counter_log()]
+        first = ab_split.split(lines)["phases"][0]["metrics"]
+        self.assertAlmostEqual(first["committer us/draw"], 100.0)
+        self.assertFalse([name for name in first if name.startswith(("queue worker", "draw finisher"))])
+
+    def test_counter_lines_attach_to_their_own_phase(self):
+        lines = counter_log()
+        moved = next(index for index, line in enumerate(lines) if line.startswith("[ab-counters] phase A 0"))
+        lines.insert(moved + 3, lines.pop(moved))
+        _, phases = ab_split.read_log(lines)
+        self.assertEqual(phases[0]["counters"]["draw_commit_ms"], 30.0)
+        self.assertEqual(phases[1]["counters"]["draw_commit_ms"], 60.0)
+
+    def test_command_line_spread(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "counters.log"
+            path.write_text("".join(counter_log()), encoding="utf-8")
+            run = subprocess.run([sys.executable, str(Path(ab_split.__file__)), str(path), "--spread"], capture_output=True, text=True, encoding="utf-8", timeout=10)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertRegex(run.stdout, r"committer us/draw +B +105\.00 +2 +7\.07 +200\.00 +1 +- +\+95\.00")
 
     def test_classes_are_read_without_their_per_present_figures(self):
         row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0))

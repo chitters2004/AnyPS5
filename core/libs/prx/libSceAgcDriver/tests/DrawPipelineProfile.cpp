@@ -89,11 +89,11 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
-        pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
+        pipeline.Enqueue(DrawPipeline::CommitKind::Draw, [&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
         std::this_thread::sleep_until(reportAfter);
-        pipeline.Enqueue([] {}, {}, 0, {}, {}, true);
+        pipeline.Enqueue(DrawPipeline::CommitKind::IndirectDraw, [] {}, {}, 0, {}, {}, true);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -108,6 +108,9 @@ void TestReport() {
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    const auto totals = pipeline.LifetimeTotals();
+    Check(totals.enqueued == 2 && totals.commits == 2 && totals.drawCommits == 2, "the lifetime totals lost what the report printed and reset");
+    Check(totals.commitNs >= 9'000'000'000ull && totals.drawNs >= 9'000'000'000ull && totals.drawNs <= totals.commitNs, "the lifetime totals lost the commits' time");
 }
 
 }
