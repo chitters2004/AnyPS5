@@ -1,4 +1,5 @@
 #include "BdaTests.hpp"
+#include "ImportWatchRestore.hpp"
 #include "NotTested.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -1574,7 +1575,7 @@ void importRequesterTests(const Context& context, const BdaTestAccess& access) {
     change(10, true);
     change(9, true);
     {
-        const auto decided = PrepareImportWatch(importing);
+        const ImportWatchRestore restore{importing, PrepareImportWatch(importing)};
         const auto before = counted(ImportRequester::ColorTarget);
         SetImportWatch(importing, ImportWatch::Unwatch);
         const auto* compared = HostImportFor(importing, address(10), 16, ImportRequester::ColorTarget);
@@ -1582,7 +1583,6 @@ void importRequesterTests(const Context& context, const BdaTestAccess& access) {
         SetImportWatch(importing, ImportWatch::Watch);
         const auto* readOnly = HostImportFor(importing, address(9), 16, ImportRequester::ColorTarget);
         const auto* outside = HostImportFor(importing, address(10), 16, ImportRequester::ColorTarget);
-        SetImportWatch(importing, decided);
         Require(compared == nullptr && refused.made == before.made && refused.refused == before.refused && refused.failed == before.failed, "a color target's import was made where imports of its memory are compared");
         Require(readOnly == nullptr && !HostImportCovers(importing, address(9), piece), "a color target's import was made of registered memory the guest cannot write");
         Require(outside == nullptr && !HostImportCovers(importing, address(10), piece) && made(ImportRequester::ColorTarget) == before.made, "a color target's import was made of memory outside the write watch");
@@ -2969,7 +2969,7 @@ void retiredImportWatchTests(const Context& context) {
     SetHostImportWindow(bytes);
     SetHostImportDeferredSettles(false);
     ClearHostImports(importing.device);
-    const auto decided = PrepareImportWatch(importing);
+    const ImportWatchRestore restore{importing, PrepareImportWatch(importing)};
     SetImportWatch(importing, ImportWatch::Unwatch);
     const auto registry = [&](std::size_t offset, bool add) {
         auto* mutation = GuestAllocations::GuestAllocationsBegin_nid_postfix();
@@ -2997,7 +2997,6 @@ void retiredImportWatchTests(const Context& context) {
     registry(piece, false);
     registry(0, false);
     build();
-    SetImportWatch(importing, decided);
     ClearHostImports(importing.device);
     SetHostImportBudget(0);
     SetHostImportWindow(0);
@@ -3830,11 +3829,10 @@ void RunHeapMirrorUnwatchTests(const Context& context, const BdaTestAccess& acce
         leased.WriteBack();
     }
     if (throughImport) {
-        const auto decided = PrepareImportWatch(importing);
+        const ImportWatchRestore restore{importing, PrepareImportWatch(importing)};
         SetImportWatch(importing, ImportWatch::Unwatch);
         SetHostImportBudget(2 * (heapBytes + idleBytes + busyBytes));
         Require(HostImportFor(importing, heap, heapBytes) != nullptr && HostImportCovers(importing, heap, heapBytes), "the heap was not imported once the budget held it");
-        SetImportWatch(importing, decided);
     } else {
         AgcDriver::GuestMemory::Unwatch(heap + heapBytes / 2, block);
     }

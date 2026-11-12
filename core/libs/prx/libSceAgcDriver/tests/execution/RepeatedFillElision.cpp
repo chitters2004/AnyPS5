@@ -1,3 +1,4 @@
+#include "../ImportWatchRestore.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -189,11 +190,7 @@ int main() {
 #ifndef _WIN32
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         const auto decided = Graphics::PrepareImportWatch(context);
-        struct Restore {
-            const Graphics::Context& context;
-            Graphics::ImportWatch decided;
-            ~Restore() { Graphics::SetImportWatch(context, decided); }
-        } restore{context, decided};
+        const ImportWatchRestore restore{context, decided};
         std::vector<Graphics::ImportWatch> modes{decided};
         if (decided != Graphics::ImportWatch::Unwatch) modes.push_back(Graphics::ImportWatch::Unwatch);
         for (const auto mode : modes) {

@@ -1,3 +1,4 @@
+#include "../ImportWatchRestore.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -334,7 +335,7 @@ void PrivateGate(AgcDriver::VulkanDevice& device) {
     Block direct(ResidentBytes / 4, 0, true);
     Block flexible(2 * BlockBytes, 0);
     GuestArena::GuestArenaCommit_nid_postfix(flexible.data + BlockBytes, BlockBytes, PAGE_READONLY, BlockBytes);
-    const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
+    const ImportWatchRestore restore{context, AgcDriver::Graphics::PrepareImportWatch(context)};
     const auto before = ColorTargetCounts();
     AgcDriver::Graphics::SetImportWatch(context, ImportWatch::Unwatch);
     const auto* compared = AgcDriver::Graphics::HostImportFor(context, direct.Address(), TargetBytes, ImportRequester::ColorTarget);
@@ -343,7 +344,6 @@ void PrivateGate(AgcDriver::VulkanDevice& device) {
     const auto refused = ColorTargetCounts();
     const auto* watched = AgcDriver::Graphics::HostImportFor(context, direct.Address(), TargetBytes, ImportRequester::ColorTarget);
     const auto made = ColorTargetCounts();
-    AgcDriver::Graphics::SetImportWatch(context, decided);
     Require(compared == nullptr, "private gate: a color target's import of direct memory under the settle floor was made where it would be compared");
     Require(readOnly == nullptr && refused.made == before.made && refused.refused == before.refused && refused.failed == before.failed, "private gate: a color target's import was made of private memory committed read-only while registered writable, or a refused color target import was counted");
     Require(watched != nullptr && made.made == before.made + 1 && made.failed == before.failed, "private gate: a color target's import of direct memory registered writable was not made where imports stay watched");
@@ -406,9 +406,9 @@ void Compared(AgcDriver::VulkanDevice& device) {
     using AgcDriver::Graphics::ImportWatch;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     constexpr std::array<float, 4> seed{900.0f, 1000.0f, 1100.0f, 1200.0f};
-    const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
-    AgcDriver::Graphics::SetImportWatch(context, ImportWatch::Unwatch);
     Block block(BlockBytes, 0);
+    const ImportWatchRestore restore{context, AgcDriver::Graphics::PrepareImportWatch(context)};
+    AgcDriver::Graphics::SetImportWatch(context, ImportWatch::Unwatch);
     Seed(block, seed);
     Require(block.Watched(), "compared import: the color target is not write-watched");
     Draw(device, block);
@@ -419,7 +419,6 @@ void Compared(AgcDriver::VulkanDevice& device) {
     Require(block.Watched(), "compared import: the draw took the color target out of the write watch");
     device.WaitIdle();
     Check(block, seed, "compared import, after the device wait");
-    AgcDriver::Graphics::SetImportWatch(context, decided);
 }
 
 }
@@ -437,11 +436,7 @@ int main(int argc, char** argv) {
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
         AgcDriver::Graphics::SetImportWatch(context, AgcDriver::Graphics::ImportWatch::Watch);
-        struct Restore {
-            const AgcDriver::Graphics::Context& context;
-            AgcDriver::Graphics::ImportWatch decided;
-            ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
-        } restore{context, decided};
+        const ImportWatchRestore restore{context, decided};
 #endif
         Block probe(SettledBytes, 0);
         if (AgcDriver::Graphics::HostImportFor(AgcDriver::VulkanDeviceTestAccess::ContextOf(*device), probe.Address(), probe.bytes) == nullptr) {

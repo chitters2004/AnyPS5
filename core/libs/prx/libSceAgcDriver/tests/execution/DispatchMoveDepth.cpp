@@ -1,3 +1,4 @@
+#include "../ImportWatchRestore.hpp"
 #include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -436,11 +437,7 @@ int main() {
 #ifndef _WIN32
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
-        struct Restore {
-            const AgcDriver::Graphics::Context& context;
-            AgcDriver::Graphics::ImportWatch decided;
-            ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
-        } restore{context, decided};
+        const ImportWatchRestore restore{context, decided};
         std::size_t pass = 0;
         for (const auto mode : {AgcDriver::Graphics::ImportWatch::Watch, AgcDriver::Graphics::ImportWatch::Unwatch}) {
             AgcDriver::Graphics::SetImportWatch(context, mode);

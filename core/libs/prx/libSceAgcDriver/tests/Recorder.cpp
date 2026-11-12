@@ -42,6 +42,7 @@
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/include/IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "HostImportLifetime.hpp"
+#include "ImportWatchRestore.hpp"
 #include "NotTested.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "SampleLod_spv.h"
@@ -136,12 +137,6 @@ void ReleaseWatched(void* block, std::size_t bytes) {
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, bytes);
 #endif
 }
-
-struct ImportWatchRestore {
-    const Context& context;
-    ImportWatch decided;
-    ~ImportWatchRestore() { SetImportWatch(context, decided); }
-};
 
 struct ReadOnlyImportWatch {
     const Context& context;

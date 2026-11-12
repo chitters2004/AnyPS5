@@ -1,3 +1,4 @@
+#include "../ImportWatchRestore.hpp"
 #include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -930,11 +931,7 @@ void DccRefillTests(AgcDriver::VulkanDevice& device, std::uint32_t selectedSampl
 #ifndef _WIN32
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
-    struct Restore {
-        const AgcDriver::Graphics::Context& context;
-        AgcDriver::Graphics::ImportWatch decided;
-        ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
-    } restore{context, decided};
+    const ImportWatchRestore restore{context, decided};
 #endif
     const auto fill = [](const Block& block, std::size_t bytes, std::uint32_t pattern) {
         for (std::size_t offset = 0; offset + sizeof(pattern) <= bytes; offset += sizeof(pattern)) std::memcpy(block.data + offset, &pattern, sizeof(pattern));
@@ -1109,11 +1106,7 @@ const char* DccComparedImportTests(AgcDriver::VulkanDevice& device, std::uint32_
     Require(AgcDriver::GuestMemory::WriteWatched(), "the guest arena is not write-watched");
     const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
     if (decided != AgcDriver::Graphics::ImportWatch::Unwatch) return "skipped, the device reports host imports that keep write protection, so the write-watch probe compares none of them";
-    struct Restore {
-        const AgcDriver::Graphics::Context& context;
-        AgcDriver::Graphics::ImportWatch decided;
-        ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
-    } restore{context, decided};
+    const ImportWatchRestore restore{context, decided};
     const auto probe = AgcDriver::Graphics::ProbeImportWriteProtection(context);
     const bool watchedImportsHold = probe.failure == nullptr && probe.writtenAtImport == 0 && probe.writtenAfterSubmit == 0;
     if (!watchedImportsHold) std::cout << "the watched-import control case is skipped: the device reports watched host memory written when it imports or reads it\n";

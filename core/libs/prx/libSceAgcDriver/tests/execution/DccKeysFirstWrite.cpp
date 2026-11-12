@@ -1,3 +1,4 @@
+#include "../ImportWatchRestore.hpp"
 #include "../NotTested.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
@@ -616,11 +617,7 @@ void RunSingleKeysOverPendingImage(AgcDriver::VulkanDevice& device, std::uint8_t
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
     AgcDriver::Graphics::SetImportWatch(context, AgcDriver::Graphics::ImportWatch::Watch);
-    struct Restore {
-        const AgcDriver::Graphics::Context& context;
-        AgcDriver::Graphics::ImportWatch decided;
-        ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
-    } restore{context, decided};
+    const ImportWatchRestore restore{context, decided};
 #endif
     auto* texels = block;
     auto* keys = block + KeysOffset;
