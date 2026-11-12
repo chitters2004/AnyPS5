@@ -67,6 +67,9 @@ std::mutex& slotMutex() {
     return value;
 }
 
+thread_local const CommandEncoder* encoderThread = nullptr;
+std::atomic<bool> anySubmitPosted{false};
+
 std::function<void()>& testDelay() {
     static std::function<void()> value;
     return value;
@@ -420,6 +423,46 @@ void installAt(std::size_t slot, DeviceFunctions& table, std::index_sequence<S..
 
 }
 
+bool QueueSubmitsPosted() noexcept {
+    return anySubmitPosted.load(std::memory_order_acquire);
+}
+
+void SettleQueueSubmits(VkDevice device, bool present) {
+    for (auto& state : slots()) {
+        auto* encoder = state.encoder.load(std::memory_order_acquire);
+        if (encoder == nullptr || state.device != device) continue;
+        encoder->SettleSubmits(present ? CommandEncoder::SettleSite::Present : CommandEncoder::SettleSite::Other);
+    }
+}
+
+bool CommandEncoder::SubmitsAsync() {
+    return RuntimeSwitches::Set(RuntimeSwitch::EncoderAsyncSubmit);
+}
+
+bool CommandEncoder::OnEncoderThread() noexcept {
+    return encoderThread != nullptr;
+}
+
+CommandEncoder::SubmitRequest::SubmitRequest() : marker(std::make_unique<Chunk>()) {}
+
+CommandEncoder::SubmitRequest::~SubmitRequest() {
+    static_cast<void>(Wait());
+}
+
+CommandEncoder::SubmitRequest::State CommandEncoder::SubmitRequest::Wait() const noexcept {
+    constexpr auto pending = static_cast<std::uint32_t>(State::Pending);
+    auto current = state.load(std::memory_order_acquire);
+    if (current != pending || encoder == nullptr) return static_cast<State>(current);
+    auto& owner = *encoder;
+    for (;;) {
+        const auto done = owner.submitsDone.load(std::memory_order_seq_cst);
+        current = state.load(std::memory_order_seq_cst);
+        if (current != pending) break;
+        owner.submitsDone.wait(done, std::memory_order_seq_cst);
+    }
+    return static_cast<State>(current);
+}
+
 bool CommandEncoder::Enabled() {
     static const bool enabled = [] {
         const char* inline_ = std::getenv("APS5_RECORD_INLINE");
@@ -473,8 +516,8 @@ CommandEncoder::CommandEncoder(VkDevice device, DeviceFunctions& table, std::siz
 }
 
 CommandEncoder::~CommandEncoder() {
-    Quiesce(WaitSite{Wait::Teardown, nullptr, 0});
     stopping.store(true, std::memory_order_seq_cst);
+    Quiesce(WaitSite{Wait::Teardown, nullptr, 0});
     posted.fetch_add(1, std::memory_order_seq_cst);
     posted.notify_all();
     worker.join();
@@ -498,7 +541,7 @@ void CommandEncoder::Recording::refuse() {
 }
 
 void CommandEncoder::Open(VkCommandBuffer commands, Recording& recording, std::source_location where) {
-    if (recent.load(std::memory_order_relaxed) != commands) Quiesce(WaitSite::At(Wait::Open, where));
+    if (recent.load(std::memory_order_relaxed) != commands && !std::exchange(handedOff, false)) Quiesce(WaitSite::At(Wait::Open, where));
     windows.push_back({commands, &recording});
     owner.store(std::this_thread::get_id(), std::memory_order_relaxed);
     this->recording = &recording;
@@ -652,6 +695,112 @@ void CommandEncoder::Quiesce(WaitSite site) noexcept {
     await(site, flushed);
 }
 
+void CommandEncoder::PostSubmit(SubmitRequest& request) noexcept {
+    anySubmitPosted.store(true, std::memory_order_seq_cst);
+    post(PostCause::BatchEnd);
+    auto* marker = request.marker.get();
+    marker->submit = &request;
+    marker->records = 0;
+    marker->windows = 0;
+    marker->used = 0;
+    marker->target = request.commands;
+    marker->recording = nullptr;
+    request.encoder = this;
+    handedOff = windows.empty();
+    request.state.store(static_cast<std::uint32_t>(SubmitRequest::State::Pending), std::memory_order_relaxed);
+    submitsPosted.fetch_add(1, std::memory_order_seq_cst);
+    {
+        std::lock_guard lock(queueMutex);
+        marker->next = nullptr;
+        (tail != nullptr ? tail->next : head) = marker;
+        tail = marker;
+    }
+    posted.fetch_add(1, std::memory_order_seq_cst);
+    if (sleeping.load(std::memory_order_seq_cst)) posted.notify_one();
+}
+
+void CommandEncoder::SettleSubmits(SettleSite site) {
+    const auto through = submitsPosted.load(std::memory_order_acquire);
+    if (submitsDone.load(std::memory_order_acquire) >= through) return;
+    if (encoderThread != nullptr) throw std::logic_error("AGC graphics: a queue was settled on a command encoder thread, which would wait for its own submits");
+    const auto start = std::chrono::steady_clock::now();
+    for (auto done = submitsDone.load(std::memory_order_seq_cst); done < through; done = submitsDone.load(std::memory_order_seq_cst)) submitsDone.wait(done, std::memory_order_seq_cst);
+    const auto index = static_cast<std::size_t>(site);
+    settleWaits[index].fetch_add(1, std::memory_order_relaxed);
+    settleWaitNs[index].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+void CommandEncoder::settle(SubmitRequest& request, SubmitRequest::State state) noexcept {
+    if (state != SubmitRequest::State::Submitted) {
+        submitFailed = true;
+        submitFailureCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (request.settled != nullptr) request.settled(request.owner, request, state);
+    request.state.store(static_cast<std::uint32_t>(state), std::memory_order_seq_cst);
+    submitsDone.fetch_add(1, std::memory_order_seq_cst);
+    submitsDone.notify_all();
+}
+
+void CommandEncoder::submit(SubmitRequest& request) noexcept {
+    using State = SubmitRequest::State;
+    request.submitStart = std::chrono::steady_clock::now();
+    if (stopping.load(std::memory_order_acquire) || submitFailed) {
+        settle(request, State::NotSubmitted);
+        return;
+    }
+    if (request.recording != nullptr && request.recording->failed.load(std::memory_order_acquire)) {
+        request.error = request.recording->error;
+        settle(request, State::Failed);
+        return;
+    }
+    VkResult result = VK_SUCCESS;
+    {
+        std::lock_guard lock(poolMutex);
+        result = request.endCommandBuffer(request.commands);
+    }
+    if (result == VK_SUCCESS && request.injectFailure != VK_SUCCESS) {
+        request.error = std::make_exception_ptr(std::runtime_error("vkQueueSubmit recorder: injected failure"));
+        result = request.injectFailure;
+    }
+    if (result != VK_SUCCESS) {
+        request.result = result;
+        settle(request, State::Failed);
+        return;
+    }
+    VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submission.commandBufferCount = 1;
+    submission.pCommandBuffers = &request.commands;
+    VkTimelineSemaphoreSubmitInfoKHR timelineInfo{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO_KHR};
+    VkPipelineStageFlags holdStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+    if (request.hold != VK_NULL_HANDLE) {
+        submission.waitSemaphoreCount = 1;
+        submission.pWaitSemaphores = &request.hold;
+        submission.pWaitDstStageMask = &holdStage;
+        timelineInfo.waitSemaphoreValueCount = 1;
+        timelineInfo.pWaitSemaphoreValues = &request.holdValue;
+    }
+    if (request.timeline != VK_NULL_HANDLE) {
+        timelineInfo.signalSemaphoreValueCount = 1;
+        timelineInfo.pSignalSemaphoreValues = &request.serial;
+        submission.signalSemaphoreCount = 1;
+        submission.pSignalSemaphores = &request.timeline;
+    }
+    if (request.hold != VK_NULL_HANDLE || request.timeline != VK_NULL_HANDLE) submission.pNext = &timelineInfo;
+    {
+        std::unique_lock<AgcDriver::Mutex> queue;
+        if (request.queueMutex != nullptr) queue = std::unique_lock(*request.queueMutex);
+        result = request.queueSubmit(request.queue, 1, &submission, request.fence);
+    }
+    request.submittedAt = std::chrono::steady_clock::now();
+    request.result = result;
+    if (result != VK_SUCCESS) {
+        settle(request, State::Failed);
+        return;
+    }
+    submitCount.fetch_add(1, std::memory_order_relaxed);
+    settle(request, State::Submitted);
+}
+
 void CommandEncoder::FinishBatch(std::source_location where) noexcept {
     const bool flushed = post(PostCause::BatchEnd);
     await(WaitSite::At(Wait::Quiesce, where), flushed);
@@ -711,7 +860,7 @@ void CommandEncoder::printSites(bool final) noexcept {
     const auto totals = Counts();
     try {
         const auto by = [&](PostCause cause) { return static_cast<unsigned long long>(totals.postsBy[static_cast<std::size_t>(cause)]); };
-        AgcDriver::ProfilePrint_nid_no_patch("[encoder] %s: %llu chunks, %llu commands, %llu windows, %.1f ms recording, %llu parks; posts by cause: window %llu, full %llu, recording %llu, await %llu, foreign %llu, batch_end %llu; %llu waits, %.1f ms; waits by site (waits/ms/flushes):%s\n", final ? "at teardown" : "so far", static_cast<unsigned long long>(totals.posts), static_cast<unsigned long long>(totals.commands), static_cast<unsigned long long>(totals.windows), static_cast<double>(totals.encodeNs) / 1e6, static_cast<unsigned long long>(totals.parks), by(PostCause::Window), by(PostCause::Full), by(PostCause::Recording), by(PostCause::Await), by(PostCause::Foreign), by(PostCause::BatchEnd), static_cast<unsigned long long>(totals.waits), static_cast<double>(totals.waitNs) / 1e6, Report(WaitsBySite(), PrintedSites).c_str());
+        AgcDriver::ProfilePrint_nid_no_patch("[encoder] %s: %llu chunks, %llu commands, %llu windows, %.1f ms recording, %llu parks; posts by cause: window %llu, full %llu, recording %llu, await %llu, foreign %llu, batch_end %llu; %llu submits, %llu failed, %llu settle waits %.1f ms, %llu present settle waits %.1f ms; %llu waits, %.1f ms; waits by site (waits/ms/flushes):%s\n", final ? "at teardown" : "so far", static_cast<unsigned long long>(totals.posts), static_cast<unsigned long long>(totals.commands), static_cast<unsigned long long>(totals.windows), static_cast<double>(totals.encodeNs) / 1e6, static_cast<unsigned long long>(totals.parks), by(PostCause::Window), by(PostCause::Full), by(PostCause::Recording), by(PostCause::Await), by(PostCause::Foreign), by(PostCause::BatchEnd), static_cast<unsigned long long>(totals.submits), static_cast<unsigned long long>(totals.submitFailures), static_cast<unsigned long long>(totals.settleWaits), static_cast<double>(totals.settleWaitNs) / 1e6, static_cast<unsigned long long>(totals.presentSettleWaits), static_cast<double>(totals.presentSettleWaitNs) / 1e6, static_cast<unsigned long long>(totals.waits), static_cast<double>(totals.waitNs) / 1e6, Report(WaitsBySite(), PrintedSites).c_str());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[encoder] the wait-site profile could not be printed: %s\n", error.what());
     }
@@ -747,6 +896,7 @@ void CommandEncoder::execute(Chunk& chunk) {
 }
 
 void CommandEncoder::run() {
+    encoderThread = this;
     std::uint64_t taken = 0;
     for (;;) {
         if (posted.load(std::memory_order_acquire) == taken) {
@@ -771,6 +921,12 @@ void CommandEncoder::run() {
             if (stopping.load(std::memory_order_acquire)) return;
             continue;
         }
+        if (chunk->submit != nullptr) {
+            submit(*std::exchange(chunk->submit, nullptr));
+            executed.fetch_add(1, std::memory_order_release);
+            executed.notify_all();
+            continue;
+        }
         auto& recording = *chunk->recording;
         if (!recording.failed.load(std::memory_order_relaxed)) {
             try {
@@ -792,6 +948,12 @@ void CommandEncoder::run() {
 CommandEncoder::Statistics CommandEncoder::Counts() const {
     Statistics counts{postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), parkCount.load(std::memory_order_relaxed), windowCount.load(std::memory_order_relaxed), {}};
     for (std::size_t cause = 0; cause < counts.postsBy.size(); ++cause) counts.postsBy[cause] = postsBy[cause].load(std::memory_order_relaxed);
+    counts.submits = submitCount.load(std::memory_order_relaxed);
+    counts.submitFailures = submitFailureCount.load(std::memory_order_relaxed);
+    counts.settleWaits = settleWaits[0].load(std::memory_order_relaxed);
+    counts.settleWaitNs = settleWaitNs[0].load(std::memory_order_relaxed);
+    counts.presentSettleWaits = settleWaits[1].load(std::memory_order_relaxed);
+    counts.presentSettleWaitNs = settleWaitNs[1].load(std::memory_order_relaxed);
     return counts;
 }
 

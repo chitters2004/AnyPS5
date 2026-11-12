@@ -192,6 +192,8 @@ struct DeviceFunctions {
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).
 std::uint64_t& DeviceProcLookups();
 void BeforeCommandLookup(VkDevice device, std::source_location where = std::source_location::current());
+bool QueueSubmitsPosted() noexcept;
+void SettleQueueSubmits(VkDevice device, bool present);
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
@@ -573,7 +575,9 @@ private:
 class QueueAccess {
 public:
     enum class Queues : std::uint8_t { Main, All };
-    explicit QueueAccess(const Context& context, Queues queues = Queues::Main) {
+    enum class Settle : std::uint8_t { Other, Present };
+    explicit QueueAccess(const Context& context, Queues queues = Queues::Main, Settle site = Settle::Other) {
+        if (QueueSubmitsPosted()) SettleQueueSubmits(context.device, site == Settle::Present);
         if (context.mainQueueMutex != nullptr) main = std::unique_lock(*context.mainQueueMutex);
         if (queues != Queues::All) return;
         if (context.sparseQueueMutex != nullptr) sparse = std::unique_lock(*context.sparseQueueMutex);

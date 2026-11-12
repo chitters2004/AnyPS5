@@ -1086,6 +1086,359 @@ void AnotherEncodersTableDefersIntoTheOpenWindow() {
     Compare({{commands, {"draw 1 1 0 0", "draw 2 1 0 0", "draw 3 1 0 0", "draw 4 1 0 0"}}}, "a call through another encoder's table inside an open window");
 }
 
+using SubmitState = CommandEncoder::SubmitRequest::State;
+using Settled = std::vector<std::pair<std::uint64_t, SubmitState>>;
+
+std::vector<std::uint64_t> submittedSerials;
+std::atomic<VkResult> fakeSubmitResult{VK_SUCCESS};
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeEndCommandBuffer(VkCommandBuffer commands) {
+    Log(commands, "end");
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL FakeQueueSubmit(VkQueue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    const auto result = fakeSubmitResult.load();
+    if (result != VK_SUCCESS || count != 1) return result;
+    const auto& submit = submits[0];
+    const auto* timeline = static_cast<const VkTimelineSemaphoreSubmitInfoKHR*>(submit.pNext);
+    const auto serial = timeline != nullptr && timeline->signalSemaphoreValueCount == 1 ? timeline->pSignalSemaphoreValues[0] : 0;
+    Log(submit.pCommandBuffers[0], "submit " + std::to_string(serial) + " fence " + std::to_string(Raw(fence)));
+    std::lock_guard lock(logMutex);
+    submittedSerials.push_back(serial);
+    return VK_SUCCESS;
+}
+
+void NoteSettled(void* owner, const CommandEncoder::SubmitRequest& request, SubmitState state) noexcept {
+    std::lock_guard lock(logMutex);
+    static_cast<Settled*>(owner)->push_back({request.serial, state});
+}
+
+std::unique_ptr<CommandEncoder::SubmitRequest> Request(VkCommandBuffer commands, std::uint64_t serial, Settled& settled, AgcDriver::Mutex* queueMutex = nullptr) {
+    auto request = std::make_unique<CommandEncoder::SubmitRequest>();
+    request->commands = commands;
+    request->queue = Handle<VkQueue>(0x77);
+    request->fence = Handle<VkFence>(0x9000 + serial);
+    request->timeline = Handle<VkSemaphore>(0x55);
+    request->serial = serial;
+    request->endCommandBuffer = &FakeEndCommandBuffer;
+    request->queueSubmit = &FakeQueueSubmit;
+    request->queueMutex = queueMutex;
+    request->recording = &RecordingOf(commands);
+    request->settled = &NoteSettled;
+    request->owner = &settled;
+    return request;
+}
+
+std::string SubmitLine(std::uint64_t serial) {
+    return "submit " + std::to_string(serial) + " fence " + std::to_string(0x9000 + serial);
+}
+
+void ResetSubmits() {
+    Reset();
+    std::lock_guard lock(logMutex);
+    submittedSerials.clear();
+}
+
+std::vector<std::uint64_t> Submitted() {
+    std::lock_guard lock(logMutex);
+    return submittedSerials;
+}
+
+void AsyncSubmitsFollowTheirChunks(std::uint32_t seed, bool delays) {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x58);
+    if (delays) {
+        CommandEncoder::SetDelayForTesting([seed]() mutable {
+            thread_local std::mt19937 delay(seed * 11 + 3);
+            if (delay() % 3 == 0) std::this_thread::sleep_for(std::chrono::microseconds(delay() % 100));
+        });
+    }
+    constexpr std::uint64_t Batches = 300;
+    std::map<VkCommandBuffer, std::vector<std::string>> expected;
+    std::vector<std::unique_ptr<CommandEncoder::SubmitRequest>> requests;
+    Settled settled;
+    std::uint64_t counted = 0;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        std::atomic<bool> stop{false};
+        std::thread foreign([&] {
+            for (std::uint32_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
+                AgcDriver::Graphics::BeforeCommandLookup(device);
+                if (round % 8 == 0) AgcDriver::Graphics::SettleQueueSubmits(device, false);
+            }
+        });
+        std::mt19937 random(seed);
+        for (std::uint64_t batch = 1; batch <= Batches; ++batch) {
+            const auto commands = Handle<VkCommandBuffer>(0x3000 + batch * 0x10);
+            const auto windows = random() % 6;
+            for (std::uint32_t window = 0; window < windows; ++window) {
+                encoder.Open(commands, RecordingOf(commands));
+                for (std::uint32_t draw = random() % 4 + 1; draw != 0; --draw) {
+                    const auto vertices = static_cast<std::uint32_t>(batch * 100 + window * 10 + draw);
+                    table.cmdDraw(commands, vertices, 1, 0, 0);
+                    expected[commands].push_back("draw " + std::to_string(vertices) + " 1 0 0");
+                }
+                encoder.Close();
+            }
+            requests.push_back(Request(commands, batch, settled));
+            encoder.PostSubmit(*requests.back());
+            expected[commands].push_back("end");
+            expected[commands].push_back(SubmitLine(batch));
+            if (random() % 16 == 0) {
+                encoder.SettleSubmits();
+                for (const auto& request : requests) Require(request->Current() == SubmitState::Submitted, "a settle returned before submit " + std::to_string(request->serial) + " reached the queue");
+            }
+        }
+        stop.store(true, std::memory_order_relaxed);
+        foreign.join();
+        encoder.SettleSubmits();
+        counted = encoder.Counts().submits;
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Compare(expected, delays ? "async submits with encoder delays" : "async submits");
+    std::vector<std::uint64_t> order(Batches);
+    for (std::uint64_t index = 0; index < Batches; ++index) order[index] = index + 1;
+    Require(Submitted() == order, "the encoder submitted the batches out of their posted order");
+    Require(counted == Batches, "the encoder counted " + std::to_string(counted) + " async submits for " + std::to_string(Batches) + " batches");
+    Require(settled.size() == Batches, "the owner heard of " + std::to_string(settled.size()) + " settled submits, not " + std::to_string(Batches));
+    for (std::uint64_t index = 0; index < Batches; ++index) Require(settled[index] == std::make_pair(index + 1, SubmitState::Submitted), "the owner heard of submit " + std::to_string(settled[index].first) + " out of order or as not submitted");
+}
+
+enum class SubmitFailure { Injected, DeviceLost, Replay };
+
+void AFailedSubmitIsSticky(SubmitFailure failure) {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x59);
+    const bool deviceLost = failure == SubmitFailure::DeviceLost;
+    std::vector<std::unique_ptr<CommandEncoder::SubmitRequest>> requests;
+    Settled settled;
+    std::uint64_t failures = 0;
+    std::vector<VkCommandBuffer> buffers;
+    std::atomic<bool> failReplay{false};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (failReplay.exchange(false)) throw std::runtime_error("injected replay failure");
+    });
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        for (std::uint64_t batch = 1; batch <= 6; ++batch) {
+            const auto commands = Handle<VkCommandBuffer>(0x4000 + batch * 0x10);
+            buffers.push_back(commands);
+            if (batch == 3) {
+                encoder.SettleSubmits();
+                if (failure == SubmitFailure::DeviceLost) fakeSubmitResult.store(VK_ERROR_DEVICE_LOST);
+                if (failure == SubmitFailure::Replay) failReplay.store(true);
+            }
+            PostOne(encoder, table, commands, static_cast<std::uint32_t>(batch));
+            requests.push_back(Request(commands, batch, settled));
+            if (batch == 3 && failure == SubmitFailure::Injected) requests.back()->injectFailure = VK_ERROR_UNKNOWN;
+            encoder.PostSubmit(*requests.back());
+        }
+        encoder.SettleSubmits();
+        fakeSubmitResult.store(VK_SUCCESS);
+        failures = encoder.Counts().submitFailures;
+    }
+    CommandEncoder::SetDelayForTesting({});
+    const std::string scenario = deviceLost ? "a lost device" : failure == SubmitFailure::Replay ? "a replay failure" : "an injected failure";
+    const SubmitState states[6]{SubmitState::Submitted, SubmitState::Submitted, SubmitState::Failed, SubmitState::NotSubmitted, SubmitState::NotSubmitted, SubmitState::NotSubmitted};
+    for (std::size_t index = 0; index < 6; ++index) {
+        Require(requests[index]->Current() == states[index], "after " + scenario + " on submit 3, submit " + std::to_string(index + 1) + " ended in state " + std::to_string(static_cast<int>(requests[index]->Current())));
+        Require(settled[index] == std::make_pair(static_cast<std::uint64_t>(index + 1), states[index]), "after " + scenario + ", the owner heard of submit " + std::to_string(settled[index].first) + " in the wrong order or state");
+    }
+    if (deviceLost) Require(requests[2]->Result() == VK_ERROR_DEVICE_LOST, "a lost device was not kept as the failed submit's result");
+    else {
+        std::string kept;
+        try {
+            if (requests[2]->Error() != nullptr) std::rethrow_exception(requests[2]->Error());
+        } catch (const std::runtime_error& error) {
+            kept = error.what();
+        }
+        const std::string expected = failure == SubmitFailure::Replay ? "injected replay failure" : "vkQueueSubmit recorder: injected failure";
+        Require(kept == expected, scenario + " was kept as '" + kept + "', not as the failed submit's error");
+    }
+    Require(Submitted() == std::vector<std::uint64_t>{1, 2}, "after " + scenario + ", a submit after the failed one reached the queue");
+    if (failure == SubmitFailure::Replay) Require(Recorded(buffers[2]) == 0, "a batch whose replay failed was ended");
+    for (std::size_t index = 3; index < 6; ++index) Require(Recorded(buffers[index]) == 1, "a batch after " + scenario + " was ended though it is never submitted");
+    Require(failures == 4, "the encoder counted " + std::to_string(failures) + " failed submits, not the failed one and the three after it");
+}
+
+void SettleOnTheEncoderThreadIsRefused() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5a);
+    const auto commands = Handle<VkCommandBuffer>(0x5000);
+    AgcDriver::Mutex main;
+    AgcDriver::Graphics::Context context{};
+    context.device = device;
+    context.mainQueueMutex = &main;
+    Settled settled;
+    std::atomic<bool> posted{false};
+    std::atomic<bool> ran{false};
+    std::atomic<bool> settleRefused{false};
+    std::atomic<bool> accessRefused{false};
+    CommandEncoder* running = nullptr;
+    CommandEncoder::SetDelayForTesting([&] {
+        if (ran.exchange(true)) return;
+        while (!posted.load()) std::this_thread::yield();
+        try {
+            running->SettleSubmits();
+        } catch (const std::logic_error&) {
+            settleRefused.store(true);
+        }
+        try {
+            const AgcDriver::Graphics::QueueAccess access(context);
+        } catch (const std::logic_error&) {
+            accessRefused.store(true);
+        }
+    });
+    {
+        const auto attached = Attached(device, table);
+        running = attached.get();
+        PostOne(*attached, table, commands, 1);
+        const auto request = Request(commands, 1, settled, &main);
+        attached->PostSubmit(*request);
+        posted.store(true);
+        attached->SettleSubmits();
+        Require(request->Current() == SubmitState::Submitted, "the submit after a refused settle did not reach the queue");
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Require(ran.load() && settleRefused.load(), "the encoder thread settled its own submits instead of refusing");
+    Require(accessRefused.load(), "the encoder thread took queue access while its own submit was posted");
+}
+
+void TeardownLeavesNoSubmitPending() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5b);
+    std::vector<std::unique_ptr<CommandEncoder::SubmitRequest>> requests;
+    Settled settled;
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(2)); });
+    {
+        const auto attached = Attached(device, table);
+        for (std::uint64_t batch = 1; batch <= 8; ++batch) {
+            const auto commands = Handle<VkCommandBuffer>(0x6000 + batch * 0x10);
+            PostOne(*attached, table, commands, static_cast<std::uint32_t>(batch));
+            requests.push_back(Request(commands, batch, settled));
+            attached->PostSubmit(*requests.back());
+        }
+    }
+    CommandEncoder::SetDelayForTesting({});
+    std::size_t notSubmitted = 0;
+    for (const auto& request : requests) {
+        const auto state = request->Current();
+        Require(state == SubmitState::Submitted || state == SubmitState::NotSubmitted, "a submit posted before the teardown ended in state " + std::to_string(static_cast<int>(state)));
+        if (state == SubmitState::NotSubmitted) ++notSubmitted;
+        else Require(notSubmitted == 0, "a submit was made at teardown after an earlier one was refused");
+    }
+    Require(notSubmitted != 0, "every submit posted before the teardown was made, so the teardown was not exercised");
+    Require(settled.size() == requests.size(), "the owner heard of " + std::to_string(settled.size()) + " of the " + std::to_string(requests.size()) + " submits posted before the teardown");
+    Require(Submitted().size() == requests.size() - notSubmitted, "a submit refused at teardown reached the queue");
+}
+
+void QueueAccessSettlesPostedSubmits() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5c);
+    AgcDriver::Mutex main;
+    AgcDriver::Graphics::Context context{};
+    context.device = device;
+    context.mainQueueMutex = &main;
+    Settled settled;
+    CommandEncoder::SetDelayForTesting([] { std::this_thread::sleep_for(std::chrono::milliseconds(5)); });
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto first = Handle<VkCommandBuffer>(0x7000);
+        PostOne(encoder, table, first, 1);
+        const auto presented = Request(first, 1, settled, &main);
+        encoder.PostSubmit(*presented);
+        {
+            const AgcDriver::Graphics::QueueAccess access(context, AgcDriver::Graphics::QueueAccess::Queues::Main, AgcDriver::Graphics::QueueAccess::Settle::Present);
+            Require(presented->Current() == SubmitState::Submitted, "queue access took the main queue before a posted submit reached it");
+        }
+        const auto second = Handle<VkCommandBuffer>(0x7100);
+        PostOne(encoder, table, second, 2);
+        const auto other = Request(second, 2, settled, &main);
+        encoder.PostSubmit(*other);
+        {
+            const AgcDriver::Graphics::QueueAccess access(context, AgcDriver::Graphics::QueueAccess::Queues::All);
+            Require(other->Current() == SubmitState::Submitted, "access to every queue was taken before a posted submit reached the main queue");
+        }
+        const auto counts = encoder.Counts();
+        Require(counts.presentSettleWaits == 1 && counts.settleWaits == 1, "the settles were counted as " + std::to_string(counts.presentSettleWaits) + " present and " + std::to_string(counts.settleWaits) + " other waits, not one of each");
+        CommandEncoder::SetDelayForTesting({});
+        const auto third = Handle<VkCommandBuffer>(0x7200);
+        PostOne(encoder, table, third, 3);
+        const auto held = Request(third, 3, settled, &main);
+        {
+            std::unique_lock hold(main);
+            encoder.PostSubmit(*held);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            Require(held->Current() == SubmitState::Pending && Submitted().size() == 2, "the encoder submitted while another thread held the main queue");
+        }
+        Require(held->Wait() == SubmitState::Submitted && Submitted().size() == 3, "a submit held back by the main queue never reached it");
+        const auto idle = encoder.Counts();
+        {
+            const AgcDriver::Graphics::QueueAccess access(context);
+        }
+        Require(encoder.Counts().settleWaits == idle.settleWaits, "queue access waited with no submit posted");
+    }
+    CommandEncoder::SetDelayForTesting({});
+}
+
+void NextBatchDoesNotWaitForTheSubmit() {
+    ResetSubmits();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5d);
+    Settled settled;
+    std::atomic<bool> gate{false};
+    std::atomic<bool> held{false};
+    CommandEncoder::SetDelayForTesting([&] {
+        if (held.exchange(true)) return;
+        while (!gate.load()) std::this_thread::yield();
+    });
+    std::chrono::steady_clock::duration opened{};
+    SubmitState stateAfterOpen = SubmitState::Submitted;
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        const auto first = Handle<VkCommandBuffer>(0x8000);
+        const auto second = Handle<VkCommandBuffer>(0x8100);
+        PostOne(encoder, table, first, 1);
+        const auto request = Request(first, 1, settled);
+        encoder.PostSubmit(*request);
+        std::thread release([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            gate.store(true);
+        });
+        const auto start = std::chrono::steady_clock::now();
+        PostOne(encoder, table, second, 2);
+        opened = std::chrono::steady_clock::now() - start;
+        stateAfterOpen = request->Current();
+        release.join();
+        encoder.SettleSubmits();
+        encoder.Quiesce();
+    }
+    CommandEncoder::SetDelayForTesting({});
+    Require(stateAfterOpen == SubmitState::Pending && opened < std::chrono::milliseconds(250), "the next batch's window waited " + std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(opened).count()) + " ms for the previous batch's posted submit");
+    Compare({{Handle<VkCommandBuffer>(0x8000), {"draw 1 1 0 0", "end", SubmitLine(1)}}, {Handle<VkCommandBuffer>(0x8100), {"draw 2 1 0 0"}}}, "a window on the next batch while the previous submit is posted");
+}
+
+void RunAsyncSubmit() {
+    NextBatchDoesNotWaitForTheSubmit();
+    for (std::uint32_t seed = 1; seed <= 4; ++seed) AsyncSubmitsFollowTheirChunks(seed, seed % 2 == 0);
+    AFailedSubmitIsSticky(SubmitFailure::Injected);
+    AFailedSubmitIsSticky(SubmitFailure::DeviceLost);
+    AFailedSubmitIsSticky(SubmitFailure::Replay);
+    SettleOnTheEncoderThreadIsRefused();
+    TeardownLeavesNoSubmitPending();
+    QueueAccessSettlesPostedSubmits();
+}
+
 void QueueAccessLocksTheQueuesItCovers() {
     AgcDriver::Mutex main;
     std::mutex sparse;
@@ -1146,6 +1499,7 @@ void RunSuite() {
     ADirectCallWaitsForTheHeldChunk();
     ForeignSettlesFlushTheHeldChunkInOrder();
     AnotherEncodersTableDefersIntoTheOpenWindow();
+    RunAsyncSubmit();
 }
 
 int main(int argc, char** argv) {
