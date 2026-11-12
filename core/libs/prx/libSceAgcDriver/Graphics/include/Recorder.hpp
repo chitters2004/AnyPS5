@@ -535,6 +535,7 @@ public:
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     static bool GpuRangeDumpEnabled();
+    static void FlushGpuRangeDump();
     void TagGpuTiming(std::uint32_t index, std::string_view tag);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
