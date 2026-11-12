@@ -139,6 +139,15 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+struct SyncedDetiler : TextureDetiler {
+    using TextureDetiler::TextureDetiler;
+    SyncedDetiler(const SyncedDetiler&) = delete;
+    SyncedDetiler& operator=(const SyncedDetiler&) = delete;
+    ~SyncedDetiler() {
+        if (auto* recorder = Recorder::Active()) recorder->Sync();
+    }
+};
+
 bool collectMappingHistoryTests() {
     constexpr std::size_t bytes = 131072;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
@@ -970,7 +979,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         }
     }
     {
-        TextureDetiler detiler(context);
+        SyncedDetiler detiler(context);
         auto imageContext = context;
         imageContext.detiler = &detiler;
         TextureCache textureCache(imageContext);
@@ -3026,7 +3035,7 @@ bool settleStorageImageTests(const Device& device) {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, unit, true, true, true);
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -3169,7 +3178,7 @@ bool settleInitialDccTests(const Device& device) {
             std::cout << "(m) " << count << " adjacent pending imports settled: " << after.submitted - before.submitted << " reads submitted\n";
         }
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     Recorder recorder(context);
@@ -4038,7 +4047,7 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the moved metadata block refused: moved DCC metadata not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -4131,7 +4140,7 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the past-last-mip block refused: views past the last mip not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto view = [&](std::uint32_t level) {
@@ -4444,7 +4453,7 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         auto downloaded = std::make_shared<Buffer>(context, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const auto source = uploaded->Bytes();
         std::fill(source.begin(), source.end(), std::byte{0});
-        TextureDetiler repack(context);
+        SyncedDetiler repack(context);
         const auto commands = recorder.Commands();
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         repack.DispatchRepack(commands, uploaded->Handle(), 0, elementView.buffer, elementView.offset + elementAdjustment, 64);
@@ -5004,7 +5013,7 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     if (context.imageTableCapacity < 2u) {
@@ -5085,7 +5094,7 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     struct Clear {
@@ -6608,7 +6617,7 @@ bool untrackedForgetTests(const Device& device, Recorder& recorder) {
     }
     const char* mode = std::getenv("APS5_WRITE_WATCH_IMPORTS");
     std::cout << "write-watch mode covered: APS5_WRITE_WATCH_IMPORTS=" << (mode != nullptr ? mode : "unset (probed)") << ", the surface is not write-watched\n";
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     struct Drain {
         Recorder& recorder;
         ~Drain() { recorder.Sync(); }
@@ -6704,7 +6713,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     watched = watched && AgcDriver::GuestMemory::Watched(address, bytes);
     Require(watched || !ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
     if (!AgcDriver::GuestMemory::WriteWatched()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -6874,7 +6883,7 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
         std::cout << "skipped, the heap is not imported or not watched\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7014,7 +7023,7 @@ bool smallTiledShadowLabelTests(const Device& device, Recorder& recorder) {
         return false;
     }
     CollectWritesUncached(address, bytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto settle = [&] {
@@ -7321,7 +7330,7 @@ bool completionStoreShadowTests(const Device& device, Recorder& recorder) {
         std::cout << "skipped, the heap is not imported or not watched\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7426,7 +7435,7 @@ bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
         return false;
     }
     std::cout << "written buffer order: host imports are " << (AgcDriver::GuestMemory::Watched(address, bytes) ? "watched" : "compared") << "\n";
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7875,7 +7884,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -8003,7 +8012,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, address, surfaceBytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         GuestTextureResource resource{};
@@ -8244,7 +8253,7 @@ struct GateBlock {
 struct GateFixture {
     const Context& base;
     ImportWatch decided;
-    TextureDetiler detiler;
+    SyncedDetiler detiler;
     Context context;
     std::deque<GateBlock> blocks;
 
@@ -8683,7 +8692,7 @@ bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
     }
     Require(mapped.size() == 1, "(l) the surface's range is not registered");
     AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -8838,7 +8847,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             std::cout << "host import of the write-back padding block refused: write-back padding not tested\n";
             return;
         }
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9008,7 +9017,7 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes, test.twoAllocations ? static_cast<void*>(memory + test.split) : nullptr};
         Require(HostImportFor(base, address, surfaceBytes) == nullptr, std::string(test.name) + ": one import covers both ranges");
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9145,7 +9154,7 @@ void dccMipWriteBackTests(const Device& device, Recorder& recorder) {
 #endif
             }
         } unregister{base, block, bytes};
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9244,7 +9253,7 @@ void writeBackBlockTests(const Device& device, Recorder& recorder) {
         ClearHostImports(base.device);
         const auto address = reinterpret_cast<std::uint64_t>(memory) + test.offset;
         const auto before = HostImportCounters();
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9333,7 +9342,7 @@ bool flushWaitMipChainTests(const Device& device, Recorder& recorder) {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     resource.baseAddress = address;
@@ -9485,7 +9494,7 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
                 std::cout << "host import refused: single-pass storage moves not tested\n";
                 return;
             }
-            TextureDetiler detiler(base);
+            SyncedDetiler detiler(base);
             context.detiler = &detiler;
             resource.baseAddress = address;
             std::size_t linearBytes = 0;
@@ -9715,7 +9724,7 @@ private:
 void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool failView) {
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     GuestTextureResource resource{};
     resource.width = 64;
@@ -9810,7 +9819,7 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
         std::cout << "no watched host import: refresh proofs not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -9976,7 +9985,7 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
         std::cout << "no watched host import: refreshes over a pending key store not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -10138,7 +10147,7 @@ bool repeatedNeighbourStoreTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!imported) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10250,7 +10259,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
                 }
             } unregister{base, block, blockAddress, bytes};
             AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-            TextureDetiler detiler(base);
+            SyncedDetiler detiler(base);
             auto context = base;
             if (!imported) context.hostImportAlignment = 0;
             context.detiler = &detiler;
@@ -10359,7 +10368,7 @@ bool rewrittenBlockTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, memoryBlock, address, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10464,7 +10473,7 @@ bool rewrittenStaleUnitTests(const Device& device, Recorder& recorder) {
         for (std::size_t i = 0; i < surfaceBytes; ++i) memory[i] = pattern(i);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10603,7 +10612,7 @@ void idleWriteBackRaceTests(const Device& device, Recorder& recorder) {
         std::memset(memory, 0x5a, surfaceBytes);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!direct) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10750,7 +10759,7 @@ void keptUnitSettleTests(const Device& device, Recorder& recorder) {
         std::memset(memory, 0x5a, surfaceBytes);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!direct) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10874,7 +10883,7 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         GuestTextureResource resource{};
@@ -10963,7 +10972,7 @@ void importWindowTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -12355,7 +12364,7 @@ void cmaskPassTests(const Device& device, Recorder& recorder) {
     namespace GuestMemory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     constexpr std::size_t surfaceBytes = 256 * 256 * 4;
     constexpr std::size_t bytes = surfaceBytes + 65536;
@@ -12467,7 +12476,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the metadata pass block refused: resident metadata passes not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     ColorTarget color{};
@@ -12607,7 +12616,7 @@ std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint
 
 void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     TextureCache textureCache(context);
@@ -12775,7 +12784,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13085,7 +13094,7 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13185,7 +13194,7 @@ void oneFragmentFmaskGuardTests(const Device& device) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13291,7 +13300,7 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     ColorTarget source{};
@@ -13356,7 +13365,7 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
         return;
     }
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     constexpr std::uint32_t side = 128;
     constexpr std::size_t targetBytes = side * side * 4u;
@@ -13482,7 +13491,7 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13657,7 +13666,7 @@ void minLodTests(const Device& device, Recorder& recorder) {
         std::cout << "VK_EXT_image_view_min_lod unavailable: minimum LOD clamp not tested\n";
         return;
     }
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     GuestTextureResource resource{};
     resource.baseAddress = 0x100000;
     resource.width = 8;
@@ -13707,7 +13716,7 @@ void minLodTests(const Device& device, Recorder& recorder) {
 void failedCheckReportTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     Require(Recorder::Active() == &recorder, "the failed check test needs the active recorder");
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     GuestTextureResource resource{};
     resource.baseAddress = 0x100000;
     resource.width = 64;
@@ -13730,7 +13739,7 @@ void failedCheckReportTests(const Device& device, Recorder& recorder) {
 void uploadScratchReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     Require(Recorder::Active() == &recorder, "the upload scratch test needs the active recorder");
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     SampleProgram program(context, recorder);
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     struct Upload {
@@ -13771,7 +13780,7 @@ void uploadScratchReuseTests(const Device& device, Recorder& recorder) {
 
 void singleCubeTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     SampleProgram program(context, recorder, SAMPLE_ARRAY_SPV);
     const VkComponentMapping identity{};
@@ -13804,7 +13813,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
         return false;
     }
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     SampleProgram program(context, recorder);
     auto cacheContext = context;
     cacheContext.detiler = &detiler;
@@ -14085,7 +14094,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
 
 void cubeExtraSliceTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     SampleProgram program(context, recorder, SAMPLE_ARRAY_SPV);
     const VkComponentMapping identity{};
@@ -14179,7 +14188,7 @@ struct SampledViewProbe {
 
 void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     GuestTextureResource resource{};
     resource.width = resource.height = 8;
@@ -14213,7 +14222,7 @@ void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder)
 
 void firstLayerViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     auto withDetiler = context;
     withDetiler.detiler = &detiler;
     GuestTextureResource resource{};
@@ -14290,7 +14299,7 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, address, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -14563,7 +14572,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address, bytes};
     AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.hostImportAlignment = 0;
     context.detiler = &detiler;
@@ -14668,7 +14677,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
 
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     auto withDetiler = context;
     withDetiler.detiler = &detiler;
     for (const std::uint32_t format : {20u, 21u, 22u, 56u}) {
@@ -14733,7 +14742,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         context.hostImportAlignment = 0;
         context.dmaBufImport = false;
     }
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     {
         GuestAllocations::Mutation mutation;
@@ -15488,7 +15497,7 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the key fill block refused: DCC key fills not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -15646,7 +15655,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         std::cout << "the imported block left the write watch: " << what << " not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto surface = [&](std::uint32_t width, std::uint32_t height, std::uint32_t format, std::uint64_t dcc) {
@@ -15892,7 +15901,7 @@ bool denormalClearTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the denormal clear block refused: denormal fill clears not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -16242,7 +16251,7 @@ GuestTextureResource Resource(std::uint64_t address, std::uint32_t side = Side) 
 }
 
 void Run(Context context) {
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     for (const bool watched : {true, false}) {
         Block block(context, watched);
@@ -16430,7 +16439,7 @@ void hostBarrier(const Context& context, VkCommandBuffer commands) {
 void smallElementDetileTests(Device& device) {
     using namespace SmallElementDetileTest;
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     struct Case {
         TextureTileMode mode;
         const char* name;
