@@ -262,8 +262,12 @@ int main() {
         AgcDriver::Graphics::SetDrawInputPreparers(1);
         const auto programs = Compile(*device);
 
+        const auto ringBefore = AgcDriver::Graphics::DrawInputRingCounters();
         const auto unchanged = DrawPrepared(*device, *programs, [] {});
+        const auto ringAfter = AgcDriver::Graphics::DrawInputRingCounters();
         Print("unchanged inputs", unchanged);
+        std::printf("unchanged inputs: %llu ring slices, %llu ring chunks made\n", static_cast<unsigned long long>(ringAfter.slices - ringBefore.slices), static_cast<unsigned long long>(ringAfter.chunks - ringBefore.chunks));
+        Require(ringAfter.slices - ringBefore.slices == 2, "prepared vertex inputs: the preparer did not copy the index and vertex ranges into ring slices");
         Require(unchanged.prepared == 2 && unchanged.adopted == 2 && unchanged.reprepared == 0 && unchanged.copied == 0, "prepared vertex inputs: an unchanged draw did not adopt its prepared index and vertex copies");
         Require(unchanged.covered, "prepared vertex inputs: the draw with adopted inputs did not cover the center");
 
@@ -366,6 +370,11 @@ int main() {
             const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
             return std::array<std::uint64_t, 3>{after.epochFollows - before.epochFollows, after.stashHits[0] - before.stashHits[0], after.stashReturned - before.stashReturned};
         };
+        const auto ringSlices = AgcDriver::Graphics::DrawInputRingCounters().slices;
+        const auto sliced = prepareUnused((std::uint64_t{1} << 62u) - 8u);
+        std::printf("three unused preparations in ring slices: %llu ring slices, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices), static_cast<unsigned long long>(sliced[1]), static_cast<unsigned long long>(sliced[2]));
+        Require(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices == 6 && sliced[1] == 0 && sliced[2] == 0, "prepared vertex inputs: preparations of ring-sized ranges did not take ring slices, or put slices in the stash of whole buffers");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRing, true);
         const auto recycled = prepareUnused(std::uint64_t{1} << 62u);
         std::printf("three unused preparations in epochs E, E and E+1: %llu epoch follows, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(recycled[0]), static_cast<unsigned long long>(recycled[1]), static_cast<unsigned long long>(recycled[2]));
         Require(recycled[0] == 2, "prepared vertex inputs: the preparer did not follow each new collect epoch of its draws exactly once");
@@ -423,6 +432,8 @@ int main() {
         const auto beforeTeardown = AgcDriver::Graphics::PreparedDrawInputCounters();
         static_cast<void>(prepareUnused((std::uint64_t{1} << 62u) + 16u));
         Require(AgcDriver::Graphics::PreparedDrawInputCounters().stashReturned > beforeTeardown.stashReturned, "prepared vertex inputs: no unused copy was kept for recycling, so destroying the device after it proves nothing");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRing, false);
+        Require(AgcDriver::Graphics::DrawInputRingCounters().outstanding != 0, "prepared vertex inputs: no ring chunk is in use, so destroying the device after the ring proves nothing");
         device.reset();
         AgcDriver::Graphics::SetDrawInputPreparers(0);
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");

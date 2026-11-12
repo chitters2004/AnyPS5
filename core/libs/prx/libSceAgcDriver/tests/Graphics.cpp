@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ShaderDiskCache.hpp"
@@ -12899,7 +12900,7 @@ void vertexZeroFillTests() {
     std::fill(guest.begin(), guest.begin() + static_cast<std::ptrdiff_t>(valid), std::byte{0x7a});
     std::fill(guest.begin() + static_cast<std::ptrdiff_t>(valid), guest.end(), std::byte{0x55});
     const auto copy = CopyZeroPaddedDrawInput(mockContext(), reinterpret_cast<std::uint64_t>(guest.data()), extent, valid);
-    const auto bytes = copy.buffer->Bytes();
+    const auto bytes = copy.Bytes();
     Require(bytes.size() == extent, "a zero-padded vertex fetch changed its size");
     Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a vertex fetch did not copy the bytes within the record count");
     Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(valid), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "a vertex fetch past the record count did not read as zeros");
@@ -12922,7 +12923,7 @@ void vertexZeroFillFlushTests() {
     AgcDriver::GuestMemory::SetFlushHook(&RecordPaddedVertexFlush);
     try {
         const auto copy = CopyZeroPaddedDrawInput(mockContext(), address, fetched, valid);
-        const auto bytes = copy.buffer->Bytes();
+        const auto bytes = copy.Bytes();
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a zero-padded vertex fetch did not copy its valid bytes");
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(previous);
@@ -12952,7 +12953,7 @@ void vertexOverhangTests() {
     const auto address = reinterpret_cast<std::uint64_t>(block) + offset;
     {
         const auto copy = CopyZeroPaddedDrawInput(mockContext(), address, readable + overhang, readable + overhang, stride);
-        const auto bytes = copy.buffer->Bytes();
+        const auto bytes = copy.Bytes();
         Require(bytes.size() == readable + overhang, "an overhanging vertex fetch changed its size");
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(readable), [](std::byte value) { return value == std::byte{0x7a}; }), "an overhanging vertex fetch did not copy the readable bytes");
         Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(readable), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "an overhanging vertex fetch did not zero its last record");
@@ -13747,6 +13748,7 @@ PFN_vkVoidFunction VKAPI_CALL retentionProc(VkDevice device, const char* name) {
 void recordedDrawRetentionTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, true);
     auto context = mockContext();
     context.deviceProc = retentionProc;
     context.formatProperties = [](VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
@@ -13861,6 +13863,7 @@ void recordedDrawRetentionTests() {
     mock.signaled.at(retentionFences.back()) = true;
     Require(recorder.Reap(), "the second replay batch was not retired");
     Require(released(), "recorded owners survived the completion of the last batch that used them");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, false);
 }
 
 void faultOnlyTemplateRecordTests() {

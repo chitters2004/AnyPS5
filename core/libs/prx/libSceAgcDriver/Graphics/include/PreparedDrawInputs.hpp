@@ -52,16 +52,43 @@ private:
     std::shared_ptr<PreparedDrawInputs> previous;
 };
 
-struct AdoptedDrawInput {
+struct DrawInputSlice {
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
+    std::size_t bytes = 0;
+    bool ring = false;
+    std::span<std::byte> Bytes() const;
+};
+
+struct AdoptedDrawInput {
+    DrawInputSlice slice;
     std::uint32_t derived = 0;
 };
 
 std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validBytes, std::size_t stride);
-std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, std::shared_ptr<Buffer>* spare = nullptr);
+std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, DrawInputSlice* spare = nullptr);
 inline constexpr VkBufferUsageFlags DrawInputUsage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
 VkMemoryPropertyFlags DrawInputMemoryProperties(const Context& context, Recorder::SnapshotUse use);
 std::shared_ptr<Buffer> NewDrawInputBuffer(const Context& context, std::size_t bytes, Recorder::SnapshotUse use);
+DrawInputSlice NewDrawInputSlice(const Context& context, std::size_t bytes, Recorder::SnapshotUse use);
+inline constexpr std::size_t DrawInputRingChunk = std::size_t{1} << 20u;
+inline constexpr std::size_t DrawInputRingSliceLimit = std::size_t{64} << 10u;
+inline constexpr VkDeviceSize DrawInputRingAlignment = 16;
+inline constexpr std::size_t DrawInputRingFreeChunks = 4;
+inline constexpr std::size_t DrawInputRingPinnedLimit = std::size_t{128} << 20u;
+
+struct DrawInputRingCounts {
+    std::uint64_t slices = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t chunks = 0;
+    std::uint64_t recycled = 0;
+    std::uint64_t returned = 0;
+    std::uint64_t capped = 0;
+    std::uint64_t oversize = 0;
+    std::uint64_t outstanding = 0;
+};
+
+DrawInputRingCounts DrawInputRingCounters();
 
 enum class PreparedRefusal : std::uint8_t { Size, Inaccessible, Forget, Pending, Unwatched, SnapshotChanged, Failed, Count };
 inline constexpr std::size_t PreparedRefusalCount = static_cast<std::size_t>(PreparedRefusal::Count);

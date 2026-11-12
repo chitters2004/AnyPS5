@@ -84,8 +84,14 @@ struct PreparedRange {
     std::uint64_t forget = 0;
     std::uint32_t derived = 0;
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
+    bool ring = false;
     VkBufferUsageFlags usage = 0;
     bool consumed = false;
+
+    std::span<std::byte> Bytes() const {
+        return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
+    }
 };
 
 struct Counters {
@@ -290,6 +296,160 @@ void countStaging(StagingRole role, const StagingCost& cost) {
     if (cost.stashHits != 0) counted(total.stashHits[index], StashHitNames[index], cost.stashHits);
 }
 
+struct RingCounters {
+    std::atomic<std::uint64_t> slices{0};
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> chunks{0};
+    std::atomic<std::uint64_t> recycled{0};
+    std::atomic<std::uint64_t> returned{0};
+    std::atomic<std::uint64_t> capped{0};
+    std::atomic<std::uint64_t> oversize{0};
+    std::atomic<std::uint64_t> outstanding{0};
+};
+
+RingCounters& ringCounters() {
+    static RingCounters values;
+    return values;
+}
+
+struct RingLane {
+    RingLane(VkDevice device, VkMemoryPropertyFlags properties) : device(device), properties(properties) {
+        free.reserve(DrawInputRingFreeChunks);
+    }
+    const VkDevice device;
+    const VkMemoryPropertyFlags properties;
+    std::mutex mutex;
+    std::atomic<bool> closed{false};
+    std::shared_ptr<Buffer> current;
+    VkDeviceSize used = 0;
+    std::vector<std::shared_ptr<Buffer>> free;
+};
+
+struct ChunkReturn {
+    std::shared_ptr<RingLane> lane;
+    std::shared_ptr<Buffer> chunk;
+
+    void operator()(Buffer*) {
+        std::shared_ptr<Buffer> dropped;
+        {
+            std::lock_guard lock(lane->mutex);
+            if (lane->closed.load(std::memory_order_relaxed) || lane->free.size() >= DrawInputRingFreeChunks) dropped = std::move(chunk);
+            else lane->free.push_back(std::move(chunk));
+        }
+        ringCounters().outstanding.fetch_sub(1, std::memory_order_relaxed);
+        counted(ringCounters().returned, "DrawInputRing.returned");
+    }
+};
+
+struct RingRegistry {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<RingLane>> lanes;
+};
+
+RingRegistry& ringRegistry() {
+    static RingRegistry registry;
+    return registry;
+}
+
+void closeLane(RingLane& lane) {
+    std::shared_ptr<Buffer> current;
+    std::vector<std::shared_ptr<Buffer>> free;
+    {
+        std::lock_guard lock(lane.mutex);
+        lane.closed.store(true, std::memory_order_relaxed);
+        current = std::move(lane.current);
+        free.swap(lane.free);
+    }
+}
+
+struct ThreadLanes {
+    std::vector<std::shared_ptr<RingLane>> lanes;
+
+    ~ThreadLanes() {
+        for (const auto& lane : lanes) closeLane(*lane);
+    }
+
+    std::shared_ptr<RingLane> Find(VkDevice device, VkMemoryPropertyFlags properties) {
+        for (auto it = lanes.begin(); it != lanes.end(); ++it) {
+            if ((*it)->device != device || (*it)->properties != properties) continue;
+            if (!(*it)->closed.load(std::memory_order_relaxed)) return *it;
+            lanes.erase(it);
+            break;
+        }
+        auto lane = std::make_shared<RingLane>(device, properties);
+        {
+            auto& registry = ringRegistry();
+            std::lock_guard lock(registry.mutex);
+            std::erase_if(registry.lanes, [](const std::weak_ptr<RingLane>& held) { return held.expired(); });
+            registry.lanes.push_back(lane);
+        }
+        lanes.push_back(lane);
+        return lane;
+    }
+};
+
+thread_local ThreadLanes threadLanes;
+
+std::optional<DrawInputSlice> ringSlice(const Context& context, std::size_t bytes, VkMemoryPropertyFlags properties) {
+    if (bytes == 0 || RuntimeSwitches::Set(RuntimeSwitch::NoDrawInputRing)) return std::nullopt;
+    auto& total = ringCounters();
+    if (bytes > DrawInputRingSliceLimit) {
+        counted(total.oversize, "DrawInputRing.oversize");
+        return std::nullopt;
+    }
+    const auto lane = threadLanes.Find(context.device, properties);
+    bool recycled = false;
+    bool made = false;
+    std::unique_lock lock(lane->mutex);
+    auto offset = (lane->used + DrawInputRingAlignment - 1) & ~(DrawInputRingAlignment - 1);
+    if (lane->current == nullptr || offset + bytes > DrawInputRingChunk) {
+        if (total.outstanding.load(std::memory_order_relaxed) * DrawInputRingChunk >= DrawInputRingPinnedLimit) {
+            lock.unlock();
+            counted(total.capped, "DrawInputRing.capped");
+            return std::nullopt;
+        }
+        auto retired = std::move(lane->current);
+        lock.unlock();
+        retired.reset();
+        lock.lock();
+        if (lane->closed.load(std::memory_order_relaxed)) {
+            lock.unlock();
+            return std::nullopt;
+        }
+        std::shared_ptr<Buffer> chunk;
+        if (!lane->free.empty()) {
+            chunk = std::move(lane->free.back());
+            lane->free.pop_back();
+            recycled = true;
+        }
+        lock.unlock();
+        if (chunk == nullptr) {
+            chunk = std::make_shared<Buffer>(context, DrawInputRingChunk, DrawInputUsage, properties);
+            made = true;
+        }
+        auto* raw = chunk.get();
+        total.outstanding.fetch_add(1, std::memory_order_relaxed);
+        std::shared_ptr<Buffer> handle(raw, ChunkReturn{lane, std::move(chunk)});
+        lock.lock();
+        if (lane->closed.load(std::memory_order_relaxed)) {
+            lock.unlock();
+            handle.reset();
+            if (made) counted(total.chunks, "DrawInputRing.chunks");
+            return std::nullopt;
+        }
+        lane->current = std::move(handle);
+        offset = 0;
+    }
+    lane->used = offset + bytes;
+    DrawInputSlice slice{lane->current, offset, bytes, true};
+    lock.unlock();
+    if (recycled) counted(total.recycled, "DrawInputRing.recycled");
+    if (made) counted(total.chunks, "DrawInputRing.chunks");
+    counted(total.slices, "DrawInputRing.slices");
+    counted(total.bytes, "DrawInputRing.bytes", bytes);
+    return slice;
+}
+
 }
 
 class PreparedWork {
@@ -368,17 +528,25 @@ protected:
         if (timed) collectNanoseconds += nanosecondsSince(collectStart);
         if (range.generation == 0) return refuse(PreparedRefusal::Unwatched);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        StagingCost cost;
-        range.buffer = stagingBuffer(context, bytes, usage, DrawInputMemoryProperties(context, use), timed, cost);
-        staging.allocNanoseconds += cost.allocNanoseconds;
-        staging.poolWaitNanoseconds += cost.poolWaitNanoseconds;
-        staging.stashHits += cost.stashHits;
-        const auto target = range.buffer->Bytes();
+        const auto properties = use == Recorder::SnapshotUse::Storage ? HostBufferProperties : DrawInputMemoryProperties(context, use);
+        const auto sliced = use == Recorder::SnapshotUse::Storage ? std::nullopt : ringSlice(context, bytes, properties);
+        if (sliced) {
+            range.buffer = sliced->buffer;
+            range.offset = sliced->offset;
+            range.ring = true;
+        } else {
+            StagingCost cost;
+            range.buffer = stagingBuffer(context, bytes, usage, properties, timed, cost);
+            staging.allocNanoseconds += cost.allocNanoseconds;
+            staging.poolWaitNanoseconds += cost.poolWaitNanoseconds;
+            staging.stashHits += cost.stashHits;
+        }
+        const auto target = range.Bytes();
         GuestMemory::CopyGuestBytes(target.data(), reinterpret_cast<const void*>(address), readable);
-        std::fill(target.begin() + static_cast<std::ptrdiff_t>(readable), target.begin() + static_cast<std::ptrdiff_t>(bytes), std::byte{0});
+        std::fill(target.begin() + static_cast<std::ptrdiff_t>(readable), target.end(), std::byte{0});
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (Recorder::PendingWriteSnapshot() != pending) {
-            static_cast<void>(returnStashed(context.device, bytes, usage, range.buffer));
+            if (!range.ring) static_cast<void>(returnStashed(context.device, bytes, usage, range.buffer));
             return refuse(PreparedRefusal::SnapshotChanged);
         }
         ranges.push_back(std::move(range));
@@ -391,7 +559,7 @@ protected:
         for (auto& range : ranges) {
             ++counts[0];
             if (!range.consumed) ++counts[1];
-            if (returnStashed(context.device, range.bytes, range.usage, range.buffer)) ++counts[2];
+            if (!range.ring && returnStashed(context.device, range.bytes, range.usage, range.buffer)) ++counts[2];
         }
         return counts;
     }
@@ -469,7 +637,7 @@ public:
             const auto index = countedCopy(draw.indexAddress, bytes, indexUse, DrawInputUsage, bytes);
             if (!index) return;
             auto& range = ranges[*index];
-            const auto highest = HighestDrawIndex(range.buffer->Bytes().first(bytes), draw.indexSize, skipRestart);
+            const auto highest = HighestDrawIndex(range.Bytes(), draw.indexSize, skipRestart);
             range.derived = skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u);
             if (!highest) return;
             if (zeroFetchFrom) {
@@ -836,7 +1004,7 @@ std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validByte
     return validBytes - prefix < stride ? prefix : validBytes;
 }
 
-std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, std::shared_ptr<Buffer>* spare) {
+std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable, DrawInputSlice* spare) {
     auto* job = currentPrepared.get();
     if (job == nullptr || job->context.device != context.device) return std::nullopt;
     job->Settle();
@@ -855,7 +1023,7 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
     }
     if (!valid) {
         if (spare != nullptr && recycling()) {
-            *spare = std::move(found->buffer);
+            *spare = DrawInputSlice{std::move(found->buffer), found->offset, found->bytes, found->ring};
             counted(total.spareReused, "DrawInputPrep.spare_reused");
         }
         found->buffer.reset();
@@ -864,10 +1032,10 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
     }
     counted(total.adopted, "DrawInputPrep.adopted");
     static const bool verify = std::getenv("APS5_VERIFY_EARLY_DRAW_INPUTS") != nullptr;
-    if (verify && std::memcmp(found->buffer->Bytes().data(), reinterpret_cast<const void*>(address), bytes) != 0) {
+    if (verify && std::memcmp(found->Bytes().data(), reinterpret_cast<const void*>(address), bytes) != 0) {
         counted(total.verifyDiffered, "DrawInputPrep.verify_differed");
     }
-    return AdoptedDrawInput{std::move(found->buffer), found->derived};
+    return AdoptedDrawInput{DrawInputSlice{std::move(found->buffer), found->offset, found->bytes, found->ring}, found->derived};
 }
 
 VkMemoryPropertyFlags DrawInputMemoryProperties(const Context& context, Recorder::SnapshotUse use) {
@@ -879,6 +1047,29 @@ std::shared_ptr<Buffer> NewDrawInputBuffer(const Context& context, std::size_t b
     auto buffer = stagingBuffer(context, bytes, DrawInputUsage, DrawInputMemoryProperties(context, use), DrawInputSourcesTimed(), cost);
     countStaging(StagingRole::Committer, cost);
     return buffer;
+}
+
+DrawInputSlice NewDrawInputSlice(const Context& context, std::size_t bytes, Recorder::SnapshotUse use) {
+    if (auto slice = ringSlice(context, bytes, DrawInputMemoryProperties(context, use))) return std::move(*slice);
+    return DrawInputSlice{NewDrawInputBuffer(context, bytes, use), 0, bytes, false};
+}
+
+std::span<std::byte> DrawInputSlice::Bytes() const {
+    return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
+}
+
+DrawInputRingCounts DrawInputRingCounters() {
+    auto& total = ringCounters();
+    DrawInputRingCounts counts;
+    counts.slices = total.slices.load(std::memory_order_relaxed);
+    counts.bytes = total.bytes.load(std::memory_order_relaxed);
+    counts.chunks = total.chunks.load(std::memory_order_relaxed);
+    counts.recycled = total.recycled.load(std::memory_order_relaxed);
+    counts.returned = total.returned.load(std::memory_order_relaxed);
+    counts.capped = total.capped.load(std::memory_order_relaxed);
+    counts.oversize = total.oversize.load(std::memory_order_relaxed);
+    counts.outstanding = total.outstanding.load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool DrawInputSourcesTimed() {
@@ -961,6 +1152,15 @@ void ClearDrawInputStash(VkDevice device) {
             it = stash.buffers.erase(it);
         }
     }
+    std::vector<std::shared_ptr<RingLane>> lanes;
+    {
+        auto& registry = ringRegistry();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& held : registry.lanes) {
+            if (auto lane = held.lock(); lane != nullptr && lane->device == device) lanes.push_back(std::move(lane));
+        }
+    }
+    for (const auto& lane : lanes) closeLane(*lane);
 }
 
 }

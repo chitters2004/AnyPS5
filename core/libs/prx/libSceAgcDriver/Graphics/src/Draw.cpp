@@ -1663,8 +1663,9 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         CountDrawInputSource(source, bytes, timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u);
     };
     DrawInputCopy copy;
+    copy.bytes = bytes;
     const bool vertex = use == Recorder::SnapshotUse::Vertex;
-    std::shared_ptr<Buffer> spare;
+    DrawInputSlice spare;
     if (recorder != nullptr && bytes != 0) {
         InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, bytes); });
 #ifdef _WIN32
@@ -1672,7 +1673,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 #else
         constexpr bool owned = false;
 #endif
-        if (owned) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived); });
+        if (owned) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, &copy.offset); });
         if (copy.buffer != nullptr) {
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopyOwned : CommitCounter::InputIndexCopyOwned);
@@ -1681,7 +1682,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
-        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived); });
+        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &copy.offset); });
         else if (owned) {
             copy.owned = InCommitPhase(CommitPhase::InputsArm, [&] { return recorder->ArmOwnedDrawInput(address, bytes); });
             if (!copy.owned.words.empty()) CountCommit(vertex ? CommitCounter::InputVertexCopyArmed : CommitCounter::InputIndexCopyArmed);
@@ -1694,7 +1695,8 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
         if (copy.generation != 0) {
             if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes, &spare); })) {
-                copy.buffer = std::move(adopted->buffer);
+                copy.buffer = std::move(adopted->slice.buffer);
+                copy.offset = adopted->slice.offset;
                 copy.derived = adopted->derived;
                 copy.prepared = true;
                 counted(DrawInputSource::Adopted);
@@ -1703,8 +1705,10 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
     }
     CountCommit(vertex ? CommitCounter::InputVertexCopyFresh : CommitCounter::InputIndexCopyFresh);
-    copy.buffer = spare != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputBuffer(context, bytes, use); });
-    InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.buffer->Bytes(), alignment); });
+    auto slice = spare.buffer != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputSlice(context, bytes, use); });
+    copy.buffer = std::move(slice.buffer);
+    copy.offset = slice.offset;
+    InCommitPhase(CommitPhase::InputsLocal, [&] { GuestMemory::Read(address, copy.Bytes(), alignment); });
     counted(DrawInputSource::Copied);
     return copy;
 }
@@ -1720,14 +1724,15 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     const auto readable = InCommitPhase(CommitPhase::InputsValidate, [&] { return ZeroPaddedReadableBytes(address, validBytes, stride); });
     if (readable != 0) InCommitPhase(CommitPhase::InputsFlush, [&] { GuestMemory::FlushGpuWrites(address, readable); });
     DrawInputCopy copy;
-    std::shared_ptr<Buffer> spare;
+    copy.bytes = bytes;
+    DrawInputSlice spare;
     auto* recorder = context.recorder;
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
     if (keep) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, readable); });
         std::uint32_t keptReadable = 0;
-        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable); });
+        if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable, 0, &copy.offset); });
         if (copy.buffer != nullptr && keptReadable == readable) {
             copy.reused = true;
             CountCommit(CommitCounter::InputVertexPaddedReused);
@@ -1735,23 +1740,27 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
             return copy;
         }
         copy.buffer = nullptr;
+        copy.offset = 0;
         if (copy.generation != 0) {
             if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable, &spare); })) {
-                copy.buffer = std::move(adopted->buffer);
+                copy.buffer = std::move(adopted->slice.buffer);
+                copy.offset = adopted->slice.offset;
                 copy.prepared = true;
-                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
+                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset);
                 counted(DrawInputSource::Adopted);
                 return copy;
             }
         }
     }
-    copy.buffer = spare != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputBuffer(context, bytes, Recorder::SnapshotUse::PaddedVertex); });
-    const auto span = copy.buffer->Bytes();
+    auto slice = spare.buffer != nullptr ? std::move(spare) : InCommitPhase(CommitPhase::InputsAlloc, [&] { return NewDrawInputSlice(context, bytes, Recorder::SnapshotUse::PaddedVertex); });
+    copy.buffer = std::move(slice.buffer);
+    copy.offset = slice.offset;
+    const auto span = copy.Bytes();
     InCommitPhase(CommitPhase::InputsLocal, [&] {
         GuestMemory::Read(address, span.subspan(0, readable), 1);
         std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
     });
-    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable)); });
+    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset); });
     counted(DrawInputSource::Copied);
     return copy;
 }
@@ -1760,10 +1769,14 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
     if (recorder == nullptr || copy.reused || copy.buffer == nullptr) return;
     const CommitPhaseScope keep(CommitPhase::InputsKeep);
     if (copy.generation == 0) {
-        if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.buffer->Bytes().size(), copy.owned, copy.buffer, use, derived);
+        if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.bytes, copy.owned, copy.buffer, use, derived, copy.offset);
         return;
     }
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived);
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.buffer, use, derived, false, copy.offset);
+}
+
+std::span<std::byte> DrawInputCopy::Bytes() const {
+    return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
@@ -2147,7 +2160,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (import != nullptr) {
             highest = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart).highest;
         } else if (!copy.reused) {
-            if (!copy.prepared) highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes)), draw.indexSize, skipRestart); });
+            if (!copy.prepared) highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(copy.Bytes(), draw.indexSize, skipRestart); });
             else if (!skipRestart) highest = copy.derived;
             else if (copy.derived != 0) highest = copy.derived - 1u;
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u));
@@ -2174,6 +2187,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 import = nullptr;
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
+                copy.bytes = static_cast<std::size_t>(indexBytes);
                 if (!highest) {
                     inputs.nothing = true;
                     return inputs;
@@ -2183,7 +2197,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         Require(*highest <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.maxIndex = *highest;
         if (skipRestart && state.stages.mesh && (state.stages.mesh->inputPrimitive == 5 || state.stages.mesh->inputPrimitive == 6)) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {
@@ -2193,6 +2207,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         } else {
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
+            inputs.indexOffset = copy.offset;
         }
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
@@ -2249,15 +2264,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());
-        rangeOffsets.push_back(0);
+        rangeOffsets.push_back(copy.offset);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    std::vector<VkDeviceSize> soloOffsets(fetches.size(), 0);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
         soloHandles[f] = copy.buffer->Handle();
+        soloOffsets[f] = copy.offset;
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
     BeginCommitPhase(CommitPhase::InputsLayout);
@@ -2271,7 +2288,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto f = fetchOf[i];
         if (isSolo[f]) {
             inputs.vertexHandles.push_back(soloHandles[f]);
-            inputs.vertexOffsets[i] = 0;
+            inputs.vertexOffsets[i] = soloOffsets[f];
             continue;
         }
         const auto j = plannedOf[f];
