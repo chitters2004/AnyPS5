@@ -413,12 +413,42 @@ void CommandBatch::release() noexcept {
         if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
+    if (stamps) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, stamps, nullptr);
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (fence) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
 }
 
 VkCommandBuffer CommandBatch::Handle() const {
     return commands;
+}
+
+void CommandBatch::BeginGpuStamp() {
+    if (!Recorder::GpuTimingEnabled() || stamps != VK_NULL_HANDLE) return;
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = 2;
+    if (context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &stamps) != VK_SUCCESS) {
+        stamps = VK_NULL_HANDLE;
+        return;
+    }
+    context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, stamps, 0, 2);
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 0);
+}
+
+void CommandBatch::EndGpuStamp(Recorder::CommandClass which) {
+    if (stamps == VK_NULL_HANDLE || stampEnded) return;
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 1);
+    stampEnded = true;
+    stampClass = which;
+}
+
+void CommandBatch::readGpuStamp() {
+    if (!stampEnded) return;
+    stampEnded = false;
+    std::uint64_t values[2] = {};
+    if (context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, stamps, 0, 2, sizeof(values), values, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && values[1] > values[0]) {
+        Recorder::AddGpuTiming(stampClass, static_cast<double>(values[1] - values[0]) * context.limits.timestampPeriod, 0);
+    }
 }
 
 void CommandBatch::SubmitAndWait() {
@@ -450,6 +480,7 @@ void CommandBatch::Wait() {
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");
+    readGpuStamp();
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
     if (auto* recorder = Recorder::Active()) recorder->Reap();
 }

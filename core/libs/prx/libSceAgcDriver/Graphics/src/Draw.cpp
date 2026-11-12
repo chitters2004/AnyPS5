@@ -3851,6 +3851,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (!recorded) batch->BeginGpuStamp();
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -4028,6 +4029,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | inputs.shaderStages, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &download, 0, nullptr, 0, nullptr);
     countBarrier();
     if (recorded) recorder->EndGpuTiming(drawTiming);
+    else batch->EndGpuStamp(CommandClass::DrawSync);
     APS5_LOG_CHARS_OUT_DEBUG("Download barrier recorded");
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);

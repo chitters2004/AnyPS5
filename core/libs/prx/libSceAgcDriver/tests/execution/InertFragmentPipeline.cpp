@@ -286,6 +286,12 @@ int main() {
             Require(after.omitted - before.omitted == (kept ? 0u : 4u), "the [gputime] draw ranges did not count the draws recorded without the fragment stage");
             Require(after.inertRanges - before.inertRanges == 3u, "the [gputime] inert-only draw ranges were not the passes made of inert fragment draws alone");
             Require(after.inertMs > before.inertMs, "the [gputime] inert-only draw ranges took no GPU time");
+            const auto syncBefore = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            for (int i = 0; i < 3; ++i) Draw(*device, full, plain, {.color = true, .depthTest = false});
+            const auto syncAfter = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(syncAfter.syncRanges - syncBefore.syncRanges == 3u, "the [gputime] draw-sync class did not hold one range per synchronous draw");
+            Require(syncAfter.syncMs > syncBefore.syncMs, "the [gputime] draw-sync ranges took no GPU time");
+            Require(syncAfter.draws == syncBefore.draws, "a synchronous draw was counted in the recorded draw ranges");
         }
 
         std::printf("inert fragment pipeline tests passed (fragment stage %s, occlusion samples %s, [gputime] draw fragment share %s)\n", kept ? "kept" : "omitted", samples.Available() ? "checked" : "not checked", timed ? "checked" : "not checked");
