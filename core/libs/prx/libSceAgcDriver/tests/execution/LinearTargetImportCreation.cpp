@@ -493,7 +493,10 @@ int main(int argc, char** argv) {
 #endif
         if (!watched) std::puts("linear target import creation: a host import of write-watched memory does not stay watched on this device; only the compared cases run");
         if (only == "--prepared") {
-            if (!watched) return unavailable("host imports that keep a linear color target write-watched");
+            if (!watched) {
+                std::puts("skipped, linear target staging prediction needs host imports that keep a linear color target write-watched");
+                return VulkanTestSkipped;
+            }
             Predicted(*device);
             std::puts("linear target staging prediction passed");
             return 0;
