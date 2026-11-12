@@ -863,6 +863,11 @@ void NoteGpuPending(std::uint64_t address, std::size_t bytes) {
     bumpSubscriptions(address, bytes, WriteBumpSource::Pending);
 }
 
+void NoteRecordedPending(std::uint64_t address, std::size_t bytes) {
+    if (certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HideRecordedPendingBumps) return;
+    bumpSubscriptions(address, bytes, WriteBumpSource::Pending);
+}
+
 void NoteTextureReleased(std::uint64_t address) {
     bumpSubscriptions(address, 1, WriteBumpSource::Release);
 }

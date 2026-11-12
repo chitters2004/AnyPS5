@@ -135,7 +135,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 void SetWriteIndexCountingForTest(bool counting);
 void SetWriteOwnersIgnoredForTest(bool ignored);
@@ -159,6 +159,7 @@ bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t
 void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t generation);
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
+void NoteRecordedPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
 constexpr std::size_t WriteBumpSizeBuckets = 7;
 struct WriteIndexStats {
