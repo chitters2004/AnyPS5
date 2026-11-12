@@ -66,7 +66,9 @@ public:
         std::atomic<bool> failed{false};
         bool reported = false;
     };
+    enum class PostCause : std::uint8_t { Window, Full, Recording, Await, Foreign, BatchEnd, Count };
     static bool Enabled();
+    static bool PostsChunks();
     static constexpr std::size_t Slots = 4;
     static std::unique_ptr<CommandEncoder> Attach(VkDevice device, DeviceFunctions& table);
     ~CommandEncoder();
@@ -76,6 +78,7 @@ public:
     void Close(std::source_location where = std::source_location::current());
     void Quiesce(std::source_location where = std::source_location::current()) noexcept { Quiesce(WaitSite::At(Wait::Quiesce, where)); }
     void Quiesce(WaitSite site) noexcept;
+    void FinishBatch(std::source_location where = std::source_location::current()) noexcept;
     bool Direct(const char* command) noexcept;
     void Settle(std::source_location where = std::source_location::current()) noexcept { Settle(WaitSite::At(Wait::Settle, where)); }
     void Settle(WaitSite site) noexcept;
@@ -86,7 +89,7 @@ public:
         if (owner.load(std::memory_order_relaxed) != std::this_thread::get_id()) RefuseForeignProducer();
         return true;
     }
-    bool Behind(VkCommandBuffer commands) const { return commands == recent.load(std::memory_order_relaxed) && executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire); }
+    bool Behind(VkCommandBuffer commands) const { return commands == recent.load(std::memory_order_relaxed) && (parked.load(std::memory_order_acquire) != nullptr || executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire)); }
     static constexpr std::size_t RecordAlign = 16;
     static constexpr std::size_t Aligned(std::size_t bytes) { return (bytes + RecordAlign - 1) / RecordAlign * RecordAlign; }
     template<typename... A>
@@ -114,6 +117,8 @@ public:
         std::uint64_t waitNs = 0;
         std::uint64_t encodeNs = 0;
         std::uint64_t parks = 0;
+        std::uint64_t windows = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(PostCause::Count)> postsBy{};
     };
     Statistics Counts() const;
     std::vector<SiteWaits> WaitsBySite() const;
@@ -139,6 +144,9 @@ private:
         std::vector<std::byte> bytes;
         std::size_t used = 0;
         std::size_t records = 0;
+        std::size_t windows = 0;
+        std::size_t countedRecords = 0;
+        std::size_t countedWindows = 0;
         VkCommandBuffer target = VK_NULL_HANDLE;
         Recording* recording = nullptr;
         Chunk* next = nullptr;
@@ -149,7 +157,12 @@ private:
     };
     CommandEncoder(VkDevice device, DeviceFunctions& table, std::size_t slot);
     static std::size_t claim();
-    bool post() noexcept;
+    bool post(PostCause cause) noexcept;
+    bool enqueue(Chunk* chunk, PostCause cause) noexcept;
+    void park() noexcept;
+    void count(Chunk& chunk) noexcept;
+    void reclaim() noexcept;
+    bool flushParked() noexcept;
     std::byte* reserve(Run run, std::size_t bytes);
     template<typename T>
     static std::byte* copyInto(std::byte* at, std::span<const T> values) {
@@ -172,6 +185,8 @@ private:
     std::atomic<VkCommandBuffer> recent{VK_NULL_HANDLE};
     Recording* recording = nullptr;
     Chunk* filling = nullptr;
+    std::atomic<Chunk*> parked{nullptr};
+    Chunk busyMark;
     std::size_t reserved = 0;
     std::mutex queueMutex;
     Chunk* head = nullptr;
@@ -191,6 +206,8 @@ private:
     std::atomic<std::uint64_t> waitCount{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> encodeNs{0};
+    std::atomic<std::uint64_t> windowCount{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PostCause::Count)> postsBy{};
     void printSites(bool final) noexcept;
     const bool profiled;
     std::chrono::steady_clock::time_point printedAt;
