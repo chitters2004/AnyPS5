@@ -1,0 +1,16 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_driver_preparer_oracles_tests tests/PreparerOracles.cpp)
+    target_include_directories(agc_driver_preparer_oracles_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_driver_preparer_oracles_tests PRIVATE libSceAgcDriver)
+    set_target_properties(agc_driver_preparer_oracles_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_driver_preparer_oracles_tests)
+    foreach(agcOraclePreparers IN ITEMS 1 4)
+        add_test(NAME agc_driver_preparer_oracles_${agcOraclePreparers} COMMAND agc_driver_preparer_oracles_tests)
+        set_tests_properties(agc_driver_preparer_oracles_${agcOraclePreparers} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=8;APS5_RING_PREPARERS=${agcOraclePreparers}")
+        if(WIN32)
+            set_tests_properties(agc_driver_preparer_oracles_${agcOraclePreparers} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+        endif()
+    endforeach()
+endif()
