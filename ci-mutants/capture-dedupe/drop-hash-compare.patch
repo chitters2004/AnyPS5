@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
+index ddb9574c9d9..bfefeea79c0 100644
+--- a/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
++++ b/core/libs/prx/libSceAgcDriver/Execution/src/FrameRecorder.cpp
+@@ -592,7 +592,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
+             if (length == FrameCaptureWriter::BlockBytes) {
+                 const auto hash = pieceHashes[piece];
+                 const auto [known, inserted] = recordedBlocks.try_emplace(at, RecordedBlock{hash, stamps[piece]});
+-                same = !inserted && known->second.hash == hash && known->second.stamp == stamps[piece];
++                same = !inserted && known->second.stamp == stamps[piece];
+                 known->second = {hash, stamps[piece]};
+             } else {
+                 recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
