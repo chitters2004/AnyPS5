@@ -498,7 +498,6 @@ void Driver::memoizeDrawStages(const std::vector<std::shared_ptr<DrawStageRecord
             continue;
         }
         record->variant = fresh[i];
-        record->prepared = capture.prepared;
         record->spans = DrawStageSpans(fresh[i]->runs);
         drawStageMemoCounters.Add(DrawStageMemoCount::Inserts);
         const auto evicted = drawStageMemo.Insert(record);

@@ -146,7 +146,6 @@ struct StageCapture {
     bool linkedCode = false;
     bool convertedSamples = false;
     bool layerRowSamples = false;
-    PreparedHandleHint prepared;
 };
 
 struct RelocatableUserWord {
