@@ -20,6 +20,7 @@ namespace {
 
 constexpr std::size_t ChunkBytes = 64 * 1024;
 constexpr std::size_t PooledChunks = 16;
+constexpr std::uint64_t PostSampleEvery = 16;
 constexpr std::size_t PrintedSites = 16;
 constexpr std::chrono::seconds SitePrintInterval{10};
 
@@ -630,7 +631,9 @@ bool CommandEncoder::PostsChunks() {
 
 bool CommandEncoder::enqueue(Chunk* chunk, PostCause cause) noexcept {
     count(*chunk);
-    postCount.fetch_add(1, std::memory_order_relaxed);
+    const auto sequence = postCount.fetch_add(1, std::memory_order_relaxed);
+    const bool timed = (sequence % PostSampleEvery) == 0;
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     postsBy[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(queueMutex);
@@ -640,6 +643,7 @@ bool CommandEncoder::enqueue(Chunk* chunk, PostCause cause) noexcept {
     }
     posted.fetch_add(1, std::memory_order_seq_cst);
     if (sleeping.load(std::memory_order_seq_cst)) posted.notify_one();
+    if (timed) postNs.fetch_add(PostSampleEvery * static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
     return true;
 }
 
@@ -688,6 +692,47 @@ bool CommandEncoder::flushParked() noexcept {
         parked.store(nullptr, std::memory_order_release);
         return true;
     }
+}
+
+std::uint64_t CommandEncoder::handoffNs() const noexcept {
+    return waitNs.load(std::memory_order_relaxed) + postNs.load(std::memory_order_relaxed);
+}
+
+bool CommandEncoder::decline(std::source_location where) noexcept {
+    inlinedCount.store(inlinedCount.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    if (executed.load(std::memory_order_acquire) < posted.load(std::memory_order_acquire) || filling != nullptr || parked.load(std::memory_order_acquire) != nullptr) Quiesce(WaitSite::At(Wait::Open, where));
+    return false;
+}
+
+bool CommandEncoder::Admit(Handoff handoff, std::source_location where) {
+    if (handoff == Handoff::Never) {
+        policy = Policy{};
+        return decline(where);
+    }
+    if (handoff == Handoff::Always) {
+        policy = Policy{};
+        return true;
+    }
+    if (policy.inlined) {
+        if (++policy.windows < policy.span) return decline(where);
+        policy = Policy{.strikes = policy.strikes};
+    }
+    if (!policy.measuring) {
+        policy.measuring = true;
+        policy.windows = 0;
+        policy.baseEncodeNs = encodeNs.load(std::memory_order_relaxed);
+        policy.baseHandoffNs = handoffNs();
+    }
+    if (++policy.windows < EncodeEpoch) return true;
+    const auto saved = encodeNs.load(std::memory_order_relaxed) - policy.baseEncodeNs;
+    const auto cost = handoffNs() - policy.baseHandoffNs;
+    if (cost <= saved) {
+        policy = Policy{};
+        return true;
+    }
+    const auto strikes = policy.strikes + 1;
+    policy = Policy{.inlined = true, .span = std::min(InlineSpanMax, InlineSpanMin << std::min<std::uint32_t>(strikes - 1, 4)), .strikes = strikes};
+    return decline(where);
 }
 
 void CommandEncoder::Quiesce(WaitSite site) noexcept {
@@ -948,6 +993,8 @@ void CommandEncoder::run() {
 CommandEncoder::Statistics CommandEncoder::Counts() const {
     Statistics counts{postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), parkCount.load(std::memory_order_relaxed), windowCount.load(std::memory_order_relaxed), {}};
     for (std::size_t cause = 0; cause < counts.postsBy.size(); ++cause) counts.postsBy[cause] = postsBy[cause].load(std::memory_order_relaxed);
+    counts.postNs = postNs.load(std::memory_order_relaxed);
+    counts.inlined = inlinedCount.load(std::memory_order_relaxed);
     counts.submits = submitCount.load(std::memory_order_relaxed);
     counts.submitFailures = submitFailureCount.load(std::memory_order_relaxed);
     counts.settleWaits = settleWaits[0].load(std::memory_order_relaxed);

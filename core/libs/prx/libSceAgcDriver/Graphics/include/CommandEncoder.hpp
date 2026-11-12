@@ -113,6 +113,10 @@ public:
     static bool OnEncoderThread() noexcept;
     void PostSubmit(SubmitRequest& request) noexcept;
     void SettleSubmits(SettleSite site = SettleSite::Other);
+    enum class Handoff : std::uint8_t { Always, Adaptive, Never };
+    static constexpr std::uint64_t EncodeEpoch = 256;
+    static constexpr std::uint64_t InlineSpanMin = 1024;
+    static constexpr std::uint64_t InlineSpanMax = 16384;
     static bool Enabled();
     static bool PostsChunks();
     static constexpr std::size_t Slots = 4;
@@ -122,6 +126,7 @@ public:
     CommandEncoder& operator=(const CommandEncoder&) = delete;
     void Open(VkCommandBuffer commands, Recording& recording, std::source_location where = std::source_location::current());
     void Close(std::source_location where = std::source_location::current());
+    bool Admit(Handoff handoff, std::source_location where = std::source_location::current());
     void Quiesce(std::source_location where = std::source_location::current()) noexcept { Quiesce(WaitSite::At(Wait::Quiesce, where)); }
     void Quiesce(WaitSite site) noexcept;
     void FinishBatch(std::source_location where = std::source_location::current()) noexcept;
@@ -171,6 +176,8 @@ public:
         std::uint64_t settleWaitNs = 0;
         std::uint64_t presentSettleWaits = 0;
         std::uint64_t presentSettleWaitNs = 0;
+        std::uint64_t postNs = 0;
+        std::uint64_t inlined = 0;
     };
     Statistics Counts() const;
     std::vector<SiteWaits> WaitsBySite() const;
@@ -271,6 +278,19 @@ private:
     std::array<std::atomic<std::uint64_t>, 2> settleWaits{};
     std::array<std::atomic<std::uint64_t>, 2> settleWaitNs{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PostCause::Count)> postsBy{};
+    std::atomic<std::uint64_t> postNs{0};
+    std::atomic<std::uint64_t> inlinedCount{0};
+    struct Policy {
+        bool inlined = false;
+        bool measuring = false;
+        std::uint64_t windows = 0;
+        std::uint64_t span = 0;
+        std::uint32_t strikes = 0;
+        std::uint64_t baseEncodeNs = 0;
+        std::uint64_t baseHandoffNs = 0;
+    } policy;
+    bool decline(std::source_location where) noexcept;
+    std::uint64_t handoffNs() const noexcept;
     void printSites(bool final) noexcept;
     const bool profiled;
     std::chrono::steady_clock::time_point printedAt;

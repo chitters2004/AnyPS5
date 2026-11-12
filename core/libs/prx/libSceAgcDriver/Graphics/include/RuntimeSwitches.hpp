@@ -51,6 +51,7 @@ enum class RuntimeSwitch : std::size_t {
     NoRecordEncoder,
     EncoderPostChunks,
     EncoderAsyncSubmit,
+    NoAdaptiveEncoder,
     Count,
 };
 
