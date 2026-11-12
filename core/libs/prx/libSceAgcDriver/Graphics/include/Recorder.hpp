@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SerialFrontiers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
@@ -468,6 +469,7 @@ public:
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
     std::uint64_t Submissions() const { return submissions; }
+    const SerialFrontiers& Frontiers() const { return frontiers; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
     // Reaps that retired at least one batch so far (the [recorder] line's 'with work' count).
@@ -1319,6 +1321,7 @@ private:
     std::vector<const Batch*> finishing;
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
+    SerialFrontiers frontiers;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
