@@ -1266,7 +1266,33 @@ void AFailedSubmitIsSticky(SubmitFailure failure) {
     Require(failures == 4, "the encoder counted " + std::to_string(failures) + " failed submits, not the failed one and the three after it");
 }
 
+class Watchdog {
+public:
+    Watchdog(std::chrono::milliseconds limit, std::string failure) : failure(std::move(failure)), thread([this, limit] {
+        const auto deadline = std::chrono::steady_clock::now() + limit;
+        while (!done.load(std::memory_order_acquire)) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                std::cerr << this->failure << std::endl;
+                std::_Exit(1);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    }) {}
+    ~Watchdog() {
+        done.store(true, std::memory_order_release);
+        thread.join();
+    }
+    Watchdog(const Watchdog&) = delete;
+    Watchdog& operator=(const Watchdog&) = delete;
+
+private:
+    std::atomic<bool> done{false};
+    std::string failure;
+    std::thread thread;
+};
+
 void SettleOnTheEncoderThreadIsRefused() {
+    const Watchdog watchdog(std::chrono::seconds(10), "the encoder thread settled its own submits and never returned");
     ResetSubmits();
     auto table = FakeTable();
     const auto device = Handle<VkDevice>(0x5a);
