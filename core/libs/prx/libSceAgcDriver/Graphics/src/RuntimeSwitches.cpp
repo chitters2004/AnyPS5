@@ -25,6 +25,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_UPLOAD_REFRESH_PROOF",
     "APS5_REFRESH_EXIT_EPOCH_STAMP",
     "APS5_NO_DEPTH_REPEAT_FIND",
+    "APS5_SINGLE_RING_PREPARER",
 };
 
 struct SwitchValues {
@@ -39,6 +40,7 @@ struct SwitchValues {
             std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr,
             std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr,
             std::getenv("APS5_NO_DEPTH_REPEAT_FIND") != nullptr,
+            std::getenv("APS5_SINGLE_RING_PREPARER") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
