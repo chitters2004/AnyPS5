@@ -714,8 +714,37 @@ int BenchStageKeys() {
     return sink == 0 ? 1 : 0;
 }
 
+int BenchCapture() {
+    {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+    }
+    Expect(std::getenv("APS5_PROFILE_DRAW") != nullptr, "--bench-capture needs APS5_PROFILE_DRAW");
+    Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const std::array<float, 4> one{1.0f, 1.0f, 1.0f, 1.0f};
+    std::memcpy(scene.constants.Bytes(0), one.data(), sizeof(one));
+    for (int warm = 0; warm < 16; ++warm) Expect(Draw(scene, VertexCode.data(), TableOffset, true) == 255u, "a bench draw did not draw");
+    const auto before = driver().DrawPhaseTotalsForTest();
+    constexpr int Draws = 400;
+    for (int draw = 0; draw < Draws; ++draw) Draw(scene, VertexCode.data(), TableOffset, true);
+    const auto after = driver().DrawPhaseTotalsForTest();
+    const auto captures = static_cast<double>(after.captures - before.captures);
+    const auto ms = [&](AgcDriver::DriverDetail::DrawDriverPhase phase) { return after.ms[phase] - before.ms[phase]; };
+    Expect(captures > 0.0, "the bench draws captured no stage: run it with APS5_NO_DRAW_SRT_ENTRIES=1 APS5_NO_DRAW_STAGE_MEMO=1");
+    std::printf("bench capture: %d draws, %.0f captures (%.2f per draw), %llu finished on the draw finisher; per capture: capture %.2f us, capture hook waits %.2f us, recompile %.2f us, vectors %.2f us\n", Draws, captures, captures / Draws, static_cast<unsigned long long>(after.finished - before.finished), ms(AgcDriver::DriverDetail::DrawRowCapture) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowCaptureHookWaits) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowRecompile) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowVectors) * 1000.0 / captures);
+    AgcDriverShutdown_nid_postfix();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
+    if (argc > 1 && std::string(argv[1]) == "--bench-capture") return BenchCapture();
     try {
         KeysFollowEveryInput();
         StageInfoKeysFollowEveryField();
