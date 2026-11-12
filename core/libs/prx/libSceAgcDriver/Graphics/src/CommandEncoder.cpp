@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -500,14 +501,17 @@ void CommandEncoder::RefuseForeignProducer() {
 }
 
 void CommandEncoder::Close(std::source_location where) {
-    const bool flushed = post();
+    if (filling != nullptr) ++filling->windows;
     const auto closed = windows.back().commands;
     windows.pop_back();
     if (windows.empty()) {
         target.store(VK_NULL_HANDLE, std::memory_order_relaxed);
         recording = nullptr;
+        if (PostsChunks()) park();
+        else post(PostCause::Window);
         return;
     }
+    const bool flushed = post(PostCause::Window);
     if (windows.back().commands != closed) await(WaitSite::At(Wait::Close, where), flushed);
     recording = windows.back().recording;
     recent.store(windows.back().commands, std::memory_order_relaxed);
@@ -516,7 +520,9 @@ void CommandEncoder::Close(std::source_location where) {
 
 std::byte* CommandEncoder::reserve(Run run, std::size_t bytes) {
     const auto need = RecordHeader + aligned(bytes);
-    if (filling != nullptr && (filling->recording != recording || filling->used + need > filling->bytes.size())) post();
+    if (filling == nullptr) reclaim();
+    if (filling != nullptr && (filling->recording != recording || filling->target != target.load(std::memory_order_relaxed))) post(PostCause::Recording);
+    else if (filling != nullptr && filling->used + need > filling->bytes.size()) post(PostCause::Full);
     if (filling == nullptr) {
         for (;;) {
             {
@@ -540,6 +546,9 @@ std::byte* CommandEncoder::reserve(Run run, std::size_t bytes) {
         }
         filling->used = 0;
         filling->records = 0;
+        filling->windows = 0;
+        filling->countedRecords = 0;
+        filling->countedWindows = 0;
         filling->next = nullptr;
         filling->target = target.load(std::memory_order_relaxed);
         filling->recording = recording;
@@ -562,13 +571,17 @@ void CommandEncoder::refuseEncoderThread() const noexcept {
     std::abort();
 }
 
-bool CommandEncoder::post() noexcept {
-    if (filling == nullptr || filling->records == 0) return false;
-    commandCount.fetch_add(filling->records, std::memory_order_relaxed);
+bool CommandEncoder::PostsChunks() {
+    return RuntimeSwitches::Set(RuntimeSwitch::EncoderPostChunks);
+}
+
+bool CommandEncoder::enqueue(Chunk* chunk, PostCause cause) noexcept {
+    count(*chunk);
     postCount.fetch_add(1, std::memory_order_relaxed);
+    postsBy[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard lock(queueMutex);
-        auto* chunk = std::exchange(filling, nullptr);
+        chunk->next = nullptr;
         (tail != nullptr ? tail->next : head) = chunk;
         tail = chunk;
     }
@@ -577,9 +590,61 @@ bool CommandEncoder::post() noexcept {
     return true;
 }
 
+bool CommandEncoder::post(PostCause cause) noexcept {
+    if (filling == nullptr) reclaim();
+    if (filling == nullptr || filling->records == 0) return false;
+    return enqueue(std::exchange(filling, nullptr), cause);
+}
+
+void CommandEncoder::count(Chunk& chunk) noexcept {
+    commandCount.fetch_add(chunk.records - std::exchange(chunk.countedRecords, chunk.records), std::memory_order_relaxed);
+    windowCount.fetch_add(chunk.windows - std::exchange(chunk.countedWindows, chunk.windows), std::memory_order_relaxed);
+}
+
+void CommandEncoder::park() noexcept {
+    if (filling == nullptr || filling->records == 0) return;
+    count(*filling);
+    parked.store(std::exchange(filling, nullptr), std::memory_order_release);
+}
+
+void CommandEncoder::reclaim() noexcept {
+    for (;;) {
+        auto* chunk = parked.load(std::memory_order_acquire);
+        if (chunk == nullptr) return;
+        if (chunk == &busyMark) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (parked.compare_exchange_weak(chunk, nullptr, std::memory_order_acquire, std::memory_order_relaxed)) {
+            filling = chunk;
+            return;
+        }
+    }
+}
+
+bool CommandEncoder::flushParked() noexcept {
+    for (;;) {
+        auto* chunk = parked.load(std::memory_order_acquire);
+        if (chunk == nullptr) return false;
+        if (chunk == &busyMark) {
+            std::this_thread::yield();
+            continue;
+        }
+        if (!parked.compare_exchange_weak(chunk, &busyMark, std::memory_order_acquire, std::memory_order_relaxed)) continue;
+        enqueue(chunk, PostCause::Foreign);
+        parked.store(nullptr, std::memory_order_release);
+        return true;
+    }
+}
+
 void CommandEncoder::Quiesce(WaitSite site) noexcept {
-    const bool flushed = post();
+    const bool flushed = post(PostCause::Await);
     await(site, flushed);
+}
+
+void CommandEncoder::FinishBatch(std::source_location where) noexcept {
+    const bool flushed = post(PostCause::BatchEnd);
+    await(WaitSite::At(Wait::Quiesce, where), flushed);
 }
 
 bool CommandEncoder::Direct(const char* command) noexcept {
@@ -588,7 +653,8 @@ bool CommandEncoder::Direct(const char* command) noexcept {
 }
 
 void CommandEncoder::Settle(WaitSite site) noexcept {
-    await(site, false);
+    const bool flushed = flushParked();
+    await(site, flushed);
 }
 
 void CommandEncoder::await(const WaitSite& site, bool flushed) noexcept {
@@ -634,7 +700,8 @@ void CommandEncoder::note(const WaitSite& site, std::uint64_t ns, bool waited, b
 void CommandEncoder::printSites(bool final) noexcept {
     const auto totals = Counts();
     try {
-        AgcDriver::ProfilePrint_nid_no_patch("[encoder] %s: %llu chunks, %llu commands, %.1f ms recording, %llu parks; %llu waits, %.1f ms; waits by site (waits/ms/flushes):%s\n", final ? "at teardown" : "so far", static_cast<unsigned long long>(totals.posts), static_cast<unsigned long long>(totals.commands), static_cast<double>(totals.encodeNs) / 1e6, static_cast<unsigned long long>(totals.parks), static_cast<unsigned long long>(totals.waits), static_cast<double>(totals.waitNs) / 1e6, Report(WaitsBySite(), PrintedSites).c_str());
+        const auto by = [&](PostCause cause) { return static_cast<unsigned long long>(totals.postsBy[static_cast<std::size_t>(cause)]); };
+        AgcDriver::ProfilePrint_nid_no_patch("[encoder] %s: %llu chunks, %llu commands, %llu windows, %.1f ms recording, %llu parks; posts by cause: window %llu, full %llu, recording %llu, await %llu, foreign %llu, batch_end %llu; %llu waits, %.1f ms; waits by site (waits/ms/flushes):%s\n", final ? "at teardown" : "so far", static_cast<unsigned long long>(totals.posts), static_cast<unsigned long long>(totals.commands), static_cast<unsigned long long>(totals.windows), static_cast<double>(totals.encodeNs) / 1e6, static_cast<unsigned long long>(totals.parks), by(PostCause::Window), by(PostCause::Full), by(PostCause::Recording), by(PostCause::Await), by(PostCause::Foreign), by(PostCause::BatchEnd), static_cast<unsigned long long>(totals.waits), static_cast<double>(totals.waitNs) / 1e6, Report(WaitsBySite(), PrintedSites).c_str());
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[encoder] the wait-site profile could not be printed: %s\n", error.what());
     }
@@ -713,7 +780,9 @@ void CommandEncoder::run() {
 }
 
 CommandEncoder::Statistics CommandEncoder::Counts() const {
-    return {postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), parkCount.load(std::memory_order_relaxed)};
+    Statistics counts{postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), parkCount.load(std::memory_order_relaxed), windowCount.load(std::memory_order_relaxed), {}};
+    for (std::size_t cause = 0; cause < counts.postsBy.size(); ++cause) counts.postsBy[cause] = postsBy[cause].load(std::memory_order_relaxed);
+    return counts;
 }
 
 std::vector<CommandEncoder::SiteWaits> CommandEncoder::WaitsBySite() const {
