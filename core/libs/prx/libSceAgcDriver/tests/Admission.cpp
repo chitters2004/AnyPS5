@@ -3,6 +3,7 @@
 #include <chrono>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -94,6 +95,19 @@ void TestOrderAndOversized() {
     Check(admission.Outstanding() == 0, "the order test left bytes charged");
 }
 
+void TestOversizedNearTheLimit() {
+    Admission admission(100);
+    const auto huge = admission.Admit(std::numeric_limits<std::uint64_t>::max());
+    Check(huge.alone && admission.Outstanding() == std::numeric_limits<std::uint64_t>::max(), "the largest item was not admitted alone");
+    Waiter small(admission, 1);
+    Check(!small.DoneWithin(Blocked), "an item was admitted beside the largest oversized one");
+    admission.Release(huge);
+    Check(small.DoneWithin(Bound), "the item after the largest oversized one was not admitted once it was released");
+    const auto ticket = small.Ticket();
+    Check(ticket.bytes == 1 && admission.Outstanding() == 1, "the item after the largest oversized one was charged wrongly");
+    admission.Release(ticket);
+}
+
 void TestFailure() {
     Admission admission(100);
     const auto held = admission.Admit(100);
@@ -137,6 +151,7 @@ int main() {
     try {
         TestWithinBudget();
         TestOrderAndOversized();
+        TestOversizedNearTheLimit();
         TestFailure();
         TestTeardown();
         TestZeroBudget();
