@@ -137,6 +137,12 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+struct ImportWatchRestore {
+    const Context& context;
+    ImportWatch decided;
+    ~ImportWatchRestore() { SetImportWatch(context, decided); }
+};
+
 struct ReadOnlyImportWatch {
     const Context& context;
     ImportWatch decided;
@@ -6824,11 +6830,7 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
     }
     SetImportWatch(base, ImportWatch::Watch);
 #endif
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     constexpr std::uint32_t width = 1024;
     constexpr std::uint32_t height = 512;
     constexpr std::size_t bytes = width * height * 4;
@@ -7270,11 +7272,7 @@ bool completionStoreShadowTests(const Device& device, Recorder& recorder) {
     }
     SetImportWatch(base, ImportWatch::Watch);
 #endif
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     constexpr std::uint32_t width = 1024;
     constexpr std::uint32_t height = 512;
     constexpr std::size_t bytes = width * height * 4;
@@ -7745,11 +7743,7 @@ void importWatchTests(const Device& device) {
     std::cout << "import probe: " << probe.writtenAfterSubmit << " of " << probe.pages << " scratch pages written after a GPU read, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenAtImport << " after the import\n";
     Require(probe.writtenByCpu != 0, "(u) a CPU store after the import probe's GPU read was not collected");
     const auto decided = PrepareImportWatch(context);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{context, decided};
+    const ImportWatchRestore restore{context, decided};
     constexpr std::size_t unit = 65536;
     const auto remap = [](void* block, std::size_t bytes) {
         munmap(block, bytes);
@@ -7852,11 +7846,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
     } release{block};
     const auto decided = PrepareImportWatch(base);
     SetImportWatch(base, ImportWatch::Unwatch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     auto* texels = static_cast<std::uint8_t*>(block);
     std::memset(texels, 0x55, surfaceBytes);
     std::memset(texels + surfaceBytes, 0x00, keyCount);
@@ -7954,11 +7944,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
     const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
     const auto decided = PrepareImportWatch(base);
     SetImportWatch(base, ImportWatch::Watch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     enum class Write { None, AfterPending, BeforePending, UnwatchedFullClear, UnwatchedPartialWrite, BeforeUnwatch, UnwatchedWithoutHook, PendingWithoutHook, UnprovenUnwatch, LateUnwatchedWrite, LateBeforeUnwatch, LateWithoutHook, LateUnproven };
     for (const std::uint32_t side : {256u, 1024u})
     for (const auto write : {Write::None, Write::AfterPending, Write::BeforePending, Write::UnwatchedFullClear, Write::UnwatchedPartialWrite, Write::BeforeUnwatch, Write::UnwatchedWithoutHook, Write::PendingWithoutHook, Write::UnprovenUnwatch, Write::LateUnwatchedWrite, Write::LateBeforeUnwatch, Write::LateWithoutHook, Write::LateUnproven}) {
@@ -9915,11 +9901,7 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
     }
 #endif
     SetImportWatch(base, ImportWatch::Watch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     constexpr std::uint32_t side = 256;
     constexpr std::size_t surfaceBytes = side * side * 4;
     constexpr std::size_t keyCount = surfaceBytes / 256;
@@ -10087,11 +10069,7 @@ bool repeatedNeighbourStoreTests(const Device& device, Recorder& recorder) {
         }
         const auto decided = PrepareImportWatch(base);
         if (imported) SetImportWatch(base, ImportWatch::Watch);
-        struct Restore {
-            const Context& context;
-            ImportWatch decided;
-            ~Restore() { SetImportWatch(context, decided); }
-        } restore{base, decided};
+        const ImportWatchRestore restore{base, decided};
         const std::string what = imported ? "over a watched host import" : "over watched memory";
         void* block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
@@ -10198,11 +10176,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
         }
         const auto decided = PrepareImportWatch(base);
         if (imported) SetImportWatch(base, ImportWatch::Watch);
-        struct Restore {
-            const Context& context;
-            ImportWatch decided;
-            ~Restore() { SetImportWatch(context, decided); }
-        } restore{base, decided};
+        const ImportWatchRestore restore{base, decided};
         for (const bool changed : {false, true}) {
             const std::string what = std::string(changed ? "a CPU store that changed a byte" : "a CPU store that left the bytes as they were") + (imported ? " over a watched host import" : " over watched memory");
             void* block = AllocateWatched(bytes, 65536);
@@ -10311,11 +10285,7 @@ bool rewrittenBlockTests(const Device& device, Recorder& recorder) {
     constexpr std::array<std::uint8_t, 4> red{255, 0, 0, 255};
     const auto pattern = [](std::size_t i) { return static_cast<std::uint8_t>(i * 131u + 7u); };
     const auto decided = PrepareImportWatch(base);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     for (const bool after : {true, false}) {
         const std::string what = after ? "a CPU store of the baseline bytes after the GPU results" : "a CPU store of the baseline bytes before the GPU results";
         void* memoryBlock = AllocateWatched(bytes, block);
@@ -10822,11 +10792,7 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t bytes = 6 * 65536;
     const auto decided = PrepareImportWatch(base);
     SetImportWatch(base, ImportWatch::Watch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     for (const bool pending : {false, true}) {
         void* block = AllocateWatched(bytes, 65536);
         if (block == nullptr) {
@@ -10920,11 +10886,7 @@ bool importWindowTests(const Device& device, Recorder& recorder) {
         return false;
     }
     SetImportWatch(base, ImportWatch::Watch);
-    struct Restore {
-        const Context& context;
-        ImportWatch decided;
-        ~Restore() { SetImportWatch(context, decided); }
-    } restore{base, decided};
+    const ImportWatchRestore restore{base, decided};
     auto* texels = static_cast<std::uint8_t*>(block);
     std::memset(texels, 0x55, surfaceBytes);
     std::memset(texels + surfaceBytes, 0x00, keyCount);
@@ -14586,11 +14548,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
     }
     Require(block != nullptr && reinterpret_cast<std::uint64_t>(block) % 65536 == 0, "cannot allocate the clear-key hand-over block");
     if (watched) SetImportWatch(base, ImportWatch::Watch);
-    struct RestoreWatch {
-        const Context& context;
-        ImportWatch decided;
-        ~RestoreWatch() { SetImportWatch(context, decided); }
-    } restoreWatch{base, decided};
+    const ImportWatchRestore restoreWatch{base, decided};
     auto* memory = static_cast<std::uint8_t*>(block);
     const auto address = reinterpret_cast<std::uint64_t>(block);
     {
