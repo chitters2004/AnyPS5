@@ -573,7 +573,13 @@ bool ProcTable() {
 AgcDriver::Mutex labelTableMutex;
 std::atomic<unsigned> injectedSubmitFailures{0};
 std::atomic<unsigned> injectedFenceFailures{0};
+std::atomic<VkResult> injectedCancelWaitResult{VK_SUCCESS};
 Recorder* labelTableOwner = nullptr;
+
+VkResult InjectedCancelWait() {
+    return injectedCancelWaitResult.exchange(VK_SUCCESS, std::memory_order_relaxed);
+}
+
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
 // overlaps one, through the function the driver installed.
@@ -1399,7 +1405,13 @@ Recorder::Recorder(const Context& context, bool timelineSemaphores, DeviceFuncti
         timeline = VK_NULL_HANDLE;
         return;
     }
-    if (context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &terminal) != VK_SUCCESS) terminal = VK_NULL_HANDLE;
+    const auto terminalResult = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore")(context.device, &info, nullptr, &terminal);
+    if (terminalResult != VK_SUCCESS) {
+        std::fprintf(stderr, "[gpu] terminal semaphore creation failed (Vulkan result %d); drains wait under the GPU mutex\n", static_cast<int>(terminalResult));
+        terminal = VK_NULL_HANDLE;
+        context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, timeline, nullptr);
+        timeline = VK_NULL_HANDLE;
+    }
 }
 
 void Recorder::LatchFailure(std::exception_ptr error) noexcept {
@@ -4567,6 +4579,10 @@ void Recorder::FailNextFenceWaitsForTest(unsigned count) {
     injectedFenceFailures.store(count, std::memory_order_relaxed);
 }
 
+void Recorder::FailNextCancelWaitForTest(VkResult result) {
+    injectedCancelWaitResult.store(result, std::memory_order_relaxed);
+}
+
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
@@ -5319,20 +5335,34 @@ void Recorder::runDiscards(Batch& batch) noexcept {
 
 void Recorder::cancelSuffix() noexcept {
     std::vector<VkFence> fences;
+    bool retired = true;
     try {
         fences.reserve(inFlight.size());
         for (const auto& batch : inFlight) {
-            if (batch->fence != VK_NULL_HANDLE) fences.push_back(batch->fence);
+            if (!batch->submitted) continue;
+            if (batch->fence == VK_NULL_HANDLE) retired = false;
+            else fences.push_back(batch->fence);
         }
     } catch (...) {
-        fences.clear();
+        retired = false;
     }
-    if (fences.size() == inFlight.size() && !fences.empty()) {
+    if (retired && !fences.empty()) {
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        while (waitFences(context.device, static_cast<std::uint32_t>(fences.size()), fences.data(), VK_TRUE, 5'000'000'000ull) == VK_TIMEOUT) std::fprintf(stderr, "[gpu] batches after a failed one still running on the GPU\n");
-    } else if (!inFlight.empty()) {
+        auto result = InjectedCancelWait();
+        if (result == VK_SUCCESS) {
+            while ((result = waitFences(context.device, static_cast<std::uint32_t>(fences.size()), fences.data(), VK_TRUE, 5'000'000'000ull)) == VK_TIMEOUT) std::fprintf(stderr, "[gpu] batches after a failed one still running on the GPU\n");
+        }
+        if (result != VK_SUCCESS) {
+            std::fprintf(stderr, "[gpu] waiting for the batches after a failed one returned Vulkan result %d; waiting for the device instead\n", static_cast<int>(result));
+            retired = false;
+        }
+    }
+    if (!retired) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) {
+            std::fprintf(stderr, "[gpu] the device did not go idle after a failed batch (Vulkan result %d); its resources cannot be released\n", static_cast<int>(idle));
+            std::terminate();
+        }
     }
     while (!inFlight.empty()) {
         auto batch = std::move(inFlight.front());
