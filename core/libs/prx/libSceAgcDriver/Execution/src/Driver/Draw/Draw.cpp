@@ -31,6 +31,7 @@
 #include <exception>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <typeinfo>
@@ -174,6 +175,7 @@ struct DrawTail {
     std::uint32_t packetOpcode = 0;
     std::uint32_t reg207 = 0;
     std::uint64_t epoch = 0;
+    std::size_t labelsAtHandOff = 0;
     QueueState* queue = nullptr;
     std::span<const std::uint32_t> packet;
     std::string* rejected = nullptr;
@@ -237,6 +239,17 @@ std::optional<HeldReason> writesBeyondTargets(const ShaderRecompiler::RecompileR
         }
     }
     return std::nullopt;
+}
+
+void requireHandOffGate(const DrawTail& tail) {
+    std::string broken;
+    if (tail.queue != nullptr) broken += " queue";
+    if (tail.drawParameters.indirect.has_value()) broken += " indirect";
+    if (tail.profile) broken += " profile";
+    if (tail.dumpTarget != 0 || tail.dumpSlot1 != 0) broken += " dump";
+    if (tail.labelsAtHandOff != 0) broken += " producer-labels";
+    if (!deferredLabels().labels.empty()) broken += " finisher-labels";
+    if (!broken.empty()) throw std::logic_error("a draw reached the draw finisher outside its hand-off gate:" + broken);
 }
 
 DrawFinisher::Pending heldWrites(const DrawTail& tail) {
@@ -736,6 +749,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpTarget = dumpTarget;
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
+    tail.labelsAtHandOff = deferredLabels().labels.size();
     const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -750,6 +764,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
+                requireHandOffGate(job);
                 if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
             } catch (const std::exception& error) {
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
@@ -1011,7 +1026,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     if (tail.queue != nullptr && pipelined && !deferredLabels().labels.empty()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Labels);
-    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) return draw(*tail.queue, packet, submission, packetOffset, rejected);
+    if (recordQueuedLabelsAfterCapture(submission.queue, memory)) {
+        if (tail.queue == nullptr) throw std::logic_error("a draw finished off its queue thread had to restart after queued labels");
+        return draw(*tail.queue, packet, submission, packetOffset, rejected);
+    }
 
     bool rectListBuilt = false;
 

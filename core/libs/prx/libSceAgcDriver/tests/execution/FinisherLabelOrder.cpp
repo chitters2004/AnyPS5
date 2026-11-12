@@ -118,6 +118,7 @@ int main() {
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         using AgcDriver::DriverDetail::DrawFinisher;
         const bool finisher = DrawFinisher::Enabled() && DrawFinisher::Overlap();
+        const bool queuedLabels = finisher && std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
         Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
         Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
         PixelConstant[0] = 0.25f;
@@ -140,8 +141,21 @@ int main() {
         unsigned brightest = 0;
         for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
         Require(brightest + 2 >= 128 && brightest <= 130, "the draws before the labels wrote " + std::to_string(brightest) + ", expected 128");
-        if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
-        if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
+        if (queuedLabels) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
+        if (queuedLabels) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
+        auto queued = Setup();
+        for (std::uint32_t index = 0; index < Labels; ++index) {
+            WriteLabel(queued, index, 0x200u + index);
+            Append(queued, 0x2d, {3, 2});
+        }
+        for (std::uint32_t index = 0; index < Labels; ++index) WaitLabel(queued, index, 0x200u + index);
+        Packet queuedPacket{queued.data(), static_cast<std::uint32_t>(queued.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&queuedPacket) == 0, "the submission with labels queued before its draws failed");
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(LabelMemory.data()), sizeof(LabelMemory));
+        for (std::uint32_t index = 0; index < Labels; ++index) {
+            Require(LabelMemory[index] == 0x200u + index, "label " + std::to_string(index) + " written before a draw is " + std::to_string(LabelMemory[index]) + ", expected " + std::to_string(0x200u + index));
+        }
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
         return 0;
