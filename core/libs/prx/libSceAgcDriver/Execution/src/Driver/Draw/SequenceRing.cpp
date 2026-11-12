@@ -233,19 +233,35 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
     counters.fullWaits = fullWaits.exchange(0, std::memory_order_relaxed);
     counters.fullWaitNs = fullWaitNs.exchange(0, std::memory_order_relaxed);
     counters.preparerSleeps = preparerSleeps.exchange(0, std::memory_order_relaxed);
-    counters.worked = worked.exchange(0, std::memory_order_relaxed);
-    counters.busyCpuNs = busyCpuNs.exchange(0, std::memory_order_relaxed);
-    counters.busyWallNs = busyWallNs.exchange(0, std::memory_order_relaxed);
     counters.idleNs = idleNs.exchange(0, std::memory_order_relaxed);
-    counters.turnWaits = turnWaits.exchange(0, std::memory_order_relaxed);
-    counters.turnWaitNs = turnWaitNs.exchange(0, std::memory_order_relaxed);
-    counters.publishedForOthers = publishedForOthers.exchange(0, std::memory_order_relaxed);
+    const auto totals = CurrentTotals();
+    {
+        std::lock_guard lock(takeMutex);
+        counters.worked = totals.worked - taken.worked;
+        counters.busyCpuNs = totals.busyCpuNs - taken.busyCpuNs;
+        counters.busyWallNs = totals.busyWallNs - taken.busyWallNs;
+        counters.turnWaits = totals.turnWaits - taken.turnWaits;
+        counters.turnWaitNs = totals.turnWaitNs - taken.turnWaitNs;
+        counters.publishedForOthers = totals.publishedForOthers - taken.publishedForOthers;
+        taken = totals;
+    }
     for (std::size_t tag = 0; tag < Tags; ++tag) {
         counters.residency[tag].items = residency[tag].items.exchange(0, std::memory_order_relaxed);
         counters.residency[tag].totalNs = residency[tag].totalNs.exchange(0, std::memory_order_relaxed);
         counters.residency[tag].longestNs = residency[tag].longestNs.exchange(0, std::memory_order_relaxed);
     }
     return counters;
+}
+
+SequenceRing::Totals SequenceRing::CurrentTotals() const {
+    Totals totals;
+    totals.worked = worked.load(std::memory_order_relaxed);
+    totals.busyCpuNs = busyCpuNs.load(std::memory_order_relaxed);
+    totals.busyWallNs = busyWallNs.load(std::memory_order_relaxed);
+    totals.turnWaits = turnWaits.load(std::memory_order_relaxed);
+    totals.turnWaitNs = turnWaitNs.load(std::memory_order_relaxed);
+    totals.publishedForOthers = publishedForOthers.load(std::memory_order_relaxed);
+    return totals;
 }
 
 void SequenceRing::publishReady() {

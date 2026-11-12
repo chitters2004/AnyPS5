@@ -1,0 +1,8 @@
+if(BUILD_TESTING)
+    agc_add_draw_pipeline_test(agc_driver_preparer_constant_stores)
+    add_test(NAME agc_driver_preparer_constant_stores_preparers4 COMMAND agc_driver_preparer_constant_stores_tests)
+    set_tests_properties(agc_driver_preparer_constant_stores_preparers4 PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_RING_PREPARERS=4" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_preparer_constant_stores_preparers4 PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

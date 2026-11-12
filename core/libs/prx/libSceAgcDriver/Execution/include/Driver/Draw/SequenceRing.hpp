@@ -69,6 +69,15 @@ public:
         std::array<Residency, Tags> residency{};
     };
 
+    struct Totals {
+        std::uint64_t worked = 0;
+        std::uint64_t busyCpuNs = 0;
+        std::uint64_t busyWallNs = 0;
+        std::uint64_t turnWaits = 0;
+        std::uint64_t turnWaitNs = 0;
+        std::uint64_t publishedForOthers = 0;
+    };
+
     explicit SequenceRing(Options options);
     ~SequenceRing();
     SequenceRing(const SequenceRing&) = delete;
@@ -92,6 +101,7 @@ public:
     bool OnPreparer() const;
     bool Producing() const { return producerId.load(std::memory_order_acquire) == std::this_thread::get_id(); }
     Counters TakeCounters();
+    Totals CurrentTotals() const;
     static std::uint64_t Running();
 
     template<typename TVisit>
@@ -179,6 +189,8 @@ private:
     std::atomic<std::uint64_t> turnWaitNs{0};
     std::atomic<std::uint64_t> publishedForOthers{0};
     std::array<ResidencyCounters, Tags> residency{};
+    std::mutex takeMutex;
+    Totals taken;
 };
 
 }

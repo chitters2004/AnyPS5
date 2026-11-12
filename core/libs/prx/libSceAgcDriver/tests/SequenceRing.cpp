@@ -321,7 +321,10 @@ void ResidencyIsCountedPerTag() {
     Require(counters.residency[0].items == 3 && counters.residency[5].items == 1, "residency was not counted under each item's tag");
     Require(counters.residency[0].totalNs >= 3'000'000 && counters.residency[0].longestNs >= 1'000'000, "residency does not cover the time an item waited and ran");
     Require(counters.residency[5].totalNs >= 1'000'000, "an item behind slower ones does not count the time it waited in the ring");
-    Require(ring.TakeCounters().residency[0].items == 0, "taking the counters did not reset them");
+    Require(counters.worked == 4, "the ring did not count its prepared items");
+    const auto again = ring.TakeCounters();
+    Require(again.residency[0].items == 0 && again.worked == 0, "taking the counters did not reset them");
+    Require(ring.CurrentTotals().worked == 4, "taking the counters reset the running totals the A/B windows read");
     Require(Throws([&] { ring.Push([] {}, {}, false, SequenceRing::Tags); }), "an out-of-range tag was accepted");
     SequenceRing untimed(Small(4));
     untimed.Push([] {}, {});
