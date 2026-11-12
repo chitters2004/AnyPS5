@@ -269,8 +269,11 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_storage_upload_failure COMMAND agc_driver_recorder_tests --storage-upload-failure-only)
     set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    add_test(NAME agc_recorded_cpu_upload COMMAND agc_driver_recorder_tests --recorded-cpu-upload-only)
+    add_test(NAME agc_recorded_cpu_upload_staging COMMAND agc_driver_recorder_tests --recorded-cpu-upload-staging-only)
+    set_tests_properties(agc_recorded_cpu_upload agc_recorded_cpu_upload_staging PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-")
     if(WIN32)
-        set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_storage_upload_lifetime agc_storage_upload_failure agc_recorded_cpu_upload agc_recorded_cpu_upload_staging PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     set_tests_properties(agc_storage_baseline_settled PROPERTIES SKIP_RETURN_CODE 77)

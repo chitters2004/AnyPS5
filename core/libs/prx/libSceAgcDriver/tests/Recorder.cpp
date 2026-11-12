@@ -140,6 +140,15 @@ void ReleaseWatched(void* block, std::size_t bytes) {
 #endif
 }
 
+struct SyncedDetiler : TextureDetiler {
+    using TextureDetiler::TextureDetiler;
+    SyncedDetiler(const SyncedDetiler&) = delete;
+    SyncedDetiler& operator=(const SyncedDetiler&) = delete;
+    ~SyncedDetiler() {
+        if (auto* recorder = Recorder::Active()) recorder->Sync();
+    }
+};
+
 bool collectMappingHistoryTests() {
     constexpr std::size_t bytes = 131072;
     auto* memory = static_cast<std::uint8_t*>(AllocateWatched(bytes, 65536));
@@ -972,7 +981,7 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
         }
     }
     {
-        TextureDetiler detiler(context);
+        SyncedDetiler detiler(context);
         auto imageContext = context;
         imageContext.detiler = &detiler;
         TextureCache textureCache(imageContext);
@@ -3028,7 +3037,7 @@ bool settleStorageImageTests(const Device& device) {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, unit, true, true, true);
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -3171,7 +3180,7 @@ bool settleInitialDccTests(const Device& device) {
             std::cout << "(m) " << count << " adjacent pending imports settled: " << after.submitted - before.submitted << " reads submitted\n";
         }
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     Recorder recorder(context);
@@ -4040,7 +4049,7 @@ void movedMetadataTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the moved metadata block refused: moved DCC metadata not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -4133,7 +4142,7 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the past-last-mip block refused: views past the last mip not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto view = [&](std::uint32_t level) {
@@ -4446,7 +4455,7 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         auto downloaded = std::make_shared<Buffer>(context, 64, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
         const auto source = uploaded->Bytes();
         std::fill(source.begin(), source.end(), std::byte{0});
-        TextureDetiler repack(context);
+        SyncedDetiler repack(context);
         const auto commands = recorder.Commands();
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         repack.DispatchRepack(commands, uploaded->Handle(), 0, elementView.buffer, elementView.offset + elementAdjustment, 64);
@@ -5006,7 +5015,7 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     if (context.imageTableCapacity < 2u) {
@@ -5087,7 +5096,7 @@ void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorde
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     struct Clear {
@@ -6614,7 +6623,7 @@ bool untrackedForgetTests(const Device& device, Recorder& recorder) {
     }
     const char* mode = std::getenv("APS5_WRITE_WATCH_IMPORTS");
     std::cout << "write-watch mode covered: APS5_WRITE_WATCH_IMPORTS=" << (mode != nullptr ? mode : "unset (probed)") << ", the surface is not write-watched\n";
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     struct Drain {
         Recorder& recorder;
         ~Drain() { recorder.Sync(); }
@@ -6710,7 +6719,7 @@ void storageRefreshTests(const Device& device, Recorder& recorder, bool watched)
     watched = watched && AgcDriver::GuestMemory::Watched(address, bytes);
     Require(watched || !ShadowDestinationFor(base, *import, address, address + 65536).has_value(), "a unit shadow was offered for memory the write tracker does not watch");
     if (!AgcDriver::GuestMemory::WriteWatched()) Require(!UnitShadowEnabled(), "unit shadows are on without write watching");
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -6880,7 +6889,7 @@ bool addressShadowTests(const Device& device, Recorder& recorder) {
         std::cout << "skipped, the heap is not imported or not watched\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7020,7 +7029,7 @@ bool smallTiledShadowLabelTests(const Device& device, Recorder& recorder) {
         return false;
     }
     CollectWritesUncached(address, bytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto settle = [&] {
@@ -7327,7 +7336,7 @@ bool completionStoreShadowTests(const Device& device, Recorder& recorder) {
         std::cout << "skipped, the heap is not imported or not watched\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7432,7 +7441,7 @@ bool writtenBufferOrderTests(const Device& device, Recorder& recorder) {
         return false;
     }
     std::cout << "written buffer order: host imports are " << (AgcDriver::GuestMemory::Watched(address, bytes) ? "watched" : "compared") << "\n";
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -7881,7 +7890,7 @@ void staleGenerationTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -8009,7 +8018,7 @@ bool pendingAfterLeavingWatchTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, address, surfaceBytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         GuestTextureResource resource{};
@@ -8250,7 +8259,7 @@ struct GateBlock {
 struct GateFixture {
     const Context& base;
     ImportWatch decided;
-    TextureDetiler detiler;
+    SyncedDetiler detiler;
     Context context;
     std::deque<GateBlock> blocks;
 
@@ -8689,7 +8698,7 @@ bool unwatchHookLockOrderTests(const Device& device, Recorder& recorder) {
     }
     Require(mapped.size() == 1, "(l) the surface's range is not registered");
     AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -8844,7 +8853,7 @@ void writeBackPaddingTests(const Device& device, Recorder& recorder, bool watche
             std::cout << "host import of the write-back padding block refused: write-back padding not tested\n";
             return;
         }
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9014,7 +9023,7 @@ void splitWriteBackTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes, test.twoAllocations ? static_cast<void*>(memory + test.split) : nullptr};
         Require(HostImportFor(base, address, surfaceBytes) == nullptr, std::string(test.name) + ": one import covers both ranges");
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9151,7 +9160,7 @@ void dccMipWriteBackTests(const Device& device, Recorder& recorder) {
 #endif
             }
         } unregister{base, block, bytes};
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9250,7 +9259,7 @@ void writeBackBlockTests(const Device& device, Recorder& recorder) {
         ClearHostImports(base.device);
         const auto address = reinterpret_cast<std::uint64_t>(memory) + test.offset;
         const auto before = HostImportCounters();
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         resource.baseAddress = address;
@@ -9339,7 +9348,7 @@ bool flushWaitMipChainTests(const Device& device, Recorder& recorder) {
         GuestAllocations::Mutation mutation;
         mutation.Add(block, bytes, true, true, true);
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     resource.baseAddress = address;
@@ -9491,7 +9500,7 @@ void singlePassTests(const Device& device, Recorder& recorder, bool watched) {
                 std::cout << "host import refused: single-pass storage moves not tested\n";
                 return;
             }
-            TextureDetiler detiler(base);
+            SyncedDetiler detiler(base);
             context.detiler = &detiler;
             resource.baseAddress = address;
             std::size_t linearBytes = 0;
@@ -9721,7 +9730,7 @@ private:
 void storageUploadLifetimeTests(const Device& device, Recorder& previous, bool failView) {
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     GuestTextureResource resource{};
     resource.width = 64;
@@ -9816,7 +9825,7 @@ bool refreshProofTests(const Device& device, Recorder& recorder) {
         std::cout << "no watched host import: refresh proofs not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -9982,7 +9991,7 @@ bool pendingKeyRefreshTests(const Device& device, Recorder& recorder) {
         std::cout << "no watched host import: refreshes over a pending key store not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -10144,7 +10153,7 @@ bool repeatedNeighbourStoreTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!imported) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10256,7 +10265,7 @@ void unchangedCpuStampTests(const Device& device, Recorder& recorder) {
                 }
             } unregister{base, block, blockAddress, bytes};
             AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-            TextureDetiler detiler(base);
+            SyncedDetiler detiler(base);
             auto context = base;
             if (!imported) context.hostImportAlignment = 0;
             context.detiler = &detiler;
@@ -10365,7 +10374,7 @@ bool rewrittenBlockTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, memoryBlock, address, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10470,7 +10479,7 @@ bool rewrittenStaleUnitTests(const Device& device, Recorder& recorder) {
         for (std::size_t i = 0; i < surfaceBytes; ++i) memory[i] = pattern(i);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10609,7 +10618,7 @@ void idleWriteBackRaceTests(const Device& device, Recorder& recorder) {
         std::memset(memory, 0x5a, surfaceBytes);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!direct) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10756,7 +10765,7 @@ void keptUnitSettleTests(const Device& device, Recorder& recorder) {
         std::memset(memory, 0x5a, surfaceBytes);
         const auto address = reinterpret_cast<std::uint64_t>(backing.block);
         AgcDriver::GuestMemory::CollectWritesUncached(address, surfaceBytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         if (!direct) context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -10880,7 +10889,7 @@ void settledBaselineTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, blockAddress, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(blockAddress, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.detiler = &detiler;
         GuestTextureResource resource{};
@@ -10969,7 +10978,7 @@ void importWindowTests(const Device& device, Recorder& recorder) {
             HostImportFor(context, address, bytes);
         }
     } unregister{base, block, address};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -11299,6 +11308,42 @@ public:
         EndRenderPass(context, commands);
     }
 
+    void DrawInto(CommandState& recording, VkImageView view) {
+        const auto commands = recording.Commands();
+        if (context.graphicsPipelineLibrary) {
+            VkRenderingAttachmentInfoKHR attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO_KHR};
+            attachment.imageView = view;
+            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
+            rendering.renderArea = {{0, 0}, {8, 8}};
+            rendering.layerCount = 1;
+            rendering.colorAttachmentCount = 1;
+            rendering.pColorAttachments = &attachment;
+            context.Resolved(&DeviceFunctions::cmdBeginRendering, "vkCmdBeginRenderingKHR")(commands, &rendering);
+        } else {
+            VkFramebufferCreateInfo framebufferInfo{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
+            framebufferInfo.renderPass = renderPass;
+            framebufferInfo.attachmentCount = 1;
+            framebufferInfo.pAttachments = &view;
+            framebufferInfo.width = 8;
+            framebufferInfo.height = 8;
+            framebufferInfo.layers = 1;
+            VkFramebuffer drawn = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateFramebuffer>("vkCreateFramebuffer")(context.device, &framebufferInfo, nullptr, &drawn), "vkCreateFramebuffer cover target");
+            drawnFramebuffers.push_back(drawn);
+            VkRenderPassBeginInfo info{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
+            info.renderPass = renderPass;
+            info.framebuffer = drawn;
+            info.renderArea = {{0, 0}, {8, 8}};
+            context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass")(commands, &info, VK_SUBPASS_CONTENTS_INLINE);
+        }
+        recording.BindPipeline(context, pipeline, 0);
+        context.Function<PFN_vkCmdDraw>("vkCmdDraw")(commands, 3, 1, 0, 0);
+        EndRenderPass(context, commands);
+    }
+
     static constexpr std::uint64_t Samples = 64;
 
 private:
@@ -11341,6 +11386,8 @@ private:
         if (fragment != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(device, fragment, nullptr);
         if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(device, layout, nullptr);
         if (framebuffer != VK_NULL_HANDLE) context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(device, framebuffer, nullptr);
+        for (const auto drawn : drawnFramebuffers) context.Function<PFN_vkDestroyFramebuffer>("vkDestroyFramebuffer")(device, drawn, nullptr);
+        drawnFramebuffers.clear();
         if (renderPass != VK_NULL_HANDLE) context.Function<PFN_vkDestroyRenderPass>("vkDestroyRenderPass")(device, renderPass, nullptr);
         pipeline = VK_NULL_HANDLE;
         vertex = fragment = VK_NULL_HANDLE;
@@ -11353,6 +11400,7 @@ private:
     mutable bool transitioned = false;
     VkRenderPass renderPass = VK_NULL_HANDLE;
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    std::vector<VkFramebuffer> drawnFramebuffers;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkShaderModule vertex = VK_NULL_HANDLE;
     VkShaderModule fragment = VK_NULL_HANDLE;
@@ -11361,11 +11409,12 @@ private:
 
 namespace FusionTrace {
 
-enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch, Copy };
+enum class Kind { Barrier, Begin, End, Draw, Fill, Dispatch, Copy, ImageCopy };
 
 struct Event {
     Kind kind;
     BarrierMask mask;
+    std::vector<std::pair<VkImage, VkAccessFlags>> images{};
 };
 
 std::vector<Event> events;
@@ -11379,6 +11428,7 @@ PFN_vkCmdEndRenderPass realEndPass = nullptr;
 PFN_vkCmdEndRenderingKHR realEndRendering = nullptr;
 PFN_vkCmdDraw realDraw = nullptr;
 PFN_vkCmdFillBuffer realFill = nullptr;
+PFN_vkCmdCopyBufferToImage realCopyToImage = nullptr;
 
 VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer commands, VkPipelineStageFlags source, VkPipelineStageFlags destination, VkDependencyFlags flags, std::uint32_t memoryCount, const VkMemoryBarrier* memory, std::uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, std::uint32_t imageCount, const VkImageMemoryBarrier* images) {
     BarrierMask mask{source, destination, 0, 0};
@@ -11387,7 +11437,9 @@ VKAPI_ATTR void VKAPI_CALL Barrier(VkCommandBuffer commands, VkPipelineStageFlag
         mask.dstAccess |= memory[i].dstAccessMask;
     }
     mask.changesLayout = imageCount != 0 || bufferCount != 0;
-    events.push_back({Kind::Barrier, mask});
+    std::vector<std::pair<VkImage, VkAccessFlags>> barred;
+    for (std::uint32_t i = 0; i < imageCount; ++i) barred.emplace_back(images[i].image, images[i].srcAccessMask);
+    events.push_back({Kind::Barrier, mask, std::move(barred)});
     realBarrier(commands, source, destination, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
 }
 
@@ -11421,6 +11473,11 @@ VKAPI_ATTR void VKAPI_CALL Fill(VkCommandBuffer commands, VkBuffer buffer, VkDev
     realFill(commands, buffer, offset, bytes, value);
 }
 
+VKAPI_ATTR void VKAPI_CALL CopyToImage(VkCommandBuffer commands, VkBuffer source, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
+    events.push_back({Kind::ImageCopy, {}, {{image, 0}}});
+    realCopyToImage(commands, source, image, layout, count, regions);
+}
+
 template<typename TFunction>
 PFN_vkVoidFunction Wrap(VkDevice device, const char* name, TFunction& real, TFunction wrapper) {
     real = reinterpret_cast<TFunction>(realProc(device, name));
@@ -11436,6 +11493,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Proc(VkDevice device, const char* name)
     if (wanted == "vkCmdEndRenderingKHR" || wanted == "vkCmdEndRendering") return Wrap(device, name, realEndRendering, &EndRendering);
     if (wanted == "vkCmdDraw") return Wrap(device, name, realDraw, &Draw);
     if (wanted == "vkCmdFillBuffer") return Wrap(device, name, realFill, &Fill);
+    if (wanted == "vkCmdCopyBufferToImage") return Wrap(device, name, realCopyToImage, &CopyToImage);
     return realProc(device, name);
 }
 
@@ -11459,7 +11517,7 @@ void CheckOracle(const std::string& scenario) {
     std::size_t afterCommand = 0;
     for (std::size_t i = 0; i < events.size(); ++i) {
         const auto kind = events[i].kind;
-        if (kind == Kind::Barrier) continue;
+        if (kind == Kind::Barrier || kind == Kind::ImageCopy) continue;
         if (kind == Kind::Begin) Require(CoveredBetween(afterCommand, i, PassStartNeeds), scenario + ": a render pass began without a barrier after the previous command that orders earlier writes before it");
         for (std::size_t end = 0; end < i; ++end) {
             if (events[end].kind == Kind::End) Require(CoveredBetween(end + 1, i, PassEndNeeds), scenario + ": a command after a depth pass's end ran before a barrier that orders the pass's writes before it");
@@ -11468,6 +11526,29 @@ void CheckOracle(const std::string& scenario) {
         }
         afterCommand = i + 1;
     }
+}
+
+BarrierMask ImageBarrierBeforeCopyInto(VkImage image) {
+    for (std::size_t copy = 0; copy < events.size(); ++copy) {
+        if (events[copy].kind != Kind::ImageCopy || events[copy].images.front().first != image) continue;
+        for (std::size_t at = copy; at-- > 0;) {
+            if (events[at].kind != Kind::Barrier) continue;
+            for (const auto& [barred, access] : events[at].images) {
+                if (barred == image) return {events[at].mask.srcStage, events[at].mask.dstStage, access, 0};
+            }
+        }
+        return {};
+    }
+    return {};
+}
+
+bool DrawBeforeCopyInto(VkImage image) {
+    bool drawn = false;
+    for (const auto& event : events) {
+        if (event.kind == Kind::Draw) drawn = true;
+        if (event.kind == Kind::ImageCopy && event.images.front().first == image) return drawn;
+    }
+    return false;
 }
 
 std::size_t BarriersAfterDispatch() {
@@ -12464,7 +12545,7 @@ void cmaskPassTests(const Device& device, Recorder& recorder) {
     namespace GuestMemory = AgcDriver::GuestMemory;
     auto context = device.GetContext();
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     constexpr std::size_t surfaceBytes = 256 * 256 * 4;
     constexpr std::size_t bytes = surfaceBytes + 65536;
@@ -12576,7 +12657,7 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the metadata pass block refused: resident metadata passes not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     ColorTarget color{};
@@ -12716,7 +12797,7 @@ std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint
 
 void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     TextureCache textureCache(context);
@@ -12884,7 +12965,7 @@ void multisampleGuestAccessTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13194,7 +13275,7 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13294,7 +13375,7 @@ void oneFragmentFmaskGuardTests(const Device& device) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13400,7 +13481,7 @@ void fmaskDecompressMsaaTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     ColorTarget source{};
@@ -13465,7 +13546,7 @@ void tiledResolveTests(const Device& device, Recorder& recorder) {
         return;
     }
     context.hostImportAlignment = 0;
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     constexpr std::uint32_t side = 128;
     constexpr std::size_t targetBytes = side * side * 4u;
@@ -13591,7 +13672,7 @@ void depthSurfaceProofTests(const Device& device, Recorder& recorder) {
 #endif
         }
     } unregister{base, block};
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     context.nullDescriptors = true;
@@ -13760,13 +13841,128 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+int recordedCpuUploadTests(const Device& device, Recorder& previous, bool ring) {
+    auto context = device.GetContext();
+    context.functions = nullptr;
+    FusionTrace::realProc = context.deviceProc;
+    context.deviceProc = &FusionTrace::Proc;
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    SyncedDetiler detiler(context);
+    context.detiler = &detiler;
+    const bool ringWas = RuntimeSwitches::Set(RuntimeSwitch::NoBarRing);
+    const bool waitedWas = RuntimeSwitches::Set(RuntimeSwitch::NoRecordedCpuUpload);
+    struct Restore {
+        bool ring;
+        bool waited;
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, ring);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, waited);
+        }
+    } restore{ringWas, waitedWas};
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, !ring);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, false);
+    GuestTextureResource resource{};
+    resource.width = 64;
+    resource.height = 64;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto guestBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    const auto paint = [](std::vector<std::byte>& texels, std::uint8_t red) {
+        for (std::size_t at = 0; at + 4 <= texels.size(); at += 4) {
+            texels[at] = std::byte{red};
+            texels[at + 1] = std::byte{0};
+            texels[at + 2] = std::byte{0};
+            texels[at + 3] = std::byte{0xff};
+        }
+    };
+    std::vector<std::byte> first(guestBytes + 256), second(guestBytes + 256);
+    paint(first, 0x40);
+    paint(second, 0xc0);
+    auto firstResource = resource;
+    auto secondResource = resource;
+    firstResource.baseAddress = (reinterpret_cast<std::uintptr_t>(first.data()) + 255) & ~std::uintptr_t{255};
+    secondResource.baseAddress = (reinterpret_cast<std::uintptr_t>(second.data()) + 255) & ~std::uintptr_t{255};
+    const std::string what = ring ? "recorded cpu upload from the upload ring: " : "recorded cpu upload from a staging buffer: ";
+    int result = 0;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        SampleProgram program(context, recorder);
+        const auto slicesBefore = Recorder::RingCounts().slices;
+        const auto serial = recorder.OpenSerial();
+        auto firstImage = StorageTexture::Create(context, detiler, firstResource, 0);
+        auto secondImage = StorageTexture::Create(context, detiler, secondResource, 0);
+        Require(recorder.OpenSerial() == serial && recorder.Recording(), what + "the uploads were not recorded into the open batch");
+        const bool ringUsed = Recorder::RingCounts().slices != slicesBefore;
+        if (ring && !ringUsed) {
+            std::cout << "skipped, the upload ring is unavailable on this device (no BAR memory)\n";
+            result = 77;
+        } else {
+            Require(ringUsed == ring, what + (ring ? "the upload did not take a ring slice" : "the upload took a ring slice with the ring switched off"));
+            expectRed(program.Red(secondImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0xc0 / 255.0f, (what + "the second of two back-to-back uploads").c_str());
+            Buffer earlier(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(earlier.Bytes().data(), 0, earlier.Bytes().size());
+            {
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageExtent = {1, 1, 1};
+                context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, firstImage->Image(), VK_IMAGE_LAYOUT_GENERAL, earlier.Handle(), 1, &copy);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            }
+            paint(first, 0x80);
+            firstImage->Refresh();
+            Require(recorder.Recording(), what + "the refresh upload was not recorded into the open batch");
+            expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x80 / 255.0f, (what + "a dispatch sampling the image in the batch that re-uploaded it").c_str());
+            Require(std::to_integer<std::uint8_t>(earlier.Bytes()[0]) == 0x40, what + "the re-upload overwrote the image before a reader recorded earlier in its batch read it");
+            CoverPass cover(context);
+            {
+                const auto commands = recorder.Commands();
+                VkImageMemoryBarrier toDraw{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                toDraw.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+                toDraw.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                toDraw.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toDraw.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDraw.image = firstImage->Image();
+                toDraw.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &toDraw);
+                FusionTrace::events.clear();
+                cover.DrawInto(recorder.GraphicsState(), firstImage->AttachmentView(VK_FORMAT_R8G8B8A8_UNORM));
+            }
+            paint(first, 0x20);
+            firstImage->Refresh();
+            Require(recorder.Recording(), what + "the upload after a draw into the image was not recorded into the open batch");
+            Require(FusionTrace::DrawBeforeCopyInto(firstImage->Image()), what + "the draw into the image and the re-upload's copy after it were not both traced");
+            auto transition = FusionTrace::ImageBarrierBeforeCopyInto(firstImage->Image());
+            transition.dstStage = 0;
+            Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, 0}), what + "the re-upload's layout transition does not wait for a draw recorded earlier in its batch that rendered to the image");
+            Require(Covers(transition, BarrierMask{VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, 0}), what + "the re-upload's layout transition does not make a draw's color writes to the image available first");
+            expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x20 / 255.0f, (what + "a dispatch sampling the image re-uploaded after a draw into it").c_str());
+        }
+        recorder.Sync();
+    }
+    previous.Activate();
+    if (result == 0) std::cout << what << "passed\n";
+    return result;
+}
+
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
         std::cout << "VK_EXT_image_view_min_lod unavailable: minimum LOD clamp not tested\n";
         return;
     }
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     GuestTextureResource resource{};
     resource.baseAddress = 0x100000;
     resource.width = 8;
@@ -13816,7 +14012,7 @@ void minLodTests(const Device& device, Recorder& recorder) {
 void failedCheckReportTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     Require(Recorder::Active() == &recorder, "the failed check test needs the active recorder");
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     GuestTextureResource resource{};
     resource.baseAddress = 0x100000;
     resource.width = 64;
@@ -13839,7 +14035,7 @@ void failedCheckReportTests(const Device& device, Recorder& recorder) {
 void uploadScratchReuseTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     Require(Recorder::Active() == &recorder, "the upload scratch test needs the active recorder");
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     SampleProgram program(context, recorder);
     const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
     struct Upload {
@@ -13880,7 +14076,7 @@ void uploadScratchReuseTests(const Device& device, Recorder& recorder) {
 
 void singleCubeTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     SampleProgram program(context, recorder, SAMPLE_ARRAY_SPV);
     const VkComponentMapping identity{};
@@ -13913,7 +14109,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
         return false;
     }
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     SampleProgram program(context, recorder);
     auto cacheContext = context;
     cacheContext.detiler = &detiler;
@@ -14194,7 +14390,7 @@ bool snapshotReadIntoStagingTests(const Device& device, Recorder& recorder) {
 
 void cubeExtraSliceTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     SampleProgram program(context, recorder, SAMPLE_ARRAY_SPV);
     const VkComponentMapping identity{};
@@ -14288,7 +14484,7 @@ struct SampledViewProbe {
 
 void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     GuestTextureResource resource{};
     resource.width = resource.height = 8;
@@ -14322,7 +14518,7 @@ void sampledStorageBaseLevelUsageTests(const Device& device, Recorder& recorder)
 
 void firstLayerViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     auto withDetiler = context;
     withDetiler.detiler = &detiler;
     GuestTextureResource resource{};
@@ -14399,7 +14595,7 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
             }
         } unregister{base, block, address, bytes};
         AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-        TextureDetiler detiler(base);
+        SyncedDetiler detiler(base);
         auto context = base;
         context.hostImportAlignment = 0;
         context.detiler = &detiler;
@@ -14672,7 +14868,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         }
     } unregister{base, block, address, bytes};
     AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.hostImportAlignment = 0;
     context.detiler = &detiler;
@@ -14777,7 +14973,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
 
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     auto withDetiler = context;
     withDetiler.detiler = &detiler;
     for (const std::uint32_t format : {20u, 21u, 22u, 56u}) {
@@ -14842,7 +15038,7 @@ bool vertexTargetRangeTests(const Device& device, Recorder& recorder, bool impor
         context.hostImportAlignment = 0;
         context.dmaBufImport = false;
     }
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     {
         GuestAllocations::Mutation mutation;
@@ -15597,7 +15793,7 @@ void keysFillTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the key fill block refused: DCC key fills not tested\n";
         return;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -15755,7 +15951,7 @@ bool clearHandOverTests(const Device& device, Recorder& recorder, bool watched) 
         std::cout << "the imported block left the write watch: " << what << " not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     const auto surface = [&](std::uint32_t width, std::uint32_t height, std::uint32_t format, std::uint64_t dcc) {
@@ -16001,7 +16197,7 @@ bool denormalClearTests(const Device& device, Recorder& recorder) {
         std::cout << "host import of the denormal clear block refused: denormal fill clears not tested\n";
         return false;
     }
-    TextureDetiler detiler(base);
+    SyncedDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
     GuestTextureResource resource{};
@@ -16351,7 +16547,7 @@ GuestTextureResource Resource(std::uint64_t address, std::uint32_t side = Side) 
 }
 
 void Run(Context context) {
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     context.detiler = &detiler;
     for (const bool watched : {true, false}) {
         Block block(context, watched);
@@ -16539,7 +16735,7 @@ void hostBarrier(const Context& context, VkCommandBuffer commands) {
 void smallElementDetileTests(Device& device) {
     using namespace SmallElementDetileTest;
     const auto& context = device.GetContext();
-    TextureDetiler detiler(context);
+    SyncedDetiler detiler(context);
     struct Case {
         TextureTileMode mode;
         const char* name;
@@ -16888,6 +17084,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);
             return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--recorded-cpu-upload-only" || std::string_view(argv[1]) == "--recorded-cpu-upload-staging-only")) {
+            return recordedCpuUploadTests(device, recorder, std::string_view(argv[1]) == "--recorded-cpu-upload-only");
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
