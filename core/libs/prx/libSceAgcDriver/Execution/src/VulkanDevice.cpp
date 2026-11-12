@@ -1180,7 +1180,9 @@ struct VulkanDevice::State {
             }
             // Results still in the unit shadows reach guest memory before the device goes; the
             // slabs (kept by the publishing batch) are freed by the recorder's teardown.
-            if (recorder) {
+            if (recorder && recorder->Latched()) {
+                std::fprintf(stderr, "[gpu] unit shadows are not published at teardown: the recorder failed\n");
+            } else if (recorder) {
                 try {
                     Graphics::PublishAllShadows(context, Graphics::PublishReason::Teardown);
                     recorder->Sync();
@@ -6135,16 +6137,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         });
     } else if (completionNeeded) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
-        auto writers = state->copiedWriters;
         auto kept = record.resources;
-        recorder.OnComplete([kept, writers, htileClear = record.htileClear] {
-            // Delisted before the write-back: one that fails must not keep indirect dispatches on the CPU.
-            writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
+        Graphics::ListCopiedWriter(recorder, state->copiedWriters, kept, [kept, htileClear = record.htileClear] {
             kept->WriteBackBuffers();
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
-        });
-        // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
-        if (resources.HasCopiedWrites()) writers->push_back(kept);
+        }, resources.HasCopiedWrites());
     }
     recordStep(PhaseRecordCompletion);
 }

@@ -605,6 +605,7 @@ bool ProcTable() {
 // under this mutex takes the GPU mutex (no lock-order cycle).
 AgcDriver::Mutex labelTableMutex;
 std::atomic<unsigned> injectedSubmitFailures{0};
+std::atomic<unsigned> injectedFenceFailures{0};
 Recorder* labelTableOwner = nullptr;
 // The ranges of the calling worker's queued labels (NoteQueuedLabel, cleared by
 // ForgetQueuedLabels): the flush hook, on the same thread, has them recorded before an access that
@@ -1481,6 +1482,8 @@ Recorder::~Recorder() {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
+    if (open != nullptr) discard(std::move(open));
+    cancelSuffix();
     ForgetHtileMasks_nid_no_patch(id);
     encoder.reset();
     progressWatcher.reset();
@@ -2431,6 +2434,7 @@ void Recorder::recordKeyStores(bool forWriter) {
 
 void Recorder::beginBatch() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
+    RethrowLatched();
     SettlePassEnd();
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
@@ -5116,6 +5120,10 @@ void Recorder::FailNextSubmitsForTest(unsigned count) {
     injectedSubmitFailures.store(count, std::memory_order_relaxed);
 }
 
+void Recorder::FailNextFenceWaitsForTest(unsigned count) {
+    injectedFenceFailures.store(count, std::memory_order_relaxed);
+}
+
 void Recorder::Submit() {
     PerformanceTimer frameTiming("Recorder.Submit");
     // The work count is cleared even when nothing is open: the driver counts a dispatch after its
@@ -5126,6 +5134,10 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    if (Latched()) {
+        discard(std::move(open));
+        RethrowLatched();
+    }
     if (CommitPhasesEnabled()) noteBatch(announcedSubmitCause, open->draws, open->passes, work);
     if (encoder != nullptr && encoder->OpenOnThisThread()) throw std::logic_error("AGC graphics: a batch was submitted inside an encoding window");
     struct DiscardUnsubmitted {
@@ -5745,19 +5757,23 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);
             result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         }
+        if (result == VK_SUCCESS && injectedFenceFailures.load(std::memory_order_relaxed) != 0 && injectedFenceFailures.fetch_sub(1, std::memory_order_relaxed) != 0) result = VK_ERROR_DEVICE_LOST;
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) {
             const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
-            Check(idle, "vkDeviceWaitIdle after recorder fence failure");
+            if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) result = idle;
         }
         if (result != VK_SUCCESS) {
-            frontiers.Mark(batch->serial, BatchState::Failed);
-            release(*batch);
             try {
                 Check(result, "vkWaitForFences recorder");
             } catch (...) {
                 LatchFailure(std::current_exception());
-                throw;
             }
+            frontiers.Mark(batch->serial, BatchState::Failed);
+            removeLabels(*batch);
+            runDiscards(*batch);
+            release(*batch);
+            cancelSuffix();
+            RethrowLatched();
         }
     }
     frontiers.Mark(batch->serial, BatchState::Completed);
@@ -5840,7 +5856,9 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     if (encoder != nullptr) encoder->Quiesce();
-    if (batch->predictedSerial != 0 && batch->predictedSerial == frontiers.Newest() && !batch->submitted) frontiers.Retract(batch->predictedSerial);
+    const auto serial = batch->submitted ? batch->serial : batch->predictedSerial;
+    if (serial != 0 && Latched()) frontiers.Mark(serial, batch->submitted ? BatchState::Failed : BatchState::Cancelled);
+    else if (serial != 0 && serial == frontiers.Newest() && !batch->submitted) frontiers.Retract(serial);
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
@@ -5851,11 +5869,50 @@ void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
         }
     }
     if (batch->writeBackCompletionCount != 0) writeBackCompletions.fetch_sub(batch->writeBackCompletionCount, std::memory_order_acq_rel);
-    if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    if (activeRecorder == this && !batch->submitted) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
+    runDiscards(*batch);
     release(*batch);
     try {
         publishPendingWrites();
     } catch (...) {
+    }
+}
+
+void Recorder::runDiscards(Batch& batch) noexcept {
+    batch.completions.clear();
+    for (auto& action : batch.discards) {
+        try {
+            action();
+        } catch (const std::exception& error) {
+            AgcDriver::LogCoalescedStderr_nid_no_patch("[gpu] a cancelled batch's discard action failed: %s\n", error.what());
+        } catch (...) {
+        }
+    }
+    batch.discards.clear();
+}
+
+void Recorder::cancelSuffix() noexcept {
+    std::vector<VkFence> fences;
+    try {
+        fences.reserve(inFlight.size());
+        for (const auto& batch : inFlight) {
+            if (batch->fence != VK_NULL_HANDLE) fences.push_back(batch->fence);
+        }
+    } catch (...) {
+        fences.clear();
+    }
+    if (fences.size() == inFlight.size() && !fences.empty()) {
+        const auto waitFences = function(waitForFences, "vkWaitForFences");
+        while (waitFences(context.device, static_cast<std::uint32_t>(fences.size()), fences.data(), VK_TRUE, 5'000'000'000ull) == VK_TIMEOUT) std::fprintf(stderr, "[gpu] batches after a failed one still running on the GPU\n");
+    } else if (!inFlight.empty()) {
+        const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
+        if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
+    }
+    while (!inFlight.empty()) {
+        auto batch = std::move(inFlight.front());
+        inFlight.pop_front();
+        inFlightKeptBytes -= batch->keptBytes;
+        discard(std::move(batch));
     }
 }
 
