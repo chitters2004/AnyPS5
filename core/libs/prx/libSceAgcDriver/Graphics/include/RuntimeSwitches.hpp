@@ -43,6 +43,7 @@ enum class RuntimeSwitch : std::size_t {
     NoResidentLinear,
     NoStagingPrediction,
     OneStageRequest,
+    StageHandleHints,
     Count,
 };
 

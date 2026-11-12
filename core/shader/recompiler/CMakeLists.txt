@@ -288,6 +288,7 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedCode
             PreparedShaderInvocation::Admits
             PreparedShaderInvocation::Adopt
+            PreparedShaderInvocation::AdoptValidated
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
             GetPreparedArtifact

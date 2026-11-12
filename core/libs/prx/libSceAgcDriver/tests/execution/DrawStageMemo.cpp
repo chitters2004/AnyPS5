@@ -38,6 +38,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -713,6 +714,62 @@ void InvocationKeysFollowSampleModesBetweenScopes() {
     std::puts("a sample mode recorded between an invocation's lock scopes rebuilds its prepared key once");
 }
 
+void StaleStagesTakeTheirPreparedHandles() {
+    if (std::getenv("APS5_NO_DRAW_STAGE_MEMO") != nullptr) {
+        std::puts("prepared handle hints: not tested, the draw stage memo is off");
+        return;
+    }
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    using Hints = AgcDriver::DriverDetail::PreparedHandleHintCounts;
+    const bool oneRequest = Switches::Set(RuntimeSwitch::OneStageRequest);
+    const bool hints = Switches::Set(RuntimeSwitch::StageHandleHints);
+    Switches::Assign(RuntimeSwitch::OneStageRequest, true);
+    Switches::Assign(RuntimeSwitch::StageHandleHints, true);
+    Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const float one = 1.0f;
+    std::memcpy(scene.data.Bytes(0), &one, sizeof(one));
+    struct Taken {
+        unsigned brightest;
+        DrawStageMemoCounts counts;
+        Hints hints;
+    };
+    const auto step = [&](const char* label) {
+        const auto before = AgcDriver::DriverDetail::PreparedHandleHints();
+        const auto measured = Measure(scene, VertexCode.data(), TableOffset, label);
+        const auto after = AgcDriver::DriverDetail::PreparedHandleHints();
+        const Hints delta{after.served - before.served, after.refusedVersion - before.refusedVersion, after.refusedModes - before.refusedModes, after.refusedOther - before.refusedOther};
+        std::printf("  hints served %llu, refused for a moved table %llu, for sample modes %llu, otherwise %llu\n", static_cast<unsigned long long>(delta.served), static_cast<unsigned long long>(delta.refusedVersion), static_cast<unsigned long long>(delta.refusedModes), static_cast<unsigned long long>(delta.refusedOther));
+        return Taken{measured.brightest, measured.counts, delta};
+    };
+    for (const auto* label : {"hint warm-up 1", "hint warm-up 2", "hint warm-up 3"}) Expect(step(label).brightest == 255u, "a hint warm-up draw did not draw");
+    WriteTable(scene.tables, TableOffset, scene.vertices, false);
+    const auto stale = step("a stale vertex stage");
+    Expect(stale.brightest != 255u, "the stale vertex stage bound its old descriptor");
+    Expect(stale.counts[MemoCount::Stale] == 1 && stale.hints.served == 1 && stale.hints.refusedVersion + stale.hints.refusedModes + stale.hints.refusedOther == 0, "a stale vertex stage did not take the prepared handle its record kept");
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    AgcDriver::DriverDetail::MovePreparedTableForTest();
+    const auto moved = step("a stale vertex stage after its prepared table moved");
+    Expect(moved.brightest == 255u, "the stale vertex stage after its prepared table moved did not draw");
+    Expect(moved.counts[MemoCount::Stale] == 1 && moved.hints.served == 0 && moved.hints.refusedVersion == 1, "a hint was served after its prepared table moved");
+    WriteTable(scene.tables, TableOffset, scene.vertices, false);
+    const auto relearnt = step("a stale vertex stage with the hint learnt again");
+    Expect(relearnt.hints.served == 1, "the hint the moved table's capture recorded was not served");
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    AgcDriver::DriverDetail::MarkLayerRowSamplesBeforeLookupForTest();
+    const auto modes = step("a stale vertex stage after a sample mode was recorded");
+    Expect(modes.brightest == 255u, "the stale vertex stage after a sample mode was recorded did not draw");
+    Expect(modes.hints.served == 0 && modes.hints.refusedModes == 1, "a hint was served after its stage's sample modes changed");
+    Switches::Assign(RuntimeSwitch::OneStageRequest, oneRequest);
+    Switches::Assign(RuntimeSwitch::StageHandleHints, hints);
+    std::puts("a stale stage takes the prepared handle its record kept, unless its table or sample modes moved");
+}
+
 int BenchStageKeys() {
     ShaderSnapshot snapshot{};
     RequestParts pixelParts;
@@ -995,6 +1052,58 @@ void InterpolatorSettingsBeyondTheCountAreKeyed() {
     std::printf("draw stage memo: a P0 read of attribute 1 with interpolatorCount 1 %s on the setting beyond the count, and the key follows it\n", zero.spirv == one.spirv ? "does not depend" : "depends");
 }
 
+int BenchStaleCapture() {
+    {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+    }
+    Expect(std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_DRAW_STAGE_MEMO") == nullptr, "--bench-stale-capture needs APS5_PROFILE_DRAW and the draw stage memo");
+    Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const auto writeConstant = [&](float value) {
+        const std::array<float, 4> words{value, value, value, value};
+        std::memcpy(scene.constants.Bytes(0), words.data(), sizeof(words));
+    };
+    writeConstant(1.0f);
+    constexpr std::size_t Placements = 64;
+    constexpr std::size_t PlacementBase = 0x1000;
+    for (std::size_t k = 0; k < Placements; ++k) WriteVertices(scene.vertices, PlacementBase + k * 0x40, -8.0f);
+    std::size_t placement = 0;
+    const auto place = [&] {
+        WriteDescriptor(scene.tables, TableOffset, 0, VertexDescriptor(scene.vertices.At(PlacementBase + (placement++ % Placements) * 0x40)));
+    };
+    for (int warm = 0; warm < 16; ++warm) {
+        place();
+        Draw(scene, VertexCode.data(), TableOffset, true);
+    }
+    const auto before = driver().DrawPhaseTotalsForTest();
+    const auto stepsBefore = AgcDriver::CaptureStepTotalsForTest();
+    const auto memoBefore = driver().StageMemoCounts();
+    const auto hintsBefore = AgcDriver::DriverDetail::PreparedHandleHints();
+    constexpr int Draws = 400;
+    for (int draw = 0; draw < Draws; ++draw) {
+        place();
+        Draw(scene, VertexCode.data(), TableOffset, true);
+    }
+    const auto after = driver().DrawPhaseTotalsForTest();
+    const auto captures = static_cast<double>(after.captures - before.captures);
+    const auto memoSeen = Since(memoBefore, driver().StageMemoCounts());
+    std::printf("bench stale capture: memo lookups %llu, stale %llu, served %llu, absent %llu, draw misses %llu\n", static_cast<unsigned long long>(memoSeen[MemoCount::Lookups]), static_cast<unsigned long long>(memoSeen[MemoCount::Stale]), static_cast<unsigned long long>(memoSeen.Served()), static_cast<unsigned long long>(memoSeen[MemoCount::Absent]), static_cast<unsigned long long>(memoSeen[MemoCount::DrawMisses]));
+    std::fflush(stdout);
+    Expect(captures > 0.0, "the stale bench draws captured no stage: the draw cache served every draw");
+    const auto stepsAfter = AgcDriver::CaptureStepTotalsForTest();
+    const auto memo = Since(memoBefore, driver().StageMemoCounts());
+    const auto hints = AgcDriver::DriverDetail::PreparedHandleHints();
+    std::printf("bench stale capture: %d draws, %.0f captures (%.2f per draw), %llu stale stages, %llu served from the memo; prepared handle hints %llu served, %llu refused; per capture: invocation %.2f us, capture %.2f us\n", Draws, captures, captures / Draws, static_cast<unsigned long long>(memo[MemoCount::Stale]), static_cast<unsigned long long>(memo.Served()), static_cast<unsigned long long>(hints.served - hintsBefore.served), static_cast<unsigned long long>((hints.refusedVersion + hints.refusedModes + hints.refusedOther) - (hintsBefore.refusedVersion + hintsBefore.refusedModes + hintsBefore.refusedOther)), static_cast<double>(stepsAfter.invocationNanoseconds - stepsBefore.invocationNanoseconds) / captures / 1e3, (after.ms[AgcDriver::DriverDetail::DrawRowCapture] - before.ms[AgcDriver::DriverDetail::DrawRowCapture]) * 1000.0 / captures);
+    AgcDriverShutdown_nid_postfix();
+    return 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
     if (argc > 1 && std::string(argv[1]) == "--bench-capture") return BenchCapture();
@@ -1007,6 +1116,7 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+    if (argc > 1 && std::string(argv[1]) == "--bench-stale-capture") return BenchStaleCapture();
     if (argc > 1 && std::string(argv[1]) == "--capture-census") {
         try {
             return CensusCaptures();
@@ -1030,6 +1140,9 @@ int main(int argc, char** argv) {
         ProofsFollowWriteStamps();
         MemoizesOnlyStagesBuiltAsKeyed();
         InvocationKeysFollowSampleModesBetweenScopes();
+        StaleStagesTakeTheirPreparedHandles();
+        const auto hinted = AgcDriver::DriverDetail::PreparedHandleHints();
+        std::printf("prepared handle hints over the run: %llu served, refused %llu for a moved table, %llu for sample modes, %llu otherwise\n", static_cast<unsigned long long>(hinted.served), static_cast<unsigned long long>(hinted.refusedVersion), static_cast<unsigned long long>(hinted.refusedModes), static_cast<unsigned long long>(hinted.refusedOther));
         AgcDriverShutdown_nid_postfix();
         std::puts("draw stage memo: hits, misses and invalidations follow the stage inputs");
         return 0;
