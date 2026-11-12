@@ -5094,6 +5094,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         ResolvedTargets resolution{bindings, ownViews};
         const auto resolveStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto how = ResolveDrawTargets(context, state, 0, DumpTargetLimit(), outcome, timer, profile, resolution);
+        if (resolution.targetMiss) NoteShadowReason(ShadowReason::TargetMiss);
         if (profile) result.ownTargetsNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - resolveStart).count());
         const bool direct = how != TargetResolution::ResolvedWithCopies && std::ranges::all_of(bindings, [](const TargetBinding& binding) { return binding.resident != nullptr && !binding.multisampled && binding.stagedTemporary == nullptr; });
         if (!direct) {

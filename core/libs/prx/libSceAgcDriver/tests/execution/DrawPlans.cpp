@@ -515,7 +515,9 @@ void PlansBindTheirOwnTargets() {
     const Look green{.colour = 0.5f};
     Draw(firstPlanned, red);
     Draw(firstPlanned, red);
+    const auto phasesBefore = AgcDriver::Graphics::ReadCommitPhases();
     const auto counts = Measure(secondPlanned, green);
+    const auto phases = AgcDriver::Graphics::ReadCommitPhases() - phasesBefore;
     {
         const FullPath fullPath;
         Draw(firstFull, red);
@@ -528,6 +530,11 @@ void PlansBindTheirOwnTargets() {
     if (!ownAttachments) Expect(counts[DrawPlanCount::Hits] == 0, "a draw into another render target was served the plan's target");
     if (PlansOn() && !ownAttachments) Expect(counts[DrawPlanCount::MissInstance] == 1, "a draw into another render target was not refused as another instance");
     if (ownAttachments) Expect(counts[DrawPlanCount::Hits] == 1 && counts[DrawPlanCount::OwnAttachmentHits] == 1, "a draw into another render target was not served its plan with its own attachments");
+    if (ownAttachments && AgcDriver::Graphics::CommitPhasesEnabled()) {
+        const auto planHits = phases.kindDraws[static_cast<std::size_t>(AgcDriver::Graphics::CommitDrawKind::PlanHit)];
+        const auto targetMisses = phases.shadowAny[static_cast<std::size_t>(AgcDriver::Graphics::ShadowReason::TargetMiss)];
+        Expect(planHits == 1 && targetMisses == 1, "an own-attachment plan hit into a target that missed marked " + std::to_string(targetMisses) + " [parallel-shadow] target misses over " + std::to_string(planHits) + " plan hits");
+    }
     const auto sum = [&](DrawPlanCount base, std::size_t buckets, std::uint8_t bit) {
         std::uint64_t total = 0;
         for (std::size_t offset = 0; offset < buckets; ++offset) {
