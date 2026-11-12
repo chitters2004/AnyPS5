@@ -2929,7 +2929,7 @@ void VulkanDevice::PrepareForReplacement() {
     }
     DriverDetail::AwaitLibraryPrebuilds();
     Graphics::FlushCachedTextures(state->device);
-    Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
+    if (!state->recorder->Latched()) Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
     Graphics::DestroyShadows(state->device);
     // The replacement's draws never find this device's pipelines (the store keys on the device), and
