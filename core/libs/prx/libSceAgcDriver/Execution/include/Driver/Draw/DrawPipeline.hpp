@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/SequenceRing.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -172,6 +173,15 @@ public:
     static bool Sequenced();
     static std::size_t Preparers();
     static std::string AbWindow(bool begins, char arm, std::uint64_t phase);
+    struct PreparerReads {
+        std::uint64_t validated = 0;
+        std::uint64_t missed = 0;
+        std::uint64_t refused = 0;
+        std::uint64_t changed = 0;
+    };
+    static bool CheckPreparerReads(GuestMemory::WriteTicket ticket, std::span<const Range> ranges, std::span<const std::span<const std::byte>> captured, bool turnWaited);
+    static PreparerReads PreparerReadsCounted();
+    static bool VerifyPreparerReads();
     static bool Buffered();
     void AwaitTurn();
     bool OlderUnpublished();

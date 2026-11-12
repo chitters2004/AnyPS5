@@ -161,12 +161,58 @@ std::size_t DrawFinisher::Preparers() {
     return Sequenced() ? preparers : 1;
 }
 
+namespace {
+
+struct PreparerReadCounters {
+    std::atomic<std::uint64_t> validated{0};
+    std::atomic<std::uint64_t> missed{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> changed{0};
+};
+
+PreparerReadCounters& preparerReads() {
+    static PreparerReadCounters counters;
+    return counters;
+}
+
+}
+
+bool DrawFinisher::CheckPreparerReads(GuestMemory::WriteTicket ticket, std::span<const Range> ranges, std::span<const std::span<const std::byte>> captured, bool turnWaited) {
+    if (captured.size() != ranges.size()) throw std::logic_error("a preparer read check was given captured bytes that do not match its ranges");
+    const bool validated = GuestMemory::UnchangedSince(ranges, ticket);
+    bool changed = false;
+    if (!validated && VerifyPreparerReads()) {
+        for (std::size_t index = 0; index < ranges.size() && !changed; ++index) changed = GuestMemory::CompareMapped(ranges[index].first, captured[index]) == GuestMemory::Compare::Differs;
+    }
+    auto& counters = preparerReads();
+    (validated ? counters.validated : counters.missed).fetch_add(1, std::memory_order_relaxed);
+    if (turnWaited) counters.refused.fetch_add(1, std::memory_order_relaxed);
+    if (changed) {
+        counters.changed.fetch_add(1, std::memory_order_relaxed);
+        throw std::logic_error("a draw finisher preparer's captured guest reads changed between its capture and its draw's commit (APS5_VERIFY_PREPARER_READS)");
+    }
+    return validated;
+}
+
+DrawFinisher::PreparerReads DrawFinisher::PreparerReadsCounted() {
+    auto& counters = preparerReads();
+    return {counters.validated.load(std::memory_order_relaxed), counters.missed.load(std::memory_order_relaxed), counters.refused.load(std::memory_order_relaxed), counters.changed.load(std::memory_order_relaxed)};
+}
+
+bool DrawFinisher::VerifyPreparerReads() {
+    static const bool verify = std::getenv("APS5_VERIFY_PREPARER_READS") != nullptr;
+    return verify;
+}
+
 std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
     struct Window {
         std::mutex mutex;
         std::optional<SequenceRing::Totals> since;
         char arm = 'A';
         bool single = false;
+        bool tickets = false;
+        PreparerReads reads;
+        GuestMemory::WriteTicketStats ticketStats;
         std::uint64_t phase = 0;
     };
     static Window window;
@@ -178,8 +224,20 @@ std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
         const auto& since = *window.since;
         const auto jobs = totals.worked - since.worked;
         const auto perJob = [&](std::uint64_t ns) { return jobs == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(jobs); };
-        char text[512];
-        std::snprintf(text, sizeof(text), "[ring-preparers] phase %c %llu (settled to next begin): %zu preparers%s, %llu jobs at %.2f us CPU and %.2f us wall each, %llu items published by another preparer, %llu turn waits (%.1f ms)\n", window.arm, static_cast<unsigned long long>(window.phase), Preparers(), window.single ? " (single-preparer switch on)" : "", static_cast<unsigned long long>(jobs), perJob(totals.busyCpuNs - since.busyCpuNs), perJob(totals.busyWallNs - since.busyWallNs), static_cast<unsigned long long>(totals.publishedForOthers - since.publishedForOthers), static_cast<unsigned long long>(totals.turnWaits - since.turnWaits), static_cast<double>(totals.turnWaitNs - since.turnWaitNs) / 1e6);
+        const auto reads = PreparerReadsCounted();
+        const auto ticketStats = GuestMemory::WriteTicketsCounted();
+        const auto refusedFor = [&](GuestMemory::TicketRefusal refusal) {
+            const auto index = static_cast<std::size_t>(refusal);
+            return static_cast<unsigned long long>(ticketStats.refused[index] - window.ticketStats.refused[index]);
+        };
+        char gate[384];
+        if (window.tickets) {
+            std::snprintf(gate, sizeof(gate), "; write tickets: %llu validated, %llu missed (no ticket %llu, unwatched %llu, stamped %llu, in flight %llu), %llu refused (turn waits)%s", static_cast<unsigned long long>(reads.validated - window.reads.validated), static_cast<unsigned long long>(reads.missed - window.reads.missed), refusedFor(GuestMemory::TicketRefusal::NoTicket), refusedFor(GuestMemory::TicketRefusal::Unwatched), refusedFor(GuestMemory::TicketRefusal::Stamped), refusedFor(GuestMemory::TicketRefusal::InFlight), static_cast<unsigned long long>(reads.refused - window.reads.refused), VerifyPreparerReads() ? (", " + std::to_string(reads.changed - window.reads.changed) + " changed (verified)").c_str() : "");
+        } else {
+            std::snprintf(gate, sizeof(gate), "; write tickets off");
+        }
+        char text[1024];
+        std::snprintf(text, sizeof(text), "[ring-preparers] phase %c %llu (settled to next begin): %zu preparers%s, %llu jobs at %.2f us CPU and %.2f us wall each, %llu items published by another preparer, %llu turn waits (%.1f ms)%s\n", window.arm, static_cast<unsigned long long>(window.phase), Preparers(), window.single ? " (single-preparer switch on)" : "", static_cast<unsigned long long>(jobs), perJob(totals.busyCpuNs - since.busyCpuNs), perJob(totals.busyWallNs - since.busyWallNs), static_cast<unsigned long long>(totals.publishedForOthers - since.publishedForOthers), static_cast<unsigned long long>(totals.turnWaits - since.turnWaits), static_cast<double>(totals.turnWaitNs - since.turnWaitNs) / 1e6, gate);
         line = text;
         window.since.reset();
     }
@@ -188,6 +246,9 @@ std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
         window.arm = arm;
         window.phase = phase;
         window.single = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SingleRingPreparer);
+        window.tickets = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::WriteTickets);
+        window.reads = PreparerReadsCounted();
+        window.ticketStats = GuestMemory::WriteTicketsCounted();
     }
     return line;
 }
