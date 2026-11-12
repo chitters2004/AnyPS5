@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_vvl_sync_canary_tests tests/VvlSyncCanary.cpp)
+    target_include_directories(agc_vvl_sync_canary_tests PRIVATE ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(agc_vvl_sync_canary_tests PRIVATE ${CMAKE_DL_LIBS})
+    add_test(NAME agc_vvl_sync_canary COMMAND agc_vvl_sync_canary_tests)
+    set_tests_properties(agc_vvl_sync_canary PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 PASS_REGULAR_EXPRESSION "SYNC-HAZARD-WRITE-AFTER-WRITE")
+endif()
