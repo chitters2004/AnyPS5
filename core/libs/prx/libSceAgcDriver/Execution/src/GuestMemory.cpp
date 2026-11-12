@@ -2357,8 +2357,7 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     };
     if (!staysWatched) {
         const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
-        if (stop - first >= (8u << 20)) std::fprintf(stderr, "[diag-stamp] import-window (not staysWatched) 0x%llx +0x%llx covered=%d before=%d
-", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first), covered ? 1 : 0, before ? 1 : 0);
+        if (stop - first >= (8u << 20)) std::fprintf(stderr, "[diag-stamp] import-window (not staysWatched) 0x%llx +0x%llx covered=%d before=%d\n", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop - first), covered ? 1 : 0, before ? 1 : 0);
         if (!runImport()) return false;
         bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
@@ -2625,8 +2624,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     if (order != nullptr) *order = 0;
     tracker.initialize();
     if (bytes == 0) return 0;
-    if (bytes >= (8u << 20)) std::fprintf(stderr, "[diag-stamp] markWritten 0x%llx +0x%zx complete=%d watched=%d covers=%d
-", static_cast<unsigned long long>(address), bytes, complete ? 1 : 0, tracker.watched ? 1 : 0, tracker.covers(address, bytes) ? 1 : 0);
+    if (bytes >= (8u << 20)) std::fprintf(stderr, "[diag-stamp] markWritten 0x%llx +0x%zx complete=%d watched=%d covers=%d\n", static_cast<unsigned long long>(address), bytes, complete ? 1 : 0, tracker.watched ? 1 : 0, tracker.covers(address, bytes) ? 1 : 0);
     ++tracker.generation;
     if (!tracker.watched || !tracker.covers(address, bytes)) {
         tracker.noteUnstampedStore(address, address + bytes);
