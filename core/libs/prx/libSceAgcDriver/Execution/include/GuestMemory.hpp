@@ -255,6 +255,7 @@ void SetConsumeCapacityForTest(std::size_t runs);
 std::uint64_t ConsumeCompactionsForTest();
 std::uint64_t ConservativeInvalidationsForTest();
 std::uint64_t CompareSiteBytesForTest(std::uint32_t line);
+void ReportMemoryProfileNextForTest();
 void WalkCountersForTest(std::uint64_t* values, std::size_t count);
 void SetReleasedWalksForTest(bool released);
 void IgnorePageWritesForTest(std::uint64_t address, std::size_t bytes);

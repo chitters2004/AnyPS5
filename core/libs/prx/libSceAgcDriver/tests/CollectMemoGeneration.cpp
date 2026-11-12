@@ -839,6 +839,8 @@ void CheckExclusionSources() {
     Require(EqualsCommitted(Base, expected), "the first compared site differs");
     const auto secondLine = static_cast<std::uint32_t>(__LINE__ + 1);
     Require(EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)) && EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)), "the second compared site differs");
+    ReportMemoryProfileNextForTest();
+    Require(EqualsCommitted(Base, std::span<const std::byte>(expected).first(16)), "the reporting compare differs");
     Require(CompareSiteBytesForTest(firstLine) == Page && CompareSiteBytesForTest(secondLine) == Page, "compared bytes were not attributed to their call sites");
 }
 

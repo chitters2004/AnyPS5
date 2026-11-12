@@ -1204,6 +1204,8 @@ struct CompareSite {
     std::atomic<std::uint32_t> line{0};
     ProfileCounter calls;
     ProfileCounter bytes;
+    std::uint64_t reportedCalls = 0;
+    std::uint64_t reportedBytes = 0;
 };
 constexpr std::size_t CompareSiteSlots = 48;
 std::array<CompareSite, CompareSiteSlots> compareSites;
@@ -1234,12 +1236,18 @@ std::uint64_t CompareSiteBytesForTest(std::uint32_t line) {
     return bytes;
 }
 
+void ReportMemoryProfileNextForTest() {
+    Profile().lastReport.store(0);
+}
+
 std::string CompareSitesText() {
     std::vector<std::tuple<std::uint64_t, std::uint64_t, const char*, std::uint32_t>> taken;
     for (auto& slot : compareSites) {
         if (slot.key.load(std::memory_order_acquire) == 0) continue;
-        const auto calls = slot.calls.Take();
-        const auto bytes = slot.bytes.Take();
+        const auto totalCalls = slot.calls.Sum();
+        const auto totalBytes = slot.bytes.Sum();
+        const auto calls = totalCalls - std::exchange(slot.reportedCalls, totalCalls);
+        const auto bytes = totalBytes - std::exchange(slot.reportedBytes, totalBytes);
         if (calls != 0) taken.emplace_back(bytes, calls, slot.file.load(std::memory_order_relaxed), slot.line.load(std::memory_order_acquire));
     }
     std::sort(taken.rbegin(), taken.rend());
@@ -1315,7 +1323,11 @@ public:
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
         AgcDriver::ProfilePrint_nid_no_patch(" | compares by site (10 s):%s | unwatched by source (10 s):", CompareSitesText().c_str());
-        for (std::size_t source = 0; source < unwatchedBytes.size(); ++source) AgcDriver::ProfilePrint_nid_no_patch(" %s %.1f MiB", ExclusionSourceName(static_cast<ExclusionSource>(source)), unwatchedBytes[source].Take() / 1048576.0);
+        static std::array<std::uint64_t, static_cast<std::size_t>(ExclusionSource::Count)> reportedUnwatched{};
+        for (std::size_t source = 0; source < unwatchedBytes.size(); ++source) {
+            const auto total = unwatchedBytes[source].Sum();
+            AgcDriver::ProfilePrint_nid_no_patch(" %s %.1f MiB", ExclusionSourceName(static_cast<ExclusionSource>(source)), (total - std::exchange(reportedUnwatched[source], total)) / 1048576.0);
+        }
         AgcDriver::ProfilePrint_nid_no_patch("\n");
 #ifdef _WIN32
         constexpr std::array<const char*, 9> mappingSites{"handlewrite", "handleread", "collect", "registry", "pin", "hostwrite", "owned", "zero", "other"};
