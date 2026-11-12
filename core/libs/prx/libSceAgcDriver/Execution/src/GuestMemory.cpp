@@ -121,6 +121,7 @@ struct alignas(64) WriteSubscription {
     std::atomic<std::uint32_t> typeMask{WriteChangeAll};
     std::atomic<bool> history{false};
     std::vector<std::uint64_t> ownerDependencies;
+    std::vector<const std::atomic<std::uint64_t>*> blockDependencies;
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint64_t> keys;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
@@ -211,6 +212,7 @@ struct KeySlot {
     std::atomic<std::uint32_t> overflow{0};
     std::atomic<std::uint32_t> ownerOverflow{0};
     std::array<std::atomic<std::uint64_t>, InlineOwners> owners{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteChange::Count)> changes{};
 };
 
 struct WriteOwnerSlot {
@@ -266,6 +268,7 @@ struct WriteIndex {
     std::array<std::atomic<Chunk*>, ChunkCount> chunks{};
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> overflowed;
     std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> ownerOverflowed;
+    std::unordered_map<std::uint64_t, std::vector<std::uint64_t>> counterSubscribers;
     std::array<std::atomic<OwnerChunk*>, ChunkCount> ownerChunks{};
     std::vector<std::uint32_t> freeOwnerSlots;
     std::uint64_t ownerSlotCount = 0;
@@ -273,6 +276,7 @@ struct WriteIndex {
     std::atomic<std::uint64_t> ownerBumps{0};
     std::atomic<std::uint64_t> ownerFastBumps{0};
     std::atomic<std::uint64_t> ownerDependencies{0};
+    std::atomic<std::uint64_t> blockDependencies{0};
     std::atomic<std::uint64_t> subscriptions{0};
     std::atomic<std::uint64_t> blocks{0};
     std::atomic<std::uint64_t> bumps{0};
@@ -372,6 +376,16 @@ std::uint64_t ownerSum(std::span<const std::uint64_t> dependencies, std::uint32_
     return sum;
 }
 
+std::uint64_t blockSum(std::span<const std::atomic<std::uint64_t>* const> dependencies, std::uint32_t typeMask) {
+    std::uint64_t sum = 0;
+    for (const auto* changes : dependencies) {
+        for (std::size_t change = 0; change < static_cast<std::size_t>(WriteChange::Count); ++change) {
+            if ((typeMask & (std::uint32_t{1} << change)) != 0) sum += changes[change].load(std::memory_order_acquire);
+        }
+    }
+    return sum;
+}
+
 template <class Visit>
 void forHandles(std::uint64_t key, KeySlot& slot, Visit&& visit) {
     for (auto& cell : slot.handles) {
@@ -459,6 +473,7 @@ Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource sourc
 
 std::atomic<CertificateMutant> certificateMutant{CertificateMutant::None};
 std::atomic<bool> countingForTest{false};
+std::atomic<bool> ownersIgnoredForTest{false};
 std::atomic<std::uint64_t> deadObservations{0};
 
 bool indexCounting() {
@@ -533,8 +548,10 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     std::uint64_t lookups = 0;
     std::uint64_t bumped = 0;
     std::uint64_t overflowed = 0;
+    const bool blocksHidden = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HideBlockBumps;
     const auto visit = [&](std::uint64_t key, KeySlot& slot) {
         ++lookups;
+        if (!blocksHidden) slot.changes[change].fetch_add(1, std::memory_order_acq_rel);
         if (owned) {
             forOwners(key, slot, [&](std::uint64_t owner) {
                 auto& entry = ownerOf(owner);
@@ -605,7 +622,6 @@ void releaseSubscription(WriteSubscription* subscription) {
         const auto next = (subscription->generation.load(std::memory_order_relaxed) + 1) & GenerationMask;
         subscription->generation.store(static_cast<std::uint32_t>(next), std::memory_order_release);
         cellOf(std::uint64_t{subscription->slot} << 24).meta.store(next, std::memory_order_release);
-        std::vector<std::uint64_t>().swap(subscription->blocks);
         std::vector<std::uint64_t>().swap(subscription->keys);
         if (!subscription->backed.empty()) index.backedLive.fetch_sub(1, std::memory_order_acq_rel);
         std::vector<std::pair<std::uint64_t, std::uint64_t>>().swap(subscription->backed);
@@ -616,8 +632,20 @@ void releaseSubscription(WriteSubscription* subscription) {
     for (const auto owner : subscription->countedOwners) {
         if (ownerLive(owner)) ownerOf(owner).handleSubscriptions.fetch_sub(1, std::memory_order_acq_rel);
     }
+    if (!subscription->blockDependencies.empty()) {
+        const auto handle = (std::uint64_t{subscription->slot} << 24) | ((subscription->generation.load(std::memory_order_relaxed) + GenerationMask) & GenerationMask);
+        for (const auto block : subscription->blocks) {
+            if (const auto found = index.counterSubscribers.find(block); found != index.counterSubscribers.end()) {
+                auto& list = found->second;
+                list.erase(std::remove(list.begin(), list.end(), handle), list.end());
+                if (list.empty()) index.counterSubscribers.erase(found);
+            }
+        }
+    }
+    std::vector<std::uint64_t>().swap(subscription->blocks);
     std::vector<std::uint64_t>().swap(subscription->countedOwners);
     std::vector<std::uint64_t>().swap(subscription->ownerDependencies);
+    std::vector<const std::atomic<std::uint64_t>*>().swap(subscription->blockDependencies);
     if (subscription->generation.load(std::memory_order_relaxed) != 0) index.freeSlots.push_back(subscription->slot);
     index.live.fetch_sub(1, std::memory_order_acq_rel);
 }
@@ -661,9 +689,11 @@ std::uint64_t observeVersion(const WriteSubscription& subscription) {
 
 std::uint64_t ObserveSubscription(const WriteSubscription& subscription) {
     const auto version = observeVersion(subscription);
-    if (subscription.ownerDependencies.empty() || certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::ObserveIgnoresOwners) return version;
+    if (certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::ObserveIgnoresOwners) return version;
+    if (subscription.ownerDependencies.empty() && subscription.blockDependencies.empty()) return version;
     bool live = true;
-    const auto sum = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
+    const auto typeMask = subscription.typeMask.load(std::memory_order_relaxed);
+    const auto sum = ownerSum(subscription.ownerDependencies, typeMask, live) + blockSum(subscription.blockDependencies, typeMask);
     if (!live) return (std::uint64_t{1} << 63) | (deadObservations.fetch_add(1, std::memory_order_relaxed) << 1) | 1u;
     return version + 2 * sum;
 }
@@ -716,15 +746,24 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
     certificate.typeMask = subscription.typeMask.load(std::memory_order_relaxed);
     certificate.ownerCount = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::CertificateDropsOwners ? 0u : static_cast<std::uint32_t>(subscription.ownerDependencies.size());
     if (certificate.ownerCount <= CertificateInlineOwners) std::copy_n(subscription.ownerDependencies.begin(), certificate.ownerCount, certificate.ownerHandles.begin());
-    if (!subscription.ownerDependencies.empty()) {
+    certificate.blockCount = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::CertificateDropsBlocks ? 0u : static_cast<std::uint32_t>(subscription.blockDependencies.size());
+    if (certificate.blockCount <= CertificateInlineOwners) std::copy_n(subscription.blockDependencies.begin(), certificate.blockCount, certificate.blockChanges.begin());
+    if (!subscription.ownerDependencies.empty() || !subscription.blockDependencies.empty()) {
         bool live = true;
-        certificate.owners = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
+        const auto mutant = certificateMutant.load(std::memory_order_relaxed);
+        const auto owners = mutant == CertificateMutant::CertificateDropsOwners ? 0 : ownerSum(subscription.ownerDependencies, certificate.typeMask, live);
+        const auto blocks = mutant == CertificateMutant::CertificateDropsBlocks ? 0 : blockSum(subscription.blockDependencies, certificate.typeMask);
+        certificate.owners = owners + blocks;
         if (!live) certificate.owners = ~std::uint64_t{0};
     }
     certificate.domains = readDomains(domainMask);
     return certificate;
 }
 
+
+void SetWriteOwnersIgnoredForTest(bool ignored) {
+    ownersIgnoredForTest.store(ignored, std::memory_order_relaxed);
+}
 
 void SetWriteIndexCountingForTest(bool counting) {
     countingForTest.store(counting, std::memory_order_relaxed);
@@ -753,9 +792,10 @@ std::uint32_t CertificateMisses(const WriteSubscription& subscription, const Wri
         if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) missed |= std::uint32_t{1} << i;
     }
     if (subscription.version->load(std::memory_order_acquire) != certificate.version) missed |= CertificateVersionMissed;
-    if (!subscription.ownerDependencies.empty()) {
+    if (!subscription.ownerDependencies.empty() || !subscription.blockDependencies.empty()) {
         bool live = true;
-        const auto sum = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
+        const auto typeMask = subscription.typeMask.load(std::memory_order_relaxed);
+        const auto sum = ownerSum(subscription.ownerDependencies, typeMask, live) + blockSum(subscription.blockDependencies, typeMask);
         if (!live || sum != certificate.owners) missed |= CertificateVersionMissed;
     }
     return missed;
@@ -775,11 +815,13 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
         if (observer != nullptr) observer(domain);
         if (DomainVersion(domain) != certificate.domains[i]) return false;
     }
-    const bool inlined = certificate.cell != nullptr && certificate.ownerCount <= CertificateInlineOwners;
+    const bool inlined = certificate.cell != nullptr && certificate.ownerCount <= CertificateInlineOwners && certificate.blockCount <= CertificateInlineOwners;
     const auto dependencies = inlined ? std::span<const std::uint64_t>(certificate.ownerHandles.data(), certificate.ownerCount) : std::span<const std::uint64_t>(subscription.ownerDependencies);
-    if (!dependencies.empty() && mutant != CertificateMutant::IgnoreOwners) {
+    const auto blocks = inlined ? std::span<const std::atomic<std::uint64_t>* const>(certificate.blockChanges.data(), certificate.blockCount) : std::span<const std::atomic<std::uint64_t>* const>(subscription.blockDependencies);
+    if ((!dependencies.empty() || !blocks.empty()) && mutant != CertificateMutant::IgnoreOwners) {
         bool live = true;
-        const auto sum = ownerSum(dependencies, inlined ? certificate.typeMask : subscription.typeMask.load(std::memory_order_relaxed), live);
+        const auto typeMask = inlined ? certificate.typeMask : subscription.typeMask.load(std::memory_order_relaxed);
+        const auto sum = ownerSum(dependencies, typeMask, live) + blockSum(blocks, typeMask);
         if (!live || sum != certificate.owners) return false;
     }
     const auto& version = inlined ? *certificate.cell : *subscription.version;
@@ -838,6 +880,7 @@ WriteIndexStats WriteIndexCounted() {
     stats.ownerBumps = index.ownerBumps.load(std::memory_order_relaxed);
     stats.ownerFastBumps = index.ownerFastBumps.load(std::memory_order_relaxed);
     stats.ownerDependencies = index.ownerDependencies.load(std::memory_order_relaxed);
+    stats.blockDependencies = index.blockDependencies.load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < stats.bySource.size(); ++i) stats.bySource[i] = index.bySource[i].load(std::memory_order_relaxed);
     for (std::size_t i = 0; i < stats.bySize.size(); ++i) {
         for (std::size_t k = 0; k < WriteBumpSizeBuckets; ++k) stats.bySize[i][k] = index.bySize[i][k].load(std::memory_order_relaxed);
@@ -847,7 +890,7 @@ WriteIndexStats WriteIndexCounted() {
 
 void ResetWriteIndexCounts() {
     auto& index = Index();
-    for (auto* counter : {&index.calls, &index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds, &index.ownerBumps, &index.ownerFastBumps, &index.ownerDependencies}) counter->store(0, std::memory_order_relaxed);
+    for (auto* counter : {&index.calls, &index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds, &index.ownerBumps, &index.ownerFastBumps, &index.ownerDependencies, &index.blockDependencies}) counter->store(0, std::memory_order_relaxed);
     for (auto& counter : index.bySource) counter.store(0, std::memory_order_relaxed);
     for (auto& sizes : index.bySize) {
         for (auto& counter : sizes) counter.store(0, std::memory_order_relaxed);
@@ -3046,11 +3089,12 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
     std::size_t keyCount = 0;
     std::size_t blockCount = 0;
     std::size_t dependencyCount = 0;
+    std::size_t blockDependencyCount = 0;
     WriteSubscription* subscription = nullptr;
     {
         std::lock_guard lock(index.mutex);
         std::vector<std::uint64_t> dependencies;
-        if (index.owners.load(std::memory_order_relaxed) != 0) {
+        if (index.owners.load(std::memory_order_relaxed) != 0 && !ownersIgnoredForTest.load(std::memory_order_relaxed)) {
             for (const auto& [begin, end] : ownable) {
                 std::uint64_t containing = 0;
                 if (auto* slot = slotOf(begin / IndexBlockBytes, false)) {
@@ -3071,7 +3115,12 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
         }
         std::sort(blocks.begin(), blocks.end());
         blocks.erase(std::unique(blocks.begin(), blocks.end()), blocks.end());
-        std::vector<std::uint64_t> keys = blocks;
+        const bool countBlocks = owned && !keepHistory && backed.empty();
+        std::vector<const std::atomic<std::uint64_t>*> blockDependencies;
+        if (countBlocks) {
+            for (const auto block : blocks) blockDependencies.push_back(slotOf(block, true)->changes.data());
+        }
+        std::vector<std::uint64_t> keys = countBlocks ? std::vector<std::uint64_t>{} : blocks;
         for (const auto& [key, block] : backed) {
             if (keys.size() == blocks.size() || keys.back() != key) keys.push_back(key);
         }
@@ -3090,6 +3139,7 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
         keyCount = keys.size();
         blockCount = blocks.size();
         dependencyCount = dependencies.size();
+        blockDependencyCount = blockDependencies.size();
         subscription = &acquireSubscription();
         std::uint64_t handle = 0;
         {
@@ -3104,16 +3154,21 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
             subscription->backed = std::move(backed);
             subscription->spans = std::move(spans);
             subscription->ownerDependencies = std::move(dependencies);
+            subscription->blockDependencies = std::move(blockDependencies);
             subscription->countedOwners = std::move(counted);
             handle = (static_cast<std::uint64_t>(subscription->slot) << 24) | subscription->generation.load(std::memory_order_relaxed);
             cellOf(handle).meta.store(CellMeta(handle & GenerationMask, typeMask, keepHistory), std::memory_order_release);
         }
         for (const auto key : subscription->keys) addHandle(key, handle);
+        if (countBlocks) {
+            for (const auto block : subscription->blocks) index.counterSubscribers[block].push_back(handle);
+        }
         index.live.fetch_add(1, std::memory_order_acq_rel);
     }
     index.subscriptions.fetch_add(1, std::memory_order_relaxed);
     index.blocks.fetch_add(keyCount == 0 ? blockCount : keyCount, std::memory_order_relaxed);
     if (dependencyCount != 0) index.ownerDependencies.fetch_add(dependencyCount, std::memory_order_relaxed);
+    if (blockDependencyCount != 0) index.blockDependencies.fetch_add(blockDependencyCount, std::memory_order_relaxed);
     return std::shared_ptr<WriteSubscription>(subscription, &releaseSubscription);
 }
 
@@ -3147,13 +3202,17 @@ std::uint64_t RegisterWriteOwner(std::uint64_t base, std::uint64_t bytes) {
             neighbour.overlapped.store(true, std::memory_order_release);
             entry.overlapped.store(true, std::memory_order_release);
         });
-        forHandles(block, keySlot, [&](std::uint64_t handle) {
+        const auto countSubscriber = [&](std::uint64_t handle) {
             if (!handleLive(handle)) return;
             auto& subscriber = subscriptionOf(handle);
             if (std::find(subscriber.countedOwners.begin(), subscriber.countedOwners.end(), owner) != subscriber.countedOwners.end()) return;
             subscriber.countedOwners.push_back(owner);
             entry.handleSubscriptions.fetch_add(1, std::memory_order_acq_rel);
-        });
+        };
+        forHandles(block, keySlot, countSubscriber);
+        if (const auto found = index.counterSubscribers.find(block); found != index.counterSubscribers.end()) {
+            for (const auto handle : found->second) countSubscriber(handle);
+        }
         bool placed = false;
         for (auto& cell : keySlot.owners) {
             if (const auto held = cell.load(std::memory_order_relaxed); held == 0 || !ownerLive(held)) {

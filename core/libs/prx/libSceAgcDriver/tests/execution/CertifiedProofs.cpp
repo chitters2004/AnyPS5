@@ -826,28 +826,36 @@ std::uint64_t RunOracle(AgcDriver::VulkanDevice& device, std::uint64_t seed, int
     return warmed;
 }
 
-std::uint64_t RunOracleWith(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, bool owners) {
+enum class OracleMode { Handles, Owners, Blocks };
+
+std::uint64_t RunOracleWith(AgcDriver::VulkanDevice& device, std::uint64_t seed, int steps, int scenesPerRun, OracleMode mode) {
     using AgcDriver::Graphics::RuntimeSwitch;
     struct Restore {
-        ~Restore() { AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, false); }
+        ~Restore() {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, false);
+            GuestMemory::SetWriteOwnersIgnoredForTest(false);
+        }
     } restore;
-    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, !owners);
-    return RunOracle(device, seed, steps, scenesPerRun, owners);
+    AgcDriver::Graphics::RuntimeSwitches::Assign(RuntimeSwitch::NoWriteOwners, mode == OracleMode::Handles);
+    GuestMemory::SetWriteOwnersIgnoredForTest(mode == OracleMode::Blocks);
+    return RunOracle(device, seed, steps, scenesPerRun, mode == OracleMode::Owners);
 }
 
 void Oracle(AgcDriver::VulkanDevice& device) {
     const auto seed = OracleSeed();
     constexpr int steps = 160;
-    for (const bool owners : {false, true}) {
+    for (const auto oracleMode : {OracleMode::Handles, OracleMode::Owners, OracleMode::Blocks}) {
         const auto before = GuestMemory::WriteIndexCounted();
-        const auto warmed = RunOracleWith(device, seed, steps, 3, owners);
+        const auto warmed = RunOracleWith(device, seed, steps, 3, oracleMode);
         const auto after = GuestMemory::WriteIndexCounted();
         const auto dependencies = after.ownerDependencies - before.ownerDependencies;
+        const auto blockDependencies = after.blockDependencies - before.blockDependencies;
         const auto ownerBumps = after.ownerBumps + after.ownerFastBumps - before.ownerBumps - before.ownerFastBumps;
-        const char* mode = owners ? "with owners" : "without owners";
+        const char* mode = oracleMode == OracleMode::Handles ? "on handles" : oracleMode == OracleMode::Owners ? "with owners" : "on block counters";
+        const bool shaped = oracleMode == OracleMode::Handles ? dependencies == 0 && blockDependencies == 0 : oracleMode == OracleMode::Owners ? dependencies != 0 && ownerBumps != 0 : dependencies == 0 && blockDependencies != 0;
         Require(warmed * 4 >= steps * 3, std::string("oracle ") + mode + ": only " + std::to_string(warmed) + " of " + std::to_string(steps) + " events met a live certificate, too few to test anything");
-        Require(owners ? dependencies != 0 && ownerBumps != 0 : dependencies == 0, std::string("oracle ") + mode + ": " + std::to_string(dependencies) + " owner dependencies and " + std::to_string(ownerBumps) + " owner bumps");
-        std::printf("certified proofs: oracle %s seed %llu, %llu of %d events met a live certificate, %llu owner dependencies, %llu owner bumps\n", mode, static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps, static_cast<unsigned long long>(dependencies), static_cast<unsigned long long>(ownerBumps));
+        Require(shaped, std::string("oracle ") + mode + ": " + std::to_string(dependencies) + " owner dependencies, " + std::to_string(blockDependencies) + " block dependencies and " + std::to_string(ownerBumps) + " owner bumps");
+        std::printf("certified proofs: oracle %s seed %llu, %llu of %d events met a live certificate, %llu owner dependencies, %llu block dependencies, %llu owner bumps\n", mode, static_cast<unsigned long long>(seed), static_cast<unsigned long long>(warmed), steps, static_cast<unsigned long long>(dependencies), static_cast<unsigned long long>(blockDependencies), static_cast<unsigned long long>(ownerBumps));
     }
 }
 
@@ -856,15 +864,18 @@ void Mutants(AgcDriver::VulkanDevice& device) {
     struct Mutant {
         CertificateMutant mutant;
         const char* name;
-        bool owners;
+        OracleMode mode;
     };
-    constexpr std::array<Mutant, 9> mutants{{{CertificateMutant::HidePipelineCommitBumps, "a stale certificate after a pipelined store that bumps nothing", false}, {CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing", false}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write", false}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch", false}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change", false}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing", false}, {CertificateMutant::IgnoreOwners, "a stale certificate after a write into its owner", true}, {CertificateMutant::HideOwnerBumps, "a stale certificate after a write its owner never counts", true}, {CertificateMutant::CertificateDropsOwners, "a stale certificate that does not carry its owners", true}}};
-    for (const auto& [mutant, name, owners] : mutants) {
+    constexpr auto Handles = OracleMode::Handles;
+    constexpr auto Owners = OracleMode::Owners;
+    constexpr auto Blocks = OracleMode::Blocks;
+    constexpr std::array<Mutant, 11> mutants{{{CertificateMutant::HidePipelineCommitBumps, "a stale certificate after a pipelined store that bumps nothing", Handles}, {CertificateMutant::HideOwnStoreBumps, "a stale certificate after an own store that bumps nothing", Handles}, {CertificateMutant::IgnoreVersion, "a stale certificate after a write", Handles}, {CertificateMutant::HideUnwatch, "a stale certificate after an unwatch", Handles}, {CertificateMutant::HideMapping, "a stale certificate after a mapping change", Handles}, {CertificateMutant::HideMarkWrittenBumps, "a stale certificate after a driver store that bumps nothing", Handles}, {CertificateMutant::IgnoreOwners, "a stale certificate after a write into its owner", Owners}, {CertificateMutant::HideOwnerBumps, "a stale certificate after a write its owner never counts", Owners}, {CertificateMutant::CertificateDropsOwners, "a stale certificate that does not carry its owners", Owners}, {CertificateMutant::HideBlockBumps, "a stale certificate after a write its block never counts", Blocks}, {CertificateMutant::CertificateDropsBlocks, "a stale certificate that does not carry its blocks", Blocks}}};
+    for (const auto& [mutant, name, mode] : mutants) {
         GuestMemory::SetCertificateMutantForTest(mutant);
         std::string caught;
         for (std::uint64_t attempt = 0; attempt < 4 && caught.empty(); ++attempt) {
             try {
-                RunOracleWith(device, OracleSeed() + attempt, 160, 3, owners);
+                RunOracleWith(device, OracleSeed() + attempt, 160, 3, mode);
             } catch (const OracleFailure& failure) {
                 caught = failure.what();
             }

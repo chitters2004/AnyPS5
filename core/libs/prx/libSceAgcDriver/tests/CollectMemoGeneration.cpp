@@ -711,6 +711,50 @@ void CheckOwnerObservation() {
     Require(!ThrowsOnRegister(Base + 140 * Block, Block), "a plain write owner range was refused");
 }
 
+bool BlockBumpVoids() {
+    const auto subscription = Subscribe(Base + 200 * Block, 1, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(CertificateHolds(*subscription, certificate, 0), "a certificate on block counters did not hold with nothing changed");
+    Pending(Base + 200 * Block + 128);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+bool LateOwnerSeesCountedSubscription() {
+    const auto subscription = Subscribe(Base + 210 * Block, 1, WriteChangeAll, false);
+    const WriteOwner owner(Base + 210 * Block, 2 * Block);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    NoteGpuPending(Base + 210 * Block, 2 * Block);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+void CheckBlockCounters() {
+    const auto subscription = Subscribe(Base + 202 * Block, 1, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 202 * Block, 1, WriteChangeBit(WriteChange::Identity), false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    const auto maskedCertificate = CertifySubscription(*masked, 0);
+    const auto seen = ObserveSubscription(*subscription);
+    Pending(Base + 203 * Block);
+    Require(CertificateHolds(*subscription, certificate, 0) && ObserveSubscription(*subscription) == seen, "a bump of the next block moved a subscription on block counters");
+    const auto notified = WriteIndexCounted().bumps;
+    Pending(Base + 202 * Block + 4096);
+    Require(WriteIndexCounted().bumps == notified, "a bump notified a handle of a subscription on block counters");
+    Require(!CertificateHolds(*subscription, certificate, 0) && ObserveSubscription(*subscription) != seen, "a bump inside a subscription's block left it standing on block counters");
+    Require(CertificateHolds(*masked, maskedCertificate, 0), "a bump outside the type mask voided a certificate on block counters");
+    const auto wide = Subscribe(Base + 220 * Block, CertificateInlineOwners + 1, WriteChangeAll, false);
+    const auto wideCertificate = CertifySubscription(*wide, 0);
+    Require(wideCertificate.blockCount == CertificateInlineOwners + 1 && CertificateHolds(*wide, wideCertificate, 0), "a certificate over more blocks than it holds inline did not hold with nothing changed");
+    Pending(Base + (220 + CertificateInlineOwners) * Block);
+    Require(!CertificateHolds(*wide, wideCertificate, 0), "a bump in the last block of a wide subscription left its certificate standing");
+    Require(BlockBumpVoids(), "a bump inside a block left its certificate standing");
+    Require(LateOwnerSeesCountedSubscription(), "an owner registered after a subscription on block counters took the fast path past it");
+    for (const auto mutant : {CertificateMutant::HideBlockBumps, CertificateMutant::CertificateDropsBlocks}) {
+        SetCertificateMutantForTest(mutant);
+        const bool caught = BlockBumpVoids();
+        SetCertificateMutantForTest(CertificateMutant::None);
+        Require(!caught, "the block counter test does not catch a block counter mutant");
+    }
+}
+
 void CheckCountingOff() {
     const auto subscription = Subscribe(Base + 150 * Block, 1, WriteChangeAll, false);
     SetWriteIndexCountingForTest(false);
@@ -737,6 +781,7 @@ void CheckWriteIndex() {
     CheckDomainOrder();
     CheckOwners();
     CheckOwnerObservation();
+    CheckBlockCounters();
     CheckCountingOff();
 }
 }
