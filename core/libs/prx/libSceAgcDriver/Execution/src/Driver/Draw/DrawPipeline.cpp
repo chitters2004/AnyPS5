@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitEffects.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -9,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
@@ -734,6 +736,18 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         const auto workerNs = workerStarvedNs.exchange(0, std::memory_order_relaxed);
         AgcDriver::ProfilePrint_nid_no_patch("[committer-idle] (10 s): %llu waits for an item while the finisher held work (%.1f ms), %llu while it was idle (%.1f ms)\n", static_cast<unsigned long long>(preparerWaits), static_cast<double>(preparerNs) / 1e6, static_cast<unsigned long long>(workerWaits), static_cast<double>(workerNs) / 1e6);
     }
+    std::string breakText;
+    for (std::size_t i = 0; i < kindBreaks.size(); ++i) {
+        std::array<std::uint64_t, 2> now{kindBreaks[i][0].load(std::memory_order_relaxed), kindBreaks[i][1].load(std::memory_order_relaxed)};
+        const auto none = now[0] - reportedKindBreaks[i][0];
+        const auto declared = now[1] - reportedKindBreaks[i][1];
+        reportedKindBreaks[i] = now;
+        if (none + declared == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu (%llu with declared writes)", KindNames[i], static_cast<unsigned long long>(none + declared), static_cast<unsigned long long>(declared));
+        breakText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[commit-breaks] proof breaks after non-draw commits by kind (10 s):%s\n", breakText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()));
     std::string nullPixelText;
@@ -772,6 +786,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 
+std::uint64_t DrawPipeline::CommitBreaks(CommitKind kind, bool declaredWrites) const {
+    return kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].load(std::memory_order_relaxed);
+}
+
 void DrawPipeline::run() {
     NameDriverThread("draw-commit");
     PerformanceTrace::BindThread("draw committer");
@@ -782,6 +800,8 @@ void DrawPipeline::run() {
         const bool starved = pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
         const bool preparing = starved && DrawFinisher::Busy();
         const auto starvedAt = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto kind = CommitKind::Other;
+        bool declaredWrites = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -795,14 +815,24 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            kind = items.front().kind;
+            declaredWrites = !items.front().writes.empty();
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
         try {
-            if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::PipelineCommit);
+            const bool covered = !isDraw && CommitCovered(kind) && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoCoveredCommits);
+            {
+                const GuestMemory::CoveredCommitScope scope(covered);
+                if (commit != nullptr) (*commit)();
+            }
+            if (!isDraw) {
+                GuestMemory::BreakProofs(covered ? GuestMemory::ProofBreak::PipelineCommitCovered : GuestMemory::ProofBreak::PipelineCommit);
+                static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+                if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

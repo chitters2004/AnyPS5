@@ -48,6 +48,19 @@ WriteIndexOutcomes WriteIndexOutcomesCounted();
 enum class CertifiedMiss : std::size_t { Uncertified, Sweep, Subscription, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
 enum class CertifyRefusal : std::size_t { Unsubscribed, PerElementTextures, ComparedTextures, ComparedTables, DepthCopies, StorageImages, PendingMoved, DepthSurfacesMoved, Count };
 enum class UncertifiedCause : std::size_t { NeverProved, Refused, Voided, ProofFailed, NotCertifying, ViewsStale, Count };
+enum class GateMiss : std::uint8_t { DepthPlanes, Sweep, Version, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
+enum class EpochGateMiss : std::uint8_t { Epoch, Proof, Pending, Count };
+constexpr std::uint32_t GateMissBit(GateMiss gate) {
+    return std::uint32_t{1} << static_cast<unsigned>(gate);
+}
+constexpr std::uint32_t EpochGateMissBit(EpochGateMiss gate) {
+    return std::uint32_t{1} << static_cast<unsigned>(gate);
+}
+constexpr std::size_t GateMissSets = std::size_t{1} << static_cast<std::size_t>(GateMiss::Count);
+constexpr std::size_t EpochGateMissSets = std::size_t{1} << static_cast<std::size_t>(EpochGateMiss::Count);
+const char* GateMissName(GateMiss gate);
+const char* EpochGateMissName(EpochGateMiss gate);
+
 struct CertifiedProofOutcomes {
     std::uint64_t proved = 0;
     std::uint64_t swept = 0;
@@ -62,6 +75,10 @@ struct CertifiedProofOutcomes {
     std::uint64_t epochServed = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
     std::uint64_t proofMissUnattributed = 0;
+    std::array<std::uint64_t, GateMissSets> certifiedGateSets{};
+    std::array<std::uint64_t, EpochGateMissSets> epochGateSets{};
+    std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> pendingMissSources{};
+    std::uint64_t pendingMissUnattributed = 0;
 };
 CertifiedProofOutcomes CertifiedProofOutcomesCounted();
 bool CertifiedProofs();
@@ -888,6 +905,7 @@ private:
     CertifiedMiss uncertifiedMiss = CertifiedMiss::Count;
     bool epochServed = false;
     std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> certifiedBreaks{};
+    std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> certifiedPendingBumps{};
     void noteUncertified(UncertifiedCause cause, CertifyRefusal refusal = CertifyRefusal::Count, CertifiedMiss miss = CertifiedMiss::Count);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
