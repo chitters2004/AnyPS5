@@ -22,6 +22,9 @@
 #include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
+#define XXH_INLINE_ALL
+#include "common/xxhash.h"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -129,8 +132,7 @@ std::uint64_t fileBackedEnd(const HostMapping::Mapping& mapping) {
 #endif
 
 std::uint64_t contentHash(std::span<const std::byte> bytes) {
-    std::uint64_t hash = 0xcbf29ce484222325ull;
-    for (const auto value : bytes) hash = (hash ^ static_cast<std::uint64_t>(value)) * 0x100000001b3ull;
+    const auto hash = XXH64(bytes.data(), bytes.size(), 0);
     return hash == 0 ? 1 : hash;
 }
 
@@ -483,10 +485,13 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
         std::tie(accepted, completed) = driver.SerialProgress();
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> blocks;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unattributed;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spanUnattributed;
     for (auto& span : spans) {
-        if (const auto since = GuestMemory::CollectWrittenBlocks(span.address, static_cast<std::size_t>(span.bytes), span.since, written); since != 0) span.since = since;
+        if (const auto since = GuestMemory::CollectWrittenBlocks(span.address, static_cast<std::size_t>(span.bytes), span.since, written, &spanUnattributed); since != 0) span.since = since;
         blocks.insert(blocks.end(), written.begin(), written.end());
+        unattributed.insert(unattributed.end(), spanUnattributed.begin(), spanUnattributed.end());
         for (std::uint64_t offset = 0; offset < span.bytes;) {
             const auto at = span.address + offset;
             const auto bytes = static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, span.bytes - offset));
@@ -504,10 +509,10 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     bool any = false;
     std::vector<std::byte> bytes;
     std::vector<std::pair<std::size_t, std::size_t>> runs;
-    const auto writeTitleWords = [&](std::uint64_t address, bool zero = false) {
-        keepTitleWords(address, bytes, runs, zero);
+    const auto writeTitleWords = [&](std::uint64_t address, std::span<const std::byte> data, bool zero = false) {
+        keepTitleWords(address, data, runs, zero);
         for (const auto& [offset, length] : runs) {
-            writer->WriteDelta(group, completed, address + offset, std::span<const std::byte>(bytes).subspan(offset, length));
+            writer->WriteDelta(group, completed, address + offset, data.subspan(offset, length));
             deltaBytes += length;
             any = true;
         }
@@ -534,7 +539,8 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, range.bytes - at)));
             readGuest(range.address + at, bytes);
             const bool zero = std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
-            writeTitleWords(range.address + at, zero && !collected);
+            writeTitleWords(range.address + at, bytes, zero && !collected);
+            forgetBlocks(range.address + at, range.address + at + bytes.size());
             at += bytes.size();
         }
     }
@@ -545,6 +551,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
         const auto hash = contentHash(bytes);
         if (const auto found = hostPageHashes.find(page); found != hostPageHashes.end() && found->second == hash) continue;
         forget(page, page + HostPageBytes);
+        forgetBlocks(page, page + HostPageBytes);
         hostPageHashes[page] = hash;
         writer->WriteDelta(group, completed, page, bytes);
         deltaBytes += bytes.size();
@@ -563,7 +570,32 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
         } else {
             forget(begin, end);
         }
-        writeTitleWords(begin);
+        std::size_t pending = bytes.size();
+        const auto flush = [&](std::size_t upTo) {
+            if (pending < upTo) writeTitleWords(begin + pending, std::span<const std::byte>(bytes).subspan(pending, upTo - pending));
+            pending = bytes.size();
+        };
+        for (std::size_t offset = 0; offset < bytes.size();) {
+            const auto at = begin + offset;
+            const auto length = std::min<std::size_t>(bytes.size() - offset, FrameCaptureWriter::BlockBytes - at % FrameCaptureWriter::BlockBytes);
+            bool same = false;
+            if (length == FrameCaptureWriter::BlockBytes) {
+                const auto hash = contentHash(std::span<const std::byte>(bytes).subspan(offset, length));
+                const auto [known, inserted] = recordedBlocks.try_emplace(at, hash);
+                same = !inserted && known->second == hash && std::ranges::any_of(unattributed, [&](const auto& span) { return span.first <= at && at + length <= span.second; });
+                known->second = hash;
+            } else {
+                recordedBlocks.erase(at & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1});
+            }
+            if (same) {
+                flush(offset);
+                elidedBytes += length;
+            } else if (pending == bytes.size()) {
+                pending = offset;
+            }
+            offset += length;
+        }
+        flush(bytes.size());
     }
     if (!any) return;
     deltaGroups = group;
@@ -674,7 +706,15 @@ void FrameRecorder::snapshot(const Range& range) {
         bytes.resize(static_cast<std::size_t>(std::min<std::uint64_t>(SnapshotPieceBytes, range.bytes - at)));
         readGuest(range.address + at, bytes);
         snapshotBytes += writer->WriteSnapshot(range.address + at, bytes);
+        if (range.kind != FrameRangeKind::Watched && range.kind != FrameRangeKind::Unwatched) continue;
+        for (std::size_t offset = 0; (range.address + at + offset) % FrameCaptureWriter::BlockBytes == 0 && offset + FrameCaptureWriter::BlockBytes <= bytes.size(); offset += FrameCaptureWriter::BlockBytes) {
+            recordedBlocks[range.address + at + offset] = contentHash(std::span<const std::byte>(bytes).subspan(offset, FrameCaptureWriter::BlockBytes));
+        }
     }
+}
+
+void FrameRecorder::forgetBlocks(std::uint64_t begin, std::uint64_t end) {
+    for (auto block = begin & ~std::uint64_t{FrameCaptureWriter::BlockBytes - 1}; block < end; block += FrameCaptureWriter::BlockBytes) recordedBlocks.erase(block);
 }
 
 void FrameRecorder::readGuest(std::uint64_t address, std::span<std::byte> bytes) {
@@ -782,9 +822,9 @@ void FrameRecorder::finish() {
     writer->WriteCall(end);
     writeReferenceFrames();
     writer->Finish(header());
-    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
+    std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored, %.1f MiB unchanged and left out, in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
-                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
+                 static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), static_cast<double>(elidedBytes) / (1024.0 * 1024.0), directory.string().c_str());
     writer.reset();
     endGpuStores();
     state = State::Done;

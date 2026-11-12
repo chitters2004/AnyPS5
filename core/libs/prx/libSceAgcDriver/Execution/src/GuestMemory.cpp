@@ -2082,8 +2082,9 @@ std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
 }
 
-std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::vector<std::pair<std::uint64_t, std::uint64_t>>* unattributed) {
     written.clear();
+    if (unattributed != nullptr) unattributed->clear();
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
@@ -2139,6 +2140,10 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
         }
         if (cpu && !any) {
             append(begin, stop);
+            if (unattributed != nullptr) {
+                if (!unattributed->empty() && unattributed->back().second == begin) unattributed->back().second = stop;
+                else unattributed->emplace_back(begin, stop);
+            }
             continue;
         }
         for (std::size_t page = 0; page < WritePagesPerBlock; ++page) {

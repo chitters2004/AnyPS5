@@ -19,6 +19,7 @@
 #include <set>
 #include <span>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace AgcDriver {
@@ -104,6 +105,7 @@ private:
     std::vector<Range> committedRanges();
     std::vector<Range> newRanges();
     std::uint64_t blockSince(std::uint64_t block) const;
+    void forgetBlocks(std::uint64_t begin, std::uint64_t end);
 
     std::filesystem::path directory;
     std::filesystem::path trigger;
@@ -118,6 +120,7 @@ private:
     std::vector<Range> ranges;
     std::map<std::uint64_t, std::uint64_t> shaderMarks;
     std::map<std::uint64_t, std::uint64_t> hostPageHashes;
+    std::unordered_map<std::uint64_t, std::uint64_t> recordedBlocks;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uint64_t, std::uint64_t>> unwatchedHashes;
     inline static std::atomic<bool> notingGpuStores{false};
     std::mutex gpuStoresMutex;
@@ -134,6 +137,7 @@ private:
     std::uint64_t startGeneration = 0;
     std::uint64_t deltaGroups = 0;
     std::uint64_t deltaBytes = 0;
+    std::uint64_t elidedBytes = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t recordedCalls = 0;
     std::uint64_t startAttempts = 0;
