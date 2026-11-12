@@ -1086,6 +1086,39 @@ void AnotherEncodersTableDefersIntoTheOpenWindow() {
     Compare({{commands, {"draw 1 1 0 0", "draw 2 1 0 0", "draw 3 1 0 0", "draw 4 1 0 0"}}}, "a call through another encoder's table inside an open window");
 }
 
+void QueueAccessLocksTheQueuesItCovers() {
+    AgcDriver::Mutex main;
+    std::mutex sparse;
+    std::mutex settle;
+    std::mutex present;
+    AgcDriver::Graphics::Context context{};
+    context.mainQueueMutex = &main;
+    context.sparseQueueMutex = &sparse;
+    context.settleQueueMutex = &settle;
+    context.presentQueueMutex = &present;
+    const auto held = [&](auto& mutex) {
+        std::atomic<bool> locked{false};
+        std::thread probe([&] {
+            if (mutex.try_lock()) {
+                mutex.unlock();
+                return;
+            }
+            locked.store(true);
+        });
+        probe.join();
+        return locked.load();
+    };
+    {
+        const AgcDriver::Graphics::QueueAccess access(context);
+        Require(held(main) && !held(sparse) && !held(settle) && !held(present), "main queue access did not hold exactly the main queue");
+    }
+    {
+        const AgcDriver::Graphics::QueueAccess access(context, AgcDriver::Graphics::QueueAccess::Queues::All);
+        Require(held(main) && held(sparse) && held(settle) && held(present), "access to every queue left a queue unlocked");
+    }
+    Require(!held(main) && !held(sparse) && !held(settle) && !held(present), "queue access kept a queue locked after it ended");
+}
+
 void RunSuite() {
     for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
     OtherThreadsRecordDirectlyWhileAWindowIsOpen();
@@ -1128,6 +1161,7 @@ int main(int argc, char** argv) {
 #else
         setenv("APS5_HANDOFF_SPIN_US", "150", 1);
 #endif
+        QueueAccessLocksTheQueuesItCovers();
         for (const bool chunks : {false, true}) {
             AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::EncoderPostChunks, chunks);
             RunSuite();
