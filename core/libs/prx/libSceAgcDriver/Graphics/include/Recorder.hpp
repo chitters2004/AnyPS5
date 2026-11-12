@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Admission.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SerialFrontiers.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
@@ -323,6 +324,11 @@ public:
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
     void OnComplete(std::function<void()> action);
     void OnDiscard(std::function<void()> action);
+    Admission::Ticket Admit(std::uint64_t bytes);
+    void Charge(const Admission::Ticket& ticket);
+    void EndItem();
+    std::uint64_t AdmittedBytes() const { return admission.Outstanding(); }
+    std::uint64_t AdmissionBudget() const { return admission.Budget(); }
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -908,6 +914,8 @@ private:
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::function<void()>> discards;
+        std::uint64_t admittedBytes = 0;
+        bool alone = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
@@ -1337,6 +1345,7 @@ private:
     mutable std::shared_ptr<const WriteRanges> published;
     std::uint64_t submissions = 0;
     SerialFrontiers frontiers;
+    Admission admission{2 * KeptBytesBudget};
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
