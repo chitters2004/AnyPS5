@@ -858,6 +858,17 @@ std::uint64_t Refused(TicketRefusal refusal) {
     return WriteTicketsCounted().refused[static_cast<std::size_t>(refusal)];
 }
 
+std::string TicketCounts() {
+    const auto stats = WriteTicketsCounted();
+    std::string text = " (held " + std::to_string(stats.held);
+    for (std::size_t refusal = 0; refusal < stats.refused.size(); ++refusal) text += std::string(", ") + TicketRefusalName(static_cast<TicketRefusal>(refusal)) + " " + std::to_string(stats.refused[refusal]);
+    return text + ")";
+}
+
+void CollectTicketSpan() {
+    Require(CollectWritesUncached(Base, static_cast<std::size_t>(96 * Block)) != 0, "the ticket span could not be collected");
+}
+
 void CheckTicketProducer(const char* name, WriteBumpSource source, std::uint64_t address, const std::function<void()>& producer) {
     Require(!HeldAfter(address, producer), std::string("a ticket held over a ") + name + " write");
     DropTicketStampsForTest(source);
@@ -888,8 +899,9 @@ bool HeldDuringStamp(std::uint64_t address) {
 void CheckWriteTickets() {
     const auto at = Base + 70 * Block;
     const std::array<TicketRange, 1> range{{{at, at + Page}}};
+    CollectTicketSpan();
     Require(!UnchangedSince(range, WriteTicket{}), "an empty ticket held");
-    Require(HeldAfter(at, [] {}), "a ticket over an untouched range did not hold");
+    Require(HeldAfter(at, [] {}), "a ticket over an untouched range did not hold" + TicketCounts());
     Require(HeldAfter(at, [&] { ForceWriteBumpForTest(at + 4 * Block, Page, WriteBumpSource::Pending); }), "a bump of a disjoint block refused the ticket");
     CheckTicketProducer("guest CPU (uncollected)", WriteBumpSource::Cpu, at, [&] { Store(at); });
     SetCertificateMutantForTest(CertificateMutant::SkipTicketCollect);
@@ -933,6 +945,7 @@ void BenchWriteTickets() {
     double checkBest = std::numeric_limits<double>::max();
     std::uint64_t sink = 0;
     bool held = true;
+    CollectTicketSpan();
     for (int round = 0; round < 3; ++round) {
         auto start = std::chrono::steady_clock::now();
         for (int call = 0; call < Calls; ++call) sink += ObserveTicket().sequence;
@@ -945,7 +958,7 @@ void BenchWriteTickets() {
         }
         checkBest = std::min(checkBest, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
     }
-    Require(held && sink != 0, "bench: the untouched ranges did not hold");
+    Require(held && sink != 0, "bench: the untouched ranges did not hold" + TicketCounts());
     std::cout << "bench ObserveTicket, best of 3 x 20000: " << observeBest << " ns per call (wall clock)\n";
     std::cout << "bench UnchangedSince over 16 held 2 KiB ranges, a collect epoch every 32 calls, best of 3 x 20000: " << checkBest << " ns per call (wall clock)\n";
     for (const bool stamped : {false, true}) {
