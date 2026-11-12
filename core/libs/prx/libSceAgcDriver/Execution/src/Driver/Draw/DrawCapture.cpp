@@ -93,7 +93,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw;
         }
     }();
-    if (pending != nullptr) pending->prepared = std::move(matchedHint);
+    if (pending != nullptr) pending->prepared = {};
     if (steps) NoteCaptureStep(CaptureStep::Invocation, stepSince(invocationStarted));
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
