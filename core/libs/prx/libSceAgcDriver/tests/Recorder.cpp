@@ -1890,7 +1890,13 @@ void latchedWaitTests(const Device& device) {
         }
         Require(bounded == "injected device loss", "a bounded wait after the latch did not get the latched error ('" + bounded + "')");
         gpu.lock();
-        recorder.Sync();
+        std::string synced;
+        try {
+            recorder.Sync();
+        } catch (const std::exception& error) {
+            synced = error.what();
+        }
+        Require(synced == "injected device loss" && recorder.Idle(), "a batch was finished as completed after the latch ('" + synced + "')");
     }
     {
         auto recorder = std::make_unique<Recorder>(context, true);
@@ -1927,6 +1933,9 @@ void suffixCancellationTests(const Device& device) {
     auto writers = std::make_shared<std::vector<std::shared_ptr<ShaderResources>>>();
     std::vector<std::shared_ptr<ShaderResources>> listed;
     std::thread releaser;
+    std::array<std::uint32_t, 4> labelled{};
+    const auto labelAddress = reinterpret_cast<std::uint64_t>(labelled.data());
+    const std::array<std::byte, 4> labelValue{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
     {
         Recorder recorder(context, true);
         std::unique_lock gpu(GpuMutex());
@@ -1941,6 +1950,8 @@ void suffixCancellationTests(const Device& device) {
                 if (index == 2) discardedAfterRelease = released.load(std::memory_order_acquire);
             });
             serials.push_back(recorder.Frontiers().Newest());
+            if (index == 1) recorder.NoteLabel(labelAddress, labelValue, 1, 0);
+            if (index == 2) recorder.NotePendingWrite(labelAddress + 8, 8);
             if (index == 2) recorder.HoldNextSubmit(hold, 1);
             if (index + 1 < Batches) recorder.Submit();
         }
@@ -1969,6 +1980,7 @@ void suffixCancellationTests(const Device& device) {
         Require(discardedAfterRelease, "a cancelled batch was released while the GPU could still run it");
         for (int index = 0; index + 1 < Batches; ++index) Require(completed[index] == 0 && discarded[index] == 1, "a cancelled batch ran a completion or did not run its discard actions exactly once");
         Require(writers->size() == 1 && writers->front() == listed[3], "a cancelled batch's copied writer stayed listed");
+        Require(!recorder.PendingLabelIn(labelAddress, 4) && !recorder.PendingWriteOverlaps(labelAddress + 8, 8), "a cancelled batch's label or pending write could still be published to a host access");
         try {
             static_cast<void>(recorder.Commands());
         } catch (const std::exception& error) {
@@ -1988,6 +2000,41 @@ void suffixCancellationTests(const Device& device) {
     releaser.join();
     context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, hold, nullptr);
     std::cout << "Suffix cancellation tests passed\n";
+}
+
+void latchedCompletionTests(const Device& device) {
+    using AgcDriver::Graphics::BatchState;
+    const auto& context = device.GetContext();
+    const auto caught = [](const std::function<void()>& step) -> std::string {
+        try {
+            step();
+            return {};
+        } catch (const std::exception& error) {
+            return error.what();
+        }
+    };
+    Recorder recorder(context, true);
+    std::unique_lock gpu(GpuMutex());
+    recorder.CountSamples();
+    int completed = 0;
+    int discarded = 0;
+    RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    recorder.OnComplete([&] { ++completed; });
+    recorder.OnDiscard([&] { ++discarded; });
+    recorder.Submit();
+    const auto serial = recorder.Submissions();
+    recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+    const auto finished = caught([&] { recorder.FinishUpTo(serial); });
+    Require(finished == "injected device loss", "a batch whose fence reported success after the latch was finished as completed ('" + finished + "')");
+    Require(completed == 0 && discarded == 1 && recorder.Frontiers().State(serial) == BatchState::Failed, "a completion ran after the latch, or the batch was not discarded as failed");
+    const auto samples = caught([&] { static_cast<void>(recorder.SamplesTotal()); });
+    Require(samples == "injected device loss", "a latched recorder read query results ('" + samples + "')");
+    auto* previous = Recorder::Active();
+    recorder.Activate();
+    const auto refused = caught([] { Recorder::RefuseWhenPoisoned(); });
+    if (previous != nullptr) previous->Activate();
+    Require(refused == "injected device loss", "a host write-back was not refused by the latched active recorder ('" + refused + "')");
+    std::cout << "Latched completion tests passed\n";
 }
 
 void serialFrontierTests(const Device& device, Recorder& recorder) {
@@ -6669,6 +6716,20 @@ bool unitShadowTests(const Device& device, Recorder& recorder) {
         Require(!sources[0].shadow && sources[0].begin == 2 * unit && sources[0].end == 3 * unit && sources[0].buffer == import->buffer && sources[0].offset == 2 * unit, "the import piece before the fresh unit is wrong");
         Require(sources[1].shadow && sources[1].begin == 3 * unit && sources[1].end == 4 * unit && sources[1].buffer == half->buffer && sources[1].offset == half->offset && sources[1].slab == half->slab, "the fresh unit's piece does not read the slab");
         Require(!sources[2].shadow && sources[2].begin == 4 * unit && sources[2].end == 5 * unit, "the import piece after the fresh unit is wrong");
+    }
+    {
+        Recorder poisoned(context, true);
+        poisoned.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+        auto* previous = Recorder::Active();
+        poisoned.Activate();
+        std::string refused;
+        try {
+            static_cast<void>(PublishShadow(unit3, unit, PublishScope::Whole, PublishReason::Hook));
+        } catch (const std::exception& error) {
+            refused = error.what();
+        }
+        if (previous != nullptr) previous->Activate();
+        Require(refused == "injected device loss" && AnyShadowedOverlaps(unit3, unit), "a shadow unit was published, or dropped, under a latched recorder ('" + refused + "')");
     }
     // A whole publish: the untouched half keeps the seed (the import's bytes), the other the
     // retile's; the copy stamps nothing, and a second publish copies nothing.
@@ -18049,6 +18110,7 @@ int main(int argc, char** argv) {
         gpu.unlock();
         latchedWaitTests(device);
         suffixCancellationTests(device);
+        latchedCompletionTests(device);
         gpu.lock();
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);
