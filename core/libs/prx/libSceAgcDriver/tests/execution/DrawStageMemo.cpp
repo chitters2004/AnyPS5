@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -773,6 +776,127 @@ int CensusCaptures() {
     return 0;
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 10> SampleLayerPixelCode{
+    0x7e0402f0u, 0x7e0602ffu, 0x49742400u, 0xf09c0f20u, 0x00820602u, 0xbf8c3f70u, 0xf800180fu, 0x09080706u, 0xbf810000u, 0xbf810000u,
+};
+alignas(8) Header SampleLayerPixelHeader{};
+constexpr std::uint32_t SampledWidth = 8;
+constexpr std::size_t SampledAlignment = 65536;
+std::array<std::uint8_t, (1u << 20u) + SampledAlignment> SampledStorage{};
+std::uint8_t* const SampledTexels = reinterpret_cast<std::uint8_t*>((reinterpret_cast<std::uintptr_t>(SampledStorage.data()) + SampledAlignment - 1u) & ~(SampledAlignment - 1u));
+
+std::array<std::uint32_t, 8> SampledArrayDescriptor(std::uint32_t layers) {
+    const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(SampledTexels));
+    return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (56u << 20u) | (((SampledWidth - 1u) & 3u) << 30u), (SampledWidth - 1u) >> 2u, 0xfacu | (12u << 28u), (layers - 1u) | (1u << 16u), 0u, 0u, 0u};
+}
+
+std::uint8_t SampledGreen(std::uint32_t layer) {
+    return (layer & 1u) != 0u ? 255u : 0u;
+}
+
+std::array<std::uint8_t, 4> DrawSampledLayer(Scene& scene, const std::array<std::uint32_t, 8>& texture) {
+    std::memset(scene.target.Bytes(0), 0, ColorBytes);
+    const auto color = scene.target.At(0);
+    const auto vertex = reinterpret_cast<std::uintptr_t>(VertexCode.data());
+    const auto pixel = reinterpret_cast<std::uintptr_t>(SampleLayerPixelCode.data());
+    const auto tableAddress = scene.tables.At(TableOffset);
+    const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
+        {0x2d5, 0x2000},
+        {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
+        {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa},
+        {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240},
+        {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
+        {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
+        {0x3b8, 0x9000000u | (RenderTargetTileMode << 14u)}, {0x1e0, 0},
+        {0xc, 0}, {0xd, 0x40040},
+        {0x81, 0x80000000}, {0x82, 0x40040},
+        {0x90, 0x80000000}, {0x91, 0x40040},
+        {0x94, 0x80000000}, {0x95, 0x40040},
+        {0x318, static_cast<std::uint32_t>(color >> 8u)}, {0x390, static_cast<std::uint32_t>(color >> 40u)},
+        {0x10f, std::bit_cast<std::uint32_t>(32.0f)}, {0x110, std::bit_cast<std::uint32_t>(32.0f)},
+        {0x111, std::bit_cast<std::uint32_t>(-2.0f)}, {0x112, std::bit_cast<std::uint32_t>(2.0f)},
+        {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0},
+        {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)},
+        {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
+    };
+    std::vector<std::uint32_t> commands;
+    Append(commands, 0x79, {0x242, 4});
+    for (const auto& [offset, value] : context) Append(commands, 0x69, {offset, value});
+    for (const auto& [offset, value] : std::initializer_list<std::pair<std::uint32_t, std::uint32_t>>{{0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, 2u << 1u}, {0x8c, static_cast<std::uint32_t>(tableAddress)}, {0x8d, static_cast<std::uint32_t>(tableAddress >> 32u)}}) Append(commands, 0x76, {offset, value});
+    Append(commands, 0x76, {0x008, static_cast<std::uint32_t>(pixel >> 8u), static_cast<std::uint32_t>(pixel >> 40u)});
+    Append(commands, 0x76, {0x00b, 20u << 1u});
+    std::array<std::uint32_t, 20> user{};
+    std::copy(texture.begin(), texture.end(), user.begin() + 8);
+    user[16] = 2u | (2u << 3u) | (2u << 6u);
+    for (std::uint32_t word = 0; word < user.size(); ++word) Append(commands, 0x76, {0x00cu + word, user[word]});
+    Append(commands, 0x2d, {3, 2});
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "registered views: the draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriver::GuestMemory::FlushGpuWrites(static_cast<std::uintptr_t>(scene.target.At(0)), ColorBytes);
+    std::array<std::uint8_t, 4> brightest{};
+    for (std::size_t at = 0; at + 4 <= ColorBytes; at += 4) {
+        const auto* texel = reinterpret_cast<const std::uint8_t*>(scene.target.Bytes(at));
+        if (texel[3] != 0u) return {texel[0], texel[1], texel[2], texel[3]};
+    }
+    return brightest;
+}
+
+int RegisteredViewsFollowTheirRange() {
+    std::uint32_t limit = 0;
+    {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+        limit = device->graphicsContext().limits.maxImageArrayLayers;
+    }
+    const auto layers = limit + 2u;
+    if (layers - 1u > 0x1fffu) {
+        std::puts("registered views: skipped, the device layer limit leaves no 13-bit last-array headroom");
+        return VulkanTestSkipped;
+    }
+    const auto texture = SampledArrayDescriptor(layers);
+    const auto geometry = AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(texture));
+    if (geometry.layerBytes == 0u || geometry.guestBytes > SampledStorage.size() - SampledAlignment) {
+        std::puts("registered views: skipped, the sampled array does not fit its backing");
+        return VulkanTestSkipped;
+    }
+    const auto& mip = geometry.mips.at(0);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        for (std::uint32_t x = 0; x < SampledWidth; ++x) {
+            const std::array<std::uint8_t, 4> texel{static_cast<std::uint8_t>(x * 30u), SampledGreen(layer), static_cast<std::uint8_t>(layer), 0xffu};
+            std::copy(texel.begin(), texel.end(), SampledTexels + geometry.GuestLayerOffset(layer) + mip.tiledOffset + x * 4u);
+        }
+    }
+    Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Register(SampleLayerPixelHeader, SampleLayerPixelCode.data(), sizeof(SampleLayerPixelCode), 1);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const auto registerSlices = [&](std::uint64_t slices, bool replace) {
+        GuestAllocations::Mutation mutation;
+        if (replace) mutation.Remove(SampledTexels);
+        mutation.Add(SampledTexels, static_cast<std::size_t>(geometry.layerBytes * slices), true, false, true);
+    };
+    registerSlices(1u + limit, false);
+    const auto wide = DrawSampledLayer(scene, texture);
+    const auto wideRepeat = DrawSampledLayer(scene, texture);
+    std::printf("registered views: %u layers over a range of %u slices sampled at the clamped last layer: %u,%u,%u,%u, again %u,%u,%u,%u\n", layers, 1u + limit, wide[0], wide[1], wide[2], wide[3], wideRepeat[0], wideRepeat[1], wideRepeat[2], wideRepeat[3]);
+    Expect(wide[3] == 255u && wide[1] == SampledGreen(limit) && wideRepeat == wide, "a draw sampling past the registered range did not clamp to the range's last complete layer");
+    registerSlices(limit, true);
+    const auto narrow = DrawSampledLayer(scene, texture);
+    std::printf("registered views: after the range shrank by one slice: %u,%u,%u,%u\n", narrow[0], narrow[1], narrow[2], narrow[3]);
+    Expect(narrow[3] == 255u && narrow[1] == SampledGreen(limit - 1u), "a draw repeated after its registered range shrank sampled the view resolved for the old range");
+    GuestAllocations::Mutation().Remove(SampledTexels);
+    AgcDriverShutdown_nid_postfix();
+    std::puts("registered views: a draw's view follows its registered range across cached draws");
+    return 0;
+}
+
 int BenchCapture() {
     {
         const auto device = OpenVulkanTestDevice();
@@ -809,6 +933,15 @@ int BenchCapture() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
     if (argc > 1 && std::string(argv[1]) == "--bench-capture") return BenchCapture();
+    if (argc > 1 && std::string(argv[1]) == "--registered-views") {
+        try {
+            return RegisteredViewsFollowTheirRange();
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
+            return 1;
+        }
+    }
     if (argc > 1 && std::string(argv[1]) == "--capture-census") {
         try {
             return CensusCaptures();
