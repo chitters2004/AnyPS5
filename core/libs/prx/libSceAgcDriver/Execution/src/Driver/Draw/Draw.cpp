@@ -773,7 +773,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.dumpTarget = dumpTarget;
     tail.dumpSlot1 = dumpSlot1;
     tail.packetOffset = packetOffset;
-    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    const bool handOff = pipelined && !drawParameters.indirect && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
     if (handOff) {
         tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         tail.submissionSerial = submission.serial;
@@ -782,20 +782,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         noteFinisherHandOff(true);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
+        const auto handed = drawn();
+        if (profile) {
+            phaseMs = {};
+            captures = 0;
+        }
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
+            if (job.profile) job.phaseLap = std::chrono::steady_clock::now();
+            const auto bookFinished = [&] {
+                if (!job.profile) return;
+                job.phaseMs[DrawRowEpilogue] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job.phaseLap).count();
+                addDrawPhases(job.phaseMs, false, job.captures, true);
+            };
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
             try {
-                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+                const auto verdict = finishDraw(job, finishTiming);
+                bookFinished();
+                if (verdict == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
             } catch (const std::exception& error) {
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
             }
         }, std::move(held));
         timing.Mark("draw_handed_off");
-        return drawn();
+        return handed;
     }
     noteFinisherHandOff(false);
     if (DrawFinisher::Busy()) {
@@ -875,7 +888,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     const QueueState& queue = tail.queue != nullptr ? *tail.queue : noQueue;
     const auto drawn = [&] {
         phaseTiming.Phase(DrawRowVectors);
-        if (!profile) return DrawVerdict::Drawn;
+        if (!profile || tail.queue == nullptr) return DrawVerdict::Drawn;
         auto& pending = pendingDrawPhases();
         pending.phases = true;
         pending.captures = captures;
