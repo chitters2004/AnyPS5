@@ -1,6 +1,7 @@
 #include "DepthFastClearHarness.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstdio>
@@ -82,7 +83,7 @@ struct Pass {
 
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
 
-std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const ShaderRecompiler::RecompileResult& pixel, const Pass& pass) {
+std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const ShaderRecompiler::RecompileResult& pixel, const Pass& pass, bool wait = true) {
     std::fill(Pixels.begin(), Pixels.end(), std::byte{0});
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &vertex.vertex, 0},
@@ -119,6 +120,7 @@ std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, 3u, 0, 1, 0, false};
     device.Draw(state, draw, shaders);
+    if (!wait) return 0;
     device.WaitIdle();
     std::uint32_t covered = 0;
     for (std::size_t index = 0; index < Pixels.size() / 4u; ++index) {
@@ -228,7 +230,22 @@ int main() {
         const auto colored = AgcDriver::Graphics::TakeInertFragmentCounts();
         Require(colored.omitted == 0u && colored.kept == 1u, "an inert draw with a writable color attachment dropped its fragment stage");
 
-        std::printf("inert fragment pipeline tests passed (fragment stage %s, occlusion samples %s)\n", kept ? "kept" : "omitted", samples.Available() ? "checked" : "not checked");
+        const bool timed = AgcDriver::Graphics::Recorder::GpuTimingEnabled();
+        if (timed) {
+            const auto before = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            for (int i = 0; i < 3; ++i) Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            for (int i = 0; i < 2; ++i) Draw(*device, full, plain, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f}, false);
+            Draw(*device, full, plain, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            const auto after = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(after.draws - before.draws == 7u, "the [gputime] draw ranges did not hold every draw of the mix");
+            Require(after.inert - before.inert == 4u, "the [gputime] draw ranges did not count the draws with an inert fragment program");
+            Require(after.omitted - before.omitted == (kept ? 0u : 4u), "the [gputime] draw ranges did not count the draws recorded without the fragment stage");
+            Require(after.inertRanges - before.inertRanges == 3u, "the [gputime] inert-only draw ranges were not the passes made of inert fragment draws alone");
+            Require(after.inertMs > before.inertMs, "the [gputime] inert-only draw ranges took no GPU time");
+        }
+
+        std::printf("inert fragment pipeline tests passed (fragment stage %s, occlusion samples %s, [gputime] draw fragment share %s)\n", kept ? "kept" : "omitted", samples.Available() ? "checked" : "not checked", timed ? "checked" : "not checked");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -186,6 +186,12 @@ class AbSplitTests(unittest.TestCase):
         self.assertEqual(row["classes"], {"staging-in": 8.0, "present-blit": 4.0})
         self.assertEqual(row["programs"], {"0x1000": 40.0, "0x2000": 5.0})
 
+    def test_inert_draw_share_is_read_as_a_class_of_its_own(self):
+        entry = (" draw x6 3.0ms 0.0MiB (per present x0.2 0.08ms 0.00MiB) draw-inert x4 1.5ms 0.0MiB "
+                 "(per present x0.1 0.04ms 0.00MiB; of x8 draws x5 inert fragment, x3 without the stage)")
+        row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0) + entry)
+        self.assertEqual(row["classes"], {"staging-in": 8.0, "present-blit": 4.0, "draw": 3.0, "draw-inert": 1.5})
+
     def test_draw_variants_are_not_summed_into_program_keys(self):
         row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0).replace("0x2000 x4 5ms", "0x2000 x4 5ms draw 0x3000 x3 30ms"))
         self.assertEqual(row["programs"], {"0x1000": 40.0, "0x2000": 5.0})

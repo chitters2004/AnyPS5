@@ -574,6 +574,17 @@ public:
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
+    enum class DrawFragment : std::uint8_t { Run = 0, InertKept, InertOmitted, Count };
+    void NoteTimedDraw(std::uint32_t index, DrawFragment fragment);
+    std::uint32_t OpenPassTiming() const;
+    struct DrawFragmentTotals {
+        std::uint64_t draws = 0;
+        std::uint64_t inert = 0;
+        std::uint64_t omitted = 0;
+        std::uint64_t inertRanges = 0;
+        double inertMs = 0;
+    };
+    static DrawFragmentTotals DrawFragmentTimes();
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
@@ -671,6 +682,7 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        std::vector<std::array<std::uint32_t, static_cast<std::size_t>(DrawFragment::Count)>> timedDraws;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
