@@ -638,7 +638,7 @@ struct Replay {
             }
             std::uint64_t live = 0;
             for (std::size_t at = 0; at < bytes.size(); ++at) live += target[at] == bytes[at];
-            std::fprintf(stderr, "[delta-diag] apply group %llu addr 0x%llx bytes %llu equal-to-live %llu again %d\n", static_cast<unsigned long long>(group), static_cast<unsigned long long>(chunk->address), static_cast<unsigned long long>(chunk->bytes), static_cast<unsigned long long>(live), again ? 1 : 0);
+            std::fprintf(stderr, "[delta-diag] apply group %llu addr 0x%llx bytes %llu equal-to-live %llu again %d\n", static_cast<unsigned long long>(group), static_cast<unsigned long long>(chunk->address), static_cast<unsigned long long>(chunk->bytes), static_cast<unsigned long long>(live), again ? 1 : 0);
             std::memcpy(target, bytes.data(), bytes.size());
             deltaBytes += chunk->bytes;
         }
@@ -1256,7 +1256,7 @@ void diagnoseDeltas(const FrameCaptureReader& reader) {
             snapshotBytes += chunk.bytes;
         }
     }
-    std::fprintf(stderr, "[delta-diag] snapshots %zu chunks %.1f MiB\n", snapshots.size(), static_cast<double>(snapshotBytes) / 1048576.0);
+    std::fprintf(stderr, "[delta-diag] snapshots %zu chunks %.1f MiB\n", snapshots.size(), static_cast<double>(snapshotBytes) / 1048576.0);
     std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> perGroup;
     for (const auto& chunk : reader.Chunks()) {
         if (chunk.kind != FrameMemoryKind::Delta) continue;
@@ -1278,9 +1278,9 @@ void diagnoseDeltas(const FrameCaptureReader& reader) {
         auto& total = perGroup[chunk.group];
         total.first += chunk.bytes;
         total.second += same;
-        std::fprintf(stderr, "[delta-diag] group %llu completed %llu addr 0x%llx bytes %llu (%.2f MiB) snapshot-covered %llu equal-to-snapshot %llu (%.2f MiB) zero %llu\n", static_cast<unsigned long long>(chunk.group), static_cast<unsigned long long>(chunk.completed), static_cast<unsigned long long>(chunk.address), static_cast<unsigned long long>(chunk.bytes), static_cast<double>(chunk.bytes) / 1048576.0, static_cast<unsigned long long>(covered), static_cast<unsigned long long>(same), static_cast<double>(same) / 1048576.0, static_cast<unsigned long long>(zero));
+        std::fprintf(stderr, "[delta-diag] group %llu completed %llu addr 0x%llx bytes %llu (%.2f MiB) snapshot-covered %llu equal-to-snapshot %llu (%.2f MiB) zero %llu\n", static_cast<unsigned long long>(chunk.group), static_cast<unsigned long long>(chunk.completed), static_cast<unsigned long long>(chunk.address), static_cast<unsigned long long>(chunk.bytes), static_cast<double>(chunk.bytes) / 1048576.0, static_cast<unsigned long long>(covered), static_cast<unsigned long long>(same), static_cast<double>(same) / 1048576.0, static_cast<unsigned long long>(zero));
     }
-    for (const auto& [group, total] : perGroup) std::fprintf(stderr, "[delta-diag] group %llu total %.2f MiB equal-to-snapshot %.2f MiB\n", static_cast<unsigned long long>(group), static_cast<double>(total.first) / 1048576.0, static_cast<double>(total.second) / 1048576.0);
+    for (const auto& [group, total] : perGroup) std::fprintf(stderr, "[delta-diag] group %llu total %.2f MiB equal-to-snapshot %.2f MiB\n", static_cast<unsigned long long>(group), static_cast<double>(total.first) / 1048576.0, static_cast<double>(total.second) / 1048576.0);
 }
 
 int run(const Options& options) {
