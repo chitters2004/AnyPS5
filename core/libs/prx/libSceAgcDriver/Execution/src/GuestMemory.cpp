@@ -113,13 +113,14 @@ std::uintptr_t userAddressLimit() {
 
 }
 
-struct WriteSubscription {
-    mutable std::atomic<std::uint64_t> version{0};
+struct alignas(64) WriteSubscription {
+    std::atomic<std::uint64_t>* version = nullptr;
     std::atomic<std::uint64_t> head{1};
     std::atomic<std::uint32_t> generation{1};
     std::uint32_t slot = 0;
     std::atomic<std::uint32_t> typeMask{WriteChangeAll};
     std::atomic<bool> history{false};
+    std::vector<std::uint64_t> ownerDependencies;
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint64_t> keys;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
@@ -132,7 +133,6 @@ struct WriteSubscription {
     AgcDriver::Mutex historyMutex;
     std::vector<Bump> bumps;
     std::uint64_t overflowedAt = 0;
-    std::vector<std::uint64_t> ownerDependencies;
     std::vector<std::uint64_t> countedOwners;
 };
 
@@ -235,8 +235,21 @@ struct DirectoryEntry {
     std::atomic<Leaf*> leaf{nullptr};
 };
 
+struct SubscriptionCell {
+    std::atomic<std::uint64_t> version{0};
+    std::atomic<std::uint64_t> meta{0};
+};
+
+constexpr std::uint64_t CellMeta(std::uint64_t generation, std::uint32_t typeMask, bool history) {
+    return generation | (std::uint64_t{typeMask} << 24) | (std::uint64_t{history ? 1u : 0u} << 56);
+}
+
 struct Chunk {
+    std::array<SubscriptionCell, ChunkSlots> cells{};
     std::array<WriteSubscription, ChunkSlots> subscriptions;
+    Chunk() {
+        for (std::size_t i = 0; i < ChunkSlots; ++i) subscriptions[i].version = &cells[i].version;
+    }
 };
 
 std::array<std::atomic<Leaf*>, TopLeaves> radixTop{};
@@ -311,6 +324,11 @@ WriteSubscription& subscriptionOf(std::uint64_t handle) {
     return Index().chunks[slot / ChunkSlots].load(std::memory_order_acquire)->subscriptions[slot % ChunkSlots];
 }
 
+SubscriptionCell& cellOf(std::uint64_t handle) {
+    const auto slot = handle >> 24;
+    return Index().chunks[slot / ChunkSlots].load(std::memory_order_acquire)->cells[slot % ChunkSlots];
+}
+
 bool handleLive(std::uint64_t handle) {
     return subscriptionOf(handle).generation.load(std::memory_order_acquire) == (handle & GenerationMask);
 }
@@ -339,7 +357,7 @@ void forOwners(std::uint64_t key, KeySlot& slot, Visit&& visit) {
     }
 }
 
-std::uint64_t ownerSum(const std::vector<std::uint64_t>& dependencies, std::uint32_t typeMask, bool& live) {
+std::uint64_t ownerSum(std::span<const std::uint64_t> dependencies, std::uint32_t typeMask, bool& live) {
     std::uint64_t sum = 0;
     for (const auto owner : dependencies) {
         if (!ownerLive(owner)) {
@@ -400,20 +418,25 @@ bool brokenSource(WriteBumpSource source) {
 }
 
 void moveVersion(WriteSubscription& subscription) {
-    auto version = subscription.version.load(std::memory_order_relaxed);
-    while ((version & 1u) != 0 && !subscription.version.compare_exchange_weak(version, version + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+    auto version = subscription.version->load(std::memory_order_relaxed);
+    while ((version & 1u) != 0 && !subscription.version->compare_exchange_weak(version, version + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
 }
 
 enum class Bumped { Stale, Done, Overflowed };
 
 Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource source) {
+    auto& cell = cellOf(handle);
+    const auto meta = cell.meta.load(std::memory_order_acquire);
+    if ((meta & GenerationMask) != (handle & GenerationMask)) return Bumped::Stale;
+    if ((meta >> 56) == 0) {
+        if (((meta >> 24) & WriteChangeBit(WriteChangeOf(source))) != 0) {
+            auto version = cell.version.load(std::memory_order_relaxed);
+            while ((version & 1u) != 0 && !cell.version.compare_exchange_weak(version, version + 1, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+        }
+        return Bumped::Done;
+    }
     auto& subscription = subscriptionOf(handle);
     auto result = Bumped::Done;
-    if (!subscription.history.load(std::memory_order_relaxed)) {
-        if (subscription.generation.load(std::memory_order_acquire) != (handle & GenerationMask)) return Bumped::Stale;
-        if ((subscription.typeMask.load(std::memory_order_relaxed) & WriteChangeBit(WriteChangeOf(source))) != 0) moveVersion(subscription);
-        return result;
-    }
     std::lock_guard lock(subscription.historyMutex);
     if (subscription.generation.load(std::memory_order_relaxed) != (handle & GenerationMask)) return Bumped::Stale;
     const auto append = [&](std::uint64_t block) {
@@ -581,6 +604,7 @@ void releaseSubscription(WriteSubscription* subscription) {
         std::lock_guard history(subscription->historyMutex);
         const auto next = (subscription->generation.load(std::memory_order_relaxed) + 1) & GenerationMask;
         subscription->generation.store(static_cast<std::uint32_t>(next), std::memory_order_release);
+        cellOf(std::uint64_t{subscription->slot} << 24).meta.store(next, std::memory_order_release);
         std::vector<std::uint64_t>().swap(subscription->blocks);
         std::vector<std::uint64_t>().swap(subscription->keys);
         if (!subscription->backed.empty()) index.backedLive.fetch_sub(1, std::memory_order_acq_rel);
@@ -631,7 +655,7 @@ std::uint64_t WriteBlockOf(std::uint64_t address) {
 
 namespace {
 std::uint64_t observeVersion(const WriteSubscription& subscription) {
-    return subscription.version.fetch_or(1u, std::memory_order_acq_rel) | 1u;
+    return subscription.version->fetch_or(1u, std::memory_order_acq_rel) | 1u;
 }
 }
 
@@ -688,6 +712,10 @@ std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> readDoma
 WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask) {
     WriteCertificate certificate;
     certificate.version = observeVersion(subscription);
+    certificate.cell = subscription.version;
+    certificate.typeMask = subscription.typeMask.load(std::memory_order_relaxed);
+    certificate.ownerCount = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::CertificateDropsOwners ? 0u : static_cast<std::uint32_t>(subscription.ownerDependencies.size());
+    if (certificate.ownerCount <= CertificateInlineOwners) std::copy_n(subscription.ownerDependencies.begin(), certificate.ownerCount, certificate.ownerHandles.begin());
     if (!subscription.ownerDependencies.empty()) {
         bool live = true;
         certificate.owners = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
@@ -724,7 +752,7 @@ std::uint32_t CertificateMisses(const WriteSubscription& subscription, const Wri
     for (std::size_t i = 0; i < domains.size(); ++i) {
         if ((domainMask & (std::uint32_t{1} << i)) != 0 && domains[i] != certificate.domains[i]) missed |= std::uint32_t{1} << i;
     }
-    if (subscription.version.load(std::memory_order_acquire) != certificate.version) missed |= CertificateVersionMissed;
+    if (subscription.version->load(std::memory_order_acquire) != certificate.version) missed |= CertificateVersionMissed;
     if (!subscription.ownerDependencies.empty()) {
         bool live = true;
         const auto sum = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
@@ -747,12 +775,15 @@ bool CertificateHolds(const WriteSubscription& subscription, const WriteCertific
         if (observer != nullptr) observer(domain);
         if (DomainVersion(domain) != certificate.domains[i]) return false;
     }
-    if (!subscription.ownerDependencies.empty() && mutant != CertificateMutant::IgnoreOwners) {
+    const bool inlined = certificate.cell != nullptr && certificate.ownerCount <= CertificateInlineOwners;
+    const auto dependencies = inlined ? std::span<const std::uint64_t>(certificate.ownerHandles.data(), certificate.ownerCount) : std::span<const std::uint64_t>(subscription.ownerDependencies);
+    if (!dependencies.empty() && mutant != CertificateMutant::IgnoreOwners) {
         bool live = true;
-        const auto sum = ownerSum(subscription.ownerDependencies, subscription.typeMask.load(std::memory_order_relaxed), live);
+        const auto sum = ownerSum(dependencies, inlined ? certificate.typeMask : subscription.typeMask.load(std::memory_order_relaxed), live);
         if (!live || sum != certificate.owners) return false;
     }
-    return mutant == CertificateMutant::IgnoreVersion || subscription.version.load(std::memory_order_acquire) == certificate.version;
+    const auto& version = inlined ? *certificate.cell : *subscription.version;
+    return mutant == CertificateMutant::IgnoreVersion || version.load(std::memory_order_acquire) == certificate.version;
 }
 
 bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t generation, std::vector<std::uint64_t>& blocks, std::vector<std::uint64_t>& lookupBlocks) {
@@ -3065,7 +3096,7 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
             std::lock_guard history(subscription->historyMutex);
             subscription->typeMask.store(typeMask, std::memory_order_relaxed);
             subscription->history.store(keepHistory, std::memory_order_relaxed);
-            subscription->version.store(0, std::memory_order_relaxed);
+            subscription->version->store(0, std::memory_order_relaxed);
             subscription->head.store(1, std::memory_order_relaxed);
             subscription->blocks = std::move(blocks);
             subscription->keys = std::move(keys);
@@ -3075,6 +3106,7 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
             subscription->ownerDependencies = std::move(dependencies);
             subscription->countedOwners = std::move(counted);
             handle = (static_cast<std::uint64_t>(subscription->slot) << 24) | subscription->generation.load(std::memory_order_relaxed);
+            cellOf(handle).meta.store(CellMeta(handle & GenerationMask, typeMask, keepHistory), std::memory_order_release);
         }
         for (const auto key : subscription->keys) addHandle(key, handle);
         index.live.fetch_add(1, std::memory_order_acq_rel);

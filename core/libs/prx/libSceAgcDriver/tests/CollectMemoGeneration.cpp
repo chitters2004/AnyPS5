@@ -604,6 +604,21 @@ bool OwnerBumpVoids() {
     return voided;
 }
 
+bool ManyOwnersVoid() {
+    std::vector<WriteOwner> owners;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (std::uint64_t i = 0; i < CertificateInlineOwners + 1; ++i) {
+        const auto base = Base + (160 + 2 * i) * Block;
+        owners.emplace_back(base, Block);
+        ranges.emplace_back(base, base + 64);
+    }
+    const auto subscription = SubscribeWrites(ranges, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(certificate.ownerCount == CertificateInlineOwners + 1 && CertificateHolds(*subscription, certificate, 0), "a certificate over more owners than it holds inline did not hold with nothing changed");
+    Pending(ranges.back().first);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
 void CheckOwners() {
     const auto dependenciesBefore = WriteIndexCounted().ownerDependencies;
     const auto first = RegisterWriteOwner(Base + 100 * Block, 4 * Block);
@@ -648,7 +663,8 @@ void CheckOwners() {
     UnregisterWriteOwner(second);
     UnregisterWriteOwner(third);
     Require(OwnerBumpVoids(), "a bump inside an owner left its certificate standing");
-    for (const auto mutant : {CertificateMutant::IgnoreOwners, CertificateMutant::HideOwnerBumps}) {
+    Require(ManyOwnersVoid(), "a bump inside the fifth owner of a subscription left its certificate standing");
+    for (const auto mutant : {CertificateMutant::IgnoreOwners, CertificateMutant::HideOwnerBumps, CertificateMutant::CertificateDropsOwners}) {
         SetCertificateMutantForTest(mutant);
         const bool caught = OwnerBumpVoids();
         SetCertificateMutantForTest(CertificateMutant::None);

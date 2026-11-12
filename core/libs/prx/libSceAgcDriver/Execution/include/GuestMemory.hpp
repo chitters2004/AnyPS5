@@ -89,10 +89,15 @@ enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, CertifiedProof,
 constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
     return std::uint32_t{1} << static_cast<unsigned>(domain);
 }
+constexpr std::size_t CertificateInlineOwners = 4;
 struct WriteCertificate {
     std::uint64_t version = 0;
     std::uint64_t owners = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
+    const std::atomic<std::uint64_t>* cell = nullptr;
+    std::uint32_t typeMask = 0;
+    std::uint32_t ownerCount = 0;
+    std::array<std::uint64_t, CertificateInlineOwners> ownerHandles{};
 };
 bool WriteIndexEnabled();
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false, bool owned = true);
@@ -127,7 +132,7 @@ WriteCertificate CertifySubscription(const WriteSubscription& subscription, std:
 bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
 constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
 std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
-enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners };
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners };
 void SetCertificateMutantForTest(CertificateMutant mutant);
 void SetWriteIndexCountingForTest(bool counting);
 using DomainReadObserver = void (*)(WriteDomain domain);
