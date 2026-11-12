@@ -349,12 +349,14 @@ double ReportAllocations(const Shape& shape, std::size_t draws) {
     auto empty = shape.build(0);
     auto repeated = shape.build(draws);
     for (int warm = 0; warm < 3; ++warm) Submit(repeated);
+    const auto firstBase = Measure(empty);
+    const auto firstMany = Measure(repeated);
     const auto base = Measure(empty);
     const auto many = Measure(repeated);
     Require(many.count > 0 && base.count > 0, std::string("draw allocations [") + shape.name + "]: the probe observed no allocations");
     const auto perDraw = PerDraw(many.count, base.count, draws);
     std::printf("draw allocations [%s]: %zu draws: %llu allocations %llu bytes, without them: %llu allocations %llu bytes, busiest thread %llu allocations\n", shape.name, draws, static_cast<unsigned long long>(many.count), static_cast<unsigned long long>(many.bytes), static_cast<unsigned long long>(base.count), static_cast<unsigned long long>(base.bytes), static_cast<unsigned long long>(many.busiestCount));
-    std::printf("draw allocations [%s] per draw: %.3f (%.1f bytes)\n", shape.name, perDraw, PerDraw(many.bytes, base.bytes, draws));
+    std::printf("draw allocations [%s] per draw: %.3f (%.1f bytes), first measured window %.3f (%.1f bytes)\n", shape.name, perDraw, PerDraw(many.bytes, base.bytes, draws), PerDraw(firstMany.count, firstBase.count, draws), PerDraw(firstMany.bytes, firstBase.bytes, draws));
     auto ordered = many.sites;
     std::sort(ordered.begin(), ordered.end(), [](const SiteCount& left, const SiteCount& right) { return left.count > right.count; });
     for (const auto& site : ordered) {
