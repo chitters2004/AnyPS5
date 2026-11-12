@@ -3712,6 +3712,7 @@ TargetMemo& ThreadTargetMemo() {
     return HostThreadLocal<TargetMemo, TargetMemoStorage>();
 }
 thread_local std::uint64_t targetMemoBuilds = 0;
+thread_local std::uint64_t targetMissDraws = 0;
 std::atomic<const TargetMemo*> targetMemoOwner{nullptr};
 
 bool ownsTargetMemo(TargetMemo& memo) {
@@ -3821,6 +3822,7 @@ struct ResolvedTargets {
     TargetProof proof{};
     bool repeatedColors = false;
     bool repeatedDepth = false;
+    bool targetMiss = false;
     bool planRecordable = false;
 };
 
@@ -4041,6 +4043,8 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
     resolved.proof = preparedProof;
     resolved.repeatedColors = repeatedColors;
     resolved.repeatedDepth = repeatedDepth;
+    resolved.targetMiss = (!state.colors.empty() && !repeatedColors) || (state.depth && !repeatedDepth);
+    if (resolved.targetMiss) ++targetMissDraws;
     if (repeatedColors && (!state.depth || repeatedDepth)) return TargetResolution::Repeated;
     const bool copies = std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.resident == nullptr && !binding.multisampled; });
     return copies ? TargetResolution::ResolvedWithCopies : TargetResolution::Resolved;
@@ -5358,6 +5362,10 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop) {
 
 std::uint64_t TargetMemoBuildsForTest() {
     return targetMemoBuilds;
+}
+
+std::uint64_t TargetMissDrawsForTest() {
+    return targetMissDraws;
 }
 
 std::uint64_t AddressDrawReuseVerifications() {
