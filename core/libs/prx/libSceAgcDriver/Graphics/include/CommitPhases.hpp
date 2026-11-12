@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_COMMITPHASES_HPP
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -253,24 +254,75 @@ struct CommitPhaseTotals {
     std::array<std::uint64_t, static_cast<std::size_t>(ShadowReason::Count)> shadowAny{};
 };
 
-bool CommitPhasesEnabled();
-const char* CommitPhaseName(CommitPhase phase);
-const char* CommitPhaseGroup(CommitPhase phase);
+extern std::atomic<int> CommitPhasesState;
+bool ResolveCommitPhases();
+
+inline bool CommitPhasesEnabled() noexcept {
+    const auto state = CommitPhasesState.load(std::memory_order_relaxed);
+    return state != 0 ? state == 2 : ResolveCommitPhases();
+}
+
+namespace Active {
 void BeginCommitPhase(CommitPhase phase);
 void NoteCommitKey(std::size_t words);
 void NoteCommitKeyMemo(bool hit);
 void NoteCommitDrawKind(CommitDrawKind kind);
-void CountCommit(CommitCounter counter, std::uint64_t amount = 1);
-void NoteEpochCauses(unsigned causes);
-void NoteEpochFollow(bool backward, unsigned causes);
-void NoteEpochFollowSkipped();
-unsigned EpochCauses();
-CommitCounter EpochCauseCounter(unsigned causes);
+void CountCommit(CommitCounter counter, std::uint64_t amount);
 CommitPhase CurrentCommitPhase();
 void RelabelCommitPhase(CommitPhase phase);
 void NoteShadowReason(ShadowReason reason);
 void NoteShadowRecording();
 void NoteShadowCommands();
+}
+
+const char* CommitPhaseName(CommitPhase phase);
+const char* CommitPhaseGroup(CommitPhase phase);
+
+inline void BeginCommitPhase(CommitPhase phase) {
+    if (CommitPhasesEnabled()) Active::BeginCommitPhase(phase);
+}
+
+inline void NoteCommitKey(std::size_t words) {
+    if (CommitPhasesEnabled()) Active::NoteCommitKey(words);
+}
+
+inline void NoteCommitKeyMemo(bool hit) {
+    if (CommitPhasesEnabled()) Active::NoteCommitKeyMemo(hit);
+}
+
+inline void NoteCommitDrawKind(CommitDrawKind kind) {
+    if (CommitPhasesEnabled()) Active::NoteCommitDrawKind(kind);
+}
+
+inline void CountCommit(CommitCounter counter, std::uint64_t amount = 1) {
+    if (CommitPhasesEnabled()) Active::CountCommit(counter, amount);
+}
+void NoteEpochCauses(unsigned causes);
+void NoteEpochFollow(bool backward, unsigned causes);
+void NoteEpochFollowSkipped();
+unsigned EpochCauses();
+CommitCounter EpochCauseCounter(unsigned causes);
+
+inline CommitPhase CurrentCommitPhase() {
+    return CommitPhasesEnabled() ? Active::CurrentCommitPhase() : CommitPhase::Other;
+}
+
+inline void RelabelCommitPhase(CommitPhase phase) {
+    if (CommitPhasesEnabled()) Active::RelabelCommitPhase(phase);
+}
+
+inline void NoteShadowReason(ShadowReason reason) {
+    if (CommitPhasesEnabled()) Active::NoteShadowReason(reason);
+}
+
+inline void NoteShadowRecording() {
+    if (CommitPhasesEnabled()) Active::NoteShadowRecording();
+}
+
+inline void NoteShadowCommands() {
+    if (CommitPhasesEnabled()) Active::NoteShadowCommands();
+}
+
 ShadowReason FirstShadowReason(unsigned mask);
 const char* ShadowReasonName(ShadowReason reason);
 std::string FormatShadowReport(const CommitPhaseTotals& window);
@@ -292,12 +344,20 @@ private:
 
 class CommitPhaseScope {
 public:
-    explicit CommitPhaseScope(CommitPhase phase);
-    ~CommitPhaseScope();
+    explicit CommitPhaseScope(CommitPhase phase) {
+        if (CommitPhasesEnabled()) enter(phase);
+    }
+
+    ~CommitPhaseScope() {
+        if (active) BeginCommitPhase(previous);
+    }
+
     CommitPhaseScope(const CommitPhaseScope&) = delete;
     CommitPhaseScope& operator=(const CommitPhaseScope&) = delete;
 
 private:
+    void enter(CommitPhase phase);
+
     CommitPhase previous = CommitPhase::Other;
     bool active = false;
 };

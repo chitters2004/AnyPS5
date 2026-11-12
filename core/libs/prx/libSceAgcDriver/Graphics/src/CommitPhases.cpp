@@ -145,8 +145,11 @@ void reportDue(Clock::time_point now) {
 
 }
 
-bool CommitPhasesEnabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_COMMIT") != nullptr;
+std::atomic<int> CommitPhasesState{0};
+
+bool ResolveCommitPhases() {
+    const bool enabled = std::getenv("APS5_PROFILE_COMMIT") != nullptr;
+    CommitPhasesState.store(enabled ? 2 : 1, std::memory_order_relaxed);
     return enabled;
 }
 
@@ -157,6 +160,8 @@ const char* CommitPhaseGroup(CommitPhase phase) {
 const char* CommitPhaseName(CommitPhase phase) {
     return PhaseNames[static_cast<std::size_t>(phase)];
 }
+
+namespace Active {
 
 void BeginCommitPhase(CommitPhase phase) {
     auto& phases = threadPhases;
@@ -180,6 +185,8 @@ void NoteShadowRecording() {
 void NoteShadowCommands() {
     auto& phases = threadPhases;
     if (phases.active && !phases.recording) markShadow(phases, ShadowReason::PreOp);
+}
+
 }
 
 ShadowReason FirstShadowReason(unsigned mask) {
@@ -216,6 +223,8 @@ std::string FormatShadowReport(const CommitPhaseTotals& window) {
     return report;
 }
 
+namespace Active {
+
 void NoteCommitKey(std::size_t words) {
     if (!threadPhases.active) return;
     keyCount.Add(1);
@@ -230,6 +239,8 @@ void NoteCommitKeyMemo(bool hit) {
 void NoteCommitDrawKind(CommitDrawKind kind) {
     auto& phases = threadPhases;
     if (phases.active) phases.kind = kind;
+}
+
 }
 
 void NoteEpochCauses(unsigned causes) {
@@ -260,6 +271,8 @@ CommitCounter EpochCauseCounter(unsigned causes) {
     return static_cast<CommitCounter>(static_cast<unsigned>(CommitCounter::TargetEpochBySubmission) + static_cast<unsigned>(std::countr_zero(causes)));
 }
 
+namespace Active {
+
 void CountCommit(CommitCounter counter, std::uint64_t amount) {
     auto& phases = threadPhases;
     if (!phases.active) return;
@@ -277,6 +290,8 @@ CommitPhase CurrentCommitPhase() {
 void RelabelCommitPhase(CommitPhase phase) {
     auto& phases = threadPhases;
     if (phases.active) phases.current = phase;
+}
+
 }
 
 CommitPhaseTotals ReadCommitPhases() {
@@ -322,6 +337,7 @@ CommitPhaseTotals operator-(const CommitPhaseTotals& later, const CommitPhaseTot
 }
 
 CommitPhaseDraw::CommitPhaseDraw() {
+    if (!CommitPhasesEnabled()) return;
     auto& phases = threadPhases;
     if (phases.active) {
         nested = true;
@@ -329,7 +345,6 @@ CommitPhaseDraw::CommitPhaseDraw() {
         BeginCommitPhase(CommitPhase::Other);
         return;
     }
-    if (!CommitPhasesEnabled()) return;
     owner = true;
     phases.active = true;
     phases.current = CommitPhase::Other;
@@ -364,16 +379,12 @@ CommitPhaseDraw::~CommitPhaseDraw() {
     reportDue(now);
 }
 
-CommitPhaseScope::CommitPhaseScope(CommitPhase phase) {
+void CommitPhaseScope::enter(CommitPhase phase) {
     auto& phases = threadPhases;
     if (!phases.active) return;
     active = true;
     previous = phases.current;
     BeginCommitPhase(phase);
-}
-
-CommitPhaseScope::~CommitPhaseScope() {
-    if (active) BeginCommitPhase(previous);
 }
 
 }
