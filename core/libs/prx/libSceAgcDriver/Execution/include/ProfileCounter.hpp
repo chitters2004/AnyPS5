@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <cstdlib>
 
+#include "prx/libc/include/HostThreadSlot.hpp"
+
 namespace AgcDriver {
 
 class ProfileCounter {
@@ -30,8 +32,13 @@ public:
     }
 
     static std::size_t ThreadSlot() noexcept {
-        thread_local const std::size_t slot = Shared() ? 0 : NextSlot().fetch_add(1, std::memory_order_relaxed) % Slots;
-        return slot;
+        using Held = HostThreadSlot<std::uint32_t, ProfileCounter>;
+        std::uint32_t held = Held::Get();
+        if (held == 0) {
+            held = static_cast<std::uint32_t>(Shared() ? 0 : NextSlot().fetch_add(1, std::memory_order_relaxed) % Slots) + 1;
+            Held::Set(held);
+        }
+        return held - 1;
     }
 
     static bool Shared() noexcept {
