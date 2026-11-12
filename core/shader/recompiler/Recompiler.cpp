@@ -2326,9 +2326,12 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 }
 
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = acquirePlan(request, handle->source, true, handle.get());
+    if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;
 }

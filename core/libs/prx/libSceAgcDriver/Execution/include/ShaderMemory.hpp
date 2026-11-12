@@ -169,6 +169,7 @@ private:
     std::vector<Supplied> supplied;
     std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> spilled;
     PendingWriteQuery pendingWrite = nullptr;
+    PendingWrite queryPending(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) const;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
     PendingWriteQuery pendingSpan = nullptr;
@@ -213,6 +214,30 @@ struct VouchedRegions {
     std::uint64_t high = 0;
 };
 std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t regions, ShaderMemory::PendingWriteQuery pending, std::vector<VouchedRegions>& vouched);
+
+struct CaptureCensusSample {
+    std::vector<std::uint32_t> pointers;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> regions;
+};
+enum class CaptureCensusKind : std::uint8_t { First, Identical, DataOnly, PointerMoved, LayoutChanged, Count };
+struct CaptureCensusVerdict {
+    CaptureCensusKind kind = CaptureCensusKind::First;
+    std::size_t differingDwords = 0;
+};
+CaptureCensusVerdict ClassifyCaptureCensus(const CaptureCensusSample* previous, const CaptureCensusSample& current);
+struct CaptureCensusCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(CaptureCensusKind::Count)> kinds{};
+    std::array<std::uint64_t, 4> dataDwords{};
+};
+enum class CaptureStep : std::uint8_t { Invocation, Assembly, Census };
+bool CaptureStepsProfiled();
+void NoteCaptureStep(CaptureStep step, std::uint64_t nanoseconds);
+void NoteCaptureCensus(std::uint64_t stage, CaptureCensusSample&& sample);
+CaptureCensusCounts CaptureCensusCountsForTest();
+struct CaptureStepTotals {
+    std::uint64_t captures = 0, captureNanoseconds = 0, resolveNanoseconds = 0, pageSetupNanoseconds = 0, pageReadNanoseconds = 0, wordReadNanoseconds = 0, pages = 0, pendingQueries = 0, invocationNanoseconds = 0, assemblyNanoseconds = 0, censusNanoseconds = 0;
+};
+CaptureStepTotals CaptureStepTotalsForTest();
 
 }
 

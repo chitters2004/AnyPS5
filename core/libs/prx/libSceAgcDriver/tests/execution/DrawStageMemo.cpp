@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -714,6 +715,64 @@ int BenchStageKeys() {
     return sink == 0 ? 1 : 0;
 }
 
+void CaptureCensusClassifies() {
+    using AgcDriver::CaptureCensusKind;
+    using AgcDriver::CaptureCensusSample;
+    const auto sample = [](std::vector<std::uint32_t> pointers, std::uint64_t address, std::vector<std::uint8_t> bytes) {
+        CaptureCensusSample made;
+        made.pointers = std::move(pointers);
+        std::vector<std::byte> copied(bytes.size());
+        std::memcpy(copied.data(), bytes.data(), bytes.size());
+        made.regions.emplace_back(address, std::move(copied));
+        return made;
+    };
+    const auto base = sample({0x1000u}, 0x1000u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
+    Expect(AgcDriver::ClassifyCaptureCensus(nullptr, base).kind == CaptureCensusKind::First, "a stage's first capture was not counted as a first sighting");
+    Expect(AgcDriver::ClassifyCaptureCensus(&base, base).kind == CaptureCensusKind::Identical, "a byte-identical capture under the same pointers was not counted as identical");
+    const auto data = AgcDriver::ClassifyCaptureCensus(&base, sample({0x1000u}, 0x1000u, {1, 2, 3, 4, 9, 6, 7, 8, 9, 10, 11, 0}));
+    Expect(data.kind == CaptureCensusKind::DataOnly && data.differingDwords == 2, "a capture whose pointers stayed and two dwords changed was not counted as data only with two dwords");
+    Expect(AgcDriver::ClassifyCaptureCensus(&base, sample({0x2000u}, 0x1000u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})).kind == CaptureCensusKind::PointerMoved, "a capture whose pointer word moved over unchanged memory was not counted as a moved pointer");
+    Expect(AgcDriver::ClassifyCaptureCensus(&base, sample({0x1000u}, 0x1040u, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})).kind == CaptureCensusKind::LayoutChanged, "a capture that read other addresses under the same pointers was not counted as a layout change");
+}
+
+int CensusCaptures() {
+    {
+        const auto device = OpenVulkanTestDevice();
+        if (!device) return VulkanTestSkipped;
+    }
+    Expect(std::getenv("APS5_PROFILE_DRAW") != nullptr && std::getenv("APS5_NO_DRAW_SRT_ENTRIES") != nullptr && std::getenv("APS5_NO_DRAW_STAGE_MEMO") != nullptr, "--capture-census needs APS5_PROFILE_DRAW, APS5_NO_DRAW_SRT_ENTRIES and APS5_NO_DRAW_STAGE_MEMO");
+    Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Register(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    WriteTable(scene.tables, SecondTableOffset, scene.vertices, true);
+    const auto writeConstant = [&](float value) {
+        const std::array<float, 4> words{value, value, value, value};
+        std::memcpy(scene.constants.Bytes(0), words.data(), sizeof(words));
+    };
+    using AgcDriver::CaptureCensusKind;
+    const auto since = [](const AgcDriver::CaptureCensusCounts& before, CaptureCensusKind kind) { return AgcDriver::CaptureCensusCountsForTest().kinds[static_cast<std::size_t>(kind)] - before.kinds[static_cast<std::size_t>(kind)]; };
+    writeConstant(1.0f);
+    Expect(Draw(scene, VertexCode.data(), TableOffset, true) == 255u, "the first census draw did not draw");
+    auto before = AgcDriver::CaptureCensusCountsForTest();
+    Expect(Draw(scene, VertexCode.data(), TableOffset, true) == 255u, "the repeated census draw did not draw");
+    Expect(since(before, CaptureCensusKind::Identical) == 2, "a repeated draw's two stages were not counted as identical captures");
+    before = AgcDriver::CaptureCensusCountsForTest();
+    writeConstant(0.25f);
+    Draw(scene, VertexCode.data(), TableOffset, true);
+    const auto dataBuckets = AgcDriver::CaptureCensusCountsForTest().dataDwords[0] + AgcDriver::CaptureCensusCountsForTest().dataDwords[1] - before.dataDwords[0] - before.dataDwords[1];
+    Expect(since(before, CaptureCensusKind::DataOnly) == 1 && since(before, CaptureCensusKind::Identical) == 1 && dataBuckets == 1, "a changed pixel constant was not counted as one data-only stage with at most four differing dwords beside one identical stage");
+    before = AgcDriver::CaptureCensusCountsForTest();
+    Expect(Draw(scene, VertexCode.data(), SecondTableOffset, true) > 0u, "the draw through the second table did not draw");
+    Expect(since(before, CaptureCensusKind::PointerMoved) == 1, "a draw whose vertex table pointer moved over identical table contents was not counted as a moved pointer");
+    AgcDriverShutdown_nid_postfix();
+    std::puts("capture census: repeats are identical, a changed constant is data only, a moved table is a moved pointer");
+    return 0;
+}
+
 int BenchCapture() {
     {
         const auto device = OpenVulkanTestDevice();
@@ -731,6 +790,7 @@ int BenchCapture() {
     std::memcpy(scene.constants.Bytes(0), one.data(), sizeof(one));
     for (int warm = 0; warm < 16; ++warm) Expect(Draw(scene, VertexCode.data(), TableOffset, true) == 255u, "a bench draw did not draw");
     const auto before = driver().DrawPhaseTotalsForTest();
+    const auto stepsBefore = AgcDriver::CaptureStepTotalsForTest();
     constexpr int Draws = 400;
     for (int draw = 0; draw < Draws; ++draw) Draw(scene, VertexCode.data(), TableOffset, true);
     const auto after = driver().DrawPhaseTotalsForTest();
@@ -738,6 +798,10 @@ int BenchCapture() {
     const auto ms = [&](AgcDriver::DriverDetail::DrawDriverPhase phase) { return after.ms[phase] - before.ms[phase]; };
     Expect(captures > 0.0, "the bench draws captured no stage: run it with APS5_NO_DRAW_SRT_ENTRIES=1 APS5_NO_DRAW_STAGE_MEMO=1");
     std::printf("bench capture: %d draws, %.0f captures (%.2f per draw), %llu finished on the draw finisher; per capture: capture %.2f us, capture hook waits %.2f us, recompile %.2f us, vectors %.2f us\n", Draws, captures, captures / Draws, static_cast<unsigned long long>(after.finished - before.finished), ms(AgcDriver::DriverDetail::DrawRowCapture) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowCaptureHookWaits) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowRecompile) * 1000.0 / captures, ms(AgcDriver::DriverDetail::DrawRowVectors) * 1000.0 / captures);
+    const auto stepsAfter = AgcDriver::CaptureStepTotalsForTest();
+    const auto step = [&](std::uint64_t AgcDriver::CaptureStepTotals::*field) { return static_cast<double>(stepsAfter.*field - stepsBefore.*field) / captures; };
+    using Steps = AgcDriver::CaptureStepTotals;
+    std::printf("bench capture steps per capture: invocation %.2f us, capture call %.2f us (plan lookup %.2f, page setup %.2f for %.2f pages, page reads %.2f, word reads %.2f, pending queries %.2f), assembly %.2f us, census bookkeeping %.2f us\n", step(&Steps::invocationNanoseconds) / 1e3, step(&Steps::captureNanoseconds) / 1e3, step(&Steps::resolveNanoseconds) / 1e3, step(&Steps::pageSetupNanoseconds) / 1e3, step(&Steps::pages), step(&Steps::pageReadNanoseconds) / 1e3, step(&Steps::wordReadNanoseconds) / 1e3, step(&Steps::pendingQueries), step(&Steps::assemblyNanoseconds) / 1e3, step(&Steps::censusNanoseconds) / 1e3);
     AgcDriverShutdown_nid_postfix();
     return 0;
 }
@@ -745,7 +809,17 @@ int BenchCapture() {
 int main(int argc, char** argv) {
     if (argc > 1 && std::string(argv[1]) == "--bench") return BenchStageKeys();
     if (argc > 1 && std::string(argv[1]) == "--bench-capture") return BenchCapture();
+    if (argc > 1 && std::string(argv[1]) == "--capture-census") {
+        try {
+            return CensusCaptures();
+        } catch (const std::exception& error) {
+            std::cerr << error.what() << '\n';
+            try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
+            return 1;
+        }
+    }
     try {
+        CaptureCensusClassifies();
         KeysFollowEveryInput();
         StageInfoKeysFollowEveryField();
         MemoStoresByWholeKey();

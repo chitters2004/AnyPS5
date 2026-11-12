@@ -6,9 +6,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -71,6 +73,10 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     request.context.vertex = vertexInfos[i];
     bool linkedCode = false;
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+    const bool steps = CaptureStepsProfiled();
+    const auto stepClock = [&] { return steps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto stepSince = [](std::chrono::steady_clock::time_point started) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()); };
+    const auto invocationStarted = stepClock();
     auto invocation = [&] {
         try {
             return InvocationFor(*program.snapshot, program.codeOffset, request, &linkedCode);
@@ -79,6 +85,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw;
         }
     }();
+    if (steps) NoteCaptureStep(CaptureStep::Invocation, stepSince(invocationStarted));
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -108,6 +115,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
 
+    const auto assemblyStarted = stepClock();
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
     stageCapture.userDataUse = capture->userDataUse;
@@ -120,6 +128,17 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     for (std::size_t j = 0; j < programs.size(); ++j) {
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
+    }
+    if (steps) {
+        NoteCaptureStep(CaptureStep::Assembly, stepSince(assemblyStarted));
+        const auto censusStarted = stepClock();
+        CaptureCensusSample sample;
+        for (std::uint32_t word = 0; word < 64 && word < request.context.userData.size(); ++word) {
+            if ((capture->userDataUse.asBase >> word & 1u) != 0) sample.pointers.push_back(request.context.userData[word]);
+        }
+        for (const auto& region : stageCapture.regions) sample.regions.emplace_back(region.guestAddress, std::vector<std::byte>(region.bytes.begin(), region.bytes.end()));
+        NoteCaptureCensus(program.binary.codeAddress, std::move(sample));
+        NoteCaptureStep(CaptureStep::Census, stepSince(censusStarted));
     }
     request.context.memory = memory;
     static const bool dumpGraphics = std::getenv("APS5_DUMP_GRAPHICS_SHADERS") != nullptr;
