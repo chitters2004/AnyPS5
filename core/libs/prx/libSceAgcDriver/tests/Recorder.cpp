@@ -94,6 +94,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1896,7 +1897,7 @@ void latchedWaitTests(const Device& device) {
     }
 }
 
-void suffixCancellationTests(const Device& device) {
+void suffixCancellationTests(const Device& device, VkResult cancelWait) {
     using AgcDriver::Graphics::BatchState;
     if (!device.Timelines()) {
         std::cout << "timeline semaphores unavailable: suffix cancellation tests not run\n";
@@ -1952,12 +1953,14 @@ void suffixCancellationTests(const Device& device) {
             static_cast<void>(context.Function<PFN_vkSignalSemaphoreKHR>("vkSignalSemaphoreKHR")(context.device, &signal));
         });
         Recorder::FailNextFenceWaitsForTest(1);
+        Recorder::FailNextCancelWaitForTest(cancelWait);
         try {
             recorder.FinishUpTo(serials[0]);
         } catch (const std::exception& error) {
             failure = error.what();
         }
         Recorder::FailNextFenceWaitsForTest(0);
+        Recorder::FailNextCancelWaitForTest(VK_SUCCESS);
         Require(failure.find("vkWaitForFences") != std::string::npos, "the injected fence failure did not fail the finish ('" + failure + "')");
         Require(recorder.Latched(), "a fence failure did not latch the recorder");
         const auto& frontiers = recorder.Frontiers();
@@ -1986,7 +1989,49 @@ void suffixCancellationTests(const Device& device) {
     }
     releaser.join();
     context.Function<PFN_vkDestroySemaphore>("vkDestroySemaphore")(context.device, hold, nullptr);
-    std::cout << "Suffix cancellation tests passed\n";
+    std::cout << "Suffix cancellation tests passed (cancellation wait result " << static_cast<int>(cancelWait) << ")\n";
+}
+
+struct FailingSemaphores {
+    static inline PFN_vkGetDeviceProcAddr resolve = nullptr;
+    static inline PFN_vkCreateSemaphore create = nullptr;
+    static inline int failOn = 0;
+    static inline int calls = 0;
+
+    static VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice device, const VkSemaphoreCreateInfo* info, const VkAllocationCallbacks* allocator, VkSemaphore* semaphore) {
+        if (++calls == failOn) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        return create(device, info, allocator, semaphore);
+    }
+
+    static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Resolve(VkDevice device, const char* name) {
+        if (std::string_view(name) == "vkCreateSemaphore") return reinterpret_cast<PFN_vkVoidFunction>(&Create);
+        return resolve(device, name);
+    }
+};
+
+void timelineAllocationFailureTests(const Device& device) {
+    if (!device.Timelines()) {
+        std::cout << "timeline semaphores unavailable: timeline allocation failure tests not run\n";
+        return;
+    }
+    auto context = device.GetContext();
+    FailingSemaphores::resolve = context.deviceProc;
+    FailingSemaphores::create = context.Function<PFN_vkCreateSemaphore>("vkCreateSemaphore");
+    context.deviceProc = &FailingSemaphores::Resolve;
+    for (const int failOn : {1, 2}) {
+        FailingSemaphores::failOn = failOn;
+        FailingSemaphores::calls = 0;
+        Recorder recorder(context, true);
+        Require(FailingSemaphores::calls == failOn, "the recorder did not create its semaphores in order (failing call " + std::to_string(failOn) + ")");
+        Require(!recorder.HasTimeline(), "a recorder kept unlocked timeline waits after failing to create semaphore " + std::to_string(failOn));
+        std::lock_guard gpu(GpuMutex());
+        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        recorder.Submit();
+        recorder.Sync();
+        Require(recorder.Idle(), "a recorder without a timeline did not drain under the GPU mutex");
+    }
+    FailingSemaphores::failOn = 0;
+    std::cout << "Timeline allocation failure tests passed\n";
 }
 
 void latchedCompletionTests(const Device& device) {
@@ -16748,7 +16793,9 @@ int main(int argc, char** argv) {
         serialFrontierTests(device, recorder);
         gpu.unlock();
         latchedWaitTests(device);
-        suffixCancellationTests(device);
+        suffixCancellationTests(device, VK_SUCCESS);
+        suffixCancellationTests(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+        timelineAllocationFailureTests(device);
         latchedCompletionTests(device);
         encoderAcknowledgementTests(device);
         admissionTests(device);

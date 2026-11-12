@@ -43,7 +43,7 @@ public:
             }
         } leave{*this};
         const bool alone = bytes > budget;
-        changed.wait(lock, [&] { return error != nullptr || (serving == turn && (alone ? outstanding == 0 : outstanding + bytes <= budget)); });
+        changed.wait(lock, [&] { return error != nullptr || (serving == turn && (alone ? outstanding == 0 : outstanding <= budget && bytes <= budget - outstanding)); });
         rethrow();
         outstanding += bytes;
         ++serving;

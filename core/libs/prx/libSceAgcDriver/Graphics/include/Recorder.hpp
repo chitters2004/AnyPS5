@@ -426,6 +426,7 @@ public:
     static void SetQueuedLabelRecorder(void (*recorder)());
     static void FailNextSubmitsForTest(unsigned count);
     static void FailNextFenceWaitsForTest(unsigned count);
+    static void FailNextCancelWaitForTest(VkResult result);
     void LatchFailure(std::exception_ptr error) noexcept;
     bool Latched() const { return latched.load(std::memory_order_acquire); }
     void RethrowLatched() const;
