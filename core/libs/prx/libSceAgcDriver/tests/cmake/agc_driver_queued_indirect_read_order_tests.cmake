@@ -1,3 +1,5 @@
 if(BUILD_TESTING)
     set_tests_properties(agc_driver_queued_indirect_read_order PROPERTIES TIMEOUT 60)
+    agc_add_ring_preparers_test(agc_driver_queued_indirect_read_order "")
+    set_tests_properties(agc_driver_queued_indirect_read_order_preparers3 PROPERTIES TIMEOUT 60)
 endif()

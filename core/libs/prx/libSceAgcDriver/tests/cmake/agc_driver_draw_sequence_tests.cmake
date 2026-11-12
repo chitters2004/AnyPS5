@@ -13,8 +13,11 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_sequence_stats COMMAND agc_driver_draw_sequence_tests)
     set_tests_properties(agc_driver_draw_sequence_stats PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
         ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=8;APS5_PIPELINE_STATS=1")
+    add_test(NAME agc_driver_draw_sequence_preparers3 COMMAND agc_driver_draw_sequence_tests)
+    set_tests_properties(agc_driver_draw_sequence_preparers3 PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77
+        ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=8;APS5_RING_PREPARERS=3;APS5_PIPELINE_STATS=1")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_sequence agc_driver_draw_sequence_drained agc_driver_draw_sequence_stats PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_sequence agc_driver_draw_sequence_drained agc_driver_draw_sequence_stats agc_driver_draw_sequence_preparers3 PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
     endif()
 endif()

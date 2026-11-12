@@ -69,6 +69,9 @@ public:
     void ReleaseRunningReads();
     QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
 
+    static SequenceRing::Publish TakePreparerOutbox();
+    static void FlushPreparerOutbox();
+    static bool PreparerDirect();
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
@@ -87,6 +90,8 @@ private:
     DrawPipeline() = default;
     void enqueue(Item item);
     void admit(Item item);
+    static std::vector<Item>& preparerOutbox();
+    static bool& preparerDirect();
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -152,6 +157,10 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Sequenced();
+    static std::size_t Preparers();
+    static bool Buffered();
+    void AwaitTurn();
+    bool OlderUnpublished();
     static bool Busy() { return Sequenced() ? !Get().Ring().Idle() : outstanding.load(std::memory_order_acquire) != 0; }
     bool Producing();
     SequenceRing& Ring();
@@ -167,6 +176,8 @@ public:
 
 private:
     DrawFinisher() = default;
+    template<typename TVisit>
+    bool visitPending(TVisit&& visit);
     void run();
     inline static std::atomic<std::size_t> outstanding{0};
     std::mutex mutex;

@@ -1,13 +1,19 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/SequenceRing.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <set>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <thread>
 #include <vector>
 
@@ -348,10 +354,335 @@ void PreparedWorkIsReleasedByTheProducer() {
     ring.Drain();
 }
 
+
+thread_local std::vector<std::uint64_t> outbox;
+
+SequenceRing::Options Parallel(std::size_t capacity, std::size_t preparers, std::vector<std::uint64_t>& published) {
+    SequenceRing::Options options;
+    options.capacity = capacity;
+    options.preparers = preparers;
+    options.outbox = [&published] {
+        return SequenceRing::Publish([&published, items = std::exchange(outbox, {})](bool keep) {
+            if (keep) published.insert(published.end(), items.begin(), items.end());
+        });
+    };
+    return options;
 }
 
-int main() {
+bool WaitFor(const std::atomic<bool>& flag) {
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!flag.load(std::memory_order_acquire)) {
+        if (std::chrono::steady_clock::now() > until) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+void PushOverlappingPair(SequenceRing& ring, std::atomic<bool>& overlapped, std::vector<std::uint64_t>* expected) {
+    auto secondStarted = std::make_shared<std::atomic<bool>>(false);
+    const auto first = ring.Push([&overlapped, secondStarted] {
+        overlapped.store(WaitFor(*secondStarted), std::memory_order_release);
+        outbox.push_back(SequenceRing::Running());
+    }, {});
+    const auto second = ring.Push([secondStarted] {
+        secondStarted->store(true, std::memory_order_release);
+        outbox.push_back(SequenceRing::Running());
+    }, {});
+    if (expected != nullptr) {
+        expected->push_back(first);
+        expected->push_back(second);
+    }
+}
+
+void Spin(std::chrono::nanoseconds duration) {
+    const auto until = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+void ItemsPublishInSequenceOrder(std::size_t preparers) {
+    std::vector<std::uint64_t> published;
+    SequenceRing ring(Parallel(8, preparers, published));
+    std::vector<std::uint64_t> expected;
+    std::atomic<bool> overlapped{false};
+    if (preparers > 1) PushOverlappingPair(ring, overlapped, &expected);
+    for (std::uint64_t round = 0; round < 600; ++round) {
+        if (round % 50 == 49) {
+            ring.Drain();
+            expected.push_back(ring.Bypass());
+            published.push_back(expected.back());
+            continue;
+        }
+        expected.push_back(ring.Push([&, slow = round % 3 == 0] {
+            if (slow) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            outbox.push_back(SequenceRing::Running());
+        }, {}));
+    }
+    ring.Drain();
+    Require(published.size() == expected.size(), "with " + std::to_string(preparers) + " preparers " + std::to_string(published.size()) + " of " + std::to_string(expected.size()) + " items were published");
+    Require(published == expected, "with " + std::to_string(preparers) + " preparers the items were not published in sequence order");
+    if (preparers > 1) Require(overlapped.load(), "several preparers never prepared two items at once");
+    Require(ring.Idle() && ring.PreparedSequence() <= ring.Issued(), "the prepared frontier did not reach the last item");
+}
+
+void OlderUnpublishedItemsAreVisible() {
+    std::vector<std::uint64_t> published;
+    SequenceRing ring(Parallel(8, 3, published));
+    std::atomic<bool> open{false};
+    const OpenOnExit opener{open};
+    std::atomic<int> sawOlder{-1};
+    std::atomic<int> sawSelf{-1};
+    std::atomic<int> sawNewer{-1};
+    SequenceRing::Held first;
+    first.unknown = false;
+    first.key = 1;
+    first.writes = {{0x100, 0x104}};
+    ring.Push([&] {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!open.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    }, std::move(first));
+    SequenceRing::Held second;
+    second.unknown = false;
+    second.key = 2;
+    ring.Push([&] {
+        sawOlder = ring.AnyOlderNewestFirst([](const SequenceRing::Held& held) { return held.key == 1 && held.writes.front().first == 0x100; }) ? 1 : 0;
+        sawSelf = ring.AnyOlderNewestFirst([](const SequenceRing::Held& held) { return held.key == 2; }) ? 1 : 0;
+        sawNewer = ring.AnyOlderNewestFirst([](const SequenceRing::Held& held) { return held.key == 3; }) ? 1 : 0;
+        open.store(true, std::memory_order_release);
+    }, std::move(second));
+    SequenceRing::Held third;
+    third.key = 3;
+    ring.Push([] {}, std::move(third));
+    ring.Drain();
+    Require(sawOlder.load() == 1, "a preparer did not see an older item that was prepared but not yet published");
+    Require(sawSelf.load() == 0 && sawNewer.load() == 0, "a preparer saw its own item or a newer one as older");
+    std::atomic<int> afterDrain{-1};
+    ring.Push([&] { afterDrain = ring.AnyOlderNewestFirst([](const SequenceRing::Held&) { return true; }) ? 1 : 0; }, {});
+    ring.Drain();
+    Require(afterDrain.load() == 0, "a published item stayed visible to later preparers");
+    Require(!ring.AnyOlderNewestFirst([](const SequenceRing::Held&) { return true; }), "the producer saw items through the preparers' older view");
+}
+
+void FailureCancelsLaterPublishes(std::size_t preparers) {
+    std::vector<std::uint64_t> published;
+    auto options = Parallel(8, preparers, published);
+    std::atomic<int> reports{0};
+    options.failed = [&](std::exception_ptr) { reports.fetch_add(1); };
+    SequenceRing ring(std::move(options));
+    std::vector<std::uint64_t> expected;
+    expected.push_back(ring.Push([] { outbox.push_back(SequenceRing::Running()); }, {}));
+    expected.push_back(ring.Push([] {
+        outbox.push_back(SequenceRing::Running());
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        throw std::runtime_error("prepare failed");
+    }, {}));
+    for (int i = 0; i < 6; ++i) ring.Push([] { outbox.push_back(SequenceRing::Running()); }, {});
+    bool thrown = false;
     try {
+        ring.Drain();
+    } catch (const std::runtime_error& error) {
+        thrown = std::string(error.what()) == "prepare failed";
+    }
+    Require(thrown, "the failed preparation was not rethrown to the producer");
+    Require(reports.load() == 1, "the failure was reported " + std::to_string(reports.load()) + " times");
+    Require(published == expected, "an item after a failed one was published, or the failed item's own commits were dropped");
+    expected.push_back(ring.Push([] { outbox.push_back(SequenceRing::Running()); }, {}));
+    ring.Drain();
+    Require(published == expected, "the ring did not resume publishing after the failure was rethrown");
+}
+
+void AwaitTurnWaitsForOlderPublishes() {
+    std::vector<std::uint64_t> published;
+    std::atomic<std::uint64_t> publishedThrough{0};
+    auto options = Parallel(8, 3, published);
+    options.outbox = [&] {
+        return SequenceRing::Publish([&, items = std::exchange(outbox, {})](bool keep) {
+            if (!keep) return;
+            published.insert(published.end(), items.begin(), items.end());
+            if (!items.empty()) publishedThrough.store(items.back(), std::memory_order_release);
+        });
+    };
+    SequenceRing ring(std::move(options));
+    Require(Throws([&] { ring.AwaitTurn(); }), "the producer waited for a preparer's turn");
+    std::atomic<std::uint64_t> seenAtTurn{0};
+    const auto first = ring.Push([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        outbox.push_back(SequenceRing::Running());
+    }, {});
+    ring.Push([&] {
+        ring.AwaitTurn();
+        seenAtTurn = publishedThrough.load(std::memory_order_acquire);
+        outbox.push_back(SequenceRing::Running());
+    }, {});
+    ring.Drain();
+    Require(seenAtTurn.load() == first, "an item's turn came before the older item was published");
+    std::atomic<bool> cancelled{false};
+    ring.Push([] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        throw std::runtime_error("boom");
+    }, {});
+    ring.Push([&] {
+        try {
+            ring.AwaitTurn();
+        } catch (const SequenceRing::Cancelled&) {
+            cancelled = true;
+            throw;
+        }
+    }, {});
+    Require(Throws([&] { ring.Drain(); }), "the failure before a waiting item was not rethrown");
+    Require(cancelled.load(), "an item waiting for its turn behind a failed one was not cancelled");
+}
+
+void ReclaimSurvivesOlderVisits() {
+    std::vector<std::uint64_t> published;
+    SequenceRing ring(Parallel(4, 3, published));
+    std::atomic<bool> cleared{false};
+    std::atomic<std::uint64_t> visited{0};
+    for (std::uint64_t i = 1; i <= 100000; ++i) {
+        SequenceRing::Held held;
+        held.unknown = false;
+        held.key = i;
+        held.writes = {{i, i + 1}};
+        ring.Push([&] {
+            ring.AnyOlderNewestFirst([&](const SequenceRing::Held& older) {
+                if (older.key == 0 || older.writes.size() != 1 || older.writes.front().first != older.key) cleared.store(true, std::memory_order_relaxed);
+                visited.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            });
+        }, std::move(held));
+    }
+    ring.Drain();
+    Require(!cleared.load(), "the producer reclaimed an older slot while a preparer was reading it");
+    std::cout << "older items visited while preparing: " << visited.load() << '\n';
+}
+
+std::atomic<bool> singlePreparer{false};
+
+void SinglePreparerSwitchParksTheOthers() {
+    std::vector<std::uint64_t> published;
+    auto options = Parallel(8, 3, published);
+    options.single = [] { return singlePreparer.load(std::memory_order_relaxed); };
+    singlePreparer = true;
+    SequenceRing ring(std::move(options));
+    std::mutex idsMutex;
+    std::set<std::thread::id> ids;
+    const auto push = [&] {
+        ring.Push([&] {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::lock_guard lock(idsMutex);
+            ids.insert(std::this_thread::get_id());
+        }, {});
+    };
+    for (int i = 0; i < 60; ++i) push();
+    ring.Drain();
+    Require(ids.size() == 1, "with the single-preparer switch set, " + std::to_string(ids.size()) + " preparers ran items");
+    singlePreparer = false;
+    std::atomic<bool> overlapped{false};
+    PushOverlappingPair(ring, overlapped, nullptr);
+    ring.Drain();
+    Require(overlapped.load(), "with the single-preparer switch clear, only one preparer ran items");
+    singlePreparer = true;
+    ids.clear();
+    for (int i = 0; i < 20; ++i) push();
+    ring.Drain();
+    Require(ids.size() == 1, "setting the single-preparer switch again did not park the other preparers");
+    singlePreparer = false;
+}
+
+void ParallelTeardownPublishesWaitingItems() {
+    std::vector<std::uint64_t> published;
+    std::vector<std::uint64_t> expected;
+    {
+        SequenceRing ring(Parallel(16, 3, published));
+        for (int i = 0; i < 12; ++i) {
+            expected.push_back(ring.Push([] {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                outbox.push_back(SequenceRing::Running());
+            }, {}));
+        }
+    }
+    Require(published == expected, "a ring with several preparers destroyed with waiting items did not publish all of them in order");
+}
+
+void EarlyRethrowStillCancelsItemsThatRanBeforeTheLatch() {
+    std::vector<std::uint64_t> published;
+    auto options = Parallel(8, 3, published);
+    SequenceRing* self = nullptr;
+    std::atomic<bool> rethrown{false};
+    options.failed = [&](std::exception_ptr) {
+        try {
+            self->RethrowFailure();
+        } catch (const std::runtime_error&) {
+            rethrown.store(true, std::memory_order_release);
+        }
+    };
+    SequenceRing ring(std::move(options));
+    self = &ring;
+    std::atomic<bool> laterRan{false};
+    std::atomic<bool> overlapped{false};
+    ring.Push([&] {
+        overlapped.store(WaitFor(laterRan), std::memory_order_release);
+        throw std::runtime_error("the older item failed");
+    }, {});
+    const auto later = ring.Push([&] {
+        outbox.push_back(SequenceRing::Running());
+        laterRan.store(true, std::memory_order_release);
+    }, {});
+    ring.Settle();
+    Require(overlapped.load() && rethrown.load(), "the later item did not run before the older one failed, or the failure was not rethrown at the latch");
+    Require(std::find(published.begin(), published.end(), later) == published.end(), "an item that ran before an older failure was published after the failure was rethrown");
+    ring.Drain();
+}
+
+void SimultaneousFinishesNeverStrandAnItem() {
+    std::vector<std::uint64_t> published;
+    SequenceRing ring(Parallel(8, 3, published));
+    std::uint64_t expected = 0;
+    for (int round = 0; round < 20000; ++round) {
+        for (int item = 0; item < 3; ++item) {
+            ring.Push([] { outbox.push_back(SequenceRing::Running()); }, {});
+        }
+        expected += 3;
+        WaitUntil([&] { return ring.Idle(); }, "the last of several simultaneously finished items to be published");
+        Require(published.size() == expected, "an item finished while another preparer was publishing was never published");
+    }
+}
+
+void Bench(std::chrono::nanoseconds work, std::uint64_t items, std::chrono::nanoseconds spin) {
+    for (std::size_t preparers = 1; preparers <= 3; ++preparers) {
+        std::vector<std::uint64_t> published;
+        published.reserve(items);
+        auto options = Parallel(32, preparers, published);
+        options.timed = true;
+        options.spin = spin;
+        SequenceRing ring(std::move(options));
+        const auto start = std::chrono::steady_clock::now();
+        for (std::uint64_t i = 0; i < items; ++i) {
+            ring.Push([work] {
+                Spin(work);
+                outbox.push_back(SequenceRing::Running());
+            }, {});
+        }
+        ring.Drain();
+        const auto wallNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        const auto counters = ring.TakeCounters();
+        Require(published.size() == items, "the bench lost items");
+        std::printf("[ring-bench] work %.1f us, spin %.0f us, preparers %zu: %.2f us per item, %.0f items/s, published by another preparer %llu, full waits %llu, preparer sleeps %llu\n", static_cast<double>(work.count()) / 1000.0, static_cast<double>(spin.count()) / 1000.0, preparers, wallNs / 1000.0 / static_cast<double>(items), static_cast<double>(items) * 1e9 / wallNs, static_cast<unsigned long long>(counters.publishedForOthers), static_cast<unsigned long long>(counters.fullWaits), static_cast<unsigned long long>(counters.preparerSleeps));
+    }
+}
+
+}
+
+int main(int argc, char** argv) {
+    try {
+        if (argc > 1 && std::string_view(argv[1]) == "--bench") {
+            const auto workUs = argc > 2 ? std::strtod(argv[2], nullptr) : 25.0;
+            const auto items = argc > 3 ? std::strtoull(argv[3], nullptr, 10) : 20000ull;
+            const auto spin = std::chrono::nanoseconds(static_cast<std::int64_t>((argc > 4 ? std::strtod(argv[4], nullptr) : 0.0) * 1000.0));
+            Bench(std::chrono::nanoseconds(static_cast<std::int64_t>(workUs * 1000.0)), items, spin);
+            Bench(std::chrono::nanoseconds::zero(), items * 10, spin);
+            return 0;
+        }
         ItemsRunInSequenceOrder(std::chrono::nanoseconds::zero());
         ItemsRunInSequenceOrder(std::chrono::microseconds(50));
         MixedItemsKeepTheirOrder();
@@ -365,6 +696,17 @@ int main() {
         ReclaimKeepsTheItemPushedIntoAFreedSlot();
         ResidencyIsCountedPerTag();
         FirstFailureIsReportedAtOnce();
+        for (std::size_t preparers = 1; preparers <= 3; ++preparers) {
+            ItemsPublishInSequenceOrder(preparers);
+            FailureCancelsLaterPublishes(preparers);
+        }
+        OlderUnpublishedItemsAreVisible();
+        AwaitTurnWaitsForOlderPublishes();
+        ReclaimSurvivesOlderVisits();
+        SinglePreparerSwitchParksTheOthers();
+        ParallelTeardownPublishesWaitingItems();
+        SimultaneousFinishesNeverStrandAnItem();
+        EarlyRethrowStillCancelsItemsThatRanBeforeTheLatch();
         std::cout << "sequence ring tests passed\n";
         return 0;
     } catch (const std::exception& error) {
