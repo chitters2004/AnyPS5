@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <mutex>
 #include <thread>
@@ -34,6 +35,8 @@ AbSample Take(std::uint64_t present, double seconds) {
     const auto totals = DriverDetail::DrawPipeline::Queue0().LifetimeTotals();
     const auto finisherDrains = DriverDetail::DrawFinisher::DrainWaitTotals();
     sample.committer = {totals.commits, totals.commitNs, totals.drawCommits, totals.drawNs, totals.enqueued, totals.fullWaitNs, totals.wakes, totals.drains, totals.drainWaitNs, finisherDrains.first, finisherDrains.second};
+    const auto encoder = Graphics::CommandEncoder::AllCounts();
+    sample.encoder = {encoder.posts, encoder.commands, encoder.waits, encoder.waitNs, encoder.encodeNs, encoder.parks, encoder.postNs, encoder.inlined};
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (auto threads = PerformanceTrace::ThreadTotals()) {
             sample.threads = std::move(*threads);

@@ -16,11 +16,16 @@ struct AbCommitterTotals {
     std::uint64_t commits = 0, commitNs = 0, drawCommits = 0, drawNs = 0, enqueued = 0, fullWaitNs = 0, wakes = 0, drains = 0, drainWaitNs = 0, finisherDrains = 0, finisherDrainWaitNs = 0;
 };
 
+struct AbEncoderTotals {
+    std::uint64_t posts = 0, commands = 0, waits = 0, waitNs = 0, encodeNs = 0, parks = 0, postNs = 0, inlined = 0;
+};
+
 struct AbSample {
     double seconds = 0;
     std::uint64_t present = 0;
     double gpuBusyMs = 0, gpuGapMs = 0;
     AbCommitterTotals committer;
+    AbEncoderTotals encoder;
     std::vector<TraceThreadTotals> threads;
 };
 
@@ -60,6 +65,14 @@ public:
         number("drain_wait_ms", ms(b.drainWaitNs - a.drainWaitNs));
         count("finisher_drains", b.finisherDrains - a.finisherDrains);
         number("finisher_drain_wait_ms", ms(b.finisherDrainWaitNs - a.finisherDrainWaitNs));
+        count("enc_chunks", to.encoder.posts - from.encoder.posts);
+        count("enc_commands", to.encoder.commands - from.encoder.commands);
+        number("enc_record_ms", ms(to.encoder.encodeNs - from.encoder.encodeNs));
+        count("enc_waits", to.encoder.waits - from.encoder.waits);
+        number("enc_wait_ms", ms(to.encoder.waitNs - from.encoder.waitNs));
+        count("enc_parks", to.encoder.parks - from.encoder.parks);
+        number("enc_post_ms", ms(to.encoder.postNs - from.encoder.postNs));
+        count("enc_inlined", to.encoder.inlined - from.encoder.inlined);
         bool recorded = false;
         for (std::size_t index = 0; index < to.threads.size(); ++index) {
             const auto before = index < from.threads.size() && from.threads[index].name == to.threads[index].name ? std::span<const TraceThread::Total>(from.threads[index].totals) : std::span<const TraceThread::Total>();

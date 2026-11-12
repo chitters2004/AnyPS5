@@ -119,6 +119,7 @@ public:
         std::uint64_t inlined = 0;
     };
     Statistics Counts() const;
+    static Statistics AllCounts();
     std::vector<SiteWaits> WaitsBySite() const;
     bool ProfilesSites() const { return profiled; }
     static void SetDelayForTesting(std::function<void()> delay);

@@ -757,6 +757,25 @@ void CommandEncoder::run() {
     }
 }
 
+CommandEncoder::Statistics CommandEncoder::AllCounts() {
+    std::lock_guard lock(slotMutex());
+    Statistics total;
+    for (const auto& slot : slots()) {
+        const auto* encoder = slot.encoder.load(std::memory_order_acquire);
+        if (encoder == nullptr) continue;
+        const auto counts = encoder->Counts();
+        total.posts += counts.posts;
+        total.commands += counts.commands;
+        total.waits += counts.waits;
+        total.waitNs += counts.waitNs;
+        total.encodeNs += counts.encodeNs;
+        total.parks += counts.parks;
+        total.postNs += counts.postNs;
+        total.inlined += counts.inlined;
+    }
+    return total;
+}
+
 CommandEncoder::Statistics CommandEncoder::Counts() const {
     return {postCount.load(std::memory_order_relaxed), commandCount.load(std::memory_order_relaxed), waitCount.load(std::memory_order_relaxed), waitNs.load(std::memory_order_relaxed), encodeNs.load(std::memory_order_relaxed), parkCount.load(std::memory_order_relaxed), postNs.load(std::memory_order_relaxed), inlinedCount.load(std::memory_order_relaxed)};
 }

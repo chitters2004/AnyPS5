@@ -171,6 +171,12 @@ def counter_metrics(counters):
         out["committer idle %"] = 100 - out["committer busy %"]
     if counters.get("draws"):
         out["committer us/draw"] = 1000 * counters["draw_commit_ms"] / counters["draws"]
+    if wall and "enc_record_ms" in counters:
+        out["encoder recording %"] = 100 * counters["enc_record_ms"] / wall
+        out["encoder wait ms/present"] = counters["enc_wait_ms"] / presents if presents else 0.0
+        out["encoder parks/present"] = counters["enc_parks"] / presents if presents else 0.0
+        out["encoder chunks/present"] = counters["enc_chunks"] / presents if presents else 0.0
+        out["encoder inlined/present"] = counters["enc_inlined"] / presents if presents and "enc_inlined" in counters else 0.0
     for key, value in counters.items():
         match = re.fullmatch(r"t\.(.+)\.(\w+)", key)
         if not match:
