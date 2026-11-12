@@ -253,11 +253,6 @@ int APS5_VABI RSA_generate_key_ex_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI SSL_CTX_add_client_CA_nid_postfix(void) {
-    NotImplemented_nid_no_patch(__func__);
-    return 0;
-}
-
 int APS5_VABI SSL_CTX_free_nid_postfix(void) {
     NotImplemented_nid_no_patch(__func__);
     return 0;
@@ -431,9 +426,9 @@ int APS5_VABI SSL_get_fd_nid_postfix(void) {
     return 0;
 }
 
-int APS5_VABI SSL_get_peer_cert_chain_nid_postfix(void) {
+LibreSslStack* APS5_VABI SSL_get_peer_cert_chain_nid_postfix(const LibreSslSsl* ssl) {
+    if (!ssl || !ssl->session) return nullptr;
     NotImplemented_nid_no_patch(__func__);
-    return 0;
 }
 
 LibreSslX509* APS5_VABI SSL_get_peer_certificate_nid_postfix(const LibreSslSsl* ssl) {

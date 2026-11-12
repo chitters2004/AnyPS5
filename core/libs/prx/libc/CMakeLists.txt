@@ -156,6 +156,8 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Math.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/MathExact.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Bessel.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/J0f.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/J1f.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Random.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/VersionedMultiprecision.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FloatBuiltins.cpp
@@ -169,6 +171,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AtomicBuiltins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Mergesort.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/Heapsort.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostErrno.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileLock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
@@ -194,6 +197,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/RuntimeSupport.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/IntegerBuiltins.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/LocaleSupport.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/SonyCrt.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Process.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Hostname.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/DeviceName.cpp
@@ -335,14 +339,14 @@ if(BUILD_TESTING)
         set_tests_properties(guest_memcmp_protected PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    add_test_executable(guest_update_env_tests NO_RUNTIME_DLL_STAGING ${LIBS_INCLUDE_DIR}/tests/GuestUpdateEnv.cpp)
-    target_include_directories(guest_update_env_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_update_env_tests PRIVATE libc ${CMAKE_DL_LIBS})
-    configure_windows_unwind(guest_update_env_tests)
-    add_test(NAME guest_update_env COMMAND guest_update_env_tests $<TARGET_FILE:libc>)
+    add_test_executable(guest_env_probe_tests NO_RUNTIME_DLL_STAGING ${LIBS_INCLUDE_DIR}/tests/GuestUpdateEnv.cpp)
+    target_include_directories(guest_env_probe_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_env_probe_tests PRIVATE libc ${CMAKE_DL_LIBS})
+    configure_windows_unwind(guest_env_probe_tests)
+    add_test(NAME guest_update_env COMMAND guest_env_probe_tests $<TARGET_FILE:libc>)
     foreach(bit RANGE 0 5)
         foreach(source RANGE 0 2)
-            add_test(NAME guest_update_env_pending_${bit}_${source} COMMAND guest_update_env_tests $<TARGET_FILE:libc> ${bit} ${source})
+            add_test(NAME guest_update_env_pending_${bit}_${source} COMMAND guest_env_probe_tests $<TARGET_FILE:libc> ${bit} ${source})
             set_tests_properties(guest_update_env_pending_${bit}_${source} PROPERTIES TIMEOUT 10 SKIP_RETURN_CODE 77)
             if(WIN32)
                 set_tests_properties(guest_update_env_pending_${bit}_${source} PROPERTIES ENVIRONMENT_MODIFICATION
@@ -691,6 +695,16 @@ if(BUILD_TESTING)
     set_tests_properties(guest_time_return PROPERTIES TIMEOUT 10)
     if(WIN32)
         set_tests_properties(guest_time_return PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_wide_set_boundary_tests ${LIBS_INCLUDE_DIR}/tests/GuestWideSetBoundary.cpp)
+    target_include_directories(guest_wide_set_boundary_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_wide_set_boundary_tests PRIVATE libc)
+    configure_windows_unwind(guest_wide_set_boundary_tests)
+    add_test(NAME guest_wide_set_boundary COMMAND guest_wide_set_boundary_tests)
+    set_tests_properties(guest_wide_set_boundary PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_wide_set_boundary PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test_executable(guest_time_extras_tests ${LIBS_INCLUDE_DIR}/tests/GuestTimeExtras.cpp)
@@ -2336,6 +2350,18 @@ if(NOT WIN32)
         set_target_properties(guest_allocations_oom_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
         add_test(NAME guest_allocations_oom COMMAND guest_allocations_oom_tests)
         set_tests_properties(guest_allocations_oom PROPERTIES TIMEOUT 60)
+    endif()
+endif()
+
+add_test_executable(guest_sce_v2_facet_ids_tests EXCLUDE_FROM_ALL ${LIBS_INCLUDE_DIR}/tests/GuestSceV2FacetIds.cpp)
+target_include_directories(guest_sce_v2_facet_ids_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(guest_sce_v2_facet_ids_tests PRIVATE libc)
+configure_windows_unwind(guest_sce_v2_facet_ids_tests)
+if(BUILD_TESTING)
+    set_target_properties(guest_sce_v2_facet_ids_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME guest_sce_v2_facet_ids COMMAND guest_sce_v2_facet_ids_tests)
+    if(WIN32)
+        set_tests_properties(guest_sce_v2_facet_ids PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
 
