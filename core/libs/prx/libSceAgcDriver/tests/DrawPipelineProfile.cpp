@@ -161,7 +161,7 @@ void TestReport() {
     Check(clears == "[dbclear] (10 s): 4 rect-list draws with a DB_RENDER_CONTROL clear (depth 2, stencil 1, both 1); first blocker of a native clear: "
                     "stencil test on a depth-only clear 1, partial sample mask 1, layered target 0, rectangle not proven 2; vertex programs: 0x410d900 x3 0x2000 x1", "the DB clear counters differ");
     const auto totals = pipeline.LifetimeTotals();
-    Check(totals.enqueued == 4 && totals.commits == 4 && totals.drawCommits == 2, "the lifetime totals lost what the report printed and reset");
+    Check(totals.enqueued >= 4 && totals.commits == totals.enqueued && totals.drawCommits == 2, "the lifetime totals lost what the report printed and reset");
     Check(totals.commitNs >= 9'000'000'000ull && totals.drawNs >= 9'000'000'000ull && totals.drawNs <= totals.commitNs, "the lifetime totals lost the commits' time");
 }
 

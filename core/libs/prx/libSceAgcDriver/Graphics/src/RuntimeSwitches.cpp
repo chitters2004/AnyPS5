@@ -308,7 +308,7 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds) {
     char text[512];
     const auto& config = state.schedule->Settings();
     const auto step = state.schedule->AtPresent(present, seconds);
-    if (const auto observe = abObserver.load(std::memory_order_acquire)) observe(step.event, step.b ? 'B' : 'A', step.phase, present, seconds);
+    if (const auto observe = abObserver.load(std::memory_order_acquire)) observe(step.event, AbSchedule::Letter(step.arm), step.phase, present, seconds);
     if (step.event == AbSchedule::Event::None) return lines;
     if (step.event == AbSchedule::Event::Begin) {
         if (step.phase == 0) {

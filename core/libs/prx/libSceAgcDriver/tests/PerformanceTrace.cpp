@@ -473,8 +473,7 @@ void AbCountersLine() {
     for (int index = 0; index < 5; ++index) flips.push_back(10.0 + 0.03 * index);
     const auto line = AgcDriver::AbCounters::Line('B', 3, from, to, flips);
     const auto has = [&](std::string_view text) { return line.find(text) != std::string::npos; };
-    Check(line.starts_with("[ab-counters] phase B 3 ") && line.ends_with("
-"), "the A/B counter line has the wrong head or tail");
+    Check(line.starts_with("[ab-counters] phase B 3 ") && line.ends_with('\n'), "the A/B counter line has the wrong head or tail");
     Check(has(" wall_ms=15000.000") && has(" presents=480") && has(" flip_p50_ms=30.000") && has(" flip_p90_ms=30.000"), "the A/B window counters differ");
     Check(has(" gpu_busy_ms=12000.000") && has(" gpu_gap_ms=300.000"), "the A/B GPU counters differ");
     Check(has(" commits=200") && has(" commit_ms=30.000") && has(" draws=170") && has(" draw_commit_ms=22.000"), "the A/B committer counters are not the phase's difference");

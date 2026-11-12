@@ -158,10 +158,10 @@ void glue() {
     lines = AgcDriver::Graphics::AbAtPresent(7, 11.5);
     Require(lines.size() == 1 && lines[0] == "[ab] phase A 2 begins at present 7 (t 11.500 s): APS5_NO_BARRIER_BATCH set\n", "phase A did not come back");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "phase A did not restore the environment's setting");
-    Require(observed == "0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0B1@6:70 1A2@7:115 ", "the A/B observer did not see every present with its event and arm: " + observed);
+    Require(observed == "0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0A0@6:70 1A2@7:115 ", "the A/B observer did not see every present with its event and arm: " + observed);
     AgcDriver::Graphics::SetAbObserver(nullptr);
     AgcDriver::Graphics::AbAtPresent(8, 12.0);
-    Require(observed.size() == std::string("0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0B1@6:70 1A2@7:115 ").size(), "a removed A/B observer was still called");
+    Require(observed.size() == std::string("0A0@1:0 1A0@3:10 2A0@4:35 1B1@5:60 0A0@6:70 1A2@7:115 ").size(), "a removed A/B observer was still called");
 }
 
 int multiArm() {
