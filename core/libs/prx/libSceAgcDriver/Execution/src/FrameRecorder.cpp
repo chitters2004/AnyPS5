@@ -487,12 +487,21 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     for (auto& span : spans) {
         if (const auto since = GuestMemory::CollectWrittenBlocks(span.address, static_cast<std::size_t>(span.bytes), span.since, written); since != 0) span.since = since;
         blocks.insert(blocks.end(), written.begin(), written.end());
+        std::uint64_t listed = 0;
+        for (const auto& [from, to] : written) listed += to - from;
+        std::uint64_t unwatchedBlocks = 0;
+        std::uint64_t allBlocks = 0;
         for (std::uint64_t offset = 0; offset < span.bytes;) {
             const auto at = span.address + offset;
             const auto bytes = static_cast<std::size_t>(std::min<std::uint64_t>(FrameCaptureWriter::BlockBytes, span.bytes - offset));
-            if (!GuestMemory::Watched(at, bytes)) blocks.emplace_back(at, at + bytes);
+            ++allBlocks;
+            if (!GuestMemory::Watched(at, bytes)) {
+                blocks.emplace_back(at, at + bytes);
+                ++unwatchedBlocks;
+            }
             offset += bytes;
         }
+        std::fprintf(stderr, "[delta-diag] capture span 0x%llx bytes %llu since %llu collected %llu bytes in %zu runs, blocks %llu of which unwatched %llu, accepted %llu completed %llu"\n", static_cast<unsigned long long>(span.address), static_cast<unsigned long long>(span.bytes), static_cast<unsigned long long>(span.since), static_cast<unsigned long long>(listed), written.size(), static_cast<unsigned long long>(allBlocks), static_cast<unsigned long long>(unwatchedBlocks), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(completed));
     }
     std::vector<std::array<std::uint64_t, 4>> parked;
     for (const auto& wait : driver.AwaitedWaits()) {
