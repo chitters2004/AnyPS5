@@ -1,7 +1,10 @@
 #include "DepthFastClearHarness.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -30,7 +33,11 @@ using ShaderRecompiler::ShaderStage;
 
 alignas(4096) std::array<float, Width * Height * 2> Depth{};
 alignas(4096) std::array<std::uint8_t, Width * Height * 2> Stencil{};
+alignas(4096) std::array<float, Width * Height * 2> OtherDepth{};
+alignas(4096) std::array<std::uint8_t, Width * Height * 2> OtherStencil{};
 alignas(256) constexpr std::array<std::uint32_t, 64> NullPixelCode{0xbf810000u};
+alignas(256) constexpr std::array<std::uint32_t, 7> BufferPixelCode{0x7e0a0280u, 0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf800180fu, 0x03020100u, 0xbf810000u};
+alignas(256) constexpr std::array<float, 4> BufferColor{1.0f, 1.0f, 1.0f, 1.0f};
 alignas(256) constexpr std::array<std::uint32_t, 8> ExportDepth{0x7e0002f2, 0xf800100f, 0x00000000, 0x7e0202ff, 0x3e800000, 0xf8001881, 0x00000001, 0xbf810000};
 
 const std::vector<std::array<float, 4>>& HalfTriangle() {
@@ -40,7 +47,12 @@ const std::vector<std::array<float, 4>>& HalfTriangle() {
     return vertices;
 }
 
-ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t vertexPush, bool exports, bool depthExport) {
+std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
+}
+
+ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, std::uint32_t vertexPush, bool exports, bool depthExport, std::span<const std::uint32_t> userWords = {}) {
     const auto target = device.Target();
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     pixel.wave32 = true;
@@ -55,6 +67,7 @@ ShaderRecompiler::RecompileResult CompilePixel(AgcDriver::VulkanDevice& device, 
     pixel.depthExportMin = 0.0f;
     pixel.depthExportMax = 1.0f;
     std::vector<std::uint32_t> userData(4, 0u);
+    std::copy(userWords.begin(), userWords.end(), userData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
@@ -78,11 +91,12 @@ struct Pass {
     float minBound = 0.0f;
     float maxBound = 1.0f;
     std::uint16_t sampleMask = 0xffffu;
+    bool otherDepth = false;
 };
 
 alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
 
-std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const ShaderRecompiler::RecompileResult& pixel, const Pass& pass) {
+std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const ShaderRecompiler::RecompileResult& pixel, const Pass& pass, bool wait = true) {
     std::fill(Pixels.begin(), Pixels.end(), std::byte{0});
     const std::array<AgcDriver::Graphics::CompiledShader, 2> shaders{{
         {ShaderStage::Vertex, &vertex.vertex, 0},
@@ -98,7 +112,7 @@ std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const
         state.blend.colorWriteMask = 15;
         state.blends = {state.blend};
     }
-    state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(Depth.data()), reinterpret_cast<std::uintptr_t>(Stencil.data()), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0, 0, false};
+    state.depth = AgcDriver::Graphics::DepthTarget{reinterpret_cast<std::uintptr_t>(pass.otherDepth ? OtherDepth.data() : Depth.data()), reinterpret_cast<std::uintptr_t>(pass.otherDepth ? OtherStencil.data() : Stencil.data()), extent, VK_FORMAT_D32_SFLOAT_S8_UINT, 1.0f, 0, 0, false};
     state.depthTest = pass.depthTest;
     state.depthWrite = pass.depthWrite;
     state.depthCompare = pass.depthCompare;
@@ -119,6 +133,7 @@ std::uint32_t Draw(AgcDriver::VulkanDevice& device, const Shaders& vertex, const
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, 3u, 0, 1, 0, false};
     device.Draw(state, draw, shaders);
+    if (!wait) return 0;
     device.WaitIdle();
     std::uint32_t covered = 0;
     for (std::size_t index = 0; index < Pixels.size() / 4u; ++index) {
@@ -154,6 +169,10 @@ public:
 private:
     AgcDriver::Graphics::Context context;
 };
+
+std::uint64_t SetsAllocated(AgcDriver::VulkanDevice& device) {
+    return AgcDriver::VulkanDeviceTestAccess::ContextOf(device).descriptorCache->Counters().sets;
+}
 
 std::uint32_t Equal(AgcDriver::VulkanDevice& device, const Shaders& full, const ShaderRecompiler::RecompileResult& plain, float depth) {
     return Draw(device, full, plain, {.color = true, .depthTest = true, .depthWrite = false, .depthCompare = VK_COMPARE_OP_EQUAL, .depth = depth});
@@ -228,7 +247,67 @@ int main() {
         const auto colored = AgcDriver::Graphics::TakeInertFragmentCounts();
         Require(colored.omitted == 0u && colored.kept == 1u, "an inert draw with a writable color attachment dropped its fragment stage");
 
-        std::printf("inert fragment pipeline tests passed (fragment stage %s, occlusion samples %s)\n", kept ? "kept" : "omitted", samples.Available() ? "checked" : "not checked");
+        const auto colorBuffer = BufferDescriptor(BufferColor.data(), 16u, 1u);
+        const auto reading = CompilePixel(*device, BufferPixelCode, full.vertexPush, true, false, colorBuffer);
+        Require(!AgcDriver::Graphics::InertFragment(reading), "a buffer-reading pixel program is inert");
+        Require(!reading.bindings.empty(), "the buffer-reading pixel program has no descriptor binding");
+        const std::array<AgcDriver::Graphics::CompiledShader, 2> readingStages{{{ShaderStage::Vertex, &full.vertex, 0}, {ShaderStage::Fragment, &reading, PixelPushOffset(full.vertexPush, device->Target())}}};
+        Require(AgcDriver::Graphics::SplitsSets(context, readingStages) == context.graphicsPipelineLibrary, "a buffer-reading pixel program did not split the descriptor sets under graphics pipeline libraries");
+        Reset(*device, full, plain);
+        const Pass depthOnly{.depthTest = true, .depthWrite = true, .depth = 0.5f};
+        for (int round = 0; round < 2; ++round) {
+            Draw(*device, full, null, depthOnly, false);
+            Draw(*device, full, reading, {.depthTest = true, .depthWrite = true, .depth = 0.25f}, false);
+        }
+        Draw(*device, full, null, depthOnly);
+        Require(Equal(*device, full, plain, 0.5f) == Covered, "a pass that switched between an inert depth-only pipeline and a buffer-reading one left other depth than its last draw");
+        Require(Draw(*device, full, reading, {.color = true, .depthTest = false}) == Covered, "the buffer-reading pixel program did not read its color from its fragment set");
+        const auto inertBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, null, depthOnly);
+        const auto inertSets = SetsAllocated(*device) - inertBefore;
+        const auto readingBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, reading, depthOnly);
+        const auto readingSets = SetsAllocated(*device) - readingBefore;
+        Require(readingSets - inertSets == (context.graphicsPipelineLibrary ? 4u : 0u), "draws whose fragment program has no bindings allocated a fragment descriptor set");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::KeepEmptyFragmentSet, true);
+        const auto keptBefore = SetsAllocated(*device);
+        for (int i = 0; i < 4; ++i) Draw(*device, full, null, depthOnly);
+        const auto keptSets = SetsAllocated(*device) - keptBefore;
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::KeepEmptyFragmentSet, false);
+        Require(keptSets == readingSets, "APS5_KEEP_EMPTY_FRAGMENT_SET did not allocate the empty fragment set again");
+
+        const bool timed = AgcDriver::Graphics::Recorder::GpuTimingEnabled();
+        if (timed) {
+            const auto before = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            for (int i = 0; i < 3; ++i) Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            for (int i = 0; i < 2; ++i) Draw(*device, full, plain, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f}, false);
+            Draw(*device, full, plain, {.depthTest = true, .depthWrite = true, .depth = 0.5f});
+            const auto after = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(after.draws - before.draws == 7u, "the [gputime] draw ranges did not hold every draw of the mix");
+            Require(after.inert - before.inert == 4u, "the [gputime] draw ranges did not count the draws with an inert fragment program");
+            Require(after.omitted - before.omitted == (kept ? 0u : 4u), "the [gputime] draw ranges did not count the draws recorded without the fragment stage");
+            Require(after.inertRanges - before.inertRanges == 3u, "the [gputime] inert-only draw ranges were not the passes made of inert fragment draws alone");
+            Require(after.inertMs > before.inertMs, "the [gputime] inert-only draw ranges took no GPU time");
+            const auto ended = [](const auto& totals, const auto& earlier, AgcDriver::Graphics::PassBreak by) { return totals.inertBreakRanges[static_cast<std::size_t>(by)] - earlier.inertBreakRanges[static_cast<std::size_t>(by)]; };
+            using Break = AgcDriver::Graphics::PassBreak;
+            Require(ended(after, before, Break::NewBatch) == 3u, "the [gputime] inert-only draw ranges were not told to end at their batch's wait");
+            const auto keyBefore = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f}, false);
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f, .otherDepth = true}, false);
+            Draw(*device, full, null, {.depthTest = true, .depthWrite = true, .depth = 0.5f, .otherDepth = true});
+            const auto keyAfter = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(ended(keyAfter, keyBefore, Break::Command) == 1u && ended(keyAfter, keyBefore, Break::NewBatch) == 1u, "the [gputime] inert-only draw range of a pass left for another depth target did not end by command, or the last one by its batch");
+            Require(keyAfter.inertRanges - keyBefore.inertRanges == 2u, "the [gputime] inert-only draw ranges did not count both passes of the depth target change");
+            const auto syncBefore = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            for (int i = 0; i < 3; ++i) Draw(*device, full, plain, {.color = true, .depthTest = false});
+            const auto syncAfter = AgcDriver::Graphics::Recorder::DrawFragmentTimes();
+            Require(syncAfter.syncRanges - syncBefore.syncRanges == 3u, "the [gputime] draw-sync class did not hold one range per synchronous draw");
+            Require(syncAfter.syncMs > syncBefore.syncMs, "the [gputime] draw-sync ranges took no GPU time");
+            Require(syncAfter.draws == syncBefore.draws, "a synchronous draw was counted in the recorded draw ranges");
+        }
+
+        std::printf("inert fragment pipeline tests passed (fragment stage %s, occlusion samples %s, [gputime] draw fragment share %s)\n", kept ? "kept" : "omitted", samples.Available() ? "checked" : "not checked", timed ? "checked" : "not checked");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

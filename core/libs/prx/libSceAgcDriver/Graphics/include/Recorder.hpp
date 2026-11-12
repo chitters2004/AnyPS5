@@ -738,7 +738,7 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawSync, Count };
     void OweTrailingBarrier(const BarrierMask& mask, CommandClass which);
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
@@ -771,6 +771,21 @@ public:
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
+    enum class DrawFragment : std::uint8_t { Run = 0, InertKept, InertOmitted, Count };
+    void NoteTimedDraw(std::uint32_t index, DrawFragment fragment);
+    std::uint32_t OpenPassTiming() const;
+    struct DrawFragmentTotals {
+        std::uint64_t draws = 0;
+        std::uint64_t inert = 0;
+        std::uint64_t omitted = 0;
+        std::uint64_t inertRanges = 0;
+        double inertMs = 0;
+        std::array<std::uint64_t, PassBreakCount> inertBreakRanges{};
+        std::array<double, PassBreakCount> inertBreakMs{};
+        std::uint64_t syncRanges = 0;
+        double syncMs = 0;
+    };
+    static DrawFragmentTotals DrawFragmentTimes();
     // Presentations, so the [gputime] class totals can be given per present.
     static void CountPresent();
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
@@ -875,6 +890,8 @@ private:
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         std::vector<std::uint8_t> timedTags;
+        std::vector<std::array<std::uint32_t, static_cast<std::size_t>(DrawFragment::Count)>> timedDraws;
+        std::vector<PassBreak> timedBreaks;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

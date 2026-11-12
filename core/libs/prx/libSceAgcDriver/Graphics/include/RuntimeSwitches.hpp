@@ -39,6 +39,7 @@ enum class RuntimeSwitch : std::size_t {
     NoEarlyRegionCopies,
     NoDrawInputRing,
     NoRecordedCpuUpload,
+    KeepEmptyFragmentSet,
     Count,
 };
 

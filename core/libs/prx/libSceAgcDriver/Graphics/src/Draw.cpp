@@ -65,8 +65,9 @@ void CountVkDraw(VkDrawKind kind) {
     vkDrawCounts[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 std::array<std::atomic<std::uint64_t>, 2> inertFragmentCounts{};
-void CountInertFragment(const Pipeline& pipeline) {
+void CountInertFragment(const Pipeline& pipeline, Recorder* recorder, std::uint32_t timing) {
     if (pipeline.InertFragmentStage()) inertFragmentCounts[pipeline.FragmentStageOmitted() ? 0u : 1u].fetch_add(1, std::memory_order_relaxed);
+    if (recorder != nullptr) recorder->NoteTimedDraw(timing, !pipeline.InertFragmentStage() ? Recorder::DrawFragment::Run : pipeline.FragmentStageOmitted() ? Recorder::DrawFragment::InertOmitted : Recorder::DrawFragment::InertKept);
 }
 
 
@@ -3313,7 +3314,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         eachDrawTiming = recorder->BeginInPassGpuTiming(Recorder::DrawTimingKey(key));
     }
     noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), record.indirect != nullptr ? record.indirect->args : nullptr);
-    CountInertFragment(*record.pipeline);
+    CountInertFragment(*record.pipeline, recorder, continued ? recorder->OpenPassTiming() : drawTiming);
     if (record.stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     else {
         recordStencilReplay(context, recording, state, draw, inputs, record.stencilReplay, shaders, resources, record.pushBytes, record.pushStages);
@@ -4603,6 +4604,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (!recorded) batch->BeginGpuStamp();
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -4695,7 +4697,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     std::uint32_t subdraw = 0;
     if (recorded) noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), args);
-    CountInertFragment(*pipeline);
+    CountInertFragment(*pipeline, recorded ? recorder : nullptr, drawTiming);
     if (stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, prepared.trace, subdraw);
     else {
         recordStencilReplay(context, recording, state, draw, inputs, stencilReplay, shaders, *resources);
@@ -4780,6 +4782,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | inputs.shaderStages, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &download, 0, nullptr, 0, nullptr);
     countBarrier();
     if (recorded) recorder->EndGpuTiming(drawTiming);
+    else batch->EndGpuStamp(CommandClass::DrawSync);
     APS5_LOG_CHARS_OUT_DEBUG("Download barrier recorded");
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);

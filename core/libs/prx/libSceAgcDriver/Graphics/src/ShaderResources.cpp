@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
 #include <atomic>
@@ -2641,7 +2642,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         _layout = createLayout(layoutKey, descriptions[0], layoutBindingFlags, ownsLayout);
         if (splitSets) {
             fragment.layout = createLayout(fragmentLayoutKey, descriptions[1], fragmentBindingFlags, fragment.ownsLayout);
-            {
+            if (!descriptions[1].empty() || RuntimeSwitches::Set(RuntimeSwitch::KeepEmptyFragmentSet)) {
                 const auto sizes = splitPoolSizes(1);
                 const auto variableCount = tableVariableCount(1);
                 if (context.descriptorCache != nullptr && !noPoolCache) {
@@ -7892,7 +7893,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         result.layout = _layout;
         Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    if (described[1] || splitSets) {
+    if (described[1] || (splitSets && RuntimeSwitches::Set(RuntimeSwitch::KeepEmptyFragmentSet))) {
         result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");

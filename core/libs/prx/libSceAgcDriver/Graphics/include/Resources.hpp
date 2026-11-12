@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include <span>
 
@@ -110,14 +111,20 @@ public:
     void SubmitAndWait();
     void Submit();
     void Wait();
+    void BeginGpuStamp();
+    void EndGpuStamp(Recorder::CommandClass which);
 
 private:
     void release() noexcept;
+    void readGpuStamp();
     Context context;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
     bool pending = false;
     bool submitted = false;
+    VkQueryPool stamps = VK_NULL_HANDLE;
+    bool stampEnded = false;
+    Recorder::CommandClass stampClass = Recorder::CommandClass::Count;
 };
 
 }

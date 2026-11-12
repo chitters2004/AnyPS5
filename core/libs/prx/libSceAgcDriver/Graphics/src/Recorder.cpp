@@ -2275,6 +2275,7 @@ void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
         CountBarriers(CommandClass::Draw);
     }
     if (pass.afterPass) pass.afterPass(open->graphicsState);
+    if (pass.timing != NoTiming && pass.timing < open->timedBreaks.size()) open->timedBreaks[pass.timing] = by;
     EndGpuTiming(pass.timing);
     open->coveredAccess = barrier ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT : 0;
     open->hostReadOwed = true;
@@ -2641,7 +2642,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "draw-sync"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -2700,6 +2701,7 @@ std::string StageText(std::uint32_t mask) {
     return text.empty() ? "0" : text;
 }
 std::uint64_t timingBatches = 0;
+Recorder::DrawFragmentTotals drawFragments, drawFragmentsReported;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -2931,6 +2933,10 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     totals.ms += nanoseconds / 1e6;
     totals.bytes += bytes;
     timingClassMs += nanoseconds / 1e6;
+    if (which == CommandClass::DrawSync) {
+        ++drawFragments.syncRanges;
+        drawFragments.syncMs += nanoseconds / 1e6;
+    }
 }
 
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
@@ -2978,6 +2984,8 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
     open->timedTags.push_back(0xff);
+    open->timedDraws.push_back({});
+    open->timedBreaks.push_back(PassBreak::Continued);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2993,6 +3001,20 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+void Recorder::NoteTimedDraw(std::uint32_t index, DrawFragment fragment) {
+    if (index == NoTiming || open == nullptr || index >= open->timedDraws.size()) return;
+    ++open->timedDraws[index][static_cast<std::size_t>(fragment)];
+}
+
+std::uint32_t Recorder::OpenPassTiming() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.timing : NoTiming;
+}
+
+Recorder::DrawFragmentTotals Recorder::DrawFragmentTimes() {
+    std::lock_guard lock(timingMutex);
+    return drawFragments;
 }
 
 bool Recorder::RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup) {
@@ -3662,6 +3684,20 @@ void Recorder::readGpuTiming(Batch& batch) {
             ++reason.count;
             reason.ms += ns / 1e6;
         }
+        if (key == ClassKey(CommandClass::Draw)) {
+            const auto& draws = batch.timedDraws[i];
+            const auto inert = draws[static_cast<std::size_t>(DrawFragment::InertKept)] + draws[static_cast<std::size_t>(DrawFragment::InertOmitted)];
+            drawFragments.draws += draws[static_cast<std::size_t>(DrawFragment::Run)] + inert;
+            drawFragments.inert += inert;
+            drawFragments.omitted += draws[static_cast<std::size_t>(DrawFragment::InertOmitted)];
+            if (inert != 0 && draws[static_cast<std::size_t>(DrawFragment::Run)] == 0) {
+                ++drawFragments.inertRanges;
+                drawFragments.inertMs += ns / 1e6;
+                const auto by = static_cast<std::size_t>(batch.timedBreaks[i]);
+                ++drawFragments.inertBreakRanges[by];
+                drawFragments.inertBreakMs[by] += ns / 1e6;
+            }
+        }
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
@@ -3683,9 +3719,25 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::string classes;
     for (const auto& [key, totals] : timingByKey) {
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
-            char text[160];
+            char text[224];
             std::snprintf(text, sizeof(text), " %s x%llu %.1fms %.1fMiB (per present x%.1f %.2fms %.2fMiB)", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<unsigned long long>(totals.count), totals.ms, totals.bytes / 1048576.0, static_cast<double>(totals.count) * perPresent, totals.ms * perPresent, totals.bytes / 1048576.0 * perPresent);
             classes += text;
+            if (key == ClassKey(CommandClass::Draw) && drawFragments.draws != drawFragmentsReported.draws) {
+                const auto ranges = drawFragments.inertRanges - drawFragmentsReported.inertRanges;
+                const auto ms = drawFragments.inertMs - drawFragmentsReported.inertMs;
+                std::string ended;
+                for (std::size_t by = 0; by < PassBreakCount; ++by) {
+                    const auto count = drawFragments.inertBreakRanges[by] - drawFragmentsReported.inertBreakRanges[by];
+                    if (count == 0) continue;
+                    char part[96];
+                    std::snprintf(part, sizeof(part), "%s %s x%llu %.1fms", ended.empty() ? "; ended by" : ",", PassBreakNames[by], static_cast<unsigned long long>(count), drawFragments.inertBreakMs[by] - drawFragmentsReported.inertBreakMs[by]);
+                    ended += part;
+                }
+                char inertText[512];
+                std::snprintf(inertText, sizeof(inertText), " draw-inert x%llu %.1fms 0.0MiB (per present x%.1f %.2fms 0.00MiB; of x%llu draws x%llu inert fragment, x%llu without the stage%s)", static_cast<unsigned long long>(ranges), ms, static_cast<double>(ranges) * perPresent, ms * perPresent, static_cast<unsigned long long>(drawFragments.draws - drawFragmentsReported.draws), static_cast<unsigned long long>(drawFragments.inert - drawFragmentsReported.inert), static_cast<unsigned long long>(drawFragments.omitted - drawFragmentsReported.omitted), ended.c_str());
+                classes += inertText;
+                drawFragmentsReported = drawFragments;
+            }
         } else {
             hot.emplace_back(key, totals);
         }
