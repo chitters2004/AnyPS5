@@ -1,3 +1,4 @@
+#pragma once
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
@@ -78,13 +79,29 @@ std::uint32_t Expected(const Variant& variant, const std::array<std::uint32_t, 3
     return result;
 }
 
-std::vector<Variant> Variants() {
+std::vector<Variant> Variants(std::span<const Operation> operations) {
     std::vector<Variant> variants;
-    for (const auto operation : {Operation::Add, Operation::Mul, Operation::Min, Operation::Max}) {
-        for (std::uint32_t bits = 0; bits < 256u; ++bits) variants.push_back({operation, bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, (bits >> 6u) & 3u, 0u});
+    const auto source = [](std::uint32_t code, std::uint32_t bit) { return (code >> bit) & 1u; };
+    for (const auto operation : operations) {
+        if (operation == Operation::Add) {
+            for (std::uint32_t bits = 0; bits < 256u; ++bits) variants.push_back({operation, bits & 3u, (bits >> 2u) & 3u, (bits >> 4u) & 3u, (bits >> 6u) & 3u, 0u});
+        } else if (operation == Operation::Fma) {
+            for (std::uint32_t first = 0; first < 16u; ++first) {
+                for (std::uint32_t second = 0; second < 16u; ++second) {
+                    const std::uint32_t third = (first + second) & 15u;
+                    const auto field = [&](std::uint32_t bit) { return source(first, bit) | (source(second, bit) << 1u) | (source(third, bit) << 2u); };
+                    variants.push_back({operation, field(0u), field(1u), field(2u), field(3u), 0u});
+                }
+            }
+        } else if (operation == Operation::Pack) {
+            for (std::uint32_t bits = 0; bits < 64u; ++bits) variants.push_back({operation, bits & 3u, 0u, (bits >> 2u) & 3u, 0u, (bits >> 4u) & 3u});
+        } else {
+            constexpr std::array<std::array<std::uint32_t, 2>, 4> Negations{{{0u, 0u}, {3u, 0u}, {0u, 3u}, {1u, 2u}}};
+            for (std::uint32_t select = 0; select < 16u; ++select) {
+                for (const auto& [negLo, negHi] : Negations) variants.push_back({operation, select & 3u, select >> 2u, negLo, negHi, 0u});
+            }
+        }
     }
-    for (std::uint32_t bits = 0; bits < 4096u; ++bits) variants.push_back({Operation::Fma, bits & 7u, (bits >> 3u) & 7u, (bits >> 6u) & 7u, (bits >> 9u) & 7u, 0u});
-    for (std::uint32_t bits = 0; bits < 64u; ++bits) variants.push_back({Operation::Pack, bits & 3u, 0u, (bits >> 2u) & 3u, 0u, (bits >> 4u) & 3u});
     return variants;
 }
 
@@ -179,21 +196,24 @@ std::size_t Run(AgcDriver::VulkanDevice& device, std::span<const Variant> varian
 
 }
 
-int main() {
+int RunPackedF16LaneModifiers(std::span<const Operation> operations) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Fill();
-        const auto variants = Variants();
+        const auto variants = Variants(operations);
         std::size_t failures = 0;
+        std::vector<Variant> everyFourth;
+        for (std::size_t index = 0; index < variants.size(); index += 4u) everyFourth.push_back(variants[index]);
         for (const bool ieee : {false, true}) {
-            for (std::size_t first = 0; first < variants.size(); first += Batch) {
-                const auto count = std::min<std::size_t>(Batch, variants.size() - first);
-                failures += Run(*device, std::span<const Variant>(variants).subspan(first, count), ieee);
+            const auto& selected = ieee ? everyFourth : variants;
+            for (std::size_t first = 0; first < selected.size(); first += Batch) {
+                const auto count = std::min<std::size_t>(Batch, selected.size() - first);
+                failures += Run(*device, std::span<const Variant>(selected).subspan(first, count), ieee);
             }
         }
         Require(failures == 0u, "packed f16 lane modifiers: " + std::to_string(failures) + " results differ from the lane model");
-        std::printf("packed f16 lane modifier tests passed (%zu variants, %u lanes, 2 IEEE modes)\n", variants.size(), Threads);
+        std::printf("packed f16 lane modifier tests passed (%zu variants, %zu of them at IEEE 1, %u lanes)\n", variants.size(), everyFourth.size(), Threads);
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

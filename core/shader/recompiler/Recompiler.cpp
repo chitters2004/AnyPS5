@@ -43,6 +43,7 @@
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/include/Optimization/NanFlagPruner.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
@@ -314,15 +315,18 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         dumpIr("ssa");
 
         constantFolder.Fold(program);
-        ResolveControlFlowIdentities(program);
         deadCodeEliminator.RemoveIdentities(program);
         deadCodeEliminator.Eliminate(program);
+        if (NanFlagPruner{}.Prune(program).removedChecks != 0u) {
+            constantFolder.Fold(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
+        }
         dumpIr("fold");
 
         const auto readLaneStats = readLaneEliminator.Eliminate(program, translateOptions.waveSize);
         if (readLaneStats.rewrittenReads != 0u) {
             constantFolder.Fold(program);
-            ResolveControlFlowIdentities(program);
             deadCodeEliminator.RemoveIdentities(program);
             deadCodeEliminator.Eliminate(program);
         }
@@ -339,7 +343,6 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
             });
             if (liveAncillary) {
                 constantFolder.Fold(program);
-                ResolveControlFlowIdentities(program);
                 deadCodeEliminator.RemoveIdentities(program);
                 deadCodeEliminator.Eliminate(program);
             }
@@ -356,6 +359,8 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         program.Metadata().barycentricEmulation = !hostInterpolationFirst;
         simplify();
     }
+
+    if (program.Metadata().nanSpeculationDeclines != 0u) std::fprintf(stderr, "[recompile] nan speculation declined %u region(s) in 0x%llx\n", program.Metadata().nanSpeculationDeclines, static_cast<unsigned long long>(request.shader.codeAddress));
 
     constexpr DenormalFlushEliminator denormalFlushEliminator;
     if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
@@ -628,7 +633,6 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     constexpr ConstantFolder constantFolder;
     if (request.shader.stage == ShaderStage::Vertex && constantFolder.FoldVertexLaneBounds(program, HostSubgroupSize(request), request.target.spirvVersion)) {
         constantFolder.Fold(program);
-        ResolveControlFlowIdentities(program);
     }
 
     deadCodeEliminator.RemoveIdentities(program);

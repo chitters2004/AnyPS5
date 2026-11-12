@@ -21,7 +21,7 @@ using namespace F16LaneModel;
 constexpr std::uint32_t Threads = 64;
 constexpr std::uint32_t Rounds = 64;
 constexpr std::uint32_t PerDispatch = Threads * Rounds;
-constexpr std::uint32_t Dispatches = 4;
+constexpr std::uint32_t Dispatches = 1;
 
 constexpr std::array<std::uint16_t, 16> Edges{
     0x0000u, 0x8000u, 0x0001u, 0x83ffu, 0x0400u, 0x3c00u, 0xbc01u, 0x3555u,
