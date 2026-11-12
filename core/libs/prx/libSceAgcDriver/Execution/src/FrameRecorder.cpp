@@ -501,7 +501,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
             }
             offset += bytes;
         }
-        std::fprintf(stderr, "[delta-diag] capture span 0x%llx bytes %llu since %llu collected %llu bytes in %zu runs, blocks %llu of which unwatched %llu, accepted %llu completed %llu"\n", static_cast<unsigned long long>(span.address), static_cast<unsigned long long>(span.bytes), static_cast<unsigned long long>(span.since), static_cast<unsigned long long>(listed), written.size(), static_cast<unsigned long long>(allBlocks), static_cast<unsigned long long>(unwatchedBlocks), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(completed));
+        std::fprintf(stderr, "[delta-diag] capture span 0x%llx bytes %llu since %llu collected %llu bytes in %zu runs, blocks %llu of which unwatched %llu, accepted %llu completed %llu\n", static_cast<unsigned long long>(span.address), static_cast<unsigned long long>(span.bytes), static_cast<unsigned long long>(span.since), static_cast<unsigned long long>(listed), written.size(), static_cast<unsigned long long>(allBlocks), static_cast<unsigned long long>(unwatchedBlocks), static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(completed));
     }
     std::vector<std::array<std::uint64_t, 4>> parked;
     for (const auto& wait : driver.AwaitedWaits()) {
