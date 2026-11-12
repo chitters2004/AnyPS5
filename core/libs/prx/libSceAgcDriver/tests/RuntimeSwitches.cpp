@@ -47,6 +47,8 @@ void registry() {
     Require(!RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back unset");
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierBatch, true);
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoBarrierBatch), "an assigned switch did not read back set");
+    const auto ring = AbSchedule::Parse("30:APS5_SINGLE_RING_PREPARER", "", "");
+    Require(ring.switches.size() == 1 && ring.switches.front() == RuntimeSwitch::SingleRingPreparer, "the ring's preparer switch is not flippable by APS5_AB");
 }
 
 void parse() {
