@@ -130,7 +130,6 @@ struct DrawTail {
     std::chrono::steady_clock::time_point phaseLap{};
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     Pm4::DrawParameters drawParameters{};
-    Pm4::DrawParameters resolvedParameters{};
     std::vector<DrawUserPatch> userPatches;
     bool pipelined = false;
     bool traceIndirect = false;
@@ -340,7 +339,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& drawParameters = tail.drawParameters;
     try {
         drawParameters = Pm4::ResolveDraw(packet, queue);
-        tail.resolvedParameters = drawParameters;
     } catch (...) {
         TraceDrawAttemptException(traceToken, "resolve-draw", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -790,7 +788,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& phaseLap = tail.phaseLap;
     auto& captures = tail.captures;
     auto& phaseTiming = tail.phaseTiming;
-    auto& drawParameters = tail.drawParameters;
+    auto drawParameters = tail.drawParameters;
     const bool pipelined = tail.pipelined;
     static const bool pipelinedIndirect = std::getenv("APS5_NO_PIPELINED_INDIRECT") == nullptr;
     const auto drainBeforeInline = [&] {
@@ -1420,7 +1418,6 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
     const auto& graphics = tail.decode->state;
     const auto& roles = tail.decode->roles;
     const auto count = programs.size();
-    tail.drawParameters = tail.resolvedParameters;
     tail.memory.clear();
     AppendProgramMemory(tail.memory, programs);
     tail.results.clear();
