@@ -3423,6 +3423,24 @@ bool RecordDraws() {
 
 }
 
+bool ResidentTargetsEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoResidentTargets);
+}
+
+TargetResidency ColorTargetResidency(const Context& context, const ColorTarget& color, bool residentTargets, bool residentLinear) {
+    if (color.samples > 1) return TargetResidency::Multisampled;
+    if (!residentTargets || context.detiler == nullptr) return TargetResidency::Copied;
+    if (!ColorTileModeIsLinear(color.tileMode)) return TargetResidency::Resident;
+    if (!residentLinear || color.tileMode != ColorTileMode::Linear || context.hostImportAlignment == 0) return TargetResidency::Copied;
+    return TargetResidency::LinearImport;
+}
+
+bool LinearTargetImported(const Context& context, const ColorTarget& color, bool import) {
+    const auto bytes = ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes();
+    if (ExistingHostImportFor(context, color.address, bytes) != nullptr) return true;
+    return import && GuestMemory::Watched(color.address, bytes) && HostImportFor(context, color.address, bytes, ImportRequester::ColorTarget) != nullptr;
+}
+
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state) {
     auto& key = validationKeyScratch();
     if (!ValidationKey(context, shaders, state, key)) return std::nullopt;
@@ -3926,10 +3944,10 @@ TargetResolution ResolveDrawTargets(const Context& context, const State& state, 
             if (color.fmaskAddress != 0) GuardOneFragmentFmask(context, color);
             constexpr VkBufferUsageFlags copies = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
             timer.phase(PhaseSetup);
-            static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
-            const bool linearResident = residentLinear && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
+            const auto residency = ColorTargetResidency(context, color, residentTargets, !RuntimeSwitches::Set(RuntimeSwitch::NoResidentLinear));
+            const bool resident = residency == TargetResidency::Resident || (residency == TargetResidency::LinearImport && LinearTargetImported(context, color, true));
             BeginCommitPhase(CommitPhase::Targets);
-            if ((binding.gpuTiling || ((!ColorTileModeIsLinear(color.tileMode) || linearResident) && context.detiler != nullptr)) && residentTargets) {
+            if (resident) {
                 // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
                 // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
                 // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts
@@ -5455,12 +5473,34 @@ std::vector<std::uint32_t> DrawResourceCacheKey(const Context& context, const St
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize, !trimKey, nullptr);
 }
 
-std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit) {
+std::optional<bool> PredictDrawDeviceStaging(const Context& context, const State& state) {
+    if (!RecordDraws() || Recorder::Active() == nullptr || DumpTargetLimit() != 0 || !drawStagingEnabled()) return false;
+    const bool residentTargets = ResidentTargetsEnabled();
+    const bool residentLinear = !RuntimeSwitches::Set(RuntimeSwitch::NoResidentLinear);
+    bool known = true;
+    for (const auto& color : state.colors) {
+        const auto residency = ColorTargetResidency(context, color, residentTargets, residentLinear);
+        if (residency == TargetResidency::Copied) return false;
+        if (residency == TargetResidency::LinearImport && !LinearTargetImported(context, color, false)) known = false;
+    }
+    if (!known) return std::nullopt;
+    return true;
+}
+
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit, bool& stagingPredicted) {
     const auto key = DrawResourceCacheKey(context, state, draw, shaders);
     predictedHit = !key.empty() && SharedResourceCache().Peek(key) != nullptr;
+    stagingPredicted = false;
     if (predictedHit) return nullptr;
+    auto deviceStaging = lastDrawDeviceStaging.load(std::memory_order_relaxed);
+    if (!RuntimeSwitches::Set(RuntimeSwitch::NoStagingPrediction)) {
+        if (const auto predicted = PredictDrawDeviceStaging(context, state)) {
+            deviceStaging = *predicted;
+            stagingPredicted = true;
+        }
+    }
     const auto indexBytes = static_cast<std::size_t>(static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize);
-    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, snapshots, lastDrawDeviceStaging.load(std::memory_order_relaxed), ShaderResources::PreparedOffDevice{});
+    return std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, snapshots, deviceStaging, ShaderResources::PreparedOffDevice{});
 }
 
 }

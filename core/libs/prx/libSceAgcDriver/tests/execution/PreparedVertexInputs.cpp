@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -405,7 +406,8 @@ int main() {
             const auto hitKey = AgcDriver::Graphics::DrawResourceCacheKey(context, epochState, epochDraw, programs->shaders);
             Require(!hitKey.empty(), "prepared vertex inputs: the draw has no resource cache key, so a cache hit cannot be predicted for it");
             bool predicted = true;
-            auto cachedBuild = AgcDriver::Graphics::PrepareDrawResourcesOffDevice(context, epochState, epochDraw, programs->shaders, {}, predicted);
+            bool stagingPredicted = false;
+            auto cachedBuild = AgcDriver::Graphics::PrepareDrawResourcesOffDevice(context, epochState, epochDraw, programs->shaders, {}, predicted, stagingPredicted);
             Require(!predicted && cachedBuild != nullptr, "prepared vertex inputs: a cache hit was predicted for a key the resource cache does not hold");
             auto& cache = AgcDriver::Graphics::SharedResourceCache();
             cache.Insert(hitKey, cachedBuild);
@@ -427,6 +429,47 @@ int main() {
             Require(AgcDriver::Graphics::ResourceCache::Finds() == findsBefore && AgcDriver::Graphics::ResourceCache::Touches() == touchesBefore, "prepared vertex inputs: predicting the cache hit found or touched the entry, which reorders the cache and its counts");
             cache.Remove(hitKey, cachedBuild.get());
             cachedBuild.reset();
+            using AgcDriver::Graphics::TargetResidency;
+            Require(context.detiler != nullptr, "prepared vertex inputs: the device has no detiler, so color target residency cannot be predicted");
+            AgcDriver::Graphics::ColorTarget linear{};
+            auto* const targetBlock = AllocateWatched(Block);
+            GuestAllocations::Mutation().Add(targetBlock, Block, true, true, true);
+            linear.address = reinterpret_cast<std::uintptr_t>(targetBlock);
+            linear.extent = {64, 32};
+            linear.format = VK_FORMAT_R8G8B8A8_UNORM;
+            linear.bytes = 64 * 32 * 4;
+            linear.tileMode = AgcDriver::Graphics::ColorTileMode::Linear;
+            linear.elementBytes = 4;
+            auto tiled = linear;
+            tiled.tileMode = AgcDriver::Graphics::ColorTileMode::Standard4KB;
+            auto multisampled = linear;
+            multisampled.samples = 4;
+            auto gcnLinear = linear;
+            gcnLinear.tileMode = AgcDriver::Graphics::ColorTileMode::GcnLinear;
+            const auto residency = [&](const AgcDriver::Graphics::ColorTarget& color, bool residentTargets = true, bool residentLinear = true) { return AgcDriver::Graphics::ColorTargetResidency(context, color, residentTargets, residentLinear); };
+            Require(residency(tiled) == TargetResidency::Resident && residency(multisampled) == TargetResidency::Multisampled && residency(gcnLinear) == TargetResidency::Copied, "prepared vertex inputs: a tiled, multisampled or GCN linear color target got the wrong residency");
+            Require(residency(tiled, false) == TargetResidency::Copied && residency(linear, true, false) == TargetResidency::Copied, "prepared vertex inputs: color target residency ignored APS5_NO_RESIDENT_TARGETS or APS5_NO_RESIDENT_LINEAR");
+            auto noImports = context;
+            noImports.hostImportAlignment = 0;
+            auto noDetiler = context;
+            noDetiler.detiler = nullptr;
+            Require(AgcDriver::Graphics::ColorTargetResidency(noImports, linear, true, true) == TargetResidency::Copied && AgcDriver::Graphics::ColorTargetResidency(noDetiler, tiled, true, true) == TargetResidency::Copied, "prepared vertex inputs: a linear target without host imports, or any target without a detiler, was not predicted copied");
+            if (context.hostImportAlignment != 0) {
+                Require(residency(linear) == TargetResidency::LinearImport, "prepared vertex inputs: a linear color target on a device with host imports does not depend on its import");
+                auto state = epochState;
+                state.colors = {tiled, linear};
+                const auto predict = [&] {
+                    const AgcDriver::GuestMemory::DeviceLockForbiddenScope forbidden;
+                    return AgcDriver::Graphics::PredictDrawDeviceStaging(context, state);
+                };
+                Require(!predict().has_value(), "prepared vertex inputs: a draw into a linear target without a host import was predicted, though the committer may still import it");
+                state.colors = {multisampled, gcnLinear};
+                const auto copied = predict();
+                Require(copied.has_value() && !*copied, "prepared vertex inputs: a draw into a copied target was not predicted synchronous");
+                std::puts("color target residency: tiled resident, multisampled, GCN linear copied; a linear target without a host import is left to the committer, off the device lock");
+            } else {
+                std::puts("the device has no host imports: linear target import prediction not tested");
+            }
         }
 
         const auto beforeTeardown = AgcDriver::Graphics::PreparedDrawInputCounters();

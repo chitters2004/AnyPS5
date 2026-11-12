@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -26,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -182,7 +184,7 @@ AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block) {
     return color;
 }
 
-void Draw(AgcDriver::VulkanDevice& device, const Block& block) {
+void Draw(AgcDriver::VulkanDevice& device, const Block& block, bool prepared = false) {
     const auto color = DecodeTarget(block);
     const auto target = device.Target();
     constexpr std::uint32_t waveSize = 64;
@@ -239,6 +241,16 @@ void Draw(AgcDriver::VulkanDevice& device, const Block& block) {
     state.blend = blend;
     state.blendConstants = {};
     const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    if (!prepared) {
+        device.Draw(state, draw, shaders);
+        return;
+    }
+    auto job = device.PrepareDrawResourcesAhead(nullptr, state, draw, shaders, {}, std::uint64_t{1} << 61u);
+    Require(job != nullptr, "the draw's resources were not queued for preparation");
+    const auto pin = std::make_shared<int>(0);
+    AgcDriver::Graphics::SubmitPreparedDrawResources(job, pin);
+    AgcDriver::Graphics::AwaitPreparedDrawInputs(*job);
+    const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
     device.Draw(state, draw, shaders);
 }
 
@@ -402,6 +414,31 @@ void Rewatched(AgcDriver::VulkanDevice& device) {
 }
 #endif
 
+void Predicted(AgcDriver::VulkanDevice& device) {
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    constexpr std::array<float, 4> first{2900.0f, 3000.0f, 3100.0f, 3200.0f};
+    constexpr std::array<float, 4> second{3300.0f, 3400.0f, 3500.0f, 3600.0f};
+    Block block(SettledBytes, 0);
+    Seed(block, first);
+    Draw(device, block);
+    ExpectRecorded(context, block, "staging prediction, the committer-built draw");
+    device.WaitIdle();
+    Check(block, first, "staging prediction, the committer-built draw");
+    Require(AgcDriver::Graphics::ExistingHostImportFor(context, block.Address(), TargetBytes) != nullptr, "staging prediction: the committer-built draw left no host import of the linear target");
+    Seed(block, second);
+    AgcDriver::Graphics::SetDrawInputPreparers(1);
+    const auto before = AgcDriver::Graphics::PreparedUploadCounters();
+    Draw(device, block, true);
+    ExpectRecorded(context, block, "staging prediction, the prepared draw");
+    device.WaitIdle();
+    const auto after = AgcDriver::Graphics::PreparedUploadCounters();
+    AgcDriver::Graphics::SetDrawInputPreparers(0);
+    std::printf("staging prediction into an imported linear target: %llu predicted, %llu left to the committer, %llu mispredicted, stage A %llu prepared / %llu adopted / %llu refused for the staging decision\n", static_cast<unsigned long long>(after.stageAStagingPredicted - before.stageAStagingPredicted), static_cast<unsigned long long>(after.stageAStagingFallback - before.stageAStagingFallback), static_cast<unsigned long long>(after.stageAStagingMispredicted - before.stageAStagingMispredicted), static_cast<unsigned long long>(after.stageAPrepared - before.stageAPrepared), static_cast<unsigned long long>(after.stageAAdopted - before.stageAAdopted), static_cast<unsigned long long>(after.stageAStaleStaging - before.stageAStaleStaging));
+    Require(after.stageAStagingPredicted - before.stageAStagingPredicted == 1 && after.stageAStagingFallback == before.stageAStagingFallback, "staging prediction: a draw into a linear target its host import covers was not predicted");
+    Require(after.stageAAdopted - before.stageAAdopted == 1 && after.stageAStaleStaging == before.stageAStaleStaging && after.stageAStagingMispredicted == before.stageAStagingMispredicted, "staging prediction: the stage A of a draw into an imported linear target was not adopted, or its predicted staging decision was not the committer's");
+    Check(block, second, "staging prediction, the draw with an adopted stage A differs from the committer-built draw");
+}
+
 void Compared(AgcDriver::VulkanDevice& device) {
     using AgcDriver::Graphics::ImportWatch;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -433,6 +470,11 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         const std::string_view only = argc > 1 ? argv[1] : "";
+        const auto unavailable = [&](const char* why) {
+            if (only == "--prepared" && std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw std::runtime_error(std::string("linear target staging prediction needs ") + why);
+            std::printf("skipped, %s\n", why);
+            return VulkanTestSkipped;
+        };
 #ifndef _WIN32
         const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
         const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
@@ -444,15 +486,18 @@ int main(int argc, char** argv) {
         } restore{context, decided};
 #endif
         Block probe(SettledBytes, 0);
-        if (AgcDriver::Graphics::HostImportFor(AgcDriver::VulkanDeviceTestAccess::ContextOf(*device), probe.Address(), probe.bytes) == nullptr) {
-            std::puts("skipped, host imports are unavailable");
-            return VulkanTestSkipped;
-        }
+        if (AgcDriver::Graphics::HostImportFor(AgcDriver::VulkanDeviceTestAccess::ContextOf(*device), probe.Address(), probe.bytes) == nullptr) return unavailable("host imports of watched memory (VK_EXT_external_memory_host)");
         const bool watched = probe.Watched();
 #ifndef _WIN32
         Require(watched, "a host import of write-watched memory left the write watch although imports are set to stay watched");
 #endif
         if (!watched) std::puts("linear target import creation: a host import of write-watched memory does not stay watched on this device; only the compared cases run");
+        if (only == "--prepared") {
+            if (!watched) return unavailable("host imports that keep a linear color target write-watched");
+            Predicted(*device);
+            std::puts("linear target staging prediction passed");
+            return 0;
+        }
         if (watched && (only.empty() || only == "--created")) Created(*device);
         if (watched && (only.empty() || only == "--reused") && Reused(*device)) std::puts("linear target import reuse passed");
 #ifdef _WIN32

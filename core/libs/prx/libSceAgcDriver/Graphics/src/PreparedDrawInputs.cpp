@@ -235,6 +235,9 @@ struct UploadCounters {
     std::atomic<std::uint64_t> stageAStale{0};
     std::atomic<std::uint64_t> stageAStaleStaging{0};
     std::array<std::atomic<std::uint64_t>, PreparedStalenessCount> stageAStaleBy{};
+    std::atomic<std::uint64_t> stageAStagingPredicted{0};
+    std::atomic<std::uint64_t> stageAStagingFallback{0};
+    std::atomic<std::uint64_t> stageAStagingMispredicted{0};
     std::atomic<std::uint64_t> stageAUnused{0};
     std::atomic<std::uint64_t> stageAPredictedHit{0};
     std::atomic<std::uint64_t> stageARefused{0};
@@ -582,6 +585,7 @@ public:
     bool regionsWanted = false;
     std::shared_ptr<ShaderResources> stageA;
     StageAOutcome outcome = StageAOutcome::None;
+    bool stagingPredicted = false;
     std::uint64_t stageANanoseconds = 0;
     bool offered = false;
 
@@ -596,7 +600,7 @@ public:
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         try {
             bool predictedHit = false;
-            stageA = PrepareDrawResourcesOffDevice(context, *drawState, draw, shaders, snapshots, predictedHit);
+            stageA = PrepareDrawResourcesOffDevice(context, *drawState, draw, shaders, snapshots, predictedHit, stagingPredicted);
             if (predictedHit) outcome = StageAOutcome::PredictedHit;
         } catch (const OffDeviceRefusal&) {
             stageA.reset();
@@ -704,6 +708,10 @@ void PreparedDrawResources::Finish() {
     if (stageAWanted) {
         if (stageA != nullptr || offered) countedUpload(total.stageAPrepared, "UploadPrep.stage_a_prepared");
         if (stageA != nullptr && !offered) countedUpload(total.stageAUnused, "UploadPrep.stage_a_unused");
+        if (stageA != nullptr || offered) {
+            if (stagingPredicted) countedUpload(total.stageAStagingPredicted, "UploadPrep.stage_a_staging_predicted");
+            else countedUpload(total.stageAStagingFallback, "UploadPrep.stage_a_staging_fallback");
+        }
         countedUpload(total.stageAPredictedHit, "UploadPrep.stage_a_predicted_hit", outcome == StageAOutcome::PredictedHit ? 1 : 0);
         countedUpload(total.stageARefused, "UploadPrep.stage_a_refused", outcome == StageAOutcome::Refused ? 1 : 0);
         countedUpload(total.stageAFailed, "UploadPrep.stage_a_failed", outcome == StageAOutcome::Failed ? 1 : 0);
@@ -916,6 +924,7 @@ std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& conte
     if (resources.stageA->PreparedStaging() != deviceStaging) {
         resources.stageA.reset();
         countedUpload(total.stageAStaleStaging, "UploadPrep.stage_a_stale_staging");
+        if (resources.stagingPredicted) countedUpload(total.stageAStagingMispredicted, "UploadPrep.stage_a_staging_mispredicted");
         return nullptr;
     }
     if (const auto staleness = resources.stageA->PreparedDrawStaleness(deviceStaging); staleness != PreparedStaleness::Current) {
@@ -976,6 +985,9 @@ PreparedUploadCounts PreparedUploadCounters() {
     counts.stageAStale = total.stageAStale.load(std::memory_order_relaxed);
     counts.stageAStaleStaging = total.stageAStaleStaging.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < PreparedStalenessCount; ++reason) counts.stageAStaleBy[reason] = total.stageAStaleBy[reason].load(std::memory_order_relaxed);
+    counts.stageAStagingPredicted = total.stageAStagingPredicted.load(std::memory_order_relaxed);
+    counts.stageAStagingFallback = total.stageAStagingFallback.load(std::memory_order_relaxed);
+    counts.stageAStagingMispredicted = total.stageAStagingMispredicted.load(std::memory_order_relaxed);
     counts.stageAUnused = total.stageAUnused.load(std::memory_order_relaxed);
     counts.stageAPredictedHit = total.stageAPredictedHit.load(std::memory_order_relaxed);
     counts.stageARefused = total.stageARefused.load(std::memory_order_relaxed);

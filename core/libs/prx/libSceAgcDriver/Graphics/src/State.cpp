@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/InlineList.hpp"
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -2152,7 +2153,7 @@ std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
 }
 
 GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    static const bool residentLinear = std::getenv("APS5_NO_RESIDENT_LINEAR") == nullptr;
+    const bool residentLinear = !RuntimeSwitches::Set(RuntimeSwitch::NoResidentLinear);
     Require((residentLinear && color.tileMode == ColorTileMode::Linear) || !ColorTileModeIsLinear(color.tileMode), "linear color targets are not resident");
     const bool chain = color.mipCount > 1;
     GuestTextureResource surface{};
