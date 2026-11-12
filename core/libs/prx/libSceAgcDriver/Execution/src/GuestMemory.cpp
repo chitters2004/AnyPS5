@@ -118,7 +118,8 @@ struct WriteSubscription {
     std::atomic<std::uint64_t> head{1};
     std::atomic<std::uint32_t> generation{1};
     std::uint32_t slot = 0;
-    std::uint32_t typeMask = WriteChangeAll;
+    std::atomic<std::uint32_t> typeMask{WriteChangeAll};
+    std::atomic<bool> history{false};
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint64_t> keys;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
@@ -342,6 +343,11 @@ enum class Bumped { Stale, Done, Overflowed };
 Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource source) {
     auto& subscription = subscriptionOf(handle);
     auto result = Bumped::Done;
+    if (!subscription.history.load(std::memory_order_relaxed)) {
+        if (subscription.generation.load(std::memory_order_acquire) != (handle & GenerationMask)) return Bumped::Stale;
+        if ((subscription.typeMask.load(std::memory_order_relaxed) & WriteChangeBit(WriteChangeOf(source))) != 0) moveVersion(subscription);
+        return result;
+    }
     std::lock_guard lock(subscription.historyMutex);
     if (subscription.generation.load(std::memory_order_relaxed) != (handle & GenerationMask)) return Bumped::Stale;
     const auto append = [&](std::uint64_t block) {
@@ -358,7 +364,7 @@ Bumped bumpHandle(std::uint64_t handle, std::uint64_t key, WriteBumpSource sourc
         const auto range = std::equal_range(subscription.backed.begin(), subscription.backed.end(), std::pair<std::uint64_t, std::uint64_t>{key, 0}, [](const auto& left, const auto& right) { return left.first < right.first; });
         for (auto it = range.first; it != range.second; ++it) append(it->second);
     } else append(key);
-    if ((subscription.typeMask & WriteChangeBit(WriteChangeOf(source))) != 0) moveVersion(subscription);
+    if ((subscription.typeMask.load(std::memory_order_relaxed) & WriteChangeBit(WriteChangeOf(source))) != 0) moveVersion(subscription);
     return result;
 }
 
@@ -613,6 +619,7 @@ bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t
     blocks.clear();
     lookupBlocks.clear();
     auto& history = const_cast<WriteSubscription&>(subscription);
+    if (!subscription.history.load(std::memory_order_relaxed)) return false;
     std::lock_guard lock(history.historyMutex);
     if (subscription.overflowedAt != 0) return false;
     for (const auto& bump : subscription.bumps) {
@@ -2831,7 +2838,7 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask) {
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask, bool keepHistory) {
     Pages().initialize();
     std::vector<std::uint64_t> blocks;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> backed;
@@ -2875,7 +2882,8 @@ std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std
         std::uint64_t handle = 0;
         {
             std::lock_guard history(subscription->historyMutex);
-            subscription->typeMask = typeMask;
+            subscription->typeMask.store(typeMask, std::memory_order_relaxed);
+            subscription->history.store(keepHistory, std::memory_order_relaxed);
             subscription->version.store(0, std::memory_order_relaxed);
             subscription->head.store(1, std::memory_order_relaxed);
             subscription->blocks = std::move(blocks);

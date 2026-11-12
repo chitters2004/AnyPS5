@@ -317,9 +317,9 @@ void CheckCoverageThreadAndDriverWrites() {
 }
 
 
-std::shared_ptr<WriteSubscription> Subscribe(std::uint64_t address, std::uint64_t blocks, std::uint32_t mask = WriteChangeAll) {
+std::shared_ptr<WriteSubscription> Subscribe(std::uint64_t address, std::uint64_t blocks, std::uint32_t mask = WriteChangeAll, bool history = true) {
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{address, address + blocks * Block}}};
-    return SubscribeWrites(ranges, mask);
+    return SubscribeWrites(ranges, mask, history);
 }
 
 void Pending(std::uint64_t address) {
@@ -495,6 +495,28 @@ void CheckCrowdedKey() {
     for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription missed a bump after its neighbours were released and replaced");
 }
 
+void CheckWithoutHistory() {
+    const auto subscription = Subscribe(Base + 80 * Block, 2, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 80 * Block, 2, WriteChangeBit(WriteChange::Identity), false);
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*subscription);
+    const auto maskedSeen = ObserveSubscription(*masked);
+    Pending(Base + 81 * Block);
+    Require(ObserveSubscription(*subscription) != seen, "a bump did not move a subscription without history");
+    Require(ObserveSubscription(*masked) == maskedSeen, "a bump outside the mask moved a subscription without history");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(!SubscriptionBumpsSince(*subscription, since, plain, lookup), "a subscription without history listed its bumps, so a narrowing reader would trust an empty list");
+    const auto calls = WriteIndexCounted().bumps;
+    {
+        const auto released = Subscribe(Base + 84 * Block, 1, WriteChangeAll, false);
+    }
+    const auto replacement = Subscribe(Base + 86 * Block, 1, WriteChangeAll, false);
+    const auto replacementSeen = ObserveSubscription(*replacement);
+    Pending(Base + 84 * Block);
+    Require(ObserveSubscription(*replacement) == replacementSeen && WriteIndexCounted().bumps == calls + 0, "a bump of a released subscription's range reached the subscription without history that replaced its slot");
+}
+
 void CheckProducerBumps() {
     const auto mirrors = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Mirror));
     const auto guest = Subscribe(Base + 40 * Block, 2);
@@ -579,6 +601,7 @@ void CheckWriteIndex() {
     CheckBackingKeys();
     CheckBackingProbesAreBounded();
     CheckDomains();
+    CheckWithoutHistory();
     CheckProducerBumps();
     CheckProducerDomains();
     CheckDomainOrder();

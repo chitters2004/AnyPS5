@@ -94,7 +94,7 @@ struct WriteCertificate {
     std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
 };
 bool WriteIndexEnabled();
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll);
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
 std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
 std::uint64_t DomainVersion(WriteDomain domain);
