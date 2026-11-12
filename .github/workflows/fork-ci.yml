@@ -970,7 +970,7 @@ jobs:
               w(f"- FAIL: {msg}")
           def read(path):
               if path.endswith(".gz"):
-                  return gzip.open(path, "rt", errors="replace").read()
+                  return gzip.open(path, "rt", errors="replace").read() if os.path.exists(path) else ""
               return open(path, errors="replace").read() if os.path.exists(path) else ""
           LINE = re.compile(r"Test\s+#(\d+):\s+(\S+)\s+\.+\s*(.*?)\s+([\d.]+) sec")
           SUMMARY = re.compile(r"(\d+)% tests passed, (\d+) tests? failed out of (\d+)")
@@ -1010,6 +1010,8 @@ jobs:
           for path in glob.glob("results/**/result.json", recursive=True):
               folder = os.path.dirname(path)
               data = json.load(open(path))
+              if data["id"].endswith("bundle"):
+                  continue
               data["_dir"] = folder
               data.update(parse(read(os.path.join(folder, "ctest.log.gz"))))
               data["proof"] = read(os.path.join(folder, "layer-proof.txt"))
