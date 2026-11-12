@@ -104,13 +104,23 @@ std::string_view shortFunction(std::string_view name) {
     return previous == std::string_view::npos ? name : name.substr(previous + 2);
 }
 
+CommandEncoder* deferringElsewhere(std::size_t slot, VkCommandBuffer commands, const char* command) {
+    for (std::size_t other = 0; other < CommandEncoder::Slots; ++other) {
+        auto* encoder = slots()[other].encoder.load(std::memory_order_acquire);
+        if (encoder != nullptr && other != slot && encoder->Defers(commands)) return encoder;
+    }
+    for (std::size_t other = 0; other < CommandEncoder::Slots; ++other) {
+        auto* encoder = slots()[other].encoder.load(std::memory_order_acquire);
+        if (encoder != nullptr && encoder->Behind(commands)) encoder->Settle(CommandEncoder::WaitSite{CommandEncoder::Wait::Behind, command, 0});
+    }
+    return nullptr;
+}
+
 template<std::size_t S>
 CommandEncoder* deferring(VkCommandBuffer commands, const char* command) {
     auto* encoder = slots()[S].encoder.load(std::memory_order_acquire);
-    if (encoder == nullptr) return nullptr;
-    if (encoder->Defers(commands)) return encoder;
-    if (encoder->Behind(commands)) encoder->Settle(CommandEncoder::WaitSite{CommandEncoder::Wait::Behind, command, 0});
-    return nullptr;
+    if (encoder != nullptr && encoder->Defers(commands)) return encoder;
+    return deferringElsewhere(S, commands, command);
 }
 
 template<typename Packed>
