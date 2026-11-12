@@ -12189,6 +12189,22 @@ void endPassWaitsNameTheirCaller(Recorder& recorder) {
     static_cast<void>(recorder.Commands());
 }
 
+bool SetEnvironment(const char* name, const char* value) {
+#ifdef _WIN32
+    return _putenv_s(name, value) == 0;
+#else
+    return setenv(name, value, 1) == 0;
+#endif
+}
+
+void ClearEnvironment(const char* name) {
+#ifdef _WIN32
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 void encoderPassEndSiteTests(const Device& device) {
     if (!CommandEncoder::Enabled() || !device.Graphics()) return;
     auto context = device.GetContext();
@@ -12196,10 +12212,10 @@ void encoderPassEndSiteTests(const Device& device) {
     FillDeviceFunctions(context, table);
     const char* configured = std::getenv("APS5_PROFILE_ENCODER");
     const std::string saved = configured != nullptr ? configured : "";
-    Require(setenv("APS5_PROFILE_ENCODER", "1", 1) == 0, "cannot set APS5_PROFILE_ENCODER");
+    Require(SetEnvironment("APS5_PROFILE_ENCODER", "1"), "cannot set APS5_PROFILE_ENCODER");
     Recorder recorder(context, false, &table, context.queueFamily);
-    if (configured != nullptr) setenv("APS5_PROFILE_ENCODER", saved.c_str(), 1);
-    else unsetenv("APS5_PROFILE_ENCODER");
+    if (configured != nullptr) SetEnvironment("APS5_PROFILE_ENCODER", saved.c_str());
+    else ClearEnvironment("APS5_PROFILE_ENCODER");
     if (!recorder.Encodes()) return;
     context.functions = &table;
     CoverPass cover(context);
