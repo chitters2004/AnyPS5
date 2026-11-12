@@ -1830,6 +1830,39 @@ void completionWaitTests(const Device& device, Recorder& recorder) {
     Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: a reader of a label stored behind a completion did not wait for that store");
 }
 
+void serialFrontierTests(const Device& device, Recorder& recorder) {
+    using AgcDriver::Graphics::BatchState;
+    const auto& context = device.GetContext();
+    const auto record = [&] { RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT); };
+    recorder.Sync();
+    const auto& frontiers = recorder.Frontiers();
+    const auto start = recorder.Submissions();
+    Require(frontiers.Newest() == start && frontiers.Through(BatchState::Submitted) == start && frontiers.Through(BatchState::Completed) == start, "an idle recorder's frontiers do not equal its submissions");
+    record();
+    Require(frontiers.Newest() == start + 1 && frontiers.State(start + 1) == BatchState::Reserved, "an open batch did not reserve the next serial");
+    recorder.Submit();
+    Require(frontiers.Through(BatchState::Submitted) == start + 1 && frontiers.State(start + 1) == BatchState::Submitted, "a submitted batch did not move the submitted frontier");
+    record();
+    recorder.Submit();
+    recorder.Sync();
+    Require(frontiers.Through(BatchState::Completed) == start + 2 && frontiers.Terminal() == start + 2, "synced batches did not move the completed frontier");
+    record();
+    recorder.FailNextSubmitsForTest(1);
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    Require(failed, "the injected submit failure did not fail the submit");
+    Require(frontiers.Newest() == start + 2 && recorder.Submissions() == start + 2, "a batch discarded before its submit kept its reserved serial");
+    record();
+    Require(frontiers.Newest() == start + 3, "the batch after a discarded one did not reuse its serial");
+    recorder.Submit();
+    recorder.Sync();
+    Require(recorder.Submissions() == start + 3 && frontiers.Through(BatchState::Completed) == start + 3, "the batch after a discarded one did not complete under its reserved serial");
+}
+
 template<typename Lock>
 void encoderFailureFollowsTheBatchTests(const Device& device, Recorder& recorder, Lock& gpu) {
     if (!recorder.Encodes()) return;
@@ -16912,6 +16945,7 @@ int main(int argc, char** argv) {
         drawSnapshotPatchTests(device);
         drawSnapshotEpochTests(device);
         gpu.lock();
+        serialFrontierTests(device, recorder);
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);
         encoderRuntimeSwitchTests(device, recorder);
