@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cmath>
@@ -19,6 +20,7 @@
 #include <string>
 #include <stdexcept>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -50,6 +52,7 @@ constexpr std::array<std::array<float, 4>, 3> Vertices{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
 alignas(256) std::array<std::array<float, 4>, 3> VertexStorage = Vertices;
+alignas(256) std::array<std::array<float, 4>, 3> EmptyStorage{{{0.0f, 0.0f, 0.5f, 1.0f}, {0.0f, 0.0f, 0.5f, 1.0f}, {0.0f, 0.0f, 0.5f, 1.0f}}};
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
@@ -62,11 +65,11 @@ struct Shaders {
     std::uint32_t vertexPush = 0;
 };
 
-Shaders Compile(AgcDriver::VulkanDevice& device) {
+Shaders Compile(AgcDriver::VulkanDevice& device, const std::array<std::array<float, 4>, 3>& vertices = VertexStorage) {
     const auto target = device.Target();
 
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto vertexBuffer = BufferDescriptor(VertexStorage.data(), 16u, static_cast<std::uint32_t>(VertexStorage.size()));
+    const auto vertexBuffer = BufferDescriptor(vertices.data(), 16u, static_cast<std::uint32_t>(vertices.size()));
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
@@ -305,6 +308,27 @@ bool EncodedMasks(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkCo
     return true;
 }
 
+bool EncodedSets(AgcDriver::VulkanDevice& device, const Shaders& compiled, const Shaders& empty, VkColorComponentFlags all) {
+    using namespace AgcDriver::Graphics;
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "the device has no active recorder");
+    if (!recorder->Encodes()) return false;
+    const auto context = device.graphicsContext();
+    const std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const auto continued = [] { return DrawPassTotals()[0].passesContinued; };
+    AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, Stages(device, empty));
+    const auto passes = continued();
+    const auto breaks = DrawPassBreaks();
+    const auto before = DrawOpsTotals();
+    AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, Stages(device, compiled));
+    Require(continued() == passes + 1u, "the encoded draw with other vertex data did not continue the open pass; breaks:" + BreaksSince(breaks));
+    const auto after = DrawOpsTotals();
+    recorder->Submit();
+    recorder->Sync();
+    const bool ops = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawOps);
+    Require(after.recorded - before.recorded == (ops ? 1u : 0u), "the continued draw with other vertex data did not take the expected draw state path");
+    if (ops) Require(after.sets - before.sets != 0, "the continued draw whose vertex data is in a descriptor set recorded its draw state without binding a set");
+    return true;
 }
 
 bool FreshRecorderDraws(AgcDriver::VulkanDevice& device, const Shaders& compiled, VkColorComponentFlags all) {
@@ -360,9 +384,10 @@ int main() {
         if (dynamic) Require(SameCounters(counters, after), "draws that differ only in their color write mask built or linked another pipeline: linked " + std::to_string(counters.linked) + " -> " + std::to_string(after.linked) + ", fragment output libraries " + std::to_string(counters.built[3]) + " -> " + std::to_string(after.built[3]));
         const bool multisampled = (device->graphicsContext().limits.framebufferColorSampleCounts & Samples) != 0;
         const bool encoded = dynamic && multisampled && EncodedMasks(*device, compiled, all, redBlue);
+        const bool encodedSets = EncodedSets(*device, compiled, Compile(*device, EmptyStorage), all);
         if (dynamic && multisampled) RecordedMasks(*device, compiled, all, redBlue);
         const bool fresh = dynamic && multisampled && FreshRecorderDraws(*device, compiled, all);
-        std::printf("color write mask tests passed (%s, %s, %s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color", encoded ? "encoded draw state" : "encoded draw state skipped", fresh ? "a fresh encoding recorder" : "a fresh encoding recorder skipped");
+        std::printf("color write mask tests passed (%s, %s, %s, %s, %s, %s)\n", dynamic ? "dynamic write mask" : "write mask in the pipeline", counters.linked != 0 ? "pipeline libraries" : "whole pipelines", !dynamic ? "no recorded draws" : multisampled ? "recorded draws" : "recorded draws skipped: no four-sample color", encoded ? "encoded draw state" : "encoded draw state skipped", encodedSets ? "encoded descriptor sets" : "encoded descriptor sets skipped", fresh ? "a fresh encoding recorder" : "a fresh encoding recorder skipped");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

@@ -1458,13 +1458,15 @@ void ListCopiedWriter(Recorder& recorder, const std::shared_ptr<std::vector<std:
 
 static std::atomic<std::uint64_t> drawOpsRecorded{0};
 static std::atomic<std::uint64_t> drawOpsFallbacks{0};
+static std::atomic<std::uint64_t> drawOpsSets{0};
 
-void CountDrawOps(bool recorded) {
+void CountDrawOps(bool recorded, std::uint32_t sets) {
     (recorded ? drawOpsRecorded : drawOpsFallbacks).fetch_add(1, std::memory_order_relaxed);
+    drawOpsSets.fetch_add(sets, std::memory_order_relaxed);
 }
 
 DrawOpsCounts DrawOpsTotals() {
-    return {drawOpsRecorded.load(std::memory_order_relaxed), drawOpsFallbacks.load(std::memory_order_relaxed)};
+    return {drawOpsRecorded.load(std::memory_order_relaxed), drawOpsFallbacks.load(std::memory_order_relaxed), drawOpsSets.load(std::memory_order_relaxed)};
 }
 
 const char* IndirectDrawPathName(IndirectDrawPath path) {
@@ -3296,7 +3298,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
                 opsEncoder->Emplace(&runDrawStateOpsRecord, ops);
                 recording.Invalidate();
                 stateRecorded = true;
-                CountDrawOps(true);
+                CountDrawOps(true, ops.setCount);
             } else {
                 record.pipeline->Continue(recording, state, record.masked);
             }

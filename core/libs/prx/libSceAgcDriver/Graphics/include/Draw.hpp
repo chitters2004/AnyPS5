@@ -195,8 +195,9 @@ void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = fa
 struct DrawOpsCounts {
     std::uint64_t recorded = 0;
     std::uint64_t fallbacks = 0;
+    std::uint64_t sets = 0;
 };
-void CountDrawOps(bool recorded);
+void CountDrawOps(bool recorded, std::uint32_t sets = 0);
 DrawOpsCounts DrawOpsTotals();
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
 void CountEmptyIndirectDraw(double readMs);
