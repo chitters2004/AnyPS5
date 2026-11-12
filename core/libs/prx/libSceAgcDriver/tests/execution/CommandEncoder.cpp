@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/tests/AllocationFailure.hpp"
 #include <algorithm>
 #include <atomic>
@@ -670,8 +671,9 @@ void WaitsAreAttributedToTheirCallSites() {
     RequireSite(sites, Site::At(Wait::Quiesce, once), 1, 1);
     RequireSite(sites, Site{Wait::Direct, "cmdUpdateBuffer", 0}, 1, 1);
     RequireSite(sites, Site::At(Wait::Lookup, lookup), 1, 1);
-    RequireSite(sites, Site{Wait::Behind, "cmdDraw", 0}, 1, 0);
-    RequireSite(sites, Site::At(Wait::Open, opened), 1, 0);
+    const std::uint64_t heldFlush = CommandEncoder::PostsChunks() ? 1 : 0;
+    RequireSite(sites, Site{Wait::Behind, "cmdDraw", 0}, 1, heldFlush);
+    RequireSite(sites, Site::At(Wait::Open, opened), 1, heldFlush);
     Require(SiteOf(sites, Site::At(Wait::Quiesce, idle)) == nullptr, "a quiesce with nothing posted and nothing to flush was attributed a wait");
     std::uint64_t waits = 0;
     for (const auto& entry : sites) waits += entry.waits;
@@ -923,7 +925,7 @@ void ProducerAheadOfTheChunkPoolWaits() {
     Reset();
     auto table = FakeTable();
     const auto device = Handle<VkDevice>(0x4e);
-    const auto commands = Handle<VkCommandBuffer>(0x1400);
+    const VkCommandBuffer buffers[2]{Handle<VkCommandBuffer>(0x1400), Handle<VkCommandBuffer>(0x1480)};
     constexpr std::uint32_t Windows = 64;
     std::atomic<bool> release{false};
     std::atomic<bool> producerDone{false};
@@ -937,6 +939,7 @@ void ProducerAheadOfTheChunkPoolWaits() {
         auto& encoder = *attached;
         std::thread producer([&] {
             for (std::uint32_t index = 0; index < Windows; ++index) {
+                const auto commands = buffers[index % 2];
                 encoder.Open(commands, RecordingOf(commands));
                 table.cmdDraw(commands, index, 1, 0, 0);
                 encoder.Close();
@@ -952,7 +955,8 @@ void ProducerAheadOfTheChunkPoolWaits() {
     }
     CommandEncoder::SetDelayForTesting({});
     Require(!doneWhileHeld, "a producer posted " + std::to_string(Windows) + " windows ahead of a held encoder without waiting for its chunk pool");
-    Require(Recorded(commands) == Windows && counts.waits != 0, "a producer that waited for the chunk pool recorded " + std::to_string(Recorded(commands)) + " of " + std::to_string(Windows) + " commands after " + std::to_string(counts.waits) + " waits");
+    const auto recordedCommands = Recorded(buffers[0]) + Recorded(buffers[1]);
+    Require(recordedCommands == Windows && counts.waits != 0, "a producer that waited for the chunk pool recorded " + std::to_string(recordedCommands) + " of " + std::to_string(Windows) + " commands after " + std::to_string(counts.waits) + " waits");
 }
 
 void ReplayFailureNeedsNoAllocation() {
@@ -985,6 +989,109 @@ void ReplayFailureNeedsNoAllocation() {
     Compare({{healthy, {"draw 2 1 0 0"}}}, "a replay after a failure stored without allocating");
 }
 
+std::uint64_t PostsBy(const CommandEncoder::Statistics& counts, CommandEncoder::PostCause cause) {
+    return counts.postsBy[static_cast<std::size_t>(cause)];
+}
+
+void WindowsShareAChunkUntilTheBatchEnds() {
+    if (!CommandEncoder::PostsChunks()) return;
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x56);
+    const auto commands = Handle<VkCommandBuffer>(0x1700);
+    constexpr std::uint32_t Windows = 200;
+    const auto attached = Attached(device, table);
+    auto& encoder = *attached;
+    std::vector<std::string> expected;
+    for (std::uint32_t index = 0; index < Windows; ++index) {
+        PostOne(encoder, table, commands, index);
+        expected.push_back("draw " + std::to_string(index) + " 1 0 0");
+    }
+    Require(encoder.Counts().posts == 0 && encoder.Behind(commands), "closed windows were posted before the batch end instead of sharing a held chunk");
+    encoder.FinishBatch();
+    const auto counts = encoder.Counts();
+    Require(counts.posts == 1 && PostsBy(counts, CommandEncoder::PostCause::BatchEnd) == 1 && counts.windows == Windows, "the batch end posted " + std::to_string(counts.posts) + " chunks holding " + std::to_string(counts.windows) + " windows, not one chunk of " + std::to_string(Windows));
+    Compare({{commands, expected}}, "windows sharing a chunk");
+}
+
+void ADirectCallWaitsForTheHeldChunk() {
+    if (!CommandEncoder::PostsChunks()) return;
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x57);
+    const auto commands = Handle<VkCommandBuffer>(0x1800);
+    const auto attached = Attached(device, table);
+    auto& encoder = *attached;
+    PostOne(encoder, table, commands, 1);
+    PostOne(encoder, table, commands, 2);
+    table.cmdDraw(commands, 3, 1, 0, 0);
+    PostOne(encoder, table, commands, 4);
+    encoder.Quiesce();
+    Compare({{commands, {"draw 1 1 0 0", "draw 2 1 0 0", "draw 3 1 0 0", "draw 4 1 0 0"}}}, "a direct call behind a held chunk");
+}
+
+void ForeignSettlesFlushTheHeldChunkInOrder() {
+    if (!CommandEncoder::PostsChunks()) return;
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x58);
+    const auto commands = Handle<VkCommandBuffer>(0x1900);
+    constexpr std::uint32_t Windows = 20000;
+    std::vector<std::string> expected;
+    CommandEncoder::Statistics counts{};
+    {
+        const auto attached = Attached(device, table);
+        auto& encoder = *attached;
+        std::atomic<bool> done{false};
+        std::atomic<std::uint32_t> settles{0};
+        std::thread flusher([&] {
+            while (!done.load()) {
+                AgcDriver::Graphics::BeforeCommandLookup(device);
+                settles.fetch_add(1);
+            }
+        });
+        for (std::uint32_t index = 0; index < Windows; ++index) {
+            PostOne(encoder, table, commands, index);
+            expected.push_back("draw " + std::to_string(index) + " 1 0 0");
+        }
+        done.store(true);
+        flusher.join();
+        encoder.FinishBatch();
+        counts = encoder.Counts();
+        Require(settles.load() != 0, "the flushing thread never settled");
+    }
+    Require(PostsBy(counts, CommandEncoder::PostCause::Foreign) != 0, "no held chunk was posted by the settling thread in " + std::to_string(Windows) + " windows");
+    Compare({{commands, expected}}, "held chunks flushed by another thread");
+}
+
+void RunSuite() {
+    for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
+    OtherThreadsRecordDirectlyWhileAWindowIsOpen();
+    HookDuringUnencodedOpsWaits();
+    EveryCommandOfTheTableIsInterposed();
+    NestedWindowKeepsOrder();
+    LargeRecordsSpanChunks();
+    UnwindingSettlesQueuedRecording();
+    OwnersOutliveTheUnwindDrain();
+    ForeignThreadCannotProduceIntoAnOpenWindow();
+    ForeignLookupWhileAWindowIsOpenProceeds();
+    RawCallAfterLookupKeepsOrder();
+    FailedReplayStaysWithItsRecording();
+    FinishCarriesAnUnreportedFailure();
+    DirectCallsSkipAFailedRecording();
+    AppendFailureKeepsTheWindow();
+    DevicesPastTheSlotsRecordInline();
+    PostingNeverAllocates();
+    ProducerAheadOfTheChunkPoolWaits();
+    EncoderParksBetweenSpacedPosts();
+    ReplayFailureNeedsNoAllocation();
+    WaitsAreAttributedToTheirCallSites();
+    SitesAreCountedOnlyWhenProfiled();
+    WindowsShareAChunkUntilTheBatchEnds();
+    ADirectCallWaitsForTheHeldChunk();
+    ForeignSettlesFlushTheHeldChunkInOrder();
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "--wait-on-the-encoder-thread") {
@@ -998,28 +1105,11 @@ int main(int argc, char** argv) {
 #else
         setenv("APS5_HANDOFF_SPIN_US", "150", 1);
 #endif
-        for (std::uint32_t seed = 1; seed <= 6; ++seed) RandomProgramRecordsWhatInlineRecords(seed, seed % 2 == 0);
-        OtherThreadsRecordDirectlyWhileAWindowIsOpen();
-        HookDuringUnencodedOpsWaits();
-        EveryCommandOfTheTableIsInterposed();
-        NestedWindowKeepsOrder();
-        LargeRecordsSpanChunks();
-        UnwindingSettlesQueuedRecording();
-        OwnersOutliveTheUnwindDrain();
-        ForeignThreadCannotProduceIntoAnOpenWindow();
-        ForeignLookupWhileAWindowIsOpenProceeds();
-        RawCallAfterLookupKeepsOrder();
-        FailedReplayStaysWithItsRecording();
-        FinishCarriesAnUnreportedFailure();
-        DirectCallsSkipAFailedRecording();
-        AppendFailureKeepsTheWindow();
-        DevicesPastTheSlotsRecordInline();
-        PostingNeverAllocates();
-        ProducerAheadOfTheChunkPoolWaits();
-        EncoderParksBetweenSpacedPosts();
-        ReplayFailureNeedsNoAllocation();
-        WaitsAreAttributedToTheirCallSites();
-        SitesAreCountedOnlyWhenProfiled();
+        for (const bool chunks : {false, true}) {
+            AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::EncoderPostChunks, chunks);
+            RunSuite();
+            std::cout << (chunks ? "chunks held across windows" : "chunks posted per window") << ": passed\n";
+        }
         std::cout << "command encoder tests passed\n";
         return 0;
     } catch (const std::exception& error) {
