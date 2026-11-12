@@ -72,7 +72,7 @@ namespace {
 constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
 constexpr std::size_t PreparedRangeLimit = Recorder::DrawInputBudget;
 
-enum class JobState : std::uint8_t { Queued, Running, Done, Cancelled };
+enum class JobState : std::uint32_t { Queued, Running, Done, Cancelled };
 
 struct PreparedRange {
     std::uint64_t address = 0;
@@ -378,7 +378,7 @@ protected:
         staging.poolWaitNanoseconds += cost.poolWaitNanoseconds;
         staging.stashHits += cost.stashHits;
         const auto target = range.buffer->Bytes();
-        std::memcpy(target.data(), reinterpret_cast<const void*>(address), readable);
+        GuestMemory::CopyGuestBytes(target.data(), reinterpret_cast<const void*>(address), readable);
         std::fill(target.begin() + static_cast<std::ptrdiff_t>(readable), target.begin() + static_cast<std::ptrdiff_t>(bytes), std::byte{0});
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (Recorder::PendingWriteSnapshot() != pending) {
