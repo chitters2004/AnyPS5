@@ -427,6 +427,14 @@ void UnwatchRange(AgcDriver::VulkanDevice& device) {
     Require(outcome.Uncertified(AgcDriver::Graphics::UncertifiedCause::Refused) == 1 && outcome.UncertifiedRefused(CertifyRefusal::ComparedTextures) == 1, "unwatch: the use after a refusal was not counted as uncertified for compared textures (" + outcome.Describe() + ")");
 }
 
+bool SceneWatched(AgcDriver::VulkanDevice& device) {
+    auto& scene = NewScene();
+    Build(device, scene);
+    static_cast<void>(Draw(device, scene, true, false));
+    device.WaitIdle();
+    return GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.table.base), scene.table.bytes) && GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.textures.base), scene.textures.bytes);
+}
+
 void Causes(AgcDriver::VulkanDevice& device) {
     using AgcDriver::Graphics::UncertifiedCause;
     auto& scene = NewScene();
@@ -971,6 +979,10 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
+        if (!SceneWatched(*device)) {
+            std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
+            return VulkanTestSkipped;
+        }
         const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 19> cases{{{"causes", &Causes}, {"held", &Held}, {"cpu", &CpuWrite}, {"table", &TableWord}, {"driver", &DriverStore}, {"pending", &PendingWrite}, {"release", &Released}, {"unwatch", &UnwatchRange}, {"mapping", &Mapping}, {"import", &Imported}, {"depth", &DepthSurfaces}, {"switch", &Switched}, {"verify", &Verified}, {"scope", &Scope}, {"nondraw", &NonDraw}, {"recorded", &Recorded}, {"joint", &Joint}, {"oracle", &Oracle}, {"mutants", &Mutants}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
