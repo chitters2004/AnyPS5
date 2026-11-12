@@ -2629,7 +2629,7 @@ std::uint64_t CollectEpochBumps() {
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 std::atomic<std::uint64_t> certificateBreakSerial{1};
-constexpr std::uint32_t CertificateCoveredBreaks = (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::Written)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::DriverStore));
+constexpr std::uint32_t CertificateCoveredBreaks = (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::Written)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::DriverStore)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::PacketCovered));
 thread_local bool proofThread = false;
 thread_local ProofBreakTrace* proofBreakTrace = nullptr;
 std::array<std::atomic<std::uint64_t>, ProofBreakSiteCount> proofBreakTotals{};
@@ -2652,6 +2652,7 @@ const char* ProofBreakSiteName(ProofBreakSite site) {
         case ProofBreakSite::WrittenBack: return "written back";
         case ProofBreakSite::KeptDraw: return "kept writing draw";
         case ProofBreakSite::ResourceWriteBack: return "resource write-back";
+        case ProofBreakSite::PacketCovered: return "non-draw packet with covered effects";
         case ProofBreakSite::Other: break;
     }
     return "other";

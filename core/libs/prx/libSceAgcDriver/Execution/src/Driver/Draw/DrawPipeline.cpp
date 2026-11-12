@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libc/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitEffects.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -486,7 +487,7 @@ void DrawPipeline::run() {
         try {
             if (commit != nullptr) (*commit)();
             if (!isDraw) {
-                GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::Packet);
+                GuestMemory::BreakProofs(CommitCovered(kind) ? GuestMemory::ProofBreakSite::PacketCovered : GuestMemory::ProofBreakSite::Packet);
                 static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
                 if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }

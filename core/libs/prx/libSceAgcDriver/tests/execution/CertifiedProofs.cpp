@@ -519,7 +519,7 @@ void Verified(AgcDriver::VulkanDevice& device) {
 }
 
 
-constexpr std::array<GuestMemory::ProofBreakSite, 2> CoveredBreaks{GuestMemory::ProofBreakSite::Written, GuestMemory::ProofBreakSite::DriverStore};
+constexpr std::array<GuestMemory::ProofBreakSite, 3> CoveredBreaks{GuestMemory::ProofBreakSite::Written, GuestMemory::ProofBreakSite::DriverStore, GuestMemory::ProofBreakSite::PacketCovered};
 
 bool UncoveredBreakVoids(AgcDriver::VulkanDevice& device, const std::string& what) {
     auto& scene = NewScene();
