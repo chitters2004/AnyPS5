@@ -710,9 +710,9 @@ jobs:
           PY
             echo "targets: $(cat build/targets.txt)"
             grep -q "[^[:space:]]" build/targets.txt || { echo "::error::none of the selected tests names a built executable"; exit 1; }
-            if [ "$(wc -c < build/targets.txt)" -gt 20000 ]; then cmake --build build; else cmake --build build --target $(cat build/targets.txt) libs; fi
+            if [ "$(wc -c < build/targets.txt)" -gt 20000 ]; then cmake --build build -- -k 0; else cmake --build build --target $(cat build/targets.txt) libs -- -k 0; fi
           else
-            cmake --build build
+            cmake --build build -- -k 0
           fi
       - name: Build the libraries
         id: libs
