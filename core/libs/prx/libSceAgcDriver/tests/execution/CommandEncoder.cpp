@@ -1721,9 +1721,18 @@ VKAPI_ATTR void VKAPI_CALL BurnDraw(VkCommandBuffer, std::uint32_t, std::uint32_
     BusyFor(std::chrono::nanoseconds(replayNs.load(std::memory_order_relaxed)));
 }
 
+VKAPI_ATTR void VKAPI_CALL BenchCopyBuffer(VkCommandBuffer, VkBuffer, VkBuffer, std::uint32_t, const VkBufferCopy*) {}
+VKAPI_ATTR void VKAPI_CALL BenchBeginQuery(VkCommandBuffer, VkQueryPool, std::uint32_t, VkQueryControlFlags) {}
+VKAPI_ATTR void VKAPI_CALL BenchEndQuery(VkCommandBuffer, VkQueryPool, std::uint32_t) {}
+VKAPI_ATTR VkResult VKAPI_CALL BenchEndCommandBuffer(VkCommandBuffer) { return VK_SUCCESS; }
+VKAPI_ATTR VkResult VKAPI_CALL BenchQueueSubmit(VkQueue, std::uint32_t, const VkSubmitInfo*, VkFence) { return VK_SUCCESS; }
+
 DeviceFunctions BurnTable() {
     DeviceFunctions table{};
     table.cmdDraw = &BurnDraw;
+    table.cmdCopyBuffer = &BenchCopyBuffer;
+    table.cmdBeginQuery = &BenchBeginQuery;
+    table.cmdEndQuery = &BenchEndQuery;
     return table;
 }
 
@@ -1734,45 +1743,133 @@ struct Pattern {
     std::uint64_t encodeNs;
 };
 
-double RunPattern(const Pattern& pattern, CommandEncoder::Handoff handoff, std::uint32_t draws, CommandEncoder::Statistics& counts) {
-    const auto commands = Handle<VkCommandBuffer>(0x1700);
+enum class Drain : std::uint8_t { Quiesce, Encoded, EncodedRead };
+
+const char* DrainName(Drain drain) {
+    return drain == Drain::Quiesce ? "quiesce" : drain == Drain::Encoded ? "encoded" : "encoded+read";
+}
+
+const char* HandoffName(CommandEncoder::Handoff handoff) {
+    return handoff == CommandEncoder::Handoff::Never ? "inline" : handoff == CommandEncoder::Handoff::Always ? "always" : "adaptive";
+}
+
+class BenchBatches {
+public:
+    static constexpr std::size_t Slots = 4;
+    BenchBatches() {
+        for (std::size_t slot = 0; slot < Slots; ++slot) commands[slot] = Handle<VkCommandBuffer>(0x1700 + 0x10 * slot);
+    }
+    VkCommandBuffer Current() const { return commands[slot]; }
+    void End(CommandEncoder& encoder, bool posted, bool read) {
+        auto& request = requests[slot];
+        if (posted) {
+            request = std::make_unique<CommandEncoder::SubmitRequest>();
+            request->commands = commands[slot];
+            request->queue = Handle<VkQueue>(0x77);
+            request->fence = Handle<VkFence>(0x9800 + slot);
+            request->serial = ++serial;
+            request->endCommandBuffer = &BenchEndCommandBuffer;
+            request->queueSubmit = &BenchQueueSubmit;
+            request->recording = &RecordingOf(commands[slot]);
+            encoder.PostSubmit(*request);
+            if (read) encoder.SettleSubmits();
+        } else {
+            BenchEndCommandBuffer(commands[slot]);
+            const VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+            BenchQueueSubmit(Handle<VkQueue>(0x77), 1, &submit, Handle<VkFence>(0x9800 + slot));
+        }
+        slot = (slot + 1) % Slots;
+        if (requests[slot] != nullptr) {
+            requests[slot]->Wait();
+            requests[slot].reset();
+        }
+    }
+    void Finish(CommandEncoder& encoder) {
+        encoder.SettleSubmits();
+        for (auto& request : requests) request.reset();
+    }
+
+private:
+    std::array<VkCommandBuffer, Slots> commands{};
+    std::array<std::unique_ptr<CommandEncoder::SubmitRequest>, Slots> requests{};
+    std::size_t slot = 0;
+    std::uint64_t serial = 0;
+};
+
+double RunPattern(const Pattern& pattern, CommandEncoder::Handoff handoff, std::uint32_t draws, CommandEncoder::Statistics& counts, Drain drain = Drain::Quiesce, std::string* sites = nullptr) {
     auto table = BurnTable();
     replayNs.store(pattern.encodeNs, std::memory_order_relaxed);
     const auto attached = Attached(Handle<VkDevice>(0x57), table);
     auto& encoder = *attached;
+    BenchBatches batches;
+    const VkBufferCopy region{0, 0, 256};
+    std::uint32_t query = 0;
     const auto start = std::chrono::steady_clock::now();
     for (std::uint32_t index = 0; index < draws; ++index) {
+        const auto commands = batches.Current();
         BusyFor(std::chrono::nanoseconds(pattern.workNs));
         const bool encoded = encoder.Admit(handoff);
         if (encoded) encoder.Open(commands, RecordingOf(commands));
         table.cmdDraw(commands, 3, 1, 0, 0);
+        const bool drained = (index + 1) % pattern.batch == 0;
+        if (drained && drain != Drain::Quiesce) {
+            table.cmdEndQuery(commands, Handle<VkQueryPool>(0x5a), query);
+            table.cmdCopyBuffer(commands, Handle<VkBuffer>(0x5b), Handle<VkBuffer>(0x5c), 1, &region);
+            query = (query + 1) % 64;
+            table.cmdBeginQuery(commands, Handle<VkQueryPool>(0x5a), query, 0);
+        }
         if (encoded) encoder.Close();
-        if ((index + 1) % pattern.batch == 0) encoder.Quiesce();
+        if (!drained) continue;
+        if (drain == Drain::Quiesce) {
+            encoder.Quiesce();
+        } else {
+            batches.End(encoder, handoff != CommandEncoder::Handoff::Never, drain == Drain::EncodedRead);
+        }
     }
+    if (drain != Drain::Quiesce) batches.Finish(encoder);
     encoder.Quiesce();
     const double ns = NanosecondsSince(start) / draws;
     counts = encoder.Counts();
+    if (sites != nullptr && encoder.ProfilesSites()) *sites = CommandEncoder::Report(encoder.WaitsBySite(), 8);
     return ns;
 }
 
-int HandoffBench() {
+double Quantile(std::vector<double> values, double fraction) {
+    std::sort(values.begin(), values.end());
+    const double position = fraction * static_cast<double>(values.size() - 1);
+    const auto below = static_cast<std::size_t>(position);
+    const auto above = std::min(below + 1, values.size() - 1);
+    return values[below] + (values[above] - values[below]) * (position - static_cast<double>(below));
+}
+
+int HandoffBench(std::uint32_t rounds) {
     const Pattern patterns[] = {
         {"few-draws-per-batch", 3, 1000, 3300},
         {"few-draws-heavy-encode", 3, 1000, 20000},
         {"many-draws-per-batch", 512, 4000, 3300},
     };
+    const CommandEncoder::Handoff handoffs[] = {CommandEncoder::Handoff::Never, CommandEncoder::Handoff::Always, CommandEncoder::Handoff::Adaptive};
+    const Drain drains[] = {Drain::Quiesce, Drain::Encoded, Drain::EncodedRead};
     constexpr std::uint32_t Draws = 40000;
+    std::cout << "bench rounds=" << rounds << " draws=" << Draws << " async_switch=" << CommandEncoder::SubmitsAsync() << " chunks=" << CommandEncoder::PostsChunks() << "\n";
     for (const auto& pattern : patterns) {
-        for (const auto handoff : {CommandEncoder::Handoff::Never, CommandEncoder::Handoff::Always, CommandEncoder::Handoff::Adaptive}) {
-            const char* name = handoff == CommandEncoder::Handoff::Never ? "inline" : handoff == CommandEncoder::Handoff::Always ? "always" : "adaptive";
-            double best = 0;
-            CommandEncoder::Statistics counts{};
-            for (std::uint32_t round = 0; round < 3; ++round) {
-                Reset();
-                const double ns = RunPattern(pattern, handoff, Draws, counts);
-                if (round == 0 || ns < best) best = ns;
+        for (const auto drain : drains) {
+            std::array<std::vector<double>, 3> samples;
+            std::array<CommandEncoder::Statistics, 3> last{};
+            std::array<std::string, 3> sites;
+            for (std::uint32_t round = 0; round < rounds; ++round) {
+                for (std::size_t which = 0; which < 3; ++which) {
+                    Reset();
+                    samples[which].push_back(RunPattern(pattern, handoffs[which], Draws, last[which], drain, round + 1 == rounds ? &sites[which] : nullptr));
+                }
             }
-            std::cout << "bench " << pattern.name << " " << name << " ns_per_draw=" << best << " inlined_share=" << static_cast<double>(counts.inlined) / Draws << " parks_per_draw=" << static_cast<double>(counts.parks) / Draws << " wait_ns_per_draw=" << static_cast<double>(counts.waitNs) / Draws << "\n";
+            for (std::size_t which = 0; which < 3; ++which) {
+                const auto& counts = last[which];
+                const double p25 = Quantile(samples[which], 0.25);
+                const double p75 = Quantile(samples[which], 0.75);
+                std::cout << "bench " << pattern.name << " drain=" << DrainName(drain) << " " << HandoffName(handoffs[which]) << " median_ns_per_draw=" << Quantile(samples[which], 0.5) << " iqr=" << p75 - p25 << " p25=" << p25 << " p75=" << p75 << " min=" << *std::min_element(samples[which].begin(), samples[which].end()) << " inlined_share=" << static_cast<double>(counts.inlined) / Draws << " waits_per_draw=" << static_cast<double>(counts.waits) / Draws << " wait_ns_per_draw=" << static_cast<double>(counts.waitNs) / Draws << " settle_ns_per_draw=" << static_cast<double>(counts.settleWaitNs) / Draws << " post_ns_per_draw=" << static_cast<double>(counts.postNs) / Draws << " parks_per_draw=" << static_cast<double>(counts.parks) / Draws << " submits=" << counts.submits << "\n";
+                if (!sites[which].empty()) std::cout << "bench-sites " << pattern.name << " drain=" << DrainName(drain) << " " << HandoffName(handoffs[which]) << ": " << sites[which] << "\n";
+            }
         }
     }
     return 0;
@@ -1797,7 +1894,7 @@ void HandoffPolicyFollowsItsMeasuredCost() {
 
 int main(int argc, char** argv) {
     try {
-        if (argc > 1 && std::string(argv[1]) == "--bench") return HandoffBench();
+        if (argc > 1 && std::string(argv[1]) == "--bench") return HandoffBench(argc > 2 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 7);
         if (argc > 1 && std::string(argv[1]) == "--wait-on-the-encoder-thread") {
             std::signal(SIGABRT, [](int) { std::_Exit(0); });
             WaitOnTheEncoderThread();

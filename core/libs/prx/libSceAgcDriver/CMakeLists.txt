@@ -1140,6 +1140,7 @@ if(NOT ANYPS5_AGC_EXECUTION_TESTS OR "CommandEncoder" IN_LIST ANYPS5_AGC_EXECUTI
     agc_add_encoder_bench(_few_cores APS5_HANDOFF_SPIN_US=0)
     agc_add_encoder_bench(_idle_spin APS5_ENCODER_IDLE_SPIN_US=100)
     agc_add_encoder_bench(_few_cores_idle_spin APS5_HANDOFF_SPIN_US=0 APS5_ENCODER_IDLE_SPIN_US=100)
+    agc_add_encoder_bench(_sites APS5_PROFILE_ENCODER=1)
 endif()
 add_library(agc_encoder_guard_accepted OBJECT tests/EncoderGuards.cpp)
 target_include_directories(agc_encoder_guard_accepted PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
