@@ -2043,6 +2043,166 @@ void latchedCompletionTests(const Device& device) {
     std::cout << "Latched completion tests passed\n";
 }
 
+void encoderAcknowledgementTests(const Device& device) {
+    if (!CommandEncoder::Enabled()) {
+        std::cout << "command encoder off: encoder acknowledgement tests not run\n";
+        return;
+    }
+    auto context = device.GetContext();
+    DeviceFunctions table;
+    FillDeviceFunctions(context, table);
+    context.functions = &table;
+    std::atomic<int> entered{0};
+    std::atomic<bool> go{false};
+    bool discardedAfterEncoding = false;
+    int discarded = 0;
+    std::string submitted;
+    std::thread releaser;
+    {
+        Recorder recorder(context, false, &table, context.queueFamily);
+        if (!recorder.Encodes()) {
+            std::cout << "no command encoder slot: encoder acknowledgement tests not run\n";
+            return;
+        }
+        std::unique_lock gpu(GpuMutex());
+        CommandEncoder::SetDelayForTesting([&] {
+            if (entered.fetch_add(1) != 0) return;
+            while (!go.load(std::memory_order_acquire)) std::this_thread::yield();
+        });
+        const auto commands = recorder.Commands();
+        recorder.OnDiscard([&] {
+            ++discarded;
+            discardedAfterEncoding = go.load(std::memory_order_acquire);
+        });
+        {
+            const Recorder::EncodingWindow window(recorder);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        }
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (entered.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        if (entered.load() == 0) {
+            go.store(true, std::memory_order_release);
+            CommandEncoder::SetDelayForTesting({});
+            throw std::runtime_error("AGC graphics: the encoder never replayed the deferred barrier");
+        }
+        releaser = std::thread([&] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            go.store(true, std::memory_order_release);
+        });
+        recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+        try {
+            recorder.Submit();
+        } catch (const std::exception& error) {
+            submitted = error.what();
+        }
+        CommandEncoder::SetDelayForTesting({});
+        Require(submitted == "injected device loss", "a latched recorder submitted the batch its encoder was still recording ('" + submitted + "')");
+        Require(discarded == 1 && discardedAfterEncoding, "a cancelled batch was released before its encoder acknowledged it");
+        Require(recorder.Idle(), "the cancelled batch stayed open");
+    }
+    releaser.join();
+    std::cout << "Encoder acknowledgement tests passed\n";
+}
+
+void admissionTests(const Device& device) {
+    const auto& context = device.GetContext();
+    const auto record = [&](Recorder& recorder) { RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT); };
+    const auto admittedWithin = [](std::atomic<bool>& done, std::chrono::milliseconds bound) {
+        const auto deadline = std::chrono::steady_clock::now() + bound;
+        while (!done.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return done.load(std::memory_order_acquire);
+    };
+    {
+        Recorder recorder(context, true);
+        const auto budget = recorder.AdmissionBudget();
+        {
+            std::lock_guard gpu(GpuMutex());
+            bool refused = false;
+            try {
+                static_cast<void>(recorder.Admit(1));
+            } catch (const std::logic_error&) {
+                refused = true;
+            }
+            Require(refused, "a producer was admitted under the GPU mutex, where it could wait for a batch only that mutex retires");
+        }
+        const auto half = recorder.Admit(budget / 2);
+        {
+            std::lock_guard gpu(GpuMutex());
+            recorder.Charge(half);
+            record(recorder);
+            recorder.EndItem();
+            recorder.Submit();
+        }
+        Require(recorder.AdmittedBytes() == budget / 2, "a submitted batch returned its admitted bytes before it retired");
+        std::atomic<bool> done{false};
+        Admission::Ticket next;
+        std::thread producer([&] {
+            next = recorder.Admit(budget);
+            done.store(true, std::memory_order_release);
+        });
+        Require(!admittedWithin(done, std::chrono::milliseconds(50)), "an item past the budget was admitted while a batch held its bytes");
+        {
+            std::lock_guard gpu(GpuMutex());
+            recorder.Sync();
+        }
+        Require(admittedWithin(done, std::chrono::seconds(5)), "a retired batch did not return its admitted bytes");
+        producer.join();
+        {
+            std::lock_guard gpu(GpuMutex());
+            recorder.Charge(next);
+            record(recorder);
+            recorder.EndItem();
+            recorder.Sync();
+        }
+        const auto oversized = recorder.Admit(budget + 1);
+        Require(!next.alone && oversized.alone, "an item that fits the budget was admitted alone, or an oversized one was not");
+        {
+            std::lock_guard gpu(GpuMutex());
+            record(recorder);
+            const auto before = recorder.Submissions();
+            recorder.Charge(oversized);
+            Require(recorder.Submissions() == before + 1, "an oversized item shared a batch with earlier work");
+            record(recorder);
+            recorder.EndItem();
+            Require(recorder.Submissions() == before + 2 && recorder.Idle() == false, "an oversized item's batch was not submitted right after it");
+            recorder.Sync();
+        }
+        Require(recorder.AdmittedBytes() == 0, "retired batches left admitted bytes charged");
+    }
+    {
+        Recorder recorder(context, true);
+        const auto all = recorder.Admit(recorder.AdmissionBudget());
+        {
+            std::lock_guard gpu(GpuMutex());
+            recorder.Charge(all);
+            record(recorder);
+            recorder.Submit();
+        }
+        std::atomic<bool> done{false};
+        std::string message;
+        std::thread producer([&] {
+            try {
+                static_cast<void>(recorder.Admit(1));
+            } catch (const std::exception& error) {
+                message = error.what();
+            }
+            done.store(true, std::memory_order_release);
+        });
+        Require(!admittedWithin(done, std::chrono::milliseconds(50)), "an item past the budget was admitted");
+        recorder.LatchFailure(std::make_exception_ptr(std::runtime_error("injected device loss")));
+        Require(admittedWithin(done, std::chrono::seconds(5)), "a latched failure did not wake a producer waiting for admission");
+        producer.join();
+        Require(message == "injected device loss", "a producer woken by the latch did not get the latched error ('" + message + "')");
+        std::lock_guard gpu(GpuMutex());
+        try {
+            recorder.Sync();
+        } catch (const std::exception&) {
+        }
+        Require(recorder.AdmittedBytes() == 0 && recorder.Idle(), "a cancelled batch kept its admitted bytes");
+    }
+    std::cout << "Recorder admission tests passed\n";
+}
+
 void serialFrontierTests(const Device& device, Recorder& recorder) {
     using AgcDriver::Graphics::BatchState;
     const auto& context = device.GetContext();
@@ -17177,6 +17337,8 @@ int main(int argc, char** argv) {
         latchedWaitTests(device);
         suffixCancellationTests(device);
         latchedCompletionTests(device);
+        encoderAcknowledgementTests(device);
+        admissionTests(device);
         gpu.lock();
         encoderFailureFollowsTheBatchTests(device, recorder, gpu);
         encoderPassEndSiteTests(device);

@@ -1408,6 +1408,7 @@ void Recorder::LatchFailure(std::exception_ptr error) noexcept {
         if (latchedError == nullptr) latchedError = error;
     }
     latched.store(true, std::memory_order_release);
+    admission.Fail(error);
     releaseTerminal();
 }
 
@@ -3843,6 +3844,27 @@ void Recorder::OnDiscard(std::function<void()> action) {
     open->discards.push_back(std::move(action));
 }
 
+Admission::Ticket Recorder::Admit(std::uint64_t bytes) {
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::logic_error("AGC graphics: recorder admission waits for retired batches, so it must not be entered under the GPU mutex");
+    return admission.Admit(bytes);
+}
+
+void Recorder::Charge(const Admission::Ticket& ticket) {
+    try {
+        if (open != nullptr && (ticket.alone || open->alone)) Submit();
+        ensureOpen();
+    } catch (...) {
+        admission.Release(ticket);
+        throw;
+    }
+    open->admittedBytes += ticket.bytes;
+    open->alone = open->alone || ticket.alone;
+}
+
+void Recorder::EndItem() {
+    if (open != nullptr && open->alone) Submit();
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -5259,7 +5281,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
-    if (encoder != nullptr) encoder->Quiesce();
+    if (encoder != nullptr) encoder->Release(batch->recording);
     const auto serial = batch->submitted ? batch->serial : batch->predictedSerial;
     if (serial != 0 && Latched()) frontiers.Mark(serial, batch->submitted ? BatchState::Failed : BatchState::Cancelled);
     else if (serial != 0 && serial == frontiers.Newest() && !batch->submitted) frontiers.Retract(serial);
@@ -5336,6 +5358,8 @@ void Recorder::removeLabels(Batch& batch) {
 }
 
 void Recorder::release(Batch& batch) noexcept {
+    if (encoder != nullptr) encoder->Release(batch.recording);
+    admission.Release({std::exchange(batch.admittedBytes, 0), batch.alone});
     if (batch.queries != VK_NULL_HANDLE) {
         if (!GpuTimingEnabled() && sparePools.size() < 64) {
             try {
