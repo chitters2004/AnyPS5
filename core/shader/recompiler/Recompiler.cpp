@@ -320,6 +320,7 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
         deadCodeEliminator.Eliminate(program);
         if (NanFlagPruner{}.Prune(program).removedChecks != 0u) {
             constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
             deadCodeEliminator.RemoveIdentities(program);
             deadCodeEliminator.Eliminate(program);
         }
