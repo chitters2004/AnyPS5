@@ -174,7 +174,7 @@ void chargeNanos(std::atomic<std::uint64_t>& counter, std::chrono::steady_clock:
 struct StorageTraffic {
     AgcDriver::Mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
-    std::array<std::pair<std::uint64_t, std::uint64_t>, 4> uploads{};
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 5> uploads{};
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> uploadReasons;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> drawnStores;
     std::map<std::string, std::uint64_t> evictions;
@@ -199,10 +199,10 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto now = std::chrono::steady_clock::now();
     if (now - traffic.lastReport < std::chrono::seconds(10)) return;
     traffic.lastReport = now;
-    static constexpr const char* uploadNames[4] = {"clear", "direct", "cpu", "alias"};
+    static constexpr std::array<const char*, 5> uploadNames{"clear", "direct", "cpu", "alias", "cpu-recorded"};
     std::string line;
     char text[96];
-    for (std::size_t i = 0; i < 4; ++i) {
+    for (std::size_t i = 0; i < uploadNames.size(); ++i) {
         std::snprintf(text, sizeof(text), " %s %llu/%.1f", uploadNames[i], static_cast<unsigned long long>(traffic.uploads[i].first), traffic.uploads[i].second / 1048576.0);
         line += text;
         traffic.uploads[i] = {};
@@ -3573,6 +3573,85 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         stampLayers(false);
         original.resize(static_cast<std::size_t>(guestBytes));
         GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    }
+    if (auto* recorder = RuntimeSwitches::Set(RuntimeSwitch::NoRecordedCpuUpload) ? nullptr : Recorder::Active()) {
+        const auto fill = [&](std::span<std::byte> destination) {
+            if (selectedCpu) {
+                for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                    if (!cpuLayers[layer]) continue;
+                    const auto offset = geometry.GuestLayerOffset(layer);
+                    std::memcpy(destination.data() + offset, original.data() + offset, static_cast<std::size_t>(geometry.layerBytes));
+                }
+            } else if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(destination.data(), original.data(), original.size());
+            else ReadTextureSurface(descriptor, uploadedKeys, destination.first(original.size()));
+        };
+        const auto commands = recorder->Commands();
+        const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        if (auto self = weak_from_this().lock()) keepStorageTexture(*recorder, std::move(self));
+        const auto linear = recorder->UploadScratchBuffer(Recorder::UploadScratch::Linear, static_cast<std::size_t>(linearBytes));
+        detiler.BeginBatch();
+        VkBuffer source = VK_NULL_HANDLE;
+        VkDeviceSize sourceOffset = 0;
+        constexpr VkAccessFlags scratchWrites = VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+        if (const auto slice = recorder->UploadRing(original.size())) {
+            fill(std::span<std::byte>(slice->bytes, original.size()));
+            source = slice->buffer->Handle();
+            sourceOffset = slice->offset;
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | Recorder::UploadScratchReuseStages, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, scratchWrites, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 3);
+        } else {
+            auto staging = std::make_shared<Buffer>(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            fill(staging->Bytes());
+            const auto tiled = recorder->UploadScratchBuffer(Recorder::UploadScratch::Tiled, original.size());
+            recorder->Keep(staging, original.size());
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT | Recorder::UploadScratchReuseStages, VK_PIPELINE_STAGE_TRANSFER_BIT, scratchWrites, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            if (selectedCpu) {
+                for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+                    if (!cpuLayers[layer]) continue;
+                    const auto offset = geometry.GuestLayerOffset(layer);
+                    CopyBuffer(context, commands, staging->Handle(), offset, tiled->Handle(), offset, geometry.layerBytes);
+                }
+            } else CopyBuffer(context, commands, staging->Handle(), 0, tiled->Handle(), 0, original.size());
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            source = tiled->Handle();
+            Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 4);
+        }
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            if (selectedCpu && !cpuLayers[layer]) continue;
+            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = mips[level];
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source, sourceOffset + geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+            }
+        }
+        const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkImageMemoryBarrier toTransfer{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        toTransfer.srcAccessMask = selectedCpu ? VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT : 0u;
+        toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toTransfer.oldLayout = selectedCpu ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        toTransfer.image = image;
+        toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, VK_REMAINING_ARRAY_LAYERS};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+        const auto regions = CopyRegions(selectedCpu ? &cpuLayers : nullptr);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        VkImageMemoryBarrier toGeneral = toTransfer;
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        if (Recorder::BarrierValidate()) {
+            const std::pair<VkImage, bool> written{image, true};
+            recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
+        }
+        recorder->EndGpuTiming(timing, uploadedBytes);
+        countStorageUpload(4, uploadedBytes);
+        ++version;
+        if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
+        return;
     }
     {
             Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);

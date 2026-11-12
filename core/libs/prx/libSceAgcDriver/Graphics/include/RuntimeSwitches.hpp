@@ -33,6 +33,7 @@ enum class RuntimeSwitch : std::size_t {
     NoDepthRepeatFind,
     PartialDrains,
     PlanAttachments,
+    NoRecordedCpuUpload,
     Count,
 };
 

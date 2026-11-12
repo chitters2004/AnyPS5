@@ -13660,6 +13660,93 @@ void expectRed(float got, float want, const char* what) {
     if (std::abs(got - want) > 1.5f / 255.0f) throw std::runtime_error(std::string(what) + ": read " + std::to_string(got) + ", expected " + std::to_string(want));
 }
 
+int recordedCpuUploadTests(const Device& device, Recorder& previous, bool ring) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.dmaBufImport = false;
+    SyncedDetiler detiler(context);
+    context.detiler = &detiler;
+    const bool ringWas = RuntimeSwitches::Set(RuntimeSwitch::NoBarRing);
+    const bool waitedWas = RuntimeSwitches::Set(RuntimeSwitch::NoRecordedCpuUpload);
+    struct Restore {
+        bool ring;
+        bool waited;
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, ring);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, waited);
+        }
+    } restore{ringWas, waitedWas};
+    RuntimeSwitches::Assign(RuntimeSwitch::NoBarRing, !ring);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoRecordedCpuUpload, false);
+    GuestTextureResource resource{};
+    resource.width = 64;
+    resource.height = 64;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto guestBytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    const auto paint = [](std::vector<std::byte>& texels, std::uint8_t red) {
+        for (std::size_t at = 0; at + 4 <= texels.size(); at += 4) {
+            texels[at] = std::byte{red};
+            texels[at + 1] = std::byte{0};
+            texels[at + 2] = std::byte{0};
+            texels[at + 3] = std::byte{0xff};
+        }
+    };
+    std::vector<std::byte> first(guestBytes + 256), second(guestBytes + 256);
+    paint(first, 0x40);
+    paint(second, 0xc0);
+    auto firstResource = resource;
+    auto secondResource = resource;
+    firstResource.baseAddress = (reinterpret_cast<std::uintptr_t>(first.data()) + 255) & ~std::uintptr_t{255};
+    secondResource.baseAddress = (reinterpret_cast<std::uintptr_t>(second.data()) + 255) & ~std::uintptr_t{255};
+    const std::string what = ring ? "recorded cpu upload from the upload ring: " : "recorded cpu upload from a staging buffer: ";
+    int result = 0;
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        SampleProgram program(context, recorder);
+        const auto slicesBefore = Recorder::RingCounts().slices;
+        const auto serial = recorder.OpenSerial();
+        auto firstImage = StorageTexture::Create(context, detiler, firstResource, 0);
+        auto secondImage = StorageTexture::Create(context, detiler, secondResource, 0);
+        Require(recorder.OpenSerial() == serial && recorder.Recording(), what + "the uploads were not recorded into the open batch");
+        const bool ringUsed = Recorder::RingCounts().slices != slicesBefore;
+        if (ring && !ringUsed) {
+            std::cout << "skipped, the upload ring is unavailable on this device (no BAR memory)\n";
+            result = 77;
+        } else {
+            Require(ringUsed == ring, what + (ring ? "the upload did not take a ring slice" : "the upload took a ring slice with the ring switched off"));
+            expectRed(program.Red(secondImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0xc0 / 255.0f, (what + "the second of two back-to-back uploads").c_str());
+            Buffer earlier(context, 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            std::memset(earlier.Bytes().data(), 0, earlier.Bytes().size());
+            {
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                VkBufferImageCopy copy{};
+                copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                copy.imageExtent = {1, 1, 1};
+                context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, firstImage->Image(), VK_IMAGE_LAYOUT_GENERAL, earlier.Handle(), 1, &copy);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+            }
+            paint(first, 0x80);
+            firstImage->Refresh();
+            Require(recorder.Recording(), what + "the refresh upload was not recorded into the open batch");
+            expectRed(program.Red(firstImage->View(), VK_IMAGE_LAYOUT_GENERAL, 0), 0x80 / 255.0f, (what + "a dispatch sampling the image in the batch that re-uploaded it").c_str());
+            Require(std::to_integer<std::uint8_t>(earlier.Bytes()[0]) == 0x40, what + "the re-upload overwrote the image before a reader recorded earlier in its batch read it");
+        }
+        recorder.Sync();
+    }
+    previous.Activate();
+    if (result == 0) std::cout << what << "passed\n";
+    return result;
+}
+
 void minLodTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (!context.imageViewMinLod) {
@@ -16788,6 +16875,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--benchmark-pending-write-snapshot") {
             pendingWriteSnapshotBenchmark(recorder);
             return 0;
+        }
+        if (argc == 2 && (std::string_view(argv[1]) == "--recorded-cpu-upload-only" || std::string_view(argv[1]) == "--recorded-cpu-upload-staging-only")) {
+            return recordedCpuUploadTests(device, recorder, std::string_view(argv[1]) == "--recorded-cpu-upload-only");
         }
         if (argc == 2 && (std::string_view(argv[1]) == "--storage-upload-lifetime-only" || std::string_view(argv[1]) == "--storage-upload-failure-only")) {
             storageUploadLifetimeTests(device, recorder, std::string_view(argv[1]) == "--storage-upload-failure-only");
