@@ -2104,12 +2104,13 @@ void encoderAcknowledgementTests(const Device& device) {
             const Recorder::EncodingWindow window(recorder);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         }
-        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        const bool parked = CommandEncoder::PostsChunks();
+        const auto deadline = std::chrono::steady_clock::now() + (parked ? std::chrono::milliseconds(50) : std::chrono::milliseconds(5000));
         while (entered.load() == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-        if (entered.load() == 0) {
+        if ((entered.load() != 0) == parked) {
             go.store(true, std::memory_order_release);
             CommandEncoder::SetDelayForTesting({});
-            throw std::runtime_error("AGC graphics: the encoder never replayed the deferred barrier");
+            throw std::runtime_error(parked ? "AGC graphics: a closed window posted its chunk while chunks are held" : "AGC graphics: the encoder never replayed the deferred barrier");
         }
         releaser = std::thread([&] {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -2124,6 +2125,7 @@ void encoderAcknowledgementTests(const Device& device) {
         CommandEncoder::SetDelayForTesting({});
         Require(submitted == "injected device loss", "a latched recorder submitted the batch its encoder was still recording ('" + submitted + "')");
         Require(discarded == 1 && discardedAfterEncoding, "a cancelled batch was released before its encoder acknowledged it");
+        Require(entered.load() != 0, "the held chunk of a cancelled batch was never posted to the encoder");
         Require(recorder.Idle(), "the cancelled batch stayed open");
     }
     releaser.join();
