@@ -1,0 +1,13 @@
+diff --git a/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp b/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
+index 7a05a1f7d7d..65e3fafc7ec 100644
+--- a/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
++++ b/core/libs/prx/libSceAgcDriver/Graphics/src/CommandEncoder.cpp
+@@ -598,7 +598,7 @@ bool CommandEncoder::Admit(Handoff handoff, std::source_location where) {
+     }
+     if (handoff == Handoff::Always) {
+         policy = Policy{};
+-        return true;
++        return decline(where);
+     }
+     if (policy.inlined) {
+         if (++policy.windows < policy.span) return decline(where);
