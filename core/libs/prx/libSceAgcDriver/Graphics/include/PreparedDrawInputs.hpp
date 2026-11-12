@@ -35,7 +35,7 @@ void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
 std::shared_ptr<PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<PreparedDrawInputs> job, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t epoch = 0);
 void SubmitPreparedDrawResources(const std::shared_ptr<PreparedDrawInputs>& job, std::shared_ptr<const void> pin);
 std::vector<std::uint32_t> DrawResourceCacheKey(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
-std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit);
+std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit, bool& stagingPredicted);
 std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& context, bool deviceStaging);
 void CountPreparedDrawResourcesVerified(bool differed);
 std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>* spare);
@@ -136,6 +136,9 @@ struct PreparedUploadCounts {
     std::uint64_t stageAStale = 0;
     std::uint64_t stageAStaleStaging = 0;
     std::array<std::uint64_t, PreparedStalenessCount> stageAStaleBy{};
+    std::uint64_t stageAStagingPredicted = 0;
+    std::uint64_t stageAStagingFallback = 0;
+    std::uint64_t stageAStagingMispredicted = 0;
     std::uint64_t stageAUnused = 0;
     std::uint64_t stageAPredictedHit = 0;
     std::uint64_t stageARefused = 0;

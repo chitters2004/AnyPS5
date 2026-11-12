@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -50,6 +51,7 @@ std::byte* Pool = nullptr;
 std::byte* IndexMemory = nullptr;
 std::byte* SpareBlock = nullptr;
 std::size_t VertexOffset = 0x2000;
+bool TiledTarget = false;
 
 alignas(256) constexpr std::array<std::uint32_t, 10> VertexCode{
     0xe0382000, 0x80020005, 0xe0382010, 0x80020405, 0xbf8c3f70,
@@ -149,6 +151,7 @@ std::vector<std::uint32_t> Draw(bool writeVerticesFirst = false) {
     }
     for (const auto& [offset, value] : ContextBaseline) SetRegister(words, SetContextReg, offset, value);
     SetRegister(words, SetContextReg, 0x207, DistanceVector);
+    if (TiledTarget) SetRegister(words, SetContextReg, 0x3b8, 0x9000000u | (5u << 14u));
     SetRegister(words, SetContextReg, 0x318, static_cast<std::uint32_t>(colorAddress >> 8u));
     SetRegister(words, SetContextReg, 0x390, static_cast<std::uint32_t>(colorAddress >> 40u));
     SetRegister(words, SetContextReg, 0x3b0, ((Width - 1u) << 14u) | (Height - 1u));
@@ -188,6 +191,10 @@ void WriteVertices(float shift) {
 }
 
 std::vector<std::byte> Colors() {
+    const auto colorAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory));
+    static_cast<void>(AgcDriver::Graphics::StorageTexture::FlushPending(colorAddress, ColorBytes, nullptr, "prepared uploads test"));
+    AgcDriver::GuestMemory::FlushGpuWrites(colorAddress, ColorBytes);
+    AgcDriverWaitIdle_nid_postfix();
     std::vector<std::byte> colors(ColorBytes);
     AgcDriver::GuestMemory::Read(static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(ColorMemory)), colors);
     return colors;
@@ -246,6 +253,9 @@ struct Outcome {
         return total;
     }
     std::uint64_t stageAUnused() const { return after.stageAUnused - before.stageAUnused; }
+    std::uint64_t stagingPredicted() const { return after.stageAStagingPredicted - before.stageAStagingPredicted; }
+    std::uint64_t stagingFallback() const { return after.stageAStagingFallback - before.stageAStagingFallback; }
+    std::uint64_t stagingMispredicted() const { return after.stageAStagingMispredicted - before.stageAStagingMispredicted; }
     std::uint64_t predictedHits() const { return after.stageAPredictedHit - before.stageAPredictedHit; }
     std::uint64_t regionsPrepared() const { return after.regionsPrepared - before.regionsPrepared; }
     std::uint64_t regionsAdopted() const { return after.regionsAdopted - before.regionsAdopted; }
@@ -270,6 +280,7 @@ Outcome DrawOnce(Change change, std::size_t vertexOffset, bool writeVerticesFirs
     outcome.written = WrittenPixels(outcome.colors);
     Require(Armed.load() == Change::None, "prepared uploads: the armed change never ran between preparation and commit");
     Require(outcome.stageAStaleReasons() == outcome.stageAStale(), "prepared uploads: a stale stage A was not counted under exactly one reason");
+    Require(outcome.stagingMispredicted() == 0, "prepared uploads: the preparer predicted a staging decision the committer did not make");
     Require(outcome.after.stageAVerifyDiffered == outcome.before.stageAVerifyDiffered && outcome.after.regionVerifyDiffered == outcome.before.regionVerifyDiffered, "prepared uploads: APS5_VERIFY_EARLY_UPLOADS found an adopted stage A or region copy that differs from the committer's own");
     return outcome;
 }
@@ -315,14 +326,15 @@ int main() {
         SpareBlock = AllocateWatched(Block);
         GuestAllocations::Mutation().Add(Pool, PoolBytes, true, true, true);
         GuestAllocations::Mutation().Add(IndexMemory, Block, true, true, true);
+        GuestAllocations::Mutation().Add(ColorMemory, 2 * Block, true, true, true);
         Register(VertexShader, VertexCode.data(), sizeof(VertexCode), 2);
         Register(PixelShader, PixelCode.data(), sizeof(PixelCode), 1);
         AgcDriver::Graphics::SetDrawInputPreparers(1);
         AgcDriver::Graphics::SetPreparedDrawInputsHook(&BeforeCommit);
 
         const auto first = DrawOnce(Change::None, 0x1f00);
-        Print("first draw, staging decision not yet known to the preparer", first);
-        Require(first.written == Width * Height && first.stageAAdopted() + first.stageAStaleStaging() == 1, "prepared uploads: the first draw neither adopted its stage A nor refused it for the staging decision");
+        Print("first draw, staging decision predicted from its linear target without host imports", first);
+        Require(first.written == Width * Height && first.stageAAdopted() == 1 && first.stageAStaleStaging() == 0 && first.stagingPredicted() == 1, "prepared uploads: the first draw's staging decision was not predicted from its target, so its stage A was refused");
         Require(first.regionsAdopted() >= 1, "prepared uploads: the committer's own build did not adopt the prepared region copy");
 
         const auto unchanged = DrawOnce(Change::None, 0x2000);
@@ -354,6 +366,33 @@ int main() {
         const auto queued = DrawOnce(Change::None, 0x2500, true);
         Print("a queued write moving the vertices ahead of the draw", queued);
         Require(queued.written == 0, "prepared uploads: the draw read the vertices from before the write the queue ordered ahead of it");
+
+        TiledTarget = true;
+        const auto tiledReference = Reference(0x2600, false).colors;
+        TiledTarget = false;
+        const auto linearReference = Reference(0x2600, false).colors;
+        const auto alternate = [&](const char* what) {
+            std::uint64_t adopted = 0;
+            std::uint64_t staleStaging = 0;
+            std::uint64_t predicted = 0;
+            for (int round = 0; round < 4; ++round) {
+                TiledTarget = (round % 2) == 1;
+                const auto outcome = DrawOnce(Change::None, 0x2600);
+                adopted += outcome.stageAAdopted();
+                staleStaging += outcome.stageAStaleStaging();
+                predicted += outcome.stagingPredicted();
+                Require(outcome.written == Width * Height && outcome.colors == (TiledTarget ? tiledReference : linearReference), std::string("prepared uploads: ") + what + ": a draw differs from the same draw built on the committer");
+            }
+            TiledTarget = false;
+            std::printf("%s: linear and tiled targets alternating over 4 draws: %llu stage A adopted, %llu refused for the staging decision, %llu decisions predicted\n", what, static_cast<unsigned long long>(adopted), static_cast<unsigned long long>(staleStaging), static_cast<unsigned long long>(predicted));
+            return std::array<std::uint64_t, 3>{adopted, staleStaging, predicted};
+        };
+        const auto predicting = alternate("staging predicted");
+        Require(predicting[0] == 4 && predicting[1] == 0 && predicting[2] == 4, "prepared uploads: synchronous and recorded draws alternating refused a stage A for its staging decision while the decision was predicted");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoStagingPrediction, true);
+        const auto guessing = alternate("APS5_NO_STAGING_PREDICTION");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoStagingPrediction, false);
+        Require(guessing[1] >= 3 && guessing[2] == 0, "prepared uploads: with APS5_NO_STAGING_PREDICTION the alternating draws were not refused for the last staging decision, so the arm proves nothing");
 
         bool refused = false;
         {

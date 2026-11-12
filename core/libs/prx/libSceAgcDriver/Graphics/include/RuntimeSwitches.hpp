@@ -37,6 +37,8 @@ enum class RuntimeSwitch : std::size_t {
     NoEarlyUploadPrepare,
     NoEarlyRegionCopies,
     NoDrawInputRing,
+    NoResidentLinear,
+    NoStagingPrediction,
     Count,
 };
 

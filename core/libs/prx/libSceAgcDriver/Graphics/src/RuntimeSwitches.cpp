@@ -45,6 +45,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_EARLY_UPLOAD_PREPARE",
     "APS5_NO_EARLY_REGION_COPIES",
     "APS5_NO_DRAW_INPUT_RING",
+    "APS5_NO_RESIDENT_LINEAR",
+    "APS5_NO_STAGING_PREDICTION",
 };
 
 struct SwitchValues {
@@ -77,6 +79,8 @@ struct SwitchValues {
             std::getenv("APS5_NO_EARLY_UPLOAD_PREPARE") != nullptr,
             std::getenv("APS5_NO_EARLY_REGION_COPIES") != nullptr,
             std::getenv("APS5_NO_DRAW_INPUT_RING") != nullptr,
+            std::getenv("APS5_NO_RESIDENT_LINEAR") != nullptr,
+            std::getenv("APS5_NO_STAGING_PREDICTION") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

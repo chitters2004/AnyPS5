@@ -74,6 +74,11 @@ struct DrawInputCopy {
     Recorder::OwnedDrawInputProof owned;
     std::span<std::byte> Bytes() const;
 };
+enum class TargetResidency : std::uint8_t { Multisampled, Resident, Copied, LinearImport };
+bool ResidentTargetsEnabled();
+TargetResidency ColorTargetResidency(const Context& context, const ColorTarget& color, bool residentTargets, bool residentLinear);
+bool LinearTargetImported(const Context& context, const ColorTarget& color, bool import);
+std::optional<bool> PredictDrawDeviceStaging(const Context& context, const State& state);
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
