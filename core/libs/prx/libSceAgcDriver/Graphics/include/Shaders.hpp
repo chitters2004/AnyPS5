@@ -6,6 +6,7 @@
 #include "Recompiler.hpp"
 #include <array>
 #include <cstddef>
+#include <vector>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -39,10 +40,29 @@ struct CompiledShader {
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
     const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
+    const std::vector<std::byte>* push = nullptr;
 };
 
 inline std::uint32_t KeyedPushOffset(const CompiledShader& shader) {
     return shader.program->pushConstants.empty() ? 0u : shader.pushConstantOffset;
+}
+
+inline const std::vector<std::byte>& PushBytes(const ShaderRecompiler::RecompileResult& program, const std::vector<std::byte>* push) {
+    return push != nullptr ? *push : program.pushConstants;
+}
+
+inline const std::vector<std::byte>& PushBytes(const CompiledShader& shader) {
+    return PushBytes(*shader.program, shader.push);
+}
+
+inline std::vector<std::byte>& OwnPushBytes(ShaderRecompiler::RecompileResult& copy) {
+    return copy.pushConstants;
+}
+
+inline ShaderRecompiler::RecompileResult CopyCompiled(const ShaderRecompiler::RecompileResult& program, const std::vector<std::byte>* push) {
+    auto copy = program;
+    if (push != nullptr) copy.pushConstants = *push;
+    return copy;
 }
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {
@@ -89,7 +109,7 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
     std::array<bool, PipelinePushConstantBytes> occupied{};
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
-        const auto& bytes = shader.program->pushConstants;
+        const auto& bytes = PushBytes(shader);
         if (bytes.empty()) continue;
         Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
         Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");

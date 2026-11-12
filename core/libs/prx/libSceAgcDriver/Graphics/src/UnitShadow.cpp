@@ -332,7 +332,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
-    recorder->NotePendingWrites(ranges);
+    recorder->NoteStampedWrites(ranges);
 }
 
 // APS5_SHADOW_VERIFY=1: the published bytes read back from the slabs equal the guest bytes.
@@ -864,7 +864,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
     // source, as they see a write-back.
-    StorageTexture::BumpPendingSerial();
+    StorageTexture::BumpPendingSerial(PendingBump::Shadowed);
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {

@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -178,6 +179,7 @@ private:
     bool repackCopy = false;
     std::uint32_t copyWidth = 0, copyHeight = 0, copyLevels = 0, copyLayers = 0, copyElementBytes = 0;
     std::uint32_t copyTexelsPerElement = 4;
+    GuestMemory::WriteOwner owner;
 };
 
 VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
@@ -266,6 +268,11 @@ private:
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+enum class PendingBump : std::uint8_t { Unlabelled, MarkLent, Mark, Reconcile, Flush, FlushStarted, FlushEnded, Discard, ClearByKeys, Destroyed, Shadowed, Count };
+const char* PendingBumpName(PendingBump source);
+bool PendingBumpsCounted();
+std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> PendingBumpCounts();
+
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     struct CreationHandOver {
@@ -309,6 +316,7 @@ public:
     std::vector<VkRect2D> UnitRects(const std::vector<bool>& units) const;
     bool BlockUnits() const { return blockUnits; }
     std::uint32_t TrackedUnits() const { return trackedLayers; }
+    std::uint64_t PendingSinceForTest(std::uint32_t unit) const { return layerPendingSince.at(unit); }
     void MarkSliceDirty(std::uint32_t slice, std::uint32_t count = 1);
     bool MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor);
     void Flush(const char* reason = "cache eviction");
@@ -335,6 +343,7 @@ public:
     static void StoreReadbackBeforeLabel(const char* reason, VkDevice device = VK_NULL_HANDLE);
     static std::size_t StoreDrawnLinear(const char* reason);
     static void NoteFlip();
+    static std::uint64_t FlipCount();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
@@ -342,7 +351,7 @@ public:
     static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
-    static void BumpPendingSerial();
+    static void BumpPendingSerial(PendingBump source = PendingBump::Unlabelled);
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -413,6 +422,15 @@ public:
         std::uint64_t refreshes;
     };
     static OrderedSkipCounts TakeOrderedSkipCounts();
+    struct FlushWaitCounts {
+        std::uint64_t flushes;
+        std::uint64_t ordered;
+        std::uint64_t none;
+        std::uint64_t stampedOnly;
+        std::uint64_t unstamped;
+    };
+    static std::array<FlushWaitCounts, 2> TakeFlushWaitCounts();
+    static bool FlushWaitsProfiled();
     static void SetFlushFailureForTest(bool fail);
     static int TakeFlushFailureForTest();
     static bool OrderedFlushArmedForTest();
@@ -526,6 +544,13 @@ public:
     static std::uint64_t RefreshesProved();
     const char* RefreshObligation(std::uint32_t first = 0, std::uint32_t count = 0) const;
     static bool UploadRefreshProofs();
+    struct SyncedBorrowCounts {
+        std::uint64_t borrows = 0;
+        std::uint64_t units = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t rollBacks = 0;
+    };
+    static SyncedBorrowCounts SyncedBorrows();
     static bool RefreshExitEpochStamps();
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
@@ -534,6 +559,8 @@ public:
     static std::uint64_t UntrackedCompares();
     static std::uint64_t GuestSnapshots();
     static std::uint64_t OccasionalLabelStores();
+    static std::uint64_t LayoutStoreSkips();
+    static std::uint64_t PendingSinceSkips();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
@@ -730,6 +757,11 @@ private:
     // stays responsible for storing them until this image's own results supersede them
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
+    bool sameShape(const StorageTexture& other) const;
+    std::shared_ptr<StorageTexture> syncedAlias(const std::vector<bool>& wanted, std::vector<bool>& lent) const;
+    void rollBackRefresh(std::span<const std::array<std::uint64_t, 3>> units, bool uploaded);
+    void armRefreshRollBack(const std::vector<std::uint64_t>& before, bool uploaded);
+    static void noteSyncedBorrow(std::size_t units, std::uint64_t bytes);
     std::optional<DccKeys> clearHandOver();
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
@@ -778,6 +810,7 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
+    GuestMemory::WriteOwner owner;
     std::vector<std::byte> original;
     struct ComparedRange {
         std::uint64_t address = 0;
@@ -820,6 +853,10 @@ private:
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> layerPendingSince;
+    std::uint64_t pendingSinceHeld = 0;
+    std::uint32_t pendingSinceFirst = 0;
+    std::uint32_t pendingSinceEnd = 0;
+    std::uint64_t layoutSerial = 0;
     std::vector<std::uint64_t> completionKept;
     UnitFlags layerPending;
     std::vector<bool> layerBehind;
@@ -833,6 +870,7 @@ private:
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
     UnitFlags borrowedUnits;
+    std::uint64_t forgetSeen = 0;
     std::vector<std::pair<std::weak_ptr<StorageTexture>, std::uint64_t>> handedOver;
     std::vector<bool> handedUnits;
     std::vector<std::shared_ptr<StorageTexture>> adoptedSources;

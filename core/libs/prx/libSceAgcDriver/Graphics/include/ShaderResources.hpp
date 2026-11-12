@@ -3,8 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
@@ -25,7 +27,6 @@
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
-namespace AgcDriver::GuestMemory { struct WriteSubscription; }
 
 namespace AgcDriver::Graphics {
 
@@ -44,6 +45,43 @@ struct WriteIndexOutcomes {
     std::uint64_t builds = 0;
 };
 WriteIndexOutcomes WriteIndexOutcomesCounted();
+enum class CertifiedMiss : std::size_t { Uncertified, Sweep, Subscription, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
+enum class CertifyRefusal : std::size_t { Unsubscribed, PerElementTextures, ComparedTextures, ComparedTables, DepthCopies, StorageImages, PendingMoved, DepthSurfacesMoved, Count };
+enum class UncertifiedCause : std::size_t { NeverProved, Refused, Voided, ProofFailed, NotCertifying, ViewsStale, Count };
+enum class GateMiss : std::uint8_t { DepthPlanes, Sweep, Version, Proof, Unwatch, Mapping, Pending, DepthSurfaces, CpuWriters, Audit, Imports, Count };
+enum class EpochGateMiss : std::uint8_t { Epoch, Proof, Pending, Count };
+constexpr std::uint32_t GateMissBit(GateMiss gate) {
+    return std::uint32_t{1} << static_cast<unsigned>(gate);
+}
+constexpr std::uint32_t EpochGateMissBit(EpochGateMiss gate) {
+    return std::uint32_t{1} << static_cast<unsigned>(gate);
+}
+constexpr std::size_t GateMissSets = std::size_t{1} << static_cast<std::size_t>(GateMiss::Count);
+constexpr std::size_t EpochGateMissSets = std::size_t{1} << static_cast<std::size_t>(EpochGateMiss::Count);
+const char* GateMissName(GateMiss gate);
+const char* EpochGateMissName(EpochGateMiss gate);
+
+struct CertifiedProofOutcomes {
+    std::uint64_t proved = 0;
+    std::uint64_t swept = 0;
+    std::uint64_t issued = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t disagreed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> missed{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> refused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(UncertifiedCause::Count)> uncertified{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifyRefusal::Count)> uncertifiedRefused{};
+    std::array<std::uint64_t, static_cast<std::size_t>(CertifiedMiss::Count)> uncertifiedVoided{};
+    std::uint64_t epochServed = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> proofMissSources{};
+    std::uint64_t proofMissUnattributed = 0;
+    std::array<std::uint64_t, GateMissSets> certifiedGateSets{};
+    std::array<std::uint64_t, EpochGateMissSets> epochGateSets{};
+    std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> pendingMissSources{};
+    std::uint64_t pendingMissUnattributed = 0;
+};
+CertifiedProofOutcomes CertifiedProofOutcomesCounted();
+bool CertifiedProofs();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 std::uint64_t TextureCacheBudget(const VkPhysicalDeviceMemoryProperties& memory);
 std::uint64_t StorageTextureCeiling(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
@@ -79,6 +117,9 @@ std::shared_ptr<StorageTexture> CachedStorageLayers(const Context& context, cons
 // Whether `image` is still the storage cache's image of its surface (what CachedStorageSurface
 // would return); a true answer counts as a use for the cache's eviction order, as a lookup would.
 bool StorageImageCached(const Context& context, const StorageTexture* image);
+bool StorageImageCachedFor(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
+enum class StorageImageMatch : std::uint8_t { Gone, Other, Same };
+StorageImageMatch MatchStorageImage(const Context& context, const StorageTexture* image, const GuestTextureResource& viewed);
 bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddress);
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& resource, const std::shared_ptr<StorageTexture>& stored);
 
@@ -193,6 +234,9 @@ struct PresyncSurface {
     bool dccKeys;
 };
 
+enum class PreparedStaleness : std::uint8_t { Current, Unusable, Registry, Forget, Recorder, Mirrors, ImageViews, StagingDecisions, Count };
+inline constexpr std::size_t PreparedStalenessCount = static_cast<std::size_t>(PreparedStaleness::Count);
+
 class ShaderResources {
 public:
     ShaderResources(const Context& context, const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment, const ColorTarget& target, std::uint64_t indexAddress, std::size_t indexBytes);
@@ -206,6 +250,13 @@ public:
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     void Complete();
     bool Completed() const { return completed; }
+    struct PreparedOffDevice {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deviceStaging, PreparedOffDevice);
+    PreparedStaleness PreparedDrawStaleness(bool deviceStaging) const;
+    bool PreparedStaging() const { return preparedStaging; }
+    void CompleteDraw(std::span<const CompiledShader> shaders);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> OffDeviceCopies() const { return guestMemory.OffDeviceCopies(); }
+    std::vector<std::uint64_t> RegionSignature() const { return guestMemory.RegionSignature(); }
     ~ShaderResources();
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
@@ -235,6 +286,8 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::vector<VkDescriptorBufferInfo> writtenBuffers;
+        std::vector<VkDescriptorImageInfo> writtenImages;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -257,6 +310,15 @@ public:
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
+    struct BoundBuffer {
+        ShaderRecompiler::DescriptorRole role;
+        bool guest;
+        std::uint64_t address;
+        std::size_t size;
+        std::vector<std::uint32_t> words;
+        bool operator==(const BoundBuffer&) const = default;
+    };
+    std::vector<BoundBuffer> BoundBuffers(std::span<const MovedBuffer> moved = {}) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
@@ -309,9 +371,11 @@ public:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
+    void StorageImages(std::vector<std::pair<VkImage, bool>>& out) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
+    static bool ReadImageSet();
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
@@ -333,6 +397,8 @@ public:
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
     static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
     static void AppendContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
+    static void AppendStaticContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, std::span<const std::uint32_t> skip, std::vector<std::uint32_t>& key);
+    static void AppendBindingContentKey(const CompiledShader& shader, std::uint32_t binding, bool dataWords, bool movableBuffers, std::vector<std::uint32_t>& key);
     static bool DiffContentKeys(std::span<const std::uint32_t> previous, std::span<const std::uint32_t> key, bool draw, ContentKeyDiff& diff);
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
@@ -344,9 +410,31 @@ public:
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
     void KeepStorageImageBytes(Recorder& recorder) const;
+    void ProbeEffectRepeat(const Recorder& recorder);
+    struct EffectRepeats {
+        std::uint64_t probed, repeated, identical;
+    };
+    static EffectRepeats EffectRepeatCounts();
+    struct BindingCounts {
+        std::uint64_t calls, visited, written, notDirect, pendingWrite, overBudget, overrides, unwritten, uploaded, reused, created, setsWritten, repeated, identical, slotsDiffer;
+    };
+    static BindingCounts DrawBindingCounts();
+    struct BindingReuseCounts {
+        std::uint64_t reused, fresh, legacy, first, newBatch, generation, faultRecord, overrideWords, slotChanged, expired, nanoseconds;
+    };
+    static BindingReuseCounts DrawBindingReuseCounts();
+    static bool CompiledBindingsEnabled();
+    void NoteBindingsChangedForTest() const { noteBindingsChanged(); }
+    bool CompareBindingDecisionsForTest(std::span<const MovedBuffer> moved, bool movedOnly, std::string& difference) const;
+    void MarkReboundForTest() {
+        rebound = true;
+        noteBindingsChanged();
+    }
+    bool BindingsCompiled() const { return compiledBindings != nullptr; }
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
+    static std::uint64_t InPlaceReadReuses();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
@@ -425,6 +513,8 @@ public:
     std::vector<PresyncSurface> PresyncSurfaces() const;
 
 private:
+    void noteReadImages();
+    bool walkReadsImage(const StorageTexture* image) const;
     friend class AgcDriver::VulkanDevice;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
@@ -676,6 +766,32 @@ private:
     std::shared_ptr<ShaderResources> afterRunSelf;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
+    struct EffectInputs;
+    struct BindingInputs;
+    struct CompiledBindings;
+    std::unique_ptr<const CompiledBindings> compiledBindings;
+    mutable std::uint64_t bindingGeneration = 1;
+    struct BindingReuse;
+    mutable std::unique_ptr<BindingReuse> bindingReuse;
+    struct BindingDecision {
+        std::size_t allocation = 0;
+        const MovedBuffer* override = nullptr;
+        std::uint64_t begin = 0;
+        std::size_t bytes = 0;
+        bool words = false;
+        bool operator==(const BindingDecision&) const = default;
+    };
+    void compileBindings();
+    void describeDrawSets(std::array<bool, 2>& described, std::array<std::vector<VkDescriptorPoolSize>, 2>& sizes, std::array<std::optional<std::uint32_t>, 2>& variable) const;
+    void noteBindingsChanged() const;
+    void decideBindingsLegacy(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const;
+    void decideBindingsCompiled(std::span<const MovedBuffer> moved, bool movedOnly, std::vector<BindingDecision>& decisions) const;
+    std::string bindingDecisionDifference(std::span<const BindingDecision> compiled, std::span<const BindingDecision> legacy) const;
+    std::shared_ptr<DrawBindings> reuseDrawBindings(const Recorder& recorder, const DrawBindings& candidate, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool words) const;
+    void rememberDrawBindings(const Recorder& recorder, const std::shared_ptr<DrawBindings>& bindings, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void verifyReusedBindings(const DrawBindings& reused, DrawBindings& fresh, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    mutable std::unique_ptr<BindingInputs> bindingInputs;
+    std::unique_ptr<EffectInputs> effectInputs;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;
     bool usesBda = false;
     bool bdaReadOnly = true;
@@ -723,7 +839,8 @@ private:
     };
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool capture = false) const;
+    void noteDrawBindings(const Recorder& recorder, BindingCounts tally, std::span<const std::size_t> selected, const DrawBindings* result, bool written) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
@@ -735,10 +852,12 @@ private:
     bool drawBuild = false;
     std::uint64_t dispatchThreads = 0;
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClear;
+    mutable GuardSetProof guardSetProof;
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
     std::vector<bool> textureSrgb;
+    std::vector<const StorageTexture*> readImages;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<VkImageView> multisampleStorageViews;
     std::vector<std::uint32_t> storageMips;
@@ -772,6 +891,22 @@ private:
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    ProofFailure proveImports();
+    ProofFailure recordStaging();
+    std::optional<bool> certifiedRevalidate(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::optional<CertifyRefusal> certifyRefusal() const;
+    GuestMemory::WriteCertificate certificate;
+    std::uint64_t certifiedEpoch = 0;
+    std::uint64_t certifiedPending = 0;
+    std::uint64_t certifiedDepth = 0;
+    bool certified = false;
+    UncertifiedCause uncertifiedCause = UncertifiedCause::NeverProved;
+    CertifyRefusal uncertifiedRefusal = CertifyRefusal::Count;
+    CertifiedMiss uncertifiedMiss = CertifiedMiss::Count;
+    bool epochServed = false;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ProofBreak::Count)> certifiedBreaks{};
+    std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> certifiedPendingBumps{};
+    void noteUncertified(UncertifiedCause cause, CertifyRefusal refusal = CertifyRefusal::Count, CertifiedMiss miss = CertifiedMiss::Count);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     bool importsReconcilable = false;
@@ -808,6 +943,12 @@ private:
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool completed = false;
+    bool preparedDraw = false;
+    bool preparedStaging = false;
+    std::uint64_t preparedRegistry = 0;
+    std::uint64_t preparedForget = 0;
+    std::uint64_t preparedMirrors = 0;
+    const Recorder* preparedRecorder = nullptr;
     std::chrono::steady_clock::time_point phaseStart;
 };
 
@@ -829,19 +970,36 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
+    static std::uint64_t SegmentHash(std::span<const std::uint32_t> words) noexcept;
+    static std::size_t Hash(std::span<const std::uint32_t> key) noexcept;
+    class DrawKeyHash {
+    public:
+        explicit DrawKeyHash(std::span<const std::uint32_t> head) noexcept;
+        void Stage(std::uint32_t words, std::uint64_t segment) noexcept;
+        std::size_t Finish(std::span<const std::uint32_t> tail) const noexcept;
+
+    private:
+        std::uint64_t state = 0;
+    };
+    static bool HashReuse();
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
+    std::shared_ptr<ShaderResources> Peek(const Key& key) const;
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
     void Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    void Insert(const Key& key, std::size_t hash, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // With `object`, erases the entry only while it still holds that object (a replacement made
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
+    void Remove(const Key& key, std::size_t hash, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     bool TryRemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
+    bool Touch(const Key& key, std::size_t hash);
     // Find and Touch calls so far (the [rescache] line: a recipe hit touches instead of finding).
     static std::uint64_t Finds();
     static std::uint64_t Touches();
@@ -855,40 +1013,35 @@ public:
     static constexpr std::size_t MaximumEntries = 16384;
 
 private:
-    void erase(const Key& key);
+    struct HashedKey {
+        Key words;
+        std::size_t hash = 0;
+    };
+    struct KeyRef {
+        const Key* words = nullptr;
+        std::size_t hash = 0;
+    };
+    struct KeyHash {
+        using is_transparent = void;
+        std::size_t operator()(const HashedKey& key) const noexcept { return key.hash; }
+        std::size_t operator()(const KeyRef& key) const noexcept { return key.hash; }
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const HashedKey& left, const HashedKey& right) const noexcept { return left.hash == right.hash && left.words == right.words; }
+        bool operator()(const HashedKey& left, const KeyRef& right) const noexcept { return left.hash == right.hash && left.words == *right.words; }
+        bool operator()(const KeyRef& left, const HashedKey& right) const noexcept { return left.hash == right.hash && *left.words == right.words; }
+    };
+    void erase(const Key& key, std::size_t hash);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
-    void noteEvicted(const Key& key);
-    void noteReturn(const Key& key);
-    void noteUse(const Key& key);
+    void noteEvicted(std::size_t hash);
+    void noteReturn(std::size_t hash);
+    void noteUse(std::size_t hash);
     void removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted);
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            constexpr std::uint64_t Prime = 0x9e3779b97f4a7c15ull;
-            std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
-            const auto* words = key.data();
-            const auto count = key.size();
-            std::size_t at = 0;
-            for (; at + 8u <= count; at += 8u) {
-                for (std::size_t lane = 0; lane < 4u; ++lane) {
-                    const auto value = static_cast<std::uint64_t>(words[at + lane * 2u]) | static_cast<std::uint64_t>(words[at + lane * 2u + 1u]) << 32u;
-                    lanes[lane] = (lanes[lane] ^ value) * Prime;
-                    lanes[lane] ^= lanes[lane] >> 29u;
-                }
-            }
-            std::uint64_t hash = lanes[0] ^ (lanes[1] << 17u | lanes[1] >> 47u) ^ (lanes[2] << 31u | lanes[2] >> 33u) ^ (lanes[3] << 47u | lanes[3] >> 17u) ^ count;
-            for (; at < count; ++at) hash = (hash ^ words[at]) * Prime;
-            hash ^= hash >> 33u;
-            hash *= 0xff51afd7ed558ccdull;
-            hash ^= hash >> 33u;
-            hash *= 0xc4ceb9fe1a85ec53ull;
-            hash ^= hash >> 33u;
-            return static_cast<std::size_t>(hash);
-        }
-    };
     mutable AgcDriver::Mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    std::list<std::pair<HashedKey, std::shared_ptr<ShaderResources>>> entries;
+    std::unordered_map<HashedKey, decltype(entries)::iterator, KeyHash, KeyEqual> index;
     std::size_t capacity = 0;
     bool fixedCapacity = false;
     std::list<std::size_t> evictedOrder;

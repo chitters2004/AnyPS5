@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -169,6 +170,12 @@ struct RegisteredPiece {
 };
 // Whether a readable registered allocation contains [address, address + bytes) right now (one
 // registry lease): a storage image whose memory was freed or re-registered has nothing to store to.
+struct OffDeviceRefusal : std::runtime_error {
+    using std::runtime_error::runtime_error;
+};
+std::uint64_t MirrorsVersion();
+VkBufferUsageFlags RegionCopyUsage(bool addressable);
+
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes, std::vector<RegisteredPiece>* pieces = nullptr);
 std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 
@@ -294,6 +301,13 @@ void ClearSnapshotCopies(VkDevice device);
 std::vector<std::uint64_t> AddressTableKey(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::span<const ShaderRecompiler::BdaAbi::Range> own);
 void ClearImageMirrors(VkDevice device);
 void ClearHostImports(VkDevice device);
+void ClearResidentRanges(VkDevice device);
+struct ResidentStatistics {
+    std::size_t resident = 0;
+    std::uint64_t promoted = 0, bound = 0, skipped = 0, copied = 0, invalidated = 0;
+    std::uint64_t skippedBytes = 0, kept = 0, refused = 0, discarded = 0;
+};
+ResidentStatistics ResidentCounts();
 
 struct RetainedAddressSpace {
     std::shared_ptr<const void> space;
@@ -380,6 +394,9 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
+    void PrepareOffDevice(bool off) { offDevice = off; }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> OffDeviceCopies() const;
+    std::vector<std::uint64_t> RegionSignature() const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -407,6 +424,7 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    void SplitDirectWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>>& direct, std::vector<std::pair<std::uint64_t, std::uint64_t>>& other) const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs
@@ -466,6 +484,7 @@ public:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> own;
     };
     std::optional<SplitReads> SplitInPlaceReads() const;
+    std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> SplitInPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& own) const;
     bool InPlaceReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
@@ -526,10 +545,13 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        bool resident = false;
+        bool residentSkipped = false;
         bool overlay = false;
         bool adaptiveInPlace = false;
     };
 
+    bool copyBackKeepsCpuBytes(const Region& region, const Recorder& recorder) const;
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
     BaseOverlap baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const;
@@ -541,6 +563,7 @@ private:
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
+    bool directWrite(std::uint64_t begin, std::uint64_t end) const;
     // Builds this build's regions from a lease as the per-build path always did: `base` gets the
     // ranges served in place (imports, mirrors), `copied` the ones copied per build.
     struct CopiedRange {
@@ -561,6 +584,7 @@ private:
     void addDescriptorRegion(std::uint64_t address, std::size_t bytes, bool atomic, bool swept, bool readOnly);
     static bool servesView(const Region& region, std::uint64_t view);
     static bool sparseHeapCandidate(const Region& region);
+    bool adoptPreparedCopy(Region& region, bool addressable);
     bool bindSparseMirror(Region& region, const GuestAllocations::Lease& lease);
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
@@ -618,6 +642,7 @@ private:
     bool prepared = false;
     bool uploaded = false;
     bool committed = false;
+    bool offDevice = false;
     mutable std::uint64_t directWritesGeneration = 0;
 };
 

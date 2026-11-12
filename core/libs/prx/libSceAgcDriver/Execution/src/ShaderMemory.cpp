@@ -63,6 +63,13 @@ struct CaptureProfile {
     std::atomic<std::uint64_t> pageReadNanoseconds{0};
     std::atomic<std::uint64_t> wordReadNanoseconds{0};
     std::atomic<std::uint64_t> hookWaitNanoseconds{0};
+    std::atomic<std::uint64_t> pageSetupNanoseconds{0};
+    std::atomic<std::uint64_t> pendingQueries{0};
+    std::atomic<std::uint64_t> invocationNanoseconds{0};
+    std::atomic<std::uint64_t> assemblyNanoseconds{0};
+    std::atomic<std::uint64_t> censusNanoseconds{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CaptureCensusKind::Count)> census{};
+    std::array<std::atomic<std::uint64_t>, 4> censusDataDwords{};
     // The driver's per-shader source handle memo: captures served from it, and resolves it made.
     std::atomic<std::uint64_t> handleHits{0};
     std::atomic<std::uint64_t> handleMisses{0};
@@ -337,9 +344,12 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
         lastPage = pages[position].second;
         return *lastPage;
     }
+    const bool profiled = CaptureProfiled();
+    const auto started = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto& page = addPage(position, base);
-    if (CaptureProfiled()) ++CaptureTotals().pages;
+    if (profiled) ++CaptureTotals().pages;
     preparePage(page, base);
+    if (profiled) CaptureTotals().pageSetupNanoseconds += NanosecondsSince(started);
     return page;
 }
 
@@ -347,7 +357,7 @@ void ShaderMemory::preparePage(Page& page, std::uint64_t base) {
     // A page is either mapped whole or read word by word where the guest mapped less than a page,
     // or where recorded GPU work writes into it (a whole-page read would wait for that work).
     if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), PageBytes)) {
-        if (WordwisePages() && pendingWrite != nullptr && pendingWrite(base, PageBytes, {}) != PendingWrite::None) {
+        if (WordwisePages() && pendingWrite != nullptr && queryPending(base, PageBytes, {}) != PendingWrite::None) {
             page.wordwise = true;
             ++CaptureTotals().pagesWordwise;
             return;
@@ -395,9 +405,9 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     };
     const auto checkSpanBytes = std::max<std::size_t>(self.descriptorSpanBytes, sizeof(*value));
     if (page.wordwise && page.valid.Test(index) &&
-        (self.forceSync != 0u ? self.pendingWrite(address, checkSpanBytes, {}) != PendingWrite::None
-                              : (spanInvalidatesCache(self.pendingWrite(address, checkSpanBytes, {})) ||
-                                 (checkSpanBytes > sizeof(*value) && spanInvalidatesCache(self.pendingWrite(address, sizeof(*value), {})))))) {
+        (self.forceSync != 0u ? self.queryPending(address, checkSpanBytes, {}) != PendingWrite::None
+                              : (spanInvalidatesCache(self.queryPending(address, checkSpanBytes, {})) ||
+                                 (checkSpanBytes > sizeof(*value) && spanInvalidatesCache(self.queryPending(address, sizeof(*value), {})))))) {
         page.valid.Clear(index);
         page.raw.Clear(index);
     }
@@ -407,12 +417,12 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         bool forcedRaw = false;
         if (page.wordwise) {
             if (self.descriptorSpanBytes > sizeof(word) &&
-                (self.forceSync != 0u ? self.pendingWrite(address, self.descriptorSpanBytes, {}) != PendingWrite::None
-                                      : spanNeedsSync(self.pendingWrite(address, self.descriptorSpanBytes, {})))) {
+                (self.forceSync != 0u ? self.queryPending(address, self.descriptorSpanBytes, {}) != PendingWrite::None
+                                      : spanNeedsSync(self.queryPending(address, self.descriptorSpanBytes, {})))) {
                 policy = PendingWrite::Sync;
-                forcedRaw = self.forceSync != 0u && !spanNeedsSync(self.pendingWrite(address, self.descriptorSpanBytes, {}));
+                forcedRaw = self.forceSync != 0u && !spanNeedsSync(self.queryPending(address, self.descriptorSpanBytes, {}));
             } else {
-                policy = self.pendingWrite(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
+                policy = self.queryPending(address, sizeof(word), std::as_writable_bytes(std::span(&word, 1)));
                 if (self.forceSync != 0u && policy != PendingWrite::None) {
                     forcedRaw = !spanNeedsSync(policy);
                     policy = PendingWrite::Sync;
@@ -654,7 +664,7 @@ bool ShaderMemory::accessible(void* context, std::uint64_t address, std::uint64_
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
     if (self.pendingWrite == nullptr || bytes == 0) return false;
-    const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
+    const auto policy = self.queryPending(address, static_cast<std::size_t>(bytes), {});
     return policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
 }
 
@@ -913,9 +923,18 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
             const auto evaluateNs = ShaderRecompiler::ResourceMaterializer::EvaluateNanoseconds();
             const auto walkNs = captureNs > resolveNs + pageNs + wordNs + specializationNs ? captureNs - resolveNs - pageNs - wordNs - specializationNs : 0;
             AgcDriver::ProfilePrint_nid_no_patch( "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values (%llu verified, %llu mismatches), %llu hook reads not observed: no GPU wait, %llu branch condition reads over pending GPU writes left the branch unpruned instead of waiting, %llu captures redone waiting after one failed), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f, materialize %.2f/%.1f (SRT evaluate %.2f/%.1f); source handle memo %llu hits, %llu resolves\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.wordsKnownVerified.load()), static_cast<unsigned long long>(totals.wordsKnownMismatches.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), static_cast<unsigned long long>(totals.branchReadsRefused.load()), static_cast<unsigned long long>(totals.branchCapturesRedone.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, materializeNs / 1e9, materializeNs / captures / 1e3, evaluateNs / 1e9, evaluateNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()));
+            const auto perCapture = [&](std::uint64_t value) { return static_cast<double>(value) / captures; };
+            AgcDriver::ProfilePrint_nid_no_patch("[capture-steps] per capture (us, count): invocation %.2f, page setup %.2f (%.2f pages), pending queries %.2f, assembly %.2f, census bookkeeping %.2f\n", perCapture(totals.invocationNanoseconds.load()) / 1e3, perCapture(totals.pageSetupNanoseconds.load()) / 1e3, perCapture(totals.pages.load()), perCapture(totals.pendingQueries.load()), perCapture(totals.assemblyNanoseconds.load()) / 1e3, perCapture(totals.censusNanoseconds.load()) / 1e3);
+            const auto kind = [&](CaptureCensusKind which) { return static_cast<unsigned long long>(totals.census[static_cast<std::size_t>(which)].load()); };
+            AgcDriver::ProfilePrint_nid_no_patch("[capture-census] draw stage captures against the previous capture of the same stage: first %llu, identical %llu, data only %llu (differing dwords 1: %llu, 2-4: %llu, 5-16: %llu, 17+: %llu), pointer moved %llu, layout changed %llu\n", kind(CaptureCensusKind::First), kind(CaptureCensusKind::Identical), kind(CaptureCensusKind::DataOnly), static_cast<unsigned long long>(totals.censusDataDwords[0].load()), static_cast<unsigned long long>(totals.censusDataDwords[1].load()), static_cast<unsigned long long>(totals.censusDataDwords[2].load()), static_cast<unsigned long long>(totals.censusDataDwords[3].load()), kind(CaptureCensusKind::PointerMoved), kind(CaptureCensusKind::LayoutChanged));
         }
     }
     return capture;
+}
+
+ShaderMemory::PendingWrite ShaderMemory::queryPending(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) const {
+    if (CaptureProfiled()) ++CaptureTotals().pendingQueries;
+    return pendingWrite(address, bytes, known);
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnly) const {
@@ -1122,6 +1141,63 @@ DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t
         positions.push_back(position);
         slots.push_back(slot);
     }
+    return counts;
+}
+
+
+bool CaptureStepsProfiled() {
+    return CaptureProfiled();
+}
+
+void NoteCaptureStep(CaptureStep step, std::uint64_t nanoseconds) {
+    auto& totals = CaptureTotals();
+    switch (step) {
+    case CaptureStep::Invocation: totals.invocationNanoseconds += nanoseconds; break;
+    case CaptureStep::Assembly: totals.assemblyNanoseconds += nanoseconds; break;
+    case CaptureStep::Census: totals.censusNanoseconds += nanoseconds; break;
+    }
+}
+
+CaptureCensusVerdict ClassifyCaptureCensus(const CaptureCensusSample* previous, const CaptureCensusSample& current) {
+    if (previous == nullptr) return {CaptureCensusKind::First, 0};
+    if (previous->pointers != current.pointers) return {CaptureCensusKind::PointerMoved, 0};
+    if (previous->regions.size() != current.regions.size()) return {CaptureCensusKind::LayoutChanged, 0};
+    std::size_t differing = 0;
+    for (std::size_t region = 0; region < current.regions.size(); ++region) {
+        const auto& [address, bytes] = current.regions[region];
+        const auto& [previousAddress, previousBytes] = previous->regions[region];
+        if (address != previousAddress || bytes.size() != previousBytes.size()) return {CaptureCensusKind::LayoutChanged, 0};
+        for (std::size_t offset = 0; offset < bytes.size(); offset += sizeof(std::uint32_t)) {
+            const auto length = std::min(sizeof(std::uint32_t), bytes.size() - offset);
+            if (std::memcmp(bytes.data() + offset, previousBytes.data() + offset, length) != 0) ++differing;
+        }
+    }
+    return {differing == 0 ? CaptureCensusKind::Identical : CaptureCensusKind::DataOnly, differing};
+}
+
+void NoteCaptureCensus(std::uint64_t stage, CaptureCensusSample&& sample) {
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, CaptureCensusSample> previous;
+    std::lock_guard lock(mutex);
+    if (previous.size() >= 65536) previous.clear();
+    const auto found = previous.find(stage);
+    const auto verdict = ClassifyCaptureCensus(found != previous.end() ? &found->second : nullptr, sample);
+    auto& totals = CaptureTotals();
+    ++totals.census[static_cast<std::size_t>(verdict.kind)];
+    if (verdict.kind == CaptureCensusKind::DataOnly) ++totals.censusDataDwords[verdict.differingDwords <= 1 ? 0 : verdict.differingDwords <= 4 ? 1 : verdict.differingDwords <= 16 ? 2 : 3];
+    previous[stage] = std::move(sample);
+}
+
+CaptureStepTotals CaptureStepTotalsForTest() {
+    auto& totals = CaptureTotals();
+    return {totals.captures.load(), totals.captureNanoseconds.load(), totals.resolveNanoseconds.load(), totals.pageSetupNanoseconds.load(), totals.pageReadNanoseconds.load(), totals.wordReadNanoseconds.load(), totals.pages.load(), totals.pendingQueries.load(), totals.invocationNanoseconds.load(), totals.assemblyNanoseconds.load(), totals.censusNanoseconds.load()};
+}
+
+CaptureCensusCounts CaptureCensusCountsForTest() {
+    CaptureCensusCounts counts;
+    auto& totals = CaptureTotals();
+    for (std::size_t kind = 0; kind < counts.kinds.size(); ++kind) counts.kinds[kind] = totals.census[kind].load();
+    for (std::size_t bucket = 0; bucket < counts.dataDwords.size(); ++bucket) counts.dataDwords[bucket] = totals.censusDataDwords[bucket].load();
     return counts;
 }
 

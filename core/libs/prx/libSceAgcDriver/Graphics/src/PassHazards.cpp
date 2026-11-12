@@ -58,6 +58,12 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
     return PassHazard::None;
 }
 
+bool PassHazards::SharesAttachment(const PassAccess& access) const {
+    return std::any_of(access.attachments.begin(), access.attachments.end(), [&](const auto& attachment) {
+        return attachment.first != VK_NULL_HANDLE && std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == attachment.first; });
+    });
+}
+
 void PassHazards::Add(const PassAccess& access) {
     for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
     for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);

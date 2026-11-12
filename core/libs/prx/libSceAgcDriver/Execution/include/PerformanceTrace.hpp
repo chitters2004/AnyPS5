@@ -707,7 +707,7 @@ public:
             for (const auto& total : thread.totals) {
                 const std::string_view scope = total.scope;
                 if (total.stage == nullptr && std::find(WorkerBusyScopes.begin(), WorkerBusyScopes.end(), scope) != WorkerBusyScopes.end()) busy += total.length;
-                if (scope.starts_with("OwnedDraw.") && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
+                if ((scope.starts_with("OwnedDraw.") || scope.starts_with("DrawInputPrep.") || scope.starts_with("UploadPrep.") || scope.starts_with("DrawInputRing.")) && total.stage == nullptr) ownedCounts[std::string(scope)] += total.count;
                 else if (scope != WorkerWaitScope) phases[Name(total.scope, total.stage)] += total.length;
             }
             if (!thread.name.starts_with(WorkerPrefix)) continue;

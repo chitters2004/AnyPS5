@@ -108,14 +108,18 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
         // The CPU reads most of these buffers back (write-back, diffs), which is very slow from
         // write-combined memory, so the default host properties prefer cached host memory.
         const bool useSlab = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 && BufferPool::SlabEligible(capacity, requirements.alignment, requirements.size, context.limits.nonCoherentAtomSize);
-        allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, properties, useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize);
-        if (headroom && !context.DeviceLocalHeadroom(allocation.memoryTypeIndex, useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize)) {
+        const auto placedBytes = useSlab ? BufferPool::SlabBlockBytes(capacity) : allocation.allocationSize;
+        this->properties = context.MappedBufferProperties(requirements.memoryTypeBits, properties, placedBytes);
+        allocation.memoryTypeIndex = context.BufferMemoryType(requirements.memoryTypeBits, this->properties, placedBytes);
+        const auto refused = context.RefusedMappedMemoryFallback(requirements.memoryTypeBits, this->properties, allocation.memoryTypeIndex);
+        if (headroom && !context.DeviceLocalHeadroom(allocation.memoryTypeIndex, placedBytes)) {
             context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, buffer, nullptr);
             buffer = VK_NULL_HANDLE;
             return;
         }
         if (useSlab) {
-            const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable);
+            const auto slot = cache->TakeSlot(context, allocation.memoryTypeIndex, capacity, addressable, refused);
+            if (slot.memoryType != allocation.memoryTypeIndex) this->properties = HostBufferProperties;
             memory = slot.memory;
             offset = slot.offset;
             slab = true;
@@ -123,13 +127,15 @@ Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usag
             Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, offset), "vkBindBufferMemory slab");
             initializeAddress(usage);
             mapping = slot.mapping;
-#ifdef __APPLE__
+    #ifdef __APPLE__
             ClearPooledTail(mapping, size, capacity, properties);
-#endif
+    #endif
             ready = true;
             return;
         }
-        memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer");
+        std::uint32_t allocatedType = allocation.memoryTypeIndex;
+        memory = cache->AllocateMemory(allocation, "vkAllocateMemory buffer", refused, &allocatedType);
+        if (allocatedType != allocation.memoryTypeIndex) this->properties = HostBufferProperties;
         Check(context.Function<PFN_vkBindBufferMemory>("vkBindBufferMemory")(context.device, buffer, memory, 0), "vkBindBufferMemory");
         initializeAddress(usage);
         if ((properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) Check(context.Function<PFN_vkMapMemory>("vkMapMemory")(context.device, memory, 0, VK_WHOLE_SIZE, 0, &mapping), "vkMapMemory");
@@ -262,6 +268,7 @@ void CopyBuffer(const Context& context, VkCommandBuffer commands, VkBuffer sourc
 }
 
 void RecordMemoryBarrier(const Context& context, VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) {
+    Recorder::NoteBarrierMasks(sourceStage, destinationStage);
     const VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, sourceAccess, destinationAccess};
     context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, sourceStage, destinationStage, 0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
@@ -271,32 +278,32 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.cmdCopyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
     functions.cmdUpdateBuffer = context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
     functions.cmdFillBuffer = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
-    functions.cmdBindPipeline = context.Function<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
+    functions.cmdBindPipeline = context.lookup<PFN_vkCmdBindPipeline>("vkCmdBindPipeline");
     functions.cmdBindDescriptorSets = context.Function<PFN_vkCmdBindDescriptorSets>("vkCmdBindDescriptorSets");
     functions.cmdPushConstants = context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
     functions.cmdDispatch = context.Function<PFN_vkCmdDispatch>("vkCmdDispatch");
     functions.cmdDispatchIndirect = context.Function<PFN_vkCmdDispatchIndirect>("vkCmdDispatchIndirect");
     functions.cmdBeginRenderPass = context.Function<PFN_vkCmdBeginRenderPass>("vkCmdBeginRenderPass");
     functions.cmdEndRenderPass = context.Function<PFN_vkCmdEndRenderPass>("vkCmdEndRenderPass");
-    functions.cmdSetViewport = context.Function<PFN_vkCmdSetViewport>("vkCmdSetViewport");
-    functions.cmdSetScissor = context.Function<PFN_vkCmdSetScissor>("vkCmdSetScissor");
-    if (context.dynamicColorWriteMask) functions.cmdSetColorWriteMask = context.Function<PFN_vkCmdSetColorWriteMaskEXT>("vkCmdSetColorWriteMaskEXT");
-    functions.cmdSetDepthBounds = context.Function<PFN_vkCmdSetDepthBounds>("vkCmdSetDepthBounds");
-    functions.cmdSetDepthBias = context.Function<PFN_vkCmdSetDepthBias>("vkCmdSetDepthBias");
+    functions.cmdSetViewport = context.lookup<PFN_vkCmdSetViewport>("vkCmdSetViewport");
+    functions.cmdSetScissor = context.lookup<PFN_vkCmdSetScissor>("vkCmdSetScissor");
+    if (context.dynamicColorWriteMask) functions.cmdSetColorWriteMask = context.lookup<PFN_vkCmdSetColorWriteMaskEXT>("vkCmdSetColorWriteMaskEXT");
+    functions.cmdSetDepthBounds = context.lookup<PFN_vkCmdSetDepthBounds>("vkCmdSetDepthBounds");
+    functions.cmdSetDepthBias = context.lookup<PFN_vkCmdSetDepthBias>("vkCmdSetDepthBias");
     if (context.graphicsPipelineLibrary) {
         functions.cmdBeginRendering = context.Function<PFN_vkCmdBeginRenderingKHR>("vkCmdBeginRenderingKHR");
         functions.cmdEndRendering = context.Function<PFN_vkCmdEndRenderingKHR>("vkCmdEndRenderingKHR");
-        functions.cmdSetCullMode = context.Function<PFN_vkCmdSetCullModeEXT>("vkCmdSetCullModeEXT");
-        functions.cmdSetFrontFace = context.Function<PFN_vkCmdSetFrontFaceEXT>("vkCmdSetFrontFaceEXT");
-        functions.cmdSetDepthTestEnable = context.Function<PFN_vkCmdSetDepthTestEnableEXT>("vkCmdSetDepthTestEnableEXT");
-        functions.cmdSetDepthWriteEnable = context.Function<PFN_vkCmdSetDepthWriteEnableEXT>("vkCmdSetDepthWriteEnableEXT");
-        functions.cmdSetDepthCompareOp = context.Function<PFN_vkCmdSetDepthCompareOpEXT>("vkCmdSetDepthCompareOpEXT");
-        functions.cmdSetDepthBoundsTestEnable = context.Function<PFN_vkCmdSetDepthBoundsTestEnableEXT>("vkCmdSetDepthBoundsTestEnableEXT");
-        functions.cmdSetStencilTestEnable = context.Function<PFN_vkCmdSetStencilTestEnableEXT>("vkCmdSetStencilTestEnableEXT");
-        functions.cmdSetStencilOp = context.Function<PFN_vkCmdSetStencilOpEXT>("vkCmdSetStencilOpEXT");
-        functions.cmdSetStencilCompareMask = context.Function<PFN_vkCmdSetStencilCompareMask>("vkCmdSetStencilCompareMask");
-        functions.cmdSetStencilWriteMask = context.Function<PFN_vkCmdSetStencilWriteMask>("vkCmdSetStencilWriteMask");
-        functions.cmdSetStencilReference = context.Function<PFN_vkCmdSetStencilReference>("vkCmdSetStencilReference");
+        functions.cmdSetCullMode = context.lookup<PFN_vkCmdSetCullModeEXT>("vkCmdSetCullModeEXT");
+        functions.cmdSetFrontFace = context.lookup<PFN_vkCmdSetFrontFaceEXT>("vkCmdSetFrontFaceEXT");
+        functions.cmdSetDepthTestEnable = context.lookup<PFN_vkCmdSetDepthTestEnableEXT>("vkCmdSetDepthTestEnableEXT");
+        functions.cmdSetDepthWriteEnable = context.lookup<PFN_vkCmdSetDepthWriteEnableEXT>("vkCmdSetDepthWriteEnableEXT");
+        functions.cmdSetDepthCompareOp = context.lookup<PFN_vkCmdSetDepthCompareOpEXT>("vkCmdSetDepthCompareOpEXT");
+        functions.cmdSetDepthBoundsTestEnable = context.lookup<PFN_vkCmdSetDepthBoundsTestEnableEXT>("vkCmdSetDepthBoundsTestEnableEXT");
+        functions.cmdSetStencilTestEnable = context.lookup<PFN_vkCmdSetStencilTestEnableEXT>("vkCmdSetStencilTestEnableEXT");
+        functions.cmdSetStencilOp = context.lookup<PFN_vkCmdSetStencilOpEXT>("vkCmdSetStencilOpEXT");
+        functions.cmdSetStencilCompareMask = context.lookup<PFN_vkCmdSetStencilCompareMask>("vkCmdSetStencilCompareMask");
+        functions.cmdSetStencilWriteMask = context.lookup<PFN_vkCmdSetStencilWriteMask>("vkCmdSetStencilWriteMask");
+        functions.cmdSetStencilReference = context.lookup<PFN_vkCmdSetStencilReference>("vkCmdSetStencilReference");
     }
     functions.cmdBindVertexBuffers = context.Function<PFN_vkCmdBindVertexBuffers>("vkCmdBindVertexBuffers");
     functions.cmdBindIndexBuffer = context.Function<PFN_vkCmdBindIndexBuffer>("vkCmdBindIndexBuffer");
@@ -413,12 +420,42 @@ void CommandBatch::release() noexcept {
         if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
     }
+    if (stamps) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, stamps, nullptr);
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (fence) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
 }
 
 VkCommandBuffer CommandBatch::Handle() const {
     return commands;
+}
+
+void CommandBatch::BeginGpuStamp() {
+    if (!Recorder::GpuTimingEnabled() || stamps != VK_NULL_HANDLE) return;
+    VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+    info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+    info.queryCount = 2;
+    if (context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &stamps) != VK_SUCCESS) {
+        stamps = VK_NULL_HANDLE;
+        return;
+    }
+    context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, stamps, 0, 2);
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 0);
+}
+
+void CommandBatch::EndGpuStamp(Recorder::CommandClass which) {
+    if (stamps == VK_NULL_HANDLE || stampEnded) return;
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, stamps, 1);
+    stampEnded = true;
+    stampClass = which;
+}
+
+void CommandBatch::readGpuStamp() {
+    if (!stampEnded) return;
+    stampEnded = false;
+    std::uint64_t values[2] = {};
+    if (context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, stamps, 0, 2, sizeof(values), values, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && values[1] > values[0]) {
+        Recorder::AddGpuTiming(stampClass, static_cast<double>(values[1] - values[0]) * context.limits.timestampPeriod, 0);
+    }
 }
 
 void CommandBatch::SubmitAndWait() {
@@ -450,6 +487,7 @@ void CommandBatch::Wait() {
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
     Check(result, "vkWaitForFences graphics");
+    readGpuStamp();
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
     if (auto* recorder = Recorder::Active()) recorder->Reap();
 }

@@ -1375,6 +1375,12 @@ ShaderRecompiler::RecompileResult CompileBufferLoad(AgcDriver::VulkanDevice& dev
     return ShaderRecompiler::Recompile(request);
 }
 
+std::uint64_t RefusalTotal() {
+    std::uint64_t total = 0;
+    for (const auto count : AgcDriver::VulkanDevice::DispatchRecipeRefusals()) total += count;
+    return total;
+}
+
 void CheckBufferLoad(AgcDriver::VulkanDevice& device, const ShaderRecompiler::RecompileResult& program, const Block& output, std::shared_ptr<const AgcDriver::Recipe>* recipe = nullptr) {
     const std::span words(reinterpret_cast<std::uint32_t*>(output.data), Threads * 2u);
     std::fill(words.begin(), words.end(), 0xdeadbeefu);
@@ -1574,7 +1580,9 @@ void NativeFmask(std::unique_ptr<AgcDriver::VulkanDevice>& device) {
             const auto codeAddress = reinterpret_cast<std::uintptr_t>(NativeFmaskCode.data());
             std::shared_ptr<const AgcDriver::Recipe> recipe;
             NativeFmaskOutput.fill(sentinel);
+            const auto refusalsBefore = RefusalTotal();
             device->Dispatch(program, 1u, 1u, 1u, {}, codeAddress, nullptr, &recipe);
+            Require(!AgcDriver::VulkanDevice::DispatchRecipes() || RefusalTotal() == refusalsBefore + 1, "the native FMASK dispatch's refused recipe was not counted once");
             device->WaitIdle();
             check();
             Require(recipe == nullptr, "native FMASK emitted a reusable recipe without an ownership proof");
@@ -1691,7 +1699,9 @@ int main(int argc, char** argv) {
         } releaseDevice{device};
         const auto warm = CompileBufferLoad(*device, block.Address(), output.Address());
         std::shared_ptr<const AgcDriver::Recipe> recipe;
+        const auto warmRefusalsBefore = RefusalTotal();
         CheckBufferLoad(*device, warm, output, &recipe);
+        Require(!AgcDriver::VulkanDevice::DispatchRecipes() || RefusalTotal() == warmRefusalsBefore + (recipe == nullptr ? 1u : 0u), "the warmed dispatch's recipe refusals do not match the recipe it returned");
         const auto deferredProgram = CompileBufferLoad(*device, block.Address() + Threads * 4u, output.Address());
         auto prepared = device->PrepareDispatch(deferredProgram, {}, Threads, reinterpret_cast<std::uintptr_t>(BufferLoadCode.data()));
         const auto color = DecodeTarget(block);

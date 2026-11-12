@@ -4,8 +4,10 @@
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -62,12 +64,16 @@ class PreparedShaderInvocation {
 public:
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
     static std::optional<PreparedShaderInvocation> TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key);
+    static bool Admits(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key);
+    static PreparedShaderInvocation Adopt(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle);
+    static PreparedShaderInvocation AdoptValidated(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle);
     const RecompileRequest& Request() const { return request; }
     std::shared_ptr<const ResourceCapture> Capture(const SrtRuntime& runtime) const;
-    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture) const;
+    std::shared_ptr<const RecompileResult> Materialize(const ResourceCapture& capture, std::vector<std::byte>* sharedPush = nullptr) const;
 
 private:
     PreparedShaderInvocation(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle);
+    PreparedShaderInvocation(RecompileRequest&& request, std::shared_ptr<const SourceHandle>&& handle);
     RecompileRequest request;
     std::shared_ptr<const SourceHandle> handle;
 };

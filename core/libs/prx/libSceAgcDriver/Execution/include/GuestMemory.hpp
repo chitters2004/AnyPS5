@@ -9,6 +9,8 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <source_location>
 #include <span>
 #include <string>
 #include <utility>
@@ -36,10 +38,10 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 // scratch heaps): uncommitted pages read as zeros, are not compared, and are never stored.
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination);
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination);
-bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes);
+bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site = std::source_location::current());
 // EqualsCommitted without the flush hook: the caller has decided that the recorded GPU work
 // writing the range need not be waited for (the dispatch-cache validation in Driver.cpp).
-bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes);
+bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site = std::source_location::current());
 // EqualsCommittedUnsynced for a caller that treats an unmapped page as a miss (the dispatch-cache
 // validation's per-run compare): one walk of the page states, one memcmp per mapped run, no profile
 // counter and no reason string. Unmapped: some page of the range is not readable (or the address
@@ -67,6 +69,9 @@ void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> 
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+enum class ExclusionSource : std::uint8_t { ComparedImport, ImportWalk, CollectFailed, Explicit, Count };
+const char* ExclusionSourceName(ExclusionSource source);
+std::uint32_t UnwatchedSources(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool UnwatchWritesProven();
@@ -78,18 +83,92 @@ void SetFreshCollectHook(FreshCollectHook hook);
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
+enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Mirror, Depth, Count };
+enum class WriteChange : std::uint8_t { Bytes, Authority, Capability, Identity, Mirror, Count };
+constexpr std::uint32_t WriteChangeBit(WriteChange change) {
+    return std::uint32_t{1} << static_cast<unsigned>(change);
+}
+constexpr std::uint32_t WriteChangeAll = WriteChangeBit(WriteChange::Bytes) | WriteChangeBit(WriteChange::Authority) | WriteChangeBit(WriteChange::Capability) | WriteChangeBit(WriteChange::Identity);
+WriteChange WriteChangeOf(WriteBumpSource source);
+enum class WriteDomain : std::uint8_t { Proof, Unwatch, Mapping, CertifiedProof, Depth, Mirror, Count };
+constexpr std::uint32_t WriteDomainBit(WriteDomain domain) {
+    return std::uint32_t{1} << static_cast<unsigned>(domain);
+}
+constexpr std::size_t CertificateInlineOwners = 4;
+struct WriteCertificate {
+    std::uint64_t version = 0;
+    std::uint64_t owners = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(WriteDomain::Count)> domains{};
+    const std::atomic<std::uint64_t>* cell = nullptr;
+    std::uint32_t typeMask = 0;
+    std::uint32_t ownerCount = 0;
+    std::array<std::uint64_t, CertificateInlineOwners> ownerHandles{};
+    std::uint32_t blockCount = 0;
+    bool handles = true;
+    std::array<const std::atomic<std::uint64_t>*, CertificateInlineOwners> blockChanges{};
+};
 bool WriteIndexEnabled();
-std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint32_t typeMask = WriteChangeAll, bool history = false, bool owned = true);
 std::uint64_t SubscriptionGeneration(const WriteSubscription& subscription);
+std::uint64_t ObserveSubscription(const WriteSubscription& subscription);
+std::uint64_t DomainVersion(WriteDomain domain);
+void BumpDomainVersion(WriteDomain domain);
+void BumpWrites(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source);
+std::uint64_t RegisterWriteOwner(std::uint64_t base, std::uint64_t bytes);
+void UnregisterWriteOwner(std::uint64_t owner);
+class WriteOwner {
+public:
+    WriteOwner() = default;
+    WriteOwner(std::uint64_t base, std::uint64_t bytes) : handle(RegisterWriteOwner(base, bytes)) {}
+    WriteOwner(const WriteOwner&) = delete;
+    WriteOwner& operator=(const WriteOwner&) = delete;
+    WriteOwner(WriteOwner&& other) noexcept : handle(std::exchange(other.handle, 0)) {}
+    WriteOwner& operator=(WriteOwner&& other) noexcept {
+        if (this != &other) {
+            UnregisterWriteOwner(handle);
+            handle = std::exchange(other.handle, 0);
+        }
+        return *this;
+    }
+    ~WriteOwner() { UnregisterWriteOwner(handle); }
+    std::uint64_t Handle() const { return handle; }
+
+private:
+    std::uint64_t handle = 0;
+};
+WriteCertificate CertifySubscription(const WriteSubscription& subscription, std::uint32_t domainMask);
+bool CertificateHolds(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
+constexpr std::uint32_t CertificateVersionMissed = std::uint32_t{1} << static_cast<unsigned>(WriteDomain::Count);
+std::uint32_t CertificateMisses(const WriteSubscription& subscription, const WriteCertificate& certificate, std::uint32_t domainMask);
+enum class CertificateMutant : std::uint8_t { None, IgnoreVersion, HideUnwatch, HideMapping, HideCertifiedProof, HideMarkWrittenBumps, HideOwnStoreBumps, ReverseDomainOrder, HidePipelineCommitBumps, IgnoreOwners, HideOwnerBumps, ObserveIgnoresOwners, CertificateDropsOwners, HideBlockBumps, CertificateDropsBlocks, CertificateSkipsVersion, HideRecordedPendingBumps, HideOverflowCounters, DropExclusionSources, SkipTicketCollect, IgnoreTicketsInFlight };
+void SetCertificateMutantForTest(CertificateMutant mutant);
+void SetWriteIndexCountingForTest(bool counting);
+void SetWriteOwnersIgnoredForTest(bool ignored);
+using DomainReadObserver = void (*)(WriteDomain domain);
+void SetDomainReadObserverForTest(DomainReadObserver observer);
+class CoveredCommitScope {
+public:
+    explicit CoveredCommitScope(bool covered);
+    ~CoveredCommitScope();
+    CoveredCommitScope(const CoveredCommitScope&) = delete;
+    CoveredCommitScope& operator=(const CoveredCommitScope&) = delete;
+
+private:
+    bool muted;
+};
+using WriteBackingResolver = bool (*)(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset);
+void SetWriteBackingResolver(WriteBackingResolver resolver);
 std::span<const std::pair<std::uint64_t, std::uint64_t>> SubscriptionSpans(const WriteSubscription& subscription);
 bool SweepSubscription(const WriteSubscription& subscription);
 bool SubscriptionBumpsSince(const WriteSubscription& subscription, std::uint64_t generation, std::vector<std::uint64_t>& blocks, std::vector<std::uint64_t>& lookupBlocks);
 void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t generation);
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
+void NoteRecordedPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
-enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
+constexpr std::size_t WriteBumpSizeBuckets = 7;
 struct WriteIndexStats {
+    std::uint64_t calls = 0;
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
     std::uint64_t bumps = 0;
@@ -98,7 +177,12 @@ struct WriteIndexStats {
     std::uint64_t sweepFailures = 0;
     std::uint64_t overflows = 0;
     std::uint64_t lookupNanoseconds = 0;
+    std::uint64_t ownerBumps = 0;
+    std::uint64_t ownerFastBumps = 0;
+    std::uint64_t ownerDependencies = 0;
+    std::uint64_t blockDependencies = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
+    std::array<std::array<std::uint64_t, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };
 WriteIndexStats WriteIndexCounted();
 void ResetWriteIndexCounts();
@@ -111,6 +195,21 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+struct WriteTicket {
+    std::uint64_t sequence = 0;
+};
+WriteTicket ObserveTicket();
+bool UnchangedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteTicket ticket);
+enum class TicketRefusal : std::uint8_t { NoTicket, Unwatched, Stamped, InFlight, Count };
+struct WriteTicketStats {
+    std::uint64_t held = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(TicketRefusal::Count)> refused{};
+};
+WriteTicketStats WriteTicketsCounted();
+const char* TicketRefusalName(TicketRefusal refusal);
+void ForceWriteBumpForTest(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source);
+void DropTicketStampsForTest(std::optional<WriteBumpSource> source);
+void SetTicketStampHookForTest(void (*hook)());
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);
@@ -146,8 +245,14 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
+enum class ProofBreak : std::uint8_t { Unlabelled, OwnStore, MarkWritten, GpuLock, WriteChanged, WriteChangedIfHeld, CompletionStore, CompletionAction, WrittenBack, CopiedWriter, PipelineCommit, ResourceWrites, PipelineCommitCovered, Count };
+const char* ProofBreakName(ProofBreak source);
+void BreakProofs(ProofBreak source = ProofBreak::Unlabelled);
+bool ProofBreakVoidsCertificates(ProofBreak source);
+std::uint64_t CertificateBreakSerial();
+bool ProofBreaksCounted();
+std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> ProofBreakCounts();
 std::uint64_t OwnProofBreaks();
-void BreakProofs();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
@@ -160,6 +265,16 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
+void SetReleasedWalkHookForTest(void (*hook)(int stage));
+void SetConsumedWalkHookForTest(void (*hook)());
+void SetConsumeCapacityForTest(std::size_t runs);
+std::uint64_t ConsumeCompactionsForTest();
+std::uint64_t ConservativeInvalidationsForTest();
+std::uint64_t CompareSiteBytesForTest(std::uint32_t line);
+void ReportMemoryProfileNextForTest();
+void WalkCountersForTest(std::uint64_t* values, std::size_t count);
+void SetReleasedWalksForTest(bool released);
+void IgnorePageWritesForTest(std::uint64_t address, std::size_t bytes);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
@@ -209,6 +324,16 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+class DeviceLockForbiddenScope {
+public:
+    DeviceLockForbiddenScope();
+    ~DeviceLockForbiddenScope();
+    DeviceLockForbiddenScope(const DeviceLockForbiddenScope&) = delete;
+    DeviceLockForbiddenScope& operator=(const DeviceLockForbiddenScope&) = delete;
+
+private:
+    bool previous;
+};
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
@@ -218,6 +343,7 @@ std::uint64_t GpuHoldSerial();
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
+bool GpuLockAssertsEnabled();
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.

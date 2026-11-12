@@ -32,6 +32,7 @@ public:
         std::vector<Range> writes;
     };
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
+    enum class CaptureSite : std::uint8_t { Decode, Validate, Query, Fill, Shader, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
     enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
 
@@ -49,7 +50,13 @@ public:
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
+    enum NullPixelKind : std::uint32_t { NullPixelRectList = 1u, NullPixelDepthClear = 2u, NullPixelStencilClear = 4u, NullPixelDepthWrite = 8u, NullPixelStencilTest = 16u, NullPixelNoDepthTarget = 32u, NullPixelIndirect = 64u, NullPixelKindCount = 7u };
+    static void NoteDecodedDraw(bool nullPixel, std::uint32_t kinds);
+    enum class DbClearBlocker : std::uint8_t { StencilTest, SampleMask, Layered, Unproven, Count };
+    static DbClearBlocker DbClearBlockerOf(bool stencilClear, bool stencilTest, bool partialSampleMask, bool layered);
+    static void NoteDbClear(bool depth, bool stencil, DbClearBlocker blocker, std::uint64_t vertexProgram);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    void DrainThrough(std::span<const Range> reads, CaptureSite site, std::uint32_t opcode = 0x100);
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
@@ -77,6 +84,7 @@ public:
     static bool MetadataPassesPipelined();
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
+    std::uint64_t CommitBreaks(CommitKind kind, bool declaredWrites) const;
 private:
     struct Item {
         Commit commit;
@@ -113,6 +121,7 @@ private:
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;
+    std::uint32_t throughWaiters = 0;
     std::size_t resumeAt = 0;
     bool committerWaiting = false;
     bool stopped = false;
@@ -136,6 +145,8 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, static_cast<std::size_t>(CommitKind::Count)> kindBreaks{};
+    std::array<std::array<std::uint64_t, 2>, static_cast<std::size_t>(CommitKind::Count)> reportedKindBreaks{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };

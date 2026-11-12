@@ -145,6 +145,7 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvBufferFormat.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvRuntimeBuffer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvSpecialization.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvValueNumbering.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvSpannedUniformity.cpp
 
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvMemory/SpirvBufferAccess.cpp
@@ -276,8 +277,18 @@ function(add_shader_recompiler target runtimeTarget)
             RecompileCacheKey::ContextHash
             RecompileCacheKey::SealFeatureDigest
             RecompileResult
+            ResultKeyShape
+            PublishOnce
+            IdentityMemo
+            VerifyIdentityMemo
+            SharedPushDonorStages
+            ComputedIdentity
+            SealIdentity
             PrepareShader
             GetPreparedCode
+            PreparedShaderInvocation::Admits
+            PreparedShaderInvocation::Adopt
+            PreparedShaderInvocation::AdoptValidated
             PreparedShaderInvocation::TryCreate
             MatchesPreparedShader
             GetPreparedArtifact

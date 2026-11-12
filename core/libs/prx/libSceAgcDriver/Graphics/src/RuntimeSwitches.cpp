@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "ShaderCacheSourceVersion.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace AgcDriver::Graphics {
@@ -18,13 +20,43 @@ constexpr std::size_t SwitchCount = static_cast<std::size_t>(RuntimeSwitch::Coun
 
 constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BARRIER_BATCH",
+    "APS5_NO_BARRIER_FUSION",
+    "APS5_NO_WRITE_BACK_RUNS",
+    "APS5_NO_GUARD_SET_PROOF",
     "APS5_NO_GUARD_SPANS",
     "APS5_NO_OWNED_DRAW_INPUTS",
+    "APS5_HANDWRITTEN_PLAN_STATE",
+    "APS5_NO_RESIDENT_RANGES",
+    "APS5_NO_EARLY_DRAW_INPUTS",
+    "APS5_NO_EMPTY_FETCH_SKIP",
+    "APS5_NO_SHARED_VERTEX_LAYOUT",
+    "APS5_CERTIFIED_PROOFS",
+    "APS5_NO_CERTIFIED_PROOF_SCOPE",
+    "APS5_SHARE_PUSH_DONOR",
+    "APS5_NO_BAR_RING",
     "APS5_NO_TARGET_MEMO",
     "APS5_FOLLOW_OLDER_EPOCH_TOKENS",
     "APS5_UPLOAD_REFRESH_PROOF",
     "APS5_REFRESH_EXIT_EPOCH_STAMP",
     "APS5_NO_DEPTH_REPEAT_FIND",
+    "APS5_PARTIAL_DRAINS",
+    "APS5_PLAN_ATTACHMENTS",
+    "APS5_NO_RESIDENT_TARGETS",
+    "APS5_NO_DRAW_INPUT_RECYCLING",
+    "APS5_NO_EARLY_UPLOAD_PREPARE",
+    "APS5_NO_EARLY_REGION_COPIES",
+    "APS5_NO_DRAW_INPUT_RING",
+    "APS5_NO_RECORDED_CPU_UPLOAD",
+    "APS5_KEEP_EMPTY_FRAGMENT_SET",
+    "APS5_NO_RESIDENT_LINEAR",
+    "APS5_NO_STAGING_PREDICTION",
+    "APS5_ONE_STAGE_REQUEST",
+    "APS5_STAGE_HANDLE_HINTS",
+    "APS5_NO_COVERED_COMMITS",
+    "APS5_NO_WRITE_OWNERS",
+    "APS5_WHOLE_PENDING_BUMPS",
+    "APS5_NO_CERTIFIED_DRAW_INPUTS",
+    "APS5_WRITE_TICKETS",
     "APS5_SINGLE_RING_PREPARER",
 };
 
@@ -33,13 +65,43 @@ struct SwitchValues {
     SwitchValues() {
         const std::array<bool, SwitchCount> environment{
             std::getenv("APS5_NO_BARRIER_BATCH") != nullptr,
+            std::getenv("APS5_NO_BARRIER_FUSION") != nullptr,
+            std::getenv("APS5_NO_WRITE_BACK_RUNS") != nullptr,
+            std::getenv("APS5_NO_GUARD_SET_PROOF") != nullptr,
             std::getenv("APS5_NO_GUARD_SPANS") != nullptr,
             std::getenv("APS5_NO_OWNED_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_HANDWRITTEN_PLAN_STATE") != nullptr,
+            std::getenv("APS5_NO_RESIDENT_RANGES") != nullptr,
+            std::getenv("APS5_NO_EARLY_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_NO_EMPTY_FETCH_SKIP") != nullptr,
+            std::getenv("APS5_NO_SHARED_VERTEX_LAYOUT") != nullptr,
+            std::getenv("APS5_CERTIFIED_PROOFS") != nullptr,
+            std::getenv("APS5_NO_CERTIFIED_PROOF_SCOPE") != nullptr,
+            std::getenv("APS5_SHARE_PUSH_DONOR") != nullptr,
+            std::getenv("APS5_NO_BAR_RING") != nullptr,
             std::getenv("APS5_NO_TARGET_MEMO") != nullptr,
             std::getenv("APS5_FOLLOW_OLDER_EPOCH_TOKENS") != nullptr,
             std::getenv("APS5_UPLOAD_REFRESH_PROOF") != nullptr,
             std::getenv("APS5_REFRESH_EXIT_EPOCH_STAMP") != nullptr,
             std::getenv("APS5_NO_DEPTH_REPEAT_FIND") != nullptr,
+            std::getenv("APS5_PARTIAL_DRAINS") != nullptr,
+            std::getenv("APS5_PLAN_ATTACHMENTS") != nullptr,
+            std::getenv("APS5_NO_RESIDENT_TARGETS") != nullptr,
+            std::getenv("APS5_NO_DRAW_INPUT_RECYCLING") != nullptr,
+            std::getenv("APS5_NO_EARLY_UPLOAD_PREPARE") != nullptr,
+            std::getenv("APS5_NO_EARLY_REGION_COPIES") != nullptr,
+            std::getenv("APS5_NO_DRAW_INPUT_RING") != nullptr,
+            std::getenv("APS5_NO_RECORDED_CPU_UPLOAD") != nullptr,
+            std::getenv("APS5_KEEP_EMPTY_FRAGMENT_SET") != nullptr,
+            std::getenv("APS5_NO_RESIDENT_LINEAR") != nullptr,
+            std::getenv("APS5_NO_STAGING_PREDICTION") != nullptr,
+            std::getenv("APS5_ONE_STAGE_REQUEST") != nullptr,
+            std::getenv("APS5_STAGE_HANDLE_HINTS") != nullptr,
+            std::getenv("APS5_NO_COVERED_COMMITS") != nullptr,
+            std::getenv("APS5_NO_WRITE_OWNERS") != nullptr,
+            std::getenv("APS5_WHOLE_PENDING_BUMPS") != nullptr,
+            std::getenv("APS5_NO_CERTIFIED_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_WRITE_TICKETS") != nullptr,
             std::getenv("APS5_SINGLE_RING_PREPARER") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
@@ -96,25 +158,56 @@ std::optional<RuntimeSwitch> Find(std::string_view name) {
 
 }
 
+std::vector<RuntimeSwitch> AbSchedule::Config::Toggled() const {
+    std::vector<RuntimeSwitch> toggled;
+    for (const auto& arm : arms) {
+        for (const auto id : arm) {
+            if (std::find(toggled.begin(), toggled.end(), id) == toggled.end()) toggled.push_back(id);
+        }
+    }
+    return toggled;
+}
+
 AbSchedule::Config AbSchedule::Parse(std::string_view ab, std::string_view start, std::string_view settle) {
     Config config;
     ab = Trim(ab);
     const auto colon = ab.find(':');
-    if (colon == std::string_view::npos) throw std::invalid_argument("APS5_AB: expected <seconds>:<switch>[+<switch>...], got '" + std::string(ab) + "'");
+    if (colon == std::string_view::npos) throw std::invalid_argument("APS5_AB: expected <seconds>:<switch>[+<switch>...][|<switch>[+<switch>...]...], got '" + std::string(ab) + "'");
     config.phaseSeconds = ParseSeconds(ab.substr(0, colon), "APS5_AB phase length");
     if (config.phaseSeconds < 1) throw std::invalid_argument("APS5_AB: a phase must last at least 1 s");
     auto list = ab.substr(colon + 1);
     if (Trim(list).empty()) throw std::invalid_argument("APS5_AB: no switch listed after the phase length");
     for (;;) {
-        const auto plus = list.find('+');
-        const auto name = Trim(list.substr(0, plus));
-        if (name.empty()) throw std::invalid_argument("APS5_AB: an empty switch name in '" + std::string(ab) + "'");
-        const auto found = RuntimeSwitches::Find(name);
-        if (!found.has_value()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " cannot change while the title runs; switches the A/B can change: " + FlippableList());
-        if (std::find(config.switches.begin(), config.switches.end(), *found) != config.switches.end()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " is listed twice");
-        config.switches.push_back(*found);
-        if (plus == std::string_view::npos) break;
-        list = list.substr(plus + 1);
+        const auto bar = list.find('|');
+        auto members = list.substr(0, bar);
+        if (Trim(members).empty()) throw std::invalid_argument("APS5_AB: an empty arm in '" + std::string(ab) + "'");
+        std::vector<RuntimeSwitch> arm;
+        for (;;) {
+            const auto plus = members.find('+');
+            const auto name = Trim(members.substr(0, plus));
+            if (name.empty()) throw std::invalid_argument("APS5_AB: an empty switch name in '" + std::string(ab) + "'");
+            const auto found = RuntimeSwitches::Find(name);
+            if (!found.has_value()) {
+                const auto& keyed = ShaderRecompiler::ShaderDiskCache::Generated::RecompilerSwitches;
+                if (std::find(keyed.begin(), keyed.end(), name) != keyed.end()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " is a shader recompiler switch, read into the shader disk cache key when shaders compile, so it cannot change while the title runs; switches the A/B can change: " + FlippableList());
+                throw std::invalid_argument("APS5_AB: " + std::string(name) + " cannot change while the title runs; switches the A/B can change: " + FlippableList());
+            }
+            if (std::find(arm.begin(), arm.end(), *found) != arm.end()) throw std::invalid_argument("APS5_AB: " + std::string(name) + " is listed twice");
+            arm.push_back(*found);
+            if (plus == std::string_view::npos) break;
+            members = members.substr(plus + 1);
+        }
+        const auto same = [&](std::vector<RuntimeSwitch> other) {
+            auto sorted = arm;
+            std::sort(sorted.begin(), sorted.end());
+            std::sort(other.begin(), other.end());
+            return sorted == other;
+        };
+        if (std::any_of(config.arms.begin(), config.arms.end(), same)) throw std::invalid_argument("APS5_AB: arm " + std::string(1, Letter(config.arms.size() + 1)) + " lists the same switches as an earlier arm");
+        config.arms.push_back(std::move(arm));
+        if (config.arms.size() > MaxArms) throw std::invalid_argument("APS5_AB: at most " + std::to_string(MaxArms) + " arms (B to Z) besides phase A");
+        if (bar == std::string_view::npos) break;
+        list = list.substr(bar + 1);
     }
     start = Trim(start);
     if (!start.empty()) {
@@ -145,17 +238,18 @@ AbSchedule::Step AbSchedule::AtPresent(std::uint64_t present, double seconds) {
         settled = false;
         phase = 0;
         phaseStart = seconds;
-        return {Event::Begin, 0, false};
+        return {Event::Begin, 0, 0};
     }
+    const auto arm = [&] { return static_cast<std::size_t>(phase % (config.arms.size() + 1)); };
     if (seconds - phaseStart >= config.phaseSeconds) {
         ++phase;
         settled = false;
         phaseStart = seconds;
-        return {Event::Begin, phase, (phase & 1u) != 0};
+        return {Event::Begin, phase, arm()};
     }
     if (!settled && seconds - phaseStart >= config.settleSeconds) {
         settled = true;
-        return {Event::Settled, phase, (phase & 1u) != 0};
+        return {Event::Settled, phase, arm()};
     }
     return {};
 }
@@ -183,10 +277,15 @@ AbState& Ab() {
     return *state;
 }
 
-std::string SwitchSettings(const AbState& state, bool b) {
+bool Toggles(const AbSchedule::Config& config, std::size_t arm, RuntimeSwitch id) {
+    return arm != 0 && std::find(config.arms[arm - 1].begin(), config.arms[arm - 1].end(), id) != config.arms[arm - 1].end();
+}
+
+std::string SwitchSettings(const AbState& state, std::size_t arm) {
+    const auto& config = state.schedule->Settings();
     std::string text;
-    for (const auto id : state.schedule->Settings().switches) {
-        const bool set = state.environment[static_cast<std::size_t>(id)] != b;
+    for (const auto id : config.Toggled()) {
+        const bool set = state.environment[static_cast<std::size_t>(id)] != Toggles(config, arm, id);
         text += std::string(text.empty() ? "" : ", ") + RuntimeSwitches::Name(id) + (set ? " set" : " unset");
     }
     return text;
@@ -214,14 +313,17 @@ std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds, AbSc
             char from[96];
             if (config.startSeconds.has_value()) std::snprintf(from, sizeof(from), "%.1f s after the first present", *config.startSeconds);
             else std::snprintf(from, sizeof(from), "present %llu", static_cast<unsigned long long>(config.startPresent));
-            std::snprintf(text, sizeof(text), "[ab] in-run A/B: phases of %.1f s from %s, settle %.1f s; A: %s; B: %s\n", config.phaseSeconds, from, config.settleSeconds, SwitchSettings(state, false).c_str(), SwitchSettings(state, true).c_str());
-            lines.emplace_back(text);
+            std::snprintf(text, sizeof(text), "[ab] in-run A/B: phases of %.1f s from %s, settle %.1f s", config.phaseSeconds, from, config.settleSeconds);
+            std::string header = text;
+            for (std::size_t arm = 0; arm <= config.arms.size(); ++arm) header += std::string("; ") + AbSchedule::Letter(arm) + ": " + SwitchSettings(state, arm);
+            lines.push_back(header + "\n");
         }
-        for (const auto id : config.switches) RuntimeSwitches::Assign(id, state.environment[static_cast<std::size_t>(id)] != step.b);
-        std::snprintf(text, sizeof(text), "[ab] phase %c %llu begins at present %llu (t %.3f s): %s\n", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds, SwitchSettings(state, step.b).c_str());
-    } else {
-        std::snprintf(text, sizeof(text), "[ab] phase %c %llu settled at present %llu (t %.3f s)\n", step.b ? 'B' : 'A', static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds);
+        for (const auto id : config.Toggled()) RuntimeSwitches::Assign(id, state.environment[static_cast<std::size_t>(id)] != Toggles(config, step.arm, id));
+        std::snprintf(text, sizeof(text), "[ab] phase %c %llu begins at present %llu (t %.3f s): ", AbSchedule::Letter(step.arm), static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds);
+        lines.push_back(text + SwitchSettings(state, step.arm) + "\n");
+        return lines;
     }
+    std::snprintf(text, sizeof(text), "[ab] phase %c %llu settled at present %llu (t %.3f s)\n", AbSchedule::Letter(step.arm), static_cast<unsigned long long>(step.phase), static_cast<unsigned long long>(present), seconds);
     lines.emplace_back(text);
     return lines;
 }

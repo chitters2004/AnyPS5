@@ -22,6 +22,12 @@ struct VkDrawCounts {
 };
 VkDrawCounts TakeVkDrawCounts();
 
+struct InertFragmentCounts {
+    std::uint64_t omitted = 0;
+    std::uint64_t kept = 0;
+};
+InertFragmentCounts TakeInertFragmentCounts();
+
 struct HostImport;
 
 struct DrawTraceContext {
@@ -58,12 +64,22 @@ std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std:
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;
+    VkDeviceSize offset = 0;
+    std::size_t bytes = 0;
     bool reused = false;
+    bool prepared = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
     Recorder::OwnedDrawInputProof owned;
+    std::span<std::byte> Bytes() const;
+    std::optional<RangeCertificate> certified;
 };
+enum class TargetResidency : std::uint8_t { Multisampled, Resident, Copied, LinearImport };
+bool ResidentTargetsEnabled();
+TargetResidency ColorTargetResidency(const Context& context, const ColorTarget& color, bool residentTargets, bool residentLinear);
+bool LinearTargetImported(const Context& context, const ColorTarget& color, bool import);
+std::optional<bool> PredictDrawDeviceStaging(const Context& context, const State& state);
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride = 0);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
@@ -108,7 +124,9 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
 // resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Instance, Moved, Count };
+enum class DrawRecipeUse : std::uint8_t { Exact, Plan };
+enum class DrawPlanInstance : std::uint8_t { None, Shape, Template, Target, View, Depth };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -117,16 +135,53 @@ struct DrawRecipeOutcome {
     // APS5_PROFILE_DRAW: the proof's and the record's time.
     double proofUs = 0;
     double recordUs = 0;
+    std::uint32_t sharedBindingStages = 0;
+    std::uint32_t comparedBindingStages = 0;
+    std::uint32_t movedBuffers = 0;
+    bool patchedData = false;
+    DrawPlanInstance instance = DrawPlanInstance::None;
+    std::uint8_t instanceMismatches = 0;
+    bool templateInstance = false;
+    bool ownAttachments = false;
+    bool handedTargets = false;
+    std::shared_ptr<const DrawRecipe> ownRecipe;
+    std::uint64_t ownTargetsNs = 0;
+    std::uint64_t ownFramebufferNs = 0;
 };
+
+inline constexpr std::uint8_t PlanMismatchShape = 1u;
+inline constexpr std::uint8_t PlanMismatchTemplate = 2u;
+inline constexpr std::uint8_t PlanMismatchTarget = 4u;
+inline constexpr std::uint8_t PlanMismatchView = 8u;
+inline constexpr std::uint8_t PlanMismatchDepth = 16u;
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
 // vertex work as Draw's, the resident-target proof on the stored images (Refresh while Cached()),
 // the template's proof (ProveCurrent) with the alias checks repeated, the pipeline and framebuffer
 // from the recipe, then the record as Draw's (pass continued or begun, Kept, MarkGpuWrites). A
 // miss records nothing.
-DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr);
+DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace = nullptr, DrawRecipeUse use = DrawRecipeUse::Exact);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+bool DrawPlanShadow();
+bool DrawPlans();
+bool DrawPlanTemplates();
+bool VerifyDrawPlans();
+void SetDrawPlansForTest(int enabled);
+void SetDrawPlanSetKeySaltForTest(std::uint32_t salt);
+struct StageKeyMemoCounts {
+    std::uint64_t staticHits = 0;
+    std::uint64_t staticFills = 0;
+    std::uint64_t staticLosses = 0;
+    std::uint64_t patchedSegments = 0;
+    std::uint64_t layoutSplitMisses = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t resultHits = 0;
+    std::uint64_t resultWalks = 0;
+};
+StageKeyMemoCounts StageKeyMemoCounters();
+std::shared_ptr<const ShaderRecompiler::ResultKeyShape::Static> StageStaticKeys(const CompiledShader& shader);
+std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
@@ -186,6 +241,7 @@ void SetSpaceKeepFailuresForTest(std::uint32_t count);
 void SetDrawStopAfterResolveForTest(DrawStopForTest stop);
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMissDrawsForTest();
+std::uint64_t CopiedTargetResolutionsForTest();
 
 }
 

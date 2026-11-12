@@ -148,7 +148,7 @@ public:
         const VkDescriptorImageInfo depthInfo{VK_NULL_HANDLE, depthPlane, VK_IMAGE_LAYOUT_GENERAL};
         const VkDescriptorImageInfo texelInfo{VK_NULL_HANDLE, texels, VK_IMAGE_LAYOUT_GENERAL};
         const std::array<VkWriteDescriptorSet, 2> writes{imageWrite(0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, depthInfo), imageWrite(1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, texelInfo)};
-        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        context.BindComputePipeline(commands, pipeline);
         pushSet(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, static_cast<std::uint32_t>(writes.size()), writes.data());
         const auto pushConstants = context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants");
         const auto dispatch = context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch");
@@ -2903,6 +2903,7 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     recorder.MarkCovered(filledAccess);
     recorder.NotePendingWordFill(address, bytes, word);
     GuestMemory::MarkWritten(address, bytes);
+    recorder.StampNote(recorder.LastWriteNote(address, bytes));
     return true;
 }
 
@@ -3226,6 +3227,18 @@ void proveOverwrittenPlanes(std::uint64_t address, std::size_t bytes) {
     for (const auto& surface : surfaces()) {
         if (surface->sampling.overwriteStencil && surface->active->load(std::memory_order_acquire) && surface->Overlaps(address, bytes)) surface->ProveOverwrite();
     }
+}
+
+std::uint64_t DepthGuardsGeneration() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+bool DepthGuardsMayOverlap(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0u && anyDepthGuard().load(std::memory_order_acquire) && (address > std::numeric_limits<std::uint64_t>::max() - bytes || mayOverlapDepthGuard(address, bytes));
+}
+
+bool DepthOverwriteProofsPending() {
+    return pendingOverwriteProofs().load(std::memory_order_acquire) != 0u;
 }
 
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool allowPublication) {
@@ -3616,6 +3629,14 @@ SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTar
         return {candidate->image, candidate->view, candidate->hostFormat, candidate->target.extent, target.samples, DepthSampleOrderMethod(context, target), candidate->owned};
     }
     throw std::runtime_error("AGC graphics: the multisampled depth surface whose samples are put in the guest's order is not resident");
+}
+
+VkImage DepthSurfaceImage(const Context& context, const DepthTarget& target) {
+    std::unique_lock lock(surfacesMutex());
+    for (const auto& candidate : surfaces()) {
+        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && holdsTarget(candidate->target, target)) return candidate->image;
+    }
+    return VK_NULL_HANDLE;
 }
 
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target) {

@@ -10,6 +10,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -669,6 +670,118 @@ bool DeclaresEarlyFragmentTests(const ShaderRecompiler::RecompileResult& program
         cursor += count;
     }
     return false;
+}
+
+namespace {
+
+bool ScanInertFragment(const ShaderRecompiler::RecompileResult& program) {
+    const auto words = program.spirv.Words();
+    if (words.size() < 5 || words[0] != spv::MagicNumber) return false;
+    std::map<std::uint32_t, std::uint32_t> pointerTypes;
+    std::map<std::uint32_t, std::uint32_t> pointers;
+    std::set<std::uint32_t> debugPrintf;
+    const auto local = [&](std::uint32_t pointer) {
+        const auto found = pointers.find(pointer);
+        return found != pointers.end() && (found->second == spv::StorageClassFunction || found->second == spv::StorageClassPrivate);
+    };
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0 || count > words.size() - cursor) return false;
+        const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
+        const auto operand = [&](std::size_t index) { return index < count ? words[cursor + index] : 0u; };
+        switch (op) {
+        case spv::OpExtInstImport: {
+            const auto name = std::string_view(reinterpret_cast<const char*>(&words[cursor + 2]), (count - 2u) * sizeof(std::uint32_t));
+            if (name.starts_with("NonSemantic.DebugPrintf")) debugPrintf.insert(operand(1));
+            break;
+        }
+        case spv::OpExtInst:
+            if (debugPrintf.contains(operand(3))) return false;
+            break;
+        case spv::OpExecutionMode:
+        case spv::OpExecutionModeId:
+            switch (static_cast<spv::ExecutionMode>(operand(2))) {
+            case spv::ExecutionModeDepthReplacing:
+            case spv::ExecutionModePostDepthCoverage:
+            case spv::ExecutionModeStencilRefReplacingEXT:
+            case spv::ExecutionModePixelInterlockOrderedEXT:
+            case spv::ExecutionModePixelInterlockUnorderedEXT:
+            case spv::ExecutionModeSampleInterlockOrderedEXT:
+            case spv::ExecutionModeSampleInterlockUnorderedEXT:
+            case spv::ExecutionModeShadingRateInterlockOrderedEXT:
+            case spv::ExecutionModeShadingRateInterlockUnorderedEXT:
+                return false;
+            default:
+                break;
+            }
+            break;
+        case spv::OpTypePointer:
+            pointerTypes[operand(1)] = operand(2);
+            break;
+        case spv::OpVariable:
+            if (operand(3) == spv::StorageClassOutput) return false;
+            pointers[operand(2)] = operand(3);
+            break;
+        case spv::OpFunctionParameter:
+        case spv::OpAccessChain:
+        case spv::OpInBoundsAccessChain:
+        case spv::OpPtrAccessChain:
+        case spv::OpInBoundsPtrAccessChain:
+        case spv::OpCopyObject:
+        case spv::OpSelect:
+        case spv::OpPhi:
+            if (const auto type = pointerTypes.find(operand(1)); type != pointerTypes.end()) pointers[operand(2)] = type->second;
+            break;
+        case spv::OpStore:
+        case spv::OpCopyMemory:
+        case spv::OpCopyMemorySized:
+            if (!local(operand(1))) return false;
+            break;
+        case spv::OpKill:
+        case spv::OpTerminateInvocation:
+        case spv::OpDemoteToHelperInvocation:
+        case spv::OpImageWrite:
+        case spv::OpAtomicLoad:
+        case spv::OpAtomicStore:
+        case spv::OpAtomicExchange:
+        case spv::OpAtomicCompareExchange:
+        case spv::OpAtomicCompareExchangeWeak:
+        case spv::OpAtomicIIncrement:
+        case spv::OpAtomicIDecrement:
+        case spv::OpAtomicIAdd:
+        case spv::OpAtomicISub:
+        case spv::OpAtomicSMin:
+        case spv::OpAtomicUMin:
+        case spv::OpAtomicSMax:
+        case spv::OpAtomicUMax:
+        case spv::OpAtomicAnd:
+        case spv::OpAtomicOr:
+        case spv::OpAtomicXor:
+        case spv::OpAtomicFlagTestAndSet:
+        case spv::OpAtomicFlagClear:
+        case spv::OpAtomicFMinEXT:
+        case spv::OpAtomicFMaxEXT:
+        case spv::OpAtomicFAddEXT:
+        case spv::OpBeginInvocationInterlockEXT:
+        case spv::OpEndInvocationInterlockEXT:
+        case spv::OpCooperativeMatrixStoreKHR:
+            return false;
+        default:
+            break;
+        }
+        cursor += count;
+    }
+    return true;
+}
+
+}
+
+bool InertFragment(const ShaderRecompiler::RecompileResult& program) {
+    auto& memo = program.inertFragmentMemo.state;
+    if (const auto known = memo.load(std::memory_order_acquire); known != 0) return known == 2u;
+    const bool inert = ScanInertFragment(program);
+    memo.store(inert ? 2u : 1u, std::memory_order_release);
+    return inert;
 }
 
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing, bool imageInt64Atomics, bool geometryShader, bool sampleRateShading, bool bufferInt64Atomics, bool shaderClipDistance, bool shaderCullDistance, bool viewportIndexLayer, bool runtimeDescriptorArray, bool demoteToHelperInvocation, bool shaderTerminateInvocation, bool meshShader, bool shaderResourceMinLod, bool fmaFloat16) {

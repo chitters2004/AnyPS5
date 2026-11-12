@@ -37,6 +37,7 @@ struct SlabSlot {
     VkDeviceMemory memory;
     VkDeviceSize offset;
     void* mapping;
+    std::uint32_t memoryType = 0;
 };
 
 // Released buffer allocations kept for reuse, since creating, binding and mapping one costs tens of
@@ -68,6 +69,7 @@ public:
     BufferPool& operator=(const BufferPool&) = delete;
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes);
+    static std::uint64_t ThreadLockWaitNanoseconds() noexcept;
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
     VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     ImageAllocation AllocateImage(const Context& context, VkImage image, const VkImageCreateInfo& imageInfo, const char* operation, bool newImage, bool budgeted);
@@ -81,7 +83,7 @@ public:
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
     static VkDeviceSize SlabBlockBytes(std::size_t capacity);
-    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
+    SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, std::optional<std::uint32_t> hostType = std::nullopt);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
 
@@ -116,6 +118,7 @@ private:
         std::vector<std::uint32_t> free;
         std::uint32_t used = 0;
         std::uint64_t slab = 0;
+        std::uint32_t memoryType = 0;
     };
     struct Slab {
         std::vector<SlabBlock*> available;

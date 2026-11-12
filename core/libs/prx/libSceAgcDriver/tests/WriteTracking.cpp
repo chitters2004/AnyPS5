@@ -20,6 +20,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -2550,6 +2552,878 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+std::atomic<bool> throwAfterConsume{false};
+
+void ThrowAfterConsume() {
+    if (throwAfterConsume.exchange(false, std::memory_order_acq_rel)) throw std::runtime_error("the consume hook threw");
+}
+
+void CheckThrowAfterConsume(bool released) {
+#ifndef _WIN32
+    SetReleasedWalksForTest(released);
+#else
+    static_cast<void>(released);
+#endif
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the throwing consume fixture was not collected");
+    Require(UnchangedSince(base, bytes, before), "the throwing consume fixture changed before its write");
+    const auto invalidations = ConservativeInvalidationsForTest();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> subscribed{{{base, base + bytes}}};
+    const auto subscription = SubscribeWrites(subscribed);
+    const auto certificate = subscription != nullptr ? CertifySubscription(*subscription, 0) : WriteCertificate{};
+    data[Block + 64] = 0x22;
+    throwAfterConsume.store(true, std::memory_order_release);
+    SetConsumedWalkHookForTest(&ThrowAfterConsume);
+    bool threw = false;
+    try {
+        static_cast<void>(CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    SetConsumedWalkHookForTest(nullptr);
+    Require(threw, "the collect did not reach the throwing consume hook");
+    Require(ConservativeInvalidationsForTest() == invalidations + 1, "a throw after a destructive collect did not invalidate conservatively");
+    Require(!UnchangedSince(base, bytes, before), "a write consumed by a collect that then threw was lost");
+    Require(CpuWroteSince(base + Block, 4096, before), "a CPU write consumed by a collect that then threw was lost");
+    Require(subscription == nullptr || !CertificateHolds(*subscription, certificate, 0), "a write-index certificate over a range whose consumed write was lost still held");
+    const auto after = CollectWritesUncached(base, bytes);
+    Require(UnchangedSince(base, bytes, after), "the conservative invalidation kept the range changed after a later collect");
+}
+
+#ifndef _WIN32
+void CheckConsumeCompaction(bool released) {
+    SetReleasedWalksForTest(released);
+    constexpr std::size_t bytes = 4 * Block;
+    constexpr std::size_t page = 4096;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the compaction fixture was not collected");
+    std::vector<std::uint64_t> written;
+    for (std::size_t offset = 0; offset < bytes; offset += 3 * page) {
+        data[offset + 8] = 0x33;
+        written.push_back(base + offset);
+    }
+    const auto compactions = ConsumeCompactionsForTest();
+    SetConsumeCapacityForTest(4);
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    SetConsumeCapacityForTest(0);
+    Require(ConsumeCompactionsForTest() > compactions, "the scattered writes did not overflow the consumed runs");
+    for (const auto address : written) Require(CpuWroteSince(address, page, before), "a written page was dropped when the consumed runs were compacted");
+}
+#endif
+
+#if defined(__linux__)
+std::atomic<int> scanPark{0};
+std::atomic<int> changeEvents{0};
+constexpr int ChangeWaited = 1;
+constexpr int ChangeDone = 2;
+
+void ParkFirstScan() {
+    int armed = 1;
+    if (!scanPark.compare_exchange_strong(armed, 2, std::memory_order_acq_rel)) return;
+    scanPark.notify_all();
+    while (scanPark.load(std::memory_order_acquire) == 2) scanPark.wait(2, std::memory_order_acquire);
+}
+
+void NoteChangeWait() {
+    changeEvents.fetch_or(ChangeWaited, std::memory_order_acq_rel);
+    changeEvents.notify_all();
+}
+
+struct SharedViews {
+    explicit SharedViews(std::size_t count) : count(count) {
+        file = memfd_create("aps5-mapping-change", 0);
+        Require(file >= 0 && ftruncate(file, Block) == 0, "cannot create the shared views' backing");
+        raw = mmap(nullptr, (count + 2) * Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        Require(raw != MAP_FAILED, "cannot reserve the shared views");
+        const auto base = (reinterpret_cast<std::uintptr_t>(raw) + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+        for (std::size_t index = 0; index < count; ++index) {
+            views.push_back(base + index * Block);
+            Require(mmap(reinterpret_cast<void*>(views.back()), Block, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) != MAP_FAILED, "cannot map a shared view");
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.back()), Block);
+        }
+        spare = base + count * Block;
+        Require(mmap(reinterpret_cast<void*>(spare), Block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED, "cannot map the unrelated view");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(spare), Block);
+    }
+    ~SharedViews() {
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.front()), (count + 1) * Block);
+        munmap(raw, (count + 2) * Block);
+        close(file);
+    }
+    bool Alias(std::size_t first, std::size_t second) const {
+        return GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views[first]), reinterpret_cast<void*>(views[second]), Block);
+    }
+    SharedViews(const SharedViews&) = delete;
+    SharedViews& operator=(const SharedViews&) = delete;
+    std::size_t count;
+    int file = -1;
+    void* raw = nullptr;
+    std::vector<std::uintptr_t> views;
+    std::uintptr_t spare = 0;
+};
+
+int ChangeDuringParkedScan(const std::function<void()>& scan, const std::function<void()>& change) {
+    scanPark.store(1, std::memory_order_release);
+    changeEvents.store(0, std::memory_order_release);
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(&ParkFirstScan);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(&NoteChangeWait);
+    std::thread walker(scan);
+    while (scanPark.load(std::memory_order_acquire) != 2) scanPark.wait(1, std::memory_order_acquire);
+    std::thread changer([&] {
+        change();
+        changeEvents.fetch_or(ChangeDone, std::memory_order_acq_rel);
+        changeEvents.notify_all();
+    });
+    while (changeEvents.load(std::memory_order_acquire) == 0) changeEvents.wait(0, std::memory_order_acquire);
+    const int seen = changeEvents.load(std::memory_order_acquire);
+    scanPark.store(3, std::memory_order_release);
+    scanPark.notify_all();
+    walker.join();
+    changer.join();
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(nullptr);
+    return seen;
+}
+
+void CollectView(std::uintptr_t view) {
+    std::size_t pages = 0;
+    static_cast<void>(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(view, Block, [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(count) += (end - begin) / 4096; }, &pages));
+}
+
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> CollectRuns(std::uintptr_t view) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    Require(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(view, Block, [](void* found, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(found)->emplace_back(begin, end); }, &runs), "cannot collect a shared view");
+    return runs;
+}
+
+bool Reports(const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& runs, std::uintptr_t address) {
+    return std::any_of(runs.begin(), runs.end(), [&](const auto& run) { return run.first <= address && address < run.second; });
+}
+
+void CheckAliasAfterConsumedWrite(std::size_t writer, std::size_t other) {
+    SharedViews views(2);
+    for (const auto view : views.views) static_cast<void>(CollectRuns(view));
+    reinterpret_cast<volatile std::uint8_t*>(views.views[writer])[0x80] = 0x6b;
+    Require(Reports(CollectRuns(views.views[writer]), views.views[writer] + 0x80), "a write through an unaliased view was not reported at that view");
+    Require(views.Alias(writer, other), "cannot alias the shared views");
+    Require(Reports(CollectRuns(views.views[other]), views.views[other] + 0x80), "a write consumed at one view before an alias was never reported at the other view");
+    Require(CollectRuns(views.views[other]).empty() && CollectRuns(views.views[writer]).empty(), "the views of a new alias are reported again after their first collect");
+}
+
+std::atomic<int> scanWaitEvents{0};
+constexpr int ScanWaited = 1;
+constexpr int LaterScanDone = 2;
+
+void NoteScanWait() {
+    scanWaitEvents.fetch_or(ScanWaited, std::memory_order_acq_rel);
+    scanWaitEvents.notify_all();
+}
+
+void CheckPendingChangeHoldsNewScans() {
+    SharedViews views(2);
+    for (const auto view : views.views) static_cast<void>(CollectRuns(view));
+    reinterpret_cast<volatile std::uint8_t*>(views.views[0])[0x100] = 0x4d;
+    scanPark.store(1, std::memory_order_release);
+    changeEvents.store(0, std::memory_order_release);
+    scanWaitEvents.store(0, std::memory_order_release);
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(&ParkFirstScan);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(&NoteChangeWait);
+    GuestWriteWatch::GuestWriteWatchSetScanWaitHookForTest_nid_postfix(&NoteScanWait);
+    std::thread parked([&] { static_cast<void>(CollectRuns(views.views[1])); });
+    while (scanPark.load(std::memory_order_acquire) != 2) scanPark.wait(1, std::memory_order_acquire);
+    bool aliased = false;
+    std::thread changer([&] { aliased = views.Alias(0, 1); });
+    while ((changeEvents.load(std::memory_order_acquire) & ChangeWaited) == 0) changeEvents.wait(0, std::memory_order_acquire);
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> later;
+    std::thread scanner([&] {
+        later = CollectRuns(views.views[0]);
+        scanWaitEvents.fetch_or(LaterScanDone, std::memory_order_acq_rel);
+        scanWaitEvents.notify_all();
+    });
+    while (scanWaitEvents.load(std::memory_order_acquire) == 0) scanWaitEvents.wait(0, std::memory_order_acquire);
+    const int seen = scanWaitEvents.load(std::memory_order_acquire);
+    scanPark.store(3, std::memory_order_release);
+    scanPark.notify_all();
+    parked.join();
+    changer.join();
+    scanner.join();
+    GuestWriteWatch::GuestWriteWatchSetScanHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetChangeWaitHookForTest_nid_postfix(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetScanWaitHookForTest_nid_postfix(nullptr);
+    Require(aliased, "cannot alias the shared views");
+    Require(seen == ScanWaited, "a scan overlapping a pending mapping change did not wait for it");
+    Require(Reports(later, views.views[1] + 0x100), "a scan held behind an alias did not report through the new link");
+}
+
+void RequireWaited(int seen, const std::string& what) {
+    Require((seen & ChangeWaited) != 0 && (seen & ChangeDone) == 0, what + " did not wait for an overlapping scan");
+}
+
+void CheckMappingChanges() {
+    CheckAliasAfterConsumedWrite(0, 1);
+    CheckAliasAfterConsumedWrite(1, 0);
+    CheckPendingChangeHoldsNewScans();
+    {
+        SharedViews views(2);
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { Require(views.Alias(0, 1), "cannot alias the shared views"); }), "an alias of the scanned view");
+        CollectView(views.views[0]);
+        CollectView(views.views[1]);
+        reinterpret_cast<volatile std::uint8_t*>(views.views[0])[0x40] = 0x5a;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> reported;
+        Require(GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(views.views[0], Block, [](void* found, std::uintptr_t begin, std::uintptr_t end) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(found)->emplace_back(begin, end); }, &reported), "cannot collect the aliased view");
+        const auto partner = views.views[1] + 0x40;
+        Require(std::any_of(reported.begin(), reported.end(), [&](const auto& run) { return run.first <= partner && partner < run.second; }), "a write after an alias made during a scan was not reported at the alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.views[1]), Block); }), "an unregistration of the scanned view's alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[1]); }, [&] { GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.views[0]), Block); }), "a registration over the scanned view's alias");
+    }
+    {
+        SharedViews views(3);
+        Require(views.Alias(0, 1) && views.Alias(1, 2), "cannot chain the shared views");
+        RequireWaited(ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<void*>(views.views[2]), Block); }), "an unregistration of an alias of the scanned view's alias");
+    }
+    {
+        SharedViews views(2);
+        Require(views.Alias(0, 1), "cannot alias the shared views");
+        const int seen = ChangeDuringParkedScan([&] { CollectView(views.views[0]); }, [&] { GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(views.spare), Block); });
+        Require(seen == ChangeDone, "a registration of an unrelated range waited for a scan");
+    }
+}
+#endif
+
+void CheckLosslessConsume() {
+    CheckThrowAfterConsume(true);
+#ifndef _WIN32
+    CheckThrowAfterConsume(false);
+    CheckConsumeCompaction(true);
+    CheckConsumeCompaction(false);
+#endif
+}
+
+struct WalkGate {
+    std::atomic<bool> holdBeforeScan{false};
+    std::atomic<bool> holdAfterScan{false};
+    std::atomic<bool> throwAfterScan{false};
+    std::atomic<bool> throwInScan{false};
+    std::atomic<bool> claimed{false};
+    std::atomic<std::thread::id> walker{};
+    std::array<std::atomic<bool>, 2> held{};
+    std::array<std::atomic<bool>, 2> released{};
+};
+
+WalkGate walkGate;
+
+void GateReleasedWalk(int stage) {
+    auto& gate = walkGate;
+    const auto self = std::this_thread::get_id();
+    if (!gate.claimed.exchange(true, std::memory_order_acq_rel)) gate.walker.store(self, std::memory_order_release);
+    else if (gate.walker.load(std::memory_order_acquire) != self) return;
+    if (stage == 1 && gate.throwAfterScan.load(std::memory_order_acquire)) throw std::runtime_error("injected after the released walk's scan");
+    if (stage == 2 && gate.throwInScan.load(std::memory_order_acquire)) throw std::runtime_error("injected inside the released walk's scan");
+    if (stage == 2) return;
+    const bool hold = stage == 0 ? gate.holdBeforeScan.load(std::memory_order_acquire) : gate.holdAfterScan.load(std::memory_order_acquire);
+    if (!hold || gate.held[static_cast<std::size_t>(stage)].exchange(true, std::memory_order_acq_rel)) return;
+    while (!gate.released[static_cast<std::size_t>(stage)].load(std::memory_order_acquire)) std::this_thread::yield();
+}
+
+void ArmWalkGate(bool beforeScan, bool afterScan, bool throwAfterScan = false, bool throwInScan = false) {
+    auto& gate = walkGate;
+    gate.throwInScan.store(throwInScan, std::memory_order_release);
+    gate.holdBeforeScan.store(beforeScan, std::memory_order_release);
+    gate.holdAfterScan.store(afterScan, std::memory_order_release);
+    gate.throwAfterScan.store(throwAfterScan, std::memory_order_release);
+    gate.claimed.store(false, std::memory_order_release);
+    for (auto& flag : gate.held) flag.store(false, std::memory_order_release);
+    for (auto& flag : gate.released) flag.store(false, std::memory_order_release);
+    SetReleasedWalkHookForTest(&GateReleasedWalk);
+}
+
+void AwaitHeldWalk(int stage) {
+    while (!walkGate.held[static_cast<std::size_t>(stage)].load(std::memory_order_acquire)) std::this_thread::yield();
+}
+
+void ReleaseWalk(int stage) {
+    walkGate.released[static_cast<std::size_t>(stage)].store(true, std::memory_order_release);
+}
+
+void DisarmWalkGate() {
+    ReleaseWalk(0);
+    ReleaseWalk(1);
+    SetReleasedWalkHookForTest(nullptr);
+}
+
+template <typename Collect>
+bool ReturnedWhileHeld(Collect&& collect, int stage) {
+    std::atomic<bool> done{false};
+    std::thread waiting([&] {
+        collect();
+        done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const bool early = done.load(std::memory_order_acquire);
+    ReleaseWalk(stage);
+    waiting.join();
+    return early;
+}
+
+void CheckUncachedCollectWaitsForHeldWalk() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the released walk fixture was not collected");
+    data[Block + 64] = 0x22;
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(base, bytes)); }, 1);
+    walker.join();
+    DisarmWalkGate();
+    Require(!early, "an uncached collect overlapping a held walk returned before that walk stamped");
+    Require(!UnchangedSince(base, bytes, before), "an uncached collect after a held walk reports the write that walk found unchanged");
+}
+
+void CheckGenerationsDuringHeldWalkPrecedeItsStamps() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto walked = base + 2 * Block;
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the watermark fixture was not collected");
+    data[2 * Block + 64] = 0x33;
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(walked, 2 * Block)); });
+    AwaitHeldWalk(1);
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, Block));
+    const auto fromMemo = CollectWrites(base, Block);
+    const auto fromUncached = CollectWritesUncached(base, Block);
+    ReleaseWalk(1);
+    walker.join();
+    DisarmWalkGate();
+    Require(!UnchangedSince(walked, 2 * Block, fromMemo), "a write a held walk found was stamped no newer than a generation a memo hit handed out while it was held");
+    Require(!UnchangedSince(walked, 2 * Block, fromUncached), "a write a held walk found was stamped no newer than a generation an uncached collect handed out while it was held");
+}
+
+void CheckMemoHitOnHeldRangeDefersUnstampedWrites() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the memo fixture was not collected");
+    const auto beforeOld = TrackerGeneration();
+    data[64] = 0x44;
+    BumpCollectEpoch();
+    Require(CollectWrites(base, bytes) != 0, "the memo entry's collect failed");
+    data[Block + 64] = 0x55;
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    AwaitHeldWalk(1);
+    const auto held = CollectWrites(base, bytes);
+    const bool oldSeen = !UnchangedSince(base, bytes, beforeOld);
+    const bool newBeforeStamp = !UnchangedSince(base, bytes, held);
+    ReleaseWalk(1);
+    walker.join();
+    DisarmWalkGate();
+    const bool newAfterStamp = !UnchangedSince(base, bytes, held);
+    Require(held <= TrackerGeneration(), "a memo hit returned a generation newer than the tracker's");
+    Require(oldSeen, "a memo hit on a range a held walk had scanned reported a write older than its epoch unchanged");
+    Require(!newBeforeStamp, "a write the held walk had not stamped yet was visible before its stamp");
+    Require(newAfterStamp, "a write found by a walk held across a memo hit was stamped no newer than the generation the memo hit returned");
+}
+
+void CheckThrowKeepsWrites(bool inScan) {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto before = CollectWritesUncached(base, bytes);
+    Require(before != 0, "the throw fixture was not collected");
+    data[Block + 64] = 0x66;
+    ArmWalkGate(false, false, !inScan, inScan);
+    bool thrown = false;
+    try {
+        static_cast<void>(CollectWritesUncached(base, bytes));
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    DisarmWalkGate();
+    Require(thrown, "the injected failure in the released walk was not raised");
+    Require(!UnchangedSince(base, bytes, before), "a write a failed walk had consumed was lost");
+}
+
+void CheckWriteDuringHeldWalkIsCollected(int stage) {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the concurrent write fixture was not collected");
+    data[64] = 0x12;
+    ArmWalkGate(stage == 0, stage == 1);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(base, bytes)); });
+    AwaitHeldWalk(stage);
+    const auto before = TrackerGeneration();
+    std::atomic_ref<std::uint8_t>(data[Block + 128]).store(0x34, std::memory_order_relaxed);
+    ReleaseWalk(stage);
+    walker.join();
+    DisarmWalkGate();
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    Require(!UnchangedSince(base + Block, Block, before), "a write made while a walk of its range was held was lost to the next uncached collect");
+}
+
+void CheckMemoHitDefersWritesToNextEpoch() {
+    SetReleasedWalksForTest(true);
+    constexpr std::size_t bytes = 2 * Block;
+    void* memory = AllocateWatched(bytes);
+    auto* data = static_cast<std::uint8_t*>(memory);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the epoch fixture was not collected");
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, bytes));
+    const auto memo = CollectWrites(base, bytes);
+    data[Block + 256] = 0x56;
+    static_cast<void>(CollectWrites(base, bytes));
+    BumpCollectEpoch();
+    static_cast<void>(CollectWrites(base, bytes));
+    Require(!UnchangedSince(base, bytes, memo), "a write after a memo hit was still unchanged since its generation in the next epoch");
+    data[256] = 0x57;
+    const auto epochGeneration = CollectWrites(base, bytes);
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    Require(!UnchangedSince(base, bytes, epochGeneration), "an uncached collect inside an epoch did not see a write made after that epoch's memo hit");
+}
+
+#if defined(__linux__)
+struct AliasedViews {
+    std::uintptr_t first = 0;
+    std::uintptr_t second = 0;
+};
+
+AliasedViews MapAliasedViews(const char* name, bool linked) {
+    const int file = memfd_create(name, 0);
+    Require(file >= 0 && ftruncate(file, Block) == 0, "cannot create the aliased views' backing");
+    void* raw = mmap(nullptr, 3 * Block, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(raw != MAP_FAILED, "cannot reserve the aliased views");
+    AliasedViews views;
+    views.first = (reinterpret_cast<std::uintptr_t>(raw) + Block - 1) & ~static_cast<std::uintptr_t>(Block - 1);
+    views.second = views.first + Block;
+    for (const auto view : {views.first, views.second}) {
+        Require(mmap(reinterpret_cast<void*>(view), Block, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) != MAP_FAILED, "cannot map an aliased view");
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<void*>(view), Block);
+    }
+    if (linked) Require(GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views.first), reinterpret_cast<void*>(views.second), Block), "the views could not be aliased");
+    std::memset(reinterpret_cast<void*>(views.first), 0x11, Block);
+    return views;
+}
+
+void CheckAliasedViewWaitsForHeldWalk() {
+    SetReleasedWalksForTest(true);
+    const auto views = MapAliasedViews("aps5-released-walk-alias", true);
+    Require(CollectWritesUncached(views.first, Block) != 0 && CollectWritesUncached(views.second, Block) != 0, "the aliased views were not collected");
+    const auto collected = CollectWritesUncached(views.second, Block);
+    reinterpret_cast<volatile std::uint8_t*>(views.first)[0x200] = 0x77;
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(views.first, Block)); });
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(views.second, Block)); }, 1);
+    walker.join();
+    DisarmWalkGate();
+    Require(!early, "an uncached collect of an aliased view returned while a walk of its alias was held");
+    Require(!UnchangedSince(views.second, Block, collected), "a write through one view was reported unchanged in its alias after a walk of the first was held");
+}
+
+void CheckAliasCreatedDuringHeldWalk(int stage) {
+    SetReleasedWalksForTest(true);
+    const auto views = MapAliasedViews("aps5-released-walk-late-alias", false);
+    Require(CollectWritesUncached(views.first, Block) != 0 && CollectWritesUncached(views.second, Block) != 0, "the late-alias views were not collected");
+    const auto collected = CollectWritesUncached(views.second, Block);
+    reinterpret_cast<volatile std::uint8_t*>(views.first)[0x300] = 0x88;
+    ArmWalkGate(stage == 0, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(views.first, Block)); });
+    AwaitHeldWalk(stage);
+    const bool aliased = GuestWriteWatch::GuestWriteWatchAlias_nid_postfix(reinterpret_cast<void*>(views.first), reinterpret_cast<void*>(views.second), Block);
+    if (stage == 0) ReleaseWalk(0);
+    AwaitHeldWalk(1);
+    const bool early = ReturnedWhileHeld([&] { static_cast<void>(CollectWritesUncached(views.second, Block)); }, 1);
+    walker.join();
+    DisarmWalkGate();
+    Require(aliased, "the views could not be aliased during the walk");
+    Require(!early, "an uncached collect of a view aliased during a held walk returned while that walk was held");
+    Require(!UnchangedSince(views.second, Block, collected), "a write through a view aliased during a walk was reported unchanged in the new alias");
+}
+#endif
+
+void RandomReleasedWalkDelay(int stage) {
+    if (stage != 1) return;
+    thread_local std::uint32_t state = static_cast<std::uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id())) | 1u;
+    state ^= state << 13u;
+    state ^= state >> 17u;
+    state ^= state << 5u;
+    if (state % 4u == 0u) std::this_thread::sleep_for(std::chrono::microseconds(state % 200u));
+}
+
+void CheckReleasedWalkStress(bool released) {
+    SetReleasedWalksForTest(released);
+    SetReleasedWalkHookForTest(&RandomReleasedWalkDelay);
+    constexpr int Threads = 4;
+    constexpr int Rounds = 400;
+    constexpr std::size_t Lanes = Threads + 1;
+    void* memory = AllocateWatched(Lanes * Block);
+    std::memset(memory, 0x11, Lanes * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, Lanes * Block) != 0, "the stress fixture was not collected");
+    std::atomic<int> missed{0};
+    std::vector<std::thread> pool;
+    for (int lane = 0; lane < Threads; ++lane) {
+        pool.emplace_back([&, lane] {
+            const auto range = base + static_cast<std::uint64_t>(lane) * Block;
+            auto* data = reinterpret_cast<std::uint8_t*>(range);
+            std::uint32_t state = static_cast<std::uint32_t>(lane) * 2654435761u + 1u;
+            for (int round = 0; round < Rounds; ++round) {
+                state ^= state << 13u;
+                state ^= state >> 17u;
+                state ^= state << 5u;
+                const auto offset = static_cast<std::size_t>(state % (2 * Block / 4096)) * 4096;
+                const auto before = TrackerGeneration();
+                std::atomic_ref<std::uint8_t>(data[offset]).store(static_cast<std::uint8_t>(round), std::memory_order_relaxed);
+                static_cast<void>(CollectWritesUncached(range, 2 * Block));
+                if (UnchangedSince(range + offset, 4096, before)) missed.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (auto& thread : pool) thread.join();
+    SetReleasedWalkHookForTest(nullptr);
+    Require(missed.load() == 0, "a write made after a generation was read was reported unchanged since it after its own collect");
+}
+
+std::vector<std::uint8_t> PhasedVerdicts(bool released) {
+    SetReleasedWalksForTest(released);
+    SetReleasedWalkHookForTest(&RandomReleasedWalkDelay);
+    constexpr int Threads = 4;
+    constexpr int Phases = 24;
+    void* memory = AllocateWatched(Threads * Block);
+    std::memset(memory, 0x11, Threads * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, Threads * Block) != 0, "the differential fixture was not collected");
+    std::vector<std::uint8_t> verdicts;
+    for (int phase = 0; phase < Phases; ++phase) {
+        const auto start = TrackerGeneration();
+        std::vector<std::thread> writers;
+        for (int lane = 0; lane < Threads; ++lane) {
+            writers.emplace_back([&, lane] {
+                if ((lane + phase) % 3 == 0) return;
+                const auto block = static_cast<std::uint64_t>((lane * 7 + phase * 3) % Threads);
+                reinterpret_cast<std::uint8_t*>(base + block * Block)[(phase * 4096) % Block] = static_cast<std::uint8_t>(phase + 1);
+            });
+        }
+        for (auto& thread : writers) thread.join();
+        std::vector<std::thread> collectors;
+        for (int lane = 0; lane < Threads; ++lane) {
+            collectors.emplace_back([&, lane] {
+                const auto blocks = lane + 1 < Threads ? 2 : 1;
+                static_cast<void>(CollectWritesUncached(base + static_cast<std::uint64_t>(lane) * Block, static_cast<std::size_t>(blocks) * Block));
+            });
+        }
+        for (auto& thread : collectors) thread.join();
+        for (int block = 0; block < Threads; ++block) verdicts.push_back(UnchangedSince(base + static_cast<std::uint64_t>(block) * Block, Block, start) ? 0 : 1);
+    }
+    SetReleasedWalkHookForTest(nullptr);
+    return verdicts;
+}
+
+void CheckReleasedWalkDifferential() {
+    constexpr int Threads = 4;
+    constexpr int Phases = 24;
+    std::vector<std::uint8_t> expected;
+    for (int phase = 0; phase < Phases; ++phase) {
+        std::vector<std::uint8_t> written(Threads, 0);
+        for (int lane = 0; lane < Threads; ++lane) {
+            if ((lane + phase) % 3 != 0) written[static_cast<std::size_t>((lane * 7 + phase * 3) % Threads)] = 1;
+        }
+        expected.insert(expected.end(), written.begin(), written.end());
+    }
+    const auto locked = PhasedVerdicts(false);
+    const auto released = PhasedVerdicts(true);
+    Require(locked == expected, "the serialized walks' verdicts differ from the writes made");
+    Require(released == locked, "the released walks' verdicts differ from the serialized walks'");
+}
+
+struct LatencySummary {
+    double median = 0.0;
+    double p99 = 0.0;
+};
+
+LatencySummary Summarize(std::vector<double>& samples) {
+    if (samples.empty()) return {};
+    std::sort(samples.begin(), samples.end());
+    return {samples[samples.size() / 2], samples[samples.size() * 99 / 100]};
+}
+
+void CheckProofBreakSources() {
+    Require(ProofBreaksCounted(), "proof breaks are counted only under APS5_PROFILE_DRAW");
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const std::array<std::byte, 4> bytes{std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}};
+    const auto before = ProofBreakCounts();
+    static_cast<void>(StoreOwnBytes(base + 64, bytes));
+    const auto after = ProofBreakCounts();
+    const auto moved = [&](ProofBreak source) { return after[static_cast<std::size_t>(source)] - before[static_cast<std::size_t>(source)]; };
+    Require(moved(ProofBreak::OwnStore) == 2, "an own store did not break proofs as an own store when it began and when it was stored");
+    Require(moved(ProofBreak::Unlabelled) == 0, "an own store broke proofs without a source");
+    const auto marked = ProofBreakCounts();
+    static_cast<void>(MarkWritten(base + 128, 4));
+    const auto done = ProofBreakCounts();
+    for (std::size_t i = 0; i < done.size(); ++i) {
+        const auto source = static_cast<ProofBreak>(i);
+        const auto expected = source == ProofBreak::MarkWritten ? 2u : 0u;
+        Require(done[i] - marked[i] == expected, std::string("a driver store moved the ") + ProofBreakName(source) + " break count by " + std::to_string(done[i] - marked[i]) + " instead of " + std::to_string(expected) + "; both its breaks must be mark-written, which certificates treat as covered");
+    }
+}
+
+void RunMemoHitBench(int threads) {
+    constexpr std::size_t Hits = 2000000;
+    const auto lanes = static_cast<std::size_t>(threads);
+    void* memory = AllocateWatched(lanes * Block);
+    std::memset(memory, 0x5a, lanes * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    Require(CollectWritesUncached(base, lanes * Block) != 0, "the memo bench region was not collected");
+    std::atomic<int> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<double> nanoseconds(lanes, 0.0);
+    std::vector<std::thread> pool;
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        pool.emplace_back([&, lane] {
+            const auto address = base + lane * Block;
+            BumpCollectEpoch();
+            Require(CollectWrites(address, 256) != 0, "the memo bench lane was not collected");
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            std::uint64_t sink = 0;
+            const auto begin = std::chrono::steady_clock::now();
+            for (std::size_t hit = 0; hit < Hits; ++hit) sink += CollectWrites(address + (hit % 16) * 256, 256);
+            const auto end = std::chrono::steady_clock::now();
+            Require(sink != 0, "the memo bench lane returned no generation");
+            nanoseconds[lane] = std::chrono::duration<double, std::nano>(end - begin).count() / static_cast<double>(Hits);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) != threads) std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : pool) thread.join();
+    double total = 0;
+    for (const auto value : nanoseconds) total += value;
+    std::printf("memo hits, %d threads: %.1f ns per hit per thread\n", threads, total / static_cast<double>(lanes));
+}
+
+void RunContentionBench(int collectors, bool overlapping, bool writing) {
+    constexpr std::size_t RangeBlocks = 4;
+    constexpr int Rounds = 20000;
+    const auto lanes = static_cast<std::size_t>(collectors) + 1;
+    void* memory = AllocateWatched(lanes * RangeBlocks * Block);
+    std::memset(memory, 0x5a, lanes * RangeBlocks * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    BumpCollectEpoch();
+    Require(CollectWritesUncached(base, lanes * RangeBlocks * Block) != 0, "the bench region was not collected");
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> collected{0};
+    std::vector<std::thread> pool;
+    for (int lane = 1; lane <= collectors; ++lane) {
+        pool.emplace_back([&, lane] {
+            auto* range = static_cast<std::uint8_t*>(memory) + static_cast<std::size_t>(lane) * RangeBlocks * Block;
+            const auto address = reinterpret_cast<std::uint64_t>(range);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (std::uint64_t round = 0; !stop.load(std::memory_order_relaxed); ++round) {
+                if (writing) range[(round % (RangeBlocks * Block / 4096)) * 4096] = static_cast<std::uint8_t>(round);
+                static_cast<void>(CollectWritesUncached(address, RangeBlocks * Block));
+                collected.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    std::vector<double> queries;
+    std::vector<double> walks;
+    queries.reserve(Rounds);
+    walks.reserve(Rounds);
+    const auto own = overlapping && collectors > 0 ? base + RangeBlocks * Block : base;
+    const auto since = CollectWritesUncached(own, RangeBlocks * Block);
+    start.store(true, std::memory_order_release);
+    const auto began = std::chrono::steady_clock::now();
+    for (int round = 0; round < Rounds; ++round) {
+        const auto queried = std::chrono::steady_clock::now();
+        const bool unchanged = UnchangedSince(own, RangeBlocks * Block, since);
+        Require(unchanged || overlapping, "the bench's own range changed");
+        const auto walked = std::chrono::steady_clock::now();
+        static_cast<void>(CollectWritesUncached(own, RangeBlocks * Block));
+        const auto done = std::chrono::steady_clock::now();
+        queries.push_back(std::chrono::duration<double, std::micro>(walked - queried).count());
+        walks.push_back(std::chrono::duration<double, std::micro>(done - walked).count());
+    }
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& thread : pool) thread.join();
+    const auto query = Summarize(queries);
+    const auto walk = Summarize(walks);
+    std::printf("contention bench: %d %s collectors%s; committer %.0f rounds/s; UnchangedSince median %.2f us p99 %.2f us; clean collect median %.2f us p99 %.2f us; collectors %.0f collects/s\n", collectors, writing ? "writing" : "clean", overlapping ? " sharing the committer's range" : "", Rounds / seconds, query.median, query.p99, walk.median, walk.p99, static_cast<double>(collected.load()) / seconds);
+}
+
+#ifdef _WIN32
+void RunMappingBench(int collectors, int spinners) {
+    constexpr std::size_t RangeBlocks = 4;
+    constexpr int Rounds = 20000;
+    const auto lanes = static_cast<std::size_t>(std::max(collectors, 1));
+    void* memory = AllocateWatched(lanes * RangeBlocks * Block);
+    std::memset(memory, 0x5a, lanes * RangeBlocks * Block);
+    constexpr std::array<const char*, 9> sites{"handlewrite", "handleread", "collect", "registry", "pin", "hostwrite", "owned", "zero", "other"};
+    std::array<std::uint64_t, sites.size() * 3> before{};
+    std::array<std::uint64_t, sites.size() * 3> after{};
+    std::uint64_t frequency = 0;
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> spinning;
+    for (int spinner = 0; spinner < spinners; ++spinner) {
+        spinning.emplace_back([&] {
+            std::uint64_t value = 0;
+            while (!stop.load(std::memory_order_relaxed)) value = value * 6364136223846793005ull + 1442695040888963407ull;
+            static_cast<void>(value);
+        });
+    }
+    std::vector<std::vector<double>> latencies(lanes);
+    std::vector<std::thread> pool;
+    GuestArena::GuestArenaMappingLockCounts_nid_no_patch(before.data(), before.size(), &frequency);
+    for (std::size_t lane = 0; lane < lanes; ++lane) {
+        pool.emplace_back([&, lane] {
+            auto* range = static_cast<std::uint8_t*>(memory) + lane * RangeBlocks * Block;
+            const auto address = reinterpret_cast<std::uintptr_t>(range);
+            std::vector<void*> pages(RangeBlocks * Block / 4096);
+            latencies[lane].reserve(Rounds);
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (int round = 0; round < Rounds; ++round) {
+                range[(static_cast<std::size_t>(round) % pages.size()) * 4096] = static_cast<std::uint8_t>(round);
+                std::size_t count = pages.size();
+                const auto began = std::chrono::steady_clock::now();
+                static_cast<void>(GuestArena::GuestArenaCollectWrites_nid_postfix(address, RangeBlocks * Block, pages.data(), &count, true));
+                latencies[lane].push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - began).count());
+            }
+        });
+    }
+    const auto began = std::chrono::steady_clock::now();
+    start.store(true, std::memory_order_release);
+    for (auto& thread : pool) thread.join();
+    const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    stop.store(true, std::memory_order_relaxed);
+    for (auto& thread : spinning) thread.join();
+    GuestArena::GuestArenaMappingLockCounts_nid_no_patch(after.data(), after.size(), &frequency);
+    std::vector<double> all;
+    for (auto& samples : latencies) all.insert(all.end(), samples.begin(), samples.end());
+    const auto collect = Summarize(all);
+    std::printf("mapping bench: %zu collectors, %d spinners; %.0f collects/s; collect median %.2f us p99 %.2f us", lanes, spinners, static_cast<double>(all.size()) / seconds, collect.median, collect.p99);
+    if (frequency != 0 && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        std::printf("; mapping lock acquisitions/contended/ms waited:");
+        for (std::size_t site = 0; site < sites.size(); ++site) {
+            const auto acquired = after[site * 3] - before[site * 3];
+            if (acquired == 0) continue;
+            std::printf(" %s %llu/%llu/%.2f", sites[site], static_cast<unsigned long long>(acquired), static_cast<unsigned long long>(after[site * 3 + 1] - before[site * 3 + 1]), static_cast<double>(after[site * 3 + 2] - before[site * 3 + 2]) * 1000.0 / static_cast<double>(frequency));
+        }
+    } else {
+        std::printf("; set APS5_PROFILE_DRAW=1 for the mapping lock counts");
+    }
+    std::printf("\n");
+}
+#endif
+
+enum WalkCount : std::size_t { Walks, ReleasedWalks, ConcurrentWalks, GranuleOnlyWalks, WaitedWalks, WaitNanoseconds, LockedNanoseconds, ReleasedNanoseconds, ClosureRanges, ClosureGranules = ClosureRanges + 4, WalkCountTotal = ClosureGranules + 4 };
+
+std::array<std::uint64_t, WalkCountTotal> WalkCounts() {
+    std::array<std::uint64_t, WalkCountTotal> counts{};
+    WalkCountersForTest(counts.data(), counts.size());
+    return counts;
+}
+
+std::uint64_t WalkDelta(const std::array<std::uint64_t, WalkCountTotal>& before, const std::array<std::uint64_t, WalkCountTotal>& after, std::size_t index) {
+    return after[index] - before[index];
+}
+
+void CheckWalkCounters() {
+    constexpr std::size_t granule = std::size_t{1} << 21;
+    constexpr std::size_t bytes = 3 * granule;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    const auto first = (base + granule - 1) & ~static_cast<std::uint64_t>(granule - 1);
+    std::memset(memory, 0x11, bytes);
+#ifndef _WIN32
+    SetReleasedWalksForTest(true);
+#endif
+    static_cast<void>(CollectWritesUncached(base, bytes));
+    auto before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(first, Block));
+    auto after = WalkCounts();
+    Require(WalkDelta(before, after, Walks) == 1, "a collect was not counted as one walk");
+    Require(WalkDelta(before, after, ClosureRanges) == 1 && WalkDelta(before, after, ClosureGranules) == 1, "a walk of one unaliased block was not counted with one range in one granule");
+    Require(WalkDelta(before, after, ConcurrentWalks) == 0 && WalkDelta(before, after, WaitedWalks) == 0, "a lone walk was counted as concurrent or waiting");
+#ifdef _WIN32
+    Require(WalkDelta(before, after, LockedNanoseconds) != 0, "the locked walk's time was not counted");
+#else
+    Require(WalkDelta(before, after, ReleasedWalks) == 1 && WalkDelta(before, after, ReleasedNanoseconds) != 0, "a released walk or its time was not counted");
+    const auto views = MapAliasedViews("aps5-walk-counters", true);
+    static_cast<void>(CollectWritesUncached(views.first, Block));
+    before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(views.first, Block));
+    after = WalkCounts();
+    Require(WalkDelta(before, after, ClosureRanges + 1) == 1, "a walk of an aliased view was not counted with its alias in its closure");
+    ArmWalkGate(false, true);
+    std::thread walker([&] { static_cast<void>(CollectWritesUncached(first, Block)); });
+    AwaitHeldWalk(1);
+    before = WalkCounts();
+    static_cast<void>(CollectWritesUncached(first + granule, Block));
+    after = WalkCounts();
+    const bool otherGranule = WalkDelta(before, after, ConcurrentWalks) == 1 && WalkDelta(before, after, GranuleOnlyWalks) == 0;
+    before = after;
+    static_cast<void>(CollectWritesUncached(first + 2 * Block, Block));
+    after = WalkCounts();
+    const bool sameGranule = WalkDelta(before, after, ConcurrentWalks) == 1 && WalkDelta(before, after, GranuleOnlyWalks) == 1;
+    before = after;
+    std::thread waiter([&] { static_cast<void>(CollectWritesUncached(first, Block)); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (WalkCounts()[WaitedWalks] == before[WaitedWalks] && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool waited = WalkCounts()[WaitedWalks] != before[WaitedWalks];
+    ReleaseWalk(1);
+    walker.join();
+    waiter.join();
+    DisarmWalkGate();
+    after = WalkCounts();
+    Require(otherGranule, "a walk in another granule beside a held walk was not counted as concurrent only");
+    Require(sameGranule, "a disjoint walk in a held walk's granule was not counted as sharing only its granule");
+    Require(waited, "a walk overlapping a held walk was not counted as waiting");
+    Require(WalkDelta(before, after, WaitNanoseconds) != 0, "the time a walk waited was not counted");
+#endif
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2560,6 +3434,81 @@ int main(int argc, char** argv) {
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--lossless-consume") {
+            CheckLosslessConsume();
+            std::cout << "lossless consume tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--walk-counters") {
+            if (std::getenv("APS5_PROFILE_DRAW") == nullptr) {
+                std::cout << "walk counters count only under APS5_PROFILE_DRAW: skipped\n";
+                return 77;
+            }
+            CheckWalkCounters();
+            std::cout << "walk counter tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mapping-changes") {
+#if defined(__linux__)
+            if (!GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+                std::cout << "no Linux write watch: mapping change tests skipped\n";
+                return 77;
+            }
+            CheckMappingChanges();
+            std::cout << "mapping change tests passed\n";
+            return 0;
+#else
+            std::cout << "mapping changes are ordered by the Linux write watch: skipped\n";
+            return 77;
+#endif
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--released-walks") {
+#ifdef _WIN32
+            std::cout << "collect walks stay under the tracker mutex on Windows: skipped\n";
+            return 77;
+#else
+            CheckUncachedCollectWaitsForHeldWalk();
+            CheckGenerationsDuringHeldWalkPrecedeItsStamps();
+            CheckMemoHitOnHeldRangeDefersUnstampedWrites();
+            CheckMemoHitDefersWritesToNextEpoch();
+            CheckWriteDuringHeldWalkIsCollected(0);
+            CheckWriteDuringHeldWalkIsCollected(1);
+            CheckThrowKeepsWrites(false);
+            CheckThrowKeepsWrites(true);
+#if defined(__linux__)
+            CheckAliasedViewWaitsForHeldWalk();
+            CheckAliasCreatedDuringHeldWalk(0);
+            CheckAliasCreatedDuringHeldWalk(1);
+#endif
+            CheckReleasedWalkStress(true);
+            CheckReleasedWalkStress(false);
+            CheckReleasedWalkDifferential();
+            std::cout << "released walk tests passed\n";
+            return 0;
+#endif
+        }
+        if (argc == 4 && std::string_view(argv[1]) == "--mapping-bench") {
+#ifdef _WIN32
+            RunMappingBench(std::stoi(argv[2]), std::stoi(argv[3]));
+#else
+            std::cout << "the mapping bench measures WindowsMappings and runs on Windows only\n";
+#endif
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--memo-bench") {
+            RunMemoHitBench(std::stoi(argv[2]));
+            return 0;
+        }
+        if (argc >= 3 && argc <= 5 && std::string_view(argv[1]) == "--contention-bench") {
+            const auto option = [&](std::string_view name) { return (argc >= 4 && std::string_view(argv[3]) == name) || (argc == 5 && std::string_view(argv[4]) == name); };
+            RunContentionBench(std::stoi(argv[2]), option("overlap"), !option("clean"));
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--proof-break-sources") {
+            CheckProofBreakSources();
+            std::cout << "proof break source test passed\n";
+            return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--generation-wrap") {
             CheckGenerationWrap();

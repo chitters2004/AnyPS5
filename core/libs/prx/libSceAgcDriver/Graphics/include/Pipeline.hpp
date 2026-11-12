@@ -8,6 +8,7 @@
 namespace AgcDriver::Graphics {
 
 struct VertexInputLayout;
+class CommandState;
 
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline);
 
@@ -49,18 +50,20 @@ public:
     VkPipelineLayout Layout() const;
     std::shared_ptr<Framebuffer> AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers = 1);
     // Begins the render pass on the framebuffer, binds the pipeline and sets its dynamic state.
-    void Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked = nullptr) const;
+    void Begin(CommandState& recording, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked = nullptr) const;
     // The same inside a render pass another pipeline of the same attachments began (compatible by
     // construction: the attachment formats alone decide).
-    void Continue(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
+    void Continue(CommandState& recording, const State& state, const State* masked = nullptr) const;
     bool SplitsFaces() const { return backFaces != VK_NULL_HANDLE; }
     bool Optimized() const { return optimized != nullptr && optimized->handle.load() != VK_NULL_HANDLE; }
-    void ContinueBackFaces(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
+    void ContinueBackFaces(CommandState& recording, const State& state, const State* masked = nullptr) const;
     bool SplitsSecondChannel() const { return secondChannel != VK_NULL_HANDLE; }
-    void ContinueSecondChannel(VkCommandBuffer commands, const State& state, const State* masked = nullptr) const;
+    void ContinueSecondChannel(CommandState& recording, const State& state, const State* masked = nullptr) const;
     const SampleOrder& HostSampleOrder() const { return sampleOrder; }
     bool ReordersSamples() const { return Graphics::ReordersSamples(sampleOrder); }
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
+    bool InertFragmentStage() const { return inertFragment; }
+    bool FragmentStageOmitted() const { return fragmentOmitted; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
@@ -70,6 +73,7 @@ private:
     struct CachedFramebuffer {
         std::vector<VkImageView> views;
         std::vector<std::weak_ptr<void>> owners;
+        std::vector<const void*> ownerPointers;
         std::vector<bool> owned;
         VkExtent2D extent;
         std::uint32_t layers = 1;
@@ -77,8 +81,8 @@ private:
         std::shared_ptr<Framebuffer> framebuffer;
     };
     void release() noexcept;
-    void setLibraryState(VkCommandBuffer commands, const State& state) const;
-    void setColorWriteMasks(VkCommandBuffer commands, const State& state, const State* masked, bool secondChannel) const;
+    void setLibraryState(CommandState& recording, const State& state) const;
+    void setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -93,8 +97,11 @@ private:
     bool depthBounds = false;
     bool depthBias = false;
     bool libraries = false;
+    std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;
+    bool inertFragment = false;
+    bool fragmentOmitted = false;
     VkFormat depthFormat = VK_FORMAT_UNDEFINED;
     VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::vector<std::uint32_t> colorSlots;
@@ -157,6 +164,8 @@ bool ValidateSampleLocations(const Context& context, const State& state);
 void ValidateShaderPair(const ShaderRecompiler::RecompileResult& vertex, const ShaderRecompiler::RecompileResult& fragment);
 bool ShadersWriteMemory(std::span<const CompiledShader> shaders);
 bool DeclaresEarlyFragmentTests(const ShaderRecompiler::RecompileResult& program);
+bool InertFragment(const ShaderRecompiler::RecompileResult& program);
+bool OmitsInertFragments();
 void ValidateSampleMask(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 // Returns the color attachment locations the pixel shader writes.
 std::set<std::uint32_t> ValidateShaders(std::span<const CompiledShader> shaders, const State& state, const VkPhysicalDeviceSubgroupProperties& subgroup, bool fragmentShaderBarycentric, bool descriptorIndexing = false, bool imageInt64Atomics = false, bool geometryShader = false, bool sampleRateShading = false, bool bufferInt64Atomics = false, bool shaderClipDistance = false, bool shaderCullDistance = false, bool viewportIndexLayer = false, bool runtimeDescriptorArray = false, bool demoteToHelperInvocation = false, bool shaderTerminateInvocation = false, bool meshShader = true, bool shaderResourceMinLod = false, bool fmaFloat16 = false);

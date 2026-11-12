@@ -1,0 +1,10 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_draw_plan_shadow_on COMMAND agc_driver_draw_plan_shadow_tests)
+    set_tests_properties(agc_driver_draw_plan_shadow_on PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLAN_SHADOW=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_draw_plan_shadow_pipeline COMMAND agc_driver_draw_plan_shadow_tests)
+    set_tests_properties(agc_driver_draw_plan_shadow_pipeline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLAN_SHADOW=1;APS5_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_plan_shadow_on agc_driver_draw_plan_shadow_pipeline PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

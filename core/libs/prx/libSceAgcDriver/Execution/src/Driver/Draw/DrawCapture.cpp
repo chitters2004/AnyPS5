@@ -1,12 +1,16 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -60,31 +64,37 @@ void TraceShaderRequestFailure(std::uint64_t token, const Submission& submission
 
 }
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::uint64_t traceToken, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) try {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::uint64_t traceToken, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics, ShaderRecompiler::RecompileRequest* shared, DrawStageRecord* pending) try {
     PerformanceTimer timing("Shader.DrawStage");
-    using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
     const auto& program = programs[i];
-    const auto waveSize = Graphics::StageWaveSize(graphics.stages, program.binary.stage);
-    ShaderRecompiler::RecompileRequest request{
-        program.binary,
-        {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfos[i], memory, RegisteredFloatMode(*program.snapshot)},
-        localDevice->Target(),
-        {0, 0, pushOffset, Graphics::StagePushLimit(graphics.stages, pushOffset, graphics.depthRemap.mode != 0u) - pushOffset % Graphics::PipelinePushSlotBytes},
-        ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, Graphics::StageMeshConfiguration(graphics.stages, program.binary.stage), graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}, program.binary.stage == Stage::Mesh ? meshBarycentrics : std::nullopt}
-    };
-    if (graphics.depthRemap.mode != 0u && pushOffset < Graphics::PipelinePushSlotBytes) {
-        request.layout.pushConstantSizeBytes = std::min(request.layout.pushConstantSizeBytes, ShaderRecompiler::DepthRemapPushOffsetBytes - pushOffset);
+    std::optional<ShaderRecompiler::RecompileRequest> own;
+    if (shared != nullptr) {
+        CompleteDrawStageRequest(*shared, program, pixel, vertexInfos[i], memory, linked, meshBarycentrics);
+        if (verifyDrawStageMemo()) VerifySharedDrawStageRequest(*shared, program, pushOffset, graphics, pixel, vertexInfos[i], memory, linked, drawParameters, localDevice->Target(), localDevice->Serial(), meshBarycentrics);
+    } else {
+        own.emplace(DrawStageRequest(program, pushOffset, graphics, memory, linked, drawParameters, localDevice->Target(), meshBarycentrics));
+        if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) own->context.pixel = pixel;
+        own->context.vertex = vertexInfos[i];
     }
+    auto& request = shared != nullptr ? *shared : *own;
+    bool linkedCode = false;
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
+    const bool steps = CaptureStepsProfiled();
+    const auto stepClock = [&] { return steps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}; };
+    const auto stepSince = [](std::chrono::steady_clock::time_point started) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()); };
+    const auto invocationStarted = stepClock();
+    PreparedHandleHint matchedHint;
     auto invocation = [&] {
         try {
-            return InvocationFor(*program.snapshot, program.codeOffset, request);
+            return InvocationFor(*program.snapshot, program.codeOffset, request, &linkedCode, pending != nullptr ? &pending->prepared : nullptr, &matchedHint);
         } catch (...) {
             TraceShaderRequestFailure(traceToken, submission, packetOffset, program, std::current_exception());
             throw;
         }
     }();
+    if (pending != nullptr) pending->prepared = std::move(matchedHint);
+    if (steps) NoteCaptureStep(CaptureStep::Invocation, stepSince(invocationStarted));
     timing.Mark("prepared_invocation");
     auto& stageCapture = stageCaptures[i];
     stageCapture.forgetSerial = GuestMemory::ForgetSerial();
@@ -114,15 +124,29 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         }
     }();
 
+    const auto assemblyStarted = stepClock();
     stageCapture.regions = shaderMemory.TakeRecentRegions();
     stageCapture.supplied = shaderMemory.SuppliedBlocks();
-    stageCapture.userDataUse = capture->userDataUse;
+    stageCapture.linkedCode = linkedCode;
+    stageCapture.convertedSamples = invocation.Request().context.convertedSamples;
+    stageCapture.layerRowSamples = invocation.Request().context.layerRowSamples;
     stageCapture.registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>(capture->snapshot.registeredImages);
     recompiled[i] = true;
     memory = shaderMemory.Regions();
 
     for (std::size_t j = 0; j < programs.size(); ++j) {
         if (matched[j] != nullptr && !recompiled[j] && (drawHit || j < i)) memory.insert(memory.end(), matchedRegions[j].begin(), matchedRegions[j].end());
+    }
+    if (steps) {
+        NoteCaptureStep(CaptureStep::Assembly, stepSince(assemblyStarted));
+        const auto censusStarted = stepClock();
+        CaptureCensusSample sample;
+        for (std::uint32_t word = 0; word < 64 && word < request.context.userData.size(); ++word) {
+            if ((capture->userDataUse.asBase >> word & 1u) != 0) sample.pointers.push_back(request.context.userData[word]);
+        }
+        for (const auto& region : stageCapture.regions) sample.regions.emplace_back(region.guestAddress, std::vector<std::byte>(region.bytes.begin(), region.bytes.end()));
+        NoteCaptureCensus(program.binary.codeAddress, std::move(sample));
+        NoteCaptureStep(CaptureStep::Census, stepSince(censusStarted));
     }
     request.context.memory = memory;
     static const bool dumpGraphics = std::getenv("APS5_DUMP_GRAPHICS_SHADERS") != nullptr;
@@ -159,7 +183,14 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
     timing.Mark("capture_resources");
     try {
-        stageCapture.compiled = invocation.Materialize(*capture);
+        stageCapture.push = nullptr;
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::SharePushDonor)) {
+            std::vector<std::byte> push;
+            stageCapture.compiled = invocation.Materialize(*capture, &push);
+            if (!push.empty()) stageCapture.push = std::make_shared<const std::vector<std::byte>>(std::move(push));
+        } else {
+            stageCapture.compiled = invocation.Materialize(*capture);
+        }
         stageCapture.capture = capture;
     } catch (const std::exception& error) {
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
@@ -212,11 +243,12 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
     variant.dataSlots.resize(kept);
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<StageDataHit>& stageData, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, bool shapeNeedsEntry, const std::vector<std::shared_ptr<DrawStageRecord>>* memoPending) {
     const bool cacheable = useDrawEntries && !drawHit && (drawCacheIndirect() || !(drawParameters.indirect && indirectCpu));
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
-    if (admitted || replaceShape) {
+    const bool memoize = cacheable && !drawParameters.indirect && memoPending != nullptr && std::any_of(memoPending->begin(), memoPending->end(), [](const std::shared_ptr<DrawStageRecord>& record) { return record != nullptr; });
+    if (admitted || replaceShape || memoize) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -228,6 +260,7 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
+            variant->push = stageCapture.push;
             variant->registeredViews = stageCapture.registeredViews;
             if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
                 std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
@@ -242,7 +275,8 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
             const bool relocatable = decodeReads[i].empty() && (!vertexInfos[i] || vertexInfos[i]->resourcesNum == 0);
-            tagVariantRuns(*variant, regions, stageCapture.userDataUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
+            const ShaderRecompiler::SrtUserDataUse emptyUse;
+            tagVariantRuns(*variant, regions, stageCapture.capture != nullptr ? stageCapture.capture->userDataUse : emptyUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
             if (relocatable) tagUserValueWords(*variant, programs[i]);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
@@ -267,17 +301,20 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 };
                 return (a.runs == b.runs && words == b.words) || flatten(a, words) == flatten(b, b.words);
             };
-            const auto sameForwardedWords = [](const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b, std::uint32_t hidden) {
-                if (a.pushConstants.size() != b.pushConstants.size() || a.shaderDataUserWords != b.shaderDataUserWords) return false;
-                for (std::size_t slot = 0; slot < a.shaderDataUserWords.size() && (slot + 1) * sizeof(std::uint32_t) <= a.pushConstants.size(); ++slot) {
-                    if (a.shaderDataUserWords[slot] >= hidden && std::memcmp(a.pushConstants.data() + slot * sizeof(std::uint32_t), b.pushConstants.data() + slot * sizeof(std::uint32_t), sizeof(std::uint32_t)) != 0) return false;
+            const auto sameForwardedWords = [](const ShaderRecompiler::RecompileResult& a, const std::vector<std::byte>* aPush, const ShaderRecompiler::RecompileResult& b, const std::vector<std::byte>* bPush, std::uint32_t hidden) {
+                const auto& aBytes = Graphics::PushBytes(a, aPush);
+                const auto& bBytes = Graphics::PushBytes(b, bPush);
+                if (aBytes.size() != bBytes.size() || a.shaderDataUserWords != b.shaderDataUserWords) return false;
+                for (std::size_t slot = 0; slot < a.shaderDataUserWords.size() && (slot + 1) * sizeof(std::uint32_t) <= aBytes.size(); ++slot) {
+                    if (a.shaderDataUserWords[slot] >= hidden && std::memcmp(aBytes.data() + slot * sizeof(std::uint32_t), bBytes.data() + slot * sizeof(std::uint32_t), sizeof(std::uint32_t)) != 0) return false;
                 }
                 return true;
             };
             if (verifyHit && matched[i] != nullptr) {
                 const auto& words = stageData[i].compiled != nullptr ? stageData[i].words : matched[i]->words;
                 const auto& compiled = stageData[i].compiled != nullptr ? *stageData[i].compiled : *matched[i]->compiled;
-                if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, *variant->compiled, programs[i].hiddenUserWords)) {
+                const auto* compiledPush = stageData[i].compiled != nullptr ? nullptr : matched[i]->push.get();
+                if (!sameContent(*matched[i], words, *variant) || !sameForwardedWords(compiled, compiledPush, *variant->compiled, variant->push.get(), programs[i].hiddenUserWords)) {
                     ++mismatches;
                     static std::atomic<std::uint64_t> reports{0};
                     if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), words.size(), variant->runs.size(), variant->words.size());
@@ -292,7 +329,9 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             fresh[i] = std::move(variant);
         }
-        insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0, replaceShape);
+        if (memoize) memoizeDrawStages(*memoPending, fresh, reused, stageCaptures);
+        if (admitted || replaceShape) insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0, replaceShape);
+        else std::fill(fresh.begin(), fresh.end(), nullptr);
         std::uint64_t dataInserts = 0, dataPositions = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (fresh[i] == nullptr || reused[i] || fresh[i]->dataPositions.empty()) continue;

@@ -212,7 +212,10 @@ void Driver::execute(const Submission& submission) {
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
                 if (suspendDrain) localDevice->WaitIdle();
-                else localDevice->SubmitRecorded(submission.queue == 0);
+                else {
+                    const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::Suspend);
+                    localDevice->SubmitRecorded(submission.queue == 0);
+                }
             }
             ++costs.suspends;
             if (profile) costs.suspendNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -452,7 +455,7 @@ void Driver::execute(const Submission& submission) {
                     abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count(), &abStep);
                 }
                 if (abStep.event != Graphics::AbSchedule::Event::None) {
-                    const auto window = DrawFinisher::AbWindow(abStep.event == Graphics::AbSchedule::Event::Begin, abStep.b ? 'B' : 'A', abStep.phase);
+                    const auto window = DrawFinisher::AbWindow(abStep.event == Graphics::AbSchedule::Event::Begin, Graphics::AbSchedule::Letter(abStep.arm), abStep.phase);
                     if (!window.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s", window.c_str());
                 }
                 for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
@@ -651,6 +654,7 @@ void Driver::execute(const Submission& submission) {
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
+        const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::SubmissionEnd);
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
     }
     flipHold.Finish();

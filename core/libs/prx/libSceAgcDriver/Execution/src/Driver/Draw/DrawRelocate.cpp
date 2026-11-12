@@ -64,6 +64,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
 void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& program) {
     if (!drawRelocationEnabled() || variant.compiled == nullptr) return;
     const auto& compiled = *variant.compiled;
+    const auto& pushBytes = Graphics::PushBytes(compiled, variant.push.get());
     const auto& forwarded = compiled.shaderDataUserWords;
     const auto users = std::min<std::size_t>(program.userData.size(), 64);
     const auto bound = [&](std::uint32_t value) {
@@ -72,9 +73,9 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
         return count;
     };
     const auto elsewhere = [&](std::uint32_t index, std::uint32_t value) {
-        for (std::size_t slot = 0; (slot + 1) * sizeof(std::uint32_t) <= compiled.pushConstants.size(); ++slot) {
+        for (std::size_t slot = 0; (slot + 1) * sizeof(std::uint32_t) <= pushBytes.size(); ++slot) {
             std::uint32_t word = 0;
-            std::memcpy(&word, compiled.pushConstants.data() + slot * sizeof(std::uint32_t), sizeof(word));
+            std::memcpy(&word, pushBytes.data() + slot * sizeof(std::uint32_t), sizeof(word));
             if (word == value && (slot >= forwarded.size() || forwarded[slot] != index)) return true;
         }
         if (std::any_of(compiled.specialization.begin(), compiled.specialization.end(), [&](const auto& constant) { return constant.value == value; })) return true;
@@ -321,6 +322,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
+            copy->push = variant->push;
             copy->meshIndexDescriptor = variant->meshIndexDescriptor;
             copy->shader = variant->shader;
             copy->dataPositions = variant->dataPositions;
@@ -355,19 +357,22 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
     if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
-    auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
+    auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(Graphics::CopyCompiled(*variant.compiled, variant.push.get()));
+    rebased->keyShape = nullptr;
     for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
         if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;
     }
     variant.compiled = std::move(rebased);
+    variant.push = nullptr;
     variant.shaderDataPatches.clear();
     variant.descriptorPatches.clear();
 }
 
 void Driver::patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value) {
     const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
-    if (at + sizeof(std::uint32_t) <= result.pushConstants.size()) std::memcpy(result.pushConstants.data() + at, &value, sizeof(value));
+    auto& push = Graphics::OwnPushBytes(result);
+    if (at + sizeof(std::uint32_t) <= push.size()) std::memcpy(push.data() + at, &value, sizeof(value));
     for (auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
     }

@@ -1,0 +1,10 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_stage_key_shape_verify COMMAND agc_driver_stage_key_shape_tests)
+    set_tests_properties(agc_driver_stage_key_shape_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_KEY_MEMO=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    add_test(NAME agc_driver_stage_key_shape_off COMMAND agc_driver_stage_key_shape_tests)
+    set_tests_properties(agc_driver_stage_key_shape_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_KEY_SHAPE=1" SKIP_RETURN_CODE 77 FAIL_REGULAR_EXPRESSION "FATAL:")
+    if(WIN32)
+        set_tests_properties(agc_driver_stage_key_shape_verify agc_driver_stage_key_shape_off PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -37,6 +38,9 @@ bool DispatchItemsEnabled() {
 enum class ItemFallback : std::size_t { Miss, Reads, NoRecipe, Writes, Verify, Count };
 constexpr std::array<const char*, static_cast<std::size_t>(ItemFallback::Count)> ItemFallbackNames{"miss", "reads", "no recipe", "writes", "verify"};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ItemFallback::Count)> itemFallbacks{};
+enum class NonCandidate : std::size_t { Ahead, Disabled, Indirect, Labels, CopyKernel, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(NonCandidate::Count)> NonCandidateNames{"resolved ahead", "items off", "indirect", "deferred labels", "copy kernel"};
+std::array<ProfileCounter, static_cast<std::size_t>(NonCandidate::Count)> nonCandidateDrains{};
 std::atomic<std::uint64_t> itemCommits{0};
 std::atomic<std::uint64_t> itemRebuilds{0};
 
@@ -56,7 +60,20 @@ void ReportDispatchItems(bool profile) {
         std::snprintf(item, sizeof(item), " %s %llu", ItemFallbackNames[i], static_cast<unsigned long long>(itemFallbacks[i].load(std::memory_order_relaxed)));
         drained += item;
     }
-    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str());
+    std::string excluded;
+    for (std::size_t i = 0; i < NonCandidateNames.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", NonCandidateNames[i], static_cast<unsigned long long>(nonCandidateDrains[i].Sum()));
+        excluded += item;
+    }
+    std::string refused;
+    const auto refusals = VulkanDevice::DispatchRecipeRefusals();
+    for (std::size_t i = 0; i < refusals.size(); ++i) {
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", VulkanDevice::DispatchRecipeRefusalName(static_cast<VulkanDevice::DispatchRecipeRefusal>(i)), static_cast<unsigned long long>(refusals[i]));
+        refused += item;
+    }
+    std::fprintf(stderr, "[dispatch-item] %llu commit items (%llu recipes rebuilt on the committer); drained instead, cumulative:%s; drained as no candidate, cumulative:%s; recipes refused, cumulative:%s\n", static_cast<unsigned long long>(itemCommits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(itemRebuilds.load(std::memory_order_relaxed)), drained.c_str(), excluded.c_str(), refused.c_str());
 }
 
 bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code) {
@@ -88,13 +105,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
+    userData.reserve(userCount);
     for (std::uint32_t i = 0; i < userCount; ++i) {
         userData.push_back(readUserData(queue.shader, 0x240 + i));
     }
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
-    std::vector<ShaderRecompiler::MemoryRegion> memory{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}};
-    if (!snapshot.header.empty()) memory.push_back({snapshot.headerAddress, snapshot.header});
+    const std::array<ShaderRecompiler::MemoryRegion, 2> memoryRegions{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
+    const auto memory = std::span(memoryRegions).first(snapshot.header.empty() ? 1u : 2u);
 
     static const bool unlockedDevice = std::getenv("APS5_NO_UNLOCKED_DEVICE") == nullptr;
     std::shared_ptr<VulkanDevice> localDevice = unlockedDevice ? device.Load() : nullptr;
@@ -157,7 +175,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            const auto reason = fromAhead ? NonCandidate::Ahead : !DispatchItemsEnabled() ? NonCandidate::Disabled : indirectArguments != 0 ? NonCandidate::Indirect : !deferredLabels().labels.empty() ? NonCandidate::Labels : NonCandidate::CopyKernel;
+            if (DrawPipeline::Queue0().Busy()) nonCandidateDrains[static_cast<std::size_t>(reason)].Add();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
@@ -196,7 +218,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};
     static std::atomic<std::uint64_t> dispatches{0};
-    auto lap = std::chrono::steady_clock::now();
+    auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     std::array<double, DriverPhaseCount> phaseMs{};
     auto phaseLap = lap;
@@ -470,6 +492,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseQueuedLabels);
     const auto& compiled = *compiledResult;
     std::vector<Graphics::GuestMemorySnapshot> snapshots;
+    snapshots.reserve(captured.size());
     for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
     std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
     if (indirectArguments == 0 && (packet[4] & 0x20u) != 0) {

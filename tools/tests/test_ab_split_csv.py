@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ab_split
 import ab_split_csv
-from test_ab_split import log
+from test_ab_split import log, multi_log
 
 
 class AbCsvTests(unittest.TestCase):
@@ -31,6 +31,15 @@ class AbCsvTests(unittest.TestCase):
         self.assertEqual(busy["noise_n"], "1")
         self.assertEqual(busy["noise_se"], "")
         self.assertEqual(busy["noise_sd"], "")
+
+    def test_multi_arm_rows_carry_the_arm_and_each_side_spread(self):
+        rows = list(csv.DictReader(io.StringIO(ab_split_csv.render(ab_split.split(multi_log())), newline="")))
+        self.assertEqual(list(rows[0]), list(ab_split_csv.ARM_COLUMNS))
+        busy = {row["arm"]: row for row in rows if row["metric"] == "GPU busy ms/frame"}
+        self.assertEqual(sorted(busy), ["B", "C", "D"])
+        self.assertEqual((busy["C"]["a_phases"], busy["C"]["b_phases"]), ("3", "2"))
+        self.assertEqual(float(busy["C"]["b"]), 92.0)
+        self.assertEqual(float(busy["C"]["a_sd"]), 4.0)
 
     def test_csv_round_trip_preserves_text_and_missing_noise(self):
         result = ab_split.split(log())

@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import subprocess
 import sys
@@ -61,7 +62,78 @@ def log():
     return [line + "\n" for line in lines]
 
 
+def multi_log(rounds=2, extra=None):
+    header = ("[ab] in-run A/B: phases of 30.0 s from present 100, settle 2.0 s; A: APS5_NO_BARRIER_BATCH set, APS5_NO_GUARD_SPANS unset; "
+              "B: APS5_NO_BARRIER_BATCH unset, APS5_NO_GUARD_SPANS unset; C: APS5_NO_BARRIER_BATCH set, APS5_NO_GUARD_SPANS set; "
+              "D: APS5_NO_BARRIER_BATCH unset, APS5_NO_GUARD_SPANS set")
+    busy = {"A": 100.0, "B": 120.0, "C": 90.0, "D": 140.0}
+    lines = ["[gpu] startup", header]
+    index = 0
+    for cycle in range(rounds):
+        for kind in "ABCD":
+            value = busy[kind] + cycle * 4.0 + (extra or {}).get((kind, cycle), 0.0)
+            lines += phase_lines(kind, index, 100 + index * 40, 10.0 + index * 30, value, 400.0, 40.0, 8.0, 200.0, 30.0)
+            index += 1
+    lines += phase_lines("A", index, 100 + index * 40, 10.0 + index * 30, busy["A"] + rounds * 4.0, 400.0, 40.0, 8.0, 200.0, 30.0)
+    return [line + "\n" for line in lines]
+
+
 class AbSplitTests(unittest.TestCase):
+    def test_every_arm_is_compared_with_phase_a(self):
+        result = ab_split.split(multi_log())
+        self.assertEqual(result["arms"], ["A", "B", "C", "D"])
+        self.assertEqual([phase["kind"] for phase in result["phases"]], list("ABCDABCDA"))
+        rows = {row["arm"]: row for row in result["metrics"] if row["metric"] == "GPU busy ms/frame"}
+        self.assertEqual(sorted(rows), ["B", "C", "D"])
+        self.assertAlmostEqual(rows["B"]["a"], 104.0)
+        for arm, base in (("B", 120.0), ("C", 90.0), ("D", 140.0)):
+            with self.subTest(arm=arm):
+                row = rows[arm]
+                self.assertAlmostEqual(row["b"], base + 2.0)
+                self.assertAlmostEqual(row["change"], base + 2.0 - 104.0)
+                self.assertEqual((row["a_phases"], row["b_phases"]), (3, 2))
+                self.assertAlmostEqual(row["a_sd"], 4.0)
+                self.assertAlmostEqual(row["b_sd"], math.sqrt(8.0))
+                self.assertEqual(row["noise"]["n"], 2)
+                self.assertAlmostEqual(row["noise"]["mean"], base - 102.0)
+                self.assertAlmostEqual(row["noise"]["sd"], 0.0)
+
+    def test_an_arm_is_measured_against_the_a_phases_that_bracket_its_cycle(self):
+        phases = [{"kind": kind, "index": index} for index, kind in enumerate("ABCDA")]
+        values = [100.0, 1.0, 2.0, 150.0, 110.0]
+        self.assertEqual(ab_split.noise(values, phases, "D", 4), {"mean": 45.0, "se": None, "sd": None, "n": 1})
+        self.assertEqual(ab_split.noise(values, phases, "B", 4)["mean"], 1.0 - 105.0)
+        partial = [phase for phase in phases if phase["index"] != 4]
+        self.assertEqual(ab_split.noise(values[:4], partial, "C", 4)["mean"], 2.0 - 100.0)
+
+    def test_one_phase_per_arm_has_no_spread(self):
+        result = ab_split.split(multi_log(rounds=1))
+        row = next(row for row in result["metrics"] if row["metric"] == "GPU busy ms/frame" and row["arm"] == "C")
+        self.assertEqual((row["a_phases"], row["b_phases"], row["b_sd"]), (2, 1, None))
+
+    def test_out_of_rotation_and_unknown_arms_are_refused(self):
+        lines = [line.replace("phase C 2 ", "phase B 2 ") for line in multi_log()]
+        with self.assertRaisesRegex(ValueError, "out of the arms' rotation"):
+            ab_split.split(lines)
+        lines = [line.replace("phase D 3 ", "phase E 3 ") for line in multi_log()]
+        with self.assertRaisesRegex(ValueError, "phase E is not an arm"):
+            ab_split.split(lines)
+        lines = [line.replace("; C: ", "; X: ") for line in multi_log()]
+        with self.assertRaisesRegex(ValueError, "does not list arms A, B, C"):
+            ab_split.split(lines)
+
+    def test_a_multi_arm_capture_without_its_header_infers_the_arms(self):
+        lines = [line for line in multi_log() if not line.startswith("[ab] in-run A/B:")]
+        self.assertEqual(ab_split.split(lines)["arms"], ["A", "B", "C", "D"])
+
+    def test_multi_arm_text_lists_each_arm_with_its_phase_count_and_spread(self):
+        text = ab_split.text_report(ab_split.split(multi_log()))
+        self.assertIn("arm vs bracketing A", text)
+        self.assertRegex(text, r"GPU busy ms/frame +D +104\.00 +3 +4\.00 +142\.00 +2 +2\.83 +\+38\.00 +\+36\.5% +\+38\.00 \+- 0\.00 \(SD 0\.00, n 2\)")
+        two = ab_split.text_report(ab_split.split(log()), True)
+        self.assertRegex(two, r"GPU busy ms/frame +B +105\.00 +2 +7\.07 +130\.00 +1 +- +\+25\.00")
+
+
     def test_noise_uses_only_consecutive_phase_indices(self):
         for indices, expected in (((0, 1, 2), 30.0), ((0, 3, 4), 20.0),
                                   ((0, 1, 4), 40.0), ((0, 3, 6), None),
@@ -185,6 +257,19 @@ class AbSplitTests(unittest.TestCase):
         row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0))
         self.assertEqual(row["classes"], {"staging-in": 8.0, "present-blit": 4.0})
         self.assertEqual(row["programs"], {"0x1000": 40.0, "0x2000": 5.0})
+
+    def test_inert_draw_share_is_read_as_a_class_of_its_own(self):
+        entry = (" draw x6 3.0ms 0.0MiB (per present x0.2 0.08ms 0.00MiB) draw-inert x4 1.5ms 0.0MiB "
+                 "(per present x0.1 0.04ms 0.00MiB; of x8 draws x5 inert fragment, x3 without the stage)")
+        row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0) + entry)
+        self.assertEqual(row["classes"], {"staging-in": 8.0, "present-blit": 4.0, "draw": 3.0, "draw-inert": 1.5})
+
+    def test_pass_break_reasons_of_the_inert_draw_share_add_no_classes(self):
+        entry = (" draw x6 3.0ms 0.0MiB (per present x0.2 0.08ms 0.00MiB) draw-inert x4 1.5ms 0.0MiB "
+                 "(per present x0.1 0.04ms 0.00MiB; of x8 draws x5 inert fragment, x3 without the stage; "
+                 "ended by new batch x3 1.0ms, read after write x1 0.5ms)")
+        row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0) + entry)
+        self.assertEqual(row["classes"], {"staging-in": 8.0, "present-blit": 4.0, "draw": 3.0, "draw-inert": 1.5})
 
     def test_draw_variants_are_not_summed_into_program_keys(self):
         row = ab_split.parse_report("gputime", gputime(400.0, 40.0, 8.0).replace("0x2000 x4 5ms", "0x2000 x4 5ms draw 0x3000 x3 30ms"))

@@ -160,7 +160,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         else preRasterization.push_back(stage);
         mesh |= stage.stage == VK_SHADER_STAGE_MESH_BIT_EXT;
     }
-    Require(fragment != nullptr && !preRasterization.empty(), "a pipeline built from libraries needs a fragment and a pre-rasterization stage");
+    Require(!preRasterization.empty(), "a pipeline built from libraries needs a pre-rasterization stage");
     constexpr std::array<VkGraphicsPipelineLibraryFlagsEXT, 4> flags{
         VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT,
         VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
@@ -213,7 +213,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.pTessellationState = info.pTessellationState;
             break;
         case VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT:
-            create.stageCount = 1;
+            create.stageCount = fragment != nullptr ? 1u : 0u;
             create.pStages = fragment;
             create.pMultisampleState = info.pMultisampleState;
             create.pDepthStencilState = info.pDepthStencilState != nullptr ? info.pDepthStencilState : &dynamicDepth;

@@ -1,3 +1,6 @@
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -6,13 +9,43 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
+
+namespace {
+
+thread_local int failAllocationIn = -1;
+std::atomic<std::uint64_t> injectedFailures{0};
+
+}
+
+void* operator new(std::size_t bytes) {
+    if (failAllocationIn >= 0 && failAllocationIn-- == 0) {
+        injectedFailures.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes != 0 ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* memory) noexcept {
+    std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept {
+    std::free(memory);
+}
 
 namespace {
 
@@ -223,19 +256,273 @@ void SharedOwnerCountsOncePerBatch() {
     auto shared = std::make_shared<int>(0);
     for (int keep = 0; keep < 3; ++keep) {
         recorder.Keep(shared);
-        recorder.KeepBytes(shared.get(), Budget / 2);
+        recorder.Retain(shared.get(), Budget / 2);
         recorder.BoundKeptBytes();
     }
     Expect(recorder.Recording() && recorder.OpenKeptBytes() == Budget / 2 && mock.submits == 0, "three keeps of one owner's half budget counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not half the budget once");
     auto other = std::make_shared<int>(1);
     recorder.Keep(other);
-    recorder.KeepBytes(other.get(), Budget / 2);
+    recorder.Retain(other.get(), Budget / 2);
     recorder.BoundKeptBytes();
     Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightKeptBytes() == Budget, "a second owner's half budget did not complete the batch's budget");
     recorder.Keep(shared);
-    recorder.KeepBytes(shared.get(), Budget / 2);
+    recorder.Retain(shared.get(), Budget / 2);
     Expect(recorder.OpenKeptBytes() == Budget / 2, "the next batch did not count an owner the submitted batch counted");
     recorder.Sync();
+}
+
+using Kind = Recorder::ReadKind;
+
+struct NotedRead {
+    std::uint64_t begin;
+    std::uint64_t end;
+    Kind kind;
+    std::shared_ptr<const Recorder::ReadList> list;
+};
+
+std::optional<Kind> FirstNotedReader(const std::vector<NotedRead>& notes, std::uint64_t address, std::uint64_t end, std::optional<Kind> only = std::nullopt) {
+    for (const auto& note : notes) {
+        if (only.has_value() && note.kind != *only) continue;
+        if (note.list == nullptr) {
+            if (address < note.end && note.begin < end) return note.kind;
+            continue;
+        }
+        for (const auto& [begin, finish] : *note.list) {
+            if (address < finish && begin < end) return note.kind;
+        }
+    }
+    return std::nullopt;
+}
+
+struct ReadSequence {
+    std::uint32_t state = 0x2545f491u;
+    std::uint32_t Next() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8u;
+    }
+};
+
+void RepeatedReadsAnswerLikeEveryNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000100000ull;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 6> ranges{{{0x000, 0x100}, {0x080, 0x200}, {0x000, 0x100}, {0x300, 0x340}, {0x100, 0x180}, {0x1c0, 0x400}}};
+    const std::array<Kind, 3> kinds{Kind::DispatchElement, Kind::AddressBased, Kind::CopySource};
+    ReadSequence random;
+    std::vector<NotedRead> notes;
+    std::vector<std::shared_ptr<const Recorder::ReadList>> lists;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, Kind>> seen;
+    std::uint64_t expectedRepeats = 0;
+    const auto remember = [&](std::uint64_t begin, std::uint64_t end, Kind kind) {
+        notes.push_back({begin, end, kind, nullptr});
+        if (std::find(seen.begin(), seen.end(), std::make_tuple(begin, end, kind)) != seen.end()) ++expectedRepeats;
+        else seen.emplace_back(begin, end, kind);
+    };
+    const auto pick = [&] {
+        const auto& range = ranges[random.Next() % ranges.size()];
+        return std::make_tuple(base + range.first, base + range.second, kinds[random.Next() % kinds.size()]);
+    };
+    const auto before = Recorder::ReadCounts();
+    std::uint64_t notedCalls = 0;
+    for (int operation = 0; operation < 600; ++operation) {
+        const auto choice = random.Next() % 10;
+        if (choice < 7) {
+            const auto [begin, end, kind] = pick();
+            recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), kind);
+            remember(begin, end, kind);
+            ++notedCalls;
+        } else if (choice < 9) {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> span;
+            const auto count = 1 + random.Next() % 3;
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto [begin, end, ignored] = pick();
+                static_cast<void>(ignored);
+                span.emplace_back(begin, end);
+            }
+            span.emplace_back(base + 0x500, base + 0x500);
+            recorder.NotePendingReads(span, kind);
+            for (const auto& [begin, end] : span) {
+                if (end > begin) remember(begin, end, kind);
+            }
+            notedCalls += span.size();
+        } else {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            std::shared_ptr<const Recorder::ReadList> list;
+            if (!lists.empty() && random.Next() % 2 == 0) {
+                list = lists[random.Next() % lists.size()];
+            } else {
+                const auto start = base + 0x40 * (random.Next() % 16);
+                list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{start, start + 0x20}, {start + 0x400, start + 0x440}});
+                lists.push_back(list);
+            }
+            recorder.NotePendingReadList(list, kind);
+            const bool listed = std::any_of(notes.begin(), notes.end(), [&](const NotedRead& note) { return note.list == list && note.kind == kind; });
+            if (!listed) notes.push_back({0, 0, kind, list});
+            notedCalls += 2;
+        }
+    }
+    const auto after = Recorder::ReadCounts();
+    Expect(after.noted - before.noted == notedCalls, "the noted counter counted " + std::to_string(after.noted - before.noted) + " ranges, not every one of the " + std::to_string(notedCalls) + " noted");
+    const auto repeats = Recorder::FlipReadCheck() ? 0 : expectedRepeats;
+    Expect(after.repeated - before.repeated == repeats, "the batch skipped " + std::to_string(after.repeated - before.repeated) + " repeated reads, not the " + std::to_string(repeats) + " (range, kind) repeats it was given");
+    std::size_t mismatches = 0;
+    for (std::uint64_t offset = 0; offset < 0x900; offset += 0x10) {
+        for (const std::uint64_t bytes : {1ull, 0x20ull, 0x90ull, 0x300ull}) {
+            const auto address = base + offset;
+            const auto expected = FirstNotedReader(notes, address, address + bytes);
+            const auto described = recorder.DescribePendingRead(address, static_cast<std::size_t>(bytes));
+            const bool leased = FirstNotedReader(notes, address, address + bytes, Kind::AddressBased).has_value();
+            if (recorder.PendingReadOverlaps(address, static_cast<std::size_t>(bytes)) != expected.has_value()) ++mismatches;
+            if (described.has_value() != expected.has_value() || (described.has_value() && (described->kind != *expected || !described->open))) ++mismatches;
+            if (recorder.PendingLeaseSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+            if (recorder.PendingWriterSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+        }
+    }
+    Expect(mismatches == 0, std::to_string(mismatches) + " read queries answered differently from the reader every noted read names");
+    recorder.Submit();
+    const auto submitted = recorder.Submissions();
+    const auto repeatedBefore = Recorder::ReadCounts().repeated;
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    Expect(Recorder::ReadCounts().repeated == repeatedBefore, "a range the submitted batch noted was skipped as a repeat in the next batch");
+    const auto next = recorder.DescribePendingRead(base, 4);
+    Expect(next.has_value() && next->open && next->kind == Kind::CopySource && next->serial == submitted + 1, "the next batch does not report the read it noted again");
+    recorder.NotePendingRead(base, 0x100, Kind::AddressBased);
+    Expect(recorder.PendingLeaseSerial(base, 4) == recorder.OpenSerial(), "the next batch dropped a range noted again with another reader kind");
+    Expect(!lists.empty(), "the read sequence noted no list: the list checks prove nothing");
+    if (!lists.empty()) {
+        const auto& list = lists.front();
+        recorder.NotePendingReadList(list, Kind::DispatchElement);
+        const auto listed = recorder.DescribePendingRead(list->back().first, 4);
+        Expect(listed.has_value() && listed->open && listed->kind == Kind::DispatchElement && listed->serial == submitted + 1, "the next batch does not report a list the submitted batch had noted");
+    }
+    recorder.Sync();
+    Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
+}
+
+void ReadSurvivesFailedNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000200000ull;
+    for (std::uint64_t index = 0; index < 8; ++index) recorder.NotePendingRead(base + index * 0x100, 0x10, Kind::CopySource);
+    const auto injected = injectedFailures.load(std::memory_order_relaxed);
+    bool threw = false;
+    failAllocationIn = 0;
+    try {
+        recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    failAllocationIn = -1;
+    if (injectedFailures.load(std::memory_order_relaxed) == injected) {
+        std::printf("allocation failure not injected into the driver: the failed read note check is skipped\n");
+        recorder.Sync();
+        return;
+    }
+    Expect(threw, "the injected allocation failure did not reach the read note");
+    recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    Expect(recorder.PendingReadOverlaps(base + 0x800, 4), "a read whose first note failed to allocate was lost when noted again");
+    recorder.Sync();
+}
+
+void RetainedBytesCountEachOwnerOncePerBatch() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    std::vector<std::shared_ptr<int>> owners;
+    for (int i = 0; i < 300; ++i) owners.push_back(std::make_shared<int>(i));
+    const auto before = Recorder::RetainedByteRepeats();
+    std::size_t expected = 0;
+    for (int round = 0; round < 3; ++round) {
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            recorder.Retain(owners[i].get(), 16 * (i + 1) + static_cast<std::size_t>(round));
+            if (round == 0) expected += 16 * (i + 1);
+            if (i % 5 == 0) recorder.Retain(owners[i / 2].get(), 1);
+        }
+    }
+    Expect(recorder.OpenKeptBytes() == expected, "300 owners retained three times counted " + std::to_string(recorder.OpenKeptBytes()) + " kept bytes, not each owner's first bytes once (" + std::to_string(expected) + ")");
+    Expect(Recorder::RetainedByteRepeats() - before == 2 * owners.size() + 3 * 60, "the repeat counter counted " + std::to_string(Recorder::RetainedByteRepeats() - before) + " repeated owners");
+    int zero = 0;
+    recorder.Retain(&zero, 0);
+    recorder.Retain(nullptr, 64);
+    Expect(recorder.OpenKeptBytes() == expected, "an owner without bytes or a null owner was counted");
+    recorder.Retain(&zero, 7);
+    Expect(recorder.OpenKeptBytes() == expected + 7, "an owner first retained without bytes was not counted when it brought bytes");
+    recorder.Submit();
+    Expect(recorder.InFlightKeptBytes() == expected + 7, "submission changed the batch's kept bytes");
+    recorder.Retain(owners[0].get(), 5);
+    recorder.Retain(owners[0].get(), 5);
+    Expect(recorder.OpenKeptBytes() == 5, "the next batch counted " + std::to_string(recorder.OpenKeptBytes()) + " bytes for an owner the submitted batch had counted");
+    mock.endResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    mock.endResult = VK_SUCCESS;
+    Expect(failed && !recorder.Recording(), "the injected end failure did not discard the batch");
+    recorder.Retain(owners[0].get(), 9);
+    Expect(recorder.OpenKeptBytes() == 9, "the batch replacing a failed one did not count an owner the failed batch had counted");
+    recorder.Sync();
+}
+
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+    }
+    return condition();
+}
+
+void RetentionGrowsWithoutDuplicates() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    std::vector<std::shared_ptr<int>> owners;
+    for (int i = 0; i < 100; ++i) owners.push_back(std::make_shared<int>(i));
+    for (int round = 0; round < 2; ++round) {
+        for (std::size_t i = 0; i < owners.size(); ++i) {
+            recorder.Retain(owners[i]);
+            if (i % 3 == 0) recorder.Keep(std::make_shared<int>(0));
+            if (i % 7 == 0) recorder.Retain(owners[i / 2]);
+        }
+    }
+    for (std::size_t i = 0; i < owners.size(); ++i) Expect(owners[i].use_count() == 2, "owner " + std::to_string(i) + " was retained " + std::to_string(owners[i].use_count() - 1) + " times after the lookup grew");
+    recorder.Submit();
+    for (auto& owner : owners) Expect(owner.use_count() == 2, "submission changed an owner's retention");
+    recorder.Sync();
+    recorder.FlushDeferredReleases();
+    Expect(EventuallyTrue([&] { return std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner.use_count() == 1; }); }), "completion did not release a retained owner");
+}
+
+void RetentionAfterFailedSubmission() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    auto owner = std::make_shared<int>(1);
+    recorder.Retain(owner);
+    mock.endResult = VK_ERROR_OUT_OF_HOST_MEMORY;
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::exception&) {
+        failed = true;
+    }
+    mock.endResult = VK_SUCCESS;
+    Expect(failed && owner.use_count() == 1, "a failed batch kept its retained owner");
+    recorder.Retain(owner);
+    Expect(owner.use_count() == 2, "the replacement batch did not retain a live owner the failed batch had retained");
+    recorder.Retain(owner);
+    Expect(owner.use_count() == 2, "the replacement batch retained an owner twice");
+    recorder.Submit();
+    Expect(!recorder.Reap() && owner.use_count() == 2, "the replacement batch released its owner before its fence");
+    for (auto& [fence, signaled] : mock.signaled) signaled = true;
+    Expect(recorder.Reap(), "the replacement batch was not retired after its fence");
+    recorder.FlushDeferredReleases();
+    Expect(EventuallyTrue([&] { return owner.use_count() == 1; }), "the replacement batch kept its owner after its fence");
 }
 
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
@@ -259,7 +546,9 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
             delete object;
         });
         std::weak_ptr<int> released = kept;
-        recorder.Keep(std::move(kept), Budget);
+        recorder.Retain(kept);
+        recorder.Retain(kept.get(), Budget);
+        kept.reset();
         recorder.NoteLabel(address + 8, std::span<const std::byte>(memory).first(4), 2, 0);
         recorder.NoteLabel(address + 16, std::span<const std::byte>(memory).first(Recorder::LabelTableBytes + 4), 3, 0);
         recorder.AfterCompletions(address + 96, std::span<const std::byte>(memory).first(4), 4, 0, false);
@@ -302,13 +591,56 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
 
 }
 
-int main() {
+int AssertsWithOpenBatch() {
+    mock = MockDevice{};
+    Recorder recorder(mockContext());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::make_shared<int>(0));
+    }
+    std::signal(SIGABRT, [](int) { std::_Exit(0); });
+    recorder.NotePendingRead(0x10000, 16, Recorder::ReadKind::CopySource);
+    std::fprintf(stderr, "FAIL: a read noted without the GPU mutex into an open batch did not assert under APS5_ASSERT_GPU_LOCK\n");
+    std::_Exit(1);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--assert-open-batch") return AssertsWithOpenBatch();
     try {
+        {
+            mock = MockDevice{};
+            Recorder recorder(mockContext());
+            auto object = std::make_shared<int>(7);
+            std::weak_ptr<int> weak = object;
+            bool refused = false;
+            try { recorder.ReserveRetention(std::numeric_limits<std::size_t>::max()); }
+            catch (const std::length_error&) { refused = true; }
+            Expect(refused && object.use_count() == 1, "a failed retention reservation changed ownership");
+            recorder.ReserveRetention(4);
+            recorder.Retain(object);
+            for (int i = 0; i < 100; ++i) recorder.Retain(object);
+            Expect(object.use_count() == 2, "retention copied an owner more than once per batch");
+            auto other = std::shared_ptr<int>(object.get(), [](int*) {});
+            recorder.Retain(other);
+            Expect(other.use_count() == 2, "retention merged distinct owners at the same address");
+            recorder.Submit();
+            recorder.Retain(object);
+            Expect(object.use_count() == 3, "retention omitted the next batch's owner");
+            object.reset();
+            Expect(!weak.expired(), "retention released an unfinished owner");
+            recorder.Sync();
+            Expect(weak.expired() && other.use_count() == 1, "retention outlived batch completion");
+        }
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        RetentionGrowsWithoutDuplicates();
+        RepeatedReadsAnswerLikeEveryNote();
+        RetainedBytesCountEachOwnerOncePerBatch();
+        ReadSurvivesFailedNote();
+        RetentionAfterFailedSubmission();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);

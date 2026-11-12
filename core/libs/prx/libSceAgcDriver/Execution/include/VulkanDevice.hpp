@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ComputePipelineCapture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
@@ -357,6 +358,9 @@ public:
     enum class RecipeKind : std::size_t { Dispatch, Indirect, Draw };
     static void NoteRecipe(RecipeEvent event, bool indirect);
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
+    enum class DispatchRecipeRefusal : std::size_t { NotCacheable, Overlay, NotReusable, NeedsCompletion, NoObjects, NoKey, Count };
+    static std::array<std::uint64_t, static_cast<std::size_t>(DispatchRecipeRefusal::Count)> DispatchRecipeRefusals();
+    static const char* DispatchRecipeRefusalName(DispatchRecipeRefusal refusal);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
     using DrawTraceContext = Graphics::DrawTraceContext;
@@ -365,12 +369,15 @@ public:
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
     bool DrawInputsInPlace() const;
+    std::shared_ptr<Graphics::PreparedDrawInputs> PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::uint64_t epoch = 0) const;
+    std::shared_ptr<Graphics::PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<Graphics::PreparedDrawInputs> job, const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t epoch = 0) const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
     RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr);
+    Graphics::DrawRecipeOutcome DrawFromPlan(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const DrawRecipe& plan, const DrawTraceContext* trace = nullptr);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.
     struct IndirectDrawSupport {

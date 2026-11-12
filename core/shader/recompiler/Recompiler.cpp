@@ -1623,6 +1623,25 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
 };
 
+struct MaskedPatchCounters {
+    std::atomic<std::uint64_t> empty{0}, pushOnly{0}, data{0}, buffers{0}, srt{0}, shared{0};
+};
+
+MaskedPatchCounters& maskedPatchCounters() {
+    static MaskedPatchCounters counters;
+    return counters;
+}
+
+void countMaskedPatch(const MemoPatch& patch) {
+    const auto kinds = ClassifyMaskedPatch(patch.buffers.size(), patch.userWords.size(), patch.pushData, patch.flattenedSrt != MemoPatch::NoBinding);
+    auto& counters = maskedPatchCounters();
+    if (kinds.empty) counters.empty.fetch_add(1, std::memory_order_relaxed);
+    if (kinds.pushOnly) counters.pushOnly.fetch_add(1, std::memory_order_relaxed);
+    if (kinds.data) counters.data.fetch_add(1, std::memory_order_relaxed);
+    if (kinds.buffers) counters.buffers.fetch_add(1, std::memory_order_relaxed);
+    if (kinds.srt) counters.srt.fetch_add(1, std::memory_order_relaxed);
+}
+
 void applyMemoPatch(RecompileResult& result, const MemoPatch& patch, const ResourceSnapshot& snapshot) {
     for (const auto& [binding, resources] : patch.buffers) {
         auto& words = result.bindings.at(binding).guestDescriptor;
@@ -1817,7 +1836,44 @@ void reportResultMemo() {
     const auto mismatches = counters.mismatches.exchange(0, std::memory_order_relaxed);
     const auto total = static_cast<double>(hits + patched + misses);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
+    auto& kinds = maskedPatchCounters();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto empty = take(kinds.empty);
+    const auto pushOnly = take(kinds.pushOnly);
+    const auto data = take(kinds.data);
+    const auto buffers = take(kinds.buffers);
+    const auto srt = take(kinds.srt);
+    const auto shared = take(kinds.shared);
+    std::fprintf(stderr, "[recompile] masked patches (10 s): push-only %llu, data %llu, buffers %llu, srt %llu, nothing patched %llu (a patch rewriting several kinds counts under each); push-only served by sharing the donor with per-draw push bytes %llu\n", pushOnly, data, buffers, srt, empty, shared);
 }
+
+}
+
+std::atomic<std::uint64_t>& sharedPushDonorStages() {
+    static std::atomic<std::uint64_t> stages{0};
+    return stages;
+}
+
+std::uint64_t SharedPushDonorStages() {
+    return sharedPushDonorStages().load(std::memory_order_relaxed);
+}
+
+bool VerifyIdentityMemo() {
+    static const bool verify = std::getenv("APS5_VERIFY_KEY_MEMO") != nullptr;
+    return verify;
+}
+
+MaskedPatchKinds ClassifyMaskedPatch(std::size_t bufferBindings, std::size_t userWords, bool pushData, bool flattenedSrt) {
+    MaskedPatchKinds kinds;
+    kinds.buffers = bufferBindings != 0;
+    kinds.data = userWords != 0 && !pushData;
+    kinds.srt = flattenedSrt;
+    kinds.pushOnly = userWords != 0 && pushData && !kinds.buffers && !kinds.srt;
+    kinds.empty = userWords == 0 && !kinds.buffers && !kinds.srt;
+    return kinds;
+}
+
+namespace {
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the
 // flattened SRT, the user data, the uniform fill) and, for the vertex family, the V# table the
@@ -1965,7 +2021,16 @@ std::uint64_t snapshotHash(const RecompileRequest& request, const ResourceSnapsh
 // The memo'd result of `source`'s variant for the snapshot (design13 R5): a hit returns the shared
 // object, a miss materializes outside the source mutex and inserts (a concurrent miss's object is
 // as good). `memoHit` reports the hit.
-std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit) {
+bool sharesDonor(const RecompileResult& donor, const MemoPatch& patch, const ResourceSnapshot& snapshot) {
+    return ClassifyMaskedPatch(patch.buffers.size(), patch.userWords.size(), patch.pushData, patch.flattenedSrt != MemoPatch::NoBinding).pushOnly && patch.userWords.size() * sizeof(std::uint32_t) <= donor.pushConstants.size() && donor.poisonedSrtReads == static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
+}
+
+void sharedPushBytes(const RecompileResult& donor, const MemoPatch& patch, const ResourceSnapshot& snapshot, std::vector<std::byte>& push) {
+    push = donor.pushConstants;
+    for (std::size_t word = 0; word < patch.userWords.size(); ++word) std::memcpy(push.data() + word * sizeof(std::uint32_t), &snapshot.userData.at(patch.userWords[word]), sizeof(std::uint32_t));
+}
+
+std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& source, const std::shared_ptr<const CompiledVariant>& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool cacheHit, bool* memoHit, std::vector<std::byte>* sharedPush) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto variantId = variant->artifact.variantId;
     const auto substitutes = bufferSubstitutesEnabled() && variant->substitutes != nullptr ? variant->substitutes->Slots() : std::vector<BufferSubstitute>{};
@@ -2007,19 +2072,48 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_ptr<RecompileResult> result;
     std::shared_ptr<MemoPatch> patch;
+    if (donor != nullptr && sharedPush != nullptr && sharesDonor(*donor, *donorPatch, snapshot)) {
+        sharedPushBytes(*donor, *donorPatch, snapshot, *sharedPush);
+        sharedPushDonorStages().fetch_add(1, std::memory_order_relaxed);
+        if (profile) {
+            countMaskedPatch(*donorPatch);
+            maskedPatchCounters().shared.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (VerifyMaskedResultMemo()) {
+            auto served = *donor;
+            served.pushConstants = *sharedPush;
+            served.cacheHit = cacheHit;
+            verifyPatchedResult(served, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
+        }
+        if (profile) counters.patchNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+        counters.patched.fetch_add(1, std::memory_order_relaxed);
+        reportResultMemo();
+        return donor;
+    }
     if (donor != nullptr) {
         result = std::make_shared<RecompileResult>(*donor);
         applyMemoPatch(*result, *donorPatch, snapshot);
+        if (profile) countMaskedPatch(*donorPatch);
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
         if (profile) counters.patchNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.patched.fetch_add(1, std::memory_order_relaxed);
     } else {
         if (masking) patch = std::make_shared<MemoPatch>();
         result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, patch.get(), &substitutes));
+        if (patch != nullptr && patch->valid) {
+            auto shape = std::make_shared<ResultKeyShape>();
+            for (const auto& [binding, resources] : patch->buffers) shape->patchedBindings.push_back(binding);
+            if (!patch->userWords.empty() && !patch->pushData) shape->patchedBindings.push_back(patch->shaderData);
+            if (patch->flattenedSrt != MemoPatch::NoBinding) shape->patchedBindings.push_back(patch->flattenedSrt);
+            std::sort(shape->patchedBindings.begin(), shape->patchedBindings.end());
+            shape->patchedBindings.erase(std::unique(shape->patchedBindings.begin(), shape->patchedBindings.end()), shape->patchedBindings.end());
+            result->keyShape = std::move(shape);
+        }
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
     result->cacheHit = cacheHit;
+    result->SealIdentity();
     std::shared_ptr<const RecompileResult> shared = std::move(result);
     if (donor != nullptr) {
         reportResultMemo();
@@ -2073,7 +2167,7 @@ std::shared_ptr<const RecompileResult> materializeMemoized(SourceEntry& source, 
         std::lock_guard lock(source.mutex);
         variant = findOrCompileVariant(source, request, cacheHit);
     }
-    return materializePreparedMemoized(source, variant, request, snapshot, cacheHit, memoHit);
+    return materializePreparedMemoized(source, variant, request, snapshot, cacheHit, memoHit, nullptr);
 }
 
 // The capture already resolved the source entry (stage input validation included) and materialized
@@ -2226,24 +2320,47 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 }
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key) {
-    if (handle == nullptr || !MatchesPreparedShader(request, *handle, key)) return std::nullopt;
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    if (handle == nullptr || !Admits(request, *handle, key)) return std::nullopt;
     return PreparedShaderInvocation(request, handle);
 }
 
+bool PreparedShaderInvocation::Admits(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key) {
+    if (!MatchesPreparedShader(request, handle, key)) return false;
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    return true;
+}
+
+PreparedShaderInvocation PreparedShaderInvocation::Adopt(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle) {
+    return PreparedShaderInvocation(std::move(request), std::move(handle));
+}
+
+PreparedShaderInvocation PreparedShaderInvocation::AdoptValidated(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle) {
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    return PreparedShaderInvocation(std::move(request), std::move(handle));
+}
+
+PreparedShaderInvocation::PreparedShaderInvocation(RecompileRequest&& request, std::shared_ptr<const SourceHandle>&& handle) : request(std::move(request)), handle(std::move(handle)) {
+    this->request.context.linkedCallFallbacks = this->handle->source->linkedCallFallbacks;
+}
+
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto capture = std::make_shared<ResourceCapture>();
     capture->source = handle->source;
     capture->plan = acquirePlan(request, handle->source, true, handle.get());
+    if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
     materializeCapture(*capture, runtime);
     return capture;
 }
 
-std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
+std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture, std::vector<std::byte>* sharedPush) const {
     if (capture.source != handle->source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
-    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr);
+    if (sharedPush != nullptr) sharedPush->clear();
+    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle->source, handle->artifact, request, capture.snapshot, true, nullptr, sharedPush);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle->artifact, request, capture.snapshot));
     result->cacheHit = true;
+    result->SealIdentity();
     return result;
 }
 
@@ -2269,9 +2386,10 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
     if (!MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
     if (capture.source != handle.source) throw std::runtime_error("ShaderRecompiler: resource capture belongs to another prepared shader");
-    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr);
+    if (request.useCache && ResultMemo()) return materializePreparedMemoized(*handle.source, handle.artifact, request, capture.snapshot, true, nullptr, nullptr);
     auto result = std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, capture.snapshot));
     result->cacheHit = true;
+    result->SealIdentity();
     return result;
 }
 

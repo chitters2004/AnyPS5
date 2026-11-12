@@ -12,13 +12,43 @@ namespace AgcDriver::Graphics {
 
 enum class RuntimeSwitch : std::size_t {
     NoBarrierBatch,
+    NoBarrierFusion,
+    NoWriteBackRuns,
+    NoGuardSetProof,
     NoGuardSpans,
     NoOwnedDrawInputs,
+    HandwrittenPlanState,
+    NoResidentRanges,
+    NoEarlyDrawInputs,
+    NoEmptyFetchSkip,
+    NoSharedVertexLayout,
+    CertifiedProofs,
+    NoCertifiedProofScope,
+    SharePushDonor,
+    NoBarRing,
     NoTargetMemo,
     FollowOlderEpochTokens,
     UploadRefreshProof,
     RefreshExitEpochStamp,
     NoDepthRepeatFind,
+    PartialDrains,
+    PlanAttachments,
+    NoResidentTargets,
+    NoDrawInputRecycling,
+    NoEarlyUploadPrepare,
+    NoEarlyRegionCopies,
+    NoDrawInputRing,
+    NoRecordedCpuUpload,
+    KeepEmptyFragmentSet,
+    NoResidentLinear,
+    NoStagingPrediction,
+    OneStageRequest,
+    StageHandleHints,
+    NoCoveredCommits,
+    NoWriteOwners,
+    WholePendingBumps,
+    NoCertifiedDrawInputs,
+    WriteTickets,
     SingleRingPreparer,
     Count,
 };
@@ -39,15 +69,19 @@ public:
         double settleSeconds = 2;
         std::uint64_t startPresent = 0;
         std::optional<double> startSeconds;
-        std::vector<RuntimeSwitch> switches;
+        std::vector<std::vector<RuntimeSwitch>> arms;
+        std::vector<RuntimeSwitch> Toggled() const;
     };
+
+    static constexpr std::size_t MaxArms = 25;
+    static char Letter(std::size_t arm) { return static_cast<char>('A' + arm); }
 
     enum class Event { None, Begin, Settled };
 
     struct Step {
         Event event = Event::None;
         std::uint64_t phase = 0;
-        bool b = false;
+        std::size_t arm = 0;
     };
 
     static Config Parse(std::string_view ab, std::string_view start, std::string_view settle);

@@ -7,8 +7,10 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -316,10 +318,710 @@ void CheckCoverageThreadAndDriverWrites() {
     Require(Walked(Base + Block, 2 * Block, Base + Block + Page, false), "an uncached collection reused an observation");
 }
 
+
+std::shared_ptr<WriteSubscription> Subscribe(std::uint64_t address, std::uint64_t blocks, std::uint32_t mask = WriteChangeAll, bool history = true) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{address, address + blocks * Block}}};
+    return SubscribeWrites(ranges, mask, history);
+}
+
+void Pending(std::uint64_t address) {
+    NoteGpuPending(address, 4);
+}
+
+void CheckObserveAndArm() {
+    const auto subscription = Subscribe(Base, 3);
+    const auto seen = ObserveSubscription(*subscription);
+    Require((seen & 1u) != 0 && ObserveSubscription(*subscription) == seen, "an observe without a bump changed the version");
+    Pending(Base);
+    const auto moved = ObserveSubscription(*subscription);
+    Require(moved != seen, "a bump after an observe did not move the version the reader holds");
+    Pending(Base);
+    Require(ObserveSubscription(*subscription) != moved, "a bump after the next observe did not move the version again");
+    const auto before = ObserveSubscription(*subscription);
+    const auto since = SubscriptionGeneration(*subscription);
+    Pending(Base + Block);
+    Pending(Base + 2 * Block);
+    const auto after = ObserveSubscription(*subscription);
+    Require(after == before + 2, "two bumps without a read in between moved the version " + std::to_string((after - before) / 2) + " times instead of once");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(Base + Block), WriteBlockOf(Base + 2 * Block)} && lookup.empty(), "the history did not list both blocks bumped without a read in between");
+}
+
+void CheckHistoryOutlivesTheArmedBit() {
+    const auto subscription = Subscribe(Base, 3);
+    const auto since = SubscriptionGeneration(*subscription);
+    NoteTextureReleased(Base);
+    Pending(Base + Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup), "the history reported an overflow after two bumps");
+    Require(lookup == std::vector<std::uint64_t>{WriteBlockOf(Base)}, "the history lost the bump that moved the version");
+    Require(plain == std::vector<std::uint64_t>{WriteBlockOf(Base + Block)}, "the history lost a bump made while the queried bit was clear");
+}
+
+void CheckTypeMask() {
+    const auto subscription = Subscribe(Base, 2, WriteChangeBit(WriteChange::Identity));
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*subscription);
+    Pending(Base);
+    Require(ObserveSubscription(*subscription) == seen, "a bump of a type outside the mask moved the version");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(Base)}, "a bump of a type outside the mask was left out of the history");
+    NoteTextureReleased(Base + Block);
+    Require(ObserveSubscription(*subscription) != seen, "a bump of a type inside the mask did not move the version");
+}
+
+void CheckReusedSlot() {
+    {
+        const auto first = Subscribe(Base, 2);
+        Pending(Base);
+    }
+    const auto second = Subscribe(Base + 8 * Block, 2);
+    const auto since = SubscriptionGeneration(*second);
+    const auto seen = ObserveSubscription(*second);
+    Pending(Base);
+    NoteTextureReleased(Base + Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(ObserveSubscription(*second) == seen && SubscriptionBumpsSince(*second, since, plain, lookup) && plain.empty() && lookup.empty(), "a bump of a released subscription's range reached the subscription that replaced it");
+    Pending(Base + 8 * Block);
+    Require(ObserveSubscription(*second) != seen, "a bump over a subscription's own range did not reach it");
+}
+
+constexpr std::uint64_t AliasA = std::uint64_t{1} << 36;
+constexpr std::uint64_t AliasB = AliasA + 64 * Block;
+
+bool ResolveAlias(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset) {
+    for (const auto base : {AliasA, AliasB}) {
+        if (address >= base && address + bytes <= base + 8 * Block) {
+            *file = 5;
+            *offset = address - base;
+            return true;
+        }
+    }
+    return false;
+}
+
+std::atomic<int> backingProbes{0};
+
+bool CountAliasProbe(std::uint64_t address, std::uint64_t bytes, int* file, std::uint64_t* offset) {
+    ++backingProbes;
+    return ResolveAlias(address, bytes, file, offset);
+}
+
+void CheckBackingProbesAreBounded() {
+    struct Scope {
+        Scope() { SetWriteBackingResolver(&CountAliasProbe); }
+        ~Scope() { SetWriteBackingResolver(nullptr); }
+    } scope;
+    const auto plain = Subscribe(Base + 40 * Block, 2);
+    backingProbes = 0;
+    NoteGpuPending(Base, 120 * Block);
+    Require(backingProbes.load() == 0, "a bump looked for backing keys while no subscription had any");
+    {
+        const auto backed = Subscribe(AliasA, 2);
+        backingProbes = 0;
+        NoteGpuPending(Base, 120 * Block);
+        Require(backingProbes.load() == 1, "a bump over a large unbacked range probed its backing more than once");
+        backingProbes = 0;
+        NoteGpuPending(Base, 8 * Block);
+        Require(backingProbes.load() <= 9, "a bump over a small unbacked range probed below 64 KiB blocks");
+    }
+    backingProbes = 0;
+    NoteGpuPending(Base, 8 * Block);
+    Require(backingProbes.load() == 0, "a released backed subscription left backing discovery on");
+}
+
+void CheckBackingKeys() {
+    struct Scope {
+        Scope() { SetWriteBackingResolver(&ResolveAlias); }
+        ~Scope() { SetWriteBackingResolver(nullptr); }
+    } scope;
+    const auto subscription = Subscribe(AliasA, 4);
+    const auto bystander = Subscribe(AliasA + 16 * Block, 2);
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*bystander);
+    Pending(AliasB + 2 * Block);
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(SubscriptionBumpsSince(*subscription, since, plain, lookup) && plain == std::vector<std::uint64_t>{WriteBlockOf(AliasA + 2 * Block)}, "a bump through an alias did not reach a subscription registered through the other view");
+    Require(ObserveSubscription(*bystander) == seen, "a bump through an alias reached a subscription over other memory");
+    const auto reverse = SubscriptionGeneration(*subscription);
+    const auto other = Subscribe(AliasB + 2 * Block, 2);
+    const auto otherSince = SubscriptionGeneration(*other);
+    NoteTextureReleased(AliasA + 3 * Block);
+    Require(SubscriptionBumpsSince(*other, otherSince, plain, lookup) && lookup == std::vector<std::uint64_t>{WriteBlockOf(AliasB + 3 * Block)} && plain.empty(), "a bump through the first view did not reach a subscription registered through the alias");
+    Require(SubscriptionBumpsSince(*subscription, reverse, plain, lookup) && plain.empty() && lookup == std::vector<std::uint64_t>{WriteBlockOf(AliasA + 3 * Block)}, "a bump through the first view did not reach its own subscription");
+}
+
+void CheckDomains() {
+    const auto subscription = Subscribe(Base, 2);
+    constexpr std::uint32_t all = WriteDomainBit(WriteDomain::Proof) | WriteDomainBit(WriteDomain::Unwatch) | WriteDomainBit(WriteDomain::Mapping);
+    auto certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a certificate did not hold with nothing changed");
+    BreakProofs();
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after BreakProofs");
+    Require(CertificateHolds(*subscription, certificate, all & ~WriteDomainBit(WriteDomain::Proof)), "a certificate that does not depend on the proof domain failed on it");
+    certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a fresh certificate did not hold");
+    Unwatch(Base + 64 * Block, Block);
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after an Unwatch");
+    certificate = CertifySubscription(*subscription, all);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 96 * Block), static_cast<std::size_t>(Block));
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after an allocation invalidation");
+    certificate = CertifySubscription(*subscription, all);
+    Require(CertificateHolds(*subscription, certificate, all), "a fresh certificate did not hold after the domains settled");
+    Pending(Base);
+    Require(!CertificateHolds(*subscription, certificate, all), "a certificate held after a bump of its range");
+}
+
+void CheckCrowdedKey() {
+    std::vector<std::shared_ptr<WriteSubscription>> crowd;
+    std::vector<std::uint64_t> seen;
+    for (int i = 0; i < 7; ++i) {
+        crowd.push_back(Subscribe(Base + 20 * Block, 1));
+        seen.push_back(ObserveSubscription(*crowd.back()));
+    }
+    Pending(Base + 20 * Block);
+    for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription sharing its block with six others missed a bump");
+    crowd.erase(crowd.begin(), crowd.begin() + 4);
+    seen.erase(seen.begin(), seen.begin() + 4);
+    for (int i = 0; i < 3; ++i) {
+        crowd.push_back(Subscribe(Base + 20 * Block, 1));
+        seen.push_back(ObserveSubscription(*crowd.back()));
+    }
+    for (std::size_t i = 0; i < crowd.size(); ++i) seen[i] = ObserveSubscription(*crowd[i]);
+    Pending(Base + 20 * Block);
+    for (std::size_t i = 0; i < crowd.size(); ++i) Require(ObserveSubscription(*crowd[i]) != seen[i], "a subscription missed a bump after its neighbours were released and replaced");
+}
+
+void CheckWithoutHistory() {
+    const auto subscription = Subscribe(Base + 80 * Block, 2, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 80 * Block, 2, WriteChangeBit(WriteChange::Identity), false);
+    const auto since = SubscriptionGeneration(*subscription);
+    const auto seen = ObserveSubscription(*subscription);
+    const auto maskedSeen = ObserveSubscription(*masked);
+    Pending(Base + 81 * Block);
+    Require(ObserveSubscription(*subscription) != seen, "a bump did not move a subscription without history");
+    Require(ObserveSubscription(*masked) == maskedSeen, "a bump outside the mask moved a subscription without history");
+    std::vector<std::uint64_t> plain;
+    std::vector<std::uint64_t> lookup;
+    Require(!SubscriptionBumpsSince(*subscription, since, plain, lookup), "a subscription without history listed its bumps, so a narrowing reader would trust an empty list");
+    const auto calls = WriteIndexCounted().bumps;
+    {
+        const auto released = Subscribe(Base + 84 * Block, 1, WriteChangeAll, false);
+    }
+    const auto replacement = Subscribe(Base + 86 * Block, 1, WriteChangeAll, false);
+    const auto replacementSeen = ObserveSubscription(*replacement);
+    Pending(Base + 84 * Block);
+    Require(ObserveSubscription(*replacement) == replacementSeen && WriteIndexCounted().bumps == calls + 0, "a bump of a released subscription's range reached the subscription without history that replaced its slot");
+}
+
+void CheckProducerBumps() {
+    const auto mirrors = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Mirror));
+    const auto guest = Subscribe(Base + 40 * Block, 2);
+    const auto bytes = Subscribe(Base + 40 * Block, 2, WriteChangeBit(WriteChange::Bytes));
+    const auto mirrorSeen = ObserveSubscription(*mirrors);
+    const auto bytesSeen = ObserveSubscription(*bytes);
+    const auto guestSeen = ObserveSubscription(*guest);
+    BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Mirror);
+    BumpWrites(Base + 50 * Block, Block, WriteBumpSource::Depth);
+    Require(ObserveSubscription(*mirrors) == mirrorSeen && ObserveSubscription(*bytes) == bytesSeen, "a producer bump of a disjoint range moved a subscription");
+    BumpWrites(Base + 41 * Block, 4, WriteBumpSource::Depth);
+    Require(ObserveSubscription(*mirrors) == mirrorSeen, "a depth bump moved a subscription to mirror changes only");
+    Require(ObserveSubscription(*bytes) != bytesSeen, "a depth bump of the range did not move a subscription to byte changes");
+    const auto guestAfterDepth = ObserveSubscription(*guest);
+    Require(guestAfterDepth != guestSeen, "a depth bump of the range did not move a subscription to every guest change");
+    BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Mirror);
+    Require(ObserveSubscription(*mirrors) != mirrorSeen, "a mirror bump of the range did not move a subscription to mirror changes");
+    Require(ObserveSubscription(*guest) == guestAfterDepth, "a mirror bump moved a subscription to guest memory changes");
+    bool refused = false;
+    try {
+        BumpWrites(Base + 40 * Block, 4, WriteBumpSource::Driver);
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    Require(refused, "BumpWrites accepted a source the index owns");
+}
+
+void CheckProducerDomains() {
+    const auto subscription = Subscribe(Base + 60 * Block, 1);
+    constexpr std::uint32_t mask = WriteDomainBit(WriteDomain::Depth) | WriteDomainBit(WriteDomain::Mirror);
+    auto certificate = CertifySubscription(*subscription, mask);
+    BumpDomainVersion(WriteDomain::Depth);
+    Require(!CertificateHolds(*subscription, certificate, mask), "a certificate held after its depth domain moved");
+    Require(CertificateHolds(*subscription, certificate, WriteDomainBit(WriteDomain::Mirror)), "a depth domain bump broke a certificate on the mirror domain only");
+    certificate = CertifySubscription(*subscription, mask);
+    BumpDomainVersion(WriteDomain::Mirror);
+    Require(!CertificateHolds(*subscription, certificate, mask), "a certificate held after its mirror domain moved");
+    for (const auto domain : {WriteDomain::Proof, WriteDomain::Unwatch, WriteDomain::Mapping, WriteDomain::CertifiedProof}) {
+        bool refused = false;
+        try {
+            BumpDomainVersion(domain);
+        } catch (const std::runtime_error&) {
+            refused = true;
+        }
+        Require(refused, "BumpDomainVersion accepted a domain the index owns");
+    }
+}
+
+std::vector<WriteDomain> domainReads;
+
+void RecordDomainRead(WriteDomain domain) {
+    domainReads.push_back(domain);
+}
+
+bool MirrorReadAfterMappingMoved() {
+    const auto subscription = Subscribe(Base + 70 * Block, 1);
+    constexpr std::uint32_t mask = WriteDomainBit(WriteDomain::Mapping) | WriteDomainBit(WriteDomain::Mirror);
+    const auto certificate = CertifySubscription(*subscription, mask);
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(Base + 98 * Block), static_cast<std::size_t>(Block));
+    domainReads.clear();
+    SetDomainReadObserverForTest(RecordDomainRead);
+    const bool held = CertificateHolds(*subscription, certificate, mask);
+    SetDomainReadObserverForTest(nullptr);
+    Require(!held, "a certificate held after a mapping change");
+    return std::find(domainReads.begin(), domainReads.end(), WriteDomain::Mirror) != domainReads.end();
+}
+
+void CheckDomainOrder() {
+    Require(!MirrorReadAfterMappingMoved(), "CertificateHolds read the mirror domain after the mapping domain had failed");
+    SetCertificateMutantForTest(CertificateMutant::ReverseDomainOrder);
+    const bool mutantRead = MirrorReadAfterMappingMoved();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(mutantRead, "the reversed domain order mutant survived");
+}
+
+bool OwnerBumpVoids() {
+    const auto owner = RegisterWriteOwner(Base + 100 * Block, 4 * Block);
+    const auto subscription = Subscribe(Base + 101 * Block, 1, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(CertificateHolds(*subscription, certificate, 0), "a certificate on an owner did not hold with nothing changed");
+    Pending(Base + 103 * Block);
+    const bool voided = !CertificateHolds(*subscription, certificate, 0);
+    UnregisterWriteOwner(owner);
+    return voided;
+}
+
+bool ManyOwnersVoid() {
+    std::vector<WriteOwner> owners;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (std::uint64_t i = 0; i < CertificateInlineOwners + 1; ++i) {
+        const auto base = Base + (160 + 2 * i) * Block;
+        owners.emplace_back(base, Block);
+        ranges.emplace_back(base, base + 64);
+    }
+    const auto subscription = SubscribeWrites(ranges, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(certificate.ownerCount == CertificateInlineOwners + 1 && CertificateHolds(*subscription, certificate, 0), "a certificate over more owners than it holds inline did not hold with nothing changed");
+    Pending(ranges.back().first);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+void CheckOwners() {
+    const auto dependenciesBefore = WriteIndexCounted().ownerDependencies;
+    const auto first = RegisterWriteOwner(Base + 100 * Block, 4 * Block);
+    const auto second = RegisterWriteOwner(Base + 110 * Block, 2 * Block);
+    const auto inside = Subscribe(Base + 101 * Block, 1, WriteChangeAll, false);
+    const auto other = Subscribe(Base + 110 * Block, 1, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 101 * Block, 1, WriteChangeBit(WriteChange::Identity), false);
+    Require(WriteIndexCounted().ownerDependencies == dependenciesBefore + 3, "subscriptions inside owners did not take owner dependencies");
+    auto certificate = CertifySubscription(*inside, 0);
+    const auto otherCertificate = CertifySubscription(*other, 0);
+    const auto maskedCertificate = CertifySubscription(*masked, 0);
+    Pending(Base + 104 * Block + 16);
+    Require(CertificateHolds(*inside, certificate, 0), "a bump beside an owner voided a certificate inside it");
+    const auto fastBefore = WriteIndexCounted().ownerFastBumps;
+    Pending(Base + 103 * Block);
+    Require(WriteIndexCounted().ownerFastBumps == fastBefore + 1, "a bump inside an owner with no handle subscribers took the block walk");
+    Require(!CertificateHolds(*inside, certificate, 0), "a bump inside an owner left a certificate on that owner standing");
+    Require(CertificateHolds(*other, otherCertificate, 0), "a bump inside one owner voided a certificate on another");
+    Require(CertificateHolds(*masked, maskedCertificate, 0), "a bump outside the type mask voided a certificate on its owner");
+    {
+        const auto straddling = Subscribe(Base + 99 * Block, 2, WriteChangeAll, false);
+        const auto seen = ObserveSubscription(*straddling);
+        const auto fast = WriteIndexCounted().ownerFastBumps;
+        Pending(Base + 100 * Block + 8);
+        Require(ObserveSubscription(*straddling) != seen, "a bump inside an owner missed a subscription that straddles the owner's start");
+        Require(WriteIndexCounted().ownerFastBumps == fast, "a bump inside an owner with a straddling subscriber took the fast path");
+    }
+    const auto fast = WriteIndexCounted().ownerFastBumps;
+    Pending(Base + 102 * Block);
+    Require(WriteIndexCounted().ownerFastBumps == fast + 1, "the owner kept counting a straddling subscriber after it was released");
+    const auto early = Subscribe(Base + 120 * Block, 1, WriteChangeAll, false);
+    const auto third = RegisterWriteOwner(Base + 120 * Block, 2 * Block);
+    const auto earlySeen = ObserveSubscription(*early);
+    Pending(Base + 120 * Block + 16);
+    Require(ObserveSubscription(*early) != earlySeen, "a bump inside an owner registered after a subscription missed that subscription");
+    certificate = CertifySubscription(*inside, 0);
+    NoteGpuPending(Base + 104 * Block - 8, 16);
+    Require(!CertificateHolds(*inside, certificate, 0), "a bump across an owner's end left a certificate on that owner standing");
+    certificate = CertifySubscription(*inside, 0);
+    UnregisterWriteOwner(first);
+    Require(!CertificateHolds(*inside, certificate, 0), "a certificate on an owner held after the owner was unregistered");
+    UnregisterWriteOwner(second);
+    UnregisterWriteOwner(third);
+    Require(OwnerBumpVoids(), "a bump inside an owner left its certificate standing");
+    Require(ManyOwnersVoid(), "a bump inside the fifth owner of a subscription left its certificate standing");
+    for (const auto mutant : {CertificateMutant::IgnoreOwners, CertificateMutant::HideOwnerBumps, CertificateMutant::CertificateDropsOwners}) {
+        SetCertificateMutantForTest(mutant);
+        const bool caught = OwnerBumpVoids();
+        SetCertificateMutantForTest(CertificateMutant::None);
+        Require(!caught, "the owner test does not catch an owner mutant");
+    }
+}
+
+bool ThrowsOnRegister(std::uint64_t base, std::uint64_t bytes) {
+    try {
+        UnregisterWriteOwner(RegisterWriteOwner(base, bytes));
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
+}
+
+bool ObservationWithOwnerHolds() {
+    const WriteOwner owner(Base + 80 * Block, 2 * Block);
+    try {
+        CheckWithoutHistory();
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
+void CheckOwnerObservation() {
+    Require(ObservationWithOwnerHolds(), "the observation contract failed for subscriptions inside an owner");
+    SetCertificateMutantForTest(CertificateMutant::ObserveIgnoresOwners);
+    const bool mutantHolds = ObservationWithOwnerHolds();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(!mutantHolds, "the observation contract test does not catch an observation that ignores owners");
+    auto owner = std::make_unique<WriteOwner>(Base + 130 * Block, 2 * Block);
+    const auto subscription = Subscribe(Base + 130 * Block, 1, WriteChangeAll, false);
+    const auto seen = ObserveSubscription(*subscription);
+    Require(ObserveSubscription(*subscription) == seen, "observing an owner-backed subscription twice with nothing written moved it");
+    Pending(Base + 131 * Block);
+    const auto bumped = ObserveSubscription(*subscription);
+    Require(bumped != seen && ObserveSubscription(*subscription) == bumped, "an observe, bump, observe sequence on an owner-backed subscription did not move exactly once");
+    owner.reset();
+    const auto dead = ObserveSubscription(*subscription);
+    Require(dead != bumped && ObserveSubscription(*subscription) != dead, "an owner-backed subscription read as unchanged after its owner was unregistered");
+    Require(ThrowsOnRegister(~std::uint64_t{0} - Block, 2 * Block), "a write owner range that wraps around the address space was registered");
+    Require(!ThrowsOnRegister(Base + 140 * Block, Block), "a plain write owner range was refused");
+}
+
+bool BlockBumpVoids() {
+    const auto subscription = Subscribe(Base + 200 * Block, 1, WriteChangeAll, false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(CertificateHolds(*subscription, certificate, 0), "a certificate on block counters did not hold with nothing changed");
+    Pending(Base + 200 * Block + 128);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+bool LateOwnerSeesCountedSubscription() {
+    const auto subscription = Subscribe(Base + 210 * Block, 1, WriteChangeAll, false);
+    const WriteOwner owner(Base + 210 * Block, 2 * Block);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    NoteGpuPending(Base + 210 * Block, 2 * Block);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+bool HandleBumpVoids() {
+    const auto subscription = Subscribe(Base + 230 * Block, 1);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    Require(!certificate.handles || CertificateHolds(*subscription, certificate, 0), "a certificate on handles did not hold with nothing changed");
+    Pending(Base + 230 * Block + 64);
+    return !CertificateHolds(*subscription, certificate, 0);
+}
+
+void CheckBlockCounters() {
+    const auto subscription = Subscribe(Base + 202 * Block, 1, WriteChangeAll, false);
+    const auto masked = Subscribe(Base + 202 * Block, 1, WriteChangeBit(WriteChange::Identity), false);
+    const auto certificate = CertifySubscription(*subscription, 0);
+    const auto maskedCertificate = CertifySubscription(*masked, 0);
+    const auto seen = ObserveSubscription(*subscription);
+    Pending(Base + 203 * Block);
+    Require(CertificateHolds(*subscription, certificate, 0) && ObserveSubscription(*subscription) == seen, "a bump of the next block moved a subscription on block counters");
+    const auto notified = WriteIndexCounted().bumps;
+    Pending(Base + 202 * Block + 4096);
+    Require(WriteIndexCounted().bumps == notified, "a bump notified a handle of a subscription on block counters");
+    Require(!CertificateHolds(*subscription, certificate, 0) && ObserveSubscription(*subscription) != seen, "a bump inside a subscription's block left it standing on block counters");
+    Require(CertificateHolds(*masked, maskedCertificate, 0), "a bump outside the type mask voided a certificate on block counters");
+    const auto wide = Subscribe(Base + 220 * Block, CertificateInlineOwners + 1, WriteChangeAll, false);
+    const auto wideCertificate = CertifySubscription(*wide, 0);
+    Require(wideCertificate.blockCount == CertificateInlineOwners + 1 && CertificateHolds(*wide, wideCertificate, 0), "a certificate over more blocks than it holds inline did not hold with nothing changed");
+    Pending(Base + (220 + CertificateInlineOwners) * Block);
+    Require(!CertificateHolds(*wide, wideCertificate, 0), "a bump in the last block of a wide subscription left its certificate standing");
+    Require(BlockBumpVoids(), "a bump inside a block left its certificate standing");
+    Require(!certificate.handles && HandleBumpVoids(), "a certificate on block counters read its version, or one on handles missed a bump");
+    SetCertificateMutantForTest(CertificateMutant::CertificateSkipsVersion);
+    const bool skipped = HandleBumpVoids();
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(!skipped, "the handle test does not catch a certificate that skips its version");
+    Require(LateOwnerSeesCountedSubscription(), "an owner registered after a subscription on block counters took the fast path past it");
+    for (const auto mutant : {CertificateMutant::HideBlockBumps, CertificateMutant::CertificateDropsBlocks}) {
+        SetCertificateMutantForTest(mutant);
+        const bool caught = BlockBumpVoids();
+        SetCertificateMutantForTest(CertificateMutant::None);
+        Require(!caught, "the block counter test does not catch a block counter mutant");
+    }
+}
+
+void CheckCountingOff() {
+    const auto subscription = Subscribe(Base + 150 * Block, 1, WriteChangeAll, false);
+    SetWriteIndexCountingForTest(false);
+    const auto before = WriteIndexCounted();
+    Pending(Base + 150 * Block);
+    const auto after = WriteIndexCounted();
+    SetWriteIndexCountingForTest(true);
+    Require(after.calls == before.calls && after.bumps == before.bumps && after.lookups == before.lookups, "a bump updated the shared write index counters with counting off");
+}
+
+void CheckWriteIndex() {
+    SetWriteIndexCountingForTest(true);
+    CheckObserveAndArm();
+    CheckHistoryOutlivesTheArmedBit();
+    CheckTypeMask();
+    CheckReusedSlot();
+    CheckCrowdedKey();
+    CheckBackingKeys();
+    CheckBackingProbesAreBounded();
+    CheckDomains();
+    CheckWithoutHistory();
+    CheckProducerBumps();
+    CheckProducerDomains();
+    CheckDomainOrder();
+    CheckOwners();
+    CheckOwnerObservation();
+    CheckBlockCounters();
+    CheckCountingOff();
+}
+}
+
+bool HasSource(std::uint64_t address, std::size_t bytes, ExclusionSource source) {
+    return (UnwatchedSources(address, bytes) & (std::uint32_t{1} << static_cast<unsigned>(source))) != 0;
+}
+
+bool ExplicitUnwatchNamed(std::uint64_t address) {
+    Unwatch(address, Page);
+    return HasSource(address, Page, ExclusionSource::Explicit);
+}
+
+void CheckExclusionSources() {
+    const auto explicitAt = Base + 40 * Page;
+    Require(ExplicitUnwatchNamed(explicitAt), "an explicit unwatch was not attributed");
+    Require(!HasSource(explicitAt + Page, Page, ExclusionSource::Explicit), "a page next to an explicit unwatch was attributed");
+    const auto importAt = Base + 48 * Page;
+    Require(ImportWatched(importAt, 2 * Page, [] { return true; }, false), "the compared import failed");
+    Require(HasSource(importAt, 2 * Page, ExclusionSource::ComparedImport) && !HasSource(importAt, 2 * Page, ExclusionSource::Explicit), "a compared import was not attributed as one");
+    Require(ExplicitUnwatchNamed(importAt) && !HasSource(importAt, Page, ExclusionSource::ComparedImport) && HasSource(importAt + Page, Page, ExclusionSource::ComparedImport), "a later exclusion did not replace the source of its own pages only");
+#ifndef _WIN32
+    const auto walkAt = Base + 56 * Page;
+    {
+        const std::lock_guard lock(Fake().mutex);
+        Fake().failWalks = true;
+    }
+    const bool imported = ImportWatched(walkAt, Page, [] { return true; }, true);
+    {
+        const std::lock_guard lock(Fake().mutex);
+        Fake().failWalks = false;
+    }
+    Require(imported && HasSource(walkAt, Page, ExclusionSource::ImportWalk), "an import whose walk failed was not attributed to the walk");
+#endif
+    SetCertificateMutantForTest(CertificateMutant::DropExclusionSources);
+    const bool caught = !ExplicitUnwatchNamed(Base + 60 * Page);
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(caught, "dropping exclusion sources still attributed the unwatch, so the case tests nothing");
+    std::vector<std::byte> expected(Page);
+    std::memcpy(expected.data(), reinterpret_cast<const void*>(Base), Page);
+    const auto firstLine = static_cast<std::uint32_t>(__LINE__ + 1);
+    Require(EqualsCommitted(Base, expected), "the first compared site differs");
+    const auto secondLine = static_cast<std::uint32_t>(__LINE__ + 1);
+    Require(EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)) && EqualsCommittedUnsynced(Base, std::span<const std::byte>(expected).first(Page / 2)), "the second compared site differs");
+    ReportMemoryProfileNextForTest();
+    Require(EqualsCommitted(Base, std::span<const std::byte>(expected).first(16)), "the reporting compare differs");
+    Require(CompareSiteBytesForTest(firstLine) == Page && CompareSiteBytesForTest(secondLine) == Page, "compared bytes were not attributed to their call sites");
+}
+
+using TicketRange = std::pair<std::uint64_t, std::uint64_t>;
+
+bool HeldAfter(std::uint64_t address, const std::function<void()>& producer) {
+    const std::array<TicketRange, 1> ranges{{{address, address + Page}}};
+    const auto ticket = ObserveTicket();
+    producer();
+    return UnchangedSince(ranges, ticket);
+}
+
+std::uint64_t Refused(TicketRefusal refusal) {
+    return WriteTicketsCounted().refused[static_cast<std::size_t>(refusal)];
+}
+
+void CheckTicketProducer(const char* name, WriteBumpSource source, std::uint64_t address, const std::function<void()>& producer) {
+    Require(!HeldAfter(address, producer), std::string("a ticket held over a ") + name + " write");
+    DropTicketStampsForTest(source);
+    const bool caught = HeldAfter(address, producer);
+    DropTicketStampsForTest(std::nullopt);
+    Require(caught, std::string("dropping the ") + name + " stamps still refused the ticket, so the case tests nothing");
+}
+
+std::array<TicketRange, 1> hookRanges{};
+WriteTicket hookTicket{};
+bool hookHeld = false;
+
+void JudgeDuringStamp() {
+    SetTicketStampHookForTest(nullptr);
+    hookHeld = UnchangedSince(hookRanges, hookTicket);
+}
+
+bool HeldDuringStamp(std::uint64_t address) {
+    hookRanges = {{{address, address + Page}}};
+    hookTicket = ObserveTicket();
+    hookHeld = false;
+    SetTicketStampHookForTest(&JudgeDuringStamp);
+    ForceWriteBumpForTest(address, Page, WriteBumpSource::Pending);
+    SetTicketStampHookForTest(nullptr);
+    return hookHeld;
+}
+
+void CheckWriteTickets() {
+    const auto at = Base + 70 * Block;
+    const std::array<TicketRange, 1> range{{{at, at + Page}}};
+    Require(!UnchangedSince(range, WriteTicket{}), "an empty ticket held");
+    Require(HeldAfter(at, [] {}), "a ticket over an untouched range did not hold");
+    Require(HeldAfter(at, [&] { ForceWriteBumpForTest(at + 4 * Block, Page, WriteBumpSource::Pending); }), "a bump of a disjoint block refused the ticket");
+    CheckTicketProducer("guest CPU (uncollected)", WriteBumpSource::Cpu, at, [&] { Store(at); });
+    SetCertificateMutantForTest(CertificateMutant::SkipTicketCollect);
+    const bool uncollectedCaught = HeldAfter(at, [&] { Store(at); });
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(uncollectedCaught, "skipping the collect still refused an uncollected store, so the case tests nothing");
+    Require(!UnchangedSince(range, ObserveTicket()) && UnchangedSince(range, ObserveTicket()), "a store observed before the ticket but collected after it did not refuse once and then hold");
+    CheckTicketProducer("driver", WriteBumpSource::Driver, at, [&] { MarkWritten(at, 4); });
+    CheckTicketProducer("recorded pending", WriteBumpSource::Pending, at, [&] { NoteRecordedPending(at, 4); });
+    CheckTicketProducer("texture pending", WriteBumpSource::Pending, at, [&] { NoteGpuPending(at, 4); });
+    CheckTicketProducer("mirror", WriteBumpSource::Mirror, at, [&] { BumpWrites(at, 4, WriteBumpSource::Mirror); });
+    CheckTicketProducer("depth", WriteBumpSource::Depth, at, [&] { BumpWrites(at, 4, WriteBumpSource::Depth); });
+    for (const auto source : {WriteBumpSource::Forget, WriteBumpSource::Release, WriteBumpSource::Import}) {
+        CheckTicketProducer("forced", source, at, [&] { ForceWriteBumpForTest(at, 4, source); });
+    }
+    const auto wide = Refused(TicketRefusal::Stamped);
+    Require(!HeldAfter(at, [&] { ForceWriteBumpForTest(Base, std::uint64_t{1} << 40, WriteBumpSource::Pending); }) && Refused(TicketRefusal::Stamped) == wide + 1, "a ticket held over a bump wider than the stamp table");
+    const auto unwatchedAt = Base + 80 * Block;
+#ifdef _WIN32
+    const auto unwatched = Refused(TicketRefusal::Unwatched);
+    DropTicketStampsForTest(WriteBumpSource::Unwatch);
+    const bool unwatchHeld = HeldAfter(unwatchedAt, [&] { Unwatch(unwatchedAt, Page); });
+    DropTicketStampsForTest(std::nullopt);
+    Require(!unwatchHeld && Refused(TicketRefusal::Unwatched) == unwatched + 1, "a ticket held over a range that stopped being watched");
+#else
+    CheckTicketProducer("unwatch", WriteBumpSource::Unwatch, unwatchedAt, [&] { Unwatch(unwatchedAt, Page); });
+#endif
+    const auto inFlight = Refused(TicketRefusal::InFlight);
+    Require(!HeldDuringStamp(at) && Refused(TicketRefusal::InFlight) == inFlight + 1, "a ticket held while a bump of its range was stamping");
+    SetCertificateMutantForTest(CertificateMutant::IgnoreTicketsInFlight);
+    const bool inFlightCaught = HeldDuringStamp(at);
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(inFlightCaught, "ignoring stamps in flight still refused the ticket, so the case tests nothing");
+}
+
+void BenchWriteTickets() {
+    constexpr int Calls = 20000;
+    std::array<TicketRange, 16> ranges{};
+    for (std::size_t index = 0; index < ranges.size(); ++index) ranges[index] = {Base + index * 3 * Block + 256, Base + index * 3 * Block + 256 + 2048};
+    double observeBest = std::numeric_limits<double>::max();
+    double checkBest = std::numeric_limits<double>::max();
+    std::uint64_t sink = 0;
+    bool held = true;
+    for (int round = 0; round < 3; ++round) {
+        auto start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) sink += ObserveTicket().sequence;
+        observeBest = std::min(observeBest, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+        const auto ticket = ObserveTicket();
+        start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) {
+            if (call % 32 == 0) BumpCollectEpoch();
+            held = UnchangedSince(ranges, ticket) && held;
+        }
+        checkBest = std::min(checkBest, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+    }
+    Require(held && sink != 0, "bench: the untouched ranges did not hold");
+    std::cout << "bench ObserveTicket, best of 3 x 20000: " << observeBest << " ns per call (wall clock)\n";
+    std::cout << "bench UnchangedSince over 16 held 2 KiB ranges, a collect epoch every 32 calls, best of 3 x 20000: " << checkBest << " ns per call (wall clock)\n";
+    for (const bool stamped : {false, true}) {
+        DropTicketStampsForTest(stamped ? std::nullopt : std::optional<WriteBumpSource>{WriteBumpSource::Pending});
+        double best = std::numeric_limits<double>::max();
+        for (int round = 0; round < 3; ++round) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int call = 0; call < Calls; ++call) NoteGpuPending(Base + static_cast<std::uint64_t>(call % 64) * Block, 4096);
+            best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+        }
+        std::cout << "bench NoteGpuPending of 4 KiB with no live subscription, ticket stamps " << (stamped ? "on" : "off (before)") << ", best of 3 x 20000: " << best << " ns per call (wall clock)\n";
+    }
+    DropTicketStampsForTest(std::nullopt);
+}
+
+void BenchCompare(const char* arm) {
+    constexpr int Calls = 20000;
+    std::vector<std::byte> expected(Page);
+    std::memcpy(expected.data(), reinterpret_cast<const void*>(Base), Page);
+    double best = std::numeric_limits<double>::max();
+    bool same = true;
+    for (int round = 0; round < 3; ++round) {
+        const auto start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) same = EqualsCommittedUnsynced(Base, expected) && same;
+        best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+    }
+    Require(same, "bench: the compared page differs");
+    std::cout << "bench EqualsCommittedUnsynced of an equal 4 KiB page, " << arm << ", best of 3 x 20000: " << best << " ns per call (wall clock)\n";
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--compare-bench") {
+#ifdef _WIN32
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            BenchCompare("not profiled");
+            return 0;
+        }
+        if (argc == 2 && (std::string(argv[1]) == "--tickets" || std::string(argv[1]) == "--ticket-bench")) {
+#ifdef _WIN32
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            if (std::string(argv[1]) == "--tickets") {
+                CheckWriteTickets();
+                std::cout << "write ticket test passed\n";
+            } else BenchWriteTickets();
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "--sources") {
+#ifdef _WIN32
+            _putenv_s("APS5_PROFILE_DRAW", "1");
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            setenv("APS5_PROFILE_DRAW", "1", 1);
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            CheckExclusionSources();
+            BenchCompare("compare sites counted (APS5_PROFILE_DRAW)");
+            std::cout << "exclusion source test passed\n";
+            return 0;
+        }
+        const bool writeIndexOnly = argc == 2 && std::string(argv[1]) == "--write-index";
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
@@ -327,12 +1029,15 @@ int main(int argc, char** argv) {
         }
         const Arena arena;
 #else
-        CheckMemoHitDuringWalk();
-        CheckFailedWalkIsRetried();
+        if (!writeIndexOnly) {
+            CheckMemoHitDuringWalk();
+            CheckFailedWalkIsRetried();
+        }
 #endif
         if (argc == 2) {
             const std::string selected = argv[1];
-            if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
+            if (selected == "--write-index") CheckWriteIndex();
+            else if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
             else if (selected == "--unions") {
                 CheckAdjacentCoverage();
                 CheckOverlappingCoverage();

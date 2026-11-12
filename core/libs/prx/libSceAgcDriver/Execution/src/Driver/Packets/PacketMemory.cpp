@@ -95,7 +95,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 const auto queueId = submission.queue;
                 const auto context = *interrupt;
                 interruptDeferred = localDevice->AfterRecordedWork([this, queueId, context] { deliverGuestEopInterrupt(queueId, context); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                if (interruptDeferred && workOpen) {
+                    const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::Interrupt);
+                    localDevice->SubmitRecorded(submission.queue == 0);
+                }
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
@@ -559,7 +562,10 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue, context] { deliverGuestEopInterrupt(queue, context); }, queue == 0);
-            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+            if (deferred && workOpen) {
+                const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::Interrupt);
+                localDevice->SubmitRecorded(queue == 0);
+            }
         }
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
@@ -571,7 +577,9 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (!due && !capped) return;
+    const Graphics::Recorder::SubmitCauseScope cause(due ? Graphics::Recorder::SubmitCause::LabelDeadline : Graphics::Recorder::SubmitCause::WorkCap);
+    localDevice->SubmitRecorded(true);
 }
 
 }

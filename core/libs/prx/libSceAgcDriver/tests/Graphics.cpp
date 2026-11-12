@@ -2,8 +2,10 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "BdaTests.hpp"
 #include "GraphicsTests.hpp"
+#include "CommandStateLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -13,6 +15,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ShaderDiskCache.hpp"
@@ -392,7 +396,8 @@ void hdrComponentSwapTests() {
         state = DecodeState(queue);
         Require(state.color.componentMapping == 0xe4u && state.blendConstants == std::array<float, 4>{0.125f, 0.25f, 0.375f, 0.5f}, "standard color mapping changed");
         queue.context[0x31c] |= 2u << 11u;
-        expectFailure([&] { DecodeState(queue); }, "reversed component order");
+        if (number == 0u || number == 7u) Require(DecodeState(queue).blendConstants == std::array<float, 4>{0.5f, 0.375f, 0.25f, 0.125f}, "reversed color blend constants were not swizzled with the export");
+        else expectFailure([&] { DecodeState(queue); }, "reversed component order");
     }
     auto queue = makeState();
     queue.context[0x31c] = (queue.context[0x31c] & ~0x1f7cu) | (12u << 2u) | (7u << 8u) | (1u << 11u);
@@ -2255,8 +2260,8 @@ void ReversedComponentOrderBlendTests() {
         {0x61000008u, "with factors the host blend cannot form from copies of the export is not implemented"},
         {0x61000501u, "with factors the host blend cannot form from copies of the export is not implemented"},
         {0x65050302u, "with factors the host blend cannot form from copies of the export is not implemented"},
-        {0x4000000du, "with a constant blend factor"},
-        {0x40000013u, "with a constant blend factor"},
+        {0x6004000du, "with a constant blend factor beside a factor of the export or the destination in the same operand"},
+        {0x40000513u, "with a constant blend factor and factors the host blend forms through a changed export"},
         {0x4000000fu, "with a second-source factor is not implemented, as dual-source blending into a component-swapped color target is unsupported"},
         {0x65240504u, "with different color and alpha operations"},
         {0x40000544u, "with a MIN or MAX operation whose factors are not ONE"},
@@ -2275,7 +2280,7 @@ void ReversedComponentOrderBlendTests() {
                 Require(blend.blendEnable && blend.srcColorBlendFactor == test.source && blend.dstColorBlendFactor == test.destination && blend.srcAlphaBlendFactor == test.sourceAlpha && blend.dstAlphaBlendFactor == test.destinationAlpha && blend.colorBlendOp == test.operation && blend.alphaBlendOp == test.operation && blend.colorWriteMask == 0xfu, std::string(what) + ": wrong Vulkan blend state");
                 Require(state.reversedBlend == code && !state.dualSourceBlend, std::string(what) + ": wrong pixel shader blend code " + std::to_string(state.reversedBlend));
                 Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, AgcDriver::Graphics::ExportMappings(state)).targetExportMapping[0] == mapping, std::string(what) + ": the export mapping changed");
-                const auto direct = AgcDriver::Graphics::TranslateReversedBlend(test.control, mapping, target.vkFormat, test.opaqueDestination);
+                const auto direct = AgcDriver::Graphics::TranslateReversedBlend(test.control, mapping, target.vkFormat, test.opaqueDestination, {});
                 Require(direct.shaderCode == code && direct.blend.srcColorBlendFactor == blend.srcColorBlendFactor && direct.blend.dstColorBlendFactor == blend.dstColorBlendFactor && direct.blend.srcAlphaBlendFactor == blend.srcAlphaBlendFactor && direct.blend.dstAlphaBlendFactor == blend.dstAlphaBlendFactor && direct.blend.colorBlendOp == blend.colorBlendOp && direct.blend.alphaBlendOp == blend.alphaBlendOp, std::string(what) + ": TranslateReversedBlend disagrees with DecodeState");
             }
         }
@@ -2283,6 +2288,24 @@ void ReversedComponentOrderBlendTests() {
             const auto queue = reversedBlendQueue(10u, 0u, swap, control);
             expectFailure([&] { DecodeState(queue); }, std::string("blending into a color target with a reversed component order ") + reason);
         }
+        const std::array<float, 4> constants{0.125f, 0.25f, 0.75f, 0.625f};
+        const auto constantQueue = [&](std::uint32_t control) {
+            auto queue = reversedBlendQueue(10u, 0u, swap, control);
+            for (std::uint32_t i = 0; i < 4; ++i) queue.context[0x105 + i] = std::bit_cast<std::uint32_t>(constants[i]);
+            return queue;
+        };
+        const auto constantOf = [&](std::uint32_t component) { return constants[(mapping >> (2u * component)) & 3u]; };
+        const auto separate = DecodeState(constantQueue(0x60130001u));
+        Require(separate.reversedBlend == 0u && separate.blends.at(0).srcColorBlendFactor == VK_BLEND_FACTOR_CONSTANT_COLOR && separate.blends.at(0).dstColorBlendFactor == VK_BLEND_FACTOR_ZERO && separate.blends.at(0).srcAlphaBlendFactor == VK_BLEND_FACTOR_ONE && separate.blends.at(0).dstAlphaBlendFactor == VK_BLEND_FACTOR_ZERO, "a constant alpha factor of the alpha equation did not reach the host color equation of the reversed target");
+        Require(separate.blendConstants[0] == constants[3] && separate.blendConstants[1] == 1.0f && separate.blendConstants[2] == 1.0f, "the host blend constants of a constant alpha factor do not weigh the alpha channel alone");
+        const auto colored = DecodeState(constantQueue(0x40000e0du));
+        Require(colored.blends.at(0).srcColorBlendFactor == VK_BLEND_FACTOR_CONSTANT_COLOR && colored.blends.at(0).dstColorBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR && colored.blends.at(0).srcAlphaBlendFactor == VK_BLEND_FACTOR_CONSTANT_ALPHA && colored.blends.at(0).dstAlphaBlendFactor == VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA, "a constant color factor and its complement did not share the host blend constants");
+        for (std::uint32_t component = 0; component < 4; ++component) Require(colored.blendConstants[component] == constantOf(component), "the blend constants of a reversed target did not follow its component mapping");
+        expectFailure([&] { DecodeState(constantQueue(0x40000d13u)); }, "with two constant blend factors that one set of host blend constants cannot form");
+        const auto unit = DecodeState(reversedBlendQueue(10u, 0u, swap, 0x4000010du));
+        Require(unit.blends.at(0).srcColorBlendFactor == VK_BLEND_FACTOR_ZERO && unit.blends.at(0).dstColorBlendFactor == VK_BLEND_FACTOR_ONE, "constants of zero did not become a ZERO factor");
+        const auto over = AgcDriver::Graphics::TranslateReversedBlend(0x4000000eu, mapping, VK_FORMAT_R8G8B8A8_UNORM, false, {2.0f, 2.0f, 2.0f, 2.0f});
+        Require(over.blend.srcColorBlendFactor == VK_BLEND_FACTOR_ZERO, "a constant above one was not clamped for a normalized target");
         char registers[96];
         std::snprintf(registers, sizeof(registers), "(CB_BLEND_CONTROL 0x65010504, component mapping 0x%02x, VkFormat %d)", mapping, static_cast<int>(VK_FORMAT_R8G8B8A8_SRGB));
         expectFailure([&] { DecodeState(reversedBlendQueue(10u, 6u, swap, 0x65010504u)); }, std::string("reversed component order is not implemented for sRGB targets ") + registers);
@@ -2308,6 +2331,20 @@ void ReversedComponentOrderBlendTests() {
         twoTargets.context[0x1e0] = 0x65010504u;
         twoTargets.context[0x1e1] = 0x40000101u;
         expectFailure([&] { DecodeState(twoTargets); }, "reversed component order through a second source color needs that target to be the shader's only color export");
+        auto alphaReader = twoTargets;
+        alphaReader.context[0x31c + 0xfu] &= ~(3u << 11u);
+        alphaReader.context[0x1e0] = 0x40000e0du;
+        alphaReader.context[0x1e1] = 0x60130001u;
+        for (std::uint32_t i = 0; i < 4; ++i) alphaReader.context[0x105 + i] = std::bit_cast<std::uint32_t>(constants[i]);
+        expectFailure([&] { DecodeState(alphaReader); }, "conflicting blend constants");
+        alphaReader.context[0x1e1] = 0x40000013u;
+        expectFailure([&] { DecodeState(alphaReader); }, "conflicting blend constants");
+        alphaReader.context[0x1e1] = 0x40000001u;
+        Require(DecodeState(alphaReader).colors.size() == 2, "a standard target that reads no blend constant was refused beside a reversed target with constants");
+        alphaReader.context[0x1e1] = 0x60130001u;
+        alphaReader.context[0x108] = std::bit_cast<std::uint32_t>(constantOf(3));
+        const auto shared = DecodeState(alphaReader);
+        Require(shared.colors.size() == 2 && shared.blendConstants[3] == constantOf(3), "a standard target that reads the alpha constant was refused although the reversed target keeps its value");
     }
 }
 
@@ -2350,7 +2387,7 @@ void ReversedBlendRoutingTests() {
         const auto control = guestFactors[0] | (guestFactors[1] << 8u) | (guestFactors[2] << 16u) | (guestFactors[3] << 24u) | 0x20000000u;
         std::optional<AgcDriver::Graphics::ReversedBlend> translated;
         try {
-            translated = AgcDriver::Graphics::TranslateReversedBlend(control, 0x1bu, VK_FORMAT_R8G8B8A8_UNORM, false);
+            translated = AgcDriver::Graphics::TranslateReversedBlend(control, 0x1bu, VK_FORMAT_R8G8B8A8_UNORM, false, {});
         } catch (const std::runtime_error& error) {
             Require(std::string(error.what()).find("reversed component order with") != std::string::npos, std::string("an unexpected reversed-order blend refusal: ") + error.what());
             continue;
@@ -5700,6 +5737,8 @@ std::condition_variable pipelineCreateCondition;
 bool blockLibraryCreate = false;
 bool libraryCreateEntered = false;
 bool releaseLibraryCreate = false;
+bool blockOptimizedLink = false;
+bool releaseOptimizedLink = false;
 
 template<typename THandle>
 THandle makeHandle() {
@@ -5926,6 +5965,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
             pipelineCreateCondition.notify_all();
             pipelineCreateCondition.wait(lock, [] { return releaseLibraryCreate; });
         }
+        if (blockOptimizedLink && (infos[0].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0) pipelineCreateCondition.wait(lock, [] { return releaseOptimizedLink; });
     }
     Require(count == 1, "mock expects exactly one graphics pipeline per call");
     if ((infos[0].flags & VK_PIPELINE_CREATE_LIBRARY_BIT_KHR) == 0) {
@@ -7502,6 +7542,45 @@ void unsetFormatStorageImageTests() {
     }
 }
 
+void contentKeyHashTests() {
+    using Cache = AgcDriver::Graphics::ResourceCache;
+    std::uint64_t seed = 0x2545f4914f6cdd1dull;
+    const auto next = [&] {
+        seed ^= seed << 13u;
+        seed ^= seed >> 7u;
+        seed ^= seed << 17u;
+        return static_cast<std::uint32_t>(seed);
+    };
+    std::set<std::size_t> hashes;
+    std::set<std::vector<std::uint32_t>> keys;
+    for (std::uint32_t round = 0; round < 2000; ++round) {
+        const auto stages = 1u + round % 4u;
+        std::vector<std::uint32_t> key{0xffffffffu, next(), next() & 0xffffu, stages};
+        Cache::DrawKeyHash composed{std::span<const std::uint32_t>(key)};
+        for (std::uint32_t stage = 0; stage < stages; ++stage) {
+            const auto words = (next() % 97u) + (round % 3u == 0 ? 0u : 1u);
+            key.push_back(words);
+            const auto at = key.size();
+            for (std::uint32_t word = 0; word < words; ++word) key.push_back(next() % 5u);
+            composed.Stage(words, Cache::SegmentHash(std::span<const std::uint32_t>(key).subspan(at, words)));
+        }
+        const auto tailAt = key.size();
+        key.push_back(1u + round % 8u);
+        if (round % 2u == 0) for (std::uint32_t word = 0; word < 8u; ++word) key.push_back(next() % 3u);
+        const auto hash = composed.Finish(std::span<const std::uint32_t>(key).subspan(tailAt));
+        Require(hash == Cache::Hash(key), "a draw content key's hash composed from its stages differs from the hash of its words");
+        if (keys.insert(key).second) hashes.insert(hash);
+        auto moved = key;
+        moved.back() ^= 1u;
+        Require(Cache::Hash(moved) != hash, "two draw content keys differing in their last word hash alike");
+    }
+    Require(hashes.size() == keys.size(), "distinct draw content keys collided");
+    const std::vector<std::uint32_t> dispatch{1u, 2u, 3u, 4u, 5u};
+    Require(Cache::Hash(dispatch) == Cache::SegmentHash(dispatch), "a dispatch key does not hash its words");
+    const std::vector<std::uint32_t> truncated{0xffffffffu, 1u, 2u, 3u, 9u, 1u};
+    Require(Cache::Hash(truncated) == Cache::SegmentHash(truncated), "a draw-marked key whose stages run past its end does not hash its words");
+}
+
 void descriptorCacheTests() {
     mock = MockVulkan{};
     auto context = mockContext();
@@ -8637,6 +8716,10 @@ void recordSampleLocations(std::vector<SampleLocationsUse>& uses, const VkSample
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL sampleLocationCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
+    if (blockOptimizedLink && (infos[0].flags & VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT) != 0) {
+        std::unique_lock lock(pipelineCreateMutex);
+        pipelineCreateCondition.wait(lock, [] { return releaseOptimizedLink; });
+    }
     Require(count == 1, "the sample location mock expects one pipeline per call");
     const auto* locations = infos[0].pMultisampleState != nullptr ? static_cast<const VkPipelineSampleLocationsStateCreateInfoEXT*>(infos[0].pMultisampleState->pNext) : nullptr;
     if (locations != nullptr && locations->sType == VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT && locations->sampleLocationsEnable) recordSampleLocations(pipelineSampleLocations, locations->sampleLocationsInfo);
@@ -8661,6 +8744,7 @@ VKAPI_ATTR void VKAPI_CALL sampleLocationDestroyRenderPass(VkDevice, VkRenderPas
 VKAPI_ATTR void VKAPI_CALL sampleLocationDestroyFramebuffer(VkDevice, VkFramebuffer, const VkAllocationCallbacks*) { --mock.live; }
 VKAPI_ATTR void VKAPI_CALL sampleLocationSetViewport(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) {}
 VKAPI_ATTR void VKAPI_CALL sampleLocationSetScissor(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) {}
+VKAPI_ATTR void VKAPI_CALL sampleLocationEndRenderPass(VkCommandBuffer) {}
 
 VKAPI_ATTR void VKAPI_CALL sampleLocationBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo* begin, VkSubpassContents) {
     const auto* locations = static_cast<const VkRenderPassSampleLocationsBeginInfoEXT*>(begin->pNext);
@@ -8678,6 +8762,7 @@ PFN_vkVoidFunction VKAPI_CALL sampleLocationProc(VkDevice device, const char* na
         {"vkDestroyFramebuffer", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationDestroyFramebuffer)},
         {"vkCmdBeginRenderPass", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationBeginRenderPass)},
         {"vkCmdSetViewport", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetViewport)},
+        {"vkCmdEndRenderPass", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationEndRenderPass)},
         {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetScissor)}
     };
     const auto it = table.find(name);
@@ -8745,7 +8830,9 @@ void sampleLocationGridFallbackTests() {
             Pipeline pipeline(context, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
             const std::array<VkImageView, 1> depthView{makeHandle<VkImageView>()};
             const auto framebuffer = pipeline.AcquireFramebuffer(std::span(depthView).first(depth ? 1u : 0u), {}, {64, 64});
-            pipeline.Begin(makeHandle<VkCommandBuffer>(), *framebuffer, {64, 64}, state);
+            CommandState recording;
+            recording.Begin(makeHandle<VkCommandBuffer>());
+            pipeline.Begin(recording, *framebuffer, {64, 64}, state);
         }
         ClearPipelineLibraries(context.device);
         Require(mock.live == 0, "sample location grid fallback tests leaked Vulkan objects");
@@ -9128,6 +9215,8 @@ void sampleOrderTests() {
 
     {
         auto context = capable();
+        const auto stateHooks = CommandStateLog::stateFunctions();
+        context.functions = &stateHooks;
         context.deviceProc = depthOrderProc;
         context.memory.memoryTypes[0].propertyFlags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
         const auto commands = makeHandle<VkCommandBuffer>();
@@ -9153,7 +9242,30 @@ void sampleOrderTests() {
             depthOrderEvents.clear();
             SampleOrderPass pass{rowSwap, {16, 8}, {}, standIn};
             std::copy(pixelZero.begin(), pixelZero.end(), pass.locations.begin());
-            RecordSampleOrder(context, commands, pass, std::span(&target, 1u), false, kept);
+            CommandStateLog::stateLog.clear();
+            CommandStateLog::statePipelines.clear();
+            const auto drawPipeline = makeHandle<VkPipeline>();
+            CommandState tracker;
+            tracker.Begin(commands);
+            CommandStateLog::stateTrackedDraw(tracker, context, drawPipeline);
+            Require(tracker.Known(CommandState::Viewport) && tracker.BoundPipeline() == drawPipeline, "the sample order test could not give its tracker a known state");
+            const auto drawLines = CommandStateLog::stateTrackedDrawLines(drawPipeline);
+            CommandStateLog::expectStateLog(drawLines, "the draw before recording the sample order");
+            RecordSampleOrder(context, tracker, pass, std::span(&target, 1u), false, kept);
+            const auto reorderPipeline = tracker.BoundPipeline();
+            Require(reorderPipeline != VK_NULL_HANDLE && reorderPipeline != drawPipeline, "recording the sample order did not leave its pipeline bound in the tracker");
+            Require(tracker.Known(CommandState::Viewport) && tracker.Known(CommandState::Scissor) && tracker.Known(CommandState::WriteMaskFront) && tracker.Known(CommandState::WriteMaskBack) && tracker.Known(CommandState::ReferenceFront) && tracker.Known(CommandState::ReferenceBack), "recording the sample order left a dynamic state it set unknown");
+            Require(!tracker.Known(CommandState::DepthBias) && !tracker.Known(CommandState::CullMode) && !tracker.Known(CommandState::StencilOpFront), "recording the sample order kept dynamic state its pipeline does not declare");
+            CommandStateLog::expectStateLog({CommandStateLog::stateLine("viewport", 0.0f, 0.0f, 16.0f, 8.0f, 0.0f, 1.0f), CommandStateLog::stateLine("scissor", 0, 0, 16u, 8u), CommandStateLog::stateLine("bind", 0u, reorderPipeline), CommandStateLog::stateLine("writemask", 3u, 0xffu), CommandStateLog::stateLine("reference", 3u, 0u)}, "the sample order pass");
+            const auto library = CommandState::DynamicSlots(PipelineLibraryDynamicStates());
+            tracker.BindPipeline(context, drawPipeline, library);
+            tracker.SetViewport(context, VkViewport{0.0f, 0.0f, 16.0f, 8.0f, 0.0f, 1.0f});
+            tracker.SetScissor(context, VkRect2D{{0, 0}, {16, 8}});
+            tracker.SetStencilWriteMask(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0xffu);
+            tracker.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, 0u);
+            CommandStateLog::expectStateLog({CommandStateLog::stateLine("bind", 0u, drawPipeline)}, "a draw repeating the state the sample order pass left");
+            tracker.SetViewport(context, VkViewport{0.0f, 0.0f, 64.0f, 32.0f, 0.0f, 1.0f});
+            CommandStateLog::expectStateLog({CommandStateLog::stateLine("viewport", 0.0f, 0.0f, 64.0f, 32.0f, 0.0f, 1.0f)}, "a draw changing only the viewport after the sample order pass");
             const auto events = onTarget();
             if (standIn) {
                 Require(events.size() == 3 && located(events[0], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, depthStencil, {1, 1}, pixelZero) && events[1].copy && events[1].from == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL && located(events[2], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, depthStencil, {1, 1}, pixelZero), "the depth swap did not copy its target between transitions that name the stand-in sample locations it was rendered with");
@@ -9367,6 +9479,12 @@ void framebufferOwnerTests() {
         auto first = pipeline.AcquireFramebuffer(views, owners, {4, 4});
         auto repeated = pipeline.AcquireFramebuffer(views, owners, {4, 4});
         Require(first == repeated, "a live framebuffer owner did not reuse its framebuffer");
+        auto aliasOwner = std::shared_ptr<void>(std::make_shared<int>(3), owners[0].get());
+        owners[0].swap(aliasOwner);
+        auto aliased = pipeline.AcquireFramebuffer(views, owners, {4, 4});
+        Require(aliased != first, "the same pointer with a different owner reused a framebuffer");
+        owners[0].swap(aliasOwner);
+        aliasOwner.reset();
         auto retainedOwner = owners[0];
         owners[0] = std::make_shared<int>(2);
         auto distinct = pipeline.AcquireFramebuffer(views, owners, {4, 4});
@@ -12524,6 +12642,27 @@ void meshIndexBufferTests() {
     expectFailure([] { static_cast<void>(AgcDriver::Graphics::MeshIndexBufferDescriptor(AgcDriver::Pm4::DrawParameters{0, 3, 2, 1, 0, true})); }, "invalid mesh index buffer range");
 }
 
+void snapshotMemoryTests() {
+    constexpr VkMemoryPropertyFlags host = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    constexpr VkMemoryPropertyFlags bar = host | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    VkPhysicalDeviceMemoryProperties memory{};
+    memory.memoryHeapCount = 2;
+    memory.memoryHeaps[0] = {VkDeviceSize{16} << 30u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryHeaps[1] = {VkDeviceSize{32} << 30u, 0};
+    memory.memoryTypeCount = 3;
+    memory.memoryTypes[0] = {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0};
+    memory.memoryTypes[1] = {host | VK_MEMORY_PROPERTY_HOST_CACHED_BIT, 1};
+    memory.memoryTypes[2] = {bar, 0};
+    Require(AgcDriver::Graphics::SnapshotMemoryProperties(memory, false) == bar, "a resizable BAR over the whole device heap was not chosen for snapshots");
+    Require(AgcDriver::Graphics::SnapshotMemoryProperties(memory, true) == host, "disabled BAR snapshots still chose device-local memory");
+    memory.memoryHeapCount = 3;
+    memory.memoryHeaps[2] = {VkDeviceSize{256} << 20u, VK_MEMORY_HEAP_DEVICE_LOCAL_BIT};
+    memory.memoryTypes[2] = {bar, 2};
+    Require(AgcDriver::Graphics::SnapshotMemoryProperties(memory, false) == host, "a 256 MiB BAR window was taken for snapshots");
+    memory.memoryTypeCount = 2;
+    Require(AgcDriver::Graphics::SnapshotMemoryProperties(memory, false) == host, "a device without host-visible device memory did not keep host snapshots");
+}
+
 void stagingPoolBudgetTests() {
     if (std::getenv("APS5_STAGING_POOL_MIB") != nullptr) return;
     VkPhysicalDeviceMemoryProperties memory{};
@@ -12794,7 +12933,7 @@ void vertexZeroFillTests() {
     std::fill(guest.begin(), guest.begin() + static_cast<std::ptrdiff_t>(valid), std::byte{0x7a});
     std::fill(guest.begin() + static_cast<std::ptrdiff_t>(valid), guest.end(), std::byte{0x55});
     const auto copy = CopyZeroPaddedDrawInput(mockContext(), reinterpret_cast<std::uint64_t>(guest.data()), extent, valid);
-    const auto bytes = copy.buffer->Bytes();
+    const auto bytes = copy.Bytes();
     Require(bytes.size() == extent, "a zero-padded vertex fetch changed its size");
     Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a vertex fetch did not copy the bytes within the record count");
     Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(valid), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "a vertex fetch past the record count did not read as zeros");
@@ -12817,7 +12956,7 @@ void vertexZeroFillFlushTests() {
     AgcDriver::GuestMemory::SetFlushHook(&RecordPaddedVertexFlush);
     try {
         const auto copy = CopyZeroPaddedDrawInput(mockContext(), address, fetched, valid);
-        const auto bytes = copy.buffer->Bytes();
+        const auto bytes = copy.Bytes();
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(valid), [](std::byte value) { return value == std::byte{0x7a}; }), "a zero-padded vertex fetch did not copy its valid bytes");
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(previous);
@@ -12847,7 +12986,7 @@ void vertexOverhangTests() {
     const auto address = reinterpret_cast<std::uint64_t>(block) + offset;
     {
         const auto copy = CopyZeroPaddedDrawInput(mockContext(), address, readable + overhang, readable + overhang, stride);
-        const auto bytes = copy.buffer->Bytes();
+        const auto bytes = copy.Bytes();
         Require(bytes.size() == readable + overhang, "an overhanging vertex fetch changed its size");
         Require(std::all_of(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(readable), [](std::byte value) { return value == std::byte{0x7a}; }), "an overhanging vertex fetch did not copy the readable bytes");
         Require(std::all_of(bytes.begin() + static_cast<std::ptrdiff_t>(readable), bytes.end(), [](std::byte value) { return value == std::byte{0}; }), "an overhanging vertex fetch did not zero its last record");
@@ -13610,6 +13749,156 @@ void pipelineJournalTests(bool longPath = false, bool extended = false) {
     Require(mock.live == 0, "the pipeline journal test leaked Vulkan objects");
 }
 
+VkBuffer retentionIndex = VK_NULL_HANDLE;
+VkBuffer retentionVertex = VK_NULL_HANDLE;
+std::set<VkBuffer> retentionDestroyed;
+
+VKAPI_ATTR void VKAPI_CALL retentionDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
+    retentionDestroyed.insert(buffer);
+    mockDestroyBuffer(device, buffer, allocator);
+}
+VKAPI_ATTR void VKAPI_CALL retentionBindIndex(VkCommandBuffer, VkBuffer buffer, VkDeviceSize, VkIndexType) { retentionIndex = buffer; }
+VKAPI_ATTR void VKAPI_CALL retentionBindVertex(VkCommandBuffer, std::uint32_t, std::uint32_t count, const VkBuffer* buffers, const VkDeviceSize*) {
+    Require(count == 1, "retention test expected one vertex binding");
+    retentionVertex = buffers[0];
+}
+VKAPI_ATTR void VKAPI_CALL retentionDrawIndexed(VkCommandBuffer, std::uint32_t, std::uint32_t, std::uint32_t, std::int32_t, std::uint32_t) {}
+std::vector<VkFence> retentionFences;
+VKAPI_ATTR VkResult VKAPI_CALL retentionQueueSubmit(VkQueue queue, std::uint32_t count, const VkSubmitInfo* submits, VkFence fence) {
+    if (fence != VK_NULL_HANDLE) retentionFences.push_back(fence);
+    return mockQueueSubmit(queue, count, submits, fence);
+}
+
+PFN_vkVoidFunction VKAPI_CALL retentionProc(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkQueueSubmit") == 0) return reinterpret_cast<PFN_vkVoidFunction>(retentionQueueSubmit);
+    if (std::strcmp(name, "vkDestroyBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(retentionDestroyBuffer);
+    if (std::strcmp(name, "vkCmdBindIndexBuffer") == 0) return reinterpret_cast<PFN_vkVoidFunction>(retentionBindIndex);
+    if (std::strcmp(name, "vkCmdBindVertexBuffers") == 0) return reinterpret_cast<PFN_vkVoidFunction>(retentionBindVertex);
+    if (std::strcmp(name, "vkCmdDrawIndexed") == 0) return reinterpret_cast<PFN_vkVoidFunction>(retentionDrawIndexed);
+    return depthOrderProc(device, name);
+}
+
+void recordedDrawRetentionTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, true);
+    auto context = mockContext();
+    context.deviceProc = retentionProc;
+    context.formatProperties = [](VkPhysicalDevice, VkFormat, VkFormatProperties* properties) {
+        *properties = {};
+        properties->bufferFeatures = VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT;
+    };
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    context.limits.maxFramebufferLayers = 1;
+    context.limits.maxViewports = 1;
+    context.limits.maxViewportDimensions[0] = context.limits.maxViewportDimensions[1] = 64;
+    context.limits.viewportBoundsRange[0] = -64;
+    context.limits.viewportBoundsRange[1] = 64;
+    context.limits.maxPushConstantsSize = PipelinePushConstantBytes;
+    context.limits.maxFramebufferWidth = context.limits.maxFramebufferHeight = 64;
+    Recorder recorder(context);
+    context.recorder = &recorder;
+    recorder.Activate();
+    DescriptorCache descriptors(context);
+    context.descriptorCache = &descriptors;
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.rasterizerDiscard = true;
+    state.renderExtent = {16, 16};
+    state.scissor = {{0, 0}, {16, 16}};
+    state.viewport = {0, 0, 16, 16, 0, 1};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({.vertexInput = true});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 5001;
+    fragment.variantId = 5002;
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}};
+    std::array<std::uint16_t, 3> indices{0, 1, 2};
+    std::array<float, 12> vertices{};
+    const auto vertexAddress = reinterpret_cast<std::uint64_t>(vertices.data());
+    vertex.vertexAttributes = {{0, 4, {{static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>(vertexAddress >> 32u) | (16u << 16u), 3u, 77u << 12u}}, 0}};
+    context.limits.maxVertexInputBindings = context.limits.maxVertexInputAttributes = 16;
+    context.limits.maxVertexInputBindingStride = 2048;
+    context.limits.maxVertexInputAttributeOffset = 2048;
+    context.limits.maxDrawIndexedIndexValue = std::numeric_limits<std::uint32_t>::max();
+    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uint64_t>(indices.data()), 3, 2, 1, 0, true};
+    retentionDestroyed.clear();
+    retentionIndex = retentionVertex = VK_NULL_HANDLE;
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+    Draw(context, state, draw, shaders, {}, &recipe);
+    Require(recipe != nullptr, "retention draw did not produce a recipe");
+    Require(retentionIndex != VK_NULL_HANDLE && retentionVertex != VK_NULL_HANDLE, "retention draw did not bind copied inputs");
+    auto replacement = std::make_shared<Buffer>(context, sizeof(vertices), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    recorder.KeepDrawSnapshot(draw.indexAddress, sizeof(indices), 1, 0, replacement, Recorder::SnapshotUse::Index16);
+    recorder.KeepDrawSnapshot(vertexAddress, sizeof(vertices), 1, 0, replacement, Recorder::SnapshotUse::Vertex);
+    const auto available = [&](VkBuffer buffer, std::size_t bytes, VkBufferUsageFlags usage) {
+        if (retentionDestroyed.contains(buffer)) return true;
+        auto pool = GetBufferPool(context);
+        auto allocation = pool->Take(bytes, usage);
+        const bool returned = allocation && allocation->buffer == buffer;
+        if (allocation) pool->Put(*allocation);
+        return returned;
+    };
+    Require(!available(retentionIndex, sizeof(indices), DrawInputUsage), "recorded indices were recycled before completion");
+    Require(!available(retentionVertex, sizeof(vertices), DrawInputUsage), "recorded vertices were recycled before completion");
+    auto pipeline = recipe->pipeline.lock();
+    Require(pipeline != nullptr, "recorded pipeline expired");
+    for (std::uint32_t size = 17; size < 30; ++size) pipeline->AcquireFramebuffer({}, {}, {size, size});
+    Require(!recipe->framebuffer.expired(), "recorded framebuffer was evicted before completion");
+    pipeline.reset();
+    ClearCachedPipelines(context.device);
+    SharedResourceCache().Clear();
+    Require(!recipe->pipeline.expired(), "recorded pipeline was released before completion");
+    Require(!recipe->templateRef.expired(), "recorded resources were released before completion");
+    recorder.OnComplete([&] {
+        Require(!recipe->pipeline.expired() && !recipe->framebuffer.expired() && !recipe->templateRef.expired(), "recorded owners expired before a completion action");
+        throw std::runtime_error("retention completion failure");
+    });
+    recorder.Sync();
+    Require(available(retentionIndex, sizeof(indices), DrawInputUsage), "recorded indices survived completion");
+    Require(available(retentionVertex, sizeof(vertices), DrawInputUsage), "recorded vertices survived completion");
+    Require(recipe->pipeline.expired() && recipe->framebuffer.expired() && recipe->templateRef.expired(), "recorded owners survived completion");
+
+    mock.deferFences = true;
+    retentionFences.clear();
+    std::shared_ptr<const AgcDriver::DrawRecipe> replayed;
+    Draw(context, state, draw, shaders, {}, &replayed);
+    Require(replayed != nullptr, "retention replay draw did not produce a recipe");
+    const auto owned = [&] { return !replayed->pipeline.expired() && !replayed->framebuffer.expired() && !replayed->templateRef.expired(); };
+    const auto released = [&] { return replayed->pipeline.expired() && replayed->framebuffer.expired() && replayed->templateRef.expired(); };
+    auto replayedPipeline = replayed->pipeline.lock();
+    Require(replayedPipeline != nullptr, "retention replay pipeline expired");
+    for (std::uint32_t size = 17; size < 30; ++size) replayedPipeline->AcquireFramebuffer({}, {}, {size, size});
+    replayedPipeline.reset();
+    ClearCachedPipelines(context.device);
+    SharedResourceCache().Clear();
+    Require(owned(), "recorded owners were released with their cache entries before completion");
+    recorder.Submit();
+    Require(retentionFences.size() == 1, "the first replay batch was not submitted");
+    const auto hit = DrawWithRecipe(context, state, draw, shaders, {}, *replayed);
+    Require(hit.recorded, "the replay draw did not record from its recipe");
+    const auto effectsBefore = ShaderResources::EffectRepeatCounts();
+    const auto again = DrawWithRecipe(context, state, draw, shaders, {}, *replayed);
+    Require(again.recorded, "the second replay draw in the batch did not record from its recipe");
+    const auto effectsAfter = ShaderResources::EffectRepeatCounts();
+    if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        Require(effectsAfter.probed == effectsBefore.probed + 1 && effectsAfter.repeated == effectsBefore.repeated + 1 && effectsAfter.identical == effectsBefore.identical + 1, "a recipe hit repeating its resources in one batch was not counted as a repeat with unchanged effect inputs");
+    } else {
+        Require(effectsAfter.probed == effectsBefore.probed, "resources effects were probed without APS5_PROFILE_DRAW");
+    }
+    Require(owned(), "recorded owners expired after a recipe hit in the next batch");
+    mock.signaled.at(retentionFences.front()) = true;
+    Require(recorder.Reap(), "the first replay batch was not retired");
+    Require(owned(), "recorded owners were released with the first batch while the second still used them");
+    recorder.Submit();
+    Require(retentionFences.size() == 2, "the second replay batch was not submitted");
+    Require(!recorder.Reap() && owned(), "recorded owners were released before the last batch that used them completed");
+    mock.signaled.at(retentionFences.back()) = true;
+    Require(recorder.Reap(), "the second replay batch was not retired");
+    Require(released(), "recorded owners survived the completion of the last batch that used them");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawInputRing, false);
+}
+
 void faultOnlyTemplateRecordTests() {
     const bool keep = std::getenv("APS5_KEEP_TEMPLATE_RECORDS") != nullptr;
     const bool guarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
@@ -13633,6 +13922,412 @@ void faultOnlyTemplateRecordTests() {
     Require(mock.live == 0, "the fault-only template record test leaked Vulkan objects");
 }
 
+void commandStateTests() {
+    using namespace AgcDriver::Graphics;
+    using namespace CommandStateLog;
+    using Slot = CommandState::Slot;
+    constexpr auto front = VK_STENCIL_FACE_FRONT_BIT;
+    constexpr auto back = VK_STENCIL_FACE_BACK_BIT;
+    constexpr auto both = VK_STENCIL_FACE_FRONT_AND_BACK;
+    const auto functions = stateFunctions();
+    auto context = mockContext();
+    context.functions = &functions;
+    stateLog.clear();
+    statePipelines.clear();
+    const auto commands = makeHandle<VkCommandBuffer>();
+    const auto pipeline = [&](std::size_t index) {
+        while (statePipelines.size() <= index) statePipelines.push_back(makeHandle<VkPipeline>());
+        return statePipelines[index];
+    };
+    const auto library = CommandState::DynamicSlots(PipelineLibraryDynamicStates());
+    const std::array<VkDynamicState, 2> viewportScissor{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    const auto fixed = CommandState::DynamicSlots(viewportScissor);
+    const std::array<VkDynamicState, 1> colorWriteMask{VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
+    const auto maskSlot = CommandState::DynamicSlots(colorWriteMask);
+    Require(maskSlot == CommandState::Mask(Slot::ColorWriteMask), "the color write mask dynamic state mapped to another slot");
+    Require((library | maskSlot) == (1u << CommandState::SlotCount) - 1u && (library & maskSlot) == 0, "the pipeline library's dynamic states and the color write mask do not cover every tracked slot");
+    Require(fixed == (CommandState::Mask(Slot::Viewport) | CommandState::Mask(Slot::Scissor)), "the viewport and scissor dynamic states mapped to other slots");
+    const std::array<VkDynamicState, 2> unmodelled{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_LINE_WIDTH};
+    bool rejected = false;
+    try {
+        CommandState::DynamicSlots(unmodelled);
+    } catch (const std::runtime_error&) {
+        rejected = true;
+    }
+    Require(rejected, "a dynamic state the tracker does not follow was accepted");
+    const auto pipelineA = pipeline(0);
+    const auto pipelineB = pipeline(1);
+    const auto pipelineC = pipeline(2);
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        for (const auto mode : {1u, 1u, 2u, 2u, 1u}) tracker.SetCullMode(context, mode);
+        expectStateLog({stateLine("cull", 1u), stateLine("cull", 2u), stateLine("cull", 1u)}, "unknown, unchanged and changed cull modes");
+        CommandState unsuppressed;
+        unsuppressed.Begin(commands, false);
+        unsuppressed.SetCullMode(context, 1u);
+        unsuppressed.SetCullMode(context, 1u);
+        expectStateLog({stateLine("cull", 1u), stateLine("cull", 1u)}, "a tracker that does not suppress");
+        tracker.Invalidate();
+        tracker.SetCullMode(context, 1u);
+        tracker.SetCullMode(context, 1u);
+        expectStateLog({stateLine("cull", 1u)}, "a cull mode after invalidation");
+    }
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        const std::array<VkColorComponentFlags, 8> masks{0xfu, 0x5u, 0x0u, 0x8u, 0x1u, 0x2u, 0x4u, 0xfu};
+        auto changed = masks;
+        changed[7] = 0x3u;
+        const auto set = [&](const std::array<VkColorComponentFlags, 8>& values, std::size_t count) { tracker.SetColorWriteMasks(context, std::span(values).first(count)); };
+        tracker.BindPipeline(context, pipelineA, library | maskSlot);
+        set(masks, 1);
+        set(masks, 1);
+        set(masks, 2);
+        set(masks, 2);
+        set(masks, 1);
+        set(masks, 8);
+        set(masks, 8);
+        set(masks, 2);
+        set(changed, 8);
+        set(masks, 7);
+        set(changed, 8);
+        expectStateLog({stateLine("bind", 0u, pipelineA), stateLine("colormask", 0u, 1u, 0xfu), stateLine("colormask", 0u, 2u, 0xfu, 0x5u), stateLine("colormask", 0u, 8u, 0xfu, 0x5u, 0x0u, 0x8u, 0x1u, 0x2u, 0x4u, 0xfu), stateLine("colormask", 0u, 8u, 0xfu, 0x5u, 0x0u, 0x8u, 0x1u, 0x2u, 0x4u, 0x3u)}, "color write masks per attachment count");
+        tracker.BindPipeline(context, pipelineA, library | maskSlot);
+        set(changed, 8);
+        Require(tracker.Known(Slot::ColorWriteMask), "a repeated bind of a pipeline with dynamic color write masks forgot them");
+        tracker.BindPipeline(context, pipelineB, library);
+        Require(!tracker.Known(Slot::ColorWriteMask), "binding a pipeline with static color write masks kept them known");
+        tracker.BindPipeline(context, pipelineA, library | maskSlot);
+        set(changed, 1);
+        set(changed, 1);
+        tracker.Invalidate();
+        set(changed, 1);
+        CommandState unsuppressed;
+        unsuppressed.Begin(commands, false);
+        unsuppressed.SetColorWriteMasks(context, std::span(changed).first(1));
+        unsuppressed.SetColorWriteMasks(context, std::span(changed).first(1));
+        expectStateLog({stateLine("bind", 0u, pipelineB), stateLine("bind", 0u, pipelineA), stateLine("colormask", 0u, 1u, 0xfu), stateLine("colormask", 0u, 1u, 0xfu), stateLine("colormask", 0u, 1u, 0xfu), stateLine("colormask", 0u, 1u, 0xfu)}, "color write masks after binds, invalidation and in a tracker that does not suppress");
+        bool rejected = false;
+        try {
+            set(masks, 0);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        Require(rejected, "an empty color write mask set was accepted");
+        stateLog.clear();
+    }
+
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        const VkViewport positive{0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f};
+        auto negative = positive;
+        negative.minDepth = -0.0f;
+        negative.x = -0.0f;
+        tracker.SetViewport(context, positive);
+        tracker.SetViewport(context, positive);
+        tracker.SetViewport(context, negative);
+        tracker.SetViewport(context, negative);
+        tracker.SetViewport(context, positive);
+        expectStateLog({stateLine("viewport", 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f), stateLine("viewport", -0.0f, 0.0f, 640.0f, 480.0f, -0.0f, 1.0f), stateLine("viewport", 0.0f, 0.0f, 640.0f, 480.0f, 0.0f, 1.0f)}, "viewports that differ in the sign of zero");
+        tracker.SetDepthBias(context, 0.0f, 0.0f, 0.0f);
+        tracker.SetDepthBias(context, -0.0f, 0.0f, 0.0f);
+        tracker.SetDepthBias(context, -0.0f, 0.0f, 0.0f);
+        tracker.SetDepthBias(context, -0.0f, 0.0f, -0.0f);
+        const auto nan = std::bit_cast<float>(0x7fc00000u);
+        const auto otherNan = std::bit_cast<float>(0x7fc00001u);
+        tracker.SetDepthBias(context, nan, 0.0f, -0.0f);
+        tracker.SetDepthBias(context, nan, 0.0f, -0.0f);
+        tracker.SetDepthBias(context, otherNan, 0.0f, -0.0f);
+        expectStateLog({stateLine("bias", 0.0f, 0.0f, 0.0f), stateLine("bias", -0.0f, 0.0f, 0.0f), stateLine("bias", -0.0f, 0.0f, -0.0f), stateLine("bias", nan, 0.0f, -0.0f), stateLine("bias", otherNan, 0.0f, -0.0f)}, "depth bias tuples compared by bit pattern");
+        tracker.SetDepthBounds(context, 0.0f, 1.0f);
+        tracker.SetDepthBounds(context, 0.0f, 1.0f);
+        tracker.SetDepthBounds(context, -0.0f, 1.0f);
+        tracker.SetScissor(context, {{0, 0}, {640, 480}});
+        tracker.SetScissor(context, {{0, 0}, {640, 480}});
+        tracker.SetScissor(context, {{0, 1}, {640, 480}});
+        expectStateLog({stateLine("bounds", 0.0f, 1.0f), stateLine("bounds", -0.0f, 1.0f), stateLine("scissor", 0, 0, 640u, 480u), stateLine("scissor", 0, 1, 640u, 480u)}, "depth bounds and scissor rectangles");
+        tracker.SetFrontFace(context, VK_FRONT_FACE_CLOCKWISE);
+        tracker.SetFrontFace(context, VK_FRONT_FACE_CLOCKWISE);
+        tracker.SetFrontFace(context, VK_FRONT_FACE_COUNTER_CLOCKWISE);
+        for (const VkBool32 enable : {1u, 1u, 0u}) {
+            tracker.SetDepthTestEnable(context, enable);
+            tracker.SetDepthWriteEnable(context, enable);
+            tracker.SetDepthBoundsTestEnable(context, enable);
+            tracker.SetStencilTestEnable(context, enable);
+        }
+        tracker.SetDepthCompareOp(context, VK_COMPARE_OP_LESS);
+        tracker.SetDepthCompareOp(context, VK_COMPARE_OP_LESS);
+        tracker.SetDepthCompareOp(context, VK_COMPARE_OP_ALWAYS);
+        expectStateLog({stateLine("front", static_cast<std::uint32_t>(VK_FRONT_FACE_CLOCKWISE)), stateLine("front", static_cast<std::uint32_t>(VK_FRONT_FACE_COUNTER_CLOCKWISE)),
+                        stateLine("depthtest", 1u), stateLine("depthwrite", 1u), stateLine("boundstest", 1u), stateLine("stenciltest", 1u),
+                        stateLine("depthtest", 0u), stateLine("depthwrite", 0u), stateLine("boundstest", 0u), stateLine("stenciltest", 0u),
+                        stateLine("depthcompare", static_cast<std::uint32_t>(VK_COMPARE_OP_LESS)), stateLine("depthcompare", static_cast<std::uint32_t>(VK_COMPARE_OP_ALWAYS))}, "face, enable and compare state");
+    }
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        const auto keep = static_cast<std::uint32_t>(VK_STENCIL_OP_KEEP);
+        const auto replace = static_cast<std::uint32_t>(VK_STENCIL_OP_REPLACE);
+        const auto always = static_cast<std::uint32_t>(VK_COMPARE_OP_ALWAYS);
+        tracker.SetStencilReference(context, front, 4u);
+        tracker.SetStencilReference(context, front, 4u);
+        tracker.SetStencilReference(context, both, 4u);
+        tracker.SetStencilReference(context, both, 4u);
+        tracker.SetStencilReference(context, back, 4u);
+        tracker.SetStencilReference(context, both, 5u);
+        tracker.SetStencilReference(context, front, 4u);
+        tracker.SetStencilReference(context, both, 4u);
+        expectStateLog({stateLine("reference", static_cast<std::uint32_t>(front), 4u), stateLine("reference", static_cast<std::uint32_t>(back), 4u), stateLine("reference", static_cast<std::uint32_t>(both), 5u), stateLine("reference", static_cast<std::uint32_t>(front), 4u), stateLine("reference", static_cast<std::uint32_t>(back), 4u)}, "front and back stencil references");
+        tracker.SetStencilCompareMask(context, front, 0xffu);
+        tracker.SetStencilCompareMask(context, back, 0x0fu);
+        tracker.SetStencilCompareMask(context, both, 0x0fu);
+        tracker.SetStencilWriteMask(context, both, 0xffu);
+        tracker.SetStencilWriteMask(context, front, 0xffu);
+        tracker.SetStencilWriteMask(context, back, 0u);
+        expectStateLog({stateLine("comparemask", static_cast<std::uint32_t>(front), 0xffu), stateLine("comparemask", static_cast<std::uint32_t>(back), 0x0fu), stateLine("comparemask", static_cast<std::uint32_t>(front), 0x0fu), stateLine("writemask", static_cast<std::uint32_t>(both), 0xffu), stateLine("writemask", static_cast<std::uint32_t>(back), 0u)}, "front and back stencil masks");
+        tracker.SetStencilOp(context, front, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+        tracker.SetStencilOp(context, back, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+        tracker.SetStencilOp(context, both, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+        tracker.SetStencilOp(context, front, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_REPLACE, VK_COMPARE_OP_ALWAYS);
+        tracker.SetStencilOp(context, both, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_REPLACE, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_ALWAYS);
+        expectStateLog({stateLine("stencilop", static_cast<std::uint32_t>(front), keep, replace, keep, always), stateLine("stencilop", static_cast<std::uint32_t>(back), keep, replace, keep, always), stateLine("stencilop", static_cast<std::uint32_t>(front), keep, replace, replace, always), stateLine("stencilop", static_cast<std::uint32_t>(front), keep, replace, keep, always)}, "front and back stencil operations");
+    }
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        const VkViewport viewport{0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f};
+        tracker.BindPipeline(context, pipelineA, library);
+        tracker.BindPipeline(context, pipelineA, library);
+        tracker.SetCullMode(context, 1u);
+        tracker.SetViewport(context, viewport);
+        tracker.BindPipeline(context, pipelineA, library);
+        expectStateLog({stateLine("bind", 0u, pipelineA), stateLine("cull", 1u), stateLine("viewport", 0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f)}, "a repeated bind of a fully dynamic pipeline");
+        tracker.BindPipeline(context, pipelineB, fixed);
+        tracker.SetViewport(context, viewport);
+        Require(!tracker.Known(Slot::CullMode) && tracker.Known(Slot::Viewport) && tracker.BoundPipeline() == pipelineB, "binding a pipeline with static cull mode kept the cull mode known");
+        tracker.BindPipeline(context, pipelineA, library);
+        tracker.SetCullMode(context, 1u);
+        tracker.SetViewport(context, viewport);
+        expectStateLog({stateLine("bind", 0u, pipelineB), stateLine("bind", 0u, pipelineA), stateLine("cull", 1u)}, "dynamic, static, dynamic pipelines");
+        tracker.BindPipeline(context, pipelineC, fixed);
+        tracker.BindPipeline(context, pipelineC, fixed);
+        tracker.SetViewport(context, {0.0f, 0.0f, 32.0f, 64.0f, 0.0f, 1.0f});
+        tracker.BindPipeline(context, pipelineC, fixed);
+        expectStateLog({stateLine("bind", 0u, pipelineC), stateLine("viewport", 0.0f, 0.0f, 32.0f, 64.0f, 0.0f, 1.0f)}, "a static pipeline after a setter of its dynamic state");
+        tracker.SetCullMode(context, 2u);
+        tracker.BindPipeline(context, pipelineC, fixed);
+        tracker.BindPipeline(context, pipelineC, fixed);
+        expectStateLog({stateLine("cull", 2u), stateLine("bind", 0u, pipelineC)}, "a static pipeline after a setter of its static state");
+        tracker.BindPipeline(context, pipelineC, library);
+        expectStateLog({stateLine("bind", 0u, pipelineC)}, "a handle bound with another dynamic state mask");
+        tracker.Invalidate();
+        tracker.BindPipeline(context, pipelineC, library);
+        Require(tracker.BoundPipeline() == pipelineC, "a bind after invalidation was not recorded");
+        expectStateLog({stateLine("bind", 0u, pipelineC)}, "a bind after invalidation");
+        CommandState unsuppressed;
+        unsuppressed.Begin(commands, false);
+        unsuppressed.BindPipeline(context, pipelineC, library);
+        unsuppressed.BindPipeline(context, pipelineC, library);
+        expectStateLog({stateLine("bind", 0u, pipelineC), stateLine("bind", 0u, pipelineC)}, "a tracker that does not suppress binding");
+    }
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        tracker.BindPipeline(context, pipelineA, library);
+        tracker.SetCullMode(context, 1u);
+        tracker.Begin(commands);
+        Require(tracker.BoundPipeline() == VK_NULL_HANDLE && !tracker.Known(Slot::CullMode), "beginning the same command buffer again did not start a new recording");
+        tracker.BindPipeline(context, pipelineA, library);
+        tracker.SetCullMode(context, 1u);
+        tracker.SetCullMode(context, 1u);
+        expectStateLog({stateLine("bind", 0u, pipelineA), stateLine("cull", 1u), stateLine("bind", 0u, pipelineA), stateLine("cull", 1u)}, "a reused command buffer handle");
+        const auto other = makeHandle<VkCommandBuffer>();
+        tracker.Begin(other);
+        tracker.SetCullMode(context, 1u);
+        Require(tracker.Commands() == other, "beginning another command buffer did not restart the tracker");
+        expectStateLog({stateLine("cull", 1u)}, "another command buffer");
+    }
+
+    {
+        const auto before = pipelineSampleLocations.size();
+        mock = MockVulkan{};
+        auto pipelineContext = mockContext();
+        pipelineContext.deviceProc = sampleLocationProc;
+        pipelineContext.device = makeHandle<VkDevice>();
+        pipelineContext.functions = &functions;
+        pipelineContext.depthBounds = true;
+        pipelineContext.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        pipelineContext.limits.framebufferDepthSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+        pipelineContext.limits.maxFramebufferWidth = 64;
+        pipelineContext.limits.maxFramebufferHeight = 64;
+        pipelineContext.limits.maxFramebufferLayers = 1;
+        State state{};
+        state.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+        state.depthBias = true;
+        state.depthBiasConstant = 2.0f;
+        state.depthBiasSlope = 1.0f;
+        state.depthBoundsTest = true;
+        state.minDepthBounds = 0.25f;
+        state.maxDepthBounds = 0.75f;
+        state.viewport = {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f};
+        state.scissor = {{0, 0}, {64, 64}};
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        vertex.spirv = makeModule({});
+        fragment.spirv = makeModule({.fragment = true});
+        vertex.variantId = 1;
+        fragment.variantId = 2;
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+        const std::array<std::uint32_t, 1> mainKey{41};
+        const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, mainKey, {}};
+        {
+            Pipeline first(pipelineContext, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            Pipeline second(pipelineContext, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            CommandState tracker;
+            tracker.Begin(commands);
+            stateLog.clear();
+            statePipelines.clear();
+            first.Continue(tracker, state);
+            const auto bound = tracker.BoundPipeline();
+            Require(bound != VK_NULL_HANDLE, "a pipeline continued through a tracker was not recorded as bound");
+            const auto lines = stateLog;
+            Require(lines.size() == 5 && lines[0] == stateLine("bind", 0u, bound), "the first continued draw did not bind and set every dynamic state");
+            expectStateLog(lines, "the first continued draw");
+            first.Continue(tracker, state);
+            expectStateLog({}, "an unchanged continued draw");
+            auto moved = state;
+            moved.scissor = {{1, 1}, {32, 32}};
+            moved.depthBiasConstant = 3.0f;
+            first.Continue(tracker, moved);
+            expectStateLog({stateLine("scissor", 1, 1, 32u, 32u), stateLine("bias", 3.0f, 0.0f, 1.0f)}, "a continued draw that changes the scissor and the depth bias");
+            second.Continue(tracker, moved);
+            const auto next = tracker.BoundPipeline();
+            Require(next != bound, "a second pipeline was not recorded as bound");
+            expectStateLog({stateLine("bind", 0u, next)}, "a second pipeline with the same dynamic state");
+            first.Continue(tracker, moved);
+            expectStateLog({stateLine("bind", 0u, bound)}, "the first pipeline again");
+            const std::array<VkImageView, 1> passView{makeHandle<VkImageView>()};
+            const auto passFramebuffer = first.AcquireFramebuffer(passView, {}, {64, 64});
+            CommandState passes;
+            passes.Begin(commands);
+            stateLog.clear();
+            first.Begin(passes, *passFramebuffer, {64, 64}, state);
+            const auto firstPass = stateLog;
+            Require(firstPass.size() == 5, "the first render pass of a batch did not bind and set every dynamic state");
+            expectStateLog(firstPass, "the first render pass of a batch");
+            EndRenderPass(pipelineContext, commands);
+            first.Begin(passes, *passFramebuffer, {64, 64}, state);
+            expectStateLog({}, "a second render pass of the same batch with an identical draw");
+            auto resized = state;
+            resized.viewport.width = 32.0f;
+            EndRenderPass(pipelineContext, commands);
+            first.Begin(passes, *passFramebuffer, {64, 64}, resized);
+            expectStateLog({stateLine("viewport", 0.0f, 0.0f, 32.0f, 64.0f, 0.0f, 1.0f)}, "a third render pass of the same batch that changes the viewport");
+            CommandState unsuppressed;
+            unsuppressed.Begin(commands, false);
+            first.Continue(unsuppressed, state);
+            Require(stateLog.size() == 5, "a continued draw through a tracker that does not suppress skipped commands");
+            stateLog.clear();
+            static int convertedTag = 0;
+            auto converted = pipelineContext;
+            converted.physical = reinterpret_cast<VkPhysicalDevice>(&convertedTag);
+            converted.formatProperties = [](VkPhysicalDevice, VkFormat format, VkFormatProperties* properties) {
+                *properties = {};
+                if (format != VK_FORMAT_D16_UNORM_S8_UINT) properties->optimalTilingFeatures = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+            };
+            auto stored = state;
+            stored.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D16_UNORM_S8_UINT, 1.0f, 0};
+            stored.depthBiasPerFace = true;
+            stored.backDepthBiasConstant = 5.0f;
+            stored.backDepthBiasSlope = 4.0f;
+            Pipeline scaled(converted, stored, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            Require(scaled.SplitsFaces(), "the converted depth format pipeline did not split its faces");
+            CommandState scaledTracker;
+            scaledTracker.Begin(commands);
+            scaled.Continue(scaledTracker, stored);
+            const auto frontBound = scaledTracker.BoundPipeline();
+            const auto scaledLines = stateLog;
+            Require(scaledLines.size() == 5 && scaledLines[3] == stateLine("bias", 512.0f, 0.0f, 1.0f), "a guest depth bias of 2 on a D16 target stored as D24 was not recorded as 512");
+            expectStateLog(scaledLines, "the first draw of a converted depth format");
+            scaled.Continue(scaledTracker, stored);
+            expectStateLog({}, "an equal guest depth bias on a converted depth format");
+            stored.depthBiasConstant = 3.0f;
+            scaled.Continue(scaledTracker, stored);
+            expectStateLog({stateLine("bias", 768.0f, 0.0f, 1.0f)}, "a changed guest depth bias on a converted depth format");
+            scaled.ContinueBackFaces(scaledTracker, stored);
+            const auto backBound = scaledTracker.BoundPipeline();
+            Require(backBound != frontBound, "the back face pipeline was not recorded as bound");
+            expectStateLog({stateLine("bind", 0u, backBound), stateLine("bias", 1280.0f, 0.0f, 4.0f)}, "back faces with a converted depth bias");
+            scaled.ContinueBackFaces(scaledTracker, stored);
+            expectStateLog({}, "back faces drawn again with an equal converted depth bias");
+            scaled.Continue(scaledTracker, stored);
+            expectStateLog({stateLine("bind", 0u, frontBound), stateLine("bias", 768.0f, 0.0f, 1.0f)}, "front faces after the back faces' depth bias");
+            auto convertedLibraries = converted;
+            convertedLibraries.graphicsPipelineLibrary = true;
+            convertedLibraries.pipelineLinkTimeOptimization = false;
+            auto storedWhole = stored;
+            storedWhole.depthBiasPerFace = false;
+            Pipeline scaledLibraries(convertedLibraries, storedWhole, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            CommandState librariesTracker;
+            librariesTracker.Begin(commands);
+            stateLog.clear();
+            scaledLibraries.Continue(librariesTracker, storedWhole);
+            Require(stateLog.size() == 16 && stateLog[5] == stateLine("bias", 768.0f, 0.0f, 1.0f), "a guest depth bias of 3 on a D16 target stored as D24 was not recorded as 768 by a graphics pipeline library pipeline");
+            stateLog.clear();
+            scaledLibraries.Continue(librariesTracker, storedWhole);
+            expectStateLog({}, "an equal guest depth bias on a converted depth format drawn with a graphics pipeline library pipeline");
+            auto optimizing = pipelineContext;
+            optimizing.graphicsPipelineLibrary = true;
+            optimizing.pipelineLinkTimeOptimization = true;
+            WaitForOptimizedPipelines(optimizing.device);
+            ClearCachedPipelines(optimizing.device);
+            {
+                std::lock_guard lock(pipelineCreateMutex);
+                blockOptimizedLink = true;
+                releaseOptimizedLink = false;
+            }
+            Pipeline linked(optimizing, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+            CommandState swapTracker;
+            swapTracker.Begin(commands);
+            linked.Continue(swapTracker, state);
+            const auto fastLinked = swapTracker.BoundPipeline();
+            Require(fastLinked != VK_NULL_HANDLE, "a pipeline drawn before its optimized link completed did not bind a handle");
+            Require(!linked.Optimized(), "the optimized link completed while it was blocked");
+            Require(stateLog.size() == 16, "the first draw of a graphics pipeline library pipeline did not bind and set every dynamic state");
+            stateLog.clear();
+            linked.Continue(swapTracker, state);
+            expectStateLog({}, "a second draw of the fast-linked handle");
+            {
+                std::lock_guard lock(pipelineCreateMutex);
+                blockOptimizedLink = false;
+                releaseOptimizedLink = true;
+            }
+            pipelineCreateCondition.notify_all();
+            WaitForOptimizedPipelines(optimizing.device);
+            Require(linked.Optimized(), "the optimized link did not complete");
+            linked.Continue(swapTracker, state);
+            const auto optimizedLinked = swapTracker.BoundPipeline();
+            Require(optimizedLinked != VK_NULL_HANDLE && optimizedLinked != fastLinked, "the optimized handle did not replace the fast-linked handle");
+            expectStateLog({stateLine("bind", 0u, optimizedLinked)}, "the first draw after the optimized link completed");
+            linked.Continue(swapTracker, state);
+            expectStateLog({}, "a second draw of the optimized handle");
+        }
+        ClearPipelineLibraries(pipelineContext.device);
+        Require(mock.live == 0, "the command state pipeline tests leaked Vulkan objects");
+        mock = MockVulkan{};
+        pipelineSampleLocations.resize(before);
+    }
+    stateLog.clear();
+    statePipelines.clear();
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -13642,12 +14337,21 @@ int main(int argc, char** argv) {
     setenv("APS5_HEAP_MIRROR_MIB", "4", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--recorded-draw-retention") {
+            recordedDrawRetentionTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--linear-volume-nonresident") {
             LinearVolumeNonResidentTests();
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--fault-only-template-records") {
             faultOnlyTemplateRecordTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--content-key-hash") {
+            contentKeyHashTests();
+            std::cout << "content key hash tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-cache") {
@@ -13661,6 +14365,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unused-stencil-reference") {
             stencilReferenceUnusedTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--command-state") {
+            commandStateTests();
+            std::cout << "graphics command state suppression tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--command-batch-fence-failure") {
@@ -14010,6 +14719,7 @@ int main(int argc, char** argv) {
         orderedPixelShaderTests();
         stencilRefExportTests();
         stencilReferenceUnusedTests();
+        commandStateTests();
         stencilLogicOperationTests();
         aliasedBufferViewTests();
         LineStripTests();
@@ -14100,6 +14810,7 @@ int main(int argc, char** argv) {
         meshLimitTests();
         meshIndexBufferTests();
         stagingPoolBudgetTests();
+        snapshotMemoryTests();
         validationTests();
         vertexCopyTests();
         highestDrawIndexTests();

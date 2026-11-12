@@ -69,14 +69,22 @@ enum class RecipeOutcome { Recorded, Rebuild };
 // push constant block, the state with the unwritten outputs masked, the fragment outputs and the
 // pipeline stages. Built at the end of a recorded, cacheable, reusable, non-indirect draw and
 // attached to the draw entry's matched stage variants; immutable.
+struct PlanStageWords {
+    std::shared_ptr<const std::vector<std::uint32_t>> fixed;
+    std::vector<std::uint32_t> patched;
+};
+
 struct DrawRecipe {
     VkDevice device = VK_NULL_HANDLE;
     std::weak_ptr<Graphics::ShaderResources> templateRef;
     Graphics::ResourceCache::Key key;
+    std::size_t keyHash = 0;
     std::weak_ptr<Graphics::Pipeline> pipeline;
     std::weak_ptr<Graphics::Framebuffer> framebuffer;
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;
     std::vector<VkImageView> targetViews;
+    std::vector<std::array<std::uint32_t, 5>> targetViewInputs;
+    std::array<std::uint64_t, 12> depthViewInputs{};
     std::uint64_t passKey = 0;
     Graphics::VertexInputLayout vertexInput;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};
@@ -85,6 +93,15 @@ struct DrawRecipe {
     std::uint32_t fragmentOutputs = 0;
     VkPipelineStageFlags shaderStages = 0;
     bool hasDepth = false;
+    VkExtent2D renderExtent{};
+    std::vector<PlanStageWords> bindingWords;
+    std::vector<std::vector<std::uint32_t>> verifyWords;
+    std::vector<std::uint32_t> mainSetKey;
+    std::vector<std::uint32_t> fragmentSetKey;
+    bool splitSets = false;
+    bool servable = true;
+    bool plannable = true;
+    std::uint32_t movedBases = 0;
 };
 
 }

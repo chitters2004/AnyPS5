@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -18,6 +19,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -31,6 +33,7 @@ class RenderCache;
 class DrawQueue;
 class GraphicsPipelineCache;
 class Recorder;
+class CommandState;
 class DescriptorCache;
 class SamplerCache;
 class ShaderResources;
@@ -99,6 +102,43 @@ struct BdaUnalignedAccess : std::runtime_error {
     std::uint32_t instruction;
 };
 
+void TrackedCommandOutsideCommandState();
+
+class FunctionName {
+public:
+    consteval FunctionName(const char* name) : value(name) {
+        constexpr std::array<std::string_view, 32> tracked{
+            "vkCmdBindPipeline", "vkCmdSetViewport", "vkCmdSetViewportWithCount", "vkCmdSetViewportWithCountEXT",
+            "vkCmdSetScissor", "vkCmdSetScissorWithCount", "vkCmdSetScissorWithCountEXT", "vkCmdSetColorWriteMaskEXT", "vkCmdSetDepthBias",
+            "vkCmdSetDepthBias2EXT", "vkCmdSetDepthBounds", "vkCmdSetCullMode", "vkCmdSetCullModeEXT",
+            "vkCmdSetFrontFace", "vkCmdSetFrontFaceEXT", "vkCmdSetDepthTestEnable", "vkCmdSetDepthTestEnableEXT",
+            "vkCmdSetDepthWriteEnable", "vkCmdSetDepthWriteEnableEXT", "vkCmdSetDepthCompareOp", "vkCmdSetDepthCompareOpEXT",
+            "vkCmdSetDepthBoundsTestEnable", "vkCmdSetDepthBoundsTestEnableEXT", "vkCmdSetStencilTestEnable", "vkCmdSetStencilTestEnableEXT",
+            "vkCmdSetStencilOp", "vkCmdSetStencilOpEXT", "vkCmdSetStencilCompareMask", "vkCmdSetStencilWriteMask",
+            "vkCmdSetStencilReference", "vkCmdBindShadersEXT", "vkCmdExecuteCommands"};
+        for (const auto entry : tracked) {
+            if (entry == name) TrackedCommandOutsideCommandState();
+        }
+    }
+    constexpr const char* Value() const { return value; }
+
+private:
+    const char* value;
+};
+
+template<typename TFunction>
+class TrackedFunction {
+public:
+    TrackedFunction& operator=(TFunction bound) {
+        function = bound;
+        return *this;
+    }
+
+private:
+    friend struct Context;
+    TFunction function = nullptr;
+};
+
 // Device entry points resolved once per device (VulkanDevice's State fills it after setup): the
 // loader's vkGetDeviceProcAddr is a name lookup under its global mutex per call, paid at every
 // record site otherwise. Null members (tests, APS5_NO_PROC_TABLE=1) resolve per call (Resolved).
@@ -107,7 +147,7 @@ struct DeviceFunctions {
     PFN_vkCmdCopyBuffer cmdCopyBuffer = nullptr;
     PFN_vkCmdUpdateBuffer cmdUpdateBuffer = nullptr;
     PFN_vkCmdFillBuffer cmdFillBuffer = nullptr;
-    PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
+    TrackedFunction<PFN_vkCmdBindPipeline> cmdBindPipeline;
     PFN_vkCmdBindDescriptorSets cmdBindDescriptorSets = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
@@ -116,22 +156,22 @@ struct DeviceFunctions {
     PFN_vkCmdEndRenderPass cmdEndRenderPass = nullptr;
     PFN_vkCmdBeginRenderingKHR cmdBeginRendering = nullptr;
     PFN_vkCmdEndRenderingKHR cmdEndRendering = nullptr;
-    PFN_vkCmdSetViewport cmdSetViewport = nullptr;
-    PFN_vkCmdSetScissor cmdSetScissor = nullptr;
-    PFN_vkCmdSetColorWriteMaskEXT cmdSetColorWriteMask = nullptr;
-    PFN_vkCmdSetDepthBounds cmdSetDepthBounds = nullptr;
-    PFN_vkCmdSetDepthBias cmdSetDepthBias = nullptr;
-    PFN_vkCmdSetCullModeEXT cmdSetCullMode = nullptr;
-    PFN_vkCmdSetFrontFaceEXT cmdSetFrontFace = nullptr;
-    PFN_vkCmdSetDepthTestEnableEXT cmdSetDepthTestEnable = nullptr;
-    PFN_vkCmdSetDepthWriteEnableEXT cmdSetDepthWriteEnable = nullptr;
-    PFN_vkCmdSetDepthCompareOpEXT cmdSetDepthCompareOp = nullptr;
-    PFN_vkCmdSetDepthBoundsTestEnableEXT cmdSetDepthBoundsTestEnable = nullptr;
-    PFN_vkCmdSetStencilTestEnableEXT cmdSetStencilTestEnable = nullptr;
-    PFN_vkCmdSetStencilOpEXT cmdSetStencilOp = nullptr;
-    PFN_vkCmdSetStencilCompareMask cmdSetStencilCompareMask = nullptr;
-    PFN_vkCmdSetStencilWriteMask cmdSetStencilWriteMask = nullptr;
-    PFN_vkCmdSetStencilReference cmdSetStencilReference = nullptr;
+    TrackedFunction<PFN_vkCmdSetViewport> cmdSetViewport;
+    TrackedFunction<PFN_vkCmdSetScissor> cmdSetScissor;
+    TrackedFunction<PFN_vkCmdSetColorWriteMaskEXT> cmdSetColorWriteMask;
+    TrackedFunction<PFN_vkCmdSetDepthBounds> cmdSetDepthBounds;
+    TrackedFunction<PFN_vkCmdSetDepthBias> cmdSetDepthBias;
+    TrackedFunction<PFN_vkCmdSetCullModeEXT> cmdSetCullMode;
+    TrackedFunction<PFN_vkCmdSetFrontFaceEXT> cmdSetFrontFace;
+    TrackedFunction<PFN_vkCmdSetDepthTestEnableEXT> cmdSetDepthTestEnable;
+    TrackedFunction<PFN_vkCmdSetDepthWriteEnableEXT> cmdSetDepthWriteEnable;
+    TrackedFunction<PFN_vkCmdSetDepthCompareOpEXT> cmdSetDepthCompareOp;
+    TrackedFunction<PFN_vkCmdSetDepthBoundsTestEnableEXT> cmdSetDepthBoundsTestEnable;
+    TrackedFunction<PFN_vkCmdSetStencilTestEnableEXT> cmdSetStencilTestEnable;
+    TrackedFunction<PFN_vkCmdSetStencilOpEXT> cmdSetStencilOp;
+    TrackedFunction<PFN_vkCmdSetStencilCompareMask> cmdSetStencilCompareMask;
+    TrackedFunction<PFN_vkCmdSetStencilWriteMask> cmdSetStencilWriteMask;
+    TrackedFunction<PFN_vkCmdSetStencilReference> cmdSetStencilReference;
     PFN_vkCmdBindVertexBuffers cmdBindVertexBuffers = nullptr;
     PFN_vkCmdBindIndexBuffer cmdBindIndexBuffer = nullptr;
     PFN_vkCmdDraw cmdDraw = nullptr;
@@ -150,6 +190,28 @@ struct DeviceFunctions {
 std::uint64_t& DeviceProcLookups();
 
 inline constexpr std::size_t EmptyBufferBytes = 16;
+
+inline constexpr VkMemoryPropertyFlags HostBufferProperties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+inline constexpr VkMemoryPropertyFlags MappedDeviceProperties = HostBufferProperties | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+inline VkMemoryPropertyFlags SnapshotMemoryProperties(const VkPhysicalDeviceMemoryProperties& memory, bool disabled) {
+    constexpr VkDeviceSize ResizableBarBytes = VkDeviceSize{4} << 30u;
+    if (disabled) return HostBufferProperties;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto& type = memory.memoryTypes[i];
+        if ((type.propertyFlags & MappedDeviceProperties) == MappedDeviceProperties && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return MappedDeviceProperties;
+    }
+    return HostBufferProperties;
+}
+
+inline std::optional<std::uint32_t> BarUploadMemoryType(const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t mask) {
+    constexpr VkDeviceSize ResizableBarBytes = VkDeviceSize{4} << 30u;
+    for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+        const auto& type = memory.memoryTypes[i];
+        if ((mask & (1u << i)) != 0 && (type.propertyFlags & MappedDeviceProperties) == MappedDeviceProperties && type.heapIndex < memory.memoryHeapCount && memory.memoryHeaps[type.heapIndex].size >= ResizableBarBytes) return i;
+    }
+    return std::nullopt;
+}
 
 struct Context {
     VkDevice device;
@@ -296,25 +358,51 @@ struct Context {
     VertexBufferFormats* vertexFormats = nullptr;
 
     template<typename TFunction>
-    TFunction Function(const char* name) const {
-        Require(deviceProc != nullptr, "missing Vulkan device function resolver");
-        ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
-        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
-        return function;
+    TFunction Function(FunctionName name) const {
+        return lookup<TFunction>(name.Value());
     }
 
     // The table's entry point, or a per-call lookup while the table is absent or lacks it.
     template<typename TFunction>
-    TFunction Resolved(TFunction DeviceFunctions::*member, const char* name) const {
+    TFunction Resolved(TFunction DeviceFunctions::*member, FunctionName name) const {
         if (functions != nullptr && functions->*member != nullptr) return functions->*member;
-        return Function<TFunction>(name);
+        return lookup<TFunction>(name.Value());
     }
 
-    std::uint32_t MemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
+    class ComputeBinder {
+    public:
+        void operator()(VkCommandBuffer commands, VkPipeline pipeline) const {
+            bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        }
+
+    private:
+        friend struct Context;
+        explicit ComputeBinder(PFN_vkCmdBindPipeline function) : bind(function) {}
+        PFN_vkCmdBindPipeline bind;
+    };
+
+    ComputeBinder ComputeBinding() const {
+        return ComputeBinder(tracked(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline"));
+    }
+
+    void BindComputePipeline(VkCommandBuffer commands, VkPipeline pipeline) const {
+        ComputeBinding()(commands, pipeline);
+    }
+
+    VkMemoryPropertyFlags SnapshotProperties() const {
+        static const bool disabled = std::getenv("APS5_NO_BAR_SNAPSHOTS") != nullptr;
+        return SnapshotMemoryProperties(memory, disabled);
+    }
+
+    std::optional<std::uint32_t> MatchingMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
         for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
             if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & flags) == flags) return i;
         }
+        return std::nullopt;
+    }
+
+    std::uint32_t MemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags) const {
+        if (const auto type = MatchingMemoryType(mask, flags)) return *type;
         throw std::runtime_error("AGC graphics: required Vulkan memory type is unavailable");
     }
 
@@ -411,6 +499,62 @@ struct Context {
     std::optional<std::uint32_t> RefusedDeviceMemoryFallback(std::uint32_t mask, std::uint32_t refused) const {
         if (refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
         return HostMemoryType(mask);
+    }
+
+    VkMemoryPropertyFlags MappedBufferProperties(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
+        if ((flags & MappedDeviceProperties) != MappedDeviceProperties) return flags;
+        const auto mapped = MatchingMemoryType(mask, flags);
+        if (!mapped) {
+            static std::atomic<std::uint64_t> placements{0};
+            const auto count = placements.fetch_add(1) + 1;
+            if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] mapped buffer: none of the buffer's memory types (mask 0x%x) is mapped device-local, placed in host memory; %llu such allocations\n", mask, static_cast<unsigned long long>(count));
+            return HostBufferProperties;
+        }
+        if (memoryProperties2 == nullptr || physical == VK_NULL_HANDLE) return flags;
+        VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+        VkPhysicalDeviceMemoryProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2};
+        properties.pNext = &reported;
+        memoryProperties2(physical, &properties);
+        const auto heap = memory.memoryTypes[*mapped].heapIndex;
+        const auto budget = reported.heapBudget[heap];
+        const auto usage = reported.heapUsage[heap];
+        if (budget == 0 || (usage < budget && bytes <= budget - usage)) return flags;
+        static std::atomic<std::uint64_t> placements{0}, placedBytes{0};
+        const auto count = placements.fetch_add(1) + 1;
+        const auto total = placedBytes.fetch_add(bytes) + bytes;
+        if (count <= 5 || (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] mapped buffer: device-local heap %u uses %llu of its %llu MiB budget, %llu bytes placed in host memory; %llu such allocations, %llu MiB\n", heap, static_cast<unsigned long long>(usage >> 20u), static_cast<unsigned long long>(budget >> 20u), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(count), static_cast<unsigned long long>(total >> 20u));
+        return HostBufferProperties;
+    }
+
+    std::optional<std::uint32_t> RefusedMappedMemoryFallback(std::uint32_t mask, VkMemoryPropertyFlags flags, std::uint32_t refused) const {
+        if ((flags & MappedDeviceProperties) != MappedDeviceProperties || refused >= memory.memoryTypeCount || (memory.memoryHeaps[memory.memoryTypes[refused].heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) == 0) return std::nullopt;
+        std::optional<std::uint32_t> host;
+        for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+            const auto& type = memory.memoryTypes[i];
+            if ((mask & (1u << i)) == 0 || (type.propertyFlags & HostBufferProperties) != HostBufferProperties || (memory.memoryHeaps[type.heapIndex].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) continue;
+            if ((type.propertyFlags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) != 0) return i;
+            if (!host) host = i;
+        }
+        return host;
+    }
+
+private:
+    friend class CommandState;
+    friend void FillDeviceFunctions(const Context& context, DeviceFunctions& functions);
+
+    template<typename TFunction>
+    TFunction lookup(const char* name) const {
+        Require(deviceProc != nullptr, "missing Vulkan device function resolver");
+        ++DeviceProcLookups();
+        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
+        return function;
+    }
+
+    template<typename TFunction>
+    TFunction tracked(TrackedFunction<TFunction> DeviceFunctions::*member, const char* name) const {
+        if (functions != nullptr && (functions->*member).function != nullptr) return (functions->*member).function;
+        return lookup<TFunction>(name);
     }
 };
 

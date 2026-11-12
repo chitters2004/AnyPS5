@@ -435,7 +435,7 @@ public:
     void Keep() {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Device() == context.device) {
             recorder->Keep(shared_from_this());
-            recorder->KeepBytes(this, allocationBytes);
+            recorder->Retain(this, allocationBytes);
         }
     }
 
@@ -1891,6 +1891,14 @@ void ReportGuardSpanMiss(const char* list, std::uint64_t address, std::uint64_t 
     static std::atomic<unsigned> reports{0};
     if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[guard-spans] verify: the %s copy answered no overlap for 0x%llx+0x%llx, but a listed guard overlaps it\n", list, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
     NoteGuardSpans(GuardSpanEvent::Missed);
+}
+
+std::uint64_t MultisampleGuardsGeneration() {
+    return guardSpansGeneration().load(std::memory_order_acquire);
+}
+
+bool MultisampleGuardsMayOverlap(std::uint64_t address, std::size_t bytes) {
+    return bytes != 0 && anyGuarded().load(std::memory_order_acquire) && mayOverlapGuarded(address, bytes);
 }
 
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {

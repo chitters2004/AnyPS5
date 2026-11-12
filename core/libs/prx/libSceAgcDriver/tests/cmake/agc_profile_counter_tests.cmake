@@ -1,5 +1,6 @@
 add_test_executable(agc_profile_counter_tests EXCLUDE_FROM_ALL tests/ProfileCounter.cpp)
 target_include_directories(agc_profile_counter_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_profile_counter_tests PRIVATE libc)
 set_target_properties(agc_profile_counter_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_profile_counter_tests)
 if(BUILD_TESTING)

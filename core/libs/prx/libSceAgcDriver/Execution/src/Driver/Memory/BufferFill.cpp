@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <vector>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include <bit>
@@ -249,11 +250,11 @@ namespace {
 void drainPendingInputWrites(std::uint32_t queueId, std::initializer_list<std::pair<std::uint64_t, std::size_t>> inputs) {
     if (queueId != 0 || !DrawPipeline::Active()) return;
     auto& pipeline = DrawPipeline::Queue0();
-    for (const auto& [address, bytes] : inputs) {
-        if (!pipeline.Overlaps(address, bytes)) continue;
-        pipeline.Drain(DrawPipeline::DrainReason::Capture, 0x15);
-        return;
-    }
+    if (std::none_of(inputs.begin(), inputs.end(), [&](const auto& input) { return pipeline.Overlaps(input.first, input.second); })) return;
+    std::vector<DrawPipeline::Range> reads;
+    reads.reserve(inputs.size());
+    for (const auto& [address, bytes] : inputs) reads.emplace_back(address, address + bytes);
+    pipeline.DrainThrough(reads, DrawPipeline::CaptureSite::Fill, 0x15);
 }
 
 }

@@ -477,7 +477,7 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
     GuestBlocks blocks(3u * BlockBytes);
     const auto base = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(blocks.base));
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{base, base + 3u * BlockBytes}}};
-    const auto subscription = GuestMemory::SubscribeWrites(ranges);
+    const auto subscription = GuestMemory::SubscribeWrites(ranges, GuestMemory::WriteChangeAll, true);
     const auto bump = [&](std::uint64_t block) { GuestMemory::NoteGpuPending(base + block * BlockBytes, 4u); };
     std::vector<std::uint64_t> plain;
     std::vector<std::uint64_t> lookup;
@@ -500,6 +500,7 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
 
 int main(int argc, char** argv) {
     try {
+        GuestMemory::SetWriteIndexCountingForTest(true);
 #ifdef _WIN32
         _putenv_s("APS5_TABLE_INDEX", "1");
 #else

@@ -5,7 +5,7 @@ import re
 import sys
 from pathlib import Path
 
-DESCRIPTION = """Per-phase means of an in-run A/B (APS5_AB) log. The driver prints "[ab] phase A|B <k> begins at present
+DESCRIPTION = """Per-phase means of an in-run A/B (APS5_AB) log. The driver prints "[ab] phase <X> <k> begins at present
 <n> (t <s> s)" when a phase starts and "[ab] phase A|B <k> settled at present <n> (t <s> s)" APS5_AB_SETTLE seconds
 later. Each periodic report covers the time since the previous report of its kind, so a report counts for phase k
 only when the previous report of its kind came after phase k's settled line and the report came before phase k+1
@@ -13,10 +13,14 @@ began. Presents per 10 s and frame time come from the [ab] lines (settled line t
 and idle gaps per frame from [present], GPU time per present from [gputime] (APS5_PROFILE_GPU), the committer and
 drains from [draw] pipelined, unlocked hook waits from [syncwait] (APS5_PROFILE_DRAW). The noise column compares
 each B phase with the mean of its neighbouring A phases, which cancels a linear drift: mean difference, standard
-error, standard deviation and count. A requested program's phase metric is omitted if a report lists 12 programs
+error, standard deviation and count. With several arms (APS5_AB=<s>:<arm>|<arm>...), phase A is the environment's
+settings and the arms B, C, ... follow it in turn; each arm is compared with A, its noise with the two A phases that
+bracket its cycle, and --spread (implied with several arms) adds each side's phase count and phase-to-phase standard
+deviation. A requested program's phase metric is omitted if a report lists 12 programs
 without it: the list may be truncated, so the program's time is unknown."""
 
-PHASE = re.compile(r"^\[ab\] phase ([AB]) (\d+) (begins|settled) at present (\d+) \(t ([\d.]+) s\)")
+PHASE = re.compile(r"^\[ab\] phase ([A-Z]) (\d+) (begins|settled) at present (\d+) \(t ([\d.]+) s\)")
+ARM = re.compile(r"; ([A-Z]): ")
 KINDS = (("present", "[present] "), ("gputime", "[gputime] "), ("draw", "[draw] pipelined"), ("syncwait", "[syncwait] "))
 
 
@@ -157,14 +161,16 @@ def metrics(phase, programs, classes):
     return {name: value for name, value in out.items() if value is not None}
 
 
-def noise(values, phases):
+def noise(values, phases, arm="B", cycle=2):
+    offset = ord(arm) - ord("A")
+    position = {phase["index"]: place for place, phase in enumerate(phases)}
     differences = []
     for index, phase in enumerate(phases):
-        if phase["kind"] != "B" or values[index] is None:
+        if phase["kind"] != arm or values[index] is None:
             continue
-        neighbours = [values[other] for other in (index - 1, index + 1)
-                      if 0 <= other < len(phases) and phases[other]["kind"] == "A"
-                      and abs(phases[other]["index"] - phase["index"]) == 1 and values[other] is not None]
+        start = phase["index"] - offset
+        neighbours = [values[position[other]] for other in (start, start + cycle)
+                      if other in position and phases[position[other]]["kind"] == "A" and values[position[other]] is not None]
         if neighbours:
             differences.append(values[index] - finite_sum(neighbours) / len(neighbours))
     if not differences:
@@ -176,22 +182,54 @@ def noise(values, phases):
     return {"mean": mean, "se": sd / math.sqrt(len(differences)), "sd": sd, "n": len(differences)}
 
 
+def spread(values):
+    if len(values) < 2:
+        return None
+    mean = finite_sum(values) / len(values)
+    return math.sqrt(finite_sum((value - mean) ** 2 for value in values) / (len(values) - 1))
+
+
+def arm_letters(config, phases):
+    named = ARM.findall(config or "")
+    if named:
+        if named != [chr(ord("A") + index) for index in range(len(named))]:
+            raise ValueError("the [ab] configuration line does not list arms A, B, C, ... in order")
+        letters = named
+    else:
+        letters = [chr(code) for code in range(ord("A"), max(ord(phase["kind"]) for phase in phases) + 1)]
+    if len(letters) < 2:
+        letters = ["A", "B"]
+    unknown = sorted({phase["kind"] for phase in phases} - set(letters))
+    if unknown:
+        raise ValueError("phase " + unknown[0] + " is not an arm of the [ab] configuration line")
+    for phase in phases:
+        if letters[phase["index"] % len(letters)] != phase["kind"]:
+            raise ValueError(f"phase {phase['kind']} {phase['index']} is out of the arms' rotation")
+    return letters
+
+
 def split_report(lines, programs, classes):
     config, phases = read_log(lines)
     if not phases:
         raise ValueError("no [ab] phase lines (was APS5_AB set?)")
+    letters = arm_letters(config, phases)
     table = [metrics(phase, programs, classes) for phase in phases]
     names = list(dict.fromkeys(name for row in table for name in row))
     rows = []
     for name in names:
         values = [row.get(name) for row in table]
         a = [value for phase, value in zip(phases, values) if phase["kind"] == "A" and value is not None]
-        b = [value for phase, value in zip(phases, values) if phase["kind"] == "B" and value is not None]
-        if a and b:
-            mean_a, mean_b = finite_sum(a) / len(a), finite_sum(b) / len(b)
-            rows.append({"metric": name, "a": mean_a, "b": mean_b, "change": mean_b - mean_a,
-                         "change_pct": (mean_b / mean_a - 1) * 100 if mean_a else None, "noise": noise(values, phases)})
-    return {"config": config,
+        for arm in letters[1:]:
+            b = [value for phase, value in zip(phases, values) if phase["kind"] == arm and value is not None]
+            if a and b:
+                mean_a, mean_b = finite_sum(a) / len(a), finite_sum(b) / len(b)
+                row = {"metric": name, "a": mean_a, "b": mean_b, "change": mean_b - mean_a,
+                       "change_pct": (mean_b / mean_a - 1) * 100 if mean_a else None, "noise": noise(values, phases, arm, len(letters))}
+                if len(letters) > 2:
+                    row["arm"] = arm
+                row.update({"a_phases": len(a), "a_sd": spread(a), "b_phases": len(b), "b_sd": spread(b)})
+                rows.append(row)
+    return {"config": config, "arms": letters,
             "phases": [{"kind": phase["kind"], "index": phase["index"], "begin_present": phase["begin"][0],
                         "settled_present": phase["settled"][0] if phase["settled"] else None,
                         "end_present": phase["end"][0] if phase["end"] else None,
@@ -207,7 +245,13 @@ def split(lines, programs=(), classes=()):
         raise ValueError("A/B statistic exceeds the finite numeric range") from error
 
 
-def text_report(result):
+def side(mean, phases, sd):
+    return f"{mean:>10.2f} {phases:>3} " + ("     -" if sd is None else f"{sd:>6.2f}")
+
+
+def text_report(result, show_spread=False):
+    if show_spread or len(result.get("arms", "AB")) > 2:
+        return spread_report(result)
     lines = [result["config"] or "[ab] configuration line missing", "",
              "phase  begin / settled / end   clean reports (present/gputime/draw/syncwait)  presents/10s"]
     for phase in result["phases"]:
@@ -231,6 +275,31 @@ def text_report(result):
     return "\n".join(lines) + "\n"
 
 
+def spread_report(result):
+    lines = [result["config"] or "[ab] configuration line missing", "",
+             "phase  begin / settled / end   clean reports (present/gputime/draw/syncwait)  presents/10s"]
+    for phase in result["phases"]:
+        settled = "-" if phase["settled_present"] is None else phase["settled_present"]
+        end = "-" if phase["end_present"] is None else phase["end_present"]
+        reports = "/".join(str(phase["clean_reports"][name]) for name, _ in KINDS)
+        rate = phase["metrics"].get("presents/10s")
+        lines.append(f"{phase['kind']} {phase['index']:<3} {phase['begin_present']:>7} / {settled:>7} / {end:>7}   {reports:<45}  "
+                     + ("unfinished" if rate is None else f"{rate:.2f}"))
+    lines.extend(["", f"{'metric':<30} arm {'A':>10} {'n':>3} {'SD':>6} {'arm':>10} {'n':>3} {'SD':>6} {'arm-A':>10} {'arm/A-1':>8}   arm vs bracketing A: mean +- SE (SD, n)"])
+    for row in result["metrics"]:
+        spread_noise = row["noise"]
+        if spread_noise is None:
+            text = "-"
+        elif spread_noise["n"] == 1:
+            text = f"{spread_noise['mean']:+.2f} (n 1)"
+        else:
+            text = f"{spread_noise['mean']:+.2f} +- {spread_noise['se']:.2f} (SD {spread_noise['sd']:.2f}, n {spread_noise['n']})"
+        percent = "n/a" if row["change_pct"] is None else f"{row['change_pct']:+.1f}%"
+        lines.append(f"{row['metric']:<30} {row.get('arm', 'B'):>3} {side(row['a'], row['a_phases'], row['a_sd'])} "
+                     f"{side(row['b'], row['b_phases'], row['b_sd'])} {row['change']:>+10.2f} {percent:>8}   {text}")
+    return "\n".join(lines) + "\n"
+
+
 def program_key(value):
     if not re.fullmatch(r"0x[0-9a-fA-F]+", value):
         raise argparse.ArgumentTypeError("must be a hexadecimal program key such as 0x1000")
@@ -243,10 +312,11 @@ def main(arguments=None):
     parser.add_argument("--program", action="append", type=program_key, default=[], help="also report this [gputime] program key per present (repeatable)")
     parser.add_argument("--class", dest="classes", action="append", default=[], help="also report this [gputime] command class per present (repeatable)")
     parser.add_argument("--json", action="store_true", help="print the phases and metrics as JSON")
+    parser.add_argument("--spread", action="store_true", help="also print each side's phase count and phase-to-phase standard deviation (always shown with several arms)")
     options = parser.parse_args(arguments)
     with Path(options.log).open(encoding="utf-8-sig", errors="replace") as source:
         result = split(source, options.program, options.classes)
-    sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else text_report(result))
+    sys.stdout.write(json.dumps(result, indent=1) + "\n" if options.json else text_report(result, options.spread))
     return 0
 
 

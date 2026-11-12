@@ -17,6 +17,14 @@ namespace AgcDriver::Graphics {
 namespace {
 
 thread_local std::uint64_t imageMemoryReleasedBytes = 0;
+thread_local std::uint64_t lockWaitNanoseconds = 0;
+
+void lockTimed(AgcDriver::Mutex& mutex) noexcept {
+    if (mutex.try_lock()) return;
+    const auto start = std::chrono::steady_clock::now();
+    mutex.lock();
+    lockWaitNanoseconds += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 class MemoryAllocationError : public std::runtime_error {
 public:
@@ -262,7 +270,7 @@ std::uint64_t BufferPool::SlabKey(std::uint32_t memoryType, std::size_t capacity
     return (static_cast<std::uint64_t>(memoryType) << 40u) | (static_cast<std::uint64_t>(addressable ? 1u : 0u) << 39u) | static_cast<std::uint64_t>(capacity);
 }
 
-SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable) {
+SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable, std::optional<std::uint32_t> hostType) {
     const auto key = SlabKey(memoryType, capacity, addressable);
     const auto takeFrom = [&](SlabBlock& block, Slab& slab) {
         const auto index = block.free.back();
@@ -271,12 +279,16 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
         if (block.free.empty()) slab.available.erase(std::find(slab.available.begin(), slab.available.end(), &block));
         const auto offset = static_cast<VkDeviceSize>(index) * block.slotBytes;
         MemoryAccounting::RetainPart(device, block.memory, block.slotBytes, false);
-        return SlabSlot{block.memory, offset, block.mapping != nullptr ? block.mapping + offset : nullptr};
+        return SlabSlot{block.memory, offset, block.mapping != nullptr ? block.mapping + offset : nullptr, block.memoryType};
     };
     {
         std::lock_guard lock(slabMutex);
         auto& slab = slabs[key];
         if (!slab.available.empty()) return takeFrom(*slab.available.back(), slab);
+        if (hostType.has_value() && *hostType != memoryType) {
+            auto& host = slabs[SlabKey(*hostType, capacity, addressable)];
+            if (!host.available.empty()) return takeFrom(*host.available.back(), host);
+        }
     }
     const auto blockBytes = SlabBlockBytes(capacity);
     const auto release = [this](SlabBlock* block) noexcept {
@@ -285,14 +297,14 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     };
     std::unique_ptr<SlabBlock, decltype(release)> block(new SlabBlock, release);
     block->slotBytes = capacity;
-    block->slab = key;
     VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     const VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, nullptr, VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, 0};
     if (addressable) allocation.pNext = &flags;
     allocation.allocationSize = blockBytes;
     allocation.memoryTypeIndex = memoryType;
-    block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
-    if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+    block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab", hostType, &block->memoryType);
+    block->slab = block->memoryType == memoryType ? key : SlabKey(block->memoryType, capacity, addressable);
+    if ((context.memory.memoryTypes[block->memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
         Check(mapped, "vkMapMemory buffer slab");
@@ -303,7 +315,7 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     for (std::uint32_t index = slots; index-- != 0;) block->free.push_back(index);
     MemoryAccounting::Retain(device, block->memory, blockBytes);
     std::lock_guard lock(slabMutex);
-    auto& slab = slabs[key];
+    auto& slab = slabs[block->slab];
     if (slab.blocks == slab.available.capacity()) slab.available.reserve(std::max<std::size_t>(1, slab.available.capacity() * 2));
     auto& inserted = *block;
     const auto owner = slabBlocks.try_emplace(inserted.memory).first;
@@ -418,10 +430,15 @@ BufferPool::Tier& BufferPool::tierFor(std::size_t capacity, VkMemoryPropertyFlag
     return !sharedTiers() && capacity < classLimit ? smallTier : largeTier;
 }
 
+std::uint64_t BufferPool::ThreadLockWaitNanoseconds() noexcept {
+    return lockWaitNanoseconds;
+}
+
 std::optional<BufferAllocation> BufferPool::Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, const char* category, bool hostPlaced) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto capacity = Capacity(bytes);
-    std::lock_guard lock(mutex);
+    lockTimed(mutex);
+    std::lock_guard lock(mutex, std::adopt_lock);
     ++clock;
     if (profile) {
         static auto lastReport = std::chrono::steady_clock::now();
@@ -599,7 +616,8 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
     // may throw on growth; a Put that cannot retain simply destroys, as noexcept requires.
     std::vector<BufferAllocation> evicted;
     try {
-        std::lock_guard lock(mutex);
+        lockTimed(mutex);
+        std::lock_guard lock(mutex, std::adopt_lock);
         auto& tier = tierFor(allocation.bytes, allocation.properties);
         if (allocation.allocationBytes > tier.budget) {
             evicted.push_back(allocation);

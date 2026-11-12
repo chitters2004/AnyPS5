@@ -123,16 +123,28 @@ private:
 
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 
+struct PreparedHandleHint {
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    const void* table = nullptr;
+    std::uint64_t version = 0;
+    bool convertedSamples = false;
+    bool layerRowSamples = false;
+    bool probe = false;
+};
+
 struct StageCapture {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    std::shared_ptr<const std::vector<std::byte>> push;
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
     std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::vector<std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
-    ShaderRecompiler::SrtUserDataUse userDataUse;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    bool linkedCode = false;
+    bool convertedSamples = false;
+    bool layerRowSamples = false;
 };
 
 struct RelocatableUserWord {

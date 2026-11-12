@@ -93,6 +93,7 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress)
     const auto localDevice = device.Load();
     if (work) {
         recordDeferredLabels(localDevice.get(), 0);
+        const Graphics::Recorder::SubmitCauseScope cause(Graphics::Recorder::SubmitCause::SubmissionEnd);
         if (localDevice != nullptr) localDevice->SubmitRecorded(true);
     }
     if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);

@@ -143,6 +143,16 @@ int main() {
         if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
         if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
         if (finisher && DrawFinisher::Sequenced()) Require(drains.find(" end 0/") != std::string::npos, "the end of a submission whose draws the finisher still held drained the finisher:" + drains);
+        if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+            const bool handsOff = DrawFinisher::Enabled() && AgcDriver::DriverDetail::DrawPipeline::Depth() != 0;
+            const auto totals = AgcDriver::DriverDetail::Driver::Get().DrawPhaseTotalsForTest();
+            std::string phases;
+            for (std::size_t i = 0; i < AgcDriver::DriverDetail::DrawDriverPhaseCount; ++i) phases += std::string(" ") + AgcDriver::DriverDetail::DrawDriverPhaseNames[i] + " " + std::to_string(totals.ms[i]);
+            std::cout << "profiled draw phases: " << totals.packets << " packets, " << totals.drawn << " drawn, " << totals.finished << " finished on the draw finisher, ms:" << phases << "\n";
+            Require(totals.packets == Labels && totals.drawn == Labels, "profiling booked " + std::to_string(totals.packets) + " draw packets and " + std::to_string(totals.drawn) + " drawn, expected " + std::to_string(Labels));
+            Require(handsOff ? totals.finished >= 1 && totals.finished <= Labels : totals.finished == 0, "profiling booked " + std::to_string(totals.finished) + " draws finished on the draw finisher with " + (handsOff ? "pipelined draws" : "no draw pipeline"));
+            Require(totals.ms[AgcDriver::DriverDetail::DrawRowCapture] > 0.0, "profiling booked no capture time for the draws");
+        }
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
         return 0;

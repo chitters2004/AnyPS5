@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -1189,8 +1190,11 @@ std::uint64_t memoEvent(CommitCounter counter) {
 void requireTargetMiss(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, bool miss, CommitCounter path, const std::string& what, bool taken = true) {
     const auto before = TargetMissDrawsForTest();
     const auto pathBefore = memoEvent(path);
+    const auto shadowBefore = ReadCommitPhases().shadowAny[static_cast<std::size_t>(ShadowReason::TargetMiss)];
     draw(device, color, options);
     const auto misses = TargetMissDrawsForTest() - before;
+    const auto shadowMisses = ReadCommitPhases().shadowAny[static_cast<std::size_t>(ShadowReason::TargetMiss)] - shadowBefore;
+    Require(!CommitPhasesEnabled() || shadowMisses == misses, what + " marked " + std::to_string(shadowMisses) + " [parallel-shadow] target misses for " + std::to_string(misses) + " target misses");
     const std::uint64_t expected = miss || !memoRepeats() ? 1u : 0u;
     Require(misses == expected, what + " counted " + std::to_string(misses) + " target misses, expected " + std::to_string(expected));
     Require(!taken || !CommitPhasesEnabled() || !memoRepeats() || memoEvent(path) != pathBefore, what + " did not take its target memo path");
@@ -1250,7 +1254,25 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 14> R3Scenarios{{
+void noResidentTargetsSkipTheMemo(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    const auto copied = CopiedTargetResolutionsForTest();
+    Switches::Assign(RuntimeSwitch::NoResidentTargets, true);
+    draw(device, color);
+    Switches::Assign(RuntimeSwitch::NoResidentTargets, false);
+    Require(CopiedTargetResolutionsForTest() == copied + 1, "a repeated draw with APS5_NO_RESIDENT_TARGETS set took its targets from the memo instead of copying them");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a repeated draw whose targets were copied");
+    draw(device, color);
+    Require(CopiedTargetResolutionsForTest() == copied + 1, "a draw after APS5_NO_RESIDENT_TARGETS was cleared still copied its targets");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a resident draw after copied ones");
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15> R3Scenarios{{
+    {"no-resident", noResidentTargetsSkipTheMemo},
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
     {"resident-dcc", residentDccClear},
