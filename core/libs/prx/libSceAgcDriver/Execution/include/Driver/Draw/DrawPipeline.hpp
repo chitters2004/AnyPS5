@@ -177,6 +177,7 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Sequenced();
+    static bool FollowSequenceSwitch();
     static std::size_t Preparers();
     static std::string AbWindow(bool begins, char arm, std::uint64_t phase);
     struct PreparerReads {
@@ -195,7 +196,7 @@ public:
     static bool Buffered();
     void AwaitTurn();
     bool OlderUnpublished();
-    static bool Busy() { return Sequenced() ? !Get().Ring().Idle() : outstanding.load(std::memory_order_acquire) != 0; }
+    static bool Busy();
     bool Producing();
     SequenceRing& Ring();
     void Enqueue(Job job);

@@ -14,7 +14,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <vector>
 #include <mutex>
@@ -106,12 +105,17 @@ struct ClearOnExit {
 namespace {
 thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
+
+std::atomic<bool>& sequencedMode() {
+    static std::atomic<bool> mode{!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSequenceRing)};
+    return mode;
+}
 }
 
 DrawFinisher& DrawFinisher::Get() {
     static DrawFinisher* finisher = [] {
         auto* created = new DrawFinisher();
-        if (Sequenced()) {
+        {
             constexpr std::size_t SequenceDepth = 32;
             SequenceRing::Options options;
             options.capacity = SequenceDepth;
@@ -146,8 +150,19 @@ DrawFinisher& DrawFinisher::Get() {
 }
 
 bool DrawFinisher::Sequenced() {
-    static const bool sequenced = std::getenv("APS5_NO_SEQUENCE_RING") == nullptr;
-    return sequenced;
+    return sequencedMode().load(std::memory_order_acquire);
+}
+
+bool DrawFinisher::Busy() {
+    return Sequenced() ? !Get().Ring().Idle() : outstanding.load(std::memory_order_acquire) != 0;
+}
+
+bool DrawFinisher::FollowSequenceSwitch() {
+    const bool wanted = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSequenceRing);
+    if (wanted == Sequenced() || OnFinisherThread()) return false;
+    if (Busy()) Get().Drain(WaitSite::Other);
+    sequencedMode().store(wanted, std::memory_order_release);
+    return true;
 }
 
 SequenceRing& DrawFinisher::Ring() {
@@ -160,7 +175,7 @@ std::size_t DrawFinisher::Preparers() {
         if (text == nullptr) return std::size_t{1};
         return static_cast<std::size_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 1, 8));
     }();
-    return Sequenced() ? preparers : 1;
+    return preparers;
 }
 
 namespace {
@@ -292,7 +307,7 @@ std::string DrawFinisher::AbWindow(bool begins, char arm, std::uint64_t phase) {
 }
 
 bool DrawFinisher::Buffered() {
-    return Preparers() > 1 && OnFinisherThread();
+    return Preparers() > 1 && Sequenced() && OnFinisherThread();
 }
 
 void DrawFinisher::AwaitTurn() {
