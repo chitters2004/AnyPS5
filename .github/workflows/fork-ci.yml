@@ -99,7 +99,7 @@ env:
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
   # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
-  REUSE_VERSION: 4
+  REUSE_VERSION: 5
   VVL_VERSION: 1.4.363.1
   MESA_VERSION: 26.2.6
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
@@ -543,12 +543,23 @@ jobs:
           key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - name: Build
         id: build
+        env:
+          SIDE: ${{ matrix.side }}
         run: |
           ccache --zero-stats
           start=$(date +%s)
           rc=0
+          no_tests=0
           select_targets() {
             ctest --test-dir build -N -R "$TESTS" | tee build/selected.txt
+            if [ "$SIDE" = base ] && [ "$KIND" = gate ] && grep -q '^Total Tests: 0' build/selected.txt; then
+              # The base predates the selected tests (they are new on the ref): nothing to build or run here.
+              no_tests=1
+              echo "NO_TESTS=1" >> "$GITHUB_ENV"
+              echo "base has none of the selected tests: ref-only gate"
+              : > build/targets.txt
+              return 0
+            fi
             python3 - <<'PY' > build/targets.txt
           import glob, os, re, subprocess
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
@@ -572,7 +583,7 @@ jobs:
             gate|warm)
               if [ "$REDUCED" = true ] && [ "$KIND" = gate ]; then
                 select_targets
-                cmake --build build --target $(cat build/targets.txt) libs || rc=$?
+                if [ "$no_tests" != 1 ]; then cmake --build build --target $(cat build/targets.txt) libs || rc=$?; fi
               else
                 cmake --build build || rc=$?
                 if [ $rc -eq 0 ]; then cmake --build build --target libs || rc=$?; fi
@@ -591,7 +602,7 @@ jobs:
           ccache --show-stats | tee ccache-stats.txt
           exit $rc
       - name: Prove the Vulkan validation layer loads
-        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' && env.NO_TESTS != '1' }}
         env:
           VK_LAYER_PATH: /home/runner/vvl/layers
           LD_LIBRARY_PATH: /home/runner/vvl/lib
@@ -614,7 +625,7 @@ jobs:
           grep -E 'VK_LAYER_KHRONOS_validation' result/layer-proof.txt | head -3
           echo "LAYER_PROOF=1" >> "$GITHUB_ENV"
       - name: Run the tests with the validation layer
-        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' }}
+        if: ${{ matrix.kind == 'gate' && !cancelled() && steps.build.outcome == 'success' && env.NO_TESTS != '1' }}
         env:
           ANYPS5_REQUIRE_VULKAN: 1
           ANYPS5_NO_SHADER_CACHE: 1
@@ -714,7 +725,8 @@ jobs:
           def num(k):
               return int(e(k)) if e(k, "") != "" else None
           json.dump({"id": e("ID"), "kind": e("KIND"), "side": e("SIDE"), "sha": e("SHA"), "patch": e("PATCH"), "os": "linux",
-                     "build_rc": num("BUILD_RC"), "test_rc": num("TEST_RC"), "layer_proof": e("LAYER_PROOF") == "1"},
+                     "build_rc": num("BUILD_RC"), "test_rc": num("TEST_RC"), "layer_proof": e("LAYER_PROOF") == "1",
+                     "no_tests": e("NO_TESTS") == "1"},
                     open("result/result.json", "w"), indent=1)
           PY
           {
@@ -741,7 +753,7 @@ jobs:
           if [ "${BUILD_RC:-1}" != 0 ] && [ "$KIND" != mutant ]; then echo "::error::the build failed"; fail=1; fi
           case "$KIND" in
             gate)
-              [ "${LAYER_PROOF:-0}" = 1 ] || { echo "::error::the Vulkan validation layer did not load"; fail=1; }
+              [ "${LAYER_PROOF:-0}" = 1 ] || [ "${NO_TESTS:-0}" = 1 ] || { echo "::error::the Vulkan validation layer did not load"; fail=1; }
               [ "${TEST_RC:-1}" = 0 ] || echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base" ;;
             census) [ "${TEST_RC:-1}" = 0 ] || { echo "::error::census failed"; fail=1; } ;;
             mutant)
@@ -902,10 +914,17 @@ jobs:
         working-directory: C:\ci-gate
         env:
           KIND: ${{ matrix.kind }}
+          SIDE: ${{ matrix.side }}
         run: |
           ccache --zero-stats
           if [ "$REDUCED" = true ] && { [ "$KIND" = gate ] || [ "$KIND" = bundle ]; }; then
             ctest --test-dir build -N -R "$TESTS" | tee build/selected.txt
+            if [ "$SIDE" = base ] && [ "$KIND" = gate ] && grep -q '^Total Tests: 0' build/selected.txt; then
+              # The base predates the selected tests (they are new on the ref): nothing to build or run here.
+              echo "NO_TESTS=1" >> "$GITHUB_ENV"
+              echo "base has none of the selected tests: ref-only gate"
+              exit 0
+            fi
             python - <<'PY' > build/targets.txt
           import glob, os, re, subprocess
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
@@ -930,6 +949,7 @@ jobs:
           fi
       - name: Build the libraries
         id: libs
+        if: ${{ env.NO_TESTS != '1' }}
         working-directory: C:\ci-gate
         run: cmake --build build --target libs
       - name: Report compiler cache statistics
@@ -1147,8 +1167,8 @@ jobs:
           def num(k):
               return int(e(k)) if e(k, "") != "" else None
           json.dump({"id": e("ID"), "kind": "windows", "side": e("SIDE"), "sha": e("SHA"), "os": "windows",
-                     "build_rc": 0 if "${{ steps.libs.outcome }}" == "success" else 1, "test_rc": num("TEST_RC"),
-                     "layer_proof": e("LAYER_PROOF") == "1", "vk_device": e("VK_DEVICE") == "1"},
+                     "build_rc": 0 if "${{ steps.libs.outcome }}" == "success" or e("NO_TESTS") == "1" else 1, "test_rc": num("TEST_RC"),
+                     "layer_proof": e("LAYER_PROOF") == "1", "vk_device": e("VK_DEVICE") == "1", "no_tests": e("NO_TESTS") == "1"},
                     open("result/result.json", "w"), indent=1)
           PY
       - uses: actions/upload-artifact@v7
@@ -1163,8 +1183,8 @@ jobs:
           LIBS_OUTCOME: ${{ steps.libs.outcome }}
           KIND: ${{ matrix.kind }}
         run: |
-          if [ "$LIBS_OUTCOME" != success ]; then echo "::error::the build failed"; exit 1; fi
-          if [ "$KIND" = warm ] || [ "$KIND" = bundle ]; then exit 0; fi
+          if [ "$LIBS_OUTCOME" != success ] && [ "${NO_TESTS:-0}" != 1 ]; then echo "::error::the build failed"; exit 1; fi
+          if [ "$KIND" = warm ] || [ "$KIND" = bundle ] || [ "${NO_TESTS:-0}" = 1 ]; then exit 0; fi
           if [ "${TEST_RC:-1}" != 0 ]; then echo "::warning::some tests failed (ctest rc ${TEST_RC:-unset}); the report job compares them with the base"; fi
       - name: Keep the base result for later runs
         if: ${{ success() && matrix.side == 'base' && matrix.kind == 'gate' }}
@@ -1293,6 +1313,7 @@ jobs:
               rcs = [p["test_rc"] for p in parts]
               m["test_rc"] = None if None in rcs else max(rcs)
               m["layer_proof"] = all(p["layer_proof"] for p in parts)
+              m["no_tests"] = all(p.get("no_tests") for p in parts)
               m["vk_device"] = all(p.get("vk_device") for p in parts)
               m["skips"] = "\n".join(p["skips"] for p in parts)
               w_note = f"{rid}: merged {len(parts)} shards ({', '.join(p['id'] for p in parts)})"
@@ -1392,12 +1413,22 @@ jobs:
               if new:
                   fail(f"{what}: new VUIDs on ref: {new}")
 
+          def ref_only(ref, what):
+              # The base has none of the selected tests (they are new on the ref), so every test of the ref must pass.
+              w(f"- {what}: base has none of the selected tests: ref-only gate (every ref test must pass)")
+              notok = sorted(n for n, st in ref["tests"].items() if st in ("failed", "notrun"))
+              w(f"- {what}: ref tests not passing: {notok or 'none'}")
+              if notok:
+                  fail(f"{what}: base has none of the selected tests (ref-only gate) and {len(notok)} ref test(s) did not pass: {notok}")
+
           ref, base = results.get("gate-ref"), results.get("gate-base")
           if ref or base:
               w("\n## Linux gate (lavapipe, Khronos validation layer)")
               for label, r in (("ref", ref), ("base", base)):
                   if r is None:
                       fail(f"linux gate {label}: no result"); continue
+                  if label == "base" and r.get("no_tests"):
+                      continue
                   proof = [l for l in r["proof"].splitlines() if re.search(r"implementation_version|api_version|VK_LAYER_KHRONOS_validation.*(version|layer)|deviceName|Vulkan Instance Version", l)]
                   w(f"- layer proof {label}: {r['layer_proof']}; " + " | ".join(x.strip() for x in proof[:6]))
                   if not r["layer_proof"]:
@@ -1405,7 +1436,9 @@ jobs:
                   side(r, f"linux {label}")
                   if r["tests"] and all(s == "skipped" for s in r["tests"].values()):
                       fail(f"linux gate {label}: every test was skipped")
-              if ref and base:
+              if ref and base and base.get("no_tests"):
+                  ref_only(ref, "linux gate")
+              elif ref and base:
                   compare(ref, base, "linux gate")
 
           wref, wbase = results.get("windows-ref"), results.get("windows-base")
@@ -1414,6 +1447,8 @@ jobs:
               for label, r in (("ref", wref), ("base", wbase)):
                   if r is None:
                       fail(f"windows {label}: no result"); continue
+                  if label == "base" and r.get("no_tests"):
+                      continue
                   side(r, f"windows {label}")
                   c = collections.Counter(r["tests"].values())
                   w(f"  - lavapipe device found: {r['vk_device']}; layer loaded: {r['layer_proof']}; skipped {c['skipped']} of {len(r['tests'])}")
@@ -1427,7 +1462,9 @@ jobs:
                       w(f"  - skipped: {sorted(n for n, s in r['tests'].items() if s == 'skipped')}")
                   if r["vk_device"] and c["skipped"] != len(r["tests"]) and not r["layer_proof"]:
                       fail(f"windows {label}: GPU tests ran without the validation layer")
-              if wref and wbase:
+              if wref and wbase and wbase.get("no_tests"):
+                  ref_only(wref, "windows")
+              elif wref and wbase:
                   compare(wref, wbase, "windows")
 
           for san in ("asan", "tsan"):
