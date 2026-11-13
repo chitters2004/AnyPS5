@@ -1062,6 +1062,8 @@ private:
 // it when it goes). Never destroyed: entries belong to the device, not to static teardown.
 ResourceCache& SharedResourceCache();
 
+void SetStageABuiltHook(void (*hook)());
+
 }
 
 #endif

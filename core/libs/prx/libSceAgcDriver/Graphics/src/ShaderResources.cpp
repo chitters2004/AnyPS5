@@ -2005,6 +2005,14 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+namespace {
+std::atomic<void (*)()> stageABuiltHook{nullptr};
+}
+
+void SetStageABuiltHook(void (*hook)()) {
+    stageABuiltHook.store(hook, std::memory_order_release);
+}
+
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool deviceStaging, PreparedOffDevice) : context(context), guestMemory(context) {
     drawBuild = true;
     const bool addressTables = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && std::ranges::any_of(shader.program->bindings, [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; }); });
@@ -2022,6 +2030,7 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
     if (usesBda) throw OffDeviceRefusal("the draw maps guest memory through address tables");
     buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
     guestMemory.PrepareOffDevice(false);
+    if (const auto hook = stageABuiltHook.load(std::memory_order_acquire); hook != nullptr) hook();
     if (preparedRegistry != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || preparedForget != GuestMemory::ForgetSerial()) {
         release();
         throw OffDeviceRefusal("the registry changed during stage A");

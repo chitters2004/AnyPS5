@@ -245,6 +245,7 @@ struct UploadCounters {
     std::atomic<std::uint64_t> stageAUnpinned{0};
     std::atomic<std::uint64_t> stageANanoseconds{0};
     std::atomic<std::uint64_t> stageAVerifyDiffered{0};
+    std::atomic<std::uint64_t> stageAVerifyRefused{0};
     std::atomic<std::uint64_t> regionsPrepared{0};
     std::atomic<std::uint64_t> regionsAdopted{0};
     std::atomic<std::uint64_t> regionsReprepared{0};
@@ -953,6 +954,10 @@ void CountPreparedDrawResourcesVerified(bool differed) {
     if (differed) countedUpload(uploadCounters().stageAVerifyDiffered, "UploadPrep.verify_stage_a_differed");
 }
 
+void CountPreparedDrawResourcesVerifyRefused() {
+    countedUpload(uploadCounters().stageAVerifyRefused, "UploadPrep.verify_stage_a_refused");
+}
+
 std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>* spare) {
     auto* job = currentPrepared.get();
     if (job == nullptr || job->resources == nullptr || job->context.device != context.device) return nullptr;
@@ -1005,6 +1010,7 @@ PreparedUploadCounts PreparedUploadCounters() {
     counts.stageAFailed = total.stageAFailed.load(std::memory_order_relaxed);
     counts.stageAUnpinned = total.stageAUnpinned.load(std::memory_order_relaxed);
     counts.stageAVerifyDiffered = total.stageAVerifyDiffered.load(std::memory_order_relaxed);
+    counts.stageAVerifyRefused = total.stageAVerifyRefused.load(std::memory_order_relaxed);
     counts.regionsPrepared = total.regionsPrepared.load(std::memory_order_relaxed);
     counts.regionsAdopted = total.regionsAdopted.load(std::memory_order_relaxed);
     counts.regionsReprepared = total.regionsReprepared.load(std::memory_order_relaxed);
