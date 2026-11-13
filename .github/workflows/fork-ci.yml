@@ -1290,8 +1290,13 @@ jobs:
               reused[json.load(open(os.path.join(os.path.dirname(path), "result.json")))["id"]] = open(path).read().strip()
           for rid, run in sorted(reused.items()):
               w(f"- {rid}: REUSED from run {run} (https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run}); the base job was not run")
-          w("| job | total | steps | ccache hits / misses | build rc | test rc |")
-          w("| - | - | - | - | - | - |")
+          w("| job | queue | total | steps | ccache hits / misses | build rc | test rc |")
+          w("| - | - | - | - | - | - | - |")
+          timing = {}
+          def seconds(a, b):
+              if not a or not b:
+                  return None
+              return int((datetime.fromisoformat(b.replace("Z", "+00:00")) - datetime.fromisoformat(a.replace("Z", "+00:00"))).total_seconds())
           prefix = os.environ.get("TAG", "").rstrip("-")
           for job in sorted(jobs, key=lambda j: j["name"]):
               if prefix and not job["name"].startswith(prefix + " / "):
@@ -1307,7 +1312,8 @@ jobs:
               hits = re.search(r"Hits:\s+(\d+) / (\d+)", st)
               miss = re.search(r"Misses:\s+(\d+)", st)
               rate = f"{hits[1]} / {miss[1]}" if hits and miss else "n/a"
-              w(f"| {job['name']} | {dur(job['started_at'], job['completed_at'])} | {steps} | {rate} | {r.get('build_rc')} | {r.get('test_rc')} |")
+              timing[job["name"]] = dict(queue_s=seconds(job["created_at"], job["started_at"]), run_s=seconds(job["started_at"], job["completed_at"]))
+              w(f"| {job['name']} | {dur(job['created_at'], job['started_at'])} | {dur(job['started_at'], job['completed_at'])} | {steps} | {rate} | {r.get('build_rc')} | {r.get('test_rc')} |")
 
           def side(r, label):
               c = collections.Counter(r["tests"].values())
@@ -1453,6 +1459,10 @@ jobs:
                                         vuid_lines=pair[0]["vuid_lines"], base_vuid_lines=pair[1]["vuid_lines"] if pair[1] else None,
                                         sha=pair[0]["sha"], base=pair[1]["sha"] if pair[1] else None)
           summary["reused_base"] = reused
+          summary["jobs"] = timing
+          runs = [t["run_s"] for t in timing.values() if t["run_s"] is not None]
+          w(f"\nRunner minutes of the jobs above: {sum(runs) / 60:.1f}; slowest job {max(runs, default=0) / 60:.1f} min; "
+            f"longest queue wait {max((t['queue_s'] or 0 for t in timing.values()), default=0) / 60:.1f} min")
           json.dump(summary, open("summary.json", "w"), indent=1)
           raise SystemExit(1 if bad else 0)
           PY
