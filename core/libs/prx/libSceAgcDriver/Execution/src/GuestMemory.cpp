@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3199,10 +3200,12 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
+    Replay::RefuseIn("GuestMemory::CollectWrites");
     return collectWrites(address, bytes, true);
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
+    Replay::RefuseIn("GuestMemory::CollectWritesUncached");
     return collectWrites(address, bytes, false);
 }
 
@@ -4794,6 +4797,7 @@ void MaterializeKnownZero(std::uint64_t address, std::size_t bytes) {
 }
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
+    Replay::RefuseIn("GuestMemory::FlushGpuWrites");
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
@@ -4897,6 +4901,7 @@ bool StopHostWrites(std::uint32_t boundMs) {
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
+    Replay::RefuseIn("GuestMemory::Read");
     if (destination.empty()) return;
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
@@ -5009,6 +5014,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 }
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
+    Replay::RefuseIn("GuestMemory::ReadCommitted");
     if (destination.empty()) return;
     GuardRead(address, destination.size());
     FlushGpuWrites(address, destination.size());
@@ -5018,6 +5024,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 }
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
+    Replay::RefuseIn("GuestMemory::ReadCommittedUnsynced");
     if (destination.empty()) return;
     GuardRead(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -5229,6 +5236,7 @@ std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte>
 }
 
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
+    Replay::RefuseIn("GuestMemory::Write");
     if (source.empty()) return;
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);

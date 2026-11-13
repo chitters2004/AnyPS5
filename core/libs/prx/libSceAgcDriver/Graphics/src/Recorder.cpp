@@ -2,6 +2,7 @@
 #include <bit>
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libc/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -1924,6 +1925,7 @@ CommandState& Recorder::GraphicsState() {
 }
 
 Recorder* Recorder::Active() {
+    Replay::RefuseIn("Recorder::Active");
     return activeRecorder;
 }
 

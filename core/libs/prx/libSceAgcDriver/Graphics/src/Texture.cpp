@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayScope.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
@@ -4627,6 +4628,7 @@ bool StorageTexture::keysReplacedByClear() const {
 }
 
 void StorageTexture::MarkDirty() {
+    Replay::RefuseIn("StorageTexture::MarkDirty");
     if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         if (!keysReplacedByClear()) MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -4636,6 +4638,7 @@ void StorageTexture::MarkDirty() {
 }
 
 void StorageTexture::MarkSliceDirty(std::uint32_t slice, std::uint32_t count) {
+    Replay::RefuseIn("StorageTexture::MarkSliceDirty");
     if (geometry.thick || geometry.imageLayers <= 1 || count == 0 || slice >= geometry.imageLayers || count > geometry.imageLayers - slice || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) {
         MarkDirty();
         return;
@@ -4909,6 +4912,7 @@ bool StorageTexture::Dirty() const {
 constexpr std::size_t MaxDrawnRects = 16;
 
 bool StorageTexture::MarkDrawn(std::uint32_t slice, std::uint32_t count, VkRect2D scissor) {
+    Replay::RefuseIn("StorageTexture::MarkDrawn");
     struct Drawing {
         bool& flag;
         bool previous;
@@ -5117,6 +5121,7 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
 }
 
 void StorageTexture::Flush(const char* reason) {
+    Replay::RefuseIn("StorageTexture::Flush");
     for (const auto& source : std::exchange(adoptedSources, {})) source->Flush();
     storeTrappedOverlaps(reason);
     countStorageEviction(reason);
@@ -6827,6 +6832,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 }
 
 void StorageTexture::WriteBack() {
+    Replay::RefuseIn("StorageTexture::WriteBack");
     storeTrappedOverlaps("explicit");
     const auto previous = std::exchange(flushReason, "explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -6933,6 +6939,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
 }
 
 void StorageTexture::MarkWholeWritten() {
+    Replay::RefuseIn("StorageTexture::MarkWholeWritten");
     // As after a clear: the image holds the surface, guest memory follows at the write-back (which
     // keeps the 64 KiB blocks the CPU writes from now on; the collect is uncached for the reason
     // given in FillClear).
@@ -6951,6 +6958,7 @@ void StorageTexture::MarkWholeWritten() {
 }
 
 void StorageTexture::MarkUnitsWritten(const std::vector<bool>& units) {
+    Replay::RefuseIn("StorageTexture::MarkUnitsWritten");
     if (!blockUnits || descriptor.dccAddress != 0 || units.size() != trackedLayers || std::all_of(units.begin(), units.end(), [](bool unit) { return unit; })) {
         MarkWholeWritten();
         return;
@@ -7161,6 +7169,7 @@ void StorageTexture::pruneAdoptedSources() {
 }
 
 void StorageTexture::Detach() {
+    Replay::RefuseIn("StorageTexture::Detach");
     storeTrappedOverlaps("cache eviction");
     auto& live = Live();
     std::lock_guard lock(live.mutex);

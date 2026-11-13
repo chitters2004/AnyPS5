@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayScope.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/tests/AllocationFailure.hpp"
 #include <algorithm>
@@ -686,6 +687,25 @@ void WaitsAreAttributedToTheirCallSites() {
 
 }
 
+std::atomic<int> replayedInScope{-1};
+
+void ReplaysInsideTheReplayScope() {
+    Reset();
+    auto table = FakeTable();
+    const auto device = Handle<VkDevice>(0x5b);
+    const auto commands = Handle<VkCommandBuffer>(0x1900);
+    const auto attached = Attached(device, table);
+    auto& encoder = *attached;
+    replayedInScope = -1;
+    encoder.Open(commands, RecordingOf(commands));
+    encoder.Emplace([](const std::byte*, VkCommandBuffer, const DeviceFunctions&) { replayedInScope = AgcDriver::Replay::Replaying() ? 1 : 0; }, std::uint32_t{0});
+    Require(!AgcDriver::Replay::Replaying(), "appending a record marked the producer as replaying");
+    encoder.Close();
+    encoder.Quiesce();
+    Require(replayedInScope.load() == 1, replayedInScope.load() == 0 ? "a record was replayed outside the replay scope" : "the appended record was never replayed");
+    Require(!AgcDriver::Replay::Replaying(), "waiting for the replay marked the producer as replaying");
+}
+
 void WaitOnTheEncoderThread() {
     Reset();
     auto table = FakeTable();
@@ -1113,6 +1133,7 @@ void RunSuite() {
     ADirectCallWaitsForTheHeldChunk();
     ForeignSettlesFlushTheHeldChunkInOrder();
     AnotherEncodersTableDefersIntoTheOpenWindow();
+    ReplaysInsideTheReplayScope();
 }
 
 int main(int argc, char** argv) {
