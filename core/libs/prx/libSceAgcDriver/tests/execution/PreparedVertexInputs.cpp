@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #endif
 #include <algorithm>
+#include <atomic>
 #include <thread>
 #include <chrono>
 #include <array>
@@ -28,6 +29,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -377,6 +379,54 @@ int main() {
             Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, initial);
             std::printf("APS5_NO_EARLY_DRAW_INPUTS: the draw is %s\n", refused == nullptr ? "left to the committer" : "prepared ahead");
             Require(refused == nullptr, "prepared vertex inputs: APS5_NO_EARLY_DRAW_INPUTS did not stop a draw's inputs being prepared ahead of its commit");
+        }
+        {
+            using AgcDriver::Graphics::RuntimeSwitch;
+            namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+            static std::atomic<bool> entered{false};
+            static std::atomic<bool> released{false};
+            const auto finishWhileRunning = [&](std::chrono::milliseconds patience) {
+                entered.store(false);
+                released.store(false);
+                AgcDriver::Graphics::SetDrawInputPreparerHook(+[] {
+                    entered.store(true);
+                    while (!released.load()) std::this_thread::yield();
+                });
+                WriteIndices(Indices);
+                const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+                const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+                auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+                Require(job != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the abandonment check");
+                while (!entered.load()) std::this_thread::yield();
+                std::jthread watchdog([patience](std::stop_token token) {
+                    const auto deadline = std::chrono::steady_clock::now() + patience;
+                    while (!token.stop_requested() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    released.store(true);
+                });
+                {
+                    const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+                }
+                const bool returnedWhileRunning = !released.load();
+                watchdog.request_stop();
+                watchdog.join();
+                AgcDriver::Graphics::SetDrawInputPreparerHook(nullptr);
+                auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+                const auto settledBy = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (after.prepared == before.prepared && std::chrono::steady_clock::now() < settledBy) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    after = AgcDriver::Graphics::PreparedDrawInputCounters();
+                }
+                return std::tuple{returnedWhileRunning, after.abandoned - before.abandoned, after.waited - before.waited, after.unused - before.unused};
+            };
+            const bool initial = Switches::Set(RuntimeSwitch::NoDrawInputAbandon);
+            Switches::Assign(RuntimeSwitch::NoDrawInputAbandon, false);
+            const auto [abandonReturned, abandoned, abandonWaited, abandonUnused] = finishWhileRunning(std::chrono::seconds(5));
+            Switches::Assign(RuntimeSwitch::NoDrawInputAbandon, true);
+            const auto [settleReturned, settleAbandoned, settleWaited, settleUnused] = finishWhileRunning(std::chrono::milliseconds(20));
+            Switches::Assign(RuntimeSwitch::NoDrawInputAbandon, initial);
+            std::printf("commit without adopting a running preparation: %s, %llu abandoned, %llu unused ranges counted by the preparer; with APS5_NO_DRAW_INPUT_ABANDON it %s and %llu waited\n", abandonReturned ? "returned at once" : "waited for the preparer", static_cast<unsigned long long>(abandoned), static_cast<unsigned long long>(abandonUnused), settleReturned ? "returned at once" : "waited", static_cast<unsigned long long>(settleWaited));
+            Require(abandonReturned && abandoned == 1 && abandonWaited == 0 && abandonUnused != 0, "prepared vertex inputs: a commit that adopted nothing waited for a running preparation instead of abandoning it to the preparer");
+            Require(!settleReturned && settleAbandoned == 0 && settleWaited == 1 && settleUnused != 0, "prepared vertex inputs: APS5_NO_DRAW_INPUT_ABANDON did not make the commit wait for the running preparation");
         }
         const auto timing = AgcDriver::Graphics::PreparedDrawInputCounters();
         std::printf("preparer time: %llu ns preparing on preparer threads, %llu ns the committer waited on %llu running preparations\n", static_cast<unsigned long long>(timing.prepareNanoseconds), static_cast<unsigned long long>(timing.waitNanoseconds), static_cast<unsigned long long>(timing.waited));

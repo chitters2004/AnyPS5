@@ -70,7 +70,7 @@ namespace {
 constexpr std::uint32_t ZeroFetchSlack = 0x10000u;
 constexpr std::size_t PreparedRangeLimit = Recorder::DrawInputBudget;
 
-enum class JobState : std::uint32_t { Queued, Running, Done, Cancelled };
+enum class JobState : std::uint32_t { Queued, Running, Done, Cancelled, Abandoned };
 
 struct PreparedRange {
     std::uint64_t address = 0;
@@ -96,6 +96,7 @@ struct alignas(64) Counters {
     std::atomic<std::uint64_t> notReady{0};
     std::atomic<std::uint64_t> waited{0};
     std::atomic<std::uint64_t> unused{0};
+    std::atomic<std::uint64_t> abandoned{0};
     std::atomic<std::uint64_t> checks{0};
     std::atomic<std::uint64_t> checkNanoseconds{0};
     std::atomic<std::uint64_t> verifyDiffered{0};
@@ -171,6 +172,7 @@ constexpr std::array<const char*, DrawInputSourceCount> SourceTimeNames{"DrawInp
 std::atomic<int> configuredPreparers{-1};
 std::atomic<bool> preparersHeld{false};
 std::atomic<void (*)(PreparedDrawInputs&)> preparedHook{nullptr};
+std::atomic<void (*)()> preparerHook{nullptr};
 
 unsigned wantedPreparers() {
     const auto configured = configuredPreparers.load(std::memory_order_acquire);
@@ -270,28 +272,39 @@ public:
     }
 
     void Finish() {
-        Settle();
-        std::uint64_t unusedRanges = 0;
-        std::uint64_t preparedRanges = 0;
-        if (!cancelled) {
-            for (const auto& range : ranges) {
-                ++preparedRanges;
-                if (!range.consumed) ++unusedRanges;
-            }
-        }
         auto& total = counters();
         counted(total.requests, "DrawInputPrep.requests");
-        counted(total.prepared, "DrawInputPrep.prepared", preparedRanges);
-        counted(total.refused, "DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
-        for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) counted(total.refusedBy[reason], RefusalNames[reason], refusedBy[reason]);
-        counted(total.unused, "DrawInputPrep.unused", unusedRanges);
+        if (!settled && !RuntimeSwitches::Set(RuntimeSwitch::NoDrawInputAbandon)) {
+            auto expected = JobState::Running;
+            if (state.compare_exchange_strong(expected, JobState::Abandoned, std::memory_order_acq_rel)) return;
+        }
+        Settle();
+        countResults(total);
         counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
         counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
-        counted(total.prepareNanoseconds, "DrawInputPrep.prepare_ns", cancelled ? 0 : prepareNanoseconds);
         counted(total.waitNanoseconds, "DrawInputPrep.wait_ns", waitNanoseconds);
     }
 
+    void FinishAbandoned() {
+        auto& total = counters();
+        counted(total.abandoned, "DrawInputPrep.abandoned");
+        countResults(total);
+    }
+
 private:
+    void countResults(Counters& total) const {
+        if (cancelled) return;
+        std::uint64_t unusedRanges = 0;
+        for (const auto& range : ranges) {
+            if (!range.consumed) ++unusedRanges;
+        }
+        counted(total.prepared, "DrawInputPrep.prepared", ranges.size());
+        counted(total.refused, "DrawInputPrep.refused", refusedRanges);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counted(total.refusedBy[reason], RefusalNames[reason], refusedBy[reason]);
+        counted(total.unused, "DrawInputPrep.unused", unusedRanges);
+        counted(total.prepareNanoseconds, "DrawInputPrep.prepare_ns", prepareNanoseconds);
+    }
+
     std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
         add(counters().ranges, 1);
         const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
@@ -393,6 +406,7 @@ private:
             auto expected = JobState::Queued;
             if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) continue;
             job->state.notify_all();
+            if (const auto hook = preparerHook.load(std::memory_order_acquire); hook != nullptr) hook();
             const bool timed = DrawInputSourcesTimed();
             const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             try {
@@ -403,7 +417,11 @@ private:
                 ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
             }
             if (timed) job->prepareNanoseconds = nanosecondsSince(started);
-            job->state.store(JobState::Done, std::memory_order_release);
+            auto running = JobState::Running;
+            if (!job->state.compare_exchange_strong(running, JobState::Done, std::memory_order_acq_rel)) {
+                job->FinishAbandoned();
+                continue;
+            }
             job->state.notify_all();
         }
     }
@@ -547,6 +565,7 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
         sum(counts.notReady, total.notReady);
         sum(counts.waited, total.waited);
         sum(counts.unused, total.unused);
+        sum(counts.abandoned, total.abandoned);
         sum(counts.checks, total.checks);
         sum(counts.checkNanoseconds, total.checkNanoseconds);
         sum(counts.verifyDiffered, total.verifyDiffered);
@@ -569,6 +588,10 @@ void SetDrawInputPreparers(unsigned count) {
 
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared)) {
     preparedHook.store(hook, std::memory_order_release);
+}
+
+void SetDrawInputPreparerHook(void (*hook)()) {
+    preparerHook.store(hook, std::memory_order_release);
 }
 
 void HoldDrawInputPreparers(bool held) {

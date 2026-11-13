@@ -19,6 +19,7 @@ enum class RuntimeSwitch : std::size_t {
     NoEmptyFetchSkip,
     NoSharedVertexLayout,
     NoSharedPreparerContext,
+    NoDrawInputAbandon,
     Count,
 };
 
