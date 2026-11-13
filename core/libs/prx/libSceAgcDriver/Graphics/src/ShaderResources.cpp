@@ -6859,6 +6859,51 @@ struct DrawBindingTimer {
 
 }
 
+namespace {
+
+constexpr std::size_t DrawSetSplitWords = sizeof(ShaderResources::DrawSetSplit) / sizeof(std::uint64_t);
+std::array<std::atomic<std::uint64_t>, DrawSetSplitWords> drawSetSplit{};
+
+std::size_t DrawSetSizeBucket(std::uint64_t elements) {
+    if (elements <= 4) return 0;
+    if (elements <= 8) return 1;
+    if (elements <= 16) return 2;
+    if (elements <= 32) return 3;
+    return 4;
+}
+
+struct DrawSetTimer {
+    using Clock = std::chrono::steady_clock;
+    const bool profiled;
+    ShaderResources::DrawSetSplit split{};
+    Clock::time_point mark = profiled ? Clock::now() : Clock::time_point{};
+    void phase(std::uint64_t& part) {
+        if (!profiled) return;
+        const auto at = Clock::now();
+        part += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(at - mark).count());
+        mark = at;
+    }
+    ~DrawSetTimer() {
+        if (!profiled) return;
+        split.calls = 1;
+        std::array<std::uint64_t, DrawSetSplitWords> words{};
+        std::memcpy(words.data(), &split, sizeof(split));
+        for (std::size_t index = 0; index < words.size(); ++index) {
+            if (words[index] != 0) drawSetSplit[index].fetch_add(words[index], std::memory_order_relaxed);
+        }
+    }
+};
+
+}
+
+ShaderResources::DrawSetSplit ShaderResources::TakeDrawSetSplit() {
+    std::array<std::uint64_t, DrawSetSplitWords> words{};
+    for (std::size_t index = 0; index < words.size(); ++index) words[index] = drawSetSplit[index].exchange(0, std::memory_order_relaxed);
+    DrawSetSplit split{};
+    std::memcpy(&split, words.data(), sizeof(split));
+    return split;
+}
+
 ShaderResources::DrawBindingSplit ShaderResources::TakeDrawBindingSplit() {
     std::array<std::uint64_t, 7> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = drawBindingSplit[index].exchange(0, std::memory_order_relaxed);
@@ -6973,6 +7018,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 
 void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    DrawSetTimer timer{profiled};
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
     auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
@@ -6988,6 +7035,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         else sizes.push_back({binding.layout.descriptorType, count});
     }
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    timer.phase(timer.split.recountNanoseconds);
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result.cache = context.descriptorCache;
@@ -7001,6 +7049,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    timer.phase(timer.split.allocateNanoseconds);
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
@@ -7032,7 +7081,23 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    timer.phase(timer.split.buildNanoseconds);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    timer.phase(timer.split.updateNanoseconds);
+    if (profiled) {
+        auto& split = timer.split;
+        split.rebound = rebound ? 1 : 0;
+        split.writes = writes.size();
+        split.patched = selected.size();
+        for (const auto& binding : bindings) {
+            const auto set = setOf(binding);
+            split.buffers[set] += binding.allocations.size();
+            split.images[set] += binding.imageAllocations.size();
+        }
+        for (std::size_t set = 0; set < split.bufferSizes.size(); ++set) {
+            if (described[set]) ++split.bufferSizes[set][DrawSetSizeBucket(split.buffers[set])];
+        }
+    }
 }
 
 ShaderResources::DrawUse::~DrawUse() {

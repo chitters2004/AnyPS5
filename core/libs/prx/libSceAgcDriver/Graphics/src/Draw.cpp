@@ -1010,6 +1010,14 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    if (const auto sets = ShaderResources::TakeDrawSetSplit(); sets.calls != 0) {
+        const auto calls = static_cast<double>(sets.calls);
+        const auto per = [&](std::uint64_t value) { return static_cast<double>(value) / calls; };
+        const auto buckets = [](const std::array<std::uint64_t, ShaderResources::DrawSetSizeBuckets>& counts) { return std::array<unsigned long long, ShaderResources::DrawSetSizeBuckets>{counts[0], counts[1], counts[2], counts[3], counts[4]}; };
+        const auto main = buckets(sets.bufferSizes[0]);
+        const auto fragment = buckets(sets.bufferSizes[1]);
+        AgcDriver::ProfilePrint_nid_no_patch("[draw-sets] (10 s) %llu written sets calls, us per call: recount %.2f, allocate %.2f, build %.2f, update %.2f; %llu with rebound images; per call: %.1f writes, %.1f patched snapshots, buffer elements main %.1f fragment %.1f, image elements main %.1f fragment %.1f; buffer elements per set (<=4, <=8, <=16, <=32, >32): main %llu/%llu/%llu/%llu/%llu, fragment %llu/%llu/%llu/%llu/%llu\n", static_cast<unsigned long long>(sets.calls), per(sets.recountNanoseconds) / 1000.0, per(sets.allocateNanoseconds) / 1000.0, per(sets.buildNanoseconds) / 1000.0, per(sets.updateNanoseconds) / 1000.0, static_cast<unsigned long long>(sets.rebound), per(sets.writes), per(sets.patched), per(sets.buffers[0]), per(sets.buffers[1]), per(sets.images[0]), per(sets.images[1]), main[0], main[1], main[2], main[3], main[4], fragment[0], fragment[1], fragment[2], fragment[3], fragment[4]);
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {
