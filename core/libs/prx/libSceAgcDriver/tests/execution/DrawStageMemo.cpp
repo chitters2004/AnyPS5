@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawStageMemo.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -493,7 +494,7 @@ AgcDriver::DriverDetail::Driver& driver() {
 }
 
 void DrawsReuseAndInvalidateTheirStages() {
-    const bool memo = std::getenv("APS5_NO_DRAW_STAGE_MEMO") == nullptr;
+    const bool memo = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoDrawStageMemo);
     const bool verify = std::getenv("APS5_VERIFY_DRAW_STAGE_MEMO") != nullptr;
     Register(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Register(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
@@ -591,6 +592,28 @@ void DrawsReuseAndInvalidateTheirStages() {
     if (fragmentMissed && !verify) Expect(partial.counts[MemoCount::ValidatedReused] == 1, "the vertex stage the draw cache had validated before the fragment stage missed was built again");
     if (!fragmentMissed || verify) Expect(partial.counts[MemoCount::ValidatedReused] == 0, "a stage was reused as validated without a partial draw-cache miss");
     std::puts("a draw that misses the draw cache on its fragment stage reuses the vertex stage the lookup validated");
+}
+
+void MemoFollowsItsRuntimeSwitch() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool off = Switches::Set(RuntimeSwitch::NoDrawStageMemo);
+    Scene scene;
+    WriteVertices(scene.vertices, MovedOffset, -8.0f);
+    WriteVertices(scene.vertices, ShiftOffset, 8.0f);
+    WriteVertices(scene.vertices, StillOffset, 0.0f);
+    WriteTable(scene.tables, TableOffset, scene.vertices, true);
+    const float one = 1.0f;
+    std::memcpy(scene.data.Bytes(0), &one, sizeof(one));
+    Switches::Assign(RuntimeSwitch::NoDrawStageMemo, true);
+    const auto switchedOff = Measure(scene, VertexCode.data(), TableOffset, "a draw while APS5_NO_DRAW_STAGE_MEMO is switched on at run time");
+    Switches::Assign(RuntimeSwitch::NoDrawStageMemo, false);
+    const auto switchedOn = Measure(scene, VertexCode.data(), TableOffset, "a draw after APS5_NO_DRAW_STAGE_MEMO is switched off again");
+    Switches::Assign(RuntimeSwitch::NoDrawStageMemo, off);
+    Expect(switchedOff.brightest == 255u && switchedOn.brightest == 255u, "a draw around the memo switch did not draw");
+    Expect(switchedOff.counts[MemoCount::Lookups] == 0, "the draw stage memo was looked up while its runtime switch disabled it");
+    Expect(switchedOn.counts[MemoCount::Lookups] != 0, "the draw stage memo was not looked up after its runtime switch was cleared");
+    std::puts("the draw stage memo follows APS5_NO_DRAW_STAGE_MEMO at run time");
 }
 
 std::uint8_t* CompareHookTarget = nullptr;
@@ -765,6 +788,7 @@ int main(int argc, char** argv) {
             if (!device) return VulkanTestSkipped;
         }
         DrawsReuseAndInvalidateTheirStages();
+        MemoFollowsItsRuntimeSwitch();
         ProofsFollowWriteStamps();
         MemoizesOnlyStagesBuiltAsKeyed();
         AgcDriverShutdown_nid_postfix();
