@@ -242,6 +242,7 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop);
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMissDrawsForTest();
 std::uint64_t CopiedTargetResolutionsForTest();
+std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const State& state, std::size_t repeats, std::size_t& hits);
 
 }
 
