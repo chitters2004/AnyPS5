@@ -8,7 +8,8 @@
 
 #if defined(_WIN32) && defined(__x86_64__) && defined(__GNUC__)
 #define HOST_THREAD_SLOT_TEB 1
-#include <processthreadsapi.h>
+extern "C" [[gnu::dllimport]] unsigned long TlsAlloc();
+extern "C" [[gnu::dllimport]] int TlsSetValue(unsigned long index, void* value);
 #endif
 
 template<typename TValue, typename TTag>
