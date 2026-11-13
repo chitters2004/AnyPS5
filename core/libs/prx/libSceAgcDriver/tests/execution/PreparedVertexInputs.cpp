@@ -366,6 +366,18 @@ int main() {
             Require(copied[0] != copied[1] && (!cached || copied[0] != shared[0]), "prepared vertex inputs: APS5_NO_SHARED_PREPARER_CONTEXT did not give each preparation its own context copy");
             Require(copiedDraw.adopted == 2 && copiedDraw.covered, "prepared vertex inputs: with its own context copy an unchanged draw did not adopt both copies");
         }
+        {
+            using AgcDriver::Graphics::RuntimeSwitch;
+            namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+            WriteIndices(Indices);
+            const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+            const bool initial = Switches::Set(RuntimeSwitch::NoEarlyDrawInputs);
+            Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, true);
+            const auto refused = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+            Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, initial);
+            std::printf("APS5_NO_EARLY_DRAW_INPUTS: the draw is %s\n", refused == nullptr ? "left to the committer" : "prepared ahead");
+            Require(refused == nullptr, "prepared vertex inputs: APS5_NO_EARLY_DRAW_INPUTS did not stop a draw's inputs being prepared ahead of its commit");
+        }
         const auto timing = AgcDriver::Graphics::PreparedDrawInputCounters();
         std::printf("preparer time: %llu ns preparing on preparer threads, %llu ns the committer waited on %llu running preparations\n", static_cast<unsigned long long>(timing.prepareNanoseconds), static_cast<unsigned long long>(timing.waitNanoseconds), static_cast<unsigned long long>(timing.waited));
         if (AgcDriver::Graphics::DrawInputSourcesTimed()) {
