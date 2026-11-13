@@ -69,6 +69,7 @@ bool NoteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes, std::siz
 void ArmHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
 void QueueHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
 void CompleteHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
+void DiscardHtileDepthClear(std::uint64_t htileAddress, std::size_t bytes);
 struct HtileMaskClear {
     std::uint64_t address = 0;
     std::size_t bytes = 0;
