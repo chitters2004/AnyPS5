@@ -107,9 +107,9 @@ env:
 jobs:
   # Compiler cache budget (GitHub keeps 10 GB per repo and evicts the least recently accessed entry first). Entries, GB:
   #   fixed: submodule gitdirs 2 x 0.34, winlibs 0.25, vvl 0.14, ffmpeg 4 x 0.04, vk 0.03, seeds ~0 = 1.3
-  #   ccache max-size / measured use: windows-base 1.6 / 1.4, windows-ref 1.8 / 1.7 (the bundle job shares it), windows-stack-ref 1.6 / 1.5,
-  #   tsan 1.2 / 0.8, asan 1.0 / 0.75, plain-base 0.5 / 0.15, plain-ref 0.5 / 0.25, plain-stack-ref 0.8 / 0.45, plain-mutant 0.5 / absent unless used.
-  #   Expected total 8.7 GB, leaving about 1.3 GB for one in-flight copy. Each job deletes the older entries of its own key
+  #   ccache max-size / measured use: windows-base 1.5 / 1.4, windows-ref 1.8 / 1.7 (the bundle job shares it), windows-stack-ref 1.5 / 1.5,
+  #   tsan 1.3 / 1.1, asan 1.3 / 1.0 (a 1.0 cap filled up on a ref far from main: 71% hits instead of 87%), plain-base 0.5 / 0.15, plain-ref 0.5 / 0.25, plain-stack-ref 0.8 / 0.45, plain-mutant 0.5 / absent unless used.
+  #   Expected total 9.1 GB, so a duplicate would push it over: hence the prune before every save. Each job deletes the older entries of its own key
   #   right before the cache action saves (step "Delete older entries of this ccache key"), so overlapping runs cannot hold two copies.
   plan:
     runs-on: ubuntu-latest
@@ -336,7 +336,7 @@ jobs:
                                           reuse_name=f"base-reuse-linux-{os.environ['key_linux']}-s{shard}",
                                           cache_key="plain-base", cache_restore=plain_restore, cache_max="500M",
                                           cache_save="true" if shard == 1 else "false", **shard_fields(shard)))
-          san_max = {"asan": "1G", "tsan": "1200M"}
+          san_max = {"asan": "1300M", "tsan": "1300M"}
           for san in ("asan", "tsan"):
               if san in jobs:
                   include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
@@ -935,7 +935,7 @@ jobs:
         with:
           key: windows-${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
           restore-keys: windows-base
-          max-size: ${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && '1600M' || matrix.side == 'ref' && '1800M' || '1600M' }}
+          max-size: ${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && '1500M' || matrix.side == 'ref' && '1800M' || '1500M' }}
           save: ${{ inputs.save_cache && matrix.shard_save != 'false' && 'true' || 'false' }}
           evict-old-files: 7d
       - id: ffmpeg-cache
