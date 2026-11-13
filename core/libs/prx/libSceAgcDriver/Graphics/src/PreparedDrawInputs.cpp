@@ -98,6 +98,8 @@ struct Counters {
     std::atomic<std::uint64_t> checkNanoseconds{0};
     std::atomic<std::uint64_t> verifyDiffered{0};
     std::atomic<std::uint64_t> requestNanoseconds{0};
+    std::atomic<std::uint64_t> prepareNanoseconds{0};
+    std::atomic<std::uint64_t> waitNanoseconds{0};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sources{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceBytes{};
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceNanoseconds{};
@@ -156,6 +158,8 @@ public:
     bool settled = false;
     bool cancelled = false;
     bool waited = false;
+    std::uint64_t prepareNanoseconds = 0;
+    std::uint64_t waitNanoseconds = 0;
 
     explicit PreparedDrawInputs(std::shared_ptr<const Context> shared) : shared(std::move(shared)), context(*this->shared) {}
 
@@ -202,7 +206,10 @@ public:
         }
         if (expected == JobState::Running) {
             waited = true;
+            const bool timed = DrawInputSourcesTimed();
+            const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             state.wait(JobState::Running, std::memory_order_acquire);
+            if (timed) waitNanoseconds = nanosecondsSince(started);
         }
     }
 
@@ -232,6 +239,8 @@ public:
         counted(total.unused, "DrawInputPrep.unused", unusedRanges);
         counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
         counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
+        counted(total.prepareNanoseconds, "DrawInputPrep.prepare_ns", cancelled ? 0 : prepareNanoseconds);
+        counted(total.waitNanoseconds, "DrawInputPrep.wait_ns", waitNanoseconds);
     }
 
 private:
@@ -336,6 +345,8 @@ private:
             auto expected = JobState::Queued;
             if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) continue;
             job->state.notify_all();
+            const bool timed = DrawInputSourcesTimed();
+            const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             try {
                 job->Prepare();
             } catch (...) {
@@ -343,6 +354,7 @@ private:
                 ++job->refusedRanges;
                 ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
             }
+            if (timed) job->prepareNanoseconds = nanosecondsSince(started);
             job->state.store(JobState::Done, std::memory_order_release);
             job->state.notify_all();
         }
@@ -490,6 +502,8 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     counts.checkNanoseconds = total.checkNanoseconds.load(std::memory_order_relaxed);
     counts.verifyDiffered = total.verifyDiffered.load(std::memory_order_relaxed);
     counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
+    counts.prepareNanoseconds = total.prepareNanoseconds.load(std::memory_order_relaxed);
+    counts.waitNanoseconds = total.waitNanoseconds.load(std::memory_order_relaxed);
     for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
         counts.sources[index] = total.sources[index].load(std::memory_order_relaxed);
         counts.sourceBytes[index] = total.sourceBytes[index].load(std::memory_order_relaxed);

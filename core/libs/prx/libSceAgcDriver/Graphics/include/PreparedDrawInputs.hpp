@@ -76,6 +76,8 @@ struct PreparedDrawInputCounts {
     std::uint64_t checkNanoseconds = 0;
     std::uint64_t verifyDiffered = 0;
     std::uint64_t requestNanoseconds = 0;
+    std::uint64_t prepareNanoseconds = 0;
+    std::uint64_t waitNanoseconds = 0;
     std::array<std::uint64_t, DrawInputSourceCount> sources{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceBytes{};
     std::array<std::uint64_t, DrawInputSourceCount> sourceNanoseconds{};

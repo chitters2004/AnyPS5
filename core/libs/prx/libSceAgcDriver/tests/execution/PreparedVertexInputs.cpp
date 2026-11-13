@@ -366,6 +366,14 @@ int main() {
             Require(copied[0] != copied[1] && (!cached || copied[0] != shared[0]), "prepared vertex inputs: APS5_NO_SHARED_PREPARER_CONTEXT did not give each preparation its own context copy");
             Require(copiedDraw.adopted == 2 && copiedDraw.covered, "prepared vertex inputs: with its own context copy an unchanged draw did not adopt both copies");
         }
+        const auto timing = AgcDriver::Graphics::PreparedDrawInputCounters();
+        std::printf("preparer time: %llu ns preparing on preparer threads, %llu ns the committer waited on %llu running preparations\n", static_cast<unsigned long long>(timing.prepareNanoseconds), static_cast<unsigned long long>(timing.waitNanoseconds), static_cast<unsigned long long>(timing.waited));
+        if (AgcDriver::Graphics::DrawInputSourcesTimed()) {
+            Require(timing.prepareNanoseconds != 0, "prepared vertex inputs: with draw profiling on, no preparer time was counted for the adopted preparations");
+            Require(timing.waited != 0 || timing.waitNanoseconds == 0, "prepared vertex inputs: committer wait time was counted although no commit waited for a running preparation");
+        } else {
+            Require(timing.prepareNanoseconds == 0 && timing.waitNanoseconds == 0, "prepared vertex inputs: preparer or wait time was counted with draw profiling off");
+        }
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
     } catch (const std::exception& error) {
