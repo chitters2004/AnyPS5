@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -435,6 +436,48 @@ void DriverThreadsAreNamed() {
 #endif
 }
 
+void MixedFrame(Log& log, int& index, int frame) {
+    Draw(log, index++);
+    Forward(log, Kind::EndOfPipe, index++, Base + 0x40, Bytes(0x300u + frame));
+    Draw(log, index++, nullptr, frame % 2 == 0);
+    Forward(log, Kind::Store, index++, Base + 0x80, Bytes(9));
+    Forward(log, Kind::SubmitEnd, index++);
+}
+
+void TheRingSwitchesBetweenSubmissions() {
+    const bool started = DrawFinisher::Sequenced();
+    Require(!DrawFinisher::FollowSequenceSwitch(), "the ring mode changed although APS5_NO_SEQUENCE_RING was not flipped");
+    Log log;
+    int index = 0;
+    for (int round = 0; round < 4; ++round) {
+        const bool before = DrawFinisher::Sequenced();
+        MixedFrame(log, index, round);
+        Gate gate;
+        gate.Close();
+        Draw(log, index++, &gate);
+        Require(DrawFinisher::Busy(), "the held draw did not keep the finisher busy");
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoSequenceRing, before);
+        std::thread opener([&gate] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            gate.Open();
+        });
+        const bool flipped = DrawFinisher::FollowSequenceSwitch();
+        const bool waited = gate.open.load(std::memory_order_acquire);
+        opener.join();
+        Require(waited, "the ring mode changed before the finisher had run the held draw");
+        Require(flipped && DrawFinisher::Sequenced() == !before, "flipping APS5_NO_SEQUENCE_RING between submissions did not change the ring mode");
+        Require(!DrawFinisher::Busy(), "the finisher still held work after the ring mode changed");
+        for (int frame = 0; frame < 3; ++frame) MixedFrame(log, index, frame);
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Other);
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        Require(log.committed == log.expected, std::string("items were lost or reordered across a switch to ") + (before ? "the drained hand-off" : "the sequence ring"));
+    }
+    AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoSequenceRing, !started);
+    DrawFinisher::FollowSequenceSwitch();
+    Require(DrawFinisher::Sequenced() == started, "the ring mode did not return to its start");
+}
+
 int main() {
     try {
         if (DrawPipeline::Depth() == 0) return 77;
@@ -453,6 +496,7 @@ int main() {
         DrainWaitsAreCountedBySite();
         PacketDrainsAreSplitByClass();
         DriverThreadsAreNamed();
+        TheRingSwitchesBetweenSubmissions();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;
     } catch (const std::exception& error) {
