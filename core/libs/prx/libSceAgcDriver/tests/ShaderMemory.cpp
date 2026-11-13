@@ -2865,6 +2865,53 @@ void verifyBatchedDescriptorReads() {
     require(same(nestedPlain, driver), "batched descriptor reads: the driver capture differs from the per-dword capture");
 }
 
+void verifyWalkRepeats() {
+    using namespace ShaderRecompiler;
+    require(std::getenv("APS5_PROFILE_DRAW") != nullptr, "walk repeats: the counters are profile-only and APS5_PROFILE_DRAW is unset");
+    alignas(256) static std::array<std::uint32_t, 64> block{};
+    alignas(16) static std::array<std::uint64_t, 2> pointer{};
+    alignas(16) static std::array<std::uint64_t, 2> other{};
+    block.fill(0u);
+    const auto blockAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block.data()));
+    pointer[0] = blockAddress;
+    other[0] = blockAddress;
+    for (const std::uint32_t offset : {0x20u, 0x60u}) {
+        const auto word = offset / 4u;
+        const auto base = blockAddress + 0x100u * (offset / 0x20u);
+        block[word] = static_cast<std::uint32_t>(base);
+        block[word + 1u] = static_cast<std::uint32_t>(base >> 32u);
+        block[word + 2u] = 0x100u + offset;
+        block[word + 3u] = 0x00027facu;
+    }
+    const auto userDataFor = [](const auto& table) {
+        const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(table.data()));
+        return std::array<std::uint32_t, 2>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u)};
+    };
+    const auto userData = userDataFor(pointer);
+    const auto otherData = userDataFor(other);
+    const std::vector<std::uint32_t> code{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080602u, 0xfa000060u, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    auto request = FrontendRequest(code, userData);
+    auto otherRequest = FrontendRequest(code, otherData);
+    request.useCache = true;
+    otherRequest.useCache = true;
+    std::vector<std::shared_ptr<const ResourceCapture>> kept;
+    const auto capture = [&kept](const auto& captured) {
+        AgcDriver::ShaderMemory memory({});
+        const auto before = AgcDriver::ShaderMemory::Repeats();
+        const auto result = memory.Capture(captured);
+        kept.push_back(result);
+        const auto after = AgcDriver::ShaderMemory::Repeats();
+        require(result != nullptr && result->source != nullptr && after.walks == before.walks + 1u, "walk repeats: a cached capture was not counted");
+        return std::array<std::uint64_t, 3>{after.seen - before.seen, after.key - before.key, after.keyAndReads - before.keyAndReads};
+    };
+    static_cast<void>(capture(request));
+    require(capture(request) == std::array<std::uint64_t, 3>{1u, 1u, 1u}, "walk repeats: an identical second walk was not counted as a repeat of both keys");
+    block[0x28u / 4u] = 0x111u;
+    require(capture(request) == std::array<std::uint64_t, 3>{1u, 1u, 0u}, "walk repeats: a walk that read a changed V# word counted as a repeat of the read words");
+    require(capture(request) == std::array<std::uint64_t, 3>{1u, 1u, 1u}, "walk repeats: a walk repeating the changed words was not counted as a repeat");
+    require(capture(otherRequest) == std::array<std::uint64_t, 3>{1u, 0u, 0u}, "walk repeats: a walk through another user-data pointer counted as a repeat of the key");
+}
+
 void requireBatchedReads() {
     if (std::getenv("APS5_NO_FAST_CAPTURE") != nullptr) return;
     require(ShaderRecompiler::Detail::SrtTape::BatchedReads() != 0u, "batched descriptor reads: no driver capture read a descriptor in bulk without APS5_NO_FAST_CAPTURE");
@@ -12474,6 +12521,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--type-zero-image-materialization") {
             verifyTypeZeroImageMaterialization();
             std::cout << "TYPE=0 image descriptor materialization passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--walk-repeats") {
+            verifyWalkRepeats();
+            std::cout << "Walk repeats passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--batched-descriptor-reads") {

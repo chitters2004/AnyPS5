@@ -87,6 +87,10 @@ public:
         std::uint64_t calls, blocks, refused, words;
     };
     static VouchCounts Vouches();
+    struct RepeatCounts {
+        std::uint64_t walks, seen, key, keyAndReads;
+    };
+    static RepeatCounts Repeats();
     static bool Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp);
     static std::uint64_t descriptorScope(void* context, std::size_t bytes);
 
@@ -162,6 +166,8 @@ private:
     void spill(std::size_t index);
     void spillTouching(std::uint64_t begin, std::uint64_t end);
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> collect(bool recentOnly) const;
+    [[nodiscard]] bool seenWord(std::uint64_t address, std::uint32_t& word) const;
+    void countWalkRepeat(const ShaderRecompiler::ResourceCapture& capture, std::span<const std::uint32_t> userData, std::uint64_t shaderBase) const;
 
     // Regions given at construction (the registered shader's code and header), referenced as given:
     // the caller keeps them alive for as long as the capture is used.

@@ -74,7 +74,39 @@ struct CaptureProfile {
     std::atomic<std::uint64_t> vouchedBlocks{0};
     std::atomic<std::uint64_t> refusedBlocks{0};
     std::atomic<std::uint64_t> vouchedWords{0};
+    std::atomic<std::uint64_t> repeatWalks{0};
+    std::atomic<std::uint64_t> repeatPlanSeen{0};
+    std::atomic<std::uint64_t> repeatKey{0};
+    std::atomic<std::uint64_t> repeatKeyAndReads{0};
+    std::atomic<std::uint64_t> repeatKeyRing{0};
+    std::atomic<std::uint64_t> repeatKeyAndReadsRing{0};
+    std::atomic<std::uint64_t> repeatUnseenWords{0};
+    std::atomic<std::uint64_t> repeatEpochThread{0};
+    std::atomic<std::uint64_t> repeatReadWords{0};
+    std::atomic<std::uint64_t> repeatPlans{0};
 };
+
+constexpr std::size_t RepeatRing = 4;
+
+struct WalkRepeats {
+    struct Seen {
+        std::uint64_t key = 0;
+        std::uint64_t reads = 0;
+    };
+    struct Entry {
+        std::weak_ptr<const ShaderRecompiler::IrResourcePlan> plan;
+        std::array<Seen, RepeatRing> ring{};
+        std::size_t filled = 0;
+        std::size_t next = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<const ShaderRecompiler::IrResourcePlan*, Entry> plans;
+};
+
+WalkRepeats& walkRepeats() {
+    static auto* repeats = new WalkRepeats();
+    return *repeats;
+}
 
 constexpr std::uint64_t WordWaitNanoseconds = 50000;
 
@@ -906,6 +938,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.batchedDescriptorReads = fastCapture;
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
+        countWalkRepeat(*capture, request.context.userData, request.shader.codeAddress);
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
         totals.hookWaitNanoseconds += static_cast<std::uint64_t>((WaitedMs() - waitedBefore) * 1e6);
@@ -927,9 +960,96 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
             const auto evaluateNs = ShaderRecompiler::ResourceMaterializer::EvaluateNanoseconds();
             const auto walkNs = captureNs > resolveNs + pageNs + wordNs + specializationNs ? captureNs - resolveNs - pageNs - wordNs - specializationNs : 0;
             AgcDriver::ProfilePrint_nid_no_patch( "[capture] %llu captures: %llu word reads, %llu pages fetched (%llu read word by word over pending GPU writes: %llu words waited %.2f s, %llu read raw on evidence, %llu verified with %llu mismatches, %llu served from known values (%llu verified, %llu mismatches), %llu hook reads not observed: no GPU wait, %llu branch condition reads over pending GPU writes left the branch unpruned instead of waiting, %llu captures redone waiting after one failed), capture (plan lookup + materialize) %.1f s, %llu KiB registered code this capture; sub-phases (s, us per capture): source resolve %.2f/%.1f, walk %.2f/%.1f, specialization (every materialize) %.2f/%.1f, page reads %.2f/%.1f, word reads %.2f/%.1f, hook GPU waits inside %.2f/%.1f, materialize %.2f/%.1f (SRT evaluate %.2f/%.1f); source handle memo %llu hits, %llu resolves\n", static_cast<unsigned long long>(totals.captures.load()), static_cast<unsigned long long>(totals.reads.load()), static_cast<unsigned long long>(totals.pages.load()), static_cast<unsigned long long>(totals.pagesWordwise.load()), static_cast<unsigned long long>(totals.wordWaits.load()), totals.wordWaitNanoseconds.load() / 1e9, static_cast<unsigned long long>(totals.wordsRaw.load()), static_cast<unsigned long long>(totals.wordsVerified.load()), static_cast<unsigned long long>(totals.wordMismatches.load()), static_cast<unsigned long long>(totals.wordsKnown.load()), static_cast<unsigned long long>(totals.wordsKnownVerified.load()), static_cast<unsigned long long>(totals.wordsKnownMismatches.load()), static_cast<unsigned long long>(totals.observationsSkipped.load()), static_cast<unsigned long long>(totals.branchReadsRefused.load()), static_cast<unsigned long long>(totals.branchCapturesRedone.load()), captureNs / 1e9, static_cast<unsigned long long>(initialBytes / 1024), resolveNs / 1e9, resolveNs / captures / 1e3, walkNs / 1e9, walkNs / captures / 1e3, specializationNs / 1e9, specializationNs / captures / 1e3, pageNs / 1e9, pageNs / captures / 1e3, wordNs / 1e9, wordNs / captures / 1e3, hookNs / 1e9, hookNs / captures / 1e3, materializeNs / 1e9, materializeNs / captures / 1e3, evaluateNs / 1e9, evaluateNs / captures / 1e3, static_cast<unsigned long long>(totals.handleHits.load()), static_cast<unsigned long long>(totals.handleMisses.load()));
+            const auto repeatWalks = totals.repeatWalks.load();
+            const auto seen = totals.repeatPlanSeen.load();
+            const auto share = [&](std::uint64_t count) { return seen != 0u ? 100.0 * static_cast<double>(count) / static_cast<double>(seen) : 0.0; };
+            AgcDriver::ProfilePrint_nid_no_patch("[capture-repeat] %llu walks, %llu plans, %llu walks of a plan seen before (%.1f%%): key (user words read + masks + shader base) equal to the last walk's %llu (%.1f%%), key and read words equal %llu (%.1f%%), within the last %zu walks key %llu (%.1f%%), key and reads %llu (%.1f%%); %llu walks with a read word not in the page cache, %.1f read log entries per walk, %llu walks on a thread with a collect epoch (%.1f%%)\n", static_cast<unsigned long long>(repeatWalks), static_cast<unsigned long long>(totals.repeatPlans.load()), static_cast<unsigned long long>(seen), repeatWalks != 0u ? 100.0 * static_cast<double>(seen) / static_cast<double>(repeatWalks) : 0.0, static_cast<unsigned long long>(totals.repeatKey.load()), share(totals.repeatKey.load()), static_cast<unsigned long long>(totals.repeatKeyAndReads.load()), share(totals.repeatKeyAndReads.load()), RepeatRing, static_cast<unsigned long long>(totals.repeatKeyRing.load()), share(totals.repeatKeyRing.load()), static_cast<unsigned long long>(totals.repeatKeyAndReadsRing.load()), share(totals.repeatKeyAndReadsRing.load()), static_cast<unsigned long long>(totals.repeatUnseenWords.load()), repeatWalks != 0u ? static_cast<double>(totals.repeatReadWords.load()) / static_cast<double>(repeatWalks) : 0.0, static_cast<unsigned long long>(totals.repeatEpochThread.load()), repeatWalks != 0u ? 100.0 * static_cast<double>(totals.repeatEpochThread.load()) / static_cast<double>(repeatWalks) : 0.0);
         }
     }
     return capture;
+}
+
+ShaderMemory::RepeatCounts ShaderMemory::Repeats() {
+    const auto& totals = CaptureTotals();
+    return {totals.repeatWalks.load(), totals.repeatPlanSeen.load(), totals.repeatKey.load(), totals.repeatKeyAndReads.load()};
+}
+
+bool ShaderMemory::seenWord(std::uint64_t address, std::uint32_t& word) const {
+    if (address % sizeof(std::uint32_t) != 0u || address > std::numeric_limits<std::uint64_t>::max() - sizeof(std::uint32_t)) return false;
+    if (overlapsInitial(address, address + sizeof(std::uint32_t))) {
+        const auto after = std::upper_bound(initial.begin(), initial.end(), address, [](std::uint64_t value, const auto& entry) { return value < entry.first; });
+        if (after == initial.begin()) return false;
+        const auto& [begin, bytes] = *std::prev(after);
+        if (address - begin + sizeof(std::uint32_t) > bytes.size()) return false;
+        std::memcpy(&word, bytes.data() + (address - begin), sizeof(word));
+        return true;
+    }
+    const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+    const auto position = pageAtOrAfter(base);
+    if (position == pages.size() || pages[position].first != base) return false;
+    const auto index = static_cast<std::size_t>((address - base) / sizeof(std::uint32_t));
+    const auto& page = *pages[position].second;
+    if (!page.valid.Test(index)) return false;
+    word = page.words[index];
+    return true;
+}
+
+void ShaderMemory::countWalkRepeat(const ShaderRecompiler::ResourceCapture& capture, std::span<const std::uint32_t> userData, std::uint64_t shaderBase) const {
+    auto& totals = CaptureTotals();
+    ++totals.repeatWalks;
+    if (GuestMemory::ThreadCollectEpoch() != 0u) ++totals.repeatEpochThread;
+    if (capture.plan == nullptr) return;
+    std::uint64_t key = 1469598103934665603ull;
+    const auto fold = [](std::uint64_t& mix, std::uint64_t value) { mix = (mix ^ value) * 1099511628211ull; };
+    const auto used = capture.userDataUse.asBase | capture.userDataUse.asValue;
+    fold(key, capture.userDataUse.asBase);
+    fold(key, capture.userDataUse.asValue);
+    fold(key, shaderBase);
+    for (std::size_t index = 0; index < userData.size() && index < ShaderRecompiler::SrtUserDataUse::TrackedWords; ++index) {
+        if ((used >> index) & 1u) fold(key, userData[index]);
+    }
+    std::uint64_t reads = key;
+    bool unseen = false;
+    std::uint64_t words = 0;
+    const auto readWord = [&](std::uint64_t address) {
+        std::uint32_t word = 0;
+        if (!seenWord(address, word)) unseen = true;
+        fold(reads, address);
+        fold(reads, word);
+        ++words;
+    };
+    for (const auto& [address, origin] : capture.userDataUse.reads) {
+        fold(reads, static_cast<std::uint64_t>(static_cast<std::uint32_t>(origin)));
+        readWord(address);
+    }
+    for (const auto& [slot, address] : capture.readTrace.leaves) readWord(address);
+    for (const auto address : capture.readTrace.otherReads) readWord(address);
+    totals.repeatReadWords += words;
+    if (unseen) ++totals.repeatUnseenWords;
+    auto& repeats = walkRepeats();
+    const std::lock_guard lock(repeats.mutex);
+    auto& entry = repeats.plans[capture.plan.get()];
+    if (entry.plan.expired() || entry.plan.lock() != capture.plan) {
+        entry = {};
+        entry.plan = capture.plan;
+        ++totals.repeatPlans;
+    } else {
+        ++totals.repeatPlanSeen;
+        const auto& last = entry.ring[(entry.next + RepeatRing - 1u) % RepeatRing];
+        if (last.key == key) ++totals.repeatKey;
+        if (last.key == key && last.reads == reads && !unseen) ++totals.repeatKeyAndReads;
+        bool ringKey = false;
+        bool ringReads = false;
+        for (std::size_t index = 0; index < entry.filled; ++index) {
+            ringKey = ringKey || entry.ring[index].key == key;
+            ringReads = ringReads || (entry.ring[index].key == key && entry.ring[index].reads == reads && !unseen);
+        }
+        if (ringKey) ++totals.repeatKeyRing;
+        if (ringReads) ++totals.repeatKeyAndReadsRing;
+    }
+    entry.ring[entry.next] = {key, reads};
+    entry.next = (entry.next + 1u) % RepeatRing;
+    entry.filled = std::min(entry.filled + 1u, RepeatRing);
 }
 
 std::vector<ShaderRecompiler::MemoryRegion> ShaderMemory::collect(bool recentOnly) const {
