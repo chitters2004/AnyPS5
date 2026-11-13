@@ -52,5 +52,5 @@ int main() {
 ", lvp ? "yes" : "no");
     }
     std::puts("the Vulkan driver was loaded and unloaded twice without a sanitizer abort");
-    return 0;
+    return 3;
 }
