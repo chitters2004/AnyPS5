@@ -12371,6 +12371,38 @@ void encoderFailedSegmentTests(const Device& device) {
     std::cout << "Command encoder failed segment tests passed\n";
 }
 
+void discardActionTests(const Device& device) {
+    auto context = device.GetContext();
+    Recorder recorder(context);
+    CoverPass cover(context);
+    int completed = 0;
+    int discarded = 0;
+    cover.Draw(recorder);
+    recorder.OnComplete([&] { ++completed; });
+    recorder.OnDiscard([&] { ++discarded; });
+    recorder.OnDiscard([] { throw std::runtime_error("injected discard action failure"); });
+    recorder.OnDiscard([&] { ++discarded; });
+    Recorder::FailNextSubmitsForTest(1);
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::runtime_error& error) {
+        failed = std::string(error.what()) == "vkQueueSubmit recorder: injected failure";
+    }
+    Recorder::FailNextSubmitsForTest(0);
+    Require(failed, "a batch with discard actions was submitted past an injected failure");
+    recorder.Sync();
+    Require(discarded == 2 && completed == 0, "a discarded batch ran " + std::to_string(discarded) + " of its 2 discard actions around a failing one and " + std::to_string(completed) + " completion actions");
+    CoverPass next(context);
+    next.Draw(recorder);
+    recorder.OnComplete([&] { ++completed; });
+    recorder.OnDiscard([&] { ++discarded; });
+    recorder.Submit();
+    recorder.Sync();
+    Require(completed == 1 && discarded == 2, "a completed batch ran " + std::to_string(completed) + " completion actions and " + std::to_string(discarded - 2) + " discard actions");
+    std::cout << "Recorder discard action tests passed\n";
+}
+
 void uncountedPassTests(const Device& device) {
     auto context = device.GetContext();
     context.bufferDeviceAddress = false;
@@ -16951,6 +16983,7 @@ int main(int argc, char** argv) {
         encoderSegmentQueryTests(device);
         encoderAdaptiveSegmentWaitTests(device);
         encoderFailedSegmentTests(device);
+        discardActionTests(device);
         encoderRuntimeSwitchTests(device, recorder);
         encoderSlotFallbackTests(device);
         recorder.Activate();
