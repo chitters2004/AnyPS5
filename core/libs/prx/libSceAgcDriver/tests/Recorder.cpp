@@ -4926,6 +4926,7 @@ public:
     std::vector<Contents> calls;
     std::uint32_t copies = 0;
     std::uint32_t templated = 0;
+    std::function<void(const Contents&)> inspect;
     Contents Since(std::size_t first) const {
         Contents merged;
         for (auto call = calls.begin() + static_cast<std::ptrdiff_t>(first); call != calls.end(); ++call) {
@@ -4954,6 +4955,7 @@ private:
                 else std::memcpy(&contents.images[key], at, sizeof(VkDescriptorImageInfo));
             }
         }
+        if (active->inspect) active->inspect(contents);
         active->calls.push_back(std::move(contents));
         ++active->templated;
         active->updateTemplate(device, set, handle, data);
@@ -4969,6 +4971,7 @@ private:
                 else contents.images[key] = write.pImageInfo[element];
             }
         }
+        if (active->inspect) active->inspect(contents);
         active->calls.push_back(std::move(contents));
         active->copies += copyCount;
         active->update(device, count, writes, copyCount, copies);
@@ -5027,6 +5030,13 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
             Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
             const auto original = updates.calls.front();
             Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
+            updates.inspect = [&](const DescriptorUpdates::Contents& sent) {
+                Require(sent.images.size() == original.images.size(), "a draw update omitted image descriptors");
+                for (const auto& [key, before] : original.images) {
+                    const auto after = sent.images.at(key);
+                    Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "a draw update would hand the driver a changed image descriptor");
+                }
+            };
             for (std::size_t allocation = 0; allocation < 2; ++allocation) {
                 const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
                 const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
@@ -5048,6 +5058,7 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
                     Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "snapshot update changed an image descriptor");
                 }
             }
+            updates.inspect = nullptr;
             ShaderRecompiler::RecompileResult faulting;
             faulting.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
             ShaderRecompiler::DescriptorBinding fault{};
