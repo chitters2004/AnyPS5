@@ -1945,7 +1945,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (hasExtension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &listRestartFeatures};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
-        state->primitiveListRestart = listRestartFeatures.primitiveTopologyListRestart == VK_TRUE;
+        state->primitiveListRestart = listRestartFeatures.primitiveTopologyListRestart == VK_TRUE && std::getenv("APS5_NO_PRIMITIVE_LIST_RESTART") == nullptr;
         if (state->primitiveListRestart) deviceExtensions.push_back(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
     }
     listRestartFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT};

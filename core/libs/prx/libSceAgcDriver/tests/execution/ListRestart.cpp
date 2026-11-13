@@ -147,6 +147,7 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         std::cout << "device list restart: " << (device->PrimitiveListRestart() ? "yes" : "no") << '\n';
+        Require(std::getenv("APS5_NO_PRIMITIVE_LIST_RESTART") == nullptr || !device->PrimitiveListRestart(), "list restart: APS5_NO_PRIMITIVE_LIST_RESTART left primitiveTopologyListRestart enabled, so the index compaction fallback is not exercised");
         const auto indexAddress = reinterpret_cast<std::uintptr_t>(Indices.data());
         Draw(*device, AgcDriver::Pm4::DrawParameters{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true});
         Check("direct triangle list with a restart and an incomplete tail", true, true);
