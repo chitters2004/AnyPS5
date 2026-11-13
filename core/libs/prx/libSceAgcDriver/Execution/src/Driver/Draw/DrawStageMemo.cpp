@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -350,8 +351,7 @@ DrawStageMemoCounts DrawStageMemoCounters::Load() const {
 }
 
 bool Driver::drawStageMemoEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_STAGE_MEMO") == nullptr;
-    return enabled;
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawStageMemo);
 }
 
 bool Driver::verifyDrawStageMemo() {
