@@ -2129,6 +2129,26 @@ auto withNanSpeculationFallback(const RecompileRequest& request, Impl&& impl) ->
 }
 
 template <typename Impl>
+auto retryWithoutNanSpeculation(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
+    if (!NanSpeculation().enabled || NanSpeculationSuppressed(request.shader.codeAddress)) return impl();
+    try {
+        return impl();
+    } catch (const ConvertedSampleRequired&) {
+        throw;
+    } catch (const LayerRowSamplesRequired&) {
+        throw;
+    } catch (const std::bad_alloc&) {
+        throw;
+    } catch (const std::exception& error) {
+        if (!SuppressNanSpeculation(request.shader.codeAddress)) throw;
+        const std::string_view reason(error.what());
+        const std::string text(reason.substr(0u, reason.find('\n')));
+        std::fprintf(stderr, "[recompile] nan speculation failed for 0x%llx (%u programs fell back): %.200s; preparing again without it\n", static_cast<unsigned long long>(request.shader.codeAddress), NanSpeculationFallbacks(), text.c_str());
+        throw NanSpeculationRetry(text);
+    }
+}
+
+template <typename Impl>
 auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltype(impl()) {
     try {
         return impl();
@@ -2216,7 +2236,7 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
 }
 
 std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& request, ShaderPreparationContext* preparation) {
-    return recompileReporting(request, [&]() -> std::shared_ptr<const SourceHandle> {
+    return recompileReporting(request, [&] { return withNanSpeculationFallback(request, [&]() -> std::shared_ptr<const SourceHandle> {
         static_cast<void>(RequestInputInfo(request));
         auto handle = std::make_shared<SourceHandle>();
         handle->source = getSource(request, preparation, false);
@@ -2226,7 +2246,7 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
         std::lock_guard lock(handle->source->mutex);
         handle->artifact = findOrCompileVariant(*handle->source, request, cacheHit, preparation);
         return handle;
-    });
+    }); });
 }
 
 bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle) {
@@ -2278,11 +2298,13 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 }
 
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {
-    auto capture = std::make_shared<ResourceCapture>();
-    capture->source = handle->source;
-    capture->plan = acquirePlan(request, handle->source, true, handle.get());
-    materializeCapture(*capture, runtime);
-    return capture;
+    return retryWithoutNanSpeculation(request, [&] {
+        auto capture = std::make_shared<ResourceCapture>();
+        capture->source = handle->source;
+        capture->plan = acquirePlan(request, handle->source, true, handle.get());
+        materializeCapture(*capture, runtime);
+        return capture;
+    });
 }
 
 std::shared_ptr<const RecompileResult> PreparedShaderInvocation::Materialize(const ResourceCapture& capture) const {
@@ -2328,12 +2350,14 @@ std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& 
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // The whole vertex family (Vertex, Local, TC, TE, Mesh) validates V# fields the memo key does not cover.
     if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
-    auto capture = std::make_shared<ResourceCapture>();
-    capture->source = handle.source;
-    capture->plan = acquirePlan(request, handle.source, true, &handle);
-    if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-    materializeCapture(*capture, runtime);
-    return capture;
+    return retryWithoutNanSpeculation(request, [&] {
+        auto capture = std::make_shared<ResourceCapture>();
+        capture->source = handle.source;
+        capture->plan = acquirePlan(request, handle.source, true, &handle);
+        if (profile) capture->sourceNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+        materializeCapture(*capture, runtime);
+        return capture;
+    });
 }
 
 RecompileResult Recompile(const RecompileRequest& request) {
