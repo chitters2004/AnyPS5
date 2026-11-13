@@ -895,6 +895,29 @@ DrawProfile& Profile() {
     return profile;
 }
 
+enum LookupPart : std::size_t { LookupKey, LookupFind, LookupRevalidate, LookupMoved, LookupPartCount };
+
+struct LookupSplit {
+    std::array<std::atomic<std::uint64_t>, LookupPartCount> calls{};
+    std::array<std::atomic<std::uint64_t>, LookupPartCount> nanoseconds{};
+};
+
+LookupSplit& LookupSplits() {
+    static LookupSplit split;
+    return split;
+}
+
+bool LookupSplitProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+void countLookupPart(LookupPart part, std::chrono::steady_clock::time_point start) {
+    auto& split = LookupSplits();
+    split.calls[part].fetch_add(1, std::memory_order_relaxed);
+    split.nanoseconds[part].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
@@ -1004,6 +1027,18 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    {
+        auto& split = LookupSplits();
+        std::array<std::uint64_t, LookupPartCount> calls{};
+        std::array<double, LookupPartCount> ms{};
+        for (std::size_t part = 0; part < LookupPartCount; ++part) {
+            calls[part] = split.calls[part].exchange(0, std::memory_order_relaxed);
+            ms[part] = static_cast<double>(split.nanoseconds[part].exchange(0, std::memory_order_relaxed)) / 1e6;
+        }
+        const double lookupMs = profile.totalsUs[PhaseLookup] / 1000.0;
+        AgcDriver::ProfilePrint_nid_no_patch("[draws] lookup split (10 s): lookup %.1f ms over %llu draws; key %llu calls %.1f ms, find %llu calls %.1f ms, revalidate %llu calls %.1f ms, moved buffers %llu calls %.1f ms, rest (space reuse and cache bookkeeping) %.1f ms\n", lookupMs, static_cast<unsigned long long>(profile.draws),
+                static_cast<unsigned long long>(calls[LookupKey]), ms[LookupKey], static_cast<unsigned long long>(calls[LookupFind]), ms[LookupFind], static_cast<unsigned long long>(calls[LookupRevalidate]), ms[LookupRevalidate], static_cast<unsigned long long>(calls[LookupMoved]), ms[LookupMoved], lookupMs - ms[LookupKey] - ms[LookupFind] - ms[LookupRevalidate] - ms[LookupMoved]);
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {
@@ -1706,6 +1741,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
         timer.charge(PhaseLookup, keyStart);
+        if (timer.profile) countLookupPart(LookupKey, keyStart);
     }
     return plan;
 }
@@ -2138,7 +2174,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
         resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        const bool lookupSplit = LookupSplitProfiled();
+        const auto findStart = lookupSplit ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        auto cached = SharedResourceCache().Find(resolved.contentKey);
+        if (lookupSplit) countLookupPart(LookupFind, findStart);
+        if (cached) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2170,12 +2210,18 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
+            const auto revalidateStart = lookupSplit && spaceHeld ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool valid = spaceHeld && cached->Revalidate(shaders);
+            if (lookupSplit && spaceHeld) countLookupPart(LookupRevalidate, revalidateStart);
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+            if (valid && recorder != nullptr) {
+                const auto movedStart = lookupSplit ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+                if (lookupSplit) countLookupPart(LookupMoved, movedStart);
+            }
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
