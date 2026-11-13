@@ -383,6 +383,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             }
         }
         if (walkFirst > walkLast) return 0;
+        Recorder::RefuseWhenPoisoned();
         const auto walkBegin = std::max(shadow->UnitBegin(walkFirst), shadow->importBase);
         const auto walkEnd = std::min(shadow->UnitBegin(walkLast + 1), shadow->ImportEnd());
         if (walkEnd > walkBegin) GuestMemory::CollectWritesUncached(walkBegin, static_cast<std::size_t>(walkEnd - walkBegin));

@@ -52,6 +52,8 @@ enum class RuntimeSwitch : std::size_t {
     SingleRingPreparer,
     NoSharedPreparerContext,
     NoTargetMemoOverlapCache,
+    NoRecordEncoder,
+    EncoderPostChunks,
     Count,
 };
 
