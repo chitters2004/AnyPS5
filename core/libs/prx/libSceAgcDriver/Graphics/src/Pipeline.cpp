@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "RuntimeAbi.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -1003,6 +1004,73 @@ void Pipeline::Continue(CommandState& recording, const State& state, const State
     if (depthBias) recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
+}
+
+void Pipeline::PushOps(DrawStateOps& ops, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    auto& record = ops.record;
+    record.pushCount = 0;
+    record.pushBytes = 0;
+    if (stages == 0) return;
+    if (dynamicRendering) {
+        record.pushCount = 2;
+        record.pushStages = {pushStagesOf(context), VK_SHADER_STAGE_FRAGMENT_BIT};
+        record.pushOffsets = {0, PipelinePushSlotBytes};
+        record.pushSizes = {PipelinePushSlotBytes, PipelinePushSlotBytes};
+        record.pushBytes = 2 * PipelinePushSlotBytes;
+    } else {
+        record.pushCount = 1;
+        record.pushStages = {stages, 0};
+        record.pushOffsets = {0, 0};
+        record.pushSizes = {PipelinePushSlotBytes, 0};
+        record.pushBytes = PipelinePushSlotBytes;
+    }
+    ops.push = bytes.data();
+}
+
+void Pipeline::DrawOps(DrawStateOps& ops, CommandState& recording, const State& state, const State* masked, std::array<VkDescriptorSet, 2> sets, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
+    {
+        CommandState::Capturing capturing(recording, ops.state);
+        Continue(recording, state, masked);
+        capturing.Composed();
+    }
+    auto& record = ops.record;
+    record.layout = layout;
+    record.opCount = static_cast<std::uint32_t>(ops.state.Ops().size());
+    record.setCount = 0;
+    const std::array<std::uint32_t, 2> firstSets{0, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet};
+    for (std::size_t index = 0; index < sets.size(); ++index) {
+        if (sets[index] == VK_NULL_HANDLE) continue;
+        record.sets[record.setCount] = sets[index];
+        record.firstSets[record.setCount++] = firstSets[index];
+    }
+    PushOps(ops, stages, bytes);
+}
+
+void Pipeline::Issue(const CommandState& recording, const DrawStateCapture& captured) const {
+    recording.Issue(context, captured);
+}
+
+bool CanRunDrawStateOps(const DrawStateOps& ops, const DeviceFunctions& functions) {
+    if (ops.record.setCount != 0 && functions.cmdBindDescriptorSets == nullptr) return false;
+    if (ops.record.pushCount != 0 && functions.cmdPushConstants == nullptr) return false;
+    return std::ranges::all_of(ops.state.Ops(), [&functions](const DrawStateOp& op) { return CommandState::Runs(op, functions); });
+}
+
+void RunDrawStateOps(const DrawStateRecord& record, std::span<const DrawStateOp> state, const std::byte* push, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    for (const auto& op : state) CommandState::Run(op, commands, functions);
+    for (std::uint32_t index = 0; index < record.setCount; ++index) functions.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.layout, record.firstSets[index], 1, &record.sets[index], 0, nullptr);
+    for (std::uint32_t index = 0; index < record.pushCount; ++index) functions.cmdPushConstants(commands, record.layout, record.pushStages[index], record.pushOffsets[index], record.pushSizes[index], push + record.pushOffsets[index]);
+}
+
+void RunDrawStateRecord(const std::byte* payload, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    const auto& record = *std::launder(reinterpret_cast<const DrawStateRecord*>(payload));
+    const auto* ops = std::launder(reinterpret_cast<const DrawStateOp*>(payload + CommandEncoder::Aligned(sizeof(DrawStateRecord))));
+    const auto* push = payload + CommandEncoder::Aligned(sizeof(DrawStateRecord)) + CommandEncoder::Aligned(sizeof(DrawStateOp) * record.opCount);
+    RunDrawStateOps(record, std::span(ops, record.opCount), push, commands, functions);
+}
+
+void EmplaceDrawStateOps(CommandEncoder& encoder, const DrawStateOps& ops) {
+    encoder.Emplace(&RunDrawStateRecord, ops.record, ops.state.Ops(), std::span<const std::byte>(ops.push, ops.record.pushBytes));
 }
 
 void Pipeline::setLibraryState(CommandState& recording, const State& state) const {

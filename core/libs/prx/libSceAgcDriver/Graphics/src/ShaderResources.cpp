@@ -6993,14 +6993,17 @@ void ShaderResources::CompleteDrawUse(const DrawUse& use) const {
     if (bda != nullptr) bda->CheckUse(use.record.get());
 }
 
-void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const {
-    if (use == nullptr || use->bindings == nullptr) {
-        Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
-        return;
-    }
+std::array<VkDescriptorSet, 2> ShaderResources::DrawUseSets(const DrawUse* use) const {
     requireGuestBuffers();
-    const auto set = use->bindings->allocation.set;
-    const auto fragmentSet = use->bindings->fragmentAllocation.set;
+    if (use == nullptr || use->bindings == nullptr) {
+        prepareFaultSlot();
+        return {_set, fragment.set};
+    }
+    return {use->bindings->allocation.set, use->bindings->fragmentAllocation.set};
+}
+
+void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const {
+    const auto [set, fragmentSet] = DrawUseSets(use);
     if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
     if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
 }

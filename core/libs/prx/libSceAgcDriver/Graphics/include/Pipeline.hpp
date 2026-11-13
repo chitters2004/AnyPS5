@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <set>
 
 namespace AgcDriver::Graphics {
@@ -30,6 +32,30 @@ private:
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
     std::vector<VkImageView> views;
 };
+
+struct DrawStateRecord {
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    std::uint32_t opCount = 0;
+    std::uint32_t setCount = 0;
+    std::array<VkDescriptorSet, 2> sets{};
+    std::array<std::uint32_t, 2> firstSets{};
+    std::uint32_t pushCount = 0;
+    std::uint32_t pushBytes = 0;
+    std::array<VkShaderStageFlags, 2> pushStages{};
+    std::array<std::uint32_t, 2> pushOffsets{};
+    std::array<std::uint32_t, 2> pushSizes{};
+};
+
+struct DrawStateOps {
+    DrawStateRecord record;
+    DrawStateCapture state;
+    const std::byte* push = nullptr;
+};
+
+void RunDrawStateOps(const DrawStateRecord& record, std::span<const DrawStateOp> state, const std::byte* push, VkCommandBuffer commands, const DeviceFunctions& functions);
+void RunDrawStateRecord(const std::byte* payload, VkCommandBuffer commands, const DeviceFunctions& functions);
+bool CanRunDrawStateOps(const DrawStateOps& ops, const DeviceFunctions& functions);
+void EmplaceDrawStateOps(CommandEncoder& encoder, const DrawStateOps& ops);
 
 // The shader modules, layout, render pass and VkPipeline of one draw configuration. Viewport,
 // scissor, depth bounds and depth bias are dynamic state set at Begin, so pipelines are shared by draws that differ only there
@@ -64,6 +90,9 @@ public:
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void PushOps(DrawStateOps& ops, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void DrawOps(DrawStateOps& ops, CommandState& recording, const State& state, const State* masked, std::array<VkDescriptorSet, 2> sets, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    void Issue(const CommandState& recording, const DrawStateCapture& captured) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 

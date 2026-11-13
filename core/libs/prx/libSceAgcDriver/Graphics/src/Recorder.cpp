@@ -1664,7 +1664,8 @@ void CommandState::applyFaces(Slot first, VkStencilFaceFlags faces, std::array<T
 
 void CommandState::BindPipeline(const Context& context, VkPipeline bound, std::uint32_t slots) {
     if (pipelineKnown && pipeline == bound && dynamicSlots == slots && (overwritten & ~slots) == 0) return;
-    context.tracked(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
+    if (capture != nullptr) capture->Add(DrawStateOp::BindPipeline, 0, bound);
+    else context.tracked(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
     pipeline = bound;
     pipelineKnown = trackable != 0 && bound != VK_NULL_HANDLE;
     dynamicSlots = slots;
@@ -1673,65 +1674,111 @@ void CommandState::BindPipeline(const Context& context, VkPipeline bound, std::u
 }
 
 void CommandState::SetViewport(const Context& context, const VkViewport& value) {
-    apply(Viewport, &CommandState::viewport, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &value); });
+    apply(Viewport, &CommandState::viewport, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::Viewport, 0, value);
+        context.tracked(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &value);
+    });
 }
 
 void CommandState::SetScissor(const Context& context, const VkRect2D& value) {
-    apply(Scissor, &CommandState::scissor, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &value); });
+    apply(Scissor, &CommandState::scissor, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::Scissor, 0, value);
+        context.tracked(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &value);
+    });
 }
 
 void CommandState::SetDepthBias(const Context& context, float constant, float clamp, float slope) {
     const std::array<float, 3> bias{constant, clamp, slope};
-    apply(DepthBias, &CommandState::depthBias, bias, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, constant, clamp, slope); });
+    apply(DepthBias, &CommandState::depthBias, bias, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthBias, 0, bias);
+        context.tracked(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, constant, clamp, slope);
+    });
 }
 
 void CommandState::SetDepthBounds(const Context& context, float minimum, float maximum) {
     const std::array<float, 2> bounds{minimum, maximum};
-    apply(DepthBounds, &CommandState::depthBounds, bounds, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, minimum, maximum); });
+    apply(DepthBounds, &CommandState::depthBounds, bounds, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthBounds, 0, bounds);
+        context.tracked(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, minimum, maximum);
+    });
 }
 
 void CommandState::SetCullMode(const Context& context, VkCullModeFlags mode) {
-    apply(CullMode, &CommandState::cullMode, mode, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, mode); });
+    apply(CullMode, &CommandState::cullMode, mode, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::CullMode, 0, mode);
+        context.tracked(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, mode);
+    });
 }
 
 void CommandState::SetFrontFace(const Context& context, VkFrontFace face) {
-    apply(FrontFace, &CommandState::frontFace, face, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, face); });
+    apply(FrontFace, &CommandState::frontFace, face, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::FrontFace, 0, face);
+        context.tracked(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, face);
+    });
 }
 
 void CommandState::SetDepthTestEnable(const Context& context, VkBool32 enable) {
-    apply(DepthTest, &CommandState::depthTest, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, enable); });
+    apply(DepthTest, &CommandState::depthTest, enable, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthTest, 0, enable);
+        context.tracked(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, enable);
+    });
 }
 
 void CommandState::SetDepthWriteEnable(const Context& context, VkBool32 enable) {
-    apply(DepthWrite, &CommandState::depthWrite, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, enable); });
+    apply(DepthWrite, &CommandState::depthWrite, enable, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthWrite, 0, enable);
+        context.tracked(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, enable);
+    });
 }
 
 void CommandState::SetDepthCompareOp(const Context& context, VkCompareOp compare) {
-    apply(DepthCompare, &CommandState::depthCompare, compare, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, compare); });
+    apply(DepthCompare, &CommandState::depthCompare, compare, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthCompare, 0, compare);
+        context.tracked(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, compare);
+    });
 }
 
 void CommandState::SetDepthBoundsTestEnable(const Context& context, VkBool32 enable) {
-    apply(DepthBoundsTest, &CommandState::depthBoundsTest, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, enable); });
+    apply(DepthBoundsTest, &CommandState::depthBoundsTest, enable, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::DepthBoundsTest, 0, enable);
+        context.tracked(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, enable);
+    });
 }
 
 void CommandState::SetStencilTestEnable(const Context& context, VkBool32 enable) {
-    apply(StencilTest, &CommandState::stencilTest, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, enable); });
+    apply(StencilTest, &CommandState::stencilTest, enable, std::equal_to<>{}, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::StencilTest, 0, enable);
+        context.tracked(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, enable);
+    });
 }
 
 void CommandState::SetStencilOp(const Context& context, VkStencilFaceFlags faces, VkStencilOp failOp, VkStencilOp passOp, VkStencilOp depthFailOp, VkCompareOp compareOp) {
-    applyFaces(StencilOpFront, faces, &CommandState::stencilOps, StencilOps{failOp, passOp, depthFailOp, compareOp}, [&](VkStencilFaceFlags needed) { context.tracked(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, needed, failOp, passOp, depthFailOp, compareOp); });
+    const StencilOps ops{failOp, passOp, depthFailOp, compareOp};
+    applyFaces(StencilOpFront, faces, &CommandState::stencilOps, ops, [&](VkStencilFaceFlags needed) {
+        if (capture != nullptr) return capture->Add(DrawStateOp::StencilOp, needed, ops);
+        context.tracked(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, needed, failOp, passOp, depthFailOp, compareOp);
+    });
 }
 
 void CommandState::SetStencilCompareMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask) {
-    applyFaces(CompareMaskFront, faces, &CommandState::compareMasks, mask, [&](VkStencilFaceFlags needed) { context.tracked(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, needed, mask); });
+    applyFaces(CompareMaskFront, faces, &CommandState::compareMasks, mask, [&](VkStencilFaceFlags needed) {
+        if (capture != nullptr) return capture->Add(DrawStateOp::CompareMask, needed, mask);
+        context.tracked(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, needed, mask);
+    });
 }
 
 void CommandState::SetStencilWriteMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask) {
-    applyFaces(WriteMaskFront, faces, &CommandState::writeMasks, mask, [&](VkStencilFaceFlags needed) { context.tracked(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, needed, mask); });
+    applyFaces(WriteMaskFront, faces, &CommandState::writeMasks, mask, [&](VkStencilFaceFlags needed) {
+        if (capture != nullptr) return capture->Add(DrawStateOp::WriteMask, needed, mask);
+        context.tracked(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, needed, mask);
+    });
 }
 
 void CommandState::SetStencilReference(const Context& context, VkStencilFaceFlags faces, std::uint32_t reference) {
-    applyFaces(ReferenceFront, faces, &CommandState::references, reference, [&](VkStencilFaceFlags needed) { context.tracked(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, needed, reference); });
+    applyFaces(ReferenceFront, faces, &CommandState::references, reference, [&](VkStencilFaceFlags needed) {
+        if (capture != nullptr) return capture->Add(DrawStateOp::Reference, needed, reference);
+        context.tracked(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, needed, reference);
+    });
 }
 
 void CommandState::SetColorWriteMasks(const Context& context, std::span<const VkColorComponentFlags> masks) {
@@ -1740,7 +1787,100 @@ void CommandState::SetColorWriteMasks(const Context& context, std::span<const Vk
     value.count = static_cast<std::uint32_t>(masks.size());
     std::ranges::copy(masks, value.masks.begin());
     const auto covered = [](const ColorWriteMasks& known, const ColorWriteMasks& wanted) { return wanted.count <= known.count && std::equal(wanted.masks.begin(), wanted.masks.begin() + wanted.count, known.masks.begin()); };
-    apply(ColorWriteMask, &CommandState::colorWriteMasks, value, covered, [&] { context.tracked(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, value.count, masks.data()); });
+    apply(ColorWriteMask, &CommandState::colorWriteMasks, value, covered, [&] {
+        if (capture != nullptr) return capture->Add(DrawStateOp::ColorWriteMask, value.count, value.masks);
+        context.tracked(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, value.count, masks.data());
+    });
+}
+
+namespace {
+
+template<typename TLookup>
+void runDrawStateOp(const DrawStateOp& op, VkCommandBuffer commands, TLookup lookup) {
+    const auto read = [&op]<typename TValue>(std::type_identity<TValue>) {
+        TValue value;
+        std::memcpy(&value, op.words.data(), sizeof(TValue));
+        return value;
+    };
+    switch (op.kind) {
+    case DrawStateOp::BindPipeline: lookup(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, read(std::type_identity<VkPipeline>{})); return;
+    case DrawStateOp::Viewport: {
+        const auto value = read(std::type_identity<VkViewport>{});
+        lookup(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &value);
+        return;
+    }
+    case DrawStateOp::Scissor: {
+        const auto value = read(std::type_identity<VkRect2D>{});
+        lookup(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &value);
+        return;
+    }
+    case DrawStateOp::DepthBias: {
+        const auto value = read(std::type_identity<std::array<float, 3>>{});
+        lookup(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, value[0], value[1], value[2]);
+        return;
+    }
+    case DrawStateOp::DepthBounds: {
+        const auto value = read(std::type_identity<std::array<float, 2>>{});
+        lookup(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, value[0], value[1]);
+        return;
+    }
+    case DrawStateOp::CullMode: lookup(&DeviceFunctions::cmdSetCullMode, "vkCmdSetCullModeEXT")(commands, read(std::type_identity<VkCullModeFlags>{})); return;
+    case DrawStateOp::FrontFace: lookup(&DeviceFunctions::cmdSetFrontFace, "vkCmdSetFrontFaceEXT")(commands, read(std::type_identity<VkFrontFace>{})); return;
+    case DrawStateOp::DepthTest: lookup(&DeviceFunctions::cmdSetDepthTestEnable, "vkCmdSetDepthTestEnableEXT")(commands, read(std::type_identity<VkBool32>{})); return;
+    case DrawStateOp::DepthWrite: lookup(&DeviceFunctions::cmdSetDepthWriteEnable, "vkCmdSetDepthWriteEnableEXT")(commands, read(std::type_identity<VkBool32>{})); return;
+    case DrawStateOp::DepthCompare: lookup(&DeviceFunctions::cmdSetDepthCompareOp, "vkCmdSetDepthCompareOpEXT")(commands, read(std::type_identity<VkCompareOp>{})); return;
+    case DrawStateOp::DepthBoundsTest: lookup(&DeviceFunctions::cmdSetDepthBoundsTestEnable, "vkCmdSetDepthBoundsTestEnableEXT")(commands, read(std::type_identity<VkBool32>{})); return;
+    case DrawStateOp::StencilTest: lookup(&DeviceFunctions::cmdSetStencilTestEnable, "vkCmdSetStencilTestEnableEXT")(commands, read(std::type_identity<VkBool32>{})); return;
+    case DrawStateOp::StencilOp: {
+        const auto value = read(std::type_identity<std::array<std::uint32_t, 4>>{});
+        lookup(&DeviceFunctions::cmdSetStencilOp, "vkCmdSetStencilOpEXT")(commands, op.faces, static_cast<VkStencilOp>(value[0]), static_cast<VkStencilOp>(value[1]), static_cast<VkStencilOp>(value[2]), static_cast<VkCompareOp>(value[3]));
+        return;
+    }
+    case DrawStateOp::CompareMask: lookup(&DeviceFunctions::cmdSetStencilCompareMask, "vkCmdSetStencilCompareMask")(commands, op.faces, op.words[0]); return;
+    case DrawStateOp::WriteMask: lookup(&DeviceFunctions::cmdSetStencilWriteMask, "vkCmdSetStencilWriteMask")(commands, op.faces, op.words[0]); return;
+    case DrawStateOp::Reference: lookup(&DeviceFunctions::cmdSetStencilReference, "vkCmdSetStencilReference")(commands, op.faces, op.words[0]); return;
+    case DrawStateOp::ColorWriteMask: {
+        const auto value = read(std::type_identity<std::array<VkColorComponentFlags, 8>>{});
+        lookup(&DeviceFunctions::cmdSetColorWriteMask, "vkCmdSetColorWriteMaskEXT")(commands, 0, op.faces, value.data());
+        return;
+    }
+    case DrawStateOp::KindCount: break;
+    }
+    throw std::runtime_error("AGC graphics: a draw state record holds an unknown command");
+}
+
+}
+
+void CommandState::Issue(const Context& context, const DrawStateCapture& captured) const {
+    for (const auto& op : captured.Ops()) runDrawStateOp(op, commands, [&context](auto member, const char* name) { return context.tracked(member, name); });
+}
+
+bool CommandState::Runs(const DrawStateOp& op, const DeviceFunctions& functions) {
+    switch (op.kind) {
+    case DrawStateOp::BindPipeline: return CommandEncoder::Unwrap(functions.cmdBindPipeline) != nullptr;
+    case DrawStateOp::Viewport: return CommandEncoder::Unwrap(functions.cmdSetViewport) != nullptr;
+    case DrawStateOp::Scissor: return CommandEncoder::Unwrap(functions.cmdSetScissor) != nullptr;
+    case DrawStateOp::DepthBias: return CommandEncoder::Unwrap(functions.cmdSetDepthBias) != nullptr;
+    case DrawStateOp::DepthBounds: return CommandEncoder::Unwrap(functions.cmdSetDepthBounds) != nullptr;
+    case DrawStateOp::CullMode: return CommandEncoder::Unwrap(functions.cmdSetCullMode) != nullptr;
+    case DrawStateOp::FrontFace: return CommandEncoder::Unwrap(functions.cmdSetFrontFace) != nullptr;
+    case DrawStateOp::DepthTest: return CommandEncoder::Unwrap(functions.cmdSetDepthTestEnable) != nullptr;
+    case DrawStateOp::DepthWrite: return CommandEncoder::Unwrap(functions.cmdSetDepthWriteEnable) != nullptr;
+    case DrawStateOp::DepthCompare: return CommandEncoder::Unwrap(functions.cmdSetDepthCompareOp) != nullptr;
+    case DrawStateOp::DepthBoundsTest: return CommandEncoder::Unwrap(functions.cmdSetDepthBoundsTestEnable) != nullptr;
+    case DrawStateOp::StencilTest: return CommandEncoder::Unwrap(functions.cmdSetStencilTestEnable) != nullptr;
+    case DrawStateOp::StencilOp: return CommandEncoder::Unwrap(functions.cmdSetStencilOp) != nullptr;
+    case DrawStateOp::CompareMask: return CommandEncoder::Unwrap(functions.cmdSetStencilCompareMask) != nullptr;
+    case DrawStateOp::WriteMask: return CommandEncoder::Unwrap(functions.cmdSetStencilWriteMask) != nullptr;
+    case DrawStateOp::Reference: return CommandEncoder::Unwrap(functions.cmdSetStencilReference) != nullptr;
+    case DrawStateOp::ColorWriteMask: return CommandEncoder::Unwrap(functions.cmdSetColorWriteMask) != nullptr;
+    case DrawStateOp::KindCount: break;
+    }
+    return false;
+}
+
+void CommandState::Run(const DrawStateOp& op, VkCommandBuffer commands, const DeviceFunctions& functions) {
+    runDrawStateOp(op, commands, [&functions](auto member, const char*) { return CommandEncoder::Unwrap(functions.*member); });
 }
 
 CommandState& Recorder::GraphicsState() {

@@ -14,6 +14,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
+#include <type_traits>
 #include <array>
 #include <deque>
 #include <exception>
@@ -34,6 +37,33 @@ namespace AgcDriver::Graphics {
 
 class Buffer;
 class DeviceBuffer;
+
+struct DrawStateOp {
+    enum Kind : std::uint32_t { BindPipeline, Viewport, Scissor, DepthBias, DepthBounds, CullMode, FrontFace, DepthTest, DepthWrite, DepthCompare, DepthBoundsTest, StencilTest, StencilOp, CompareMask, WriteMask, Reference, ColorWriteMask, KindCount };
+    Kind kind;
+    std::uint32_t faces;
+    std::array<std::uint32_t, 8> words;
+};
+
+class DrawStateCapture {
+public:
+    static constexpr std::size_t Capacity = 32;
+    template<typename TValue>
+    void Add(DrawStateOp::Kind kind, std::uint32_t faces, const TValue& value) {
+        static_assert(std::is_trivially_copyable_v<TValue> && sizeof(TValue) <= sizeof(DrawStateOp::words));
+        if (count == Capacity) throw std::runtime_error("AGC graphics: a draw set more state commands than a draw state record holds");
+        auto& op = ops[count++];
+        op.kind = kind;
+        op.faces = faces;
+        op.words = {};
+        std::memcpy(op.words.data(), &value, sizeof(TValue));
+    }
+    std::span<const DrawStateOp> Ops() const { return std::span(ops).first(count); }
+
+private:
+    std::array<DrawStateOp, Capacity> ops;
+    std::uint32_t count = 0;
+};
 
 class CommandState {
 public:
@@ -89,6 +119,25 @@ public:
     void SetStencilWriteMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask);
     void SetStencilReference(const Context& context, VkStencilFaceFlags faces, std::uint32_t reference);
     void SetColorWriteMasks(const Context& context, std::span<const VkColorComponentFlags> masks);
+    void Issue(const Context& context, const DrawStateCapture& captured) const;
+    static bool Runs(const DrawStateOp& op, const DeviceFunctions& functions);
+    static void Run(const DrawStateOp& op, VkCommandBuffer commands, const DeviceFunctions& functions);
+
+    class Capturing {
+    public:
+        Capturing(CommandState& state, DrawStateCapture& capture) : state(state) { state.capture = &capture; }
+        ~Capturing() {
+            state.capture = nullptr;
+            if (!composed) state.Invalidate();
+        }
+        Capturing(const Capturing&) = delete;
+        Capturing& operator=(const Capturing&) = delete;
+        void Composed() { composed = true; }
+
+    private:
+        CommandState& state;
+        bool composed = false;
+    };
 
 private:
     struct StencilOps {
@@ -109,6 +158,7 @@ private:
     void applyFaces(Slot first, VkStencilFaceFlags faces, std::array<TValue, 2> CommandState::*field, const TValue& value, TEmit emit);
 
     VkCommandBuffer commands = VK_NULL_HANDLE;
+    DrawStateCapture* capture = nullptr;
     std::uint32_t trackable = 0;
     std::uint32_t valid = 0;
     std::uint32_t overwritten = 0;
@@ -599,6 +649,7 @@ public:
     bool BeginEncoding(std::source_location where = std::source_location::current());
     void EndEncoding(std::source_location where = std::source_location::current());
     bool Encodes() const { return encoder != nullptr; }
+    CommandEncoder* DeferringEncoder(VkCommandBuffer commands) const { return encoder != nullptr && encoder->Defers(commands) ? encoder.get() : nullptr; }
     CommandEncoder::UnwindQuiesce UnwindGuard(std::source_location where = std::source_location::current()) const { return CommandEncoder::UnwindQuiesce(encoder.get(), where); }
     class EncodingWindow {
     public:
