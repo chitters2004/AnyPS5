@@ -15272,7 +15272,7 @@ int pipelineMonolithicDiagnosticTests(const Device& device, bool expectLibraries
         std::cout << "skipped, graphics pipeline libraries unavailable or disabled\n";
         return 77;
     }
-    Require(std::getenv("APS5_DIAG_MONOLITHIC_PIPELINES") != nullptr, "the monolithic pipeline diagnostic test requires APS5_DIAG_MONOLITHIC_PIPELINES");
+    Require(std::getenv("APS5_DIAG_MONOLITHIC_PIPELINES") != nullptr || std::getenv("APS5_DIAG_GPL_PARTS") != nullptr, "the monolithic pipeline diagnostic test requires APS5_DIAG_MONOLITHIC_PIPELINES or APS5_DIAG_GPL_PARTS");
     LibraryCreateFlags created(context);
     struct Cleanup {
         VkDevice device;
@@ -15296,11 +15296,12 @@ int pipelineMonolithicDiagnosticTests(const Device& device, bool expectLibraries
     VertexInputLayout input;
     auto traced = context;
     traced.deviceProc = created.Resolver();
+    traced.libraryPartsOff = AgcDriver::Graphics::LibraryPartsOff();
     const auto pipeline = CachedPipeline(traced, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
     Require(pipeline != nullptr, "no pipeline was created");
     const auto libraries = created.Libraries();
     if (expectLibraries) Require(libraries != 0, "a pipeline outside the APS5_DIAG_MONOLITHIC_PIPELINES selection was linked whole");
-    else Require(libraries == 0, "a pipeline selected by APS5_DIAG_MONOLITHIC_PIPELINES was linked from " + std::to_string(libraries) + " libraries");
+    else Require(libraries == 0, "a pipeline selected by APS5_DIAG_MONOLITHIC_PIPELINES or APS5_DIAG_GPL_PARTS was linked from " + std::to_string(libraries) + " libraries");
     std::cout << "monolithic pipeline diagnostic checked: " << libraries << " libraries\n";
     return 0;
 }

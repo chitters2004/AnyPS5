@@ -617,6 +617,7 @@ struct VulkanDevice::State {
     bool primitiveListRestart = false;
     bool depthClipControl = false;
     bool graphicsPipelineLibrary = false;
+    std::uint32_t libraryPartsOff = 0;
     bool pipelineLinkTimeOptimization = true;
     bool dynamicColorWriteMask = false;
     bool imageViewMinLod = false;
@@ -2046,12 +2047,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         libraryDevice = libraryFeatures.graphicsPipelineLibrary == VK_TRUE && dynamicStateFeatures.extendedDynamicState == VK_TRUE && renderingFeatures.dynamicRendering == VK_TRUE && libraryProperties.graphicsPipelineLibraryFastLinking == VK_TRUE && properties.properties.limits.maxPushConstantsSize >= Graphics::PipelinePushConstantBytes;
         if (libraryDevice) deviceExtensions.insert(deviceExtensions.end(), libraryExtensions.begin(), libraryExtensions.end());
         state->graphicsPipelineLibrary = libraryDevice && std::getenv("APS5_NO_GPL") == nullptr;
+        state->libraryPartsOff = state->graphicsPipelineLibrary ? Graphics::LibraryPartsOff() : 0u;
         if (state->graphicsPipelineLibrary && hasExtension(VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME)) {
             state->pipelineLinkTimeOptimization = PipelineLinkTimeOptimizationUsable(driverId);
         }
     }
     VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5Features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
-    if (state->graphicsPipelineLibrary && hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+    if (state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartMaintenance5) == 0u && hasExtension(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &maintenance5Features};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
         state->maintenance5 = maintenance5Features.maintenance5 == VK_TRUE;
@@ -2204,7 +2206,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.shaderResourceMinLod = available.shaderResourceMinLod;
     if (enabled.shaderResourceMinLod) state->capabilities.push_back(spv::CapabilityMinLod);
     state->shaderResourceMinLod = enabled.shaderResourceMinLod == VK_TRUE;
-    state->shaderImageMinLod = state->shaderResourceMinLod && !state->imageViewMinLod && !state->graphicsPipelineLibrary;
+    state->shaderImageMinLod = state->shaderResourceMinLod && !state->imageViewMinLod && (!state->graphicsPipelineLibrary || (state->libraryPartsOff & Graphics::LibraryPartMinLod) != 0u);
     enabled.sampleRateShading = available.sampleRateShading;
     enabled.geometryShader = available.geometryShader;
     state->geometryShader = enabled.geometryShader == VK_TRUE;
@@ -4686,8 +4688,8 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.float16DenormPreserve = state->float16DenormPreserve;
     target.spannedWaves = state->spannedWaves;
     target.depthRangeRemap = !state->depthRangeUnrestricted;
-    target.fixedPushSlots = state->graphicsPipelineLibrary;
-    target.registrationModules = state->graphicsPipelineLibrary;
+    target.fixedPushSlots = state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartPush) == 0u;
+    target.registrationModules = state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartSets) == 0u;
     target.robustBufferAccess2 = state->robustBufferAccess2;
     target.exactRobustLoads = state->exactRobustLoads;
     target.waveLdsMemoryBarriers = !state->subgroupControlBarriers;
@@ -4830,6 +4832,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.meshWave32 = state->meshWave32;
     context.provokingVertexLast = state->provokingVertexLast;
     context.graphicsPipelineLibrary = state->graphicsPipelineLibrary;
+    context.libraryPartsOff = state->libraryPartsOff;
     context.pipelineLinkTimeOptimization = state->pipelineLinkTimeOptimization;
     context.dynamicColorWriteMask = state->dynamicColorWriteMask;
     context.drawInputsInPlace = state->drawInputsInPlace;
@@ -4907,7 +4910,7 @@ void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
 bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stages, std::span<const Graphics::CompiledShader> shaders) {
     PerformanceTimer timing("Vulkan.GraphicsPipelinePrebuild");
     const auto context = graphicsContext();
-    if (!context.graphicsPipelineLibrary || context.descriptorCache == nullptr) return false;
+    if (!context.graphicsPipelineLibrary || context.libraryPartsOff != 0u || context.descriptorCache == nullptr) return false;
     Graphics::State state{};
     state.stages = stages;
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;

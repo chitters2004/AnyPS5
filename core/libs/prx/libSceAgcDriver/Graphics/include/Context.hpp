@@ -275,6 +275,7 @@ struct Context {
     bool maintenance8 = false;
     bool pushDescriptors = false;
     bool graphicsPipelineLibrary = false;
+    std::uint32_t libraryPartsOff = 0;
     bool pipelineLinkTimeOptimization = true;
     bool dynamicColorWriteMask = false;
     std::uint32_t srgbDecodeFormats = 0;
@@ -414,12 +415,24 @@ struct Context {
     }
 };
 
+enum LibraryPart : std::uint32_t {
+    LibraryPartRendering = 1u,
+    LibraryPartPush = 2u,
+    LibraryPartSets = 4u,
+    LibraryPartMinLod = 8u,
+    LibraryPartMaintenance5 = 16u,
+};
+
+std::uint32_t LibraryPartsOff();
+
+inline bool DynamicRendering(const Context& context) { return context.graphicsPipelineLibrary && (context.libraryPartsOff & LibraryPartRendering) == 0u; }
+
 inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {
     return CreateShaderModule(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule"), context.device, context.graphicsPipelineLibrary, code, bytes, operation);
 }
 
 inline void EndRenderPass(const Context& context, VkCommandBuffer commands) {
-    if (context.graphicsPipelineLibrary) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
+    if (DynamicRendering(context)) context.Resolved(&DeviceFunctions::cmdEndRendering, "vkCmdEndRenderingKHR")(commands);
     else context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
 }
 
