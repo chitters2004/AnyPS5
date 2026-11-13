@@ -15,6 +15,8 @@
 #include <sys/mman.h>
 #endif
 #include <algorithm>
+#include <thread>
+#include <chrono>
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -250,6 +252,32 @@ int main() {
         Print("allocation registry changed after preparation", remapped);
         Require(remapped.adopted == 0 && remapped.reprepared == 2 && remapped.copied == 2, "prepared vertex inputs: a copy prepared under another registry generation was adopted");
         Require(remapped.covered, "prepared vertex inputs: the draw copied again after the registry changed did not cover the center");
+
+        AgcDriver::Graphics::HoldDrawInputPreparers(true);
+        WriteIndices(Indices);
+        WriteVertices(0.0f);
+        Pixels.fill(Background);
+        const auto heldState = DrawState();
+        const AgcDriver::Pm4::DrawParameters heldDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+        const auto beforeHeld = AgcDriver::Graphics::PreparedDrawInputCounters();
+        auto kept = device->PrepareDrawInputsAhead(heldState, heldDraw, programs->shaders);
+        Require(kept != nullptr, "prepared vertex inputs: the held draw was not queued for preparation");
+        {
+            const AgcDriver::Graphics::PreparedDrawInputsScope scope(kept);
+            device->Draw(heldState, heldDraw, programs->shaders);
+        }
+        device->WaitIdle();
+        AgcDriver::Graphics::HoldDrawInputPreparers(false);
+        const auto settleBy = std::chrono::steady_clock::now() + std::chrono::milliseconds(200);
+        while (std::chrono::steady_clock::now() < settleBy) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto afterHeld = AgcDriver::Graphics::PreparedDrawInputCounters();
+        kept.reset();
+        constexpr auto copiedSource = static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied);
+        std::printf("preparers held at commit: center %s, %llu not ready, %llu adopted, %llu ranges prepared after the release, %llu copied on the committer\n", CenterCovered() ? "covered" : "clear", static_cast<unsigned long long>(afterHeld.notReady - beforeHeld.notReady), static_cast<unsigned long long>(afterHeld.adopted - beforeHeld.adopted), static_cast<unsigned long long>(afterHeld.ranges - beforeHeld.ranges), static_cast<unsigned long long>(afterHeld.sources[copiedSource] - beforeHeld.sources[copiedSource]));
+        Require(afterHeld.notReady - beforeHeld.notReady == 1 && afterHeld.adopted == beforeHeld.adopted, "prepared vertex inputs: a draw whose preparation had not started was not cancelled at its commit");
+        Require(afterHeld.sources[copiedSource] - beforeHeld.sources[copiedSource] == 2, "prepared vertex inputs: the cancelled draw did not copy its index and vertex ranges on the committer");
+        Require(afterHeld.ranges == beforeHeld.ranges, "prepared vertex inputs: a preparer copied guest memory for a draw after its commit cancelled the job");
+        Require(CenterCovered(), "prepared vertex inputs: the draw copied on the committer after the cancel did not cover the center");
 
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
