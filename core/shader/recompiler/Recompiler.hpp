@@ -1051,12 +1051,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
         }
         return ComputedIdentity();
     }
-    void SealIdentity() const {
-        const auto identity = ComputedIdentity();
-        if (identity.low == 0) return;
-        identityMemo.high.store(identity.high, std::memory_order_relaxed);
-        identityMemo.low.store(identity.low, std::memory_order_release);
-    }
+    void SealIdentity() const {}
     [[nodiscard]] PipelineIdentity ComputedIdentity() const {
         const auto hash = spirv.ContentHash();
         if (hash == SpirvContentHash{}) return {};

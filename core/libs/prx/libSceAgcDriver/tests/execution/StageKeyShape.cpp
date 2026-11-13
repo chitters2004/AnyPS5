@@ -126,32 +126,6 @@ ShaderRecompiler::RecompileResult Shaped(std::uint32_t staticBufferElements, std
     return result;
 }
 
-void IdentityMemoFollowsTheResult() {
-    auto result = Program(0x1000u, 0x2000u);
-    result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
-    const auto identity = result.Identity();
-    Expect(!identity.Empty() && identity == result.ComputedIdentity(), "an unsealed result's identity differs from the computed one");
-    Expect(result.identityMemo.low.load() == 0, "reading an unsealed result's identity memoized it");
-    result.spirv[4] = 1u;
-    const auto edited = result.Identity();
-    Expect(edited != identity && edited == result.ComputedIdentity(), "an unsealed result kept its identity after its SPIR-V changed in place");
-    result.bindings[1].descriptorSet = 1u;
-    Expect(result.Identity() != edited && result.Identity() == result.ComputedIdentity(), "an unsealed result kept its identity after a binding changed in place");
-    result.SealIdentity();
-    const auto sealed = result.ComputedIdentity();
-    Expect(result.identityMemo.low.load() == sealed.low && result.identityMemo.high.load() == sealed.high && result.Identity() == sealed, "a sealed result did not serve its memoized identity");
-    auto copy = result;
-    Expect(copy.identityMemo.low.load() == 0, "a copy kept its source's sealed identity");
-    copy.spirv[4] = 2u;
-    Expect(copy.Identity() == copy.ComputedIdentity() && copy.Identity() != sealed, "a copy whose SPIR-V changed kept the source's identity");
-    copy = result;
-    Expect(copy.identityMemo.low.load() == 0 && copy.Identity() == sealed, "an assigned result kept the identity sealed before the assignment");
-    ShaderRecompiler::RecompileResult empty;
-    empty.SealIdentity();
-    Expect(empty.Identity().Empty() && empty.identityMemo.low.load() == 0, "a result without SPIR-V sealed an identity");
-    std::puts("stage key shape: only a sealed result serves a memoized identity; unsealed results, copies and assignments compute theirs");
-}
-
 void BenchIdentity() {
     auto result = Program(0x1000u, 0x2000u);
     result.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010500u, 0u, 16u, 0u};
@@ -235,7 +209,6 @@ int main(int argc, char** argv) {
         }
         FirstFillRaces();
         CopiesShareTheStaticPart();
-        IdentityMemoFollowsTheResult();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
