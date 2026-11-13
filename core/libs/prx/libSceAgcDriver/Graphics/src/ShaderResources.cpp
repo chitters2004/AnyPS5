@@ -6812,8 +6812,51 @@ std::size_t ShaderResources::DrawUploadLimit() {
     return limit;
 }
 
+namespace {
+
+std::array<std::atomic<std::uint64_t>, 7> drawBindingSplit{};
+
+struct DrawBindingTimer {
+    using Clock = std::chrono::steady_clock;
+    enum Part : std::size_t { Calls, Guard, Walk, Snapshot, Upload, Sets, Objects };
+    const bool profiled;
+    Clock::time_point start = profiled ? Clock::now() : Clock::time_point{};
+    Clock::time_point mark = start;
+    std::array<std::uint64_t, 7> parts{};
+    static std::uint64_t elapsed(Clock::time_point from, Clock::time_point to) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count()); }
+    Clock::time_point now() const { return profiled ? Clock::now() : Clock::time_point{}; }
+    void phase(Part part) {
+        if (!profiled) return;
+        const auto at = Clock::now();
+        parts[part] += elapsed(mark, at);
+        mark = at;
+    }
+    void charge(Part part, Clock::time_point from) {
+        if (profiled) parts[part] += elapsed(from, Clock::now());
+    }
+    ~DrawBindingTimer() {
+        if (!profiled) return;
+        phase(Walk);
+        const auto inner = parts[Snapshot] + parts[Upload];
+        parts[Walk] = parts[Walk] > inner ? parts[Walk] - inner : 0;
+        parts[Calls] = 1;
+        for (std::size_t index = 0; index < parts.size(); ++index) drawBindingSplit[index].fetch_add(parts[index], std::memory_order_relaxed);
+    }
+};
+
+}
+
+ShaderResources::DrawBindingSplit ShaderResources::TakeDrawBindingSplit() {
+    std::array<std::uint64_t, 7> taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = drawBindingSplit[index].exchange(0, std::memory_order_relaxed);
+    return {taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6]};
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    DrawBindingTimer timer{profiled};
     requireGuestBuffers(moved);
+    timer.phase(DrawBindingTimer::Guard);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
@@ -6836,6 +6879,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
+            const auto uploadStart = timer.now();
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
@@ -6843,6 +6887,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             selected.push_back(index);
             keep({0, std::move(slice.buffer), slice.offset, override->size});
+            timer.charge(DrawBindingTimer::Upload, uploadStart);
             continue;
         }
         std::uint64_t address = item.address;
@@ -6864,6 +6909,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamped = true;
         }
         VkDeviceSize offset = 0;
+        const auto snapshotStart = timer.now();
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
@@ -6893,6 +6939,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
+            timer.charge(uploaded ? DrawBindingTimer::Upload : DrawBindingTimer::Snapshot, snapshotStart);
+        } else {
+            timer.charge(DrawBindingTimer::Snapshot, snapshotStart);
         }
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
@@ -6900,9 +6949,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
+    timer.phase(DrawBindingTimer::Walk);
     writeDrawSets(*result, selected, faultRecord);
+    timer.phase(DrawBindingTimer::Sets);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    timer.phase(DrawBindingTimer::Objects);
     return result;
 }
 
