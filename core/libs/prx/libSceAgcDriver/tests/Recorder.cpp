@@ -15265,6 +15265,46 @@ void pipelineLibraryLtoInfoTests(const Device& device) {
     std::cout << "Pipeline library link-time optimization info tests passed: " << fastLibraries << " libraries without the info, " << created.Retaining() << " with it\n";
 }
 
+int pipelineMonolithicDiagnosticTests(const Device& device, bool expectLibraries) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    if (!context.graphicsPipelineLibrary) {
+        std::cout << "skipped, graphics pipeline libraries unavailable or disabled\n";
+        return 77;
+    }
+    Require(std::getenv("APS5_DIAG_MONOLITHIC_PIPELINES") != nullptr, "the monolithic pipeline diagnostic test requires APS5_DIAG_MONOLITHIC_PIPELINES");
+    LibraryCreateFlags created(context);
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ClearCachedPipelines(context.device);
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 43;
+    fragment.variantId = 44;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+    VertexInputLayout input;
+    auto traced = context;
+    traced.deviceProc = created.Resolver();
+    const auto pipeline = CachedPipeline(traced, state, input, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Require(pipeline != nullptr, "no pipeline was created");
+    const auto libraries = created.Libraries();
+    if (expectLibraries) Require(libraries != 0, "a pipeline outside the APS5_DIAG_MONOLITHIC_PIPELINES selection was linked whole");
+    else Require(libraries == 0, "a pipeline selected by APS5_DIAG_MONOLITHIC_PIPELINES was linked from " + std::to_string(libraries) + " libraries");
+    std::cout << "monolithic pipeline diagnostic checked: " << libraries << " libraries\n";
+    return 0;
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -15920,6 +15960,8 @@ int main(int argc, char** argv) {
             }
             return sparseRunImportTests(device, true) ? 0 : 77;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-monolithic-diag-only") return pipelineMonolithicDiagnosticTests(device, false);
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-monolithic-diag-unselected-only") return pipelineMonolithicDiagnosticTests(device, true);
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-lto-info-only") {
             pipelineLibraryLtoInfoTests(device);
             return 0;
