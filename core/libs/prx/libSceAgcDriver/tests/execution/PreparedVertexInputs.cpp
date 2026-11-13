@@ -358,6 +358,34 @@ int main() {
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
         Require(again.adopted == 2 && again.covered, "prepared vertex inputs: an unchanged draw after the others did not adopt both copies");
+
+        {
+            using AgcDriver::Graphics::RuntimeSwitch;
+            namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+            const auto contexts = [&] {
+                WriteIndices(Indices);
+                const auto state = DrawState();
+                const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+                auto first = device->PrepareDrawInputsAhead(state, draw, programs->shaders);
+                auto second = device->PrepareDrawResourcesAhead(nullptr, state, draw, programs->shaders, {});
+                Require(first != nullptr && second != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the context check");
+                AgcDriver::Graphics::AwaitPreparedDrawInputs(*first);
+                return std::array{&AgcDriver::Graphics::PreparedDrawInputsContext(*first), &AgcDriver::Graphics::PreparedDrawInputsContext(*second), AgcDriver::Graphics::PreparedDrawResourcesContext(*second)};
+            };
+            const bool initial = Switches::Set(RuntimeSwitch::NoSharedPreparerContext);
+            const bool cached = std::getenv("APS5_NO_CONTEXT_CACHE") == nullptr;
+            Switches::Assign(RuntimeSwitch::NoSharedPreparerContext, false);
+            const auto shared = contexts();
+            Switches::Assign(RuntimeSwitch::NoSharedPreparerContext, true);
+            const auto copied = contexts();
+            const auto copiedDraw = DrawPrepared(*device, *programs, [] {});
+            Switches::Assign(RuntimeSwitch::NoSharedPreparerContext, initial);
+            std::printf("preparer context: two requests share %s; with APS5_NO_SHARED_PREPARER_CONTEXT they share %s and the draw adopts %llu copies\n", shared[0] == shared[1] && shared[1] == shared[2] ? "one context" : "nothing", copied[0] == copied[1] ? "one context" : "nothing", static_cast<unsigned long long>(copiedDraw.adopted));
+            Require(shared[2] != nullptr && copied[2] != nullptr, "prepared vertex inputs: the draw's resources were not prepared for the context check");
+            Require(!cached || (shared[0] == shared[1] && shared[1] == shared[2]), "prepared vertex inputs: two preparations on one device copied the device's context instead of sharing it");
+            Require(copied[0] != copied[1] && (!cached || (copied[0] != shared[0] && copied[2] != shared[0])), "prepared vertex inputs: APS5_NO_SHARED_PREPARER_CONTEXT did not give each preparation its own context copy");
+            Require(copiedDraw.adopted == 2 && copiedDraw.covered, "prepared vertex inputs: with its own context copy an unchanged draw did not adopt both copies");
+        }
         const auto epochState = DrawState();
         const AgcDriver::Pm4::DrawParameters epochDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
         const auto prepareUnused = [&](std::uint64_t firstEpoch) {
