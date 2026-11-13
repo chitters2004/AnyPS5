@@ -5429,12 +5429,6 @@ void Recorder::Submit() {
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
-        try {
-            Check(result, "vkQueueSubmit recorder");
-        } catch (...) {
-            LatchFailure(std::current_exception());
-            throw;
-        }
     }
     Check(result, "vkQueueSubmit recorder");
     if (batch->guestWork) LibcRunReportMilestone_nid_no_patch(2);

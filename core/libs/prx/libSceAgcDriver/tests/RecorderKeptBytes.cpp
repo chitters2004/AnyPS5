@@ -565,6 +565,7 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
             failed = std::string_view(error.what()).find(operation) != std::string_view::npos;
         }
         Expect(failed, "submission did not report its Vulkan failure");
+        Expect(!recorder.Latched(), "a failed submission latched the recorder");
         Expect(released.expired() && !completed, "a failed batch retained objects or ran its completions");
         Expect(!recorder.Recording() && recorder.Submissions() == 1 && recorder.InFlightBatches() == 1 && recorder.InFlightKeptBytes() == 17,
             "the failed batch changed the earlier in-flight submission");
