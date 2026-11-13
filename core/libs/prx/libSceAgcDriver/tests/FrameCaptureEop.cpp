@@ -11,11 +11,14 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -56,6 +59,38 @@ public:
         if (!error) std::terminate();
     }
     std::atomic<int> ready = 0;
+};
+
+class HeldOutput final : public AgcDriver::IVideoOutput {
+public:
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override { return std::make_shared<Request>(ready); }
+    void WaitForFlipRoom() override {
+        std::unique_lock lock(mutex);
+        waiting = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return room; });
+    }
+    void Fail(std::exception_ptr error) noexcept override {
+        if (!error) std::terminate();
+    }
+    bool WaitUntilHeld() {
+        std::unique_lock lock(mutex);
+        return changed.wait_for(lock, std::chrono::seconds(10), [&] { return waiting; });
+    }
+    void Open() {
+        {
+            std::lock_guard lock(mutex);
+            room = true;
+        }
+        changed.notify_all();
+    }
+    std::atomic<int> ready = 0;
+
+private:
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool waiting = false;
+    bool room = false;
 };
 
 std::byte* allocate() {
@@ -233,11 +268,70 @@ void testSettledHoldsAdmissions() {
 
 }
 
+void submitWords(std::span<const std::uint32_t> words, std::byte* at) {
+    std::memcpy(at, words.data(), words.size_bytes());
+    Packet packet{reinterpret_cast<std::uint32_t*>(at), static_cast<std::uint32_t>(words.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "a submission was refused");
+}
+
+void testWaitingRecorderAdmitsBesideBlockedFlip() {
+    auto* const block = allocate();
+    auto output = std::make_shared<HeldOutput>();
+    AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    auto* const gate = reinterpret_cast<std::uint32_t*>(block + BlockBytes / 2);
+    auto* const done = gate + 2;
+    auto* const registers = reinterpret_cast<std::uint32_t*>(block + BlockBytes / 2 + 256);
+    registers[0] = 0x00ffffffu;
+    registers[1] = 74;
+    const auto at = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    const std::array<std::uint32_t, 17> listed{
+        0xc0053c00u, 0x13u, static_cast<std::uint32_t>(at(gate)), static_cast<std::uint32_t>(at(gate) >> 32u), 1u, 0xffffffffu, 0x19u,
+        0xc0039f00u, static_cast<std::uint32_t>(at(registers)), static_cast<std::uint32_t>(at(registers) >> 32u), 0x80000000u, 1u,
+        0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(at(done)), static_cast<std::uint32_t>(at(done) >> 32u), 1u};
+    submitWords(listed, block);
+    std::exception_ptr flipFailure;
+    std::thread flipper([&] {
+        try {
+            const std::array<std::uint32_t, 6> flip{AgcDriver::FlipPacketHeader, Handle, 0, 1, 0, 0};
+            submitWords(flip, block + 1024);
+        } catch (...) {
+            flipFailure = std::current_exception();
+        }
+    });
+    const bool held = output->WaitUntilHeld();
+    std::atomic<bool> admitted{false};
+    std::thread writer([&] {
+        const std::array<std::uint32_t, 2> nop{0xc0001000u, 0};
+        submitWords(nop, block + 2048);
+        admitted.store(true);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!admitted.load() && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    const bool besideFlip = admitted.load();
+    registers[0] = 0x10;
+    std::atomic_ref<std::uint32_t>(*gate).store(1);
+    output->Open();
+    writer.join();
+    flipper.join();
+    if (flipFailure) std::rethrow_exception(flipFailure);
+    AgcDriverWaitIdle_nid_postfix();
+    check(held, "the flip submission did not wait for flip room");
+    check(besideFlip, "with the frame recorder waiting for its trigger, a submission waited for another thread's submission that was waiting for flip room");
+    check(std::atomic_ref<std::uint32_t>(*done).load() == 1, "a register list written after its submission was not read where the packet executes");
+    check(!std::filesystem::exists(captureDirectory()) || std::filesystem::is_empty(captureDirectory()), "the frame recorder started without its trigger");
+}
+
+
 int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "rewind") {
             testRewindTailFramesCount();
             std::puts("frame capture rewind tail tests passed");
+            return 0;
+        }
+        if (argc > 1 && std::string(argv[1]) == "waiting") {
+            testWaitingRecorderAdmitsBesideBlockedFlip();
+            std::puts("frame capture waiting recorder tests passed");
             return 0;
         }
         if (argc > 1 && std::string(argv[1]) == "rewind_held") {
