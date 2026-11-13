@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -419,7 +420,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(heldReadHits.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; GPU waits %.1f ms (in draws %.1f ms); %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), committerWaitedMs, drawWaitedMs, static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
     std::string kindText;
     for (std::size_t i = 0; i < kindCommits.size(); ++i) {
         const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
@@ -438,6 +439,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[early-inputs] (10 s, opens at %zu queued; %s%s): gate closed %llu, open %llu; %llu prepared over %llu ranges, %llu refused; %llu adopted, %llu waited, %llu not ready, %llu unused, %llu abandoned\n", std::max<std::size_t>(2, Depth() / 2), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoEarlyDrawInputs) ? "APS5_NO_EARLY_DRAW_INPUTS" : "adaptive", Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::EarlyDrawInputsAlways) ? ", APS5_EARLY_DRAW_INPUTS_ALWAYS" : "", delta(inputs.shallow, reportedInputs.shallow), delta(inputs.opened, reportedInputs.opened), delta(inputs.prepared, reportedInputs.prepared), delta(inputs.ranges, reportedInputs.ranges), delta(inputs.refused, reportedInputs.refused), delta(inputs.adopted, reportedInputs.adopted), delta(inputs.waited, reportedInputs.waited), delta(inputs.notReady, reportedInputs.notReady), delta(inputs.unused, reportedInputs.unused), delta(inputs.abandoned, reportedInputs.abandoned));
     reportedInputs = inputs;
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
+    committerWaitedMs = drawWaitedMs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -447,6 +449,7 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     ReserveCommitterCore();
     StartCommitterSampler();
+    auto waitedAfterCommit = Graphics::Recorder::ThreadWaitedMs();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -461,6 +464,7 @@ void DrawPipeline::run() {
             isDraw = items.front().draw;
         }
         const auto start = std::chrono::steady_clock::now();
+        const auto waitedBeforeCommit = Graphics::Recorder::ThreadWaitedMs();
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
@@ -477,6 +481,10 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        const auto waitedNow = Graphics::Recorder::ThreadWaitedMs();
+        const auto waitedOutside = waitedBeforeCommit - waitedAfterCommit;
+        const auto waitedInside = waitedNow - waitedBeforeCommit;
+        waitedAfterCommit = waitedNow;
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
@@ -491,6 +499,8 @@ void DrawPipeline::run() {
         retiredItems.fetch_add(1, std::memory_order_release);
         ++commits;
         commitNs += spent;
+        committerWaitedMs += waitedOutside + waitedInside;
+        if (isDraw) drawWaitedMs += waitedInside;
         if (failed) ++commitErrors;
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);

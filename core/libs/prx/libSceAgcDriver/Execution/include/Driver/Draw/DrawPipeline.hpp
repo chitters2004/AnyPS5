@@ -109,6 +109,8 @@ private:
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
     std::uint64_t commitErrors = 0;
+    double committerWaitedMs = 0;
+    double drawWaitedMs = 0;
     std::uint64_t enqueued = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};
