@@ -682,6 +682,8 @@ void HashLeaves(const T& value, TSink& sink) {
         if (value.has_value()) HashLeaves(*value, sink);
     } else if constexpr (IsShared<U>::value) {
         sink.Word(value != nullptr);
+    } else if constexpr (requires { sink.Leaf(value); }) {
+        sink.Leaf(value);
     } else if constexpr (std::is_aggregate_v<U>) {
         ForEachField(value, HashMember<U, TSink>{value, sink});
     } else {
