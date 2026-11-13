@@ -114,6 +114,19 @@ static void GapStartsNewRun() {
     Require(early);
 }
 
+// The run state belongs to the calling thread: one thread spending its early wakes must not cost another its own.
+static void ThreadsKeepTheirOwnRun() {
+    Waker waker;
+    bool early = false;
+    for (unsigned attempt = 0; attempt < TRIES && !early; ++attempt) {
+        std::thread other([] { for (unsigned i = 0; i < EARLY_WAKES_PER_RUN + 4; ++i) Usleep(WAKEABLE_MICROS); });
+        other.join();
+        // Straight after the other thread's run: shared state would still be spent and this sleep would be full.
+        early = Usleep(WAKEABLE_MICROS) < EARLY;
+    }
+    Require(early);
+}
+
 int main() {
 #ifdef _WIN32
     if (std::getenv("APS5_COARSE_TIMED_WAITS") != nullptr) {
@@ -127,5 +140,6 @@ int main() {
     RunOfSleepsEndsEarlyAtMostEightTimes();
     SubmitStartsNewRun();
     GapStartsNewRun();
+    ThreadsKeepTheirOwnRun();
     return 0;
 }
