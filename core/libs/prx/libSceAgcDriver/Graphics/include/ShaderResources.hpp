@@ -399,6 +399,16 @@ public:
         std::uint64_t t1Eligible = 0;
     };
     static PendingFails PendingFailCounts();
+    struct DrawBindingSplit {
+        std::uint64_t calls = 0;
+        std::uint64_t guardNanoseconds = 0;
+        std::uint64_t walkNanoseconds = 0;
+        std::uint64_t snapshotNanoseconds = 0;
+        std::uint64_t uploadNanoseconds = 0;
+        std::uint64_t setsNanoseconds = 0;
+        std::uint64_t objectsNanoseconds = 0;
+    };
+    static DrawBindingSplit TakeDrawBindingSplit();
     static std::array<std::uint64_t, static_cast<std::size_t>(FastFail::Count)> FullWalkNanoseconds();
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.

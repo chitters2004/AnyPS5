@@ -973,6 +973,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     for (std::size_t i = 0; i < PhaseCount && room(); ++i) {
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
+        if (i == PhaseDrawSets && room()) {
+            const auto split = ShaderResources::TakeDrawBindingSplit();
+            const auto per = [&](std::uint64_t nanoseconds) { return split.calls == 0 ? 0.0 : static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(split.calls); };
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu calls, us per call: guard %.2f, walk %.2f, snapshots %.2f, uploads %.2f, sets %.2f, keeps %.2f)", static_cast<unsigned long long>(split.calls), per(split.guardNanoseconds), per(split.walkNanoseconds), per(split.snapshotNanoseconds), per(split.uploadNanoseconds), per(split.setsNanoseconds), per(split.objectsNanoseconds));
+        }
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
