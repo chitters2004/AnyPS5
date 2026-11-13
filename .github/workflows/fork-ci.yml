@@ -180,23 +180,48 @@ jobs:
           rm -rf plan-times/dl plan-times/dl.zip
           cat > plan-times/shard.py <<'SHARDPY'
           # Usage: shard.py <shard> <shards> <os>. Writes build/shard-tests.txt: the selected tests of this shard.
-          # Longest tests first, each onto the least loaded shard, by measured time (median of the known times for new tests).
-          import json, os, re, statistics, subprocess, sys
+          # Tests that share a fixture or a DEPENDS edge stay together: ctest adds the setup test of a fixture to every run
+          # that holds a dependent, so splitting them would run the setup test in both shards.
+          # Groups go longest first, each onto the least loaded shard, by measured time (median of the known times for new tests).
+          import json, os, statistics, subprocess, sys
           shard, shards, osname = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
-          out = subprocess.run(["ctest", "--test-dir", "build", "-N", "-R", os.environ["TESTS"]], capture_output=True, text=True).stdout
-          names = sorted(set(re.findall(r"^\s*Test\s+#\d+: (.*\S)\s*$", out, re.M)))
+          out = subprocess.run(["ctest", "--test-dir", "build", "-N", "-R", os.environ["TESTS"], "--show-only=json-v1"], capture_output=True, text=True, check=True).stdout
+          selected = json.loads(out)["tests"]
+          names = sorted({t["name"] for t in selected})
+          parent = {}
+          def find(x):
+              parent.setdefault(x, x)
+              while parent[x] != x:
+                  parent[x] = parent[parent[x]]
+                  x = parent[x]
+              return x
+          def union(a, b):
+              parent[find(a)] = find(b)
+          for t in selected:
+              find(t["name"])
+              for prop in t.get("properties", []):
+                  if prop["name"] in ("FIXTURES_SETUP", "FIXTURES_REQUIRED", "FIXTURES_CLEANUP"):
+                      for fixture in prop["value"]:
+                          union(t["name"], "fixture:" + fixture)
+                  elif prop["name"] == "DEPENDS":
+                      for dep in prop["value"]:
+                          union(t["name"], dep)
           times = json.load(open(f"plan-times/times-{osname}.json"))
           known = [times[n] for n in names if n in times]
           default = statistics.median(known) if known else 5.0
-          cost = {n: times.get(n, default) for n in names}
+          groups = {}
+          for n in names:
+              groups.setdefault(find(n), []).append(n)
+          cost = {root: sum(times.get(n, default) for n in members) for root, members in groups.items()}
           loads, mine = [0.0] * shards, []
-          for n in sorted(names, key=lambda n: (-cost[n], n)):
+          for root in sorted(groups, key=lambda r: (-cost[r], min(groups[r]))):
               i = loads.index(min(loads))
-              loads[i] += cost[n]
+              loads[i] += cost[root]
               if i == shard - 1:
-                  mine.append(n)
-          open("build/shard-tests.txt", "w").write("".join(n + "\n" for n in sorted(mine)))
-          print(f"shard {shard}/{shards}: {len(mine)} of {len(names)} tests ({len(known)} timed); expected load per shard (s): {[round(x) for x in loads]}")
+                  mine.extend(groups[root])
+          open("build/shard-tests.txt", "w").write("".join(n + chr(10) for n in sorted(mine)))
+          big = sorted((len(m) for m in groups.values()), reverse=True)[:3]
+          print(f"shard {shard}/{shards}: {len(mine)} of {len(names)} tests ({len(known)} timed) in {len(groups)} groups, largest {big}; expected load per shard (s): {[round(x) for x in loads]}")
           SHARDPY
           # Reuse the base result of an earlier run for the same base sha, test set and tool versions.
           # The artifacts base-reuse-<os>-<key>-s1 and -s2 are uploaded by base shards that finished successfully; both must come from one run.
