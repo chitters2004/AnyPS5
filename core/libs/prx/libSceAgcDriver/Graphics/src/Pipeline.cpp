@@ -60,6 +60,33 @@ bool LogicOpFormat(VkFormat format) {
 
 }
 
+enum RenderPassDiagnostic : std::uint32_t {
+    RenderPassDependencies = 1u,
+    RenderPassAlias = 2u,
+    RenderPassNoSampleLocations = 4u,
+};
+
+std::uint32_t RenderPassDiagnostics() {
+    static const std::uint32_t chosen = [] {
+        const char* text = std::getenv("APS5_DIAG_RENDER_PASS");
+        if (text == nullptr || *text == '\0') return 0u;
+        constexpr std::array<std::pair<std::string_view, std::uint32_t>, 3> names{{{"deps", RenderPassDependencies}, {"alias", RenderPassAlias}, {"nolocations", RenderPassNoSampleLocations}}};
+        std::uint32_t result = 0u;
+        std::string_view rest(text);
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            const auto name = rest.substr(0u, comma);
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1u);
+            const auto found = std::ranges::find_if(names, [&](const auto& entry) { return entry.first == name; });
+            Require(found != names.end(), "APS5_DIAG_RENDER_PASS takes a comma list of deps, alias or nolocations, not '" + std::string(name) + "'");
+            result |= found->second;
+        }
+        std::fprintf(stderr, "[render-pass-diag]%s%s%s\n", (result & RenderPassDependencies) != 0u ? " deps" : "", (result & RenderPassAlias) != 0u ? " alias" : "", (result & RenderPassNoSampleLocations) != 0u ? " nolocations" : "");
+        return result;
+    }();
+    return chosen;
+}
+
 void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline, std::span<const CompiledShader> shaders) {
     if (!context.pipelineExecutableInfo) return;
     const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
@@ -716,6 +743,23 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         passInfo.pAttachments = colors.empty() ? nullptr : colors.data();
         passInfo.subpassCount = 1;
         passInfo.pSubpasses = &subpass;
+        const auto diagnostics = dynamicRendering ? 0u : RenderPassDiagnostics();
+        if ((diagnostics & RenderPassAlias) != 0u) {
+            for (auto& attachment : colors) attachment.flags |= VK_ATTACHMENT_DESCRIPTION_MAY_ALIAS_BIT;
+        }
+        constexpr VkAccessFlags anyAccess = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+        constexpr VkPipelineStageFlags framebufferStages = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+        constexpr VkAccessFlags attachmentWrites = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        constexpr VkAccessFlags framebufferReads = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_INPUT_ATTACHMENT_READ_BIT;
+        const std::array<VkSubpassDependency, 3> dependencies{{
+            {VK_SUBPASS_EXTERNAL, 0u, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, anyAccess, 0u},
+            {0u, VK_SUBPASS_EXTERNAL, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_MEMORY_WRITE_BIT, anyAccess, 0u},
+            {0u, 0u, framebufferStages, framebufferStages, attachmentWrites, framebufferReads | attachmentWrites, VK_DEPENDENCY_BY_REGION_BIT},
+        }};
+        if ((diagnostics & RenderPassDependencies) != 0u) {
+            passInfo.dependencyCount = static_cast<std::uint32_t>(dependencies.size());
+            passInfo.pDependencies = dependencies.data();
+        }
         if (!dynamicRendering) Check(context.Function<PFN_vkCreateRenderPass>("vkCreateRenderPass")(context.device, &passInfo, nullptr, &renderPass), "vkCreateRenderPass");
         VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
         input.vertexBindingDescriptionCount = static_cast<std::uint32_t>(vertexInput.bindings.size());
@@ -1038,7 +1082,7 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
     sampleLocations.pAttachmentInitialSampleLocations = state.depth ? &initial : nullptr;
     sampleLocations.postSubpassSampleLocationsCount = 1;
     sampleLocations.pPostSubpassSampleLocations = &post;
-    if (sampleLocationsEnabled) begin.pNext = &sampleLocations;
+    if (sampleLocationsEnabled && (RenderPassDiagnostics() & RenderPassNoSampleLocations) == 0u) begin.pNext = &sampleLocations;
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
     Continue(commands, state, masked);
 }
