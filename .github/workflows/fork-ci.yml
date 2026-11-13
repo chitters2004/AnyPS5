@@ -99,7 +99,7 @@ env:
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
   # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
-  REUSE_VERSION: 5
+  REUSE_VERSION: 6
   VVL_VERSION: 1.4.363.1
   MESA_VERSION: 26.2.6
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
@@ -223,8 +223,26 @@ jobs:
           big = sorted((len(m) for m in groups.values()), reverse=True)[:3]
           print(f"shard {shard}/{shards}: {len(mine)} of {len(names)} tests ({len(known)} timed) in {len(groups)} groups, largest {big}; expected load per shard (s): {[round(x) for x in loads]}")
           SHARDPY
-          # Reuse the base result of an earlier run for the same base sha, test set and tool versions.
-          # The artifacts base-reuse-<os>-<key>-s1 and -s2 are uploaded by base shards that finished successfully; both must come from one run.
+          cat > plan-times/est.py <<'ESTPY'
+          # Usage: est.py <os>. Prints 2 when the measured time of the selected tests is long enough to be worth two shards, else 1.
+          # A second shard costs another build and about 2 min of setup, and a job under the 20-job concurrency limit, so small
+          # selections stay in one job. ctest runs 4 tests at a time, hence wall = sum / 4. Unknown tests count nothing.
+          import json, os, re, sys
+          times = json.load(open(f"plan-times/times-{sys.argv[1]}.json"))
+          try:
+              rx = re.compile(os.environ["TESTS"])
+          except re.error:
+              rx = None
+          total = sum(t for n, t in times.items() if rx and rx.search(n))
+          wall = total / 4
+          print(2 if wall > float(os.environ.get("SHARD_MIN_WALL_S", "360")) else 1)
+          print(f"{sys.argv[1]}: {total:.0f} s of measured tests, about {wall:.0f} s wall", file=sys.stderr)
+          ESTPY
+          shards_linux=$(python3 plan-times/est.py linux)
+          shards_windows=$(python3 plan-times/est.py windows)
+          echo "shards: linux $shards_linux, windows $shards_windows"
+          # Reuse the base result of an earlier run for the same base sha, test set, shard count and tool versions.
+          # The artifacts base-reuse-<os>-<key>-s1..sK are uploaded by base shards that finished successfully; all must come from one run.
           # The result is downloaded and checked here, so a missing or broken artifact falls back to running the base job.
           reuse_notes=""
           reuse_linux=false
@@ -233,39 +251,42 @@ jobs:
           key_windows=""
           mkdir -p reuse/out
           cat > reuse/pick.py <<'PICKPY'
-          # Reads "<shard> <run> <artifact> <created>" lines; prints "<run> <artifact1> <artifact2>" of the newest run that holds both shards.
+          # Usage: pick.py <shards>. Reads "<shard> <run> <artifact> <created>" lines; prints "<run> <artifact1> .. <artifactK>"
+          # of the newest run that holds every shard.
           import collections, sys
+          k = int(sys.argv[1])
           by = collections.defaultdict(dict)
           for line in sys.stdin:
               n, run, art, created = line.split()
               by[run][n] = (art, created)
-          ok = [(v["1"][1], run, v["1"][0], v["2"][0]) for run, v in by.items() if "1" in v and "2" in v]
+          ok = [(v["1"][1], run, [v[str(i)][0] for i in range(1, k + 1)]) for run, v in by.items() if all(str(i) in v for i in range(1, k + 1))]
           if ok:
-              created, run, a1, a2 = max(ok)
-              print(run, a1, a2)
+              created, run, arts = max(ok)
+              print(run, *arts)
           PICKPY
           for os in linux windows; do
             case "$os" in linux) wanted=linux-gate ;; windows) wanted=windows ;; esac
             case ",$(printf '%s' "$JOBS" | tr -d ' ')," in *",$wanted,"*) ;; *) continue ;; esac
-            key=$(printf '%s\n' "v$REUSE_VERSION" "$os" "$REPOSITORY" "$base_sha" "$TESTS" "$MUTANTS" "$REDUCED" "$VVL_VERSION" "$MESA_VERSION" "$WINLIBS_ZIP" | sha256sum | cut -c1-24)
+            if [ "$os" = linux ]; then k=$shards_linux; else k=$shards_windows; fi
+            key=$(printf '%s\n' "v$REUSE_VERSION" "$os" "$REPOSITORY" "$base_sha" "$TESTS" "$MUTANTS" "$REDUCED" "$VVL_VERSION" "$MESA_VERSION" "$WINLIBS_ZIP" "shards=$k" | sha256sum | cut -c1-24)
             eval "key_$os=$key"
             if [ "$FRESH_BASE" = true ]; then reuse_notes="$reuse_notes$os: fresh_base requested; "; continue; fi
-            found=$(for n in 1 2; do
+            found=$(for n in $(seq 1 "$k"); do
               gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=base-reuse-$os-$key-s$n&per_page=20" \
                 --jq ".artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID) | [\"$n\", (.workflow_run.id|tostring), (.id|tostring), .created_at] | join(\" \")" || true
-            done | python3 reuse/pick.py)
+            done | python3 reuse/pick.py "$k")
             if [ -z "$found" ]; then reuse_notes="$reuse_notes$os: no earlier base result; "; continue; fi
             from_run=${found%% *}; arts=${found#* }
             got=0
-            for n in 1 2; do
+            for n in $(seq 1 "$k"); do
               art_id=$(echo "$arts" | cut -d' ' -f"$n")
               rm -rf "reuse/$os-dl$n"; mkdir -p "reuse/$os-dl$n"
               if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$art_id/zip" > "reuse/$os-$n.zip" && unzip -q -o "reuse/$os-$n.zip" -d "reuse/$os-dl$n" && [ -f "reuse/$os-dl$n/result.json" ]; then
                 got=$((got + 1))
               fi
             done
-            if [ "$got" = 2 ]; then
-              for n in 1 2; do
+            if [ "$got" = "$k" ]; then
+              for n in $(seq 1 "$k"); do
                 mkdir -p "reuse/out/$os/s$n"
                 cp -r "reuse/$os-dl$n/." "reuse/out/$os/s$n/"
                 echo "$from_run" > "reuse/out/$os/s$n/from-run.txt"
@@ -279,7 +300,7 @@ jobs:
           echo "reuse notes: $reuse_notes"
           echo "reuse_notes=$reuse_notes" >> "$GITHUB_OUTPUT"
           echo "reuse_any=$([ "$reuse_linux$reuse_windows" = falsefalse ] && echo false || echo true)" >> "$GITHUB_OUTPUT"
-          export ref_sha base_sha patches stack reuse_linux reuse_windows key_linux key_windows
+          export ref_sha base_sha patches stack reuse_linux reuse_windows key_linux key_windows shards_linux shards_windows
           python3 - <<'PY'
           import json, os, re
           jobs = {j.strip() for j in os.environ["JOBS"].split(",") if j.strip()}
@@ -293,17 +314,22 @@ jobs:
           ref_key = "plain-stack-ref" if family else "plain-ref"
           include = []
           if "linux-gate" in jobs:
-              # Two runners each take a share of the selected tests, balanced by measured time; the report merges them.
-              for shard in (1, 2):
-                  include.append(dict(id=f"gate-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
-                                      shard=shard, shards=2, cache_key=ref_key, cache_restore=plain_restore, cache_max="4G",
-                                      cache_save="true" if shard == 1 else "false"))
+              # Selections with more than about 6 min of measured test wall time run in two shards, balanced by measured time
+              # (plan-times/shard.py); the report merges them. Smaller ones stay one job per side.
+              k = int(os.environ["shards_linux"])
+              def shard_fields(shard):
+                  return dict(shard=shard, shards=k) if k > 1 else {}
+              suffix = lambda shard: f"-s{shard}" if k > 1 else ""
+              for shard in range(1, k + 1):
+                  include.append(dict(id=f"gate-ref{suffix(shard)}", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
+                                      cache_key=ref_key, cache_restore=plain_restore, cache_max="4G",
+                                      cache_save="true" if shard == 1 else "false", **shard_fields(shard)))
               if os.environ["reuse_linux"] != "true":
-                  for shard in (1, 2):
-                      include.append(dict(id=f"gate-base-s{shard}", kind="gate", side="base", sha=base_sha, group="plain", cache_family="",
-                                          shard=shard, shards=2, reuse_name=f"base-reuse-linux-{os.environ['key_linux']}-s{shard}",
+                  for shard in range(1, k + 1):
+                      include.append(dict(id=f"gate-base{suffix(shard)}", kind="gate", side="base", sha=base_sha, group="plain", cache_family="",
+                                          reuse_name=f"base-reuse-linux-{os.environ['key_linux']}-s{shard}",
                                           cache_key="plain-base", cache_restore=plain_restore, cache_max="4G",
-                                          cache_save="true" if shard == 1 else "false"))
+                                          cache_save="true" if shard == 1 else "false", **shard_fields(shard)))
           for san in ("asan", "tsan"):
               if san in jobs:
                   include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
@@ -333,16 +359,21 @@ jobs:
               out.write("report=" + ("true" if jobs - {"warm", "warm-stack", "bundle"} else "false") + "\n")
               win = []
               if "windows" in jobs:
-                  # The test step of the ref dominates the job (about 16 min of agc_.* on 4 cores), so two runners each take
-                  # a share of the selected tests, balanced by measured time (plan-times/shard.py); the report merges the shards.
-                  # The base runs in the same two shards when it is not reused. Only the first shard saves the compiler cache.
-                  for shard in (1, 2):
-                      win.append(dict(id=f"windows-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, cache_family=family,
-                                      shard=shard, shards=2, shard_save="true" if shard == 1 else "false"))
+                  # Selections with more than about 6 min of measured test wall time (agc_.* is about 16) run in two shards,
+                  # balanced by measured time (plan-times/shard.py); the report merges them. Smaller ones stay one job per side.
+                  # Only the first shard saves the compiler cache.
+                  k = int(os.environ["shards_windows"])
+                  def shard_fields(shard):
+                      return dict(shard=shard, shards=k) if k > 1 else {}
+                  suffix = lambda shard: f"-s{shard}" if k > 1 else ""
+                  for shard in range(1, k + 1):
+                      win.append(dict(id=f"windows-ref{suffix(shard)}", kind="gate", side="ref", sha=ref_sha, cache_family=family,
+                                      shard_save="true" if shard == 1 else "false", **shard_fields(shard)))
                   if os.environ["reuse_windows"] != "true":
-                      for shard in (1, 2):
-                          win.append(dict(id=f"windows-base-s{shard}", kind="gate", side="base", sha=base_sha, cache_family="", shard=shard, shards=2,
-                                          reuse_name=f"base-reuse-windows-{os.environ['key_windows']}-s{shard}", shard_save="true" if shard == 1 else "false"))
+                      for shard in range(1, k + 1):
+                          win.append(dict(id=f"windows-base{suffix(shard)}", kind="gate", side="base", sha=base_sha, cache_family="",
+                                          reuse_name=f"base-reuse-windows-{os.environ['key_windows']}-s{shard}",
+                                          shard_save="true" if shard == 1 else "false", **shard_fields(shard)))
               if "warm" in jobs:
                   win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha, cache_family=""))
               if "warm-stack" in jobs:
@@ -1320,7 +1351,8 @@ jobs:
               print(w_note)
               results[rid] = m
           jobs = json.load(open("jobs.json"))["jobs"]
-          from datetime import datetime
+          import subprocess
+          from datetime import datetime, timezone
           def dur(a, b):
               if not a or not b:
                   return "n/a"
@@ -1525,6 +1557,9 @@ jobs:
                                         sha=pair[0]["sha"], base=pair[1]["sha"] if pair[1] else None)
           summary["reused_base"] = reused
           summary["jobs"] = timing
+          created = subprocess.run(["gh", "api", f"repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}", "--jq", ".created_at"], capture_output=True, text=True).stdout.strip()
+          summary["wall_s"] = int((datetime.now(timezone.utc) - datetime.fromisoformat(created.replace("Z", "+00:00"))).total_seconds()) if created else None
+          w(f"\nWall time from the start of the run to this report: {(summary['wall_s'] or 0) / 60:.1f} min")
           runs = [t["run_s"] for t in timing.values() if t["run_s"] is not None]
           w(f"\nRunner minutes of the jobs above: {sum(runs) / 60:.1f}; slowest job {max(runs, default=0) / 60:.1f} min; "
             f"longest queue wait {max((t['queue_s'] or 0 for t in timing.values()), default=0) / 60:.1f} min")
