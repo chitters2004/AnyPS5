@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/CommitEffects.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -546,6 +547,7 @@ void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
 void DrawFinisher::run() {
     NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
+    ReserveFinisherCore();
     const bool timed = pipelineStats();
     for (;;) {
         Job* job = nullptr;
@@ -931,7 +933,7 @@ void DrawPipeline::admit(Item item) {
     items.push_back(std::move(item));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
-        thread = std::thread([this] {
+        thread = Libc::StartHostThread([this] {
             GuestMemory::MarkProofThread();
             run();
         });
@@ -1111,6 +1113,7 @@ std::uint64_t DrawPipeline::CommitBreaks(CommitKind kind, bool declaredWrites) c
 void DrawPipeline::run() {
     NameDriverThread("draw-commit");
     PerformanceTrace::BindThread("draw committer");
+    ReserveCommitterCore();
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;

@@ -21,7 +21,8 @@ each B phase with the mean of its neighbouring A phases, which cancels a linear 
 error, standard deviation and count. With several arms (APS5_AB=<s>:<arm>|<arm>...), phase A is the environment's
 settings and the arms B, C, ... follow it in turn; each arm is compared with A, its noise with the two A phases that
 bracket its cycle, and --spread (implied with several arms) adds each side's phase count and phase-to-phase standard
-deviation. A requested program's phase metric is omitted if a report lists 12 programs
+deviation. A counted GPU timing report that dropped ranges refuses the comparison.
+A requested program's phase metric is omitted if a report lists 12 programs
 without it: the list may be truncated, so the program's time is unknown."""
 
 COUNTERS = re.compile(r"^\[ab-counters\] phase ([A-Z]) (\d+) (.*)$")
@@ -62,9 +63,12 @@ def parse_report(kind, text):
         total, presents = number(r"^\[gputime\] ([\d.]+) ms of GPU time", text), number(r"; (\d+) presents;", text)
         if total is None or presents is None or "; by class:" not in text:
             return None
+        dropped = re.search(r"; (\d+) ranges dropped at the \d+ cap\)", text)
+        if dropped and int(dropped.group(1)):
+            raise ValueError("GPU timing ranges were dropped in a settled A/B phase; timing statistics are incomplete")
         programs_text, classes_text = text.split("by program:", 1)[-1].split("; by class:", 1)
         programs, classes = {}, {}
-        for key, ms in re.findall(r" (?<!draw )(0x[0-9a-f]+) x\d+ ([\d.]+)ms", programs_text):
+        for key, ms in re.findall(r" (?<!draw )(?<!drawset )(0x[0-9a-f]+) x\d+ ([\d.]+)ms", programs_text):
             programs[key] = programs.get(key, 0.0) + finite(float(ms))
         for name, ms in re.findall(r" ([a-z][a-z-]*) x\d+ ([\d.]+)ms [\d.]+MiB \(per present", classes_text):
             classes[name] = classes.get(name, 0.0) + finite(float(ms))

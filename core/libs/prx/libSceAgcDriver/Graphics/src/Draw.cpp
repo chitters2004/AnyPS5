@@ -1684,7 +1684,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 #else
         constexpr bool owned = false;
 #endif
-        if (owned) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, &copy.offset); });
+        if (owned && recorder->OwnedDrawInputEntries() != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, &copy.offset); });
         if (copy.buffer != nullptr) {
             copy.reused = true;
             CountCommit(vertex ? CommitCounter::InputVertexCopyOwned : CommitCounter::InputIndexCopyOwned);
@@ -2119,7 +2119,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - lastVertex, "auto draw vertex range overflow");
             expand([](std::uint32_t idx) { return idx; });
         }
-        inputs.maxIndex = maxIdx + draw.firstVertex;
+        inputs.maxIndex = draw.indexed ? maxIdx : maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
         inputs.indexHandle = indexCopy->Handle();
         inputs.indexOffset = 0;
@@ -2345,6 +2345,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         resident = lookup();
         if (resident != nullptr) InCommitPhase(CommitPhase::TargetsClearCheck, [&] { materializeRegisterClear(context, color, *resident); });
     } catch (const std::exception& error) {
+        resident = nullptr;
         static AgcDriver::Mutex reportMutex;
         static std::set<std::uint64_t> reported;
         std::lock_guard lock(reportMutex);
@@ -5279,7 +5280,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         if ((!planned && !cached()) || !StorageImageServesKeys(*stored, surface.dccAddress)) return miss(DrawRecipeMiss::TargetGone);
         auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, [&] {
             const CommitPhaseScope refresh(CommitPhase::TargetsRefresh);
-            if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, 1);
+            if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, state.colors[index].layers);
             else stored->Refresh();
             return stored;
         });

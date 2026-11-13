@@ -60,6 +60,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_SINGLE_RING_PREPARER",
     "APS5_NO_SHARED_PREPARER_CONTEXT",
     "APS5_NO_TARGET_MEMO_OVERLAP_CACHE",
+    "APS5_PIPELINE_DISPATCH_MISSES",
 };
 
 struct SwitchValues {
@@ -107,6 +108,7 @@ struct SwitchValues {
             std::getenv("APS5_SINGLE_RING_PREPARER") != nullptr,
             std::getenv("APS5_NO_SHARED_PREPARER_CONTEXT") != nullptr,
             std::getenv("APS5_NO_TARGET_MEMO_OVERLAP_CACHE") != nullptr,
+            std::getenv("APS5_PIPELINE_DISPATCH_MISSES") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

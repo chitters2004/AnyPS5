@@ -13,6 +13,10 @@ void NameDriverThread(const char* name);
 
 std::uint64_t ThreadCpuNanos();
 
+void ReserveCommitterCore();
+
+void ReserveFinisherCore();
+
 }
 
 #endif

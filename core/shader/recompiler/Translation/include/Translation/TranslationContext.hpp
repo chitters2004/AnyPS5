@@ -44,6 +44,7 @@ public:
         execHighInactive = state.execHighInactive;
     }
     [[nodiscard]] IrValue& WaveAny(IrValue& flag);
+    void SetNativeInteger16(bool enabled) { nativeInteger16 = enabled; }
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
@@ -308,6 +309,8 @@ private:
     IrU32 saturateInteger16(const RdnaOperand& destination, IrU32 value, bool sign);
     bool packedInteger16Mad(const RdnaInstruction& inst, bool sign);
     bool packedInteger16MinMax(const RdnaInstruction& inst, IrOpcode opcode, bool sign);
+    IrU32 readPackedU16Source(const RdnaOperand& operand);
+    bool packedInteger16Native(const RdnaInstruction& inst, IrOpcode opcode, std::uint32_t first, std::uint32_t second);
     bool sU64Mask(const RdnaInstruction& inst, IrOpcode logicalOpcode, IrOpcode bitOpcode, bool negateRhs, bool negateResult, bool unary);
     IrU1 u64MaskBinary(const RdnaInstruction& inst, IrOpcode opcode, bool negateRhs, bool negateResult);
     template <typename TWord>
@@ -420,6 +423,7 @@ private:
     bool ieeeMode = false;
     bool nativeFloat16 = false;
     bool nativeFloat16Fma = false;
+    bool nativeInteger16 = false;
     IrBuilder ir;
     IrBlock& block;
     IrU1 instructionBranchCondition;
