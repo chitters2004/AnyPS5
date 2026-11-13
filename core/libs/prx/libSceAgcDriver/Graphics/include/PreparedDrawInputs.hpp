@@ -100,6 +100,13 @@ inline constexpr std::size_t DrawInputSourceCount = static_cast<std::size_t>(Dra
 bool DrawInputSourcesTimed();
 void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64_t nanoseconds);
 
+struct PreparedCollectBatchCounts {
+    std::uint64_t batches = 0;
+    std::uint64_t ranges = 0;
+    std::uint64_t runs = 0;
+    std::uint64_t memoOnly = 0;
+};
+
 struct PreparedDrawInputCounts {
     std::uint64_t requests = 0;
     std::uint64_t ranges = 0;
@@ -117,6 +124,7 @@ struct PreparedDrawInputCounts {
     std::uint64_t requestNanoseconds = 0;
     std::uint64_t epochFollows = 0;
     std::uint64_t collectNanoseconds = 0;
+    PreparedCollectBatchCounts collectBatches;
     std::array<std::uint64_t, 2> allocNanoseconds{};
     std::array<std::uint64_t, 2> poolWaitNanoseconds{};
     std::array<std::uint64_t, 2> stashHits{};
@@ -155,6 +163,7 @@ struct PreparedUploadCounts {
     std::array<std::uint64_t, PreparedRefusalCount> regionsRefusedBy{};
     std::uint64_t regionSpareReused = 0;
     std::uint64_t regionVerifyDiffered = 0;
+    PreparedCollectBatchCounts regionCollectBatches;
 };
 
 PreparedUploadCounts PreparedUploadCounters();
