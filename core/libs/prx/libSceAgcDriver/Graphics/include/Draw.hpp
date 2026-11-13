@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -191,6 +192,17 @@ std::shared_ptr<const DrawRecipe> TakeDrawPlanShadowDecision();
 // `rewritten` counts a GPU-side draw whose records were copied and patched with a constant.
 enum class IndirectDrawPath : std::uint8_t { Gpu, NotFolded, FetchUnknown, NonVertexPath, IndxOffset, DrawIndex, VertexRange, FeatureGap, PendingImage, PendingLabelOrCopy, NotImported, Disabled, IndexRange, IndexLimitUnknown, Count };
 void CountIndirectDraw(IndirectDrawPath path, double readMs, bool rewritten = false);
+struct DrawOpsCounts {
+    static constexpr std::size_t SizeBuckets = 6;
+    std::uint64_t recorded = 0;
+    std::uint64_t fallbacks = 0;
+    std::uint64_t sets = 0;
+    std::uint64_t stateOps = 0;
+    std::array<std::uint64_t, SizeBuckets> sizes{};
+    std::array<std::uint64_t, DrawStateOp::KindCount> kinds{};
+};
+void CountDrawOps(bool recorded, std::uint32_t sets = 0, std::span<const DrawStateOp> state = {});
+DrawOpsCounts DrawOpsTotals();
 std::array<std::uint64_t, static_cast<std::size_t>(IndirectDrawPath::Count)> IndirectDrawCounts();
 void CountEmptyIndirectDraw(double readMs);
 std::uint64_t EmptyIndirectDrawCount();
@@ -226,6 +238,7 @@ void CountDrawSkip(DrawSkip kind, double us);
 // which the switch can turn into APS5_NO_RECORD_COPIED_DRAWS. Until then such draws are recorded and
 // waited for at once. Read and written under GuestMemory::GpuMutex, like the device's list.
 std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>> DrawCopiedWriters();
+void ListCopiedWriter(Recorder& recorder, const std::shared_ptr<std::vector<std::shared_ptr<ShaderResources>>>& writers, const std::shared_ptr<ShaderResources>& resources, std::function<void()> completion, bool listed);
 
 void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass);
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
