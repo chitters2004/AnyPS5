@@ -14012,15 +14012,16 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         } stopReader{reading, reader};
         image->MarkDirty();
         Require(lastDimension() == TextureDimension::k2DArray, "the array image's write is not the recorded layout");
+        const std::uint64_t dedupe = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) ? 0 : 1;
         const auto layoutSkips = StorageTexture::LayoutStoreSkips();
         image->MarkSliceDirty(1);
         Require(lastDimension() == TextureDimension::k2DArray, "a repeated write of the array image changed the recorded layout");
-        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a repeated write of the array image stored its layout again");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + dedupe, dedupe != 0 ? "a repeated write of the array image stored its layout again" : "APS5_NO_EFFECTS_DEDUPE still skipped a layout store");
         alias->MarkDirty();
         Require(lastDimension() == TextureDimension::k2D, "the alias's write after the array image's is not the recorded layout");
         image->MarkSliceDirty(2);
         Require(lastDimension() == TextureDimension::k2DArray, "the array image's write after the alias's left the alias's layout recorded");
-        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + 1, "a write after another image's was skipped as a repeat");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + dedupe, "a write after another image's was skipped as a repeat");
         auto neighborResource = flat;
         neighborResource.baseAddress = address + sliceBytes;
         auto neighbor = StorageTexture::Create(context, detiler, neighborResource, 0);
@@ -14030,7 +14031,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         image->MarkSliceDirty(3);
         neighbor->MarkDirty();
         image->MarkSliceDirty(0);
-        Require(StorageTexture::LayoutStoreSkips() == alternating + 3, "alternating writes of images at different addresses stored their layouts again");
+        Require(StorageTexture::LayoutStoreSkips() == alternating + 3 * dedupe, "alternating writes of images at different addresses stored their layouts again");
         Require(lastDimension() == TextureDimension::k2DArray, "a neighbouring image's write changed the array image's recorded layout");
         const auto neighborRecord = StorageTexture::LastWrite(address + sliceBytes);
         Require(neighborRecord.has_value() && neighborRecord->dimension == TextureDimension::k2D, "the neighbouring image's layout is not recorded at its address");
@@ -14060,7 +14061,7 @@ void markRepeatTests(const Device& device, Recorder& recorder) {
         const bool heldBefore = AgcDriver::GuestMemory::TrackerGeneration() == held;
         const auto repeatSkips = mark(1, 2, false, "a repeated mark inside the whole mark");
         Require(heldBefore && AgcDriver::GuestMemory::TrackerGeneration() == held, "the tracker generation moved under a repeated mark: the skip is not exercised");
-        Require(repeatSkips == 1, "a repeated mark at the same generation walked its units again");
+        Require(repeatSkips == dedupe, dedupe != 0 ? "a repeated mark at the same generation walked its units again" : "APS5_NO_EFFECTS_DEDUPE still skipped a pending-since walk");
         mark(2, 1, true, "a one-unit mark at a new generation");
         const auto outsideSkips = mark(0, 1, false, "a mark of a unit outside the newest mark at the same generation");
         mark(1, 1, false, "a mark between the two newest marks");

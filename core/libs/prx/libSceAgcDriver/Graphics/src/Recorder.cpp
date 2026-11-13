@@ -3891,7 +3891,7 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
 
 void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
     open->reads.push_back({begin, end, kind});
-    if (FlipReadCheck() || notedReadKeys.Insert({begin, end, kind}, batchEpoch)) return;
+    if (FlipReadCheck() || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) || notedReadKeys.Insert({begin, end, kind}, batchEpoch)) return;
     open->reads.pop_back();
     readsRepeated.store(readsRepeated.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
 }
@@ -3912,6 +3912,13 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
     }
     ensureOpen();
     readsNoted.store(readsNoted.load(std::memory_order_relaxed) + ranges->size(), std::memory_order_relaxed);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        for (const auto& note : open->readLists) {
+            if (note.ranges == ranges && note.kind == kind) return;
+        }
+        open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+        return;
+    }
     const ReadListKey key{ranges.get(), kind};
     open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
     if (!notedReadLists.Insert(key, batchEpoch)) open->readLists.pop_back();

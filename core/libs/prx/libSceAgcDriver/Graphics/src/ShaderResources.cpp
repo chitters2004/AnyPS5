@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -7093,18 +7094,27 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
-    auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
-    auto reads = std::move(ownedReads);
-    const auto capacity = reads.capacity();
-    if (auto space = guestMemory.SplitInPlaceReads(reads)) {
-        recorder.NotePendingReadList(std::move(space), kind);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        if (auto split = guestMemory.SplitInPlaceReads()) {
+            recorder.NotePendingReadList(std::move(split->space), kind);
+            recorder.NotePendingReads(split->own, kind);
+        } else {
+            recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        }
     } else {
-        guestMemory.InPlaceReads(reads);
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
+        auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
+        auto reads = std::move(ownedReads);
+        const auto capacity = reads.capacity();
+        if (auto space = guestMemory.SplitInPlaceReads(reads)) {
+            recorder.NotePendingReadList(std::move(space), kind);
+        } else {
+            guestMemory.InPlaceReads(reads);
+        }
+        if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.store(inPlaceReadReuses.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        recorder.NotePendingReads(reads, kind);
+        ownedReads = std::move(reads);
     }
-    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.store(inPlaceReadReuses.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
-    recorder.NotePendingReads(reads, kind);
-    ownedReads = std::move(reads);
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
