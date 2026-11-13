@@ -74,6 +74,16 @@ struct InPlaceIndices {
 };
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart);
 
+enum class DrawInputStage : std::size_t { Layout, InPlace, Lookup, Allocate, Read, IndexScan, Keep, FetchPlan, ZeroPadded, Expand, Count };
+enum class DrawInputOutcome : std::size_t { InPlace, SnapshotReused, OwnedReused, Copied, Count };
+struct DrawInputCounters {
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawInputStage::Count)> calls{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawInputStage::Count)> nanoseconds{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawInputStage::Count)> amounts{};
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawInputOutcome::Count)> outcomes{};
+};
+DrawInputCounters DrawInputCountersNow();
+
 std::array<std::uint32_t, 4> MeshIndexBufferDescriptor(const Pm4::DrawParameters& draw);
 
 struct MeshArguments {
