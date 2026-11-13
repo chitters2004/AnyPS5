@@ -1182,7 +1182,7 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      actions: read
+      actions: write
     env:
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag }}
@@ -1509,17 +1509,9 @@ jobs:
           name: summary-${{ inputs.tag || 'run' }}
           path: summary.json
           if-no-files-found: ignore
-  prune-ccache:
-    needs: [plan, linux, windows]
-    if: ${{ !cancelled() && needs.plan.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      actions: write
-    env:
-      GH_TOKEN: ${{ github.token }}
-    steps:
+      # Folded into this job so a run has one tail job fewer; fork-warm.yml prunes again every 30 min.
       - name: Keep the newest ccache entry per key
+        if: ${{ always() }}
         run: |
           gh api "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" --paginate --jq '.actions_caches[] | select(.key | startswith("ccache-")) | [.id, .key, .created_at, .size_in_bytes, .ref] | @tsv' > caches.tsv
           python3 - <<'PY'
