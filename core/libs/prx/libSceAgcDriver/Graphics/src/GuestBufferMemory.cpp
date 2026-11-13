@@ -7750,6 +7750,7 @@ void GuestBufferMemory::takeHeapReferences() {
 }
 
 void GuestBufferMemory::WriteBack() {
+    Recorder::RefuseWhenPoisoned();
     Require(uploaded && !committed, "guest memory cannot be committed twice or before upload");
     const auto merged = mergeWrites(writes);
     // The CPU keeps running while the GPU works, so storing whole ranges would roll back its writes to
