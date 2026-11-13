@@ -99,7 +99,7 @@ env:
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
   # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
-  REUSE_VERSION: 2
+  REUSE_VERSION: 3
   VVL_VERSION: 1.4.363.1
   MESA_VERSION: 26.2.6
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
@@ -163,6 +163,41 @@ jobs:
             stack=stack
           fi
           echo "cache family: ${stack:-shared}"
+          # Measured per-test times of the last runs (ci-times-<os>, written by the report job), newest wins per test.
+          mkdir -p plan-times
+          for os in linux windows; do
+            echo '{}' > "plan-times/times-$os.json"
+            ids=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=ci-times-$os&per_page=5" --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | .[].id' || true)
+            for id in $ids; do
+              rm -rf plan-times/dl plan-times/dl.zip
+              mkdir -p plan-times/dl
+              if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$id/zip" > plan-times/dl.zip && unzip -q -o plan-times/dl.zip -d plan-times/dl; then
+                python3 -c 'import json, sys; a = json.load(open(sys.argv[1])); a.update(json.load(open(sys.argv[2]))); json.dump(a, open(sys.argv[1], "w"))' "plan-times/times-$os.json" plan-times/dl/times.json || true
+              fi
+            done
+            python3 -c 'import json, sys; print(sys.argv[1], len(json.load(open(sys.argv[2]))), "measured tests")' "$os" "plan-times/times-$os.json"
+          done
+          rm -rf plan-times/dl plan-times/dl.zip
+          cat > plan-times/shard.py <<'SHARDPY'
+          # Usage: shard.py <shard> <shards> <os>. Writes build/shard-tests.txt: the selected tests of this shard.
+          # Longest tests first, each onto the least loaded shard, by measured time (median of the known times for new tests).
+          import json, os, re, statistics, subprocess, sys
+          shard, shards, osname = int(sys.argv[1]), int(sys.argv[2]), sys.argv[3]
+          out = subprocess.run(["ctest", "--test-dir", "build", "-N", "-R", os.environ["TESTS"]], capture_output=True, text=True).stdout
+          names = sorted(set(re.findall(r"^\s*Test\s+#\d+: (.*\S)\s*$", out, re.M)))
+          times = json.load(open(f"plan-times/times-{osname}.json"))
+          known = [times[n] for n in names if n in times]
+          default = statistics.median(known) if known else 5.0
+          cost = {n: times.get(n, default) for n in names}
+          loads, mine = [0.0] * shards, []
+          for n in sorted(names, key=lambda n: (-cost[n], n)):
+              i = loads.index(min(loads))
+              loads[i] += cost[n]
+              if i == shard - 1:
+                  mine.append(n)
+          open("build/shard-tests.txt", "w").write("".join(n + "\n" for n in sorted(mine)))
+          print(f"shard {shard}/{shards}: {len(mine)} of {len(names)} tests ({len(known)} timed); expected load per shard (s): {[round(x) for x in loads]}")
+          SHARDPY
           # Reuse the base result of an earlier run for the same base sha, test set and tool versions.
           # The artifact base-reuse-<os>-<key> is uploaded only by a base job that finished successfully.
           # The result is downloaded and checked here, so a missing or broken artifact falls back to running the base job.
@@ -241,11 +276,11 @@ jobs:
               win = []
               if "windows" in jobs:
                   # The test step of the ref dominates the job (about 16 min of agc_.* on 4 cores), so two runners each take
-                  # every second test by ctest number (ctest -I n,,2); the report merges the shards. The base stays one job:
-                  # its result is normally reused. Only the first shard saves the compiler cache.
+                  # a share of the selected tests, balanced by measured time (plan-times/shard.py); the report merges the shards.
+                  # The base stays one job: its result is normally reused. Only the first shard saves the compiler cache.
                   for shard in (1, 2):
-                      win.append(dict(id=f"windows-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, cache_family=family, shard=shard,
-                                      shard_save="true" if shard == 1 else "false"))
+                      win.append(dict(id=f"windows-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, cache_family=family,
+                                      shard=shard, shards=2, shard_save="true" if shard == 1 else "false"))
                   if os.environ["reuse_windows"] != "true":
                       win.append(dict(id="windows-base", kind="gate", side="base", sha=base_sha, cache_family="", reuse_name="base-reuse-windows-" + os.environ["key_windows"]))
               if "warm" in jobs:
@@ -256,6 +291,11 @@ jobs:
               out.write("ref_sha=" + ref_sha + "\nbase_sha=" + base_sha + "\n")
           print(json.dumps(include, indent=1))
           PY
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plan-${{ inputs.tag }}times
+          path: plan-times/
+          retention-days: 2
       - uses: actions/upload-artifact@v7
         if: ${{ steps.plan.outputs.reuse_any == 'true' }}
         with:
@@ -662,6 +702,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ matrix.sha }}
           persist-credentials: false
+      - uses: actions/download-artifact@v8
+        if: ${{ matrix.shards }}
+        with:
+          name: plan-${{ inputs.tag }}times
+          path: plan-times
       - id: submodules
         name: Key the submodules on their commits
         run: |
@@ -844,13 +889,24 @@ jobs:
           VK_LOADER_DEBUG: layer
           ANYPS5_NO_SHADER_CACHE: 1
           SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
         run: |
           export PATH="/c/winlibs/mingw64/bin:/c/vk:$PATH"
           if [ "${VK_DEVICE:-0}" = 1 ]; then export ANYPS5_REQUIRE_VULKAN=1; fi
           set +e
-          # An empty SHARD runs every selected test; SHARD n runs the tests whose ctest number is n modulo 2.
-          select=(); no_tests=error; if [ -n "$SHARD" ]; then select=(-I "$SHARD,,2"); fi; if [ "$SHARD" = 2 ]; then no_tests=ignore; fi
-          ctest --test-dir build -R "$TESTS" "${select[@]}" -V --no-tests=$no_tests --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
+          if [ -n "$SHARD" ]; then
+            # This shard runs its own list of the selected tests; no test is in two shards.
+            ctest --version | head -1
+            python plan-times/shard.py "$SHARD" "$SHARDS" windows | tee shard.txt
+            if [ ! -s build/shard-tests.txt ]; then
+              echo "No tests were found for this shard" | tee ctest.log
+              echo "TEST_RC=0" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            ctest --test-dir build --tests-from-file "$(cygpath -m "$PWD")/build/shard-tests.txt" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
+          else
+            ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 --parallel 4 --output-junit ctest.xml 2>&1 | tee ctest.log
+          fi
           echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
           exit 0
       - name: Assemble the gate bundle
@@ -1135,9 +1191,9 @@ jobs:
               m["tests"] = {}
               for part in parts:
                   m["tests"].update(part["tests"])
-              # ctest -I n,,2 can hand a test to both shards; it then runs twice and counts once.
-              overlap = sum(len(p["tests"]) for p in parts) - len(m["tests"])
-              m["total"] = sum(p["total"] or 0 for p in parts) - overlap if any(p["total"] is not None for p in parts) else None
+              m["total"] = sum(p["total"] or 0 for p in parts) if any(p["total"] is not None for p in parts) else None
+              if sum(len(p["tests"]) for p in parts) != len(m["tests"]):
+                  fail(f"{rid}: a test ran in more than one shard")
               m["per_test"] = collections.defaultdict(collections.Counter)
               m["vuid_ids"] = collections.Counter()
               m["replay"] = {}
@@ -1318,6 +1374,21 @@ jobs:
                   w(f"- `{r['patch']}`: {verdict} ({collections.Counter(r['tests'].values())})")
           w("\n## Verdict")
           w("RED: " + "; ".join(bad) if bad else "GREEN")
+          import xml.etree.ElementTree as ET
+          times = {"linux": {}, "windows": {}}
+          for path in sorted(glob.glob("results/**/result.json", recursive=True)):
+              xml = os.path.join(os.path.dirname(path), "ctest.xml")
+              kind = json.load(open(path)).get("os")
+              if kind in times and os.path.exists(xml):
+                  for tc in ET.parse(xml).getroot().iter("testcase"):
+                      try:
+                          times[kind][tc.get("name")] = float(tc.get("time"))
+                      except (TypeError, ValueError):
+                          pass
+          for kind, measured in times.items():
+              if measured:
+                  os.makedirs(f"times-{kind}", exist_ok=True)
+                  json.dump(measured, open(f"times-{kind}/times.json", "w"))
           summary = {"tag": prefix, "verdict": "RED" if bad else "GREEN", "bad": bad}
           for label, pair in (("linux", (ref, base)), ("windows", (wref, wbase))):
               if pair[0]:
@@ -1328,6 +1399,18 @@ jobs:
           json.dump(summary, open("summary.json", "w"), indent=1)
           raise SystemExit(1 if bad else 0)
           PY
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && hashFiles('times-linux/times.json') != '' }}
+        with:
+          name: ci-times-linux
+          path: times-linux/
+          retention-days: 30
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() && hashFiles('times-windows/times.json') != '' }}
+        with:
+          name: ci-times-windows
+          path: times-windows/
+          retention-days: 30
       - uses: actions/upload-artifact@v7
         if: ${{ always() }}
         with:
