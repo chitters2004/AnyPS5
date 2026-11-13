@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -19,6 +20,7 @@
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -94,7 +96,61 @@ struct PreparedRange {
     }
 };
 
-struct Counters {
+template <typename Shard> class CounterShards {
+public:
+    static CounterShards& Get() {
+        static auto* shards = new CounterShards;
+        return *shards;
+    }
+
+    Shard* Lease() {
+        std::lock_guard lock(mutex);
+        if (!idle.empty()) {
+            auto* shard = idle.back();
+            idle.pop_back();
+            return shard;
+        }
+        return &store.emplace_back();
+    }
+
+    void Return(Shard* shard) {
+        std::lock_guard lock(mutex);
+        idle.push_back(shard);
+    }
+
+    template <typename Visit> void ForEach(Visit&& visit) {
+        std::lock_guard lock(mutex);
+        for (const auto& shard : store) visit(shard);
+    }
+
+private:
+    std::mutex mutex;
+    std::deque<Shard> store;
+    std::vector<Shard*> idle;
+};
+
+template <typename Shard> struct CounterLease {
+    Shard* shard = nullptr;
+    ~CounterLease() {
+        if (shard != nullptr) CounterShards<Shard>::Get().Return(shard);
+    }
+};
+
+template <typename Shard> Shard& LocalShard() {
+    auto& lease = HostThreadLocal<CounterLease<Shard>, CounterLease<Shard>>();
+    if (lease.shard == nullptr) lease.shard = CounterShards<Shard>::Get().Lease();
+    return *lease.shard;
+}
+
+void add(std::atomic<std::uint64_t>& total, std::uint64_t amount) {
+    total.store(total.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+void sum(std::uint64_t& into, const std::atomic<std::uint64_t>& from) {
+    into += from.load(std::memory_order_relaxed);
+}
+
+struct alignas(64) Counters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> prepared{0};
@@ -122,12 +178,12 @@ struct Counters {
 };
 
 Counters& counters() {
-    static Counters values;
-    return values;
+    return LocalShard<Counters>();
 }
 
 void counted(std::atomic<std::uint64_t>& total, const char* scope, std::uint64_t amount = 1) {
-    total.fetch_add(amount, std::memory_order_relaxed);
+    if (amount == 0) return;
+    add(total, amount);
     PerformanceTrace::CountOwnedDraw(scope, amount);
 }
 
@@ -226,7 +282,7 @@ bool returnStashed(VkDevice device, std::size_t bytes, VkBufferUsageFlags usage,
     return true;
 }
 
-struct UploadCounters {
+struct alignas(64) UploadCounters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> notReady{0};
     std::atomic<std::uint64_t> waited{0};
@@ -259,13 +315,12 @@ struct UploadCounters {
 };
 
 UploadCounters& uploadCounters() {
-    static UploadCounters values;
-    return values;
+    return LocalShard<UploadCounters>();
 }
 
 void countedUpload(std::atomic<std::uint64_t>& total, const char* scope, std::uint64_t amount = 1) {
     if (amount == 0) return;
-    total.fetch_add(amount, std::memory_order_relaxed);
+    add(total, amount);
     PerformanceTrace::CountOwnedDraw(scope, amount);
 }
 
@@ -301,7 +356,7 @@ void countStaging(StagingRole role, const StagingCost& cost) {
     if (cost.stashHits != 0) counted(total.stashHits[index], StashHitNames[index], cost.stashHits);
 }
 
-struct RingCounters {
+struct alignas(64) RingCounters {
     std::atomic<std::uint64_t> slices{0};
     std::atomic<std::uint64_t> bytes{0};
     std::atomic<std::uint64_t> chunks{0};
@@ -309,12 +364,12 @@ struct RingCounters {
     std::atomic<std::uint64_t> returned{0};
     std::atomic<std::uint64_t> capped{0};
     std::atomic<std::uint64_t> oversize{0};
-    std::atomic<std::uint64_t> outstanding{0};
 };
 
+std::atomic<std::uint64_t> ringOutstanding{0};
+
 RingCounters& ringCounters() {
-    static RingCounters values;
-    return values;
+    return LocalShard<RingCounters>();
 }
 
 struct RingLane {
@@ -341,7 +396,7 @@ struct ChunkReturn {
             if (lane->closed.load(std::memory_order_relaxed) || lane->free.size() >= DrawInputRingFreeChunks) dropped = std::move(chunk);
             else lane->free.push_back(std::move(chunk));
         }
-        ringCounters().outstanding.fetch_sub(1, std::memory_order_relaxed);
+        ringOutstanding.fetch_sub(1, std::memory_order_relaxed);
         counted(ringCounters().returned, "DrawInputRing.returned");
     }
 };
@@ -408,7 +463,7 @@ std::optional<DrawInputSlice> ringSlice(const Context& context, std::size_t byte
     std::unique_lock lock(lane->mutex);
     auto offset = (lane->used + DrawInputRingAlignment - 1) & ~(DrawInputRingAlignment - 1);
     if (lane->current == nullptr || offset + bytes > DrawInputRingChunk) {
-        if (total.outstanding.load(std::memory_order_relaxed) * DrawInputRingChunk >= DrawInputRingPinnedLimit) {
+        if (ringOutstanding.load(std::memory_order_relaxed) * DrawInputRingChunk >= DrawInputRingPinnedLimit) {
             lock.unlock();
             counted(total.capped, "DrawInputRing.capped");
             return std::nullopt;
@@ -433,7 +488,7 @@ std::optional<DrawInputSlice> ringSlice(const Context& context, std::size_t byte
             made = true;
         }
         auto* raw = chunk.get();
-        total.outstanding.fetch_add(1, std::memory_order_relaxed);
+        ringOutstanding.fetch_add(1, std::memory_order_relaxed);
         std::shared_ptr<Buffer> handle(raw, ChunkReturn{lane, std::move(chunk)});
         lock.lock();
         if (lane->closed.load(std::memory_order_relaxed)) {
@@ -690,8 +745,9 @@ public:
     }
 
 private:
+
     std::optional<std::size_t> countedCopy(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
-        counters().ranges.fetch_add(1, std::memory_order_relaxed);
+        add(counters().ranges, 1);
         return copyRange(address, bytes, use, usage, readable);
     }
 };
@@ -986,33 +1042,34 @@ std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Record
 }
 
 PreparedUploadCounts PreparedUploadCounters() {
-    auto& total = uploadCounters();
     PreparedUploadCounts counts;
-    counts.requests = total.requests.load(std::memory_order_relaxed);
-    counts.notReady = total.notReady.load(std::memory_order_relaxed);
-    counts.waited = total.waited.load(std::memory_order_relaxed);
-    counts.stageAPrepared = total.stageAPrepared.load(std::memory_order_relaxed);
-    counts.stageAAdopted = total.stageAAdopted.load(std::memory_order_relaxed);
-    counts.stageAStale = total.stageAStale.load(std::memory_order_relaxed);
-    counts.stageAStaleStaging = total.stageAStaleStaging.load(std::memory_order_relaxed);
-    for (std::size_t reason = 0; reason < PreparedStalenessCount; ++reason) counts.stageAStaleBy[reason] = total.stageAStaleBy[reason].load(std::memory_order_relaxed);
-    counts.stageAStagingPredicted = total.stageAStagingPredicted.load(std::memory_order_relaxed);
-    counts.stageAStagingFallback = total.stageAStagingFallback.load(std::memory_order_relaxed);
-    counts.stageAStagingMispredicted = total.stageAStagingMispredicted.load(std::memory_order_relaxed);
-    counts.stageAUnused = total.stageAUnused.load(std::memory_order_relaxed);
-    counts.stageAPredictedHit = total.stageAPredictedHit.load(std::memory_order_relaxed);
-    counts.stageARefused = total.stageARefused.load(std::memory_order_relaxed);
-    counts.stageAFailed = total.stageAFailed.load(std::memory_order_relaxed);
-    counts.stageAUnpinned = total.stageAUnpinned.load(std::memory_order_relaxed);
-    counts.stageAVerifyDiffered = total.stageAVerifyDiffered.load(std::memory_order_relaxed);
-    counts.regionsPrepared = total.regionsPrepared.load(std::memory_order_relaxed);
-    counts.regionsAdopted = total.regionsAdopted.load(std::memory_order_relaxed);
-    counts.regionsReprepared = total.regionsReprepared.load(std::memory_order_relaxed);
-    counts.regionsUnused = total.regionsUnused.load(std::memory_order_relaxed);
-    counts.regionsRefused = total.regionsRefused.load(std::memory_order_relaxed);
-    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.regionsRefusedBy[reason] = total.regionsRefusedBy[reason].load(std::memory_order_relaxed);
-    counts.regionSpareReused = total.regionSpareReused.load(std::memory_order_relaxed);
-    counts.regionVerifyDiffered = total.regionVerifyDiffered.load(std::memory_order_relaxed);
+    CounterShards<UploadCounters>::Get().ForEach([&](const UploadCounters& total) {
+        sum(counts.requests, total.requests);
+        sum(counts.notReady, total.notReady);
+        sum(counts.waited, total.waited);
+        sum(counts.stageAPrepared, total.stageAPrepared);
+        sum(counts.stageAAdopted, total.stageAAdopted);
+        sum(counts.stageAStale, total.stageAStale);
+        sum(counts.stageAStaleStaging, total.stageAStaleStaging);
+        for (std::size_t reason = 0; reason < PreparedStalenessCount; ++reason) sum(counts.stageAStaleBy[reason], total.stageAStaleBy[reason]);
+        sum(counts.stageAStagingPredicted, total.stageAStagingPredicted);
+        sum(counts.stageAStagingFallback, total.stageAStagingFallback);
+        sum(counts.stageAStagingMispredicted, total.stageAStagingMispredicted);
+        sum(counts.stageAUnused, total.stageAUnused);
+        sum(counts.stageAPredictedHit, total.stageAPredictedHit);
+        sum(counts.stageARefused, total.stageARefused);
+        sum(counts.stageAFailed, total.stageAFailed);
+        sum(counts.stageAUnpinned, total.stageAUnpinned);
+        sum(counts.stageAVerifyDiffered, total.stageAVerifyDiffered);
+        sum(counts.regionsPrepared, total.regionsPrepared);
+        sum(counts.regionsAdopted, total.regionsAdopted);
+        sum(counts.regionsReprepared, total.regionsReprepared);
+        sum(counts.regionsUnused, total.regionsUnused);
+        sum(counts.regionsRefused, total.regionsRefused);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) sum(counts.regionsRefusedBy[reason], total.regionsRefusedBy[reason]);
+        sum(counts.regionSpareReused, total.regionSpareReused);
+        sum(counts.regionVerifyDiffered, total.regionVerifyDiffered);
+    });
     return counts;
 }
 
@@ -1044,7 +1101,7 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool valid = PreparedInputStillValid(*found, recorder, registryGeneration);
     auto& total = counters();
-    total.checks.fetch_add(1, std::memory_order_relaxed);
+    add(total.checks, 1);
     if (timed) {
         const auto spent = nanosecondsSince(start);
         counted(total.checkNanoseconds, "DrawInputPrep.check_ns", spent);
@@ -1087,16 +1144,17 @@ std::span<std::byte> DrawInputSlice::Bytes() const {
 }
 
 DrawInputRingCounts DrawInputRingCounters() {
-    auto& total = ringCounters();
     DrawInputRingCounts counts;
-    counts.slices = total.slices.load(std::memory_order_relaxed);
-    counts.bytes = total.bytes.load(std::memory_order_relaxed);
-    counts.chunks = total.chunks.load(std::memory_order_relaxed);
-    counts.recycled = total.recycled.load(std::memory_order_relaxed);
-    counts.returned = total.returned.load(std::memory_order_relaxed);
-    counts.capped = total.capped.load(std::memory_order_relaxed);
-    counts.oversize = total.oversize.load(std::memory_order_relaxed);
-    counts.outstanding = total.outstanding.load(std::memory_order_relaxed);
+    CounterShards<RingCounters>::Get().ForEach([&](const RingCounters& total) {
+        sum(counts.slices, total.slices);
+        sum(counts.bytes, total.bytes);
+        sum(counts.chunks, total.chunks);
+        sum(counts.recycled, total.recycled);
+        sum(counts.returned, total.returned);
+        sum(counts.capped, total.capped);
+        sum(counts.oversize, total.oversize);
+    });
+    counts.outstanding = ringOutstanding.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -1114,36 +1172,37 @@ void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64
 }
 
 PreparedDrawInputCounts PreparedDrawInputCounters() {
-    auto& total = counters();
     PreparedDrawInputCounts counts;
-    counts.requests = total.requests.load(std::memory_order_relaxed);
-    counts.ranges = total.ranges.load(std::memory_order_relaxed);
-    counts.prepared = total.prepared.load(std::memory_order_relaxed);
-    counts.refused = total.refused.load(std::memory_order_relaxed);
-    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.refusedBy[reason] = total.refusedBy[reason].load(std::memory_order_relaxed);
-    counts.adopted = total.adopted.load(std::memory_order_relaxed);
-    counts.reprepared = total.reprepared.load(std::memory_order_relaxed);
-    counts.notReady = total.notReady.load(std::memory_order_relaxed);
-    counts.waited = total.waited.load(std::memory_order_relaxed);
-    counts.unused = total.unused.load(std::memory_order_relaxed);
-    counts.checks = total.checks.load(std::memory_order_relaxed);
-    counts.checkNanoseconds = total.checkNanoseconds.load(std::memory_order_relaxed);
-    counts.verifyDiffered = total.verifyDiffered.load(std::memory_order_relaxed);
-    counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
-    counts.epochFollows = total.epochFollows.load(std::memory_order_relaxed);
-    counts.collectNanoseconds = total.collectNanoseconds.load(std::memory_order_relaxed);
-    for (std::size_t role = 0; role < 2; ++role) {
-        counts.allocNanoseconds[role] = total.allocNanoseconds[role].load(std::memory_order_relaxed);
-        counts.poolWaitNanoseconds[role] = total.poolWaitNanoseconds[role].load(std::memory_order_relaxed);
-        counts.stashHits[role] = total.stashHits[role].load(std::memory_order_relaxed);
-    }
-    counts.stashReturned = total.stashReturned.load(std::memory_order_relaxed);
-    counts.spareReused = total.spareReused.load(std::memory_order_relaxed);
-    for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
-        counts.sources[index] = total.sources[index].load(std::memory_order_relaxed);
-        counts.sourceBytes[index] = total.sourceBytes[index].load(std::memory_order_relaxed);
-        counts.sourceNanoseconds[index] = total.sourceNanoseconds[index].load(std::memory_order_relaxed);
-    }
+    CounterShards<Counters>::Get().ForEach([&](const Counters& total) {
+        sum(counts.requests, total.requests);
+        sum(counts.ranges, total.ranges);
+        sum(counts.prepared, total.prepared);
+        sum(counts.refused, total.refused);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) sum(counts.refusedBy[reason], total.refusedBy[reason]);
+        sum(counts.adopted, total.adopted);
+        sum(counts.reprepared, total.reprepared);
+        sum(counts.notReady, total.notReady);
+        sum(counts.waited, total.waited);
+        sum(counts.unused, total.unused);
+        sum(counts.checks, total.checks);
+        sum(counts.checkNanoseconds, total.checkNanoseconds);
+        sum(counts.verifyDiffered, total.verifyDiffered);
+        sum(counts.requestNanoseconds, total.requestNanoseconds);
+        sum(counts.epochFollows, total.epochFollows);
+        sum(counts.collectNanoseconds, total.collectNanoseconds);
+        for (std::size_t role = 0; role < 2; ++role) {
+            sum(counts.allocNanoseconds[role], total.allocNanoseconds[role]);
+            sum(counts.poolWaitNanoseconds[role], total.poolWaitNanoseconds[role]);
+            sum(counts.stashHits[role], total.stashHits[role]);
+        }
+        sum(counts.stashReturned, total.stashReturned);
+        sum(counts.spareReused, total.spareReused);
+        for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
+            sum(counts.sources[index], total.sources[index]);
+            sum(counts.sourceBytes[index], total.sourceBytes[index]);
+            sum(counts.sourceNanoseconds[index], total.sourceNanoseconds[index]);
+        }
+    });
     return counts;
 }
 
