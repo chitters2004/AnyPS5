@@ -6,9 +6,10 @@ if(BUILD_TESTING)
     add_test(NAME agc_runtime_switches COMMAND agc_runtime_switches_tests)
     add_test(NAME agc_runtime_switches_refused COMMAND agc_runtime_switches_tests refused)
     add_test(NAME agc_runtime_switches_multi_arm COMMAND agc_runtime_switches_tests multi)
-    set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_multi_arm PROPERTIES TIMEOUT 20)
+    add_test(NAME agc_runtime_switches_environment COMMAND agc_runtime_switches_tests environment)
+    set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_multi_arm agc_runtime_switches_environment PROPERTIES TIMEOUT 20)
     if(WIN32)
-        set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_multi_arm PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_runtime_switches agc_runtime_switches_refused agc_runtime_switches_multi_arm agc_runtime_switches_environment PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

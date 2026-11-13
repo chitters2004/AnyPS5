@@ -216,11 +216,26 @@ int refused() {
     return 1;
 }
 
+int environment() {
+    for (std::size_t index = 0; index < static_cast<std::size_t>(RuntimeSwitch::Count); ++index) SetEnvironment(RuntimeSwitches::Name(static_cast<RuntimeSwitch>(index)), "1");
+    int unread = 0;
+    for (std::size_t index = 0; index < static_cast<std::size_t>(RuntimeSwitch::Count); ++index) {
+        const auto id = static_cast<RuntimeSwitch>(index);
+        if (RuntimeSwitches::Set(id)) continue;
+        std::fprintf(stderr, "FAILED: %s is set in the environment but the switch did not start set\n", RuntimeSwitches::Name(id));
+        ++unread;
+    }
+    if (unread != 0) return 1;
+    std::printf("every runtime switch reads its environment variable\n");
+    return 0;
+}
+
 }
 
 int main(int argc, char** argv) {
     if (argc > 1 && std::string_view(argv[1]) == "refused") return refused();
     if (argc > 1 && std::string_view(argv[1]) == "multi") return multiArm();
+    if (argc > 1 && std::string_view(argv[1]) == "environment") return environment();
     try {
         SetEnvironment("APS5_NO_BARRIER_BATCH", "1");
         SetEnvironment("APS5_AB", "5:APS5_NO_BARRIER_BATCH");
