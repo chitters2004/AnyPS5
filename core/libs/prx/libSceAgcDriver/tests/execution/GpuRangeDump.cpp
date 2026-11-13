@@ -1,8 +1,25 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <process.h>
+#else
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -16,57 +33,147 @@
 #include <span>
 #include <string>
 #include <vector>
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <unistd.h>
-#endif
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::Graphics::StorageTexture;
 using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Width = 64;
 constexpr std::uint32_t Height = 16;
-constexpr std::uint32_t WaveSize = 64;
-alignas(256) std::array<std::byte, Width * Height * 4> Pixels{};
+constexpr std::size_t BlockBytes = 65536;
+constexpr std::size_t SettledBytes = 16 * BlockBytes;
+constexpr std::size_t TargetBytes = std::size_t{Width} * Height * 16u;
+constexpr std::uint32_t Rgba32FloatInfo = 0x8738u;
+constexpr std::uint32_t LinearAttrib3 = 0x09000000u;
+constexpr std::uint32_t Float32AbgrExport = 9;
+constexpr VkColorComponentFlags RedGreen = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT;
+constexpr int Draws = 2;
 
 alignas(256) constexpr std::array<std::uint32_t, 6> VertexCode{
     0xe0382000, 0x80000005, 0xbf8c3f70, 0xf80008cf, 0x03020100, 0xbf810000,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 11> PixelCode{
-    0x7e0802ff, 0x3e4ccccd, 0x7e0a02ff, 0x3ecccccd, 0x7e0c02ff, 0x3f19999a, 0x7e0e02ff, 0x3f4ccccd,
-    0xf800180f, 0x07060504, 0xbf810000,
-};
-
-alignas(256) std::array<std::array<float, 4>, 3> VertexStorage{{
+constexpr std::array<std::array<float, 4>, 3> Triangle{{
     {-1.0f, -1.0f, 0.5f, 1.0f}, {3.0f, -1.0f, 0.5f, 1.0f}, {-1.0f, 3.0f, 0.5f, 1.0f}
 }};
+
+alignas(256) std::array<std::uint32_t, 16> PixelCode{};
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t stride, std::uint32_t count) {
     const auto address = reinterpret_cast<std::uintptr_t>(data);
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-void SetVariable(const char* name, const std::string& value) {
-#ifdef _WIN32
-    _putenv_s(name, value.c_str());
-#else
-    setenv(name, value.c_str(), 1);
-#endif
+std::span<const std::uint32_t> Program() {
+    std::size_t at = 0;
+    PixelCode[at++] = 0x36000000u | (20u << 17u) | 0xffu;
+    PixelCode[at++] = 0x0000ffffu;
+    PixelCode[at++] = 0x2c000000u | (21u << 17u) | 0x90u;
+    PixelCode[at++] = 0x7e000c00u | (20u << 17u) | (256u + 20u);
+    PixelCode[at++] = 0x7e000c00u | (21u << 17u) | (256u + 21u);
+    PixelCode[at++] = 0x7e000280u | (22u << 17u);
+    PixelCode[at++] = 0x7e0002f2u | (23u << 17u);
+    PixelCode[at++] = 0xf800180fu;
+    PixelCode[at++] = 0x17161514u;
+    PixelCode[at++] = 0xbf810000u;
+    return std::span<const std::uint32_t>(PixelCode.data(), at);
 }
 
-void Draw(AgcDriver::VulkanDevice& device) {
+struct Block {
+    explicit Block(std::size_t bytes) : bytes(bytes), arena(AgcDriver::GuestMemory::WriteWatched()) {
+#ifdef _WIN32
+        if (arena) {
+            data = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
+            GuestArena::GuestArenaCommit_nid_postfix(data, bytes, PAGE_READWRITE, bytes);
+        } else {
+            data = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        }
+#else
+        if (arena) {
+            void* raw = mmap(nullptr, bytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            Require(raw != MAP_FAILED, "cannot map the color target");
+            const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+            const auto aligned = (begin + BlockBytes - 1) & ~(static_cast<std::uintptr_t>(BlockBytes) - 1);
+            if (aligned != begin) munmap(raw, aligned - begin);
+            if (aligned + bytes != begin + bytes + BlockBytes) munmap(reinterpret_cast<void*>(aligned + bytes), begin + BlockBytes - aligned);
+            data = reinterpret_cast<std::uint8_t*>(aligned);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, bytes);
+        } else {
+            data = static_cast<std::uint8_t*>(std::aligned_alloc(BlockBytes, bytes));
+        }
+#endif
+        Require(data != nullptr, "cannot allocate the color target");
+        GuestAllocations::Mutation mutation;
+        mutation.Add(data, bytes, true, true, true);
+    }
+    ~Block() {
+        StorageTexture::FlushPending(Address(), bytes, nullptr, "test release");
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(data);
+        }
+#ifdef _WIN32
+        if (arena) {
+            GuestArena::GuestArenaReset_nid_postfix(data, bytes);
+            GuestArena::GuestArenaRelease_nid_postfix(data, bytes);
+        } else {
+            VirtualFree(data, 0, MEM_RELEASE);
+        }
+#else
+        if (arena) {
+            munmap(data, bytes);
+            GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(data, bytes);
+        } else {
+            std::free(data);
+        }
+#endif
+    }
+    Block(const Block&) = delete;
+    Block& operator=(const Block&) = delete;
+    std::uint64_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    std::size_t bytes;
+    bool arena;
+    std::uint8_t* data = nullptr;
+};
+
+AgcDriver::Graphics::ColorTarget DecodeTarget(const Block& block) {
+    AgcDriver::Registers cx;
+    cx[0x318] = static_cast<std::uint32_t>(block.Address() >> 8u);
+    cx[0x31b] = 0;
+    cx[0x31c] = Rgba32FloatInfo;
+    cx[0x31d] = 0;
+    cx[0x323] = 0;
+    cx[0x324] = 0;
+    cx[0x3b0] = ((Width - 1u) << 14u) | (Height - 1u);
+    cx[0x3b8] = LinearAttrib3;
+    cx[0x390] = static_cast<std::uint32_t>(block.Address() >> 40u);
+    auto color = AgcDriver::Graphics::DecodeColorBuffer(cx, 0);
+    color.exportIndex = 0;
+    Require(color.tileMode == AgcDriver::Graphics::ColorTileMode::Linear && color.bytes == TargetBytes, "the target is not a linear R32G32B32A32 target");
+    return color;
+}
+
+void Draw(AgcDriver::VulkanDevice& device, const Block& block) {
+    const auto color = DecodeTarget(block);
     const auto target = device.Target();
+    constexpr std::uint32_t waveSize = 64;
     std::vector<std::uint32_t> vertexUserData(4, 0u);
-    const auto vertexBuffer = BufferDescriptor(VertexStorage.data(), 16u, static_cast<std::uint32_t>(VertexStorage.size()));
+    const auto vertexBuffer = BufferDescriptor(Triangle.data(), 16u, static_cast<std::uint32_t>(Triangle.size()));
     std::copy(vertexBuffer.begin(), vertexBuffer.end(), vertexUserData.begin());
     const std::array<ShaderRecompiler::MemoryRegion, 1> vertexMemory{{{reinterpret_cast<std::uintptr_t>(VertexCode.data()), std::as_bytes(std::span(VertexCode))}}};
     ShaderRecompiler::RecompileRequest vertex{
         {ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(VertexCode.data()), VertexCode, 0, {}},
-        {WaveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
+        {waveSize, 0, vertexUserData, std::nullopt, std::nullopt, ShaderRecompiler::ShaderVertexStageInfo{}, vertexMemory},
         target,
         {0, 0, 0, 64}
     };
@@ -74,17 +181,16 @@ void Draw(AgcDriver::VulkanDevice& device) {
     const auto vertexResult = ShaderRecompiler::Recompile(vertex);
     const auto vertexPush = static_cast<std::uint32_t>(vertexResult.pushConstants.size());
 
+    const auto pixelCode = Program();
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
-    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionX) | ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionY);
-    pixel.posX = true;
-    pixel.posY = true;
-    pixel.targetOutputMode[0] = 9;
+    pixel.inputAddr = ShaderRecompiler::PixelInputBit(ShaderRecompiler::PixelInput::PositionFixedPoint);
+    pixel.targetOutputMode.at(0) = Float32AbgrExport;
     pixel.targetExportMapping.fill(0xe4u);
     const std::vector<std::uint32_t> pixelUserData(8, 0u);
-    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(PixelCode.data()), std::as_bytes(std::span(PixelCode))}}};
+    const std::array<ShaderRecompiler::MemoryRegion, 1> pixelMemory{{{reinterpret_cast<std::uintptr_t>(pixelCode.data()), std::as_bytes(pixelCode)}}};
     ShaderRecompiler::RecompileRequest fragment{
-        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(PixelCode.data()), PixelCode, 0, {}},
-        {WaveSize, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
+        {ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(pixelCode.data()), pixelCode, 0, {}},
+        {waveSize, 0, pixelUserData, std::nullopt, pixel, std::nullopt, pixelMemory},
         target,
         PixelPushLayout(vertexPush, target)
     };
@@ -95,23 +201,34 @@ void Draw(AgcDriver::VulkanDevice& device) {
         {ShaderStage::Fragment, &pixelResult, PixelPushOffset(vertexPush, target)}
     }};
 
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.blendEnable = VK_FALSE;
+    blend.colorWriteMask = RedGreen;
     AgcDriver::Graphics::State state{};
-    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, WaveSize, WaveSize, std::nullopt, std::nullopt};
-    state.color = {reinterpret_cast<std::uintptr_t>(Pixels.data()), {Width, Height}, VK_FORMAT_R8G8B8A8_UNORM, Pixels.size(), 0xe4u};
-    state.colors = {state.color};
+    state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, waveSize, waveSize, std::nullopt, std::nullopt};
+    state.colors = {color};
+    state.color = color;
     state.hasColorTarget = true;
     state.renderExtent = {Width, Height};
     state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
     state.viewport = {0, static_cast<float>(Height), static_cast<float>(Width), -static_cast<float>(Height), 0, 1};
+    state.negativeOneToOne = false;
     state.scissor = {{0, 0}, {Width, Height}};
     state.cullMode = VK_CULL_MODE_NONE;
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    state.blend.colorWriteMask = 15;
-    state.blends = {state.blend};
-    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(VertexStorage.size()), 0, 1, 0, false};
-    device.Draw(state, draw, shaders);
-    device.Draw(state, draw, shaders);
-    device.WaitIdle();
+    state.blends = {blend};
+    state.blend = blend;
+    state.blendConstants = {};
+    const AgcDriver::Pm4::DrawParameters draw{0, static_cast<std::uint32_t>(Triangle.size()), 0, 1, 0, false};
+    for (int index = 0; index < Draws; ++index) device.Draw(state, draw, shaders);
+}
+
+void SetVariable(const char* name, const std::string& value) {
+#ifdef _WIN32
+    _putenv_s(name, value.c_str());
+#else
+    setenv(name, value.c_str(), 1);
+#endif
 }
 
 struct Range {
@@ -139,15 +256,32 @@ int main() {
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
+            if (!AgcDriver::GuestMemory::WriteWatched()) {
+                std::puts("skipped, guest memory is not write-watched");
+                return VulkanTestSkipped;
+            }
             Require(AgcDriver::Graphics::Recorder::GpuTimingEnabled(), "APS5_PROFILE_GPU_RANGES did not turn GPU timing on");
-            Draw(*device);
+            const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(*device);
+#ifndef _WIN32
+            const auto decided = AgcDriver::Graphics::PrepareImportWatch(context);
+            AgcDriver::Graphics::SetImportWatch(context, AgcDriver::Graphics::ImportWatch::Watch);
+            struct Restore {
+                const AgcDriver::Graphics::Context& context;
+                AgcDriver::Graphics::ImportWatch decided;
+                ~Restore() { AgcDriver::Graphics::SetImportWatch(context, decided); }
+            } restore{context, decided};
+#endif
+            Block block(SettledBytes);
+            if (AgcDriver::Graphics::HostImportFor(context, block.Address(), block.bytes) == nullptr) {
+                std::puts("skipped, host imports are unavailable");
+                return VulkanTestSkipped;
+            }
+            Draw(*device, block);
+            device->WaitIdle();
         }
         AgcDriver::Graphics::Recorder::FlushGpuRangeDump();
         std::ifstream file(path);
-        if (!file.good()) {
-            std::puts("skipped: the draws were not recorded into a recorder batch on this device, so no range was timed");
-            return VulkanTestSkipped;
-        }
+        Require(file.good(), "no range file was written: the draws into a write-watched linear target were not recorded into a recorder batch");
         std::string line;
         std::getline(file, line);
         Require(line.rfind("aps5-gpu-ranges 1 period_ns ", 0) == 0, "the range file starts with '" + line + "', not its header");
@@ -198,7 +332,7 @@ int main() {
                     Require(range.pass == -1, "a draw class range names an enclosing pass");
                     Require(tags.contains(range.tag), "a draw class range has no declared pass tag");
                     const auto& tag = tags.at(range.tag);
-                    const auto colorField = "c" + std::to_string(static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM)) + "@" + std::to_string(Width) + "x" + std::to_string(Height) + ":0x";
+                    const auto colorField = "c" + std::to_string(static_cast<unsigned>(VK_FORMAT_R32G32B32A32_SFLOAT)) + "@" + std::to_string(Width) + "x" + std::to_string(Height) + ":0x";
                     Require(tag.find(colorField) != std::string::npos && tag.find("colors=1,") != std::string::npos && tag.find(",samples=1,") != std::string::npos && tag.find("extent=64x16") != std::string::npos, "the pass tag does not describe the color target: " + tag);
                 }
                 if (range.name.rfind("draw:0x", 0) == 0) {
@@ -212,7 +346,7 @@ int main() {
         }
         Require(!batches.empty() && batchRanges == batches.size(), "not every batch has its whole-batch range");
         Require(passes >= 1, "no draw class range was written");
-        Require(draws == 2, "expected one per-draw range for each of the 2 draws, found " + std::to_string(draws));
+        Require(draws == Draws, "expected one per-draw range for each of the " + std::to_string(Draws) + " draws, found " + std::to_string(draws));
         std::filesystem::remove(path);
         std::printf("gpu range dump tests passed (%zu batches, %zu passes, %zu draws)\n", batches.size(), passes, draws);
         return 0;
