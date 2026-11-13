@@ -187,6 +187,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_DUMP_TEXTURE` | string | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | hex addresses or WxH extents whose sampled textures are dumped on each of their first 8 uploads as texture_<address>_<n>.raw |
 | `APS5_EAGER_WRITEBACK` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | writes back pending storage layers eagerly |
 | `APS5_EXACT_DRAW_WRITES` | string | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/WrittenBuffers.cpp` |  | sizes a color or depth target's draw write ranges from its own bytes and slices (the default when unset); `0` uses the slack and unknown-byte approximation instead |
+| `APS5_FAST_CAPTURE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/RuntimeSwitches.cpp` |  | captures a shader's resources with facts its resource plan computed once (which buffers memory instructions access) instead of deriving them on every capture (a runtime switch, flippable under APS5_AB) |
 | `APS5_FILL_CHAIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | seeds and doubles the fill pattern in place in the import |
 | `APS5_FILL_CLEAR_EXACT_ONLY` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Memory/BufferFill.cpp` |  | turns a fill into a clear only when it covers the target exactly and nothing else |
 | `APS5_FILL_SYNC` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/VulkanDevice.cpp` |  | waits for every recorded store over the fill's range |

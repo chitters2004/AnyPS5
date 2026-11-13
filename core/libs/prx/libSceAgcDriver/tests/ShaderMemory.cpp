@@ -2711,6 +2711,80 @@ void verifySnapshotAllocationMoves() {
             "snapshot allocation moves: after the page holding T# was remapped during the capture, the snapshot kept the T# read before the remap");
 }
 
+void verifyPlanFactsMaterialization() {
+    using namespace ShaderRecompiler;
+    {
+        const std::vector<std::uint32_t> code{0xf4080600u, 0xfa000060u, 0xbf8cc07fu, 0x7e140300u, 0x4a141481u, 0x34141482u, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0x7e28050bu, 0xf4000540u, 0x28000000u, 0xf4080700u, 0xfa000020u, 0xbf8c0000u, 0xbf078015u, 0xbf840002u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+        const std::array<std::uint32_t, 2> userData{0x10000u, 0u};
+        const auto extracted = GetResourcePlan(FrontendRequest(code, userData));
+        std::vector<std::uint8_t> expected(extracted->info.buffers.size(), 0u);
+        for (const auto& memory : extracted->memoryInfo) {
+            if (memory.kind == ResourceKind::Buffer) expected.at(memory.resource) = 1u;
+        }
+        require(!expected.empty() && std::ranges::count(expected, 1u) != 0u && extracted->memoryAccessedBuffers == expected, "plan facts: ExtractPlan did not record the buffers memory instructions read");
+    }
+    constexpr std::array<std::array<std::uint32_t, 4>, 3> words{{{0x00010000u, 0x40000000u, 0x00000100u, 0x00027facu}, {0x00020000u, 0x40000000u, 0x00000100u, 0x00027facu}, {0x00030000u, 0x40000000u, 0x00000100u, 0x00027facu}}};
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    plan.userDataCount = 0u;
+    std::vector<std::unique_ptr<IrValue>> values;
+    for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) {
+        DescriptorSource source;
+        source.dwordCount = 4u;
+        for (std::uint32_t i = 0u; i < 4u; ++i) {
+            auto value = std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, buffer * 4u + i);
+            value->SetImmediateU32(words[buffer][i]);
+            source.dwords[i] = value.get();
+            values.push_back(std::move(value));
+        }
+        plan.descriptorSources.push_back(source);
+        plan.materializationSources.push_back(buffer);
+        BufferResource resource;
+        resource.source = buffer;
+        resource.read = true;
+        resource.scalar = true;
+        plan.info.buffers.push_back(resource);
+    }
+    for (std::uint32_t i = 0u; i < 336u; ++i) plan.memoryInfo.push_back(MemoryInfo{.kind = i % 2u == 0u ? ResourceKind::Lds : ResourceKind::Image, .resource = 0u});
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Buffer, .resource = 1u});
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Image, .resource = 2u});
+
+    const auto materialize = [&](bool fastCapture) {
+        SrtRuntime runtime;
+        runtime.fastCapture = fastCapture;
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+        require(snapshot.buffers.size() == plan.info.buffers.size(), "plan facts: the snapshot does not hold every buffer");
+        return snapshot;
+    };
+    const auto check = [&](const ResourceSnapshot& snapshot, const char* message) {
+        for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) {
+            const auto& dwords = snapshot.buffers[buffer].dwords;
+            const bool scalarOnly = buffer != 1u;
+            require(dwords[0] == words[buffer][0] && dwords[2] == words[buffer][2], message);
+            require(scalarOnly ? (dwords[1] == (words[buffer][1] & ~0x40000000u) && dwords[3] == 0u) : (dwords[1] == words[buffer][1] && dwords[3] == words[buffer][3]), message);
+        }
+    };
+
+    require(plan.memoryAccessedBuffers.empty(), "plan facts: a hand-built plan already holds facts");
+    check(materialize(true), "plan facts: without facts the fast capture did not scan memoryInfo");
+    ResourceMaterializer::CompactPlan(plan);
+    require(plan.memoryAccessedBuffers == std::vector<std::uint8_t>{0u, 1u, 0u}, "plan facts: CompactPlan did not record only the buffer a memory instruction reads");
+    const auto slow = materialize(false);
+    const auto fast = materialize(true);
+    check(slow, "plan facts: the scanned capture rewrote the wrong buffers");
+    check(fast, "plan facts: the fast capture rewrote the wrong buffers");
+    for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) require(slow.buffers[buffer].dwords == fast.buffers[buffer].dwords, "plan facts: the fast and scanned captures differ");
+
+    plan.memoryAccessedBuffers = {0u, 0u, 0u};
+    plan.info.buffers.push_back(plan.info.buffers[0]);
+    plan.materializationSources.push_back(0u);
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Buffer, .resource = 3u});
+    const auto grown = materialize(true);
+    require(grown.buffers.size() == 4u && grown.buffers[1].dwords[3] == words[1][3] && grown.buffers[3].dwords[3] == words[0][3], "plan facts: facts sized for another buffer list were trusted");
+}
+
 void verifyUnsetFormatImageMaterialization() {
     using namespace ShaderRecompiler;
     constexpr std::array<std::uint32_t, 8> measuredImage{0xffffffffu, 0xffffffffu, 0x00000019u, 0xc0017901u, 0x00000342u, 0xc8000000u, 0xc0064900u, 0x0000062fu};
@@ -12200,6 +12274,11 @@ int main(int argc, char** argv) {
             std::cout << "TYPE=0 image descriptor materialization passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--plan-facts") {
+            verifyPlanFactsMaterialization();
+            std::cout << "Plan facts materialization passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-phis") {
             verifyDescriptorPhis();
             return 0;
@@ -12212,6 +12291,7 @@ int main(int argc, char** argv) {
         verifySignedSrtComparison();
         verifyTypeZeroImageMaterialization();
         verifyUnsetFormatImageMaterialization();
+        verifyPlanFactsMaterialization();
         verifyOutOfRangeConstantReads();
         verifyDescriptorWebLaneIndexFold();
         verifyDescriptorWebTexelFold();
