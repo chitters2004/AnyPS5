@@ -550,66 +550,74 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
             self.forceSync = forceSync;
         }
     } scopeReset{self, savedSpanBytes, savedForceSync};
-    const auto strideWords = savedSpanBytes / sizeof(std::uint32_t);
     for (std::uint32_t attempt = 0; attempt < 3u; ++attempt) {
         if (attempt == 2u) ++self.forceSync;
-        address = startAddress;
-        values = startValues;
-        count = startCount;
-        const auto invalidationsBefore = self.rawInvalidations;
-        while (count != 0) {
-            const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
-            const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
-            const auto words = static_cast<std::size_t>(std::min<std::uint64_t>(count, PageWords - index));
-            const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
-            Page* page = nullptr;
-            if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
-            if (page != nullptr && page->lazy) {
-                const auto end = (index + words + BlockWords - 1u) / BlockWords * BlockWords;
-                auto first = index / BlockWords * BlockWords;
-                while (first < end) {
-                    if (page->valid.TestBlock(first)) {
-                        first += BlockWords;
-                        continue;
-                    }
-                    auto last = first + BlockWords;
-                    while (last < end && !page->valid.TestBlock(last)) last += BlockWords;
-                    GuestMemory::CopyGuestBytes(&page->words[first], reinterpret_cast<const void*>(base + first * sizeof(std::uint32_t)), (last - first) * sizeof(std::uint32_t));
-                    page->valid.SetRun(first, last - first);
-                    first = last;
-                }
-            }
-            if (page != nullptr && (page->lazy || (!page->wordwise && page->valid.All()))) {
-                std::memcpy(values, page->words.data() + index, bytes);
-                page->read.SetRun(index, words);
-                page->recent.SetRun(index, words);
-                CaptureTotals().reads += words;
-            } else {
-                const auto offsetWords = static_cast<std::uint64_t>(values - startValues);
-                for (std::size_t word = 0; word < words; ++word) {
-                    if (strideWords > 1u) {
-                        const auto inRecord = (offsetWords + word) % strideWords;
-                        const auto remainingWords = std::min<std::uint64_t>(strideWords - inRecord, startCount - (offsetWords + word));
-                        self.descriptorSpanBytes = static_cast<std::size_t>(remainingWords * sizeof(std::uint32_t));
-                    }
-                    const bool ok = read(context, address + word * sizeof(std::uint32_t), values + word);
-                    self.descriptorSpanBytes = savedSpanBytes;
-                    if (!ok) {
-                        return false;
-                    }
-                    if (self.rawInvalidations != invalidationsBefore) break;
-                }
-                if (self.rawInvalidations != invalidationsBefore) break;
-            }
-            address += bytes;
-            values += words;
-            count -= words;
-        }
-        if (self.rawInvalidations == invalidationsBefore) {
-            return true;
-        }
+        const auto pass = self.readPass(startAddress, startValues, startCount, true);
+        if (pass == Pass::Failed) return false;
+        if (pass == Pass::Read) return true;
     }
     return false;
+}
+
+bool ShaderMemory::readSpan(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    auto& self = *static_cast<ShaderMemory*>(context);
+    if (!self.supplied.empty() && count != 0) self.spillTouching(address, count > (std::numeric_limits<std::uint64_t>::max() - address) / sizeof(std::uint32_t) ? std::numeric_limits<std::uint64_t>::max() : address + count * sizeof(std::uint32_t));
+    return self.readPass(address, values, count, false) != Pass::Failed;
+}
+
+ShaderMemory::Pass ShaderMemory::readPass(std::uint64_t address, std::uint32_t* values, std::uint64_t count, bool stopOnInvalidation) {
+    auto& self = *this;
+    auto* const startValues = values;
+    const auto startCount = count;
+    const auto savedSpanBytes = self.descriptorSpanBytes;
+    const auto strideWords = savedSpanBytes / sizeof(std::uint32_t);
+    const auto invalidationsBefore = self.rawInvalidations;
+    while (count != 0) {
+        const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(std::uint32_t));
+        const auto words = static_cast<std::size_t>(std::min<std::uint64_t>(count, PageWords - index));
+        const auto bytes = static_cast<std::uint64_t>(words) * sizeof(std::uint32_t);
+        Page* page = nullptr;
+        if (address % sizeof(std::uint32_t) == 0 && address <= std::numeric_limits<std::uint64_t>::max() - bytes && !self.overlapsInitial(address, address + bytes)) page = &self.page(base);
+        if (page != nullptr && page->lazy) {
+            const auto end = (index + words + BlockWords - 1u) / BlockWords * BlockWords;
+            auto first = index / BlockWords * BlockWords;
+            while (first < end) {
+                if (page->valid.TestBlock(first)) {
+                    first += BlockWords;
+                    continue;
+                }
+                auto last = first + BlockWords;
+                while (last < end && !page->valid.TestBlock(last)) last += BlockWords;
+                GuestMemory::CopyGuestBytes(&page->words[first], reinterpret_cast<const void*>(base + first * sizeof(std::uint32_t)), (last - first) * sizeof(std::uint32_t));
+                page->valid.SetRun(first, last - first);
+                first = last;
+            }
+        }
+        if (page != nullptr && (page->lazy || (!page->wordwise && page->valid.All()))) {
+            std::memcpy(values, page->words.data() + index, bytes);
+            page->read.SetRun(index, words);
+            page->recent.SetRun(index, words);
+            CaptureTotals().reads += words;
+        } else {
+            const auto offsetWords = static_cast<std::uint64_t>(values - startValues);
+            for (std::size_t word = 0; word < words; ++word) {
+                if (strideWords > 1u) {
+                    const auto inRecord = (offsetWords + word) % strideWords;
+                    const auto remainingWords = std::min<std::uint64_t>(strideWords - inRecord, startCount - (offsetWords + word));
+                    self.descriptorSpanBytes = static_cast<std::size_t>(remainingWords * sizeof(std::uint32_t));
+                }
+                const bool ok = read(this, address + word * sizeof(std::uint32_t), values + word);
+                self.descriptorSpanBytes = savedSpanBytes;
+                if (!ok) return Pass::Failed;
+                if (stopOnInvalidation && self.rawInvalidations != invalidationsBefore) return Pass::Invalidated;
+            }
+        }
+        address += bytes;
+        values += words;
+        count -= words;
+    }
+    return self.rawInvalidations == invalidationsBefore ? Pass::Read : Pass::Invalidated;
 }
 
 std::uint64_t ShaderMemory::descriptorScope(void* context, std::size_t bytes) {
@@ -884,6 +892,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.accessible = &accessible;
     runtime.pendingWrite = &pending;
     runtime.readWords = &readWords;
+    runtime.readSpan = &readSpan;
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
@@ -893,6 +902,7 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.snapshotCurrent = &snapshotCurrent;
     runtime.fastCapture = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::FastCapture);
     runtime.sizedReadLog = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::SizedReadLog);
+    runtime.batchedDescriptorReads = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::BatchedDescriptorReads);
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);

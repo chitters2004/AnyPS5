@@ -142,6 +142,9 @@ private:
 
     static bool read(void* context, std::uint64_t address, std::uint32_t* value);
     static bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
+    static bool readSpan(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count);
+    enum class Pass : std::uint8_t { Read, Failed, Invalidated };
+    Pass readPass(std::uint64_t address, std::uint32_t* values, std::uint64_t count, bool stopOnInvalidation);
     static bool accessible(void* context, std::uint64_t address, std::uint64_t bytes);
     static bool pending(void* context, std::uint64_t address, std::uint64_t bytes);
     static ShaderRecompiler::SrtWriteStamp stampWrites(void* context, std::uint64_t address, std::uint64_t bytes);
