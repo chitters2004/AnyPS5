@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -287,10 +288,37 @@ int main() {
         Require(degenerate.reprepared >= 1 && degenerate.copied >= 1, "prepared vertex inputs: an index range the CPU wrote after preparation was adopted");
         Require(!degenerate.covered, "prepared vertex inputs: the draw used the indices prepared before the CPU made them degenerate");
 
-        const auto remapped = DrawPrepared(*device, *programs, [] { GuestAllocations::Mutation().Add(SpareBlock, Block, true, true, true); });
-        Print("allocation registry changed after preparation", remapped);
-        Require(remapped.adopted == 0 && remapped.reprepared == 2 && remapped.copied == 2, "prepared vertex inputs: a copy prepared under another registry generation was adopted");
-        Require(remapped.covered, "prepared vertex inputs: the draw copied again after the registry changed did not cover the center");
+        using AgcDriver::Graphics::RuntimeSwitch;
+        namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+        const bool globalChecks = Switches::Set(RuntimeSwitch::GlobalProofChecks);
+        const auto elsewhere = [] {
+            GuestAllocations::Mutation().Add(SpareBlock, Block, true, true, true);
+            GuestAllocations::Mutation().Remove(SpareBlock);
+        };
+        const auto covering = [] { GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(VertexBlock), Block); };
+        const auto coveringReprepared = [](const Outcome& outcome, bool global) {
+            return global ? outcome.adopted == 0 && outcome.reprepared == 2 && outcome.copied == 2 : outcome.adopted == 1 && outcome.reprepared == 1 && outcome.copied == 1;
+        };
+        for (const bool global : {false, true}) {
+            Switches::Assign(RuntimeSwitch::GlobalProofChecks, global);
+            const char* mode = global ? " (APS5_GLOBAL_PROOF_CHECKS)" : "";
+            const auto remapped = DrawPrepared(*device, *programs, elsewhere);
+            Print(global ? "allocation registry changed elsewhere after preparation, global proof checks" : "allocation registry changed elsewhere after preparation", remapped);
+            if (global) Require(remapped.adopted == 0 && remapped.reprepared == 2 && remapped.copied == 2, "prepared vertex inputs: a copy prepared under another registry generation was adopted under APS5_GLOBAL_PROOF_CHECKS");
+            else Require(remapped.adopted == 2 && remapped.reprepared == 0 && remapped.copied == 0, "prepared vertex inputs: a registry change outside the prepared ranges made them prepare again");
+            Require(remapped.covered, std::string("prepared vertex inputs: the draw after a registry change elsewhere did not cover the center") + mode);
+            const auto forgotten = DrawPrepared(*device, *programs, covering);
+            Print(global ? "vertex range forgotten after preparation, global proof checks" : "vertex range forgotten after preparation", forgotten);
+            Require(coveringReprepared(forgotten, global), std::string("prepared vertex inputs: a copy was adopted across a forget over its range") + mode);
+            Require(forgotten.covered, std::string("prepared vertex inputs: the draw after a forget over its vertex range did not cover the center") + mode);
+        }
+        Switches::Assign(RuntimeSwitch::GlobalProofChecks, false);
+        AgcDriver::Graphics::IgnoreRangeForgetsForTest(true);
+        const auto mutated = DrawPrepared(*device, *programs, covering);
+        AgcDriver::Graphics::IgnoreRangeForgetsForTest(false);
+        Switches::Assign(RuntimeSwitch::GlobalProofChecks, globalChecks);
+        Print("vertex range forgotten after preparation, range forget stamps ignored (mutant)", mutated);
+        Require(!coveringReprepared(mutated, false), "prepared vertex inputs: the forget check does not kill a mutant that ignores range forget stamps");
 
         AgcDriver::Graphics::HoldDrawInputPreparers(true);
         WriteIndices(Indices);

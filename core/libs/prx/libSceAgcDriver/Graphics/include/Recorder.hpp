@@ -228,6 +228,7 @@ struct MappingCounts {
 };
 bool MappingHolds(MappingSite site, std::uint64_t keptRegistry, std::uint64_t currentRegistry, std::uint64_t keptForget, std::uint64_t address, std::size_t bytes);
 MappingCounts MappingCountsFor(MappingSite site);
+void IgnoreRangeForgetsForTest(bool ignored);
 
 class Recorder {
 public:

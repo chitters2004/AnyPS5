@@ -4153,6 +4153,7 @@ struct MappingTally {
 };
 
 std::array<MappingTally, static_cast<std::size_t>(MappingSite::Count)> mappingTallies;
+std::atomic<bool> rangeForgetsIgnored{false};
 constexpr std::array<std::array<const char*, 3>, static_cast<std::size_t>(MappingSite::Count)> MappingNames{{
     {"Mapping.owned_held", "Mapping.owned_dropped", "Mapping.owned_avoided"},
     {"Mapping.prepared_held", "Mapping.prepared_dropped", "Mapping.prepared_avoided"},
@@ -4171,9 +4172,13 @@ bool MappingHolds(MappingSite site, std::uint64_t keptRegistry, std::uint64_t cu
         countMapping(site, global ? 0 : 1);
         return global;
     }
-    const bool ranged = MappingUnchanged(keptForget, address, bytes);
+    const bool ranged = rangeForgetsIgnored.load(std::memory_order_relaxed) ? (keptForget & 1u) == 0 : MappingUnchanged(keptForget, address, bytes);
     countMapping(site, !ranged ? 1 : global ? 0 : 2);
     return ranged;
+}
+
+void IgnoreRangeForgetsForTest(bool ignored) {
+    rangeForgetsIgnored.store(ignored, std::memory_order_relaxed);
 }
 
 MappingCounts MappingCountsFor(MappingSite site) {

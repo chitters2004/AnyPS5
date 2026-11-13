@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -210,7 +211,7 @@ std::size_t WrittenPixels(const std::vector<std::byte>& colors) {
     return written;
 }
 
-enum class Change { None, MoveVertices, Registry };
+enum class Change { None, MoveVertices, Registry, ForgetPool };
 
 std::atomic<Change> Armed{Change::None};
 std::atomic<int> HookRuns{0};
@@ -226,6 +227,10 @@ void BeforeCommit(AgcDriver::Graphics::PreparedDrawInputs& prepared) {
         break;
     case Change::Registry:
         GuestAllocations::Mutation().Add(SpareBlock, Block, true, true, true);
+        GuestAllocations::Mutation().Remove(SpareBlock);
+        break;
+    case Change::ForgetPool:
+        GuestAllocations::GuestAllocationsInvalidate_nid_postfix(reinterpret_cast<std::uintptr_t>(Pool), PoolBytes);
         break;
     }
 }
@@ -357,11 +362,31 @@ int main() {
         const auto movedReference = Reference(0x2300, true);
         Require(movedReference.colors == moved.colors, "prepared uploads: the draw whose region was copied again differs from the draw built on the committer");
 
-        const auto remapped = DrawOnce(Change::Registry, 0x2400);
-        Print("allocation registry changed after preparation", remapped);
-        Require(remapped.stageAStale() == 1 && remapped.stageAAdopted() == 0 && remapped.regionsAdopted() == 0, "prepared uploads: a stage A or region prepared under another registry generation was adopted");
-        Require(remapped.stageAStaleBy(AgcDriver::Graphics::PreparedStaleness::Registry) == 1, "prepared uploads: a stage A refused for a registry change was counted under another reason");
-        Require(remapped.written == Width * Height, "prepared uploads: the draw built again after the registry changed left pixels cleared");
+        using AgcDriver::Graphics::RuntimeSwitch;
+        namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+        const bool globalChecks = Switches::Set(RuntimeSwitch::GlobalProofChecks);
+        for (const bool global : {false, true}) {
+            Switches::Assign(RuntimeSwitch::GlobalProofChecks, global);
+            const std::string mode = global ? " (APS5_GLOBAL_PROOF_CHECKS)" : "";
+            const auto remapped = DrawOnce(Change::Registry, 0x2400);
+            Print(global ? "allocation registry changed elsewhere after preparation, global proof checks" : "allocation registry changed elsewhere after preparation", remapped);
+            Require(remapped.stageAStale() == 1 && remapped.stageAAdopted() == 0, "prepared uploads: a stage A prepared under another registry generation was adopted" + mode);
+            if (global) Require(remapped.regionsAdopted() == 0, "prepared uploads: a region prepared under another registry generation was adopted under APS5_GLOBAL_PROOF_CHECKS");
+            else Require(remapped.regionsAdopted() >= 1 && remapped.regionsReprepared() == 0, "prepared uploads: a registry change outside the prepared region made it prepare again");
+            Require(remapped.stageAStaleBy(AgcDriver::Graphics::PreparedStaleness::Registry) == 1, "prepared uploads: a stage A refused for a registry change was counted under another reason" + mode);
+            Require(remapped.written == Width * Height, "prepared uploads: the draw built again after the registry changed left pixels cleared" + mode);
+            const auto forgotten = DrawOnce(Change::ForgetPool, 0x2400);
+            Print(global ? "vertex pool forgotten after preparation, global proof checks" : "vertex pool forgotten after preparation", forgotten);
+            Require(forgotten.stageAAdopted() == 0 && forgotten.regionsAdopted() == 0 && forgotten.regionsReprepared() >= 1, "prepared uploads: a stage A or region was adopted across a forget over its range" + mode);
+            Require(forgotten.written == Width * Height, "prepared uploads: the draw built again after a forget over its vertex pool left pixels cleared" + mode);
+        }
+        Switches::Assign(RuntimeSwitch::GlobalProofChecks, false);
+        AgcDriver::Graphics::IgnoreRangeForgetsForTest(true);
+        const auto mutated = DrawOnce(Change::ForgetPool, 0x2400);
+        AgcDriver::Graphics::IgnoreRangeForgetsForTest(false);
+        Switches::Assign(RuntimeSwitch::GlobalProofChecks, globalChecks);
+        Print("vertex pool forgotten after preparation, range forget stamps ignored (mutant)", mutated);
+        Require(mutated.regionsAdopted() >= 1, "prepared uploads: the forget check does not kill a mutant that ignores range forget stamps");
 
         const auto queued = DrawOnce(Change::None, 0x2500, true);
         Print("a queued write moving the vertices ahead of the draw", queued);
