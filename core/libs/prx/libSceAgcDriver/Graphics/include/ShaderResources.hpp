@@ -184,6 +184,13 @@ struct ImageTableReuseCounts {
     std::uint64_t variantRejected = 0;
 };
 ImageTableReuseCounts ImageTableReuses();
+struct UntrackedProofCounts {
+    std::uint64_t held = 0;
+    std::uint64_t changed = 0;
+    std::uint64_t unstamped = 0;
+    std::uint64_t switchedOff = 0;
+};
+UntrackedProofCounts UntrackedProofsCounted();
 std::uint64_t SampledTexturesCleared();
 std::uint64_t SampledLookupKeyScans();
 std::uint64_t SampledLookupKeyProofs();

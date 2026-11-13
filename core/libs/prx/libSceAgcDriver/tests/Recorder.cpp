@@ -6661,7 +6661,7 @@ bool untrackedForgetTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
-bool untrackedRevalidateTests(const Device& device, Recorder& recorder) {
+bool untrackedRevalidateTests(const Device& device, Recorder& recorder, bool bench = false) {
     auto context = device.GetContext();
     context.nullDescriptors = device.NullDescriptors();
     if (context.hostImportAlignment == 0 || !context.nullDescriptors) {
@@ -6732,6 +6732,28 @@ bool untrackedRevalidateTests(const Device& device, Recorder& recorder) {
             recorder.Sync();
             return resources;
         };
+        if (bench) {
+            const auto time = [&](bool off) {
+                RuntimeSwitches::Assign(RuntimeSwitch::NoUntrackedProofs, off);
+                auto resources = fresh();
+                ShaderResources::ProofReport report;
+                static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
+                constexpr int calls = 20000;
+                double best = 0;
+                for (int round = 0; round < 3; ++round) {
+                    const auto start = std::chrono::steady_clock::now();
+                    for (int call = 0; call < calls; ++call) static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
+                    const double ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / calls;
+                    best = round == 0 ? ns : std::min(best, ns);
+                }
+                RuntimeSwitches::Assign(RuntimeSwitch::NoUntrackedProofs, false);
+                return std::pair{best, report.path == ShaderResources::ProofPath::Fast};
+            };
+            const auto [proved, provedFast] = time(false);
+            const auto [walked, walkedFast] = time(true);
+            std::cout << "bench Revalidate of a " << label << " template over 128 KiB of untracked memory, best of 3 x 20000: " << proved << " ns with untracked proofs (fast " << provedFast << "), " << walked << " ns with APS5_NO_UNTRACKED_PROOFS (fast " << walkedFast << ")\n";
+            return;
+        }
         {
             auto resources = fresh();
             ShaderResources::ProofReport report;
@@ -6744,12 +6766,33 @@ bool untrackedRevalidateTests(const Device& device, Recorder& recorder) {
             Require(report.path != ShaderResources::ProofPath::Fast, "a " + label + " template over untracked memory kept its fast proof across a store and a new collect epoch");
         }
         {
+            const auto before = UntrackedProofsCounted();
+            auto resources = fresh();
+            ShaderResources::ProofReport report;
+            Require(resources->Revalidate(std::span(&imageCompute, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "a " + label + " template did not prove fast before the switch");
+            Require(UntrackedProofsCounted().held > before.held, "a fast " + label + " proof over untracked memory was not counted as held");
+            RuntimeSwitches::Assign(RuntimeSwitch::NoUntrackedProofs, true);
+            static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
+            const bool switchedFast = report.path == ShaderResources::ProofPath::Fast;
+            auto unstamped = fresh();
+            static_cast<void>(unstamped->Revalidate(std::span(&imageCompute, 1), &report));
+            const bool unstampedFast = report.path == ShaderResources::ProofPath::Fast;
+            const auto off = UntrackedProofsCounted();
+            RuntimeSwitches::Assign(RuntimeSwitch::NoUntrackedProofs, false);
+            Require(!switchedFast, "APS5_NO_UNTRACKED_PROOFS set after the capture left a " + label + " fast proof over untracked memory standing");
+            Require(!unstampedFast, "a " + label + " template built under APS5_NO_UNTRACKED_PROOFS proved fast over untracked memory");
+            Require(off.switchedOff >= before.switchedOff + 2, "untracked checks skipped by APS5_NO_UNTRACKED_PROOFS were not counted");
+            static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
+            Require(resources->Revalidate(std::span(&imageCompute, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "clearing APS5_NO_UNTRACKED_PROOFS did not restore the " + label + " fast proof in the same collect epoch");
+        }
+        {
             auto resources = fresh();
             ShaderResources::ProofReport report;
             Require(resources->Revalidate(std::span(&imageCompute, 1), &report) && report.path == ShaderResources::ProofPath::Fast, "a " + label + " template did not prove fast before the forget");
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, 65536);
             static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
             Require(report.path != ShaderResources::ProofPath::Fast, "forgetting the memory a " + label + " template covers left its fast proof standing");
+            Require(UntrackedProofsCounted().changed > 0, "a " + label + " proof broken by a forget was not counted as a changed stamp");
         }
     };
     scenario(ShaderRecompiler::DescriptorKind::SampledImage, "sampled");
@@ -16434,6 +16477,9 @@ int main(int argc, char** argv) {
             spaceWriteSyncTests(device, recorder);
             std::cout << "Address space pending write tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--untracked-revalidate-bench") {
+            return untrackedRevalidateTests(device, recorder, true) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--untracked-revalidate-only") {
             return untrackedRevalidateTests(device, recorder) ? 0 : 77;

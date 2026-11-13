@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -3395,6 +3396,21 @@ UntrackedVerification& UntrackedVerified() {
     return verification;
 }
 
+struct UntrackedProofTally {
+    std::atomic<std::uint64_t> held{0}, changed{0}, unstamped{0}, switchedOff{0};
+};
+
+UntrackedProofTally& UntrackedProofTallies() {
+    static UntrackedProofTally tally;
+    return tally;
+}
+
+bool UntrackedProofsOn() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoUntrackedProofs);
+}
+
+bool untrackedProofHolds(const std::array<std::uint64_t, 4>& kept, std::uint64_t address, std::size_t bytes);
+
 constexpr std::size_t RefusedSurfaceLimit = 65536;
 
 void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes) {
@@ -3477,6 +3493,8 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         profile.refusedSurfaces.clear();
     }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
+    auto& untracked = UntrackedProofTallies();
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] untracked proofs (10 s): held %llu, stamp changed %llu, unstamped %llu, switched off %llu (APS5_NO_UNTRACKED_PROOFS)\n", static_cast<unsigned long long>(untracked.held.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.unstamped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.switchedOff.exchange(0, std::memory_order_relaxed)));
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
@@ -3569,6 +3587,37 @@ std::array<std::uint64_t, 4> untrackedRangeStamp(std::uint64_t address, std::siz
     return {epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetStamp(address, bytes), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
 }
 
+std::array<std::uint64_t, 4> untrackedCapture(std::uint64_t address, std::size_t bytes) {
+    return UntrackedProofsOn() ? untrackedRangeStamp(address, bytes) : std::array<std::uint64_t, 4>{};
+}
+
+}
+
+namespace {
+
+bool untrackedProofHolds(const std::array<std::uint64_t, 4>& kept, std::uint64_t address, std::size_t bytes) {
+    auto& tally = UntrackedProofTallies();
+    if (!UntrackedProofsOn()) {
+        tally.switchedOff.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (kept[0] == 0) {
+        tally.unstamped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (untrackedRangeStamp(address, bytes) != kept) {
+        tally.changed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    tally.held.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+}
+
+UntrackedProofCounts UntrackedProofsCounted() {
+    const auto& tally = UntrackedProofTallies();
+    return {tally.held.load(std::memory_order_relaxed), tally.changed.load(std::memory_order_relaxed), tally.unstamped.load(std::memory_order_relaxed), tally.switchedOff.load(std::memory_order_relaxed)};
 }
 
 bool ShaderResources::keepsTemplateRecords() const {
@@ -3602,7 +3651,7 @@ void ShaderResources::captureValidation() {
         const auto& found = log[indices[i]];
         validatedTextures[i] = {found.resource, found.bytes, found.keys, found.generation, 0, found.source, found.depth, true};
         auto& surface = validatedTextures[i];
-        if (!surface.depth && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedRangeStamp(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
+        if (!surface.depth && GuestMemory::CollectWrites(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)) == 0) surface.untracked = untrackedCapture(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes));
     }
     storageUntracked.assign(storageTextures.size(), {});
     for (std::size_t i = 0; i < storageTextures.size(); ++i) {
@@ -3610,7 +3659,7 @@ void ShaderResources::captureValidation() {
         if (image == nullptr) continue;
         const auto address = image->Descriptor().baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) storageUntracked[i] = untrackedRangeStamp(address, bytes);
+        if (GuestMemory::CollectWrites(address, bytes) == 0) storageUntracked[i] = untrackedCapture(address, bytes);
     }
     lookupLog().clear();
     const auto trim = [](auto& scratch) {
@@ -3722,7 +3771,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         bool untracked = false;
         if (surface.collected == 0) {
-            if (surface.untracked[0] == 0 || untrackedRangeStamp(address, bytes) != surface.untracked) {
+            if (!untrackedProofHolds(surface.untracked, address, bytes)) {
                 countCollectRefusal(false, address, bytes);
                 return fail(FastFail::Collect);
             }
@@ -3785,7 +3834,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         bool untracked = false;
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
-            if (i >= storageUntracked.size() || storageUntracked[i][0] == 0 || untrackedRangeStamp(address, bytes) != storageUntracked[i]) {
+            if (!untrackedProofHolds(i < storageUntracked.size() ? storageUntracked[i] : std::array<std::uint64_t, 4>{}, address, bytes)) {
                 countCollectRefusal(true, address, bytes);
                 return fail(FastFail::Collect);
             }
