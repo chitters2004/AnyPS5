@@ -394,6 +394,7 @@ private:
     }
 
     void run(std::stop_token token) {
+        PerformanceTrace::BindThread("draw input preparer", TraceThread::DefaultCapacity / 8);
         for (;;) {
             std::shared_ptr<PreparedDrawInputs> job;
             {
