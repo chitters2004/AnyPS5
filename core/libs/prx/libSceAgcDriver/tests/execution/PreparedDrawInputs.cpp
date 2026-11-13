@@ -342,7 +342,7 @@ void IdleCommitterCopiesTheInputsItself() {
     const auto shallow = outcome.after.shallow - outcome.before.shallow;
     Print("committer idle at the enqueue", outcome);
     std::printf("committer idle at the enqueue: %llu draws left to the committer\n", static_cast<unsigned long long>(shallow));
-    Require(outcome.hooks == 0 && outcome.requests() == 0 && shallow == 1, "prepared draw inputs: a draw enqueued while the committer was idle was prepared ahead of its commit");
+    Require(outcome.hooks == 0 && outcome.requests() == 0 && outcome.after.opened == outcome.before.opened && shallow == (std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr ? 1u : 0u), "prepared draw inputs: a draw enqueued while the committer was idle was prepared ahead of its commit");
     Require(outcome.copied() != 0 && outcome.written == Width * Height, "prepared draw inputs: the draw left to an idle committer did not copy its inputs there and draw");
 }
 

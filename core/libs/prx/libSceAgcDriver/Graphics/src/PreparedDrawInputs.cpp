@@ -468,7 +468,8 @@ private:
     std::vector<std::jthread> threads;
 };
 
-thread_local std::shared_ptr<PreparedDrawInputs> currentPrepared;
+thread_local PreparedDrawInputs* currentPrepared = nullptr;
+std::atomic<std::size_t> openScopes{0};
 
 bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorder, std::uint64_t registryGeneration) {
     if (range.registry != registryGeneration || range.forget != GuestMemory::ForgetSerial()) return false;
@@ -478,14 +479,19 @@ bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorde
 
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool committerBehind) {
-    const Context& context = *shared;
-    if (RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return nullptr;
+bool DrawInputsAheadAdmitted(bool committerBehind) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return false;
     if (!committerBehind && !RuntimeSwitches::Set(RuntimeSwitch::EarlyDrawInputsAlways)) {
-        counted(counters().shallow, "DrawInputPrep.shallow");
-        return nullptr;
+        static const bool reported = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+        if (reported) counted(counters().shallow, "DrawInputPrep.shallow");
+        return false;
     }
     counted(counters().opened, "DrawInputPrep.opened");
+    return true;
+}
+
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    const Context& context = *shared;
     if (context.drawInputsInPlace || (draw.indirect && !draw.indexed) || (!draw.indirect && draw.instanceCount == 0) || draw.indexCount == 0 || state.quadList) return nullptr;
     if (shaders.empty() || shaders.front().program == nullptr || !GuestMemory::WriteWatched()) return nullptr;
     const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -532,13 +538,16 @@ const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared) {
     return prepared.context;
 }
 
-PreparedDrawInputsScope::PreparedDrawInputsScope(std::shared_ptr<PreparedDrawInputs> prepared) : prepared(std::move(prepared)), previous(std::exchange(currentPrepared, this->prepared)) {
-    if (const auto hook = preparedHook.load(std::memory_order_acquire); hook != nullptr && this->prepared != nullptr) hook(*this->prepared);
+void PreparedDrawInputsScope::enter() {
+    previous = std::exchange(currentPrepared, prepared.get());
+    openScopes.fetch_add(1, std::memory_order_relaxed);
+    if (const auto hook = preparedHook.load(std::memory_order_acquire); hook != nullptr) hook(*prepared);
 }
 
-PreparedDrawInputsScope::~PreparedDrawInputsScope() {
-    currentPrepared = std::move(previous);
-    if (prepared != nullptr) prepared->Finish();
+void PreparedDrawInputsScope::leave() {
+    currentPrepared = previous;
+    openScopes.fetch_sub(1, std::memory_order_relaxed);
+    prepared->Finish();
 }
 
 std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validBytes, std::size_t stride) {
@@ -549,7 +558,8 @@ std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validByte
 }
 
 std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable) {
-    auto* job = currentPrepared.get();
+    if (openScopes.load(std::memory_order_relaxed) == 0) return std::nullopt;
+    auto* job = currentPrepared;
     if (job == nullptr || job->context.device != context.device) return std::nullopt;
     job->Settle();
     if (job->cancelled) return std::nullopt;
