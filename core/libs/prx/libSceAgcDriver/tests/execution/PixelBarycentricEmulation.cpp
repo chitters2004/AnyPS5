@@ -45,6 +45,7 @@ alignas(256) constexpr std::array<std::uint32_t, 5> InterpolatedPixelCode{
 
 alignas(256) constexpr std::array<std::uint16_t, 7> RestartIndices{2, 0xffff, 0, 1, 2, 0, 1};
 alignas(256) constexpr std::array<std::uint16_t, 4> StripIndices{0, 1, 2, 3};
+alignas(256) constexpr std::array<std::uint32_t, 4> WideStripIndices{0, 1, 2, 3};
 
 struct Vertex {
     float x;
@@ -85,7 +86,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t st
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu) | (stride << 16u), count, 0x01016facu};
 }
 
-ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, Emulation emulation, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, VkCullModeFlags cullMode = VK_CULL_MODE_NONE, bool flat = false, VkProvokingVertexModeEXT provoking = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, bool strip = false, bool builtins = false, bool restart = false, std::span<const std::uint16_t> indices = {}) {
+ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, Emulation emulation, std::span<const std::uint32_t> pixelCode, std::uint32_t inputs, VkCullModeFlags cullMode = VK_CULL_MODE_NONE, bool flat = false, VkProvokingVertexModeEXT provoking = VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, bool strip = false, bool builtins = false, bool restart = false, std::span<const std::byte> indices = {}, std::uint32_t indexSize = 0) {
     Pixels.fill(Unwritten);
     auto target = device.Target();
     target.fragmentShaderBarycentricEnabled = false;
@@ -164,7 +165,7 @@ ShaderRecompiler::RecompileResult Draw(AgcDriver::VulkanDevice& device, Emulatio
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
     state.blendConstants = {};
-    const auto draw = indices.empty() ? AgcDriver::Pm4::DrawParameters{0, static_cast<std::uint32_t>(positions.size()), 0, 1, 0, false} : AgcDriver::Pm4::DrawParameters{reinterpret_cast<std::uintptr_t>(indices.data()), static_cast<std::uint32_t>(indices.size()), 2, 1, 0, true};
+    const auto draw = indexSize == 0 ? AgcDriver::Pm4::DrawParameters{0, static_cast<std::uint32_t>(positions.size()), 0, 1, 0, false} : AgcDriver::Pm4::DrawParameters{reinterpret_cast<std::uintptr_t>(indices.data()), static_cast<std::uint32_t>(indices.size() / indexSize), indexSize, 1, 0, true};
     device.Draw(state, draw, shaders);
     device.WaitIdle();
     return pixelResult;
@@ -344,9 +345,9 @@ StripPixel StripBarycentrics(std::uint32_t x, std::uint32_t y, bool snapped) {
     return {false, {}, {}};
 }
 
-void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std::string& name, bool restart = false, std::span<const std::uint16_t> indices = {}) {
-    const std::string strip = restart ? " triangle strip with primitive restart" : indices.empty() ? " triangle strip" : " triangle strip drawn from an index buffer";
-    Draw(device, emulation, BarycentricPixelCode, PixelInputBit(PixelInput::LinearCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices);
+void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std::string& name, bool restart = false, std::span<const std::byte> indices = {}, std::uint32_t indexSize = 0) {
+    const std::string strip = restart ? " triangle strip with primitive restart" : indexSize == 0 ? " triangle strip" : " triangle strip drawn from a " + std::to_string(indexSize * 8u) + "-bit index buffer";
+    Draw(device, emulation, BarycentricPixelCode, PixelInputBit(PixelInput::LinearCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices, indexSize);
     std::array<std::uint32_t, 2> checked{};
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
@@ -363,7 +364,7 @@ void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std:
     }
     Require(checked[0] > 200u && checked[1] > 200u, name + strip + ": too few pixels of each triangle were checked");
     static const auto positions = StripPositions();
-    Draw(device, emulation, VertexValuePixelCode, PixelInputBit(PixelInput::PerspectiveCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices);
+    Draw(device, emulation, VertexValuePixelCode, PixelInputBit(PixelInput::PerspectiveCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices, indexSize);
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
             const auto expected = StripBarycentrics(x, y, false);
@@ -424,17 +425,22 @@ void RunEmulation(AgcDriver::VulkanDevice& device, Emulation emulation) {
             CheckFlat(name + " flat input, last provoking vertex", 2u);
             CheckStripFlatLast(device, emulation, name);
             CheckStrip(device, emulation, name, true);
-            CheckStrip(device, emulation, name, false, StripIndices);
+            CheckStrip(device, emulation, name, false, std::as_bytes(std::span(StripIndices)), 2);
+            CheckStrip(device, emulation, name, false, std::as_bytes(std::span(WideStripIndices)), 4);
+            for (std::size_t count = 0; count <= 3; ++count) {
+                Draw(device, emulation, BarycentricPixelCode, PixelInputBit(PixelInput::LinearCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, false, std::as_bytes(std::span(WideStripIndices)).first(count * 4u), 4);
+                Require(Drawn() == (count == 3), name + ": an indexed triangle strip of " + std::to_string(count) + " indices " + (count == 3 ? "drew nothing" : "drew pixels"));
+            }
             if (!device.PrimitiveListRestart()) {
                 Draw(device, emulation, BarycentricPixelCode, perspective, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, false, false, true);
                 const auto restartList = CheckBarycentrics(emulation, name + " triangle list with primitive restart", true);
-                Draw(device, emulation, BarycentricPixelCode, perspective, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, false, false, true, RestartIndices);
+                Draw(device, emulation, BarycentricPixelCode, perspective, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, false, false, true, std::as_bytes(std::span(RestartIndices)), 2);
                 const auto compactedList = CheckBarycentrics(emulation, name + " indexed triangle list with a restart index", true);
                 std::printf("barycentric emulation through the %s passed for a triangle list with primitive restart: %u pixels without indices and %u with a compacted restart index\n", name.c_str(), restartList, compactedList);
             }
             bool refused = false;
             try {
-                Draw(device, emulation, BarycentricPixelCode, linear, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, true, RestartIndices);
+                Draw(device, emulation, BarycentricPixelCode, linear, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, true, std::as_bytes(std::span(RestartIndices)), 2);
             } catch (const std::exception& error) {
                 refused = std::string(error.what()).find("an indexed triangle strip with primitive restart through emulated barycentric patches is unsupported") != std::string::npos;
             }
