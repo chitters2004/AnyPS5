@@ -459,12 +459,13 @@ std::optional<DrawInputSlice> ringSlice(const Context& context, std::size_t byte
 
 class PreparedWork {
 public:
-    explicit PreparedWork(const Context& context) : context(context) {}
+    explicit PreparedWork(std::shared_ptr<const Context> shared) : shared(std::move(shared)), context(*this->shared) {}
     virtual ~PreparedWork() = default;
     PreparedWork(const PreparedWork&) = delete;
     PreparedWork& operator=(const PreparedWork&) = delete;
 
-    Context context;
+    std::shared_ptr<const Context> shared;
+    const Context& context;
     std::uint64_t epoch = 0;
     bool followedEpoch = false;
     std::uint64_t collectNanoseconds = 0;
@@ -835,7 +836,8 @@ bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorde
 
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t epoch) {
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::uint64_t epoch) {
+    const Context& context = *shared;
     if (context.drawInputsInPlace || (draw.indirect && !draw.indexed) || (!draw.indirect && draw.instanceCount == 0) || draw.indexCount == 0 || state.quadList || RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return nullptr;
     if (shaders.empty() || shaders.front().program == nullptr || !GuestMemory::WriteWatched()) return nullptr;
     const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -847,7 +849,7 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
     if (preparers == nullptr) return nullptr;
     const bool timed = DrawInputSourcesTimed();
     const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto job = std::make_shared<PreparedDrawInputs>(context);
+    auto job = std::make_shared<PreparedDrawInputs>(shared);
     job->draw = draw;
     job->epoch = epoch;
     job->attributes.assign(attributes.begin(), attributes.end());
@@ -881,18 +883,27 @@ void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared) {
     if (prepared.resources != nullptr) prepared.resources->Await();
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<PreparedDrawInputs> job, const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t epoch) {
+const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared) {
+    return prepared.context;
+}
+
+const Context* PreparedDrawResourcesContext(const PreparedDrawInputs& prepared) {
+    return prepared.resources != nullptr ? &prepared.resources->context : nullptr;
+}
+
+std::shared_ptr<PreparedDrawInputs> PrepareDrawResourcesAhead(std::shared_ptr<PreparedDrawInputs> job, const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t epoch) {
+    const Context& context = *shared;
     const bool stageAWanted = !RuntimeSwitches::Set(RuntimeSwitch::NoEarlyUploadPrepare);
     const bool regionsWanted = !RuntimeSwitches::Set(RuntimeSwitch::NoEarlyRegionCopies) && GuestMemory::WriteWatched();
     if ((!stageAWanted && !regionsWanted) || shaders.empty() || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program == nullptr; })) return job;
     if (job != nullptr && job->context.device != context.device) return job;
     if (Preparers::Get() == nullptr) return job;
     if (job == nullptr) {
-        job = std::make_shared<PreparedDrawInputs>(context);
+        job = std::make_shared<PreparedDrawInputs>(shared);
         job->epoch = epoch;
         job->state.store(JobState::Done, std::memory_order_release);
     }
-    auto resources = std::make_shared<PreparedDrawResources>(context);
+    auto resources = std::make_shared<PreparedDrawResources>(shared);
     resources->epoch = epoch;
     resources->drawState = &state;
     resources->draw = draw;
