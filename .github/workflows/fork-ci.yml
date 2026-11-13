@@ -105,6 +105,12 @@ env:
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
 
 jobs:
+  # Compiler cache budget (GitHub keeps 10 GB per repo and evicts the least recently accessed entry first). Entries, GB:
+  #   fixed: submodule gitdirs 2 x 0.34, winlibs 0.25, vvl 0.14, ffmpeg 4 x 0.04, vk 0.03, seeds ~0 = 1.3
+  #   ccache max-size / measured use: windows-base 1.6 / 1.4, windows-ref 1.8 / 1.7 (the bundle job shares it), windows-stack-ref 1.6 / 1.5,
+  #   tsan 1.2 / 0.8, asan 1.0 / 0.75, plain-base 0.5 / 0.15, plain-ref 0.5 / 0.25, plain-stack-ref 0.8 / 0.45, plain-mutant 0.5 / absent unless used.
+  #   Expected total 8.7 GB, leaving about 1.3 GB for one in-flight copy. Each job deletes the older entries of its own key
+  #   right before the cache action saves (step "Delete older entries of this ccache key"), so overlapping runs cannot hold two copies.
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -322,35 +328,39 @@ jobs:
               suffix = lambda shard: f"-s{shard}" if k > 1 else ""
               for shard in range(1, k + 1):
                   include.append(dict(id=f"gate-ref{suffix(shard)}", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
-                                      cache_key=ref_key, cache_restore=plain_restore, cache_max="4G",
+                                      cache_key=ref_key, cache_restore=plain_restore, cache_max="800M" if family else "500M",
                                       cache_save="true" if shard == 1 else "false", **shard_fields(shard)))
               if os.environ["reuse_linux"] != "true":
                   for shard in range(1, k + 1):
                       include.append(dict(id=f"gate-base{suffix(shard)}", kind="gate", side="base", sha=base_sha, group="plain", cache_family="",
                                           reuse_name=f"base-reuse-linux-{os.environ['key_linux']}-s{shard}",
-                                          cache_key="plain-base", cache_restore=plain_restore, cache_max="4G",
+                                          cache_key="plain-base", cache_restore=plain_restore, cache_max="500M",
                                           cache_save="true" if shard == 1 else "false", **shard_fields(shard)))
+          san_max = {"asan": "1G", "tsan": "1200M"}
           for san in ("asan", "tsan"):
               if san in jobs:
                   include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
-                                      cache_key=san, cache_restore=san, cache_max="2G", cache_save="true"))
+                                      cache_key=san, cache_restore=san, cache_max=san_max[san], cache_save="true"))
           if "warm" in jobs:
               include.append(dict(id="warm-linux", kind="warm", side="base", sha=ref_sha, group="plain",
-                                  cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+                                  cache_key="plain-base", cache_restore=plain_restore, cache_max="500M", cache_save="true"))
               include.append(dict(id="warm-tsan", kind="warm", side="base", sha=ref_sha, group="tsan",
-                                  cache_key="tsan", cache_restore="tsan", cache_max="2G", cache_save="true"))
+                                  cache_key="tsan", cache_restore="tsan", cache_max=san_max["tsan"], cache_save="true"))
+              # Rebuilt on the same cadence as plain and tsan, so the ASan cache stays recently accessed and is not the first one evicted.
+              include.append(dict(id="warm-asan", kind="warm", side="base", sha=ref_sha, group="asan",
+                                  cache_key="asan", cache_restore="asan", cache_max=san_max["asan"], cache_save="true"))
           if "warm-stack" in jobs:
               # A full build of the stack head into the stack ccache, so a gate run on the stack starts warm.
               include.append(dict(id="warm-linux-stack", kind="warm", side="ref", sha=ref_sha, group="plain", cache_family="stack",
-                                  cache_key="plain-stack-ref", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+                                  cache_key="plain-stack-ref", cache_restore=plain_restore, cache_max="800M", cache_save="true"))
           if "census" in jobs:
               include.append(dict(id="census", kind="census", side="ref", sha=ref_sha, group="plain",
-                                  cache_key="plain-census", cache_restore=plain_restore, cache_max="4G", cache_save="false"))
+                                  cache_key="plain-census", cache_restore=plain_restore, cache_max="500M", cache_save="false"))
           if "mutants" in jobs:
               for index, path in enumerate(os.environ["patches"].split()):
                   name = re.sub(r"[^A-Za-z0-9]+", "-", os.path.basename(path)[:-6]).strip("-")
                   include.append(dict(id=f"mutant-{name}", kind="mutant", side="ref", sha=ref_sha, group="plain", patch=path,
-                                      cache_key="plain-mutant", cache_restore=plain_restore, cache_max="4G", cache_save="true" if index == 0 else "false"))
+                                      cache_key="plain-mutant", cache_restore=plain_restore, cache_max="500M", cache_save="true" if index == 0 else "false"))
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write("matrix=" + json.dumps({"include": include}) + "\n")
               out.write("has_linux=" + ("true" if include else "false") + "\n")
@@ -402,6 +412,9 @@ jobs:
     name: linux ${{ matrix.id }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: write
     defaults:
       run:
         shell: bash
@@ -804,6 +817,16 @@ jobs:
           path: result/
           retention-days: 14
           if-no-files-found: error
+      # Runs last, so right before the post step of the ccache action saves the new entry: the older copies of this key go first.
+      - name: Delete older entries of this ccache key
+        if: ${{ !cancelled() && matrix.cache_save == 'true' && inputs.save_cache }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCACHE_KEY: ${{ matrix.cache_key }}
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100&ref=$GITHUB_REF&key=ccache-$CCACHE_KEY-" --jq ".actions_caches[] | select(.key | test(\"^ccache-$CCACHE_KEY-[0-9]{4}-\")) | .id") || exit 0
+          for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent && echo "deleted ccache entry $id of $CCACHE_KEY"; done
 
   windows:
     needs: plan
@@ -811,6 +834,9 @@ jobs:
     name: windows ${{ matrix.id }}
     runs-on: windows-latest
     timeout-minutes: 350
+    permissions:
+      contents: read
+      actions: write
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.win_matrix) }}
@@ -907,9 +933,9 @@ jobs:
           key: ${{ steps.vk-cache.outputs.cache-primary-key }}
       - uses: hendrikmuhs/ccache-action@v1.2.24
         with:
-          key: windows-${{ matrix.kind == 'bundle' && 'bundle' || matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
+          key: windows-${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
           restore-keys: windows-base
-          max-size: 4G
+          max-size: ${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && '1600M' || matrix.side == 'ref' && '1800M' || '1600M' }}
           save: ${{ inputs.save_cache && matrix.shard_save != 'false' && 'true' || 'false' }}
           evict-old-files: 7d
       - id: ffmpeg-cache
@@ -1234,6 +1260,17 @@ jobs:
           path: result/
           retention-days: 14
           if-no-files-found: error
+      # Runs last, so right before the post step of the ccache action saves the new entry: the older copies of this key go first.
+      # The bundle job builds the ref tree and shares the windows-ref key.
+      - name: Delete older entries of this ccache key
+        if: ${{ !cancelled() && inputs.save_cache && matrix.shard_save != 'false' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CCACHE_KEY: windows-${{ matrix.side == 'ref' && matrix.cache_family == 'stack' && 'stack-ref' || matrix.side }}
+        run: |
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100&ref=$GITHUB_REF&key=ccache-$CCACHE_KEY-" --jq ".actions_caches[] | select(.key | test(\"^ccache-$CCACHE_KEY-[0-9]{4}-\")) | .id") || exit 0
+          for id in $ids; do gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent && echo "deleted ccache entry $id of $CCACHE_KEY"; done
 
   report:
     needs: [plan, linux, windows]
