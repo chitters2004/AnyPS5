@@ -3398,6 +3398,7 @@ UntrackedVerification& UntrackedVerified() {
 
 struct UntrackedProofTally {
     std::atomic<std::uint64_t> held{0}, changed{0}, unstamped{0}, switchedOff{0};
+    std::array<std::atomic<std::uint64_t>, 4> changedWord{};
 };
 
 UntrackedProofTally& UntrackedProofTallies() {
@@ -3494,7 +3495,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
     auto& untracked = UntrackedProofTallies();
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] untracked proofs (10 s): held %llu, stamp changed %llu, unstamped %llu, switched off %llu (APS5_NO_UNTRACKED_PROOFS)\n", static_cast<unsigned long long>(untracked.held.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.unstamped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.switchedOff.exchange(0, std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] untracked proofs (10 s): held %llu, stamp changed %llu (by word: collect epoch %llu, newest stamp %llu, forget stamp %llu, write note %llu), unstamped %llu, switched off %llu (APS5_NO_UNTRACKED_PROOFS)\n", static_cast<unsigned long long>(untracked.held.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changedWord[0].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changedWord[1].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changedWord[2].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.changedWord[3].exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.unstamped.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(untracked.switchedOff.exchange(0, std::memory_order_relaxed)));
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
@@ -3605,8 +3606,12 @@ bool untrackedProofHolds(const std::array<std::uint64_t, 4>& kept, std::uint64_t
         tally.unstamped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
-    if (untrackedRangeStamp(address, bytes) != kept) {
+    const auto now = untrackedRangeStamp(address, bytes);
+    if (now != kept) {
         tally.changed.fetch_add(1, std::memory_order_relaxed);
+        for (std::size_t word = 0; word < now.size(); ++word) {
+            if (now[word] != kept[word]) tally.changedWord[word].fetch_add(1, std::memory_order_relaxed);
+        }
         return false;
     }
     tally.held.fetch_add(1, std::memory_order_relaxed);
@@ -3617,7 +3622,7 @@ bool untrackedProofHolds(const std::array<std::uint64_t, 4>& kept, std::uint64_t
 
 UntrackedProofCounts UntrackedProofsCounted() {
     const auto& tally = UntrackedProofTallies();
-    return {tally.held.load(std::memory_order_relaxed), tally.changed.load(std::memory_order_relaxed), tally.unstamped.load(std::memory_order_relaxed), tally.switchedOff.load(std::memory_order_relaxed)};
+    return {tally.held.load(std::memory_order_relaxed), tally.changed.load(std::memory_order_relaxed), tally.unstamped.load(std::memory_order_relaxed), tally.switchedOff.load(std::memory_order_relaxed), {tally.changedWord[0].load(std::memory_order_relaxed), tally.changedWord[1].load(std::memory_order_relaxed), tally.changedWord[2].load(std::memory_order_relaxed), tally.changedWord[3].load(std::memory_order_relaxed)}};
 }
 
 bool ShaderResources::keepsTemplateRecords() const {

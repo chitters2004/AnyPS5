@@ -6792,7 +6792,9 @@ bool untrackedRevalidateTests(const Device& device, Recorder& recorder, bool ben
             GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address, 65536);
             static_cast<void>(resources->Revalidate(std::span(&imageCompute, 1), &report));
             Require(report.path != ShaderResources::ProofPath::Fast, "forgetting the memory a " + label + " template covers left its fast proof standing");
-            Require(UntrackedProofsCounted().changed > 0, "a " + label + " proof broken by a forget was not counted as a changed stamp");
+            const auto forgotten = UntrackedProofsCounted();
+            Require(forgotten.changed > 0, "a " + label + " proof broken by a forget was not counted as a changed stamp");
+            Require(forgotten.changedWord[2] > 0, "a " + label + " proof broken by a forget was not counted under the forget stamp word");
         }
     };
     scenario(ShaderRecompiler::DescriptorKind::SampledImage, "sampled");

@@ -189,6 +189,7 @@ struct UntrackedProofCounts {
     std::uint64_t changed = 0;
     std::uint64_t unstamped = 0;
     std::uint64_t switchedOff = 0;
+    std::array<std::uint64_t, 4> changedWord{};
 };
 UntrackedProofCounts UntrackedProofsCounted();
 std::uint64_t SampledTexturesCleared();
