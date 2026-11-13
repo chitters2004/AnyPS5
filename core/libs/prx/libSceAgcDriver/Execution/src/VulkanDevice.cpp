@@ -4688,7 +4688,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     target.float16DenormPreserve = state->float16DenormPreserve;
     target.spannedWaves = state->spannedWaves;
     target.depthRangeRemap = !state->depthRangeUnrestricted;
-    target.fixedPushSlots = state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartPush) == 0u;
+    target.fixedPushSlots = FixedPushSlots();
     target.registrationModules = state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartSets) == 0u;
     target.robustBufferAccess2 = state->robustBufferAccess2;
     target.exactRobustLoads = state->exactRobustLoads;
@@ -4750,6 +4750,10 @@ bool VulkanDevice::ProvokingVertexLast() const {
 
 bool VulkanDevice::GraphicsPipelineLibraries() const {
     return state->graphicsPipelineLibrary;
+}
+
+bool VulkanDevice::FixedPushSlots() const {
+    return state->graphicsPipelineLibrary && (state->libraryPartsOff & Graphics::LibraryPartPush) == 0u;
 }
 
 std::pair<VkBuffer, std::uint64_t> VulkanDevice::scratchPoolHeader(const ShaderRecompiler::RecompileResult& shader) const {

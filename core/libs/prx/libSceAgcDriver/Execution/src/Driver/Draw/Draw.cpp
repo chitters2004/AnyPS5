@@ -943,7 +943,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
-        pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
+        pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->FixedPushSlots());
         pushOffsets[i] = pushCursorBytes;
         if (drawHit) {
 
