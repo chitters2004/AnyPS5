@@ -44,6 +44,7 @@ alignas(256) constexpr std::array<std::uint32_t, 5> InterpolatedPixelCode{
 };
 
 alignas(256) constexpr std::array<std::uint16_t, 7> RestartIndices{2, 0xffff, 0, 1, 2, 0, 1};
+alignas(256) constexpr std::array<std::uint16_t, 4> StripIndices{0, 1, 2, 3};
 
 struct Vertex {
     float x;
@@ -343,9 +344,9 @@ StripPixel StripBarycentrics(std::uint32_t x, std::uint32_t y, bool snapped) {
     return {false, {}, {}};
 }
 
-void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std::string& name, bool restart = false) {
-    const std::string strip = restart ? " triangle strip with primitive restart" : " triangle strip";
-    Draw(device, emulation, BarycentricPixelCode, PixelInputBit(PixelInput::LinearCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart);
+void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std::string& name, bool restart = false, std::span<const std::uint16_t> indices = {}) {
+    const std::string strip = restart ? " triangle strip with primitive restart" : indices.empty() ? " triangle strip" : " triangle strip drawn from an index buffer";
+    Draw(device, emulation, BarycentricPixelCode, PixelInputBit(PixelInput::LinearCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices);
     std::array<std::uint32_t, 2> checked{};
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
@@ -362,7 +363,7 @@ void CheckStrip(AgcDriver::VulkanDevice& device, Emulation emulation, const std:
     }
     Require(checked[0] > 200u && checked[1] > 200u, name + strip + ": too few pixels of each triangle were checked");
     static const auto positions = StripPositions();
-    Draw(device, emulation, VertexValuePixelCode, PixelInputBit(PixelInput::PerspectiveCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart);
+    Draw(device, emulation, VertexValuePixelCode, PixelInputBit(PixelInput::PerspectiveCenter), VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, true, false, restart, indices);
     for (std::uint32_t y = 0; y < Height; ++y) {
         for (std::uint32_t x = 0; x < Width; ++x) {
             const auto expected = StripBarycentrics(x, y, false);
@@ -423,6 +424,7 @@ void RunEmulation(AgcDriver::VulkanDevice& device, Emulation emulation) {
             CheckFlat(name + " flat input, last provoking vertex", 2u);
             CheckStripFlatLast(device, emulation, name);
             CheckStrip(device, emulation, name, true);
+            CheckStrip(device, emulation, name, false, StripIndices);
             if (!device.PrimitiveListRestart()) {
                 Draw(device, emulation, BarycentricPixelCode, perspective, VK_CULL_MODE_NONE, false, VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT, false, false, true);
                 const auto restartList = CheckBarycentrics(emulation, name + " triangle list with primitive restart", true);

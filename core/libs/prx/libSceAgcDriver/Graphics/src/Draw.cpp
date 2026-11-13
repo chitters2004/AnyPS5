@@ -1821,6 +1821,11 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     return plan;
 }
 
+bool verifyExpandReads() {
+    static const bool verify = std::getenv("APS5_VERIFY_EXPAND_READS") != nullptr;
+    return verify;
+}
+
 bool VerifyDrawPlan() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLAN") != nullptr;
     return verify;
@@ -1927,8 +1932,37 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                     return v;
                 }
             };
-            DrawInputSpan expanding(DrawInputStage::Expand, state.quadList ? static_cast<std::uint64_t>(primitives) * 4u : static_cast<std::uint64_t>(primitives) + 2u);
-            expand(readIndex);
+            const std::uint32_t sourceIndices = state.quadList ? primitives * 4u : primitives + 2u;
+            DrawInputSpan expanding(DrawInputStage::Expand, sourceIndices);
+            if (RuntimeSwitches::Set(RuntimeSwitch::NoBulkExpandReads)) {
+                expand(readIndex);
+            } else {
+                std::vector<std::byte> source(static_cast<std::size_t>(sourceIndices) * draw.indexSize);
+                GuestMemory::Read(draw.indexAddress, source, draw.indexSize);
+                const auto sourceIndex = [&](std::uint32_t idx) -> std::uint32_t {
+                    if (draw.indexSize == 2) {
+                        std::uint16_t v = 0;
+                        std::memcpy(&v, source.data() + static_cast<std::size_t>(idx) * 2u, sizeof(v));
+                        return v;
+                    }
+                    std::uint32_t v = 0;
+                    std::memcpy(&v, source.data() + static_cast<std::size_t>(idx) * 4u, sizeof(v));
+                    return v;
+                };
+                expand(sourceIndex);
+                if (verifyExpandReads()) {
+                    const std::vector<std::uint32_t> bulk(outIndices, outIndices + outputIndexCount);
+                    const auto bulkMax = maxIdx;
+                    maxIdx = 0;
+                    expand(readIndex);
+                    if (maxIdx != bulkMax || !std::equal(bulk.begin(), bulk.end(), outIndices)) {
+                        const auto at = static_cast<std::size_t>(std::mismatch(bulk.begin(), bulk.end(), outIndices).first - bulk.begin());
+                        char message[256];
+                        std::snprintf(message, sizeof(message), "APS5_VERIFY_EXPAND_READS: the indices expanded from one read differ from those read one by one (index %zu of %u, highest %u vs %u)", at, outputIndexCount, bulkMax, maxIdx);
+                        throw std::runtime_error(message);
+                    }
+                }
+            }
             expanding.Finish();
             Require(draw.firstVertex <= std::numeric_limits<std::uint32_t>::max() - maxIdx, "indexed draw vertex range overflow");
         } else {
