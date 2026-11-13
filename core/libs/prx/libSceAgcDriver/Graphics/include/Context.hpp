@@ -144,6 +144,9 @@ struct DeviceFunctions {
     PFN_vkUpdateDescriptorSets updateDescriptorSets = nullptr;
     PFN_vkAllocateDescriptorSets allocateDescriptorSets = nullptr;
     PFN_vkGetFenceStatus getFenceStatus = nullptr;
+    PFN_vkCreateDescriptorUpdateTemplate createDescriptorUpdateTemplate = nullptr;
+    PFN_vkDestroyDescriptorUpdateTemplate destroyDescriptorUpdateTemplate = nullptr;
+    PFN_vkUpdateDescriptorSetWithTemplate updateDescriptorSetWithTemplate = nullptr;
 };
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).

@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -6651,6 +6652,13 @@ void ShaderResources::release() noexcept {
     _layout = VK_NULL_HANDLE;
     fragment = {};
     tableWrites = {};
+    if (rowShape != nullptr) {
+        const auto destroy = context.Resolved(&DeviceFunctions::destroyDescriptorUpdateTemplate, "vkDestroyDescriptorUpdateTemplate");
+        for (const auto handle : rowShape->templates) {
+            if (handle != VK_NULL_HANDLE) destroy(context.device, handle, nullptr);
+        }
+        rowShape.reset();
+    }
 }
 
 std::uint32_t ShaderResources::setOf(const Binding& binding) const {
@@ -7003,10 +7011,128 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+namespace {
+
+constexpr std::size_t BufferInfoWords = sizeof(VkDescriptorBufferInfo) / sizeof(std::uint64_t);
+constexpr std::size_t ImageInfoWords = sizeof(VkDescriptorImageInfo) / sizeof(std::uint64_t);
+static_assert(sizeof(VkDescriptorBufferInfo) % sizeof(std::uint64_t) == 0 && sizeof(VkDescriptorImageInfo) % sizeof(std::uint64_t) == 0, "binding row entries are whole words");
+
+}
+
+const ShaderResources::BindingRowShape& ShaderResources::bindingRowShape() const {
+    std::call_once(rowShapeOnce, [this] { buildBindingRowShape(); });
+    return *rowShape;
+}
+
+void ShaderResources::buildBindingRowShape() const {
+    auto shape = std::make_unique<BindingRowShape>();
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        shape->described[set] = true;
+        const auto count = (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
+        if (count == 0) continue;
+        auto& sizes = shape->sizes[set];
+        const auto held = std::find_if(sizes.begin(), sizes.end(), [&](const VkDescriptorPoolSize& entry) { return entry.type == binding.layout.descriptorType; });
+        if (held != sizes.end()) held->descriptorCount += count;
+        else sizes.push_back({binding.layout.descriptorType, count});
+    }
+    for (auto& sizes : shape->sizes) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    for (std::size_t set = 0; set < shape->variable.size(); ++set) shape->variable[set] = tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt;
+    shape->bufferWords = descriptorBuffers.size() * BufferInfoWords;
+    shape->words = shape->bufferWords + descriptorImages.size() * ImageInfoWords;
+    std::array<std::vector<VkDescriptorUpdateTemplateEntry>, 2> entries;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> patches;
+    auto nextWrite = descriptorWrites.begin();
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        const auto original = set == 0 ? _set : fragment.set;
+        while (nextWrite != descriptorWrites.end() && nextWrite->dstBinding == binding.layout.binding && nextWrite->dstSet == original) {
+            const auto& write = *nextWrite++;
+            VkDescriptorUpdateTemplateEntry entry{write.dstBinding, write.dstArrayElement, write.descriptorCount, write.descriptorType, 0, 0};
+            if (write.descriptorCount == 0) continue;
+            if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) {
+                const auto first = static_cast<std::size_t>(write.pBufferInfo - descriptorBuffers.data());
+                entry.offset = first * sizeof(VkDescriptorBufferInfo);
+                entry.stride = sizeof(VkDescriptorBufferInfo);
+                for (std::size_t element = 0; element < binding.allocations.size(); ++element) patches.emplace_back(static_cast<std::uint32_t>(binding.allocations[element]), static_cast<std::uint32_t>(first + element));
+            } else {
+                entry.offset = shape->bufferWords * sizeof(std::uint64_t) + static_cast<std::size_t>(write.pImageInfo - descriptorImages.data()) * sizeof(VkDescriptorImageInfo);
+                entry.stride = sizeof(VkDescriptorImageInfo);
+            }
+            entries[set].push_back(entry);
+        }
+    }
+    Require(nextWrite == descriptorWrites.end(), "binding row entries disagree with their descriptor bindings");
+    std::sort(patches.begin(), patches.end());
+    shape->patchStart.assign(allocations.size() + 1, 0);
+    for (const auto& patch : patches) ++shape->patchStart[patch.first + 1];
+    for (std::size_t index = 1; index < shape->patchStart.size(); ++index) shape->patchStart[index] += shape->patchStart[index - 1];
+    shape->patchPositions.reserve(patches.size());
+    for (const auto& patch : patches) shape->patchPositions.push_back(patch.second);
+    const auto create = context.Resolved(&DeviceFunctions::createDescriptorUpdateTemplate, "vkCreateDescriptorUpdateTemplate");
+    for (std::size_t set = 0; set < entries.size(); ++set) {
+        if (entries[set].empty()) continue;
+        VkDescriptorUpdateTemplateCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO};
+        info.descriptorUpdateEntryCount = static_cast<std::uint32_t>(entries[set].size());
+        info.pDescriptorUpdateEntries = entries[set].data();
+        info.templateType = VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+        info.descriptorSetLayout = set == 0 ? _layout : fragment.layout;
+        Check(create(context.device, &info, nullptr, &shape->templates[set]), "vkCreateDescriptorUpdateTemplate");
+    }
+    rowShape = std::move(shape);
+}
+
+void ShaderResources::resolveBindingRow(const DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::span<std::uint64_t> row) const {
+    const auto& shape = *rowShape;
+    Require(row.size() == shape.words, "binding row storage does not match its shape");
+    auto* bytes = reinterpret_cast<std::byte*>(row.data());
+    std::memcpy(bytes, descriptorBuffers.data(), descriptorBuffers.size() * sizeof(VkDescriptorBufferInfo));
+    std::memcpy(bytes + shape.bufferWords * sizeof(std::uint64_t), descriptorImages.data(), descriptorImages.size() * sizeof(VkDescriptorImageInfo));
+    const auto put = [&](std::size_t position, const VkDescriptorBufferInfo& info) { std::memcpy(bytes + position * sizeof(VkDescriptorBufferInfo), &info, sizeof(info)); };
+    if (faultRecord != nullptr) {
+        const auto fault = faultRecord->Fault();
+        for (const auto& entry : faultDescriptors) put(entry.buffer, fault);
+    }
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result.snapshots[index];
+        const auto info = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+        for (auto patch = shape.patchStart[selected[index]]; patch < shape.patchStart[selected[index] + 1]; ++patch) put(shape.patchPositions[patch], info);
+    }
+}
+
 void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawSetTimer timer{profiled};
+    if (!RuntimeSwitches::Set(RuntimeSwitch::NoBindingRows)) {
+        const auto& shape = bindingRowShape();
+        timer.phase(timer.split.recountNanoseconds);
+        result.cache = context.descriptorCache;
+        if (shape.described[0] || splitSets) {
+            result.allocation = result.cache->AllocateRewritten(_layout, shape.sizes[0], updateAfterBind, shape.variable[0]);
+            result.layout = _layout;
+            Require(result.allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        }
+        if (shape.described[1] || splitSets) {
+            result.fragmentAllocation = result.cache->AllocateRewritten(fragment.layout, shape.sizes[1], updateAfterBind, shape.variable[1]);
+            result.fragmentLayout = fragment.layout;
+            Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+        }
+        timer.phase(timer.split.allocateNanoseconds);
+        thread_local std::vector<std::uint64_t>* rowSlot = nullptr;
+        auto& row = ShaderRecompiler::ThreadOwned(rowSlot);
+        row.resize(shape.words);
+        resolveBindingRow(result, selected, faultRecord, row);
+        timer.phase(timer.split.buildNanoseconds);
+        const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSetWithTemplate, "vkUpdateDescriptorSetWithTemplate");
+        const std::array<VkDescriptorSet, 2> sets{result.allocation.set, result.fragmentAllocation.set};
+        for (std::size_t set = 0; set < sets.size(); ++set) {
+            if (shape.templates[set] != VK_NULL_HANDLE && sets[set] != VK_NULL_HANDLE) update(context.device, sets[set], shape.templates[set], row.data());
+        }
+        timer.phase(timer.split.updateNanoseconds);
+        if (profiled) noteDrawSetSizes(timer.split, selected.size(), descriptorWrites.size(), shape.described);
+        return;
+    }
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
     auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
@@ -7071,19 +7197,20 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     timer.phase(timer.split.buildNanoseconds);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     timer.phase(timer.split.updateNanoseconds);
-    if (profiled) {
-        auto& split = timer.split;
-        split.rebound = rebound ? 1 : 0;
-        split.writes = writes.size();
-        split.patched = selected.size();
-        for (const auto& binding : bindings) {
-            const auto set = setOf(binding);
-            split.buffers[set] += binding.allocations.size();
-            split.images[set] += binding.imageAllocations.size();
-        }
-        for (std::size_t set = 0; set < split.bufferSizes.size(); ++set) {
-            if (described[set]) ++split.bufferSizes[set][DrawSetSizeBucket(split.buffers[set])];
-        }
+    if (profiled) noteDrawSetSizes(timer.split, selected.size(), writes.size(), described);
+}
+
+void ShaderResources::noteDrawSetSizes(DrawSetSplit& split, std::size_t patched, std::size_t writes, const std::array<bool, 2>& described) const {
+    split.rebound = rebound ? 1 : 0;
+    split.writes = writes;
+    split.patched = patched;
+    for (const auto& binding : bindings) {
+        const auto set = setOf(binding);
+        split.buffers[set] += binding.allocations.size();
+        split.images[set] += binding.imageAllocations.size();
+    }
+    for (std::size_t set = 0; set < split.bufferSizes.size(); ++set) {
+        if (described[set]) ++split.bufferSizes[set][DrawSetSizeBucket(split.buffers[set])];
     }
 }
 
