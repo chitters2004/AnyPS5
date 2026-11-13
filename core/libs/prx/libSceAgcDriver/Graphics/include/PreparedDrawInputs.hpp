@@ -29,7 +29,7 @@ DrawVertexFetches PlanDrawVertexFetches(std::optional<std::pair<std::uint64_t, s
 
 class PreparedDrawInputs;
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool committerBehind);
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
 const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared);
 
@@ -63,6 +63,7 @@ void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64
 
 struct PreparedDrawInputCounts {
     std::uint64_t requests = 0;
+    std::uint64_t shallow = 0;
     std::uint64_t ranges = 0;
     std::uint64_t prepared = 0;
     std::uint64_t refused = 0;

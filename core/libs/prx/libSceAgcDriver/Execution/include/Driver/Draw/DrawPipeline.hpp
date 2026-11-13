@@ -36,6 +36,7 @@ public:
     static DrawPipeline& Queue0();
     static std::size_t Depth();
     static std::size_t QueuedItems();
+    static bool CommitterBehind();
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);

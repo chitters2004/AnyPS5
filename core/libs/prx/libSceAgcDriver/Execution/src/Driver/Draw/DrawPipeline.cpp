@@ -279,6 +279,10 @@ std::size_t DrawPipeline::QueuedItems() {
     return pipeline.items.size();
 }
 
+bool DrawPipeline::CommitterBehind() {
+    return Queue0().outstanding.load(std::memory_order_relaxed) >= std::max<std::size_t>(2, Depth() / 2);
+}
+
 bool& DrawPipeline::Active() {
     static thread_local bool active = false;
     return active;

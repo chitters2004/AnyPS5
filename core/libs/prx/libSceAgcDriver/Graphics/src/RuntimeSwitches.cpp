@@ -26,6 +26,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_SHARED_VERTEX_LAYOUT",
     "APS5_NO_SHARED_PREPARER_CONTEXT",
     "APS5_NO_DRAW_INPUT_ABANDON",
+    "APS5_EARLY_DRAW_INPUTS_ALWAYS",
 };
 
 struct SwitchValues {
@@ -41,6 +42,7 @@ struct SwitchValues {
             std::getenv("APS5_NO_SHARED_VERTEX_LAYOUT") != nullptr,
             std::getenv("APS5_NO_SHARED_PREPARER_CONTEXT") != nullptr,
             std::getenv("APS5_NO_DRAW_INPUT_ABANDON") != nullptr,
+            std::getenv("APS5_EARLY_DRAW_INPUTS_ALWAYS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

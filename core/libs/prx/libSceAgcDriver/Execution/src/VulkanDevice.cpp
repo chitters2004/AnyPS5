@@ -4977,9 +4977,9 @@ bool VulkanDevice::DrawInputsInPlace() const {
     return state->drawInputsInPlace;
 }
 
-std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const {
+std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, bool committerBehind) const {
     if (state->drawInputsInPlace || (draw.indirect && !draw.indexed)) return nullptr;
-    return Graphics::PrepareDrawInputsAhead(preparerContext(), graphics, draw, shaders);
+    return Graphics::PrepareDrawInputsAhead(preparerContext(), graphics, draw, shaders, committerBehind);
 }
 
 namespace {

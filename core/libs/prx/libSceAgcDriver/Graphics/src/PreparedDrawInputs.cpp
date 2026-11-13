@@ -87,6 +87,7 @@ struct PreparedRange {
 
 struct alignas(64) Counters {
     std::atomic<std::uint64_t> requests{0};
+    std::atomic<std::uint64_t> shallow{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> prepared{0};
     std::atomic<std::uint64_t> refused{0};
@@ -476,8 +477,12 @@ bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorde
 
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool committerBehind) {
     const Context& context = *shared;
+    if (!committerBehind && !RuntimeSwitches::Set(RuntimeSwitch::EarlyDrawInputsAlways)) {
+        counted(counters().shallow, "DrawInputPrep.shallow");
+        return nullptr;
+    }
     if (context.drawInputsInPlace || (draw.indirect && !draw.indexed) || (!draw.indirect && draw.instanceCount == 0) || draw.indexCount == 0 || state.quadList || RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return nullptr;
     if (shaders.empty() || shaders.front().program == nullptr || !GuestMemory::WriteWatched()) return nullptr;
     const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -588,6 +593,7 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     CounterShards::Get().ForEach([&](const Counters& total) {
         const auto sum = [](std::uint64_t& into, const std::atomic<std::uint64_t>& from) { into += from.load(std::memory_order_relaxed); };
         sum(counts.requests, total.requests);
+        sum(counts.shallow, total.shallow);
         sum(counts.ranges, total.ranges);
         sum(counts.prepared, total.prepared);
         sum(counts.refused, total.refused);

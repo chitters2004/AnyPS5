@@ -205,7 +205,7 @@ Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, 
         draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(IndirectRecord.data()), 0x25u, 20u, 20u, 1u, false, 0u, NoLocation, NoLocation, NoLocation, false, 0u};
     }
     const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
-    auto prepared = device.PrepareDrawInputsAhead(state, draw, programs.shaders);
+    auto prepared = device.PrepareDrawInputsAhead(state, draw, programs.shaders, true);
     Require(prepared != nullptr, "prepared vertex inputs: the draw was not prepared ahead of its commit");
     AgcDriver::Graphics::AwaitPreparedDrawInputs(*prepared);
     betweenPrepareAndCommit();
@@ -281,7 +281,7 @@ int main() {
         const auto heldState = DrawState();
         const AgcDriver::Pm4::DrawParameters heldDraw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
         const auto beforeHeld = AgcDriver::Graphics::PreparedDrawInputCounters();
-        auto kept = device->PrepareDrawInputsAhead(heldState, heldDraw, programs->shaders);
+        auto kept = device->PrepareDrawInputsAhead(heldState, heldDraw, programs->shaders, true);
         Require(kept != nullptr, "prepared vertex inputs: the held draw was not queued for preparation");
         {
             const AgcDriver::Graphics::PreparedDrawInputsScope scope(kept);
@@ -348,8 +348,8 @@ int main() {
                 WriteIndices(Indices);
                 const auto state = DrawState();
                 const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
-                auto first = device->PrepareDrawInputsAhead(state, draw, programs->shaders);
-                auto second = device->PrepareDrawInputsAhead(state, draw, programs->shaders);
+                auto first = device->PrepareDrawInputsAhead(state, draw, programs->shaders, true);
+                auto second = device->PrepareDrawInputsAhead(state, draw, programs->shaders, true);
                 Require(first != nullptr && second != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the context check");
                 AgcDriver::Graphics::AwaitPreparedDrawInputs(*first);
                 AgcDriver::Graphics::AwaitPreparedDrawInputs(*second);
@@ -375,10 +375,35 @@ int main() {
             const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
             const bool initial = Switches::Set(RuntimeSwitch::NoEarlyDrawInputs);
             Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, true);
-            const auto refused = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+            const auto refused = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, true);
             Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, initial);
             std::printf("APS5_NO_EARLY_DRAW_INPUTS: the draw is %s\n", refused == nullptr ? "left to the committer" : "prepared ahead");
             Require(refused == nullptr, "prepared vertex inputs: APS5_NO_EARLY_DRAW_INPUTS did not stop a draw's inputs being prepared ahead of its commit");
+        }
+        {
+            using AgcDriver::Graphics::RuntimeSwitch;
+            namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+            WriteIndices(Indices);
+            const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+            const bool initial = Switches::Set(RuntimeSwitch::EarlyDrawInputsAlways);
+            Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, false);
+            const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+            auto idle = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, false);
+            const auto afterIdle = AgcDriver::Graphics::PreparedDrawInputCounters();
+            auto behind = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, true);
+            Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, true);
+            auto always = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, false);
+            Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, initial);
+            const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+            std::printf("committer not behind: the draw is %s; behind: %s; APS5_EARLY_DRAW_INPUTS_ALWAYS: %s; %llu counted as shallow\n", idle == nullptr ? "left to the committer" : "prepared ahead", behind == nullptr ? "left to the committer" : "prepared ahead", always == nullptr ? "left to the committer" : "prepared ahead", static_cast<unsigned long long>(after.shallow - before.shallow));
+            Require(idle == nullptr && afterIdle.shallow - before.shallow == 1, "prepared vertex inputs: a draw was prepared ahead although the committer was not behind");
+            Require(behind != nullptr && always != nullptr && after.shallow == afterIdle.shallow, "prepared vertex inputs: a draw behind a busy committer, or one with APS5_EARLY_DRAW_INPUTS_ALWAYS, was not prepared ahead");
+            {
+                const AgcDriver::Graphics::PreparedDrawInputsScope first(std::move(behind));
+            }
+            {
+                const AgcDriver::Graphics::PreparedDrawInputsScope second(std::move(always));
+            }
         }
         {
             using AgcDriver::Graphics::RuntimeSwitch;
@@ -395,7 +420,7 @@ int main() {
                 WriteIndices(Indices);
                 const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
                 const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
-                auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+                auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, true);
                 Require(job != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the abandonment check");
                 while (!entered.load()) std::this_thread::yield();
                 std::jthread watchdog([patience](std::stop_token token) {
@@ -449,7 +474,7 @@ int main() {
             WriteIndices(Indices);
             const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
             const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
-            auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+            auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, true);
             Require(job != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the teardown check");
             while (!entered.load()) std::this_thread::yield();
             {

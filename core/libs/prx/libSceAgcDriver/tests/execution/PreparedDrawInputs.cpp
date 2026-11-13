@@ -333,6 +333,19 @@ void EmptyFetchSkipDrawsTheSame() {
     Require(skipped.adopted() == planned.adopted() && skipped.copied() == planned.copied(), "prepared draw inputs: skipping the vertex fetch planning changed how the draw's inputs were made");
 }
 
+void IdleCommitterCopiesTheInputsItself() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, false);
+    const auto outcome = DrawOnce(Change::None);
+    Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, true);
+    const auto shallow = outcome.after.shallow - outcome.before.shallow;
+    Print("committer idle at the enqueue", outcome);
+    std::printf("committer idle at the enqueue: %llu draws left to the committer\n", static_cast<unsigned long long>(shallow));
+    Require(outcome.hooks == 0 && outcome.requests() == 0 && shallow == 1, "prepared draw inputs: a draw enqueued while the committer was idle was prepared ahead of its commit");
+    Require(outcome.copied() != 0 && outcome.written == Width * Height, "prepared draw inputs: the draw left to an idle committer did not copy its inputs there and draw");
+}
+
 void NoPreparersCopyOnTheCommitter() {
     AgcDriver::Graphics::SetDrawInputPreparers(0);
     const auto outcome = DrawOnce(Change::None);
@@ -365,6 +378,7 @@ int main() {
         Register(PixelShader, PixelCode.data(), sizeof(PixelCode), 1);
         AgcDriver::Graphics::SetDrawInputPreparers(1);
         AgcDriver::Graphics::SetPreparedDrawInputsHook(&BeforeCommit);
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::EarlyDrawInputsAlways, true);
         UnchangedInputsAreAdopted();
         VerticesChangedAfterPreparationAreCopiedAgain();
         IndicesChangedAfterPreparationAreCopiedAgain();
@@ -373,6 +387,7 @@ int main() {
         IndirectRecordInputsAreAdopted();
         IndirectRecordIndicesChangedAfterPreparation();
         EmptyFetchSkipDrawsTheSame();
+        IdleCommitterCopiesTheInputsItself();
         NoPreparersCopyOnTheCommitter();
         AgcDriver::Graphics::SetPreparedDrawInputsHook(nullptr);
         std::puts("prepared draw inputs: copies made before the commit are adopted only while the CPU left their ranges unchanged");
