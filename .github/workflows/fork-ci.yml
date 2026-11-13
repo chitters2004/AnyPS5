@@ -605,6 +605,8 @@ jobs:
                       for candidate in (name, name[:-4] if name.endswith(".exe") else name):
                           if candidate in known:
                               names.add(candidate)
+          _t = [x for x in json.loads(out)["tests"] if x["name"] in selected]
+          print("target scan sample:", [(x["name"], x.get("command")) for x in _t[:2]], "memo targets known:", sorted(k for k in known if "memo" in k)[:8], file=sys.stderr)
           print(f"target scan: {len(selected)} selected tests, {len(known)} ninja target names, {len(names)} matched", file=sys.stderr)
           print(" ".join(sorted(names)))
           PY
