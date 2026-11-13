@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitPhases.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
@@ -439,6 +440,33 @@ void Predicted(AgcDriver::VulkanDevice& device) {
     Check(block, second, "staging prediction, the draw with an adopted stage A differs from the committer-built draw");
 }
 
+void MemoPin(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::CommitCounter;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto counter = [](CommitCounter id) { return AgcDriver::Graphics::ReadCommitPhases().counters[static_cast<std::size_t>(id)]; };
+    constexpr std::array<float, 4> seed{5300.0f, 5400.0f, 5500.0f, 5600.0f};
+    Block block(SettledBytes, 0);
+    Seed(block, seed);
+    const auto acceptsBefore = counter(CommitCounter::TargetMemoAccept);
+    const auto invalidBefore = counter(CommitCounter::TargetMemoInvalid);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto epoch = AgcDriver::GuestMemory::CollectEpoch();
+    constexpr int draws = 4;
+    for (int drawn = 0; drawn < draws; ++drawn) {
+        Draw(device, block);
+        ExpectRecorded(context, block, "memo pin, repeated draw " + std::to_string(drawn));
+        device.WaitIdle();
+    }
+    Check(block, seed, "memo pin, the repeated draws");
+    Require(epoch != 0 && AgcDriver::GuestMemory::CollectEpoch() == epoch, "memo pin: the repeated draws did not share one collect epoch, so the target memo could never be remembered and the pin proves nothing");
+    const auto accepted = counter(CommitCounter::TargetMemoAccept) - acceptsBefore;
+    const auto invalid = counter(CommitCounter::TargetMemoInvalid) - invalidBefore;
+    std::printf("memo pin: %d repeated draws into an imported linear target, %llu target memo hits, %llu found no valid memo\n", draws, static_cast<unsigned long long>(accepted), static_cast<unsigned long long>(invalid));
+    Require(invalid != 0, "memo pin: the target memo was never consulted, so the pin proves nothing; it needs APS5_DRAW_PIPELINE=1 and APS5_PROFILE_COMMIT=1");
+    Require(accepted == 0, "memo pin: the target memo admitted a repeated draw into an imported linear target. Its proof does not carry the APS5_NO_RESIDENT_LINEAR policy, so an A/B flip of that switch would keep the resident linear decision (Sol LIKELY #6): apply the guard on lab branch cloud/copy-offload/memo-policy (copy-offload-memo-policy)");
+    Require(invalid == draws, "memo pin: the target memo was remembered for an imported linear target, so it is warm for these targets and its proof does not carry the APS5_NO_RESIDENT_LINEAR policy (Sol LIKELY #6): apply the guard on lab branch cloud/copy-offload/memo-policy (copy-offload-memo-policy)");
+}
+
 void Compared(AgcDriver::VulkanDevice& device) {
     using AgcDriver::Graphics::ImportWatch;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
@@ -492,6 +520,15 @@ int main(int argc, char** argv) {
         Require(watched, "a host import of write-watched memory left the write watch although imports are set to stay watched");
 #endif
         if (!watched) std::puts("linear target import creation: a host import of write-watched memory does not stay watched on this device; only the compared cases run");
+        if (only == "--memo-pin") {
+            if (!watched) {
+                std::puts("skipped, the memo pin needs host imports that keep a linear color target write-watched");
+                return VulkanTestSkipped;
+            }
+            MemoPin(*device);
+            std::puts("linear target memo pin passed");
+            return 0;
+        }
         if (only == "--prepared") {
             if (!watched) {
                 std::puts("skipped, linear target staging prediction needs host imports that keep a linear color target write-watched");
