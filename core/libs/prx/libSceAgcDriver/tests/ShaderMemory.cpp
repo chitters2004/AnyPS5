@@ -2826,6 +2826,36 @@ void verifyBatchedDescriptorReads() {
     require(splitPlain->snapshot.buffers.size() == 2u && std::ranges::any_of(splitPlain->snapshot.buffers, [](const DescriptorValue& value) { return value.dwords[2] == 0x300u; }), "batched descriptor reads: the split program does not read a V# from two separate loads");
     require(Detail::SrtTape::BatchedReads() == splitBefore + 1u && count(splitLog, Words) == 1, "batched descriptor reads: a V# loaded from two separate pairs of words was read in bulk, or the whole V# was not");
     require(same(splitPlain, splitBatched), "batched descriptor reads: the split program's batched capture differs from its per-dword capture");
+    const auto nestedBase = blockAddress + 0x80u;
+    block[0x20u / 4u] = static_cast<std::uint32_t>(nestedBase);
+    block[0x24u / 4u] = static_cast<std::uint32_t>(nestedBase >> 32u);
+    block[0x28u / 4u] = 0x100u;
+    block[0x2cu / 4u] = 0x00027facu;
+    block[0x80u / 4u] = static_cast<std::uint32_t>(blockAddress + 0xc0u);
+    block[0x84u / 4u] = static_cast<std::uint32_t>((blockAddress + 0xc0u) >> 32u);
+    block[0x88u / 4u] = 0x200u;
+    block[0x8cu / 4u] = 0x00027facu;
+    const std::vector<std::uint32_t> nested{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xf408060eu, 0xfa000000u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto nestedRequest = FrontendRequest(nested, userData);
+    const auto nestedCapture = [&](bool batched, BatchedReadLog& log) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.readSpan = readSpan;
+        runtime.descriptorScope = scope;
+        runtime.userContext = &log;
+        runtime.batchedDescriptorReads = batched;
+        return CaptureResources(nestedRequest, runtime);
+    };
+    BatchedReadLog nestedPlainLog;
+    BatchedReadLog nestedLog;
+    const auto nestedPlain = nestedCapture(false, nestedPlainLog);
+    const auto nestedBefore = Detail::SrtTape::BatchedReads();
+    const auto nestedBatched = nestedCapture(true, nestedLog);
+    require(nestedPlain->snapshot.buffers.size() == 2u && nestedPlain->snapshot.buffers[0].dwords[2] == 0x200u && nestedPlain->snapshot.buffers[1].dwords[2] == 0x100u, "batched descriptor reads: the nested program does not walk the V# loaded through another V#'s base first");
+    require(Detail::SrtTape::BatchedReads() == nestedBefore + 1u && count(nestedLog, Words) == 1 && std::ranges::find(nestedLog.events, std::array<std::uint64_t, 3>{Words, nestedBase, 4u}) != nestedLog.events.end(), "batched descriptor reads: a V# whose dwords an earlier V# already read was read in bulk, or the earlier V# was not");
+    require(same(nestedPlain, nestedBatched), "batched descriptor reads: the nested program's batched capture differs from its per-dword capture");
 }
 
 void requireBatchedReads() {
