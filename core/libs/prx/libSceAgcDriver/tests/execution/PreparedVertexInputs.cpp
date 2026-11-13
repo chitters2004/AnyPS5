@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -324,6 +325,15 @@ int main() {
         Require(DrawInline(*device, *padded, 0.0f) == paddedPixels, "prepared vertex inputs: the draw with an adopted zero-padded vertex fetch differs from the same draw copied on the committer");
         Require(DrawInline(*device, *padded, 0.5f) == paddedMovedPixels, "prepared vertex inputs: the draw whose zero-padded vertex fetch was prepared again differs from the same draw copied on the committer");
         AgcDriver::Graphics::SetDrawInputPreparers(1);
+
+        AgcDriver::Graphics::SetDrawInputPreparers(0);
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoSharedVertexLayout, true);
+        const auto copiedLayout = DrawInline(*device, *padded, 0.0f);
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoSharedVertexLayout, false);
+        const auto sharedLayout = DrawInline(*device, *padded, 0.0f);
+        AgcDriver::Graphics::SetDrawInputPreparers(1);
+        std::printf("vertex input layout copied into the inputs and shared with them: %s\n", copiedLayout == sharedLayout ? "same pixels" : "different pixels");
+        Require(copiedLayout == paddedPixels && sharedLayout == paddedPixels, "prepared vertex inputs: sharing the plan's vertex input layout with the draw's inputs changed what it drew");
 
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);

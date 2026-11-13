@@ -1604,6 +1604,7 @@ struct DrawInputs {
     std::uint32_t listRestartPrimitive = 0;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    const VertexInputLayout* sharedVertexInput = nullptr;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
@@ -1616,7 +1617,7 @@ struct DrawInputs {
     std::uint32_t meshLayerStride = 0;
     std::vector<std::uint32_t> restartTable;
     std::uint32_t expandedIndexCount = 0;
-    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : sharedVertexInput != nullptr ? *sharedVertexInput : vertexInput; }
 };
 
 bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
@@ -1642,10 +1643,11 @@ struct DrawPlan {
     std::uint32_t meshLayerStride = 0;
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
+    const VertexInputLayout* sharedVertexInput = nullptr;
     bool candidate = false;
     bool keyed = false;
     ResourceCache::Key contentKey;
-    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
+    const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : sharedVertexInput != nullptr ? *sharedVertexInput : vertexInput; }
 };
 
 DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, DrawOutcome& outcome, DrawTimer& timer) {
@@ -1721,7 +1723,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     const auto layoutStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& attributes = shaders.front().program->vertexAttributes;
     if (recipe != nullptr) {
-        plan.vertexInput = recipe->vertexInput;
+        if (RuntimeSwitches::Set(RuntimeSwitch::NoSharedVertexLayout)) plan.vertexInput = recipe->vertexInput;
+        else plan.sharedVertexInput = &recipe->vertexInput;
     } else if (!attributes.empty()) {
         if (context.vertexInputs != nullptr) plan.retainedVertexInput = context.vertexInputs->TryGet(shaders.front().program->variantId, attributes);
         if (plan.retainedVertexInput == nullptr) plan.vertexInput = BuildVertexInputLayout(context, attributes);
@@ -1764,8 +1767,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     inputs.meshGroups = drawPlan.meshGroups;
     inputs.meshLayers = drawPlan.meshLayers;
     inputs.meshLayerStride = drawPlan.meshLayerStride;
-    inputs.vertexInput = drawPlan.vertexInput;
     inputs.retainedVertexInput = drawPlan.retainedVertexInput;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoSharedVertexLayout)) {
+        inputs.vertexInput = drawPlan.vertexInput;
+        inputs.sharedVertexInput = drawPlan.sharedVertexInput;
+    } else if (inputs.retainedVertexInput == nullptr) {
+        inputs.sharedVertexInput = &drawPlan.VertexLayout();
+    }
     const auto* args = draw.indirect ? &*draw.indirect : nullptr;
     const auto indexBytes = inputs.indexBytes;
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
@@ -3132,6 +3140,7 @@ struct PreparedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
+    DrawPlan plan;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -3321,7 +3330,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    prepared.plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    const auto& plan = prepared.plan;
     if (plan.nothing) return false;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
