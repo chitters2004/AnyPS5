@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
@@ -1138,6 +1139,90 @@ std::shared_ptr<const ShaderRecompiler::LinkedCalls> LinkUserDataCallees(const S
 
 }
 
+namespace {
+
+void ApplyPreparedSampleModesLocked(const PreparedShaders& prepared, std::size_t codeOffset, ShaderRecompiler::GuestContext& context) {
+    if (std::ranges::find(prepared.convertedSamples, codeOffset) != prepared.convertedSamples.end()) context.convertedSamples = true;
+    if (std::ranges::find(prepared.layerRowSamples, codeOffset) != prepared.layerRowSamples.end()) context.layerRowSamples = true;
+}
+
+std::atomic<std::uint64_t> invocationKeyRebuilds{0};
+std::atomic<bool> convertedSamplesBetweenScopes{false};
+
+bool VerifyInvocationKeys() {
+    static const bool verify = std::getenv("APS5_VERIFY_INVOCATION_KEYS") != nullptr;
+    return verify;
+}
+
+void MarkConvertedSamplesBetweenScopes(PreparedShaders& prepared, std::size_t codeOffset) {
+    if (!convertedSamplesBetweenScopes.exchange(false, std::memory_order_acq_rel)) return;
+    std::lock_guard lock(prepared.mutex);
+    if (std::ranges::find(prepared.convertedSamples, codeOffset) == prepared.convertedSamples.end()) prepared.convertedSamples.push_back(codeOffset);
+}
+
+ShaderRecompiler::PreparedShaderInvocation InvocationWithOneCopy(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::LinkedCalls& linked) {
+    auto source = request;
+    if (!linked.code.empty()) {
+        source.shader.code = linked.code;
+        source.context.linkedCallFallbacks = linked.fallbacks;
+    }
+    auto& prepared = *snapshot.prepared;
+    std::unique_lock lock(prepared.mutex);
+    AwaitRegisteredPreparation(prepared, lock);
+    ApplyPreparedSampleModesLocked(prepared, codeOffset, source.context);
+    lock.unlock();
+    struct OneCopyKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, OneCopyKeyStorage>();
+    ShaderRecompiler::BuildPreparedShaderKey(source, key);
+    MarkConvertedSamplesBetweenScopes(prepared, codeOffset);
+    const bool keyedConverted = source.context.convertedSamples;
+    const bool keyedLayerRow = source.context.layerRowSamples;
+    lock.lock();
+    AwaitRegisteredPreparation(prepared, lock);
+    ApplyPreparedSampleModesLocked(prepared, codeOffset, source.context);
+    if (source.context.convertedSamples != keyedConverted || source.context.layerRowSamples != keyedLayerRow) {
+        invocationKeyRebuilds.fetch_add(1, std::memory_order_relaxed);
+        ShaderRecompiler::BuildPreparedShaderKey(source, key);
+    }
+    if (VerifyInvocationKeys()) {
+        std::vector<std::uint64_t> fresh;
+        ShaderRecompiler::BuildPreparedShaderKey(source, fresh);
+        require(fresh == key, "APS5_VERIFY_INVOCATION_KEYS: a prepared invocation's key does not match its request's sample modes");
+    }
+    PreparedAtUse preparedAtUse;
+    if (!prepared.deferredAbis.empty() || prepared.deferredPreparing) preparedAtUse = PrepareDeferredAbis(snapshot, lock);
+    const auto sourceCode = source.shader.code;
+    for (auto& entry : prepared.entries) {
+        if (entry.codeOffset != codeOffset) continue;
+        source.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
+        if (!linked.code.empty() && !std::ranges::equal(source.shader.code, linked.code)) continue;
+        if (!ShaderRecompiler::PreparedShaderInvocation::Admits(source, *entry.handle, key)) continue;
+        NoteMatchedEntry(entry, preparedAtUse);
+        auto handle = entry.handle;
+        lock.unlock();
+        return ShaderRecompiler::PreparedShaderInvocation::Adopt(std::move(source), std::move(handle));
+    }
+    source.shader.code = sourceCode;
+    NoteOwnPreparation(preparedAtUse);
+    ReportPreparedAtUse(snapshot, source);
+    auto handle = PrepareShaderWithDiagnostics(source);
+    source.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
+    if (!ShaderRecompiler::PreparedShaderInvocation::Admits(source, *handle, key)) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
+    prepared.entries.push_back({codeOffset, handle});
+    lock.unlock();
+    return ShaderRecompiler::PreparedShaderInvocation::Adopt(std::move(source), std::move(handle));
+}
+
+}
+
+std::uint64_t InvocationKeyRebuilds() {
+    return invocationKeyRebuilds.load(std::memory_order_relaxed);
+}
+
+void MarkConvertedSamplesBetweenScopesForTest() {
+    convertedSamplesBetweenScopes.store(true, std::memory_order_release);
+}
+
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
@@ -1146,6 +1231,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     ShaderRecompiler::LinkedCalls tail;
     if (shared == nullptr || shared->code.empty()) tail.code = LinkGraphicsUserDataTail(request, snapshot);
     const auto& linked = shared != nullptr && tail.code.empty() ? *shared : tail;
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::OneStageRequest)) return InvocationWithOneCopy(snapshot, codeOffset, request, linked);
     auto source = request;
     if (!linked.code.empty()) {
         source.shader.code = linked.code;

@@ -2240,9 +2240,22 @@ std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(cons
 }
 
 std::optional<PreparedShaderInvocation> PreparedShaderInvocation::TryCreate(const RecompileRequest& request, const std::shared_ptr<const SourceHandle>& handle, std::span<const std::uint64_t> key) {
-    if (handle == nullptr || !MatchesPreparedShader(request, *handle, key)) return std::nullopt;
-    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    if (handle == nullptr || !Admits(request, *handle, key)) return std::nullopt;
     return PreparedShaderInvocation(request, handle);
+}
+
+bool PreparedShaderInvocation::Admits(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key) {
+    if (!MatchesPreparedShader(request, handle, key)) return false;
+    if (request.shader.stage != ShaderStage::Compute && request.shader.stage != ShaderStage::Fragment) ValidateRequestInputs(request);
+    return true;
+}
+
+PreparedShaderInvocation PreparedShaderInvocation::Adopt(RecompileRequest&& request, std::shared_ptr<const SourceHandle> handle) {
+    return PreparedShaderInvocation(std::move(request), std::move(handle));
+}
+
+PreparedShaderInvocation::PreparedShaderInvocation(RecompileRequest&& request, std::shared_ptr<const SourceHandle>&& handle) : request(std::move(request)), handle(std::move(handle)) {
+    this->request.context.linkedCallFallbacks = this->handle->source->linkedCallFallbacks;
 }
 
 std::shared_ptr<const ResourceCapture> PreparedShaderInvocation::Capture(const SrtRuntime& runtime) const {

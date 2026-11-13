@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
@@ -117,6 +118,49 @@ void NullPixelAtDraw(AgcDriver::VulkanDevice& device) {
     Require(snapshot.prepared->entries.size() == 2, "the null pixel program was not prepared at draw");
     static_cast<void>(AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request));
     Require(AgcDriver::DriverDetail::SourceHandleFor(snapshot, 0, request) == snapshot.prepared->entries.back().handle && snapshot.prepared->entries.size() == 2, "the null pixel program was prepared again for the same draw");
+}
+
+void OneCopyInvocations(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool before = Switches::Set(RuntimeSwitch::OneStageRequest);
+    alignas(256) std::array<std::uint32_t, 1> code{0xbf810000u};
+    std::array<std::uint32_t, 4> users{};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{1, 1, 1}, 0, {false, false, false}, false, 1, {}};
+    ShaderRecompiler::RecompileRequest request{{ShaderRecompiler::ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}}, {32, 0, users, compute, {}, {}, {}}, device.ComputeTarget(32), {0, 0, 0, 128}};
+    AgcDriver::DriverDetail::ShaderSnapshot snapshot{request.shader.codeAddress, 0, 0, {code.begin(), code.end()}, {}};
+    snapshot.header.resize(sizeof(Shader));
+    request.shader.code = snapshot.code;
+    request.useCache = true;
+    Switches::Assign(RuntimeSwitch::OneStageRequest, false);
+    const auto legacy = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+    Require(snapshot.prepared->entries.size() == 1, "the copying invocation did not prepare its shader at use");
+    Switches::Assign(RuntimeSwitch::OneStageRequest, true);
+    const auto single = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+    Require(snapshot.prepared->entries.size() == 1, "the one-copy invocation did not take the entry the copying invocation prepared");
+    std::vector<std::uint64_t> legacyKey;
+    std::vector<std::uint64_t> singleKey;
+    ShaderRecompiler::BuildPreparedShaderKey(legacy.Request(), legacyKey);
+    ShaderRecompiler::BuildPreparedShaderKey(single.Request(), singleKey);
+    Require(legacyKey == singleKey && single.Request().shader.code.data() == legacy.Request().shader.code.data(), "the one-copy invocation's request keys or points unlike the copying invocation's");
+    ShaderRecompiler::SrtRuntime runtime{};
+    runtime.userData = users;
+    Require(single.Materialize(*single.Capture(runtime)) == legacy.Materialize(*legacy.Capture(runtime)), "the one-copy invocation materialized another result than the copying invocation");
+    const auto rebuilds = AgcDriver::DriverDetail::InvocationKeyRebuilds();
+    AgcDriver::DriverDetail::MarkConvertedSamplesBetweenScopesForTest();
+    const auto converted = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+    Require(AgcDriver::DriverDetail::InvocationKeyRebuilds() == rebuilds + 1, "a converted-sample mode recorded between the lock scopes did not rebuild the prepared key exactly once");
+    Require(converted.Request().context.convertedSamples, "the invocation after a converted-sample mode was recorded does not convert samples");
+    const auto entries = snapshot.prepared->entries.size();
+    Require(entries == 2, "a converted-sample invocation took an entry prepared without converted samples");
+    const auto again = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+    Require(AgcDriver::DriverDetail::InvocationKeyRebuilds() == rebuilds + 1, "a sample mode recorded before the first lock scope rebuilt the prepared key");
+    Require(again.Request().context.convertedSamples && snapshot.prepared->entries.size() == entries, "the next one-copy invocation did not reuse the converted-sample entry");
+    Switches::Assign(RuntimeSwitch::OneStageRequest, false);
+    const auto copied = AgcDriver::DriverDetail::InvocationFor(snapshot, 0, request);
+    Require(copied.Request().context.convertedSamples && snapshot.prepared->entries.size() == entries, "the copying invocation did not reuse the converted-sample entry the one-copy invocation prepared");
+    Switches::Assign(RuntimeSwitch::OneStageRequest, before);
+    device.WaitIdle();
 }
 
 void Run(AgcDriver::VulkanDevice& device) {
@@ -1889,6 +1933,7 @@ int main(int argc, char** argv) {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         Run(*device);
+        OneCopyInvocations(*device);
         RegisteredVertexWorkgroup(device->Target());
         FailureCapture(*device);
         DumpSelection(*device);
