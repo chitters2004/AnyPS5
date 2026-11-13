@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <stop_token>
 #include <thread>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
@@ -83,7 +85,7 @@ struct PreparedRange {
     bool consumed = false;
 };
 
-struct Counters {
+struct alignas(64) Counters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> prepared{0};
@@ -105,13 +107,59 @@ struct Counters {
     std::array<std::atomic<std::uint64_t>, DrawInputSourceCount> sourceNanoseconds{};
 };
 
+class CounterShards {
+public:
+    static CounterShards& Get() {
+        static auto* shards = new CounterShards;
+        return *shards;
+    }
+
+    Counters* Lease() {
+        std::lock_guard lock(mutex);
+        if (!idle.empty()) {
+            auto* shard = idle.back();
+            idle.pop_back();
+            return shard;
+        }
+        return &store.emplace_back();
+    }
+
+    void Return(Counters* shard) {
+        std::lock_guard lock(mutex);
+        idle.push_back(shard);
+    }
+
+    template <typename Visit> void ForEach(Visit&& visit) {
+        std::lock_guard lock(mutex);
+        for (const auto& shard : store) visit(shard);
+    }
+
+private:
+    std::mutex mutex;
+    std::deque<Counters> store;
+    std::vector<Counters*> idle;
+};
+
+struct CounterLease {
+    Counters* shard = nullptr;
+    ~CounterLease() {
+        if (shard != nullptr) CounterShards::Get().Return(shard);
+    }
+};
+
 Counters& counters() {
-    static Counters values;
-    return values;
+    auto& lease = HostThreadLocal<CounterLease, CounterLease>();
+    if (lease.shard == nullptr) lease.shard = CounterShards::Get().Lease();
+    return *lease.shard;
+}
+
+void add(std::atomic<std::uint64_t>& total, std::uint64_t amount) {
+    total.store(total.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
 }
 
 void counted(std::atomic<std::uint64_t>& total, const char* scope, std::uint64_t amount = 1) {
-    total.fetch_add(amount, std::memory_order_relaxed);
+    if (amount == 0) return;
+    add(total, amount);
     PerformanceTrace::CountOwnedDraw(scope, amount);
 }
 
@@ -245,7 +293,7 @@ public:
 
 private:
     std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
-        counters().ranges.fetch_add(1, std::memory_order_relaxed);
+        add(counters().ranges, 1);
         const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
             ++refusedRanges;
             ++refusedBy[static_cast<std::size_t>(reason)];
@@ -454,7 +502,7 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool valid = PreparedInputStillValid(*found, recorder, registryGeneration);
     auto& total = counters();
-    total.checks.fetch_add(1, std::memory_order_relaxed);
+    add(total.checks, 1);
     if (timed) {
         const auto spent = nanosecondsSince(start);
         counted(total.checkNanoseconds, "DrawInputPrep.check_ns", spent);
@@ -486,29 +534,31 @@ void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64
 }
 
 PreparedDrawInputCounts PreparedDrawInputCounters() {
-    auto& total = counters();
     PreparedDrawInputCounts counts;
-    counts.requests = total.requests.load(std::memory_order_relaxed);
-    counts.ranges = total.ranges.load(std::memory_order_relaxed);
-    counts.prepared = total.prepared.load(std::memory_order_relaxed);
-    counts.refused = total.refused.load(std::memory_order_relaxed);
-    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.refusedBy[reason] = total.refusedBy[reason].load(std::memory_order_relaxed);
-    counts.adopted = total.adopted.load(std::memory_order_relaxed);
-    counts.reprepared = total.reprepared.load(std::memory_order_relaxed);
-    counts.notReady = total.notReady.load(std::memory_order_relaxed);
-    counts.waited = total.waited.load(std::memory_order_relaxed);
-    counts.unused = total.unused.load(std::memory_order_relaxed);
-    counts.checks = total.checks.load(std::memory_order_relaxed);
-    counts.checkNanoseconds = total.checkNanoseconds.load(std::memory_order_relaxed);
-    counts.verifyDiffered = total.verifyDiffered.load(std::memory_order_relaxed);
-    counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
-    counts.prepareNanoseconds = total.prepareNanoseconds.load(std::memory_order_relaxed);
-    counts.waitNanoseconds = total.waitNanoseconds.load(std::memory_order_relaxed);
-    for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
-        counts.sources[index] = total.sources[index].load(std::memory_order_relaxed);
-        counts.sourceBytes[index] = total.sourceBytes[index].load(std::memory_order_relaxed);
-        counts.sourceNanoseconds[index] = total.sourceNanoseconds[index].load(std::memory_order_relaxed);
-    }
+    CounterShards::Get().ForEach([&](const Counters& total) {
+        const auto sum = [](std::uint64_t& into, const std::atomic<std::uint64_t>& from) { into += from.load(std::memory_order_relaxed); };
+        sum(counts.requests, total.requests);
+        sum(counts.ranges, total.ranges);
+        sum(counts.prepared, total.prepared);
+        sum(counts.refused, total.refused);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) sum(counts.refusedBy[reason], total.refusedBy[reason]);
+        sum(counts.adopted, total.adopted);
+        sum(counts.reprepared, total.reprepared);
+        sum(counts.notReady, total.notReady);
+        sum(counts.waited, total.waited);
+        sum(counts.unused, total.unused);
+        sum(counts.checks, total.checks);
+        sum(counts.checkNanoseconds, total.checkNanoseconds);
+        sum(counts.verifyDiffered, total.verifyDiffered);
+        sum(counts.requestNanoseconds, total.requestNanoseconds);
+        sum(counts.prepareNanoseconds, total.prepareNanoseconds);
+        sum(counts.waitNanoseconds, total.waitNanoseconds);
+        for (std::size_t index = 0; index < DrawInputSourceCount; ++index) {
+            sum(counts.sources[index], total.sources[index]);
+            sum(counts.sourceBytes[index], total.sourceBytes[index]);
+            sum(counts.sourceNanoseconds[index], total.sourceNanoseconds[index]);
+        }
+    });
     return counts;
 }
 
