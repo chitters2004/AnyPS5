@@ -108,6 +108,11 @@ Counters& counters() {
     return values;
 }
 
+void counted(std::atomic<std::uint64_t>& total, const char* scope, std::uint64_t amount = 1) {
+    total.fetch_add(amount, std::memory_order_relaxed);
+    PerformanceTrace::CountOwnedDraw(scope, amount);
+}
+
 constexpr std::array<const char*, PreparedRefusalCount> RefusalNames{"DrawInputPrep.refused_size", "DrawInputPrep.refused_inaccessible", "DrawInputPrep.refused_forget", "DrawInputPrep.refused_pending", "DrawInputPrep.refused_unwatched", "DrawInputPrep.refused_snapshot_changed", "DrawInputPrep.refused_failed"};
 constexpr std::array<const char*, DrawInputSourceCount> SourceNames{"DrawInputPrep.source_owned_reused", "DrawInputPrep.source_snapshot_reused", "DrawInputPrep.source_adopted", "DrawInputPrep.source_copied"};
 constexpr std::array<const char*, DrawInputSourceCount> SourceByteNames{"DrawInputPrep.bytes_owned_reused", "DrawInputPrep.bytes_snapshot_reused", "DrawInputPrep.bytes_adopted", "DrawInputPrep.bytes_copied"};
@@ -147,7 +152,7 @@ public:
     std::vector<PreparedRange> ranges;
     std::uint64_t refusedRanges = 0;
     std::array<std::uint64_t, PreparedRefusalCount> refusedBy{};
-    bool resolved = false;
+    bool settled = false;
     bool cancelled = false;
     bool waited = false;
 
@@ -186,9 +191,9 @@ public:
         }
     }
 
-    void Resolve() {
-        if (resolved) return;
-        resolved = true;
+    void Settle() {
+        if (settled) return;
+        settled = true;
         auto expected = JobState::Queued;
         if (state.compare_exchange_strong(expected, JobState::Cancelled, std::memory_order_acq_rel)) {
             cancelled = true;
@@ -198,7 +203,6 @@ public:
             waited = true;
             state.wait(JobState::Running, std::memory_order_acquire);
         }
-        static_cast<void>(state.load(std::memory_order_acquire));
     }
 
     void Await() {
@@ -210,12 +214,7 @@ public:
     }
 
     void Finish() {
-        auto expected = JobState::Queued;
-        if (state.compare_exchange_strong(expected, JobState::Cancelled, std::memory_order_acq_rel)) cancelled = true;
-        else if (expected == JobState::Running) {
-            waited = true;
-            state.wait(JobState::Running, std::memory_order_acquire);
-        }
+        Settle();
         std::uint64_t unusedRanges = 0;
         std::uint64_t preparedRanges = 0;
         if (!cancelled) {
@@ -225,22 +224,13 @@ public:
             }
         }
         auto& total = counters();
-        total.requests.fetch_add(1, std::memory_order_relaxed);
-        total.prepared.fetch_add(preparedRanges, std::memory_order_relaxed);
-        total.refused.fetch_add(cancelled ? 0 : refusedRanges, std::memory_order_relaxed);
-        total.unused.fetch_add(unusedRanges, std::memory_order_relaxed);
-        if (cancelled) total.notReady.fetch_add(1, std::memory_order_relaxed);
-        if (waited) total.waited.fetch_add(1, std::memory_order_relaxed);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.requests");
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.prepared", preparedRanges);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
-        for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) {
-            total.refusedBy[reason].fetch_add(refusedBy[reason], std::memory_order_relaxed);
-            PerformanceTrace::CountOwnedDraw(RefusalNames[reason], refusedBy[reason]);
-        }
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.unused", unusedRanges);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.not_ready", cancelled ? 1 : 0);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.waited", waited ? 1 : 0);
+        counted(total.requests, "DrawInputPrep.requests");
+        counted(total.prepared, "DrawInputPrep.prepared", preparedRanges);
+        counted(total.refused, "DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) counted(total.refusedBy[reason], RefusalNames[reason], refusedBy[reason]);
+        counted(total.unused, "DrawInputPrep.unused", unusedRanges);
+        counted(total.notReady, "DrawInputPrep.not_ready", cancelled ? 1 : 0);
+        counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
     }
 
 private:
@@ -409,8 +399,7 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
     preparers->Submit(job);
     if (timed) {
         const auto spent = nanosecondsSince(started);
-        counters().requestNanoseconds.fetch_add(spent, std::memory_order_relaxed);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.request_ns", spent);
+        counted(counters().requestNanoseconds, "DrawInputPrep.request_ns", spent);
     }
     return job;
 }
@@ -438,7 +427,7 @@ std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validByte
 std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable) {
     auto* job = currentPrepared.get();
     if (job == nullptr || job->context.device != context.device) return std::nullopt;
-    job->Resolve();
+    job->Settle();
     if (job->cancelled) return std::nullopt;
     const auto found = std::find_if(job->ranges.begin(), job->ranges.end(), [&](const PreparedRange& range) { return !range.consumed && range.address == address && range.bytes == bytes && range.readable == readable && range.use == use; });
     if (found == job->ranges.end()) return std::nullopt;
@@ -450,21 +439,17 @@ std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, c
     total.checks.fetch_add(1, std::memory_order_relaxed);
     if (timed) {
         const auto spent = nanosecondsSince(start);
-        total.checkNanoseconds.fetch_add(spent, std::memory_order_relaxed);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.check_ns", spent);
+        counted(total.checkNanoseconds, "DrawInputPrep.check_ns", spent);
     }
     if (!valid) {
         found->buffer.reset();
-        total.reprepared.fetch_add(1, std::memory_order_relaxed);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.reprepared");
+        counted(total.reprepared, "DrawInputPrep.reprepared");
         return std::nullopt;
     }
-    total.adopted.fetch_add(1, std::memory_order_relaxed);
-    PerformanceTrace::CountOwnedDraw("DrawInputPrep.adopted");
+    counted(total.adopted, "DrawInputPrep.adopted");
     static const bool verify = std::getenv("APS5_VERIFY_EARLY_DRAW_INPUTS") != nullptr;
     if (verify && std::memcmp(found->buffer->Bytes().data(), reinterpret_cast<const void*>(address), bytes) != 0) {
-        total.verifyDiffered.fetch_add(1, std::memory_order_relaxed);
-        PerformanceTrace::CountOwnedDraw("DrawInputPrep.verify_differed");
+        counted(total.verifyDiffered, "DrawInputPrep.verify_differed");
     }
     return AdoptedDrawInput{std::move(found->buffer), found->derived};
 }
@@ -477,12 +462,9 @@ bool DrawInputSourcesTimed() {
 void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64_t nanoseconds) {
     const auto index = static_cast<std::size_t>(source);
     auto& total = counters();
-    total.sources[index].fetch_add(1, std::memory_order_relaxed);
-    total.sourceBytes[index].fetch_add(bytes, std::memory_order_relaxed);
-    total.sourceNanoseconds[index].fetch_add(nanoseconds, std::memory_order_relaxed);
-    PerformanceTrace::CountOwnedDraw(SourceNames[index]);
-    PerformanceTrace::CountOwnedDraw(SourceByteNames[index], bytes);
-    PerformanceTrace::CountOwnedDraw(SourceTimeNames[index], nanoseconds);
+    counted(total.sources[index], SourceNames[index]);
+    counted(total.sourceBytes[index], SourceByteNames[index], bytes);
+    counted(total.sourceNanoseconds[index], SourceTimeNames[index], nanoseconds);
 }
 
 PreparedDrawInputCounts PreparedDrawInputCounters() {
