@@ -243,6 +243,9 @@ Outcome DrawOnce(Change change) {
     outcome.after = AgcDriver::Graphics::PreparedDrawInputCounters();
     outcome.hooks = HookRuns.load() - hooks;
     outcome.written = WrittenPixels();
+    std::uint64_t byReason = 0;
+    for (std::size_t reason = 0; reason < AgcDriver::Graphics::PreparedRefusalCount; ++reason) byReason += outcome.after.refusedBy[reason] - outcome.before.refusedBy[reason];
+    Require(byReason == outcome.refused(), "prepared draw inputs: the refusals by reason do not add up to the refused ranges");
     Require(Armed.load() == Change::None, "prepared draw inputs: the armed change never ran between preparation and commit");
     return outcome;
 }

@@ -87,6 +87,7 @@ struct Counters {
     std::atomic<std::uint64_t> ranges{0};
     std::atomic<std::uint64_t> prepared{0};
     std::atomic<std::uint64_t> refused{0};
+    std::array<std::atomic<std::uint64_t>, PreparedRefusalCount> refusedBy{};
     std::atomic<std::uint64_t> adopted{0};
     std::atomic<std::uint64_t> reprepared{0};
     std::atomic<std::uint64_t> notReady{0};
@@ -106,6 +107,7 @@ Counters& counters() {
     return values;
 }
 
+constexpr std::array<const char*, PreparedRefusalCount> RefusalNames{"DrawInputPrep.refused_size", "DrawInputPrep.refused_inaccessible", "DrawInputPrep.refused_forget", "DrawInputPrep.refused_pending", "DrawInputPrep.refused_unwatched", "DrawInputPrep.refused_snapshot_changed", "DrawInputPrep.refused_failed"};
 constexpr std::array<const char*, DrawInputSourceCount> SourceNames{"DrawInputPrep.source_owned_reused", "DrawInputPrep.source_snapshot_reused", "DrawInputPrep.source_adopted", "DrawInputPrep.source_copied"};
 constexpr std::array<const char*, DrawInputSourceCount> SourceByteNames{"DrawInputPrep.bytes_owned_reused", "DrawInputPrep.bytes_snapshot_reused", "DrawInputPrep.bytes_adopted", "DrawInputPrep.bytes_copied"};
 constexpr std::array<const char*, DrawInputSourceCount> SourceTimeNames{"DrawInputPrep.ns_owned_reused", "DrawInputPrep.ns_snapshot_reused", "DrawInputPrep.ns_adopted", "DrawInputPrep.ns_copied"};
@@ -142,6 +144,7 @@ public:
     std::atomic<JobState> state{JobState::Queued};
     std::vector<PreparedRange> ranges;
     std::uint64_t refusedRanges = 0;
+    std::array<std::uint64_t, PreparedRefusalCount> refusedBy{};
     bool resolved = false;
     bool cancelled = false;
     bool waited = false;
@@ -222,6 +225,10 @@ public:
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.requests");
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.prepared", preparedRanges);
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.refused", cancelled ? 0 : refusedRanges);
+        for (std::size_t reason = 0; reason < PreparedRefusalCount && !cancelled; ++reason) {
+            total.refusedBy[reason].fetch_add(refusedBy[reason], std::memory_order_relaxed);
+            PerformanceTrace::CountOwnedDraw(RefusalNames[reason], refusedBy[reason]);
+        }
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.unused", unusedRanges);
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.not_ready", cancelled ? 1 : 0);
         PerformanceTrace::CountOwnedDraw("DrawInputPrep.waited", waited ? 1 : 0);
@@ -230,28 +237,29 @@ public:
 private:
     std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage) {
         counters().ranges.fetch_add(1, std::memory_order_relaxed);
-        const auto refuse = [&]() -> std::optional<std::size_t> {
+        const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
             ++refusedRanges;
+            ++refusedBy[static_cast<std::size_t>(reason)];
             return std::nullopt;
         };
-        if (bytes == 0 || bytes > PreparedRangeLimit || bytes > std::numeric_limits<std::uint64_t>::max() - address) return refuse();
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return refuse();
+        if (bytes == 0 || bytes > PreparedRangeLimit || bytes > std::numeric_limits<std::uint64_t>::max() - address) return refuse(PreparedRefusal::Size);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return refuse(PreparedRefusal::Inaccessible);
         PreparedRange range;
         range.address = address;
         range.bytes = bytes;
         range.use = use;
         range.forget = GuestMemory::ForgetSerial();
-        if ((range.forget & 1u) != 0) return refuse();
+        if ((range.forget & 1u) != 0) return refuse(PreparedRefusal::Forget);
         range.registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto pending = Recorder::PendingWriteSnapshot();
-        if (Recorder::SnapshotOverlaps(pending.get(), address, bytes)) return refuse();
+        if (Recorder::SnapshotOverlaps(pending.get(), address, bytes)) return refuse(PreparedRefusal::Pending);
         range.generation = GuestMemory::CollectWrites(address, bytes);
-        if (range.generation == 0) return refuse();
+        if (range.generation == 0) return refuse(PreparedRefusal::Unwatched);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         range.buffer = std::make_shared<Buffer>(context, bytes, usage);
         GuestMemory::CopyGuestBytes(range.buffer->Bytes().data(), reinterpret_cast<const void*>(address), bytes);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (Recorder::PendingWriteSnapshot() != pending) return refuse();
+        if (Recorder::PendingWriteSnapshot() != pending) return refuse(PreparedRefusal::SnapshotChanged);
         ranges.push_back(std::move(range));
         return ranges.size() - 1u;
     }
@@ -320,6 +328,7 @@ private:
             } catch (...) {
                 job->ranges.clear();
                 ++job->refusedRanges;
+                ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
             }
             job->state.store(JobState::Done, std::memory_order_release);
             job->state.notify_all();
@@ -454,6 +463,7 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     counts.ranges = total.ranges.load(std::memory_order_relaxed);
     counts.prepared = total.prepared.load(std::memory_order_relaxed);
     counts.refused = total.refused.load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.refusedBy[reason] = total.refusedBy[reason].load(std::memory_order_relaxed);
     counts.adopted = total.adopted.load(std::memory_order_relaxed);
     counts.reprepared = total.reprepared.load(std::memory_order_relaxed);
     counts.notReady = total.notReady.load(std::memory_order_relaxed);
