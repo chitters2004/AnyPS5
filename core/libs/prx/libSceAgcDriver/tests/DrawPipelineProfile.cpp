@@ -106,6 +106,8 @@ void TestReport() {
     Check(Count(report, " read ranges") == 1, "pipeline read-range counters were printed more than once");
     Check(Count(report, " stores held") == 1, "pipeline held-store counters were printed more than once");
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
+    Check(report.find("; GPU waits 0.0 ms (in draws 0.0 ms); ") != std::string::npos, "the committer's GPU waits were not reported, or a test that waits for nothing reported some");
+    Check(Count(report, " GPU waits ") == 1, "the committer's GPU waits were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
 }
