@@ -563,7 +563,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout) {}
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(DynamicRendering(context)) {
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(DynamicRendering(context)), fixedPushSlots(FixedPushSlots(context)) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
@@ -607,8 +607,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         ValidateMeshLimits(context, mesh, invocations);
     }
     const auto pushStages = PushConstantStages(shaders);
-    Require(pushStages == 0 || context.limits.maxPushConstantsSize >= PushBlockBytes(dynamicRendering), "graphics push constant range exceeds device limit");
-    if (dynamicRendering) {
+    Require(pushStages == 0 || context.limits.maxPushConstantsSize >= PushBlockBytes(fixedPushSlots), "graphics push constant range exceeds device limit");
+    if (fixedPushSlots) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || (shader.pushConstantOffset >= PipelinePushSlotBytes) == (shader.stage == ShaderRecompiler::ShaderStage::Fragment), "a stage's push constants lie outside its push constant slot");
     }
     try {
@@ -648,8 +648,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         layoutInfo.flags = pixelLds || meshWindow || !resources.split ? 0 : VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT;
         layoutInfo.setLayoutCount = meshWindow ? 4u : pixelLds ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
-        layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
+        layoutInfo.pushConstantRangeCount = fixedPushSlots ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
+        layoutInfo.pPushConstantRanges = fixedPushSlots ? slots.data() : pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
@@ -1105,7 +1105,7 @@ void Pipeline::ContinueBackFaces(VkCommandBuffer commands, const State& state, c
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
     if (stages == 0) return;
-    if (dynamicRendering) {
+    if (fixedPushSlots) {
         context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, pushStagesOf(context), 0, PipelinePushSlotBytes, bytes.data());
         context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes, bytes.data() + PipelinePushSlotBytes);
         return;
@@ -1536,7 +1536,7 @@ std::uint32_t LibraryPartsOff() {
     static const std::uint32_t parts = [] {
         const char* text = std::getenv("APS5_DIAG_GPL_PARTS");
         if (text == nullptr || *text == '\0') return 0u;
-        constexpr std::array<std::pair<std::string_view, std::uint32_t>, 5> names{{{"rendering", LibraryPartRendering | LibraryPartPush}, {"sets", LibraryPartSets}, {"minlod", LibraryPartMinLod}, {"maint5", LibraryPartMaintenance5}, {"all", LibraryPartRendering | LibraryPartPush | LibraryPartSets | LibraryPartMinLod | LibraryPartMaintenance5}}};
+        constexpr std::array<std::pair<std::string_view, std::uint32_t>, 6> names{{{"rendering", LibraryPartRendering}, {"push", LibraryPartPush}, {"sets", LibraryPartSets}, {"minlod", LibraryPartMinLod}, {"maint5", LibraryPartMaintenance5}, {"all", LibraryPartRendering | LibraryPartPush | LibraryPartSets | LibraryPartMinLod | LibraryPartMaintenance5}}};
         std::uint32_t result = 0u;
         std::string_view rest(text);
         while (!rest.empty()) {
@@ -1544,10 +1544,10 @@ std::uint32_t LibraryPartsOff() {
             const auto name = rest.substr(0u, comma);
             rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1u);
             const auto found = std::ranges::find_if(names, [&](const auto& entry) { return entry.first == name; });
-            Require(found != names.end(), "APS5_DIAG_GPL_PARTS takes a comma list of rendering, sets, minlod, maint5 or all, not '" + std::string(name) + "'");
+            Require(found != names.end(), "APS5_DIAG_GPL_PARTS takes a comma list of rendering, push, sets, minlod, maint5 or all, not '" + std::string(name) + "'");
             result |= found->second;
         }
-        std::fprintf(stderr, "[gpl-parts] off:%s%s%s%s; every graphics pipeline is linked whole\n", (result & LibraryPartRendering) != 0u ? " rendering" : "", (result & LibraryPartSets) != 0u ? " sets" : "", (result & LibraryPartMinLod) != 0u ? " minlod" : "", (result & LibraryPartMaintenance5) != 0u ? " maint5" : "");
+        std::fprintf(stderr, "[gpl-parts] off:%s%s%s%s%s; every graphics pipeline is linked whole\n", (result & LibraryPartRendering) != 0u ? " rendering" : "", (result & LibraryPartPush) != 0u ? " push" : "", (result & LibraryPartSets) != 0u ? " sets" : "", (result & LibraryPartMinLod) != 0u ? " minlod" : "", (result & LibraryPartMaintenance5) != 0u ? " maint5" : "");
         return result;
     }();
     return parts;

@@ -426,6 +426,7 @@ enum LibraryPart : std::uint32_t {
 std::uint32_t LibraryPartsOff();
 
 inline bool DynamicRendering(const Context& context) { return context.graphicsPipelineLibrary && (context.libraryPartsOff & LibraryPartRendering) == 0u; }
+inline bool FixedPushSlots(const Context& context) { return context.graphicsPipelineLibrary && (context.libraryPartsOff & LibraryPartPush) == 0u; }
 
 inline VkShaderModule CreateShaderModule(const Context& context, const std::uint32_t* code, std::size_t bytes, const char* operation) {
     return CreateShaderModule(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule"), context.device, context.graphicsPipelineLibrary, code, bytes, operation);
