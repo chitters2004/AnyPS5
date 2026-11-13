@@ -600,7 +600,10 @@ jobs:
               for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in selected:
-                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
+                      words = [q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))]
+                      if "--build" in words or "--target" in words:
+                          continue  # a compile-must-fail test: its command builds its own target, which is meant not to compile, so it never joins the main build (ctest still runs it)
+                      for word in words:
                           name = os.path.basename(word.replace("\\", "/"))
                           for candidate in (name, name[:-4] if name.endswith(".exe") else name):
                               if candidate in known:
@@ -965,7 +968,10 @@ jobs:
               for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in selected:
-                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
+                      words = [q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))]
+                      if "--build" in words or "--target" in words:
+                          continue  # a compile-must-fail test: its command builds its own target, which is meant not to compile, so it never joins the main build (ctest still runs it)
+                      for word in words:
                           name = os.path.basename(word.replace("\\", "/"))
                           for candidate in (name, name[:-4] if name.endswith(".exe") else name):
                               if candidate in known:
@@ -1095,7 +1101,10 @@ jobs:
                                   break
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in chosen:
-                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
+                      words = [q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))]
+                      if "--build" in words or "--target" in words:
+                          continue  # a compile-must-fail test: its command builds its own target, which is meant not to compile, so it never joins the main build (ctest still runs it)
+                      for word in words:
                           word = word.replace("\\\\", "/").replace("\\", "/")
                           if os.path.isfile(word) and word.lower().endswith((".exe", ".dll", ".prx", ".py", ".cmake")) and os.path.abspath(word).replace("\\", "/").startswith(build_abs + "/"):
                               exes.add(word)
