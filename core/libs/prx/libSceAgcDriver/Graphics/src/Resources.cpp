@@ -321,6 +321,9 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     functions.mapMemory = context.Function<PFN_vkMapMemory>("vkMapMemory");
     functions.unmapMemory = context.Function<PFN_vkUnmapMemory>("vkUnmapMemory");
+    functions.createDescriptorUpdateTemplate = context.Function<PFN_vkCreateDescriptorUpdateTemplate>("vkCreateDescriptorUpdateTemplate");
+    functions.destroyDescriptorUpdateTemplate = context.Function<PFN_vkDestroyDescriptorUpdateTemplate>("vkDestroyDescriptorUpdateTemplate");
+    functions.updateDescriptorSetWithTemplate = context.Function<PFN_vkUpdateDescriptorSetWithTemplate>("vkUpdateDescriptorSetWithTemplate");
 }
 
 RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bool blending) : context(context) {

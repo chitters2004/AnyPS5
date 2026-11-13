@@ -152,6 +152,9 @@ struct DeviceFunctions {
     PFN_vkFreeMemory freeMemory = nullptr;
     PFN_vkMapMemory mapMemory = nullptr;
     PFN_vkUnmapMemory unmapMemory = nullptr;
+    PFN_vkCreateDescriptorUpdateTemplate createDescriptorUpdateTemplate = nullptr;
+    PFN_vkDestroyDescriptorUpdateTemplate destroyDescriptorUpdateTemplate = nullptr;
+    PFN_vkUpdateDescriptorSetWithTemplate updateDescriptorSetWithTemplate = nullptr;
 };
 
 // Per-thread count of vkGetDeviceProcAddr lookups made through Context::Function (the [vk] line).

@@ -4911,18 +4911,53 @@ public:
         std::map<std::pair<VkDescriptorSet, std::uint32_t>, std::uint32_t> written;
     };
     explicit DescriptorUpdates(Context& context) : context(context), previous(context.functions),
-        update(context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")) {
+        update(context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")),
+        createTemplate(context.Resolved(&DeviceFunctions::createDescriptorUpdateTemplate, "vkCreateDescriptorUpdateTemplate")),
+        updateTemplate(context.Resolved(&DeviceFunctions::updateDescriptorSetWithTemplate, "vkUpdateDescriptorSetWithTemplate")) {
         Require(active == nullptr, "nested descriptor update capture");
         if (previous != nullptr) functions = *previous;
         functions.updateDescriptorSets = captureUpdate;
+        functions.createDescriptorUpdateTemplate = captureCreateTemplate;
+        functions.updateDescriptorSetWithTemplate = captureTemplateUpdate;
         context.functions = &functions;
         active = this;
     }
     ~DescriptorUpdates() { context.functions = previous; active = nullptr; }
     std::vector<Contents> calls;
     std::uint32_t copies = 0;
+    std::uint32_t templated = 0;
+    Contents Since(std::size_t first) const {
+        Contents merged;
+        for (auto call = calls.begin() + static_cast<std::ptrdiff_t>(first); call != calls.end(); ++call) {
+            merged.buffers.insert(call->buffers.begin(), call->buffers.end());
+            merged.images.insert(call->images.begin(), call->images.end());
+            for (const auto& [key, count] : call->written) merged.written[key] += count;
+        }
+        return merged;
+    }
 
 private:
+    static VKAPI_ATTR VkResult VKAPI_CALL captureCreateTemplate(VkDevice device, const VkDescriptorUpdateTemplateCreateInfo* info, const VkAllocationCallbacks* allocator, VkDescriptorUpdateTemplate* handle) {
+        const auto result = active->createTemplate(device, info, allocator, handle);
+        if (result == VK_SUCCESS) active->templates[*handle].assign(info->pDescriptorUpdateEntries, info->pDescriptorUpdateEntries + info->descriptorUpdateEntryCount);
+        return result;
+    }
+    static VKAPI_ATTR void VKAPI_CALL captureTemplateUpdate(VkDevice device, VkDescriptorSet set, VkDescriptorUpdateTemplate handle, const void* data) {
+        Contents contents;
+        const auto* bytes = static_cast<const std::byte*>(data);
+        for (const auto& entry : active->templates.at(handle)) {
+            contents.written[{set, entry.dstBinding}] += entry.descriptorCount;
+            for (std::uint32_t element = 0; element < entry.descriptorCount; ++element) {
+                const auto key = std::pair{entry.dstBinding, entry.dstArrayElement + element};
+                const auto* at = bytes + entry.offset + element * entry.stride;
+                if (entry.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) std::memcpy(&contents.buffers[key], at, sizeof(VkDescriptorBufferInfo));
+                else std::memcpy(&contents.images[key], at, sizeof(VkDescriptorImageInfo));
+            }
+        }
+        active->calls.push_back(std::move(contents));
+        ++active->templated;
+        active->updateTemplate(device, set, handle, data);
+    }
     static VKAPI_ATTR void VKAPI_CALL captureUpdate(VkDevice device, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
         Contents contents;
         for (std::uint32_t i = 0; i < count; ++i) {
@@ -4942,63 +4977,104 @@ private:
     const DeviceFunctions* previous;
     DeviceFunctions functions{};
     PFN_vkUpdateDescriptorSets update;
+    PFN_vkCreateDescriptorUpdateTemplate createTemplate;
+    PFN_vkUpdateDescriptorSetWithTemplate updateTemplate;
+    std::map<VkDescriptorUpdateTemplate, std::vector<VkDescriptorUpdateTemplateEntry>> templates;
     static inline DescriptorUpdates* active = nullptr;
 };
 
-void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
-    auto context = device.GetContext();
-    DescriptorUpdates updates(context);
-    {
-        DescriptorCache cache(context);
-        context.descriptorCache = &cache;
-        Recorder snapshots(context);
-        snapshots.Activate();
-        ShaderRecompiler::RecompileResult program;
-        ShaderRecompiler::DescriptorBinding data{};
-        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
-        data.binding = 2;
-        data.count = 1;
-        data.guestDescriptor = {1, 2, 3, 4};
-        program.bindings.push_back(data);
-        data.binding = 7;
-        program.bindings.push_back(data);
-        ShaderRecompiler::DescriptorBinding sampler{};
-        sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
-        sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
-        sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
-        sampler.count = 2;
-        sampler.guestDescriptor.resize(8);
-        sampler.samplerDepthCompare = {false, false};
-        program.bindings.push_back(sampler);
-        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
-        ShaderResources resources(context, shader);
-        Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
-        const auto original = updates.calls.front();
-        Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
-        for (std::size_t allocation = 0; allocation < 2; ++allocation) {
-            const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
-            const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
-            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
-            Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
-            Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
-            const auto& actual = updates.calls.back();
-            Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
-            for (const auto& [key, before] : original.buffers) {
-                const auto after = actual.buffers.at(key);
-                const bool replaced = key.first == (allocation == 0 ? 2u : 7u);
-                const auto expected = replaced ? draw->snapshots.front().buffer->Handle() : before.buffer;
-                const auto expectedOffset = replaced ? draw->snapshots.front().offset : before.offset;
-                Require(after.buffer == expected && after.offset == expectedOffset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
-            }
-            for (const auto& [key, before] : original.images) {
-                const auto after = actual.images.at(key);
-                Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "snapshot update changed an image descriptor");
-            }
-        }
-        snapshots.Sync();
+template <typename Body>
+void bothBindingRowArms(Body body) {
+    const auto rows = RuntimeSwitches::Find("APS5_NO_BINDING_ROWS");
+    Require(rows.has_value(), "the binding row switch is not registered");
+    const bool before = RuntimeSwitches::Set(*rows);
+    for (const bool legacy : {false, true}) {
+        RuntimeSwitches::Assign(*rows, legacy);
+        body(legacy);
     }
-    recorder.Activate();
+    RuntimeSwitches::Assign(*rows, before);
+}
+
+void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
+    bothBindingRowArms([&](bool legacy) {
+        auto context = device.GetContext();
+        DescriptorUpdates updates(context);
+        {
+            DescriptorCache cache(context);
+            context.descriptorCache = &cache;
+            Recorder snapshots(context);
+            snapshots.Activate();
+            ShaderRecompiler::RecompileResult program;
+            ShaderRecompiler::DescriptorBinding data{};
+            data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+            data.binding = 2;
+            data.count = 1;
+            data.guestDescriptor = {1, 2, 3, 4};
+            program.bindings.push_back(data);
+            data.binding = 7;
+            program.bindings.push_back(data);
+            ShaderRecompiler::DescriptorBinding sampler{};
+            sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+            sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+            sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+            sampler.count = 2;
+            sampler.guestDescriptor.resize(8);
+            sampler.samplerDepthCompare = {false, false};
+            program.bindings.push_back(sampler);
+            const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            ShaderResources resources(context, shader);
+            Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
+            const auto original = updates.calls.front();
+            Require(original.buffers.size() == 2 && original.images.size() == 2, "descriptor test lacks mixed bindings and an image array");
+            for (std::size_t allocation = 0; allocation < 2; ++allocation) {
+                const std::array<std::uint32_t, 4> words{5, 6, 7, 8};
+                const ShaderResources::MovedBuffer moved{allocation, 0, 16, words};
+                const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+                Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
+                Require(updates.calls.size() == allocation + 2 && updates.copies == 0, "draw descriptors copied GPU memory or needed multiple updates");
+                Require(updates.templated == (legacy ? 0u : allocation + 1u), "draw descriptors did not take the selected binding path");
+                const auto& actual = updates.calls.back();
+                Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "snapshot update omitted unchanged descriptors");
+                for (const auto& [key, before] : original.buffers) {
+                    const auto after = actual.buffers.at(key);
+                    const bool replaced = key.first == (allocation == 0 ? 2u : 7u);
+                    const auto expected = replaced ? draw->snapshots.front().buffer->Handle() : before.buffer;
+                    const auto expectedOffset = replaced ? draw->snapshots.front().offset : before.offset;
+                    Require(after.buffer == expected && after.offset == expectedOffset && after.range == before.range, "snapshot update replaced the wrong buffer or changed its range");
+                }
+                for (const auto& [key, before] : original.images) {
+                    const auto after = actual.images.at(key);
+                    Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "snapshot update changed an image descriptor");
+                }
+            }
+            ShaderRecompiler::RecompileResult faulting;
+            faulting.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+            ShaderRecompiler::DescriptorBinding fault{};
+            fault.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            fault.role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+            fault.binding = 3;
+            fault.count = 1;
+            faulting.bindings.push_back(fault);
+            data.binding = 4;
+            faulting.bindings.push_back(data);
+            const CompiledShader faultShader{ShaderRecompiler::ShaderStage::Compute, &faulting, 0};
+            ShaderResources faultResources(context, faultShader);
+            BdaResources record(context);
+            const std::array<std::uint32_t, 4> words{9, 10, 11, 12};
+            const ShaderResources::MovedBuffer moved{1, 0, 16, words};
+            const auto first = updates.calls.size();
+            const auto draw = faultResources.PrepareDrawBindings(snapshots, std::span(&moved, 1), false, &record);
+            Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data beside a fault buffer did not create a draw snapshot");
+            const auto written = updates.Since(first);
+            const auto expectedFault = record.Fault();
+            const auto actualFault = written.buffers.at({3u, 0u});
+            Require(actualFault.buffer == expectedFault.buffer && actualFault.offset == expectedFault.offset && actualFault.range == expectedFault.range, "a draw's fault record did not reach its fault descriptor");
+            Require(written.buffers.at({4u, 0u}).buffer == draw->snapshots.front().buffer->Handle(), "a draw beside a fault buffer lost its snapshot");
+            snapshots.Sync();
+        }
+        recorder.Activate();
+    });
 }
 
 void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
@@ -5046,40 +5122,44 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
         images.imageSamplers.assign(elements, 0u);
         program.bindings.push_back(std::move(images));
     };
-    DescriptorUpdates updates(context);
-    {
-        DescriptorCache cache(context);
-        context.descriptorCache = &cache;
-        Recorder snapshots(context);
-        snapshots.Activate();
-        ShaderRecompiler::RecompileResult vertex, fragment;
-        ShaderRecompiler::DescriptorBinding data{};
-        data.kind = DescriptorKind::StorageBuffer;
-        data.role = DescriptorRole::FlattenedSrt;
-        data.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt);
-        data.count = 1;
-        data.guestDescriptor = {1, 2, 3, 4};
-        vertex.bindings.push_back(data);
-        addTable(vertex, ShaderRecompiler::RuntimeAbi::Stage::Main, 0u, 1u);
-        addTable(fragment, ShaderRecompiler::RuntimeAbi::Stage::Fragment, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 2u);
-        const ColorTarget target{};
-        ShaderResources resources(context, vertex, fragment, target, 0, 0);
-        Require(resources.SplitSets(), "a fragment image table did not get its own descriptor set");
-        const std::array<std::uint32_t, 4> movedWords{5, 6, 7, 8};
-        const ShaderResources::MovedBuffer moved{0, 0, 16, movedWords};
-        const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
-        Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
-        const auto& written = updates.calls.back().written;
-        const auto tableWrites = [&](VkDescriptorSet set) {
-            const auto it = written.find({set, ShaderRecompiler::RuntimeAbi::ImageTableBinding});
-            return it == written.end() ? 0u : it->second;
-        };
-        Require(tableWrites(draw->allocation.set) == 1u, "the draw snapshot wrote the wrong number of image table descriptors into the vertex set");
-        Require(tableWrites(draw->fragmentAllocation.set) == 2u, "the draw snapshot wrote the wrong number of image table descriptors into the fragment set");
-        snapshots.Sync();
-    }
-    ClearCachedTextures(context.device);
-    recorder.Activate();
+    bothBindingRowArms([&](bool legacy) {
+        DescriptorUpdates updates(context);
+        {
+            DescriptorCache cache(context);
+            context.descriptorCache = &cache;
+            Recorder snapshots(context);
+            snapshots.Activate();
+            ShaderRecompiler::RecompileResult vertex, fragment;
+            ShaderRecompiler::DescriptorBinding data{};
+            data.kind = DescriptorKind::StorageBuffer;
+            data.role = DescriptorRole::FlattenedSrt;
+            data.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::FlattenedSrt);
+            data.count = 1;
+            data.guestDescriptor = {1, 2, 3, 4};
+            vertex.bindings.push_back(data);
+            addTable(vertex, ShaderRecompiler::RuntimeAbi::Stage::Main, 0u, 1u);
+            addTable(fragment, ShaderRecompiler::RuntimeAbi::Stage::Fragment, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 2u);
+            const ColorTarget target{};
+            ShaderResources resources(context, vertex, fragment, target, 0, 0);
+            Require(resources.SplitSets(), "a fragment image table did not get its own descriptor set");
+            const std::array<std::uint32_t, 4> movedWords{5, 6, 7, 8};
+            const ShaderResources::MovedBuffer moved{0, 0, 16, movedWords};
+            const auto first = updates.calls.size();
+            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data did not create a draw snapshot");
+            Require(updates.templated == (legacy ? 0u : 2u), "the split draw sets did not take the selected binding path");
+            const auto written = updates.Since(first).written;
+            const auto tableWrites = [&](VkDescriptorSet set) {
+                const auto it = written.find({set, ShaderRecompiler::RuntimeAbi::ImageTableBinding});
+                return it == written.end() ? 0u : it->second;
+            };
+            Require(tableWrites(draw->allocation.set) == 1u, "the draw snapshot wrote the wrong number of image table descriptors into the vertex set");
+            Require(tableWrites(draw->fragmentAllocation.set) == 2u, "the draw snapshot wrote the wrong number of image table descriptors into the fragment set");
+            snapshots.Sync();
+        }
+        ClearCachedTextures(context.device);
+        recorder.Activate();
+    });
 }
 
 void imageTableFirstLayerRevalidateTests(const Device& device, Recorder& recorder) {

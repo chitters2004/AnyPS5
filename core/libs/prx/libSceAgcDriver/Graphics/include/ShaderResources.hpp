@@ -750,6 +750,22 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    struct BindingRowShape {
+        std::array<bool, 2> described{};
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<std::optional<std::uint32_t>, 2> variable;
+        std::array<VkDescriptorUpdateTemplate, 2> templates{};
+        std::size_t bufferWords = 0;
+        std::size_t words = 0;
+        std::vector<std::uint32_t> patchStart;
+        std::vector<std::uint32_t> patchPositions;
+    };
+    const BindingRowShape& bindingRowShape() const;
+    void buildBindingRowShape() const;
+    void resolveBindingRow(const DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, std::span<std::uint64_t> row) const;
+    mutable std::unique_ptr<BindingRowShape> rowShape;
+    mutable std::once_flag rowShapeOnce;
+    void noteDrawSetSizes(DrawSetSplit& split, std::size_t patched, std::size_t writes, const std::array<bool, 2>& described) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
