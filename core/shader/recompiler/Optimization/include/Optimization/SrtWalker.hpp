@@ -118,6 +118,7 @@ struct SrtRuntime {
     SrtImageViewGeneration imageViewGeneration = nullptr;
     SrtSnapshotCurrent snapshotCurrent = nullptr;
     bool fastCapture = false;
+    bool sizedReadLog = false;
 };
 
 struct SrtForceSyncScope {

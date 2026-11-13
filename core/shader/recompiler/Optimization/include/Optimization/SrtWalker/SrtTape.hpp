@@ -20,6 +20,7 @@ public:
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
     std::size_t Nodes() const { return nodes.size(); }
+    std::size_t Reads() const { return reads; }
 
 private:
     friend class SrtTapeCompiler;
@@ -52,6 +53,7 @@ private:
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    std::size_t reads = 0;
 };
 
 }

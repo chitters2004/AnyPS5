@@ -47,6 +47,7 @@
 #include "Optimization/include/Optimization/VectorWindowStoreEliminator.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
+#include "Optimization/include/Optimization/SrtWalker/SrtTape.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "Optimization/include/Optimization/TessellationLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
@@ -2141,11 +2142,14 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
+    const auto* tape = runtime.sizedReadLog ? Detail::SrtTape::For(plan) : nullptr;
+    if (tape != nullptr) capture.userDataUse.reads.reserve(tape->Reads());
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }
     traced.readTrace = &capture.readTrace;
+    if (tape != nullptr) capture.readTrace.otherReads.reserve(tape->Reads());
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
     auto& other = capture.readTrace.otherReads;
     if (other.size() > 1) {

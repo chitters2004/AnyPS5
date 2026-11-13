@@ -2711,6 +2711,49 @@ void verifySnapshotAllocationMoves() {
             "snapshot allocation moves: after the page holding T# was remapped during the capture, the snapshot kept the T# read before the remap");
 }
 
+void verifySizedReadLog() {
+    using namespace ShaderRecompiler;
+    alignas(256) static std::array<std::uint32_t, 64> block{};
+    alignas(16) static std::array<std::uint64_t, 2> pointer{};
+    block.fill(0u);
+    const auto blockAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block.data()));
+    pointer[0] = blockAddress;
+    for (const std::uint32_t offset : {0x20u, 0x60u}) {
+        const auto word = offset / 4u;
+        const auto base = blockAddress + 0x100u * (offset / 0x20u);
+        block[word] = static_cast<std::uint32_t>(base);
+        block[word + 1u] = static_cast<std::uint32_t>(base >> 32u);
+        block[word + 2u] = 0x100u;
+        block[word + 3u] = 0x00027facu;
+    }
+    const auto pointerAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(pointerAddress), static_cast<std::uint32_t>(pointerAddress >> 32u)};
+    const std::vector<std::uint32_t> code{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080602u, 0xfa000060u, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto request = FrontendRequest(code, userData);
+    const auto read = +[](void*, std::uint64_t address, std::uint32_t* value) {
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto capture = [&](bool sized) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.sizedReadLog = sized;
+        return CaptureResources(request, runtime);
+    };
+    const auto plain = capture(false);
+    const auto sized = capture(true);
+    const auto* tape = Detail::SrtTape::For(*sized->plan);
+    require(tape != nullptr && tape->Reads() == 11u, "sized read log: the pointer-chasing program's tape does not hold its eleven reads");
+    const auto& left = plain->userDataUse;
+    const auto& right = sized->userDataUse;
+    require(!left.reads.empty() && left.asBase == right.asBase && left.asValue == right.asValue && left.reads == right.reads, "sized read log: the sized capture's user-data use differs from the plain capture's");
+    require(right.reads.size() <= tape->Reads() && right.reads.capacity() == tape->Reads(), "sized read log: the sized capture's read log was not reserved to its tape's reads, or grew past them");
+    require(plain->readTrace.leaves == sized->readTrace.leaves && plain->readTrace.otherReads == sized->readTrace.otherReads, "sized read log: the sized capture's traced reads differ");
+    require(plain->snapshot.buffers.size() == sized->snapshot.buffers.size() && std::ranges::equal(plain->snapshot.buffers, sized->snapshot.buffers, [](const DescriptorValue& a, const DescriptorValue& b) { return a.dwords == b.dwords; }), "sized read log: the sized capture's buffers differ");
+}
+
 void verifyPlanFactsMaterialization() {
     using namespace ShaderRecompiler;
     {
@@ -12274,6 +12317,11 @@ int main(int argc, char** argv) {
             std::cout << "TYPE=0 image descriptor materialization passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--sized-read-log") {
+            verifySizedReadLog();
+            std::cout << "Sized read log passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--plan-facts") {
             verifyPlanFactsMaterialization();
             std::cout << "Plan facts materialization passed\n";
@@ -12292,6 +12340,7 @@ int main(int argc, char** argv) {
         verifyTypeZeroImageMaterialization();
         verifyUnsetFormatImageMaterialization();
         verifyPlanFactsMaterialization();
+        verifySizedReadLog();
         verifyOutOfRangeConstantReads();
         verifyDescriptorWebLaneIndexFold();
         verifyDescriptorWebTexelFold();

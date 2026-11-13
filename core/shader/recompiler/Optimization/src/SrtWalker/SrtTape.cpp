@@ -301,6 +301,7 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     auto tape = std::make_shared<SrtTape>();
     SrtTapeCompiler compiler(plan, *tape);
     if (!compiler.Build()) return nullptr;
+    tape->reads = static_cast<std::size_t>(std::count_if(tape->nodes.begin(), tape->nodes.end(), [](const Node& node) { return node.op == Op::Read || node.op == Op::ReadConstBuffer; }));
     return tape;
 }
 
