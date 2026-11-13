@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iterator>
@@ -21,6 +22,7 @@ int AgcDriver::SubmitMany(std::uint32_t* const* addresses, const std::uint32_t* 
     if (!addresses || !sizes) throw std::runtime_error("AGC driver: null multi-submit arrays");
     AgcDriver::GuestMemory::CheckRange(addresses, count * sizeof(*addresses), alignof(std::uint32_t*));
     AgcDriver::GuestMemory::CheckRange(sizes, count * sizeof(*sizes), alignof(std::uint32_t));
+    const AgcDriver::GuestBufferProfile::SubmitGroup group(count);
     for (std::uint32_t i = 0; i < count; ++i) {
         if (sizes[i] != 0 && addresses[i] == nullptr) {
             throw std::runtime_error("AGC driver: null multi-submit command buffer");

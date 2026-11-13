@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -3626,6 +3627,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 }
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
+    GuestBufferProfile::NoteRange(address, bytes, true);
     if (!noteWrite(address, bytes)) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3635,6 +3637,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
+    GuestBufferProfile::NoteRange(address, bytes, true);
     if (!noteWrite(address, bytes, false, value, value * std::int64_t{0x01010101})) return;
     const std::array ranges{std::pair{address, address + bytes}};
     publishPendingWrites(ranges);
@@ -3650,6 +3653,9 @@ void Recorder::NotePendingWordFill(std::uint64_t address, std::size_t bytes, std
 }
 
 void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    for (const auto& [begin, end] : ranges) {
+        if (end > begin) GuestBufferProfile::NoteRange(begin, static_cast<std::size_t>(end - begin), true);
+    }
     notePendingRanges(ranges, -1);
 }
 

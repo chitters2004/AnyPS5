@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
@@ -150,6 +151,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     work();
     const auto end = std::chrono::steady_clock::now();
     profile.*bucket += std::chrono::duration<double, std::milli>(end - begin).count();
+    if (bucket == &WorkerProfile::waitMs) GuestBufferProfile::NoteWaitNs(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count()));
     if (end - profile.reported > std::chrono::seconds(10)) {
         profile.reported = end;
         AgcDriver::ProfilePrint_nid_no_patch( "[gpu] worker at %.0f s: dispatch %.1f s, draw %.1f s, wait %.1f s\n", std::chrono::duration<double>(end - profile.start).count(), profile.dispatchMs / 1000, profile.drawMs / 1000, profile.waitMs / 1000);
@@ -222,6 +224,7 @@ void Driver::execute(const Submission& submission) {
         resetGraphics = true;
         return;
     }
+    const GuestBufferProfile::Execution profiledBuffer(submission.serial);
     QueueState* state = nullptr;
     {
         std::lock_guard lock(mutex);
@@ -288,6 +291,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (profilePackets) GuestBufferProfile::NotePacket(opcode, packet);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;

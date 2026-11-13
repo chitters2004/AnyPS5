@@ -78,6 +78,7 @@ private:
         bool draw = false;
         bool store = false;
         CommitKind kind = CommitKind::Other;
+        std::uint64_t guestBuffer = 0;
     };
     DrawPipeline() = default;
     void enqueue(Item item);

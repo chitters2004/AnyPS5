@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -649,6 +650,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
             ++flipsCounted;
             submission.flips.begin()->second->GpuReady(frame);
             lock.unlock();
+            GuestBufferProfile::NoteFlip();
             Graphics::NoteHostImportFrame();
             return;
         }
@@ -658,6 +660,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
                                 static_cast<const void*>(descriptor.addr), cpuFlip ? " (cpu flip)" : "");
 
         submission.received = ++eventSerial;
+        if (profile) GuestBufferProfile::NoteSubmitted(submission.serial, queue, descriptor.addr, descriptor.dw_num, queue == 0 && !submission.flips.empty(), cpuFlip);
         const auto now = std::chrono::steady_clock::now();
         submission.enqueuedAt = now;
         if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);

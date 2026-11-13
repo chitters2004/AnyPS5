@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -362,11 +363,22 @@ void DrawPipeline::enqueue(Item item) {
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
         resumeAt = 0;
-        fullWaitNs += elapsedNs(start);
+        const auto waited = elapsedNs(start);
+        fullWaitNs += waited;
+        if (profile) GuestBufferProfile::NoteWaitNs(waited);
         rethrowFailure();
     }
     depthSum += items.size();
     ++enqueued;
+    if (profile) {
+        item.guestBuffer = GuestBufferProfile::Current();
+        for (const auto& [begin, end] : item.reads) {
+            if (end > begin) GuestBufferProfile::NoteRange(begin, static_cast<std::size_t>(end - begin), false);
+        }
+        for (const auto& [begin, end] : item.writes) {
+            if (end > begin) GuestBufferProfile::NoteRange(begin, static_cast<std::size_t>(end - begin), true);
+        }
+    }
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
     items.push_back(std::move(item));
@@ -439,6 +451,7 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        std::uint64_t guestBuffer = 0;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -448,6 +461,7 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            guestBuffer = items.front().guestBuffer;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -466,6 +480,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        GuestBufferProfile::AddCommitterNs(guestBuffer, spent);
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
