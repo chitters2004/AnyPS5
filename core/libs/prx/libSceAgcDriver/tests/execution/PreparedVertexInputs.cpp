@@ -59,6 +59,8 @@ constexpr std::array<std::uint16_t, 3> Degenerate{0, 0, 0};
 std::byte* IndexBlock = nullptr;
 std::byte* VertexBlock = nullptr;
 std::byte* SpareBlock = nullptr;
+constexpr std::uint32_t NoLocation = 0x280u;
+alignas(256) std::array<std::uint32_t, 5> IndirectRecord{3, 1, 0, 0, 0};
 
 std::byte* AllocateWatched(std::size_t bytes) {
 #ifdef _WIN32
@@ -188,12 +190,16 @@ struct Outcome {
     std::uint64_t copied = 0;
 };
 
-Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit) {
+Outcome DrawPrepared(AgcDriver::VulkanDevice& device, const Programs& programs, const std::function<void()>& betweenPrepareAndCommit, bool indirect = false) {
     WriteIndices(Indices);
     WriteVertices(0.0f);
     Pixels.fill(Background);
     const auto state = DrawState();
-    const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+    AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+    if (indirect) {
+        draw.instanceCount = 0;
+        draw.indirect = AgcDriver::Pm4::DrawParameters::IndirectDraw{reinterpret_cast<std::uintptr_t>(IndirectRecord.data()), 0x25u, 20u, 20u, 1u, false, 0u, NoLocation, NoLocation, NoLocation, false, 0u};
+    }
     const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
     auto prepared = device.PrepareDrawInputsAhead(state, draw, programs.shaders);
     Require(prepared != nullptr, "prepared vertex inputs: the draw was not prepared ahead of its commit");
@@ -278,6 +284,16 @@ int main() {
         Require(afterHeld.sources[copiedSource] - beforeHeld.sources[copiedSource] == 2, "prepared vertex inputs: the cancelled draw did not copy its index and vertex ranges on the committer");
         Require(afterHeld.ranges == beforeHeld.ranges, "prepared vertex inputs: a preparer copied guest memory for a draw after its commit cancelled the job");
         Require(CenterCovered(), "prepared vertex inputs: the draw copied on the committer after the cancel did not cover the center");
+
+        const auto indirectUnchanged = DrawPrepared(*device, *programs, [] {}, true);
+        Print("indexed indirect draw, unchanged inputs", indirectUnchanged);
+        Require(indirectUnchanged.prepared == 2 && indirectUnchanged.adopted == 2 && indirectUnchanged.copied == 0, "prepared vertex inputs: an unchanged indexed indirect draw did not adopt its prepared index copy and vertex extent");
+        Require(indirectUnchanged.covered, "prepared vertex inputs: the indexed indirect draw with adopted inputs did not cover the center");
+
+        const auto indirectMoved = DrawPrepared(*device, *programs, [] { WriteVertices(4.0f); }, true);
+        Print("indexed indirect draw, vertices moved off the target after preparation", indirectMoved);
+        Require(indirectMoved.adopted == 1 && indirectMoved.reprepared == 1 && indirectMoved.copied == 1, "prepared vertex inputs: an indirect draw's vertex extent the CPU wrote after preparation was adopted, or its untouched index range was not");
+        Require(!indirectMoved.covered, "prepared vertex inputs: the indexed indirect draw used the vertices prepared before the CPU moved them off the target");
 
         const auto again = DrawPrepared(*device, *programs, [] {});
         Print("unchanged inputs again", again);
