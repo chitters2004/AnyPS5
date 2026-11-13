@@ -26,6 +26,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -210,10 +211,19 @@ std::size_t WrittenPixels(const std::vector<std::byte>& colors) {
     return written;
 }
 
-enum class Change { None, MoveVertices, Registry };
+enum class Change { None, MoveVertices, Registry, RegistryDuringStageA, RegistryDuringVerify };
 
 std::atomic<Change> Armed{Change::None};
 std::atomic<int> HookRuns{0};
+std::atomic<bool> StageAArmed{false};
+std::atomic<int> StageAMutations{0};
+
+void DuringStageA() {
+    if (!StageAArmed.exchange(false)) return;
+    std::thread guest([] { const GuestAllocations::Mutation mutation; });
+    guest.join();
+    StageAMutations.fetch_add(1);
+}
 
 void BeforeCommit(AgcDriver::Graphics::PreparedDrawInputs& prepared) {
     HookRuns.fetch_add(1);
@@ -226,6 +236,11 @@ void BeforeCommit(AgcDriver::Graphics::PreparedDrawInputs& prepared) {
         break;
     case Change::Registry:
         GuestAllocations::Mutation().Add(SpareBlock, Block, true, true, true);
+        break;
+    case Change::RegistryDuringStageA:
+        break;
+    case Change::RegistryDuringVerify:
+        StageAArmed.store(true);
         break;
     }
 }
@@ -253,6 +268,8 @@ struct Outcome {
         return total;
     }
     std::uint64_t stageAUnused() const { return after.stageAUnused - before.stageAUnused; }
+    std::uint64_t stageARefused() const { return after.stageARefused - before.stageARefused; }
+    std::uint64_t verifyRefused() const { return after.stageAVerifyRefused - before.stageAVerifyRefused; }
     std::uint64_t stagingPredicted() const { return after.stageAStagingPredicted - before.stageAStagingPredicted; }
     std::uint64_t stagingFallback() const { return after.stageAStagingFallback - before.stageAStagingFallback; }
     std::uint64_t stagingMispredicted() const { return after.stageAStagingMispredicted - before.stageAStagingMispredicted; }
@@ -271,6 +288,7 @@ Outcome DrawOnce(Change change, std::size_t vertexOffset, bool writeVerticesFirs
     Outcome outcome;
     outcome.before = AgcDriver::Graphics::PreparedUploadCounters();
     const auto hooks = HookRuns.load();
+    StageAArmed.store(change == Change::RegistryDuringStageA);
     Armed.store(change);
     Submit(Draw(writeVerticesFirst));
     AgcDriverWaitIdle_nid_postfix();
@@ -362,6 +380,17 @@ int main() {
         Require(remapped.stageAStale() == 1 && remapped.stageAAdopted() == 0 && remapped.regionsAdopted() == 0, "prepared uploads: a stage A or region prepared under another registry generation was adopted");
         Require(remapped.stageAStaleBy(AgcDriver::Graphics::PreparedStaleness::Registry) == 1, "prepared uploads: a stage A refused for a registry change was counted under another reason");
         Require(remapped.written == Width * Height, "prepared uploads: the draw built again after the registry changed left pixels cleared");
+
+        AgcDriver::Graphics::SetStageABuiltHook(&DuringStageA);
+        const auto duringStageA = DrawOnce(Change::RegistryDuringStageA, 0x2400);
+        Print("allocation registry changed while a preparer built stage A", duringStageA);
+        Require(StageAMutations.exchange(0) == 1 && duringStageA.stageARefused() == 1 && duringStageA.stageAAdopted() == 0, "prepared uploads: a stage A whose registry changed while a preparer built it was not refused");
+        Require(duringStageA.written == Width * Height && duringStageA.colors == remapped.colors, "prepared uploads: the draw whose stage A was refused differs from the same draw built on the committer");
+        const auto duringVerify = DrawOnce(Change::RegistryDuringVerify, 0x2400);
+        Print("allocation registry changed while the committer built stage A again to verify the adopted one", duringVerify);
+        Require(StageAMutations.exchange(0) == 1 && duringVerify.stageAAdopted() == 1 && duringVerify.verifyRefused() == 1, "prepared uploads: APS5_VERIFY_EARLY_UPLOADS did not count the committer's own stage A refused for a registry change as refused");
+        Require(duringVerify.written == Width * Height && duringVerify.colors == remapped.colors, "prepared uploads: the draw whose verification was refused differs from the same draw built on the committer");
+        AgcDriver::Graphics::SetStageABuiltHook(nullptr);
 
         const auto queued = DrawOnce(Change::None, 0x2500, true);
         Print("a queued write moving the vertices ahead of the draw", queued);

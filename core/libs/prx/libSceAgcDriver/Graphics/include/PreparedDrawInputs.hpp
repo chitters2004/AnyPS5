@@ -40,6 +40,7 @@ std::vector<std::uint32_t> DrawResourceCacheKey(const Context& context, const St
 std::shared_ptr<ShaderResources> PrepareDrawResourcesOffDevice(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool& predictedHit, bool& stagingPredicted);
 std::shared_ptr<ShaderResources> AdoptPreparedDrawResources(const Context& context, bool deviceStaging);
 void CountPreparedDrawResourcesVerified(bool differed);
+void CountPreparedDrawResourcesVerifyRefused();
 std::shared_ptr<Buffer> AdoptPreparedRegion(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<Buffer>* spare);
 
 class PreparedDrawInputsScope {
@@ -156,6 +157,7 @@ struct PreparedUploadCounts {
     std::uint64_t stageAFailed = 0;
     std::uint64_t stageAUnpinned = 0;
     std::uint64_t stageAVerifyDiffered = 0;
+    std::uint64_t stageAVerifyRefused = 0;
     std::uint64_t regionsPrepared = 0;
     std::uint64_t regionsAdopted = 0;
     std::uint64_t regionsReprepared = 0;

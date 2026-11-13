@@ -2499,8 +2499,12 @@ std::shared_ptr<ShaderResources> adoptedOrBuilt(const Context& context, const St
     lastDrawDeviceStaging.store(deviceStaging, std::memory_order_relaxed);
     if (auto prepared = AdoptPreparedDrawResources(context, deviceStaging)) {
         if (verifyEarlyUploads()) {
-            const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging, ShaderResources::PreparedOffDevice{});
-            CountPreparedDrawResourcesVerified(fresh.RegionSignature() != prepared->RegionSignature() || fresh.OffDeviceCopies() != prepared->OffDeviceCopies());
+            try {
+                const ShaderResources fresh(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, deviceStaging, ShaderResources::PreparedOffDevice{});
+                CountPreparedDrawResourcesVerified(fresh.RegionSignature() != prepared->RegionSignature() || fresh.OffDeviceCopies() != prepared->OffDeviceCopies());
+            } catch (const OffDeviceRefusal&) {
+                CountPreparedDrawResourcesVerifyRefused();
+            }
         }
         prepared->CompleteDraw(shaders);
         return prepared;
