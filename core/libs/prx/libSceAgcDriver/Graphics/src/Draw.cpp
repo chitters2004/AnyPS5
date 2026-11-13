@@ -1745,7 +1745,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             counted(DrawInputSource::OwnedReused);
             return copy;
         }
-        copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        copy.forgetSerial = GuestMemory::ForgetSerial();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
         if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, &copy.offset); });
         else if (owned) {
@@ -1760,7 +1760,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
         if (copy.generation != 0) {
-            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes, &spare); })) {
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, use, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), bytes, &spare); })) {
                 copy.buffer = std::move(adopted->slice.buffer);
                 copy.offset = adopted->slice.offset;
                 copy.derived = adopted->derived;
@@ -1796,7 +1796,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     auto* recorder = context.recorder;
     const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
     if (keep) {
-        copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        copy.forgetSerial = GuestMemory::ForgetSerial();
         copy.generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, readable); });
         std::uint32_t keptReadable = 0;
         if (copy.generation != 0) copy.buffer = InCommitPhase(CommitPhase::InputsReuse, [&] { return recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable, 0, &copy.offset); });
@@ -1809,11 +1809,11 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         copy.buffer = nullptr;
         copy.offset = 0;
         if (copy.generation != 0) {
-            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable, &spare); })) {
+            if (auto adopted = InCommitPhase(CommitPhase::InputsReuse, [&] { return AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), readable, &spare); })) {
                 copy.buffer = std::move(adopted->slice.buffer);
                 copy.offset = adopted->slice.offset;
                 copy.prepared = true;
-                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset);
+                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.forgetSerial, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset);
                 counted(DrawInputSource::Adopted);
                 return copy;
             }
@@ -1827,7 +1827,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         GuestMemory::Read(address, span.subspan(0, readable), 1);
         std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
     });
-    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset); });
+    if (keep) InCommitPhase(CommitPhase::InputsKeep, [&] { recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.forgetSerial, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable), false, copy.offset); });
     counted(DrawInputSource::Copied);
     return copy;
 }
@@ -1839,7 +1839,7 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
         if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.bytes, copy.owned, copy.buffer, use, derived, copy.offset);
         return;
     }
-    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.registryGeneration, copy.buffer, use, derived, false, copy.offset, copy.certified);
+    recorder->KeepDrawSnapshot(address, copy.bytes, copy.generation, copy.forgetSerial, copy.buffer, use, derived, false, copy.offset, copy.certified);
 }
 
 std::span<std::byte> DrawInputCopy::Bytes() const {
@@ -1878,7 +1878,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
         return indices;
     }
     const auto use = indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
-    const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto forgetSerial = GuestMemory::ForgetSerial();
     const auto generation = InCommitPhase(CommitPhase::InputsCollect, [&] { return GuestMemory::CollectWrites(address, bytes); });
     if (generation != 0 && InCommitPhase(CommitPhase::InputsIndexRange, [&] { return recorder.KnownHighestIndex(address, bytes, use, indices.highest); })) {
         indices.reused = true;
@@ -1886,7 +1886,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
         return indices;
     }
     indices.highest = InCommitPhase(CommitPhase::InputsLocal, [&] { return HighestDrawIndex(range, indexSize, skipRestart); });
-    InCommitPhase(CommitPhase::InputsKeep, [&] { recorder.KeepHighestIndex(address, bytes, use, generation, registryGeneration, indices.highest); });
+    InCommitPhase(CommitPhase::InputsKeep, [&] { recorder.KeepHighestIndex(address, bytes, use, generation, forgetSerial, indices.highest); });
     return indices;
 }
 

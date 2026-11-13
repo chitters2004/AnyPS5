@@ -71,7 +71,7 @@ struct DrawInputCopy {
     bool prepared = false;
     std::uint32_t derived = 0;
     std::uint64_t generation = 0;
-    std::uint64_t registryGeneration = 0;
+    std::uint64_t forgetSerial = 0;
     Recorder::OwnedDrawInputProof owned;
     std::span<std::byte> Bytes() const;
     std::optional<RangeCertificate> certified;
