@@ -2711,6 +2711,78 @@ void verifySnapshotAllocationMoves() {
             "snapshot allocation moves: after the page holding T# was remapped during the capture, the snapshot kept the T# read before the remap");
 }
 
+struct LinearTapeLog {
+    std::vector<std::pair<char, std::uint64_t>> events;
+};
+
+void verifyLinearTapeScopes() {
+    using namespace ShaderRecompiler;
+    alignas(256) static std::array<std::uint32_t, 64> block{};
+    alignas(16) static std::array<std::uint64_t, 2> pointer{};
+    block.fill(0u);
+    const auto blockAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block.data()));
+    pointer[0] = blockAddress;
+    for (const std::uint32_t offset : {0x20u, 0x60u}) {
+        const auto word = offset / 4u;
+        block[word] = static_cast<std::uint32_t>(blockAddress + 0x100u * (offset / 0x20u));
+        block[word + 1u] = static_cast<std::uint32_t>((blockAddress + 0x100u * (offset / 0x20u)) >> 32u);
+        block[word + 2u] = 0x100u;
+        block[word + 3u] = 0x00027facu;
+    }
+    const auto pointerAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(pointerAddress), static_cast<std::uint32_t>(pointerAddress >> 32u)};
+    const std::vector<std::uint32_t> code{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080602u, 0xfa000060u, 0xf4080702u, 0xfa000020u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x80070b00u, 0xbf810000u};
+    const auto plan = GetResourcePlan(FrontendRequest(code, userData));
+    require(Detail::SrtTape::For(*plan) != nullptr && plan->info.buffers.size() == 2u, "linear tape scopes: the pointer-chasing program has no tape or not two buffers");
+
+    const auto read = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        static_cast<LinearTapeLog*>(context)->events.emplace_back('r', address);
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto scope = +[](void* context, std::size_t bytes) -> std::uint64_t {
+        if (bytes != 0u) static_cast<LinearTapeLog*>(context)->events.emplace_back('s', bytes);
+        return 0u;
+    };
+    const auto capture = [&](bool linear, LinearTapeLog& log, SrtUserDataUse& use) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.descriptorScope = scope;
+        runtime.userContext = &log;
+        runtime.userDataUse = &use;
+        runtime.linearTape = linear;
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(*plan, runtime, snapshot);
+        return snapshot;
+    };
+    LinearTapeLog recursiveLog;
+    LinearTapeLog linearLog;
+    SrtUserDataUse recursiveUse;
+    SrtUserDataUse linearUse;
+    const auto runsBefore = Detail::SrtTape::LinearRuns();
+    const auto recursive = capture(false, recursiveLog, recursiveUse);
+    require(Detail::SrtTape::LinearRuns() == runsBefore, "linear tape scopes: a capture without the switch walked linearly");
+    const auto linear = capture(true, linearLog, linearUse);
+    require(Detail::SrtTape::LinearRuns() > runsBefore, "linear tape scopes: a capture with the switch did not walk linearly");
+    const auto scopedRead = [](const LinearTapeLog& log, std::uint64_t address) {
+        for (std::size_t i = 1; i < log.events.size(); ++i) {
+            if (log.events[i] == std::pair<char, std::uint64_t>{'r', address}) return log.events[i - 1].first == 's';
+        }
+        return false;
+    };
+    require(!scopedRead(recursiveLog, pointerAddress) && scopedRead(recursiveLog, blockAddress + 0x60u), "linear tape scopes: the fixture does not read the pointer unscoped and the descriptor scoped");
+    require(linearLog.events == recursiveLog.events, "linear tape scopes: the linear walk's reads and descriptor scopes differ from the recursive walk's");
+    require(linearUse.asBase == recursiveUse.asBase && linearUse.asValue == recursiveUse.asValue && linearUse.reads == recursiveUse.reads, "linear tape scopes: the linear walk's user-data use differs");
+    require(linear.buffers.size() == recursive.buffers.size() && std::ranges::equal(linear.buffers, recursive.buffers, [](const DescriptorValue& a, const DescriptorValue& b) { return a.dwords == b.dwords; }), "linear tape scopes: the linear walk's buffers differ");
+}
+
+void requireLinearWalks() {
+    if (std::getenv("APS5_LINEAR_SRT_TAPE") == nullptr) return;
+    require(ShaderRecompiler::Detail::SrtTape::LinearRuns() != 0u, "linear tape: APS5_LINEAR_SRT_TAPE is set but no capture walked a tape linearly");
+}
+
 void verifyPlanFactsMaterialization() {
     using namespace ShaderRecompiler;
     {
@@ -12274,6 +12346,11 @@ int main(int argc, char** argv) {
             std::cout << "TYPE=0 image descriptor materialization passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--linear-tape-scopes") {
+            verifyLinearTapeScopes();
+            std::cout << "Linear tape scopes passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--plan-facts") {
             verifyPlanFactsMaterialization();
             std::cout << "Plan facts materialization passed\n";
@@ -12281,6 +12358,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-phis") {
             verifyDescriptorPhis();
+            requireLinearWalks();
             return 0;
         }
         require(argc == 1, "unknown shader memory test arguments");
@@ -12292,6 +12370,7 @@ int main(int argc, char** argv) {
         verifyTypeZeroImageMaterialization();
         verifyUnsetFormatImageMaterialization();
         verifyPlanFactsMaterialization();
+        verifyLinearTapeScopes();
         verifyOutOfRangeConstantReads();
         verifyDescriptorWebLaneIndexFold();
         verifyDescriptorWebTexelFold();
@@ -12631,6 +12710,7 @@ int main(int argc, char** argv) {
         require(Recompile(request, *nullRootCapture)->poisonedSrtReads >= nullRootCapture->snapshot.nullRootReads, "a capture through a null user-data pointer is cacheable");
         verifyAllocationChurnSnapshot();
         verifySnapshotAllocationMoves();
+        requireLinearWalks();
         std::cout << "Shader memory capture, strict validation and deterministic replay passed\n";
         return 0;
     } catch (const std::exception& error) {

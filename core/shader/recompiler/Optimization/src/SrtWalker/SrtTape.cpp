@@ -6,6 +6,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -54,12 +55,78 @@ public:
         for (std::size_t block = 0; block < plan.controlFlow.size(); ++block) {
             if (plan.controlFlow[block].condition != nullptr) tape.conditionRoots[block] = compile(plan.controlFlow[block].condition, CleanContext, 0);
         }
-        return !malformed;
+        if (malformed) return false;
+        schedule();
+        return true;
     }
 
 private:
     using Op = SrtTape::Op;
     using Node = SrtTape::Node;
+    using Step = SrtTape::Step;
+    using StepKind = SrtTape::StepKind;
+
+    static bool lazy(Op op) { return op == Op::LogicalAnd || op == Op::LogicalOr || op == Op::ULessThan32 || op == Op::UGreaterThan32; }
+
+    static bool nestedAddress(Op op, std::uint8_t index) { return op == Op::Read || op == Op::ReadConstBuffer || (op == Op::Select && index == 0u); }
+
+    void schedule() {
+        const auto count = static_cast<std::uint32_t>(tape.nodes.size());
+        tape.rootBegin.assign(count, SrtTape::NoNode);
+        tape.rootEnd.assign(count, 0u);
+        for (const auto& node : tape.nodes) tape.maxBaseWord = std::max(tape.maxBaseWord, node.baseWord);
+        std::vector<std::uint32_t> stamp(count, SrtTape::NoNode);
+        struct Pending {
+            std::uint32_t node;
+            std::uint32_t depth;
+            std::uint32_t enter;
+            std::uint8_t next;
+        };
+        std::vector<Pending> stack;
+        const auto scheduleRoot = [&](std::uint32_t root) {
+            if (root >= count || tape.rootBegin[root] != SrtTape::NoNode) return;
+            tape.rootBegin[root] = static_cast<std::uint32_t>(tape.steps.size());
+            const auto visit = [&](std::uint32_t index, std::uint32_t depth) {
+                if (stamp[index] == root) return;
+                stamp[index] = root;
+                const auto& node = tape.nodes[index];
+                if (lazy(node.op)) {
+                    tape.steps.push_back({index, 0u, depth, StepKind::Lazy});
+                    return;
+                }
+                const bool children = node.argumentCount > (node.baseWord >= 0 ? 1u : 0u);
+                if (!children) {
+                    tape.steps.push_back({index, 0u, depth, StepKind::Exit});
+                    return;
+                }
+                stack.push_back({index, depth, static_cast<std::uint32_t>(tape.steps.size()), 0u});
+                tape.steps.push_back({index, 0u, depth, StepKind::Enter});
+            };
+            visit(root, 0u);
+            while (!stack.empty()) {
+                auto& top = stack.back();
+                const auto& node = tape.nodes[top.node];
+                if (top.next < node.argumentCount) {
+                    const auto argument = top.next++;
+                    if (argument == 0u && node.baseWord >= 0) continue;
+                    const auto depth = top.depth + (nestedAddress(node.op, argument) ? 1u : 0u);
+                    visit(node.arguments[argument], depth);
+                    continue;
+                }
+                tape.steps[top.enter].jump = static_cast<std::uint32_t>(tape.steps.size());
+                tape.steps.push_back({top.node, 0u, top.depth, StepKind::Exit});
+                stack.pop_back();
+            }
+            tape.rootEnd[root] = static_cast<std::uint32_t>(tape.steps.size());
+        };
+        for (const auto index : plan.materializationSources) {
+            const auto& source = plan.descriptorSources[index];
+            for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) scheduleRoot(tape.sourceDwords[index][dword]);
+        }
+        for (const auto root : tape.flatRoots) scheduleRoot(root);
+        for (const auto root : tape.conditionRoots) scheduleRoot(root);
+    }
+
     struct Context {
         const IrValue* mask;
         bool clean;
@@ -296,6 +363,19 @@ bool SrtTape::Verified() {
     return verified;
 }
 
+bool SrtTape::LinearVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_LINEAR_TAPE") != nullptr;
+    return verified;
+}
+
+namespace {
+std::atomic<std::uint64_t> linearRuns {0};
+}
+
+std::uint64_t SrtTape::LinearRuns() {
+    return linearRuns.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     if (!plan.srtPlanComplete) return nullptr;
     auto tape = std::make_shared<SrtTape>();
@@ -327,6 +407,8 @@ struct SrtTape::Frame {
     bool nullRoot = false;
     std::uint32_t addressDepth = 0;
     std::size_t descriptorBytes = 0;
+    bool linear = false;
+    bool failed = false;
 };
 
 bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const {
@@ -339,6 +421,7 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
     std::uint64_t value = 0;
     if (!compute(frame, nodes[index], value)) {
         frame.states[index] = 2;
+        frame.failed = true;
         return false;
     }
     frame.states[index] = 1;
@@ -402,6 +485,61 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
         if (nestedAddress) --frame.addressDepth;
         if (!ok) return false;
     }
+    return apply(frame, node, operand, origin, result);
+}
+
+bool SrtTape::evaluateRoot(Frame& frame, std::uint32_t root, std::uint64_t& result) const {
+    if (!frame.linear || frame.failed || root >= rootBegin.size() || rootBegin[root] == NoNode) return evaluate(frame, root, result);
+    const auto end = rootEnd[root];
+    for (auto position = rootBegin[root]; position < end; ++position) {
+        const auto& step = steps[position];
+        const auto state = frame.states[step.node];
+        if (state == 2) {
+            frame.failed = true;
+            return false;
+        }
+        if (step.kind == StepKind::Enter) {
+            if (state == 1) {
+                position = step.jump;
+                continue;
+            }
+            const auto& node = nodes[step.node];
+            if (node.baseWord >= 0) frame.runtime.userDataUse->asBase |= std::uint64_t {1} << node.baseWord;
+            continue;
+        }
+        if (state == 1) continue;
+        std::uint64_t value = 0;
+        frame.addressDepth = step.depth;
+        bool ok = false;
+        if (step.kind == StepKind::Lazy) {
+            ok = evaluate(frame, step.node, value);
+        } else {
+            const auto& node = nodes[step.node];
+            std::array<std::uint64_t, 5> operand{};
+            std::int32_t origin = -1;
+            for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
+                if (index == 0 && node.baseWord >= 0) {
+                    origin = node.baseWord;
+                    operand[0] = frame.runtime.userData[static_cast<std::size_t>(origin)];
+                    continue;
+                }
+                operand[index] = frame.values[node.arguments[index]];
+            }
+            ok = apply(frame, node, operand, origin, value);
+            frame.states[step.node] = ok ? 1u : 2u;
+            frame.values[step.node] = value;
+        }
+        frame.addressDepth = 0;
+        if (!ok) {
+            frame.failed = true;
+            return false;
+        }
+    }
+    result = frame.values[root];
+    return true;
+}
+
+bool SrtTape::apply(Frame& frame, const Node& node, const std::array<std::uint64_t, 5>& operand, std::int32_t origin, std::uint64_t& result) const {
     const auto a = operand[0];
     const auto b = operand[1];
     const auto c = operand[2];
@@ -586,6 +724,8 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         std::fill_n(states, nodes.size(), std::uint8_t {0});
     }
     Frame frame {runtime, values, states};
+    frame.linear = runtime.linearTape && runtime.userDataUse != nullptr && (maxBaseWord < 0 || static_cast<std::size_t>(maxBaseWord) < runtime.userData.size());
+    if (frame.linear) linearRuns.fetch_add(1u, std::memory_order_relaxed);
 
     struct Scratch {
         std::uint32_t attempt = 0;
@@ -643,7 +783,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             bool cleanEvaluable = false;
             {
                 const SrtBranchScope branch;
-                cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && conditionRoots[index] != NoNode && evaluate(frame, conditionRoots[index], condition);
+                cleanEvaluable = block.condition != nullptr && runtime.readSpecializationMemory != nullptr && conditionRoots[index] != NoNode && evaluateRoot(frame, conditionRoots[index], condition);
             }
             if (frame.nullRoot) return refuse();
             if (cleanEvaluable) {
@@ -667,7 +807,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
                 std::uint64_t word = 0;
                 frame.descriptorBytes = source.dwordCount > 1u ? static_cast<std::size_t>(source.dwordCount - dword) * sizeof(std::uint32_t) : 0u;
-                const bool ok = evaluate(frame, sourceDwords[sourceIndex][dword], word);
+                const bool ok = evaluateRoot(frame, sourceDwords[sourceIndex][dword], word);
                 frame.descriptorBytes = 0u;
                 if (!ok) return refuse();
                 value.dwords[dword] = static_cast<std::uint32_t>(word);
@@ -687,7 +827,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             trace->leafSlot = read.flatOffset;
         }
         std::uint64_t word = 0;
-        const bool ok = read.flatOffset < flattened.size() && evaluate(frame, flatRoots[slot], word);
+        const bool ok = read.flatOffset < flattened.size() && evaluateRoot(frame, flatRoots[slot], word);
         if (pure) trace->leaf = nullptr;
         if (!ok) return refuse();
         flattened[read.flatOffset] = static_cast<std::uint32_t>(word);

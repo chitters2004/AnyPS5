@@ -16,6 +16,8 @@ public:
     static const SrtTape* For(const IrResourcePlan& plan);
     static bool Enabled();
     static bool Verified();
+    static bool LinearVerified();
+    static std::uint64_t LinearRuns();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
@@ -44,14 +46,27 @@ private:
         std::uint64_t immediate = 0;
         const IrValue* source = nullptr;
     };
+    enum class StepKind : std::uint8_t { Enter, Exit, Lazy };
+    struct Step {
+        std::uint32_t node = 0;
+        std::uint32_t jump = 0;
+        std::uint32_t depth = 0;
+        StepKind kind = StepKind::Exit;
+    };
     struct Frame;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;
+    bool evaluateRoot(Frame& frame, std::uint32_t root, std::uint64_t& result) const;
     bool compute(Frame& frame, const Node& node, std::uint64_t& result) const;
+    bool apply(Frame& frame, const Node& node, const std::array<std::uint64_t, 5>& operand, std::int32_t origin, std::uint64_t& result) const;
 
     std::vector<Node> nodes;
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    std::vector<Step> steps;
+    std::vector<std::uint32_t> rootBegin;
+    std::vector<std::uint32_t> rootEnd;
+    std::int32_t maxBaseWord = -1;
 };
 
 }
