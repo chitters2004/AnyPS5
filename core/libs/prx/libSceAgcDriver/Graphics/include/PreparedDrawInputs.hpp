@@ -89,6 +89,7 @@ void SetDrawInputPreparers(unsigned count);
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared));
 void SetDrawInputPreparerHook(void (*hook)());
 void HoldDrawInputPreparers(bool held);
+void QuiesceDrawInputPreparers(VkDevice device);
 void ShutdownDrawInputPreparers();
 
 }

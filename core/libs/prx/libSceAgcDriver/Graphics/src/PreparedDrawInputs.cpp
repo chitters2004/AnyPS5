@@ -368,6 +368,11 @@ public:
         delete instance.exchange(nullptr, std::memory_order_acq_rel);
     }
 
+    static void Quiesce(VkDevice device) {
+        std::lock_guard lock(creation);
+        if (auto* existing = instance.load(std::memory_order_acquire); existing != nullptr) existing->quiesce(device);
+    }
+
     void Submit(const std::shared_ptr<PreparedDrawInputs>& job) {
         {
             std::lock_guard lock(mutex);
@@ -402,36 +407,62 @@ private:
                 if (!wake.wait(lock, token, [&] { return !jobs.empty() && !preparersHeld.load(std::memory_order_acquire); })) return;
                 job = jobs.front().lock();
                 jobs.pop_front();
+                if (job == nullptr) continue;
+                ++running;
             }
-            if (job == nullptr) continue;
-            auto expected = JobState::Queued;
-            if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) continue;
-            job->state.notify_all();
-            if (const auto hook = preparerHook.load(std::memory_order_acquire); hook != nullptr) hook();
-            const bool timed = DrawInputSourcesTimed();
-            const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            try {
-                job->Prepare();
-            } catch (...) {
-                job->ranges.clear();
-                ++job->refusedRanges;
-                ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
+            runJob(job);
+            job.reset();
+            {
+                std::lock_guard lock(mutex);
+                --running;
             }
-            if (timed) job->prepareNanoseconds = nanosecondsSince(started);
-            auto running = JobState::Running;
-            if (!job->state.compare_exchange_strong(running, JobState::Done, std::memory_order_acq_rel)) {
-                job->FinishAbandoned();
-                continue;
-            }
-            job->state.notify_all();
+            settled.notify_all();
         }
+    }
+
+    void quiesce(VkDevice device) {
+        std::unique_lock lock(mutex);
+        std::erase_if(jobs, [&](const std::weak_ptr<PreparedDrawInputs>& queued) {
+            const auto job = queued.lock();
+            if (job == nullptr) return true;
+            if (job->context.device != device) return false;
+            auto expected = JobState::Queued;
+            if (job->state.compare_exchange_strong(expected, JobState::Cancelled, std::memory_order_acq_rel)) job->state.notify_all();
+            return true;
+        });
+        settled.wait(lock, [&] { return running == 0; });
+    }
+
+    static void runJob(const std::shared_ptr<PreparedDrawInputs>& job) {
+        auto expected = JobState::Queued;
+        if (!job->state.compare_exchange_strong(expected, JobState::Running, std::memory_order_acq_rel)) return;
+        job->state.notify_all();
+        if (const auto hook = preparerHook.load(std::memory_order_acquire); hook != nullptr) hook();
+        const bool timed = DrawInputSourcesTimed();
+        const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        try {
+            job->Prepare();
+        } catch (...) {
+            job->ranges.clear();
+            ++job->refusedRanges;
+            ++job->refusedBy[static_cast<std::size_t>(PreparedRefusal::Failed)];
+        }
+        if (timed) job->prepareNanoseconds = nanosecondsSince(started);
+        auto running = JobState::Running;
+        if (!job->state.compare_exchange_strong(running, JobState::Done, std::memory_order_acq_rel)) {
+            job->FinishAbandoned();
+            return;
+        }
+        job->state.notify_all();
     }
 
     static inline std::atomic<Preparers*> instance{nullptr};
     static inline std::mutex creation;
     std::mutex mutex;
     std::condition_variable_any wake;
+    std::condition_variable_any settled;
     std::deque<std::weak_ptr<PreparedDrawInputs>> jobs;
+    std::size_t running = 0;
     std::vector<std::jthread> threads;
 };
 
@@ -598,6 +629,10 @@ void SetDrawInputPreparerHook(void (*hook)()) {
 void HoldDrawInputPreparers(bool held) {
     preparersHeld.store(held, std::memory_order_release);
     if (!held) Preparers::Release();
+}
+
+void QuiesceDrawInputPreparers(VkDevice device) {
+    Preparers::Quiesce(device);
 }
 
 void ShutdownDrawInputPreparers() {

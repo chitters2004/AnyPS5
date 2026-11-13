@@ -244,7 +244,7 @@ int main() {
     setenv("APS5_NO_DRAW_INPUTS_IN_PLACE", "1", 1);
 #endif
     try {
-        const auto device = OpenVulkanTestDevice();
+        auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         IndexBlock = AllocateWatched(Block);
         VertexBlock = AllocateWatched(Block);
@@ -435,6 +435,40 @@ int main() {
             Require(timing.waited != 0 || timing.waitNanoseconds == 0, "prepared vertex inputs: committer wait time was counted although no commit waited for a running preparation");
         } else {
             Require(timing.prepareNanoseconds == 0 && timing.waitNanoseconds == 0, "prepared vertex inputs: preparer or wait time was counted with draw profiling off");
+        }
+        {
+            using AgcDriver::Graphics::RuntimeSwitch;
+            namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+            static std::atomic<bool> entered{false};
+            static std::atomic<bool> released{false};
+            Switches::Assign(RuntimeSwitch::NoDrawInputAbandon, false);
+            AgcDriver::Graphics::SetDrawInputPreparerHook(+[] {
+                entered.store(true);
+                while (!released.load()) std::this_thread::yield();
+            });
+            WriteIndices(Indices);
+            const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
+            const auto before = AgcDriver::Graphics::PreparedDrawInputCounters();
+            auto job = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders);
+            Require(job != nullptr, "prepared vertex inputs: a draw was not prepared ahead of its commit for the teardown check");
+            while (!entered.load()) std::this_thread::yield();
+            {
+                const AgcDriver::Graphics::PreparedDrawInputsScope scope(std::move(job));
+            }
+            std::atomic<bool> destroyed{false};
+            std::jthread teardown([&] {
+                device.reset();
+                destroyed.store(true);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            const bool waitedForPreparer = !destroyed.load();
+            released.store(true);
+            teardown.join();
+            AgcDriver::Graphics::SetDrawInputPreparerHook(nullptr);
+            const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
+            std::printf("device teardown with an abandoned preparation still running: %s, %llu abandoned\n", waitedForPreparer ? "waited for the preparer" : "did not wait", static_cast<unsigned long long>(after.abandoned - before.abandoned));
+            Require(waitedForPreparer, "prepared vertex inputs: the device was destroyed while a preparer still ran an abandoned preparation on it");
+            Require(destroyed.load() && after.abandoned - before.abandoned == 1, "prepared vertex inputs: the preparation running at device teardown was not abandoned to its preparer");
         }
         std::puts("prepared vertex inputs: index and vertex copies made before the commit are adopted only while their ranges and the registry are unchanged");
         return 0;
