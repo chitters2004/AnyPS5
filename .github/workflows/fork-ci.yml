@@ -1135,7 +1135,9 @@ jobs:
               m["tests"] = {}
               for part in parts:
                   m["tests"].update(part["tests"])
-              m["total"] = sum(p["total"] or 0 for p in parts) if any(p["total"] is not None for p in parts) else None
+              # ctest -I n,,2 can hand a test to both shards; it then runs twice and counts once.
+              overlap = sum(len(p["tests"]) for p in parts) - len(m["tests"])
+              m["total"] = sum(p["total"] or 0 for p in parts) - overlap if any(p["total"] is not None for p in parts) else None
               m["per_test"] = collections.defaultdict(collections.Counter)
               m["vuid_ids"] = collections.Counter()
               m["replay"] = {}
