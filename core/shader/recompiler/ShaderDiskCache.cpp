@@ -6,6 +6,7 @@
 #include "ShaderCacheDirectory.hpp"
 #include "ThreadOwned.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/NanTestEliminator.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -1919,7 +1920,8 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    const auto version = ExactF32Arithmetic() ? Generated::SourceVersion : Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull;
+    return NanProofDisabled() ? version ^ 0xc2b2ae3d27d4eb4full : version;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {

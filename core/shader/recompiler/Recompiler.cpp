@@ -34,6 +34,7 @@
 #include "Optimization/include/Optimization/ConstantFolder.hpp"
 #include "Optimization/include/Optimization/DeadCodeEliminator.hpp"
 #include "Optimization/include/Optimization/DenormalFlushEliminator.hpp"
+#include "Optimization/include/Optimization/NanTestEliminator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
@@ -361,6 +362,18 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
     constexpr DenormalFlushEliminator denormalFlushEliminator;
     if (denormalFlushEliminator.Eliminate(program).removedFlushes != 0u) {
         deadCodeEliminator.Eliminate(program);
+    }
+
+    if (!NanProofDisabled()) {
+        constexpr NanTestEliminator nanTestEliminator;
+        const auto nanStats = nanTestEliminator.Eliminate(program);
+        RecordNanTests(request.shader.codeAddress, nanStats);
+        if (nanStats.removedTests != 0u) {
+            constantFolder.Fold(program);
+            ResolveControlFlowIdentities(program);
+            deadCodeEliminator.RemoveIdentities(program);
+            deadCodeEliminator.Eliminate(program);
+        }
     }
 
     if (inputInfo.vertex != nullptr) {
