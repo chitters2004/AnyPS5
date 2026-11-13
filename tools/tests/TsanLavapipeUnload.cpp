@@ -48,8 +48,7 @@ int main() {
         std::string line;
         bool lvp = false;
         while (std::getline(maps, line)) if (line.find("vulkan_lvp") != std::string::npos) lvp = true;
-        std::printf("DIAG lavapipe still mapped after probes: %s
-", lvp ? "yes" : "no");
+        std::printf("DIAG lavapipe still mapped after probes: %s\n", lvp ? "yes" : "no");
     }
     std::puts("the Vulkan driver was loaded and unloaded twice without a sanitizer abort");
     return 3;
