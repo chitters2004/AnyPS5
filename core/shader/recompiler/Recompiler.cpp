@@ -366,14 +366,16 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparat
 
     if (!NanProofDisabled()) {
         constexpr NanTestEliminator nanTestEliminator;
-        const auto nanStats = nanTestEliminator.Eliminate(program);
-        RecordNanTests(request.shader.codeAddress, nanStats);
+        const auto nanStarted = std::chrono::steady_clock::now();
+        auto nanStats = nanTestEliminator.Eliminate(program);
         if (nanStats.removedTests != 0u) {
             constantFolder.Fold(program);
             ResolveControlFlowIdentities(program);
             deadCodeEliminator.RemoveIdentities(program);
             deadCodeEliminator.Eliminate(program);
         }
+        nanStats.nanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - nanStarted).count());
+        RecordNanTests(request.shader.codeAddress, nanStats);
     }
 
     if (inputInfo.vertex != nullptr) {

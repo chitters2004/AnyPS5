@@ -9,6 +9,7 @@ namespace ShaderRecompiler {
 struct NanTestEliminationStats {
     std::uint32_t tests = 0;
     std::uint32_t removedTests = 0;
+    std::uint64_t nanoseconds = 0;
 };
 
 class NanTestEliminator {

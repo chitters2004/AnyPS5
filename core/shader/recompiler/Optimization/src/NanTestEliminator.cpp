@@ -181,6 +181,7 @@ namespace {
 
 std::atomic<std::uint64_t> totalTests{0};
 std::atomic<std::uint64_t> totalRemoved{0};
+std::atomic<std::uint64_t> totalNanoseconds{0};
 
 bool StatsLogged() {
     static const bool logged = std::getenv("APS5_NAN_PROOF_STATS") != nullptr;
@@ -192,12 +193,13 @@ bool StatsLogged() {
 void RecordNanTests(std::uint64_t codeAddress, const NanTestEliminationStats& stats) {
     totalTests.fetch_add(stats.tests, std::memory_order_relaxed);
     totalRemoved.fetch_add(stats.removedTests, std::memory_order_relaxed);
+    totalNanoseconds.fetch_add(stats.nanoseconds, std::memory_order_relaxed);
     if (!StatsLogged()) return;
-    std::fprintf(stderr, "[nan-proof] program 0x%llx f32 NaN tests %u removed %u kept %u\n", static_cast<unsigned long long>(codeAddress), stats.tests, stats.removedTests, stats.tests - stats.removedTests);
+    std::fprintf(stderr, "[nan-proof] program 0x%llx f32 NaN tests %u removed %u kept %u time %llu us\n", static_cast<unsigned long long>(codeAddress), stats.tests, stats.removedTests, stats.tests - stats.removedTests, static_cast<unsigned long long>(stats.nanoseconds / 1000u));
 }
 
 NanTestEliminationStats NanTestTotals() {
-    return {static_cast<std::uint32_t>(totalTests.load(std::memory_order_relaxed)), static_cast<std::uint32_t>(totalRemoved.load(std::memory_order_relaxed))};
+    return {static_cast<std::uint32_t>(totalTests.load(std::memory_order_relaxed)), static_cast<std::uint32_t>(totalRemoved.load(std::memory_order_relaxed)), totalNanoseconds.load(std::memory_order_relaxed)};
 }
 
 NanTestEliminationStats NanTestEliminator::Eliminate(IrProgram& program) const {
