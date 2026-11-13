@@ -5672,6 +5672,89 @@ void drawSnapshotEvictionTests(const Device& device) {
     Require(cache.ReusableDrawSnapshot(address, 16) == nullptr && cache.ReusableDrawSnapshot(address, 16) == nullptr, "a snapshot outlived a CPU store");
 }
 
+void proofMappingBench() {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr int calls = 5000000;
+    constexpr double drawsPerPresent = 3085;
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto forget = ForgetSerial();
+    const bool global = RuntimeSwitches::Set(RuntimeSwitch::GlobalProofChecks);
+    volatile std::uint64_t sink = 0;
+    const auto time = [&](bool globalChecks, std::size_t bytes) {
+        RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, globalChecks);
+        const auto begin = std::chrono::steady_clock::now();
+        for (int i = 0; i < calls; ++i) {
+            const auto at = 0x40000000ull + static_cast<std::uint64_t>(i & 1023) * block;
+            sink = sink + MappingHolds(MappingSite::PreparedRange, registry, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), forget, at, bytes);
+        }
+        return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - begin).count() / calls;
+    };
+    for (int round = 0; round < 3; ++round) {
+        const auto old = time(true, 4096);
+        const auto small = time(false, 4096);
+        const auto wide = time(false, 4 * block);
+        std::cout << "MappingHolds ns/call: global " << old << ", range 4 KiB " << small << ", range 256 KiB " << wide
+                  << "; added us/present at " << drawsPerPresent << " draws x 1/2/4 checks: " << (small - old) * drawsPerPresent / 1000 << " / " << 2 * (small - old) * drawsPerPresent / 1000 << " / " << 4 * (small - old) * drawsPerPresent / 1000 << "\n";
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, global);
+    if (sink == 0) std::cout << "\n";
+}
+
+void proofMappingTests() {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::size_t block = 65536;
+    constexpr std::size_t bytes = 4 * block;
+    void* memory = WriteWatched() ? AllocateWatched(bytes, block) : nullptr;
+    if (memory == nullptr) {
+        std::cout << "write watching unavailable: proof mapping checks not tested\n";
+        return;
+    }
+    struct Release {
+        void* memory;
+        ~Release() { ReleaseWatched(memory, bytes); }
+    } release{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    auto* nearBlock = reinterpret_cast<void*>(address);
+    auto* otherBlock = reinterpret_cast<void*>(address + 2 * block);
+    struct Restore {
+        bool global = RuntimeSwitches::Set(RuntimeSwitch::GlobalProofChecks);
+        std::vector<void*> added;
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, global);
+            GuestAllocations::Mutation mutation;
+            for (auto* at : added) mutation.Remove(at);
+        }
+    } restore;
+    const auto registry = [] { return GuestAllocations::GuestAllocationsGeneration_nid_postfix(); };
+    const auto holds = [&](std::uint64_t keptRegistry, std::uint64_t keptForget) { return MappingHolds(MappingSite::PreparedRange, keptRegistry, registry(), keptForget, address, 16); };
+    const auto add = [&](void* at) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(at, block, true, true, false);
+        restore.added.push_back(at);
+    };
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, false);
+    auto keptRegistry = registry();
+    auto keptForget = ForgetSerial();
+    const auto start = MappingCountsFor(MappingSite::PreparedRange);
+    Require(holds(keptRegistry, keptForget), "an unchanged mapping did not hold");
+    add(otherBlock);
+    Require(holds(keptRegistry, keptForget), "a registry change outside the range broke the proof");
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, true);
+    Require(!holds(keptRegistry, keptForget), "APS5_GLOBAL_PROOF_CHECKS kept a proof across a registry change");
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, false);
+    add(nearBlock);
+    Require(!holds(keptRegistry, keptForget), "a registry change over the range kept the proof");
+    keptRegistry = registry();
+    keptForget = ForgetSerial();
+    Require(holds(keptRegistry, keptForget), "a proof taken after the change did not hold");
+    Require(!holds(keptRegistry, keptForget | 1u), "a proof taken while a forget was being stored held");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(address + 8, 4);
+    Require(!holds(keptRegistry, keptForget), "a decommit inside the range kept the proof");
+    const auto end = MappingCountsFor(MappingSite::PreparedRange);
+    Require(end.held - start.held == 2 && end.avoided - start.avoided == 1 && end.dropped - start.dropped == 4, "the mapping counters do not match the checks: held " + std::to_string(end.held - start.held) + ", avoided " + std::to_string(end.avoided - start.avoided) + ", dropped " + std::to_string(end.dropped - start.dropped));
+}
+
 void drawSnapshotForgetTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t block = 65536;
@@ -6042,15 +6125,25 @@ void ownedDrawInputTests(const Device& device, Recorder& recorder) {
     keep(afterPending);
     Require(copy().reused == reusable, "the copy after a pending writer was not kept");
     alignas(64) static std::byte other[64];
-    {
-        GuestAllocations::Mutation mutation;
-        mutation.Add(other, sizeof(other), true, true, true);
-    }
-    {
+    const auto mutateElsewhere = [&] {
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Add(other, sizeof(other), true, true, true);
+        }
         GuestAllocations::Mutation mutation;
         mutation.Remove(other);
-    }
-    Require(!copy().reused, "an owned input outlived a registry mutation");
+    };
+    const bool globalChecks = RuntimeSwitches::Set(RuntimeSwitch::GlobalProofChecks);
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, false);
+    const auto avoidedBefore = MappingCountsFor(MappingSite::OwnedProof).avoided;
+    mutateElsewhere();
+    Require(copy().reused == reusable, "a registry mutation outside an owned input's range dropped it");
+    Require(MappingCountsFor(MappingSite::OwnedProof).avoided == avoidedBefore + (reusable ? 1 : 0), "an owned input kept across a registry mutation elsewhere was not counted as avoided");
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, true);
+    mutateElsewhere();
+    const bool keptUnderGlobal = copy().reused;
+    RuntimeSwitches::Assign(RuntimeSwitch::GlobalProofChecks, globalChecks);
+    Require(!keptUnderGlobal, "an owned input outlived a registry mutation under APS5_GLOBAL_PROOF_CHECKS");
 #ifdef _WIN32
     const auto beforeCollect = copy();
     keep(beforeCollect);
@@ -15870,6 +15963,16 @@ int main(int argc, char** argv) {
         LibcTerminate_nid_no_patch(1);
     });
     {
+        if (argc == 2 && std::string_view(argv[1]) == "--proof-mapping-only") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) return 77;
+            proofMappingTests();
+            std::cout << "proof mapping tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--proof-mapping-bench") {
+            proofMappingBench();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--collect-mapping-history-only") {
             if (!collectMappingHistoryTests()) return 77;
             std::cout << "collect mapping history tests passed\n";
@@ -16439,6 +16542,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--draw-snapshot-cap-only") {
             drawSnapshotCapTests(device, recorder);
             drawSnapshotForgetTests(device);
+            proofMappingTests();
             containingSnapshotTests(device);
             unwrittenSnapshotTests(device);
             drawSnapshotUploadTests(device, recorder);
@@ -16499,6 +16603,7 @@ int main(int argc, char** argv) {
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
         drawSnapshotForgetTests(device);
+        proofMappingTests();
         paddedVertexSnapshotTests(device);
         containingSnapshotTests(device);
         unwrittenSnapshotTests(device);
