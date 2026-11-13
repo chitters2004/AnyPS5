@@ -144,49 +144,6 @@ std::vector<std::uint32_t> CollapseBlockBallots(std::span<const std::uint32_t> s
     return collapsed;
 }
 
-void RegisterFullPassesWithoutFolding(spvtools::Optimizer& optimizer) {
-    optimizer.RegisterPass(spvtools::CreateWrapOpKillPass())
-        .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateMergeReturnPass())
-        .RegisterPass(spvtools::CreateInlineExhaustivePass())
-        .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreatePrivateToLocalPass())
-        .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-        .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
-        .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
-        .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-        .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateLoopUnrollPass(true))
-        .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateRedundancyEliminationPass())
-        .RegisterPass(spvtools::CreateCombineAccessChainsPass())
-        .RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
-        .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
-        .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-        .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateSSARewritePass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateVectorDCEPass())
-        .RegisterPass(spvtools::CreateDeadInsertElimPass())
-        .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateIfConversionPass())
-        .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
-        .RegisterPass(spvtools::CreateReduceLoadSizePass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-        .RegisterPass(spvtools::CreateBlockMergePass())
-        .RegisterPass(spvtools::CreateRedundancyEliminationPass())
-        .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateBlockMergePass());
-}
-
 std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::uint32_t> spirv, std::uint32_t vulkanVersion, std::uint32_t spirvVersion, bool allowOffsetTextureOperand, bool optimize, bool specialize) {
     spv_target_env environment;
     const auto apiVersion = vulkanVersion & ~0xfffu;
@@ -234,18 +191,55 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirvInline(std::span<const std::u
     const bool full = mode != nullptr && std::string(mode) == "full";
     if (full && allowFolding) {
         optimizer.RegisterPerformancePasses(true);
-    } else if (full) {
-        RegisterFullPassesWithoutFolding(optimizer);
     } else {
-        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
+        optimizer.RegisterPass(spvtools::CreateWrapOpKillPass())
+            .RegisterPass(spvtools::CreateDeadBranchElimPass());
+        if (full) {
+            optimizer.RegisterPass(spvtools::CreateMergeReturnPass())
+                .RegisterPass(spvtools::CreateInlineExhaustivePass())
+                .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
+        }
+        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true))
             .RegisterPass(spvtools::CreatePrivateToLocalPass())
-            .RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
-            .RegisterPass(spvtools::CreateLocalMultiStoreElimPass());
-        if (allowFolding) optimizer.RegisterPass(spvtools::CreateCCPPass());
-        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
-            .RegisterPass(spvtools::CreateRedundancyEliminationPass())
+            .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+            .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
             .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+            .RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
+            .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
+            .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+            .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
+            .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+            .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
+            .RegisterPass(spvtools::CreateAggressiveDCEPass(true));
+        if (allowFolding) optimizer.RegisterPass(spvtools::CreateCCPPass());
+        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
+        if (full) optimizer.RegisterPass(spvtools::CreateLoopUnrollPass(true));
+        optimizer.RegisterPass(spvtools::CreateDeadBranchElimPass())
+            .RegisterPass(spvtools::CreateRedundancyEliminationPass());
+        if (full) optimizer.RegisterPass(spvtools::CreateCombineAccessChainsPass());
+        if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
+        if (full) {
+            optimizer.RegisterPass(spvtools::CreateScalarReplacementPass(ScalarReplacementLimit))
+                .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
+                .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+                .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
+                .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+                .RegisterPass(spvtools::CreateSSARewritePass())
+                .RegisterPass(spvtools::CreateAggressiveDCEPass(true))
+                .RegisterPass(spvtools::CreateVectorDCEPass())
+                .RegisterPass(spvtools::CreateDeadInsertElimPass())
+                .RegisterPass(spvtools::CreateDeadBranchElimPass())
+                .RegisterPass(spvtools::CreateIfConversionPass())
+                .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
+                .RegisterPass(spvtools::CreateReduceLoadSizePass());
+        }
+        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true))
             .RegisterPass(spvtools::CreateBlockMergePass());
+        if (full) {
+            optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass())
+                .RegisterPass(spvtools::CreateDeadBranchElimPass())
+                .RegisterPass(spvtools::CreateBlockMergePass());
+        }
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
     }
     // Validating after every pass costs more than the passes on large shaders; the result is validated below.
