@@ -90,6 +90,7 @@ namespace {
 std::mutex reachabilityMutex;
 void* reachabilityCallback = nullptr;
 void* reachabilityUserdata = nullptr;
+bool reachabilityPending = false;
 std::mutex requestMutex;
 std::unordered_set<int> liveRequests;
 
@@ -871,6 +872,17 @@ int APS5_VABI sceNpCheckCallback(void) {
     for (const auto& entry : callbacksA) {
         if (entry.pending) entry.callback(USER_SERVICE_INITIAL_USER_ID, NP_STATE_SIGNED_OUT, entry.userdata);
     }
+    NpReachabilityStateCallback reachability = nullptr;
+    void* reachabilityData = nullptr;
+    {
+        std::lock_guard lock(reachabilityMutex);
+        if (reachabilityPending) {
+            reachability = reinterpret_cast<NpReachabilityStateCallback>(reachabilityCallback);
+            reachabilityData = reachabilityUserdata;
+        }
+        reachabilityPending = false;
+    }
+    if (reachability) reachability(USER_SERVICE_INITIAL_USER_ID, NP_REACHABILITY_STATE_UNAVAILABLE, reachabilityData);
     return 0;
 }
 
@@ -1083,6 +1095,7 @@ int APS5_VABI sceNpRegisterNpReachabilityStateCallback(void* callback, void* use
     if (reachabilityCallback) return SCE_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
     reachabilityCallback = callback;
     reachabilityUserdata = userdata;
+    reachabilityPending = true;
     return 0;
 }
 

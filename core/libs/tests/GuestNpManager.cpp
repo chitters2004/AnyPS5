@@ -73,9 +73,13 @@ void APS5_VABI AbortingGamePresenceCallback(const void*, const void*, void*) {
     std::abort();
 }
 
-void APS5_VABI AbortingReachabilityCallback(int, std::uint32_t, void*) {
-    std::fprintf(stderr, "NpManager: the reachability callback was called\n");
-    std::abort();
+StateCall reachabilityCall;
+
+void APS5_VABI RecordingReachabilityCallback(int userId, std::uint32_t state, void* userdata) {
+    ++reachabilityCall.calls;
+    reachabilityCall.userId = userId;
+    reachabilityCall.state = state;
+    reachabilityCall.userdata = userdata;
 }
 
 struct SelfUnregister {
@@ -106,16 +110,20 @@ void CheckStateCallbacksA() {
     Require(ids[0] >= 1 && ids[0] <= 8, "state callback id outside 1..8");
     Require(sceNpRegisterStateCallbackA(reinterpret_cast<NpStateCallbackA>(callbacks[0]), &userdata[1]) == AlreadyRegistered, "duplicate state callback");
     Require(stateCallsA[0].calls == 0, "registering calls the state callback");
-    Require(sceNpRegisterNpReachabilityStateCallback(reinterpret_cast<void*>(&AbortingReachabilityCallback), nullptr) == 0,
+    Require(sceNpRegisterNpReachabilityStateCallback(reinterpret_cast<void*>(&RecordingReachabilityCallback), &userdata[5]) == 0,
         "registering the reachability callback");
+    Require(reachabilityCall.calls == 0, "registering calls the reachability callback");
     sceNpRegisterGamePresenceCallback(nullptr, nullptr);
     sceNpRegisterGamePresenceCallback(reinterpret_cast<void*>(&AbortingGamePresenceCallback), &userdata[0]);
 
     Require(sceNpCheckCallback() == 0, "sceNpCheckCallback failed");
     Require(SignedOutOnce(stateCallsA[0], &userdata[0]), "sceNpCheckCallback must deliver SIGNED_OUT once");
+    Require(reachabilityCall.calls == 1 && reachabilityCall.userId == InitialUserId && reachabilityCall.state == 0 && reachabilityCall.userdata == &userdata[5],
+        "sceNpCheckCallback must deliver the unavailable reachability state once");
     Require(sceNpUnregisterNpReachabilityStateCallback() == 0, "unregistering the reachability callback");
     Require(sceNpCheckCallback() == 0, "second sceNpCheckCallback failed");
     Require(stateCallsA[0].calls == 1, "the second sceNpCheckCallback delivered the state again");
+    Require(reachabilityCall.calls == 1, "the second sceNpCheckCallback delivered the reachability state again");
     for (int index = 1; index < 8; ++index) {
         ids[index] = sceNpRegisterStateCallbackA(reinterpret_cast<NpStateCallbackA>(callbacks[index]), &userdata[index]);
         Require(ids[index] >= 1 && ids[index] <= 8, "state callback id outside 1..8");

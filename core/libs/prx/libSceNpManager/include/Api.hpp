@@ -6,6 +6,8 @@ using NpStateCallback = void (APS5_VABI *)(int userId, uint32_t state, NpId* npI
 
 using NpStateCallbackA = void (APS5_VABI *)(int userId, uint32_t state, void* userdata);
 
+using NpReachabilityStateCallback = void (APS5_VABI *)(int userId, uint32_t state, void* userdata);
+
 struct SceNpOnlineId {
     char data[16];
     std::uint32_t term;
