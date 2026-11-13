@@ -6,6 +6,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -25,6 +26,8 @@ std::uint64_t float32Bits(float value) { return std::bit_cast<std::uint32_t>(val
 constexpr std::uint32_t MainContext = 0;
 constexpr std::uint32_t CleanContext = 1;
 constexpr std::uint32_t MaxDepth = 512;
+
+std::atomic<std::uint64_t> batchedReads {0};
 
 }
 
@@ -296,11 +299,51 @@ bool SrtTape::Verified() {
     return verified;
 }
 
+bool SrtTape::BatchVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_BATCHED_DESCRIPTOR_READS") != nullptr;
+    return verified;
+}
+
+std::uint64_t SrtTape::BatchedReads() {
+    return batchedReads.load(std::memory_order_relaxed);
+}
+
 std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     if (!plan.srtPlanComplete) return nullptr;
     auto tape = std::make_shared<SrtTape>();
     SrtTapeCompiler compiler(plan, *tape);
     if (!compiler.Build()) return nullptr;
+    tape->reads = static_cast<std::size_t>(std::count_if(tape->nodes.begin(), tape->nodes.end(), [](const Node& node) { return node.op == Op::Read || node.op == Op::ReadConstBuffer; }));
+    tape->batchable.assign(plan.descriptorSources.size(), 0u);
+    for (const auto index : plan.materializationSources) {
+        const auto count = plan.descriptorSources[index].dwordCount;
+        const auto& roots = tape->sourceDwords[index];
+        if (count < 2u || roots[0] >= tape->nodes.size()) continue;
+        const auto& first = tape->nodes[roots[0]];
+        if (first.op != Op::Read || first.argumentCount != 3u) continue;
+        const auto offset = [&](const Node& node, std::int64_t& result) {
+            if (node.arguments[2] >= tape->nodes.size()) return false;
+            const auto& index = tape->nodes[node.arguments[2]];
+            const bool constant = index.op == Op::Const;
+            if (!constant && node.arguments[2] != first.arguments[2]) return false;
+            result = (static_cast<std::int64_t>(node.immediate) & ~std::int64_t {3}) + (constant ? static_cast<std::int64_t>(static_cast<std::uint32_t>(index.immediate) & ~3u) : 0);
+            return constant == (tape->nodes[first.arguments[2]].op == Op::Const);
+        };
+        std::int64_t firstOffset = 0;
+        if (!offset(first, firstOffset)) continue;
+        bool batchable = true;
+        for (std::uint32_t dword = 1; batchable && dword < count; ++dword) {
+            if (roots[dword] >= tape->nodes.size()) {
+                batchable = false;
+                break;
+            }
+            const auto& node = tape->nodes[roots[dword]];
+            std::int64_t nodeOffset = 0;
+            batchable = node.op == Op::Read && node.argumentCount == 3u && node.clean == first.clean && node.loaded == first.loaded && node.baseWord == first.baseWord &&
+                node.arguments[0] == first.arguments[0] && node.arguments[1] == first.arguments[1] && offset(node, nodeOffset) && nodeOffset == firstOffset + static_cast<std::int64_t>(dword) * 4;
+        }
+        tape->batchable[index] = batchable ? 1u : 0u;
+    }
     return tape;
 }
 
@@ -347,6 +390,71 @@ bool SrtTape::evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result)
     return true;
 }
 
+bool SrtTape::operands(Frame& frame, const Node& node, std::array<std::uint64_t, 5>& operand, std::int32_t& origin) const {
+    const bool addressCone = node.op == Op::Read || node.op == Op::ReadConstBuffer;
+    for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
+        if (index == 0 && node.baseWord >= 0 && frame.runtime.userDataUse != nullptr && static_cast<std::size_t>(node.baseWord) < frame.runtime.userData.size()) {
+            origin = node.baseWord;
+            operand[0] = frame.runtime.userData[static_cast<std::size_t>(origin)];
+            frame.runtime.userDataUse->asBase |= std::uint64_t {1} << origin;
+            continue;
+        }
+        const bool nestedAddress = addressCone || (node.op == Op::Select && index == 0u);
+        if (nestedAddress) ++frame.addressDepth;
+        const bool ok = evaluate(frame, node.arguments[index], operand[index]);
+        if (nestedAddress) --frame.addressDepth;
+        if (!ok) return false;
+    }
+    return true;
+}
+
+SrtTape::Batch SrtTape::readBatch(Frame& frame, std::uint32_t sourceIndex, std::uint32_t count, DescriptorValue& value) const {
+    const auto& runtime = frame.runtime;
+    const auto& roots = sourceDwords[sourceIndex];
+    const auto& first = nodes[roots[0]];
+    if (runtime.readSpan == nullptr || runtime.readMemory == nullptr || (first.clean && runtime.readSpecializationMemory != runtime.readMemory)) return Batch::Skipped;
+    if (runtime.readTrace != nullptr && runtime.readTrace->leaf != nullptr) return Batch::Skipped;
+    for (std::uint32_t dword = 0; dword < count; ++dword) {
+        if (frame.states[roots[dword]] != 0u) return Batch::Skipped;
+    }
+    std::array<std::uint64_t, 5> operand{};
+    std::int32_t origin = -1;
+    if (!operands(frame, first, operand, origin)) return Batch::Failed;
+    const auto base = ((operand[1] << 32u) | static_cast<std::uint32_t>(operand[0])) & AddressMask;
+    const auto relative = (static_cast<std::int64_t>(first.immediate) & ~std::int64_t {3}) + static_cast<std::int64_t>(static_cast<std::uint32_t>(operand[2]) & ~3u);
+    std::uint64_t address = 0;
+    std::uint64_t last = 0;
+    const auto bytes = static_cast<std::uint64_t>(count) * sizeof(std::uint32_t);
+    if (!AddSignedAddress(base & ~std::uint64_t {3}, relative, address)) return Batch::Failed;
+    if (base == 0u && !first.loaded) {
+        frame.nullRoot = true;
+        return Batch::Failed;
+    }
+    if (!AddSignedAddress(base & ~std::uint64_t {3}, relative + static_cast<std::int64_t>(bytes - sizeof(std::uint32_t)), last)) return Batch::Failed;
+    if (auto* use = runtime.userDataUse; use != nullptr) {
+        for (std::uint32_t dword = 0; dword < count; ++dword) use->reads.emplace_back(address + dword * sizeof(std::uint32_t), origin);
+    }
+    if (first.loaded && runtime.accessible != nullptr && !runtime.accessible(runtime.userContext, address, bytes)) {
+        for (std::uint32_t dword = 0; dword < count; ++dword) {
+            if (!runtime.accessible(runtime.userContext, address + dword * sizeof(std::uint32_t), sizeof(std::uint32_t))) return Batch::Failed;
+        }
+    }
+    if (auto* trace = runtime.readTrace; trace != nullptr) {
+        for (std::uint32_t dword = 0; dword < count; ++dword) trace->otherReads.push_back(address + dword * sizeof(std::uint32_t));
+    }
+    const bool scoped = frame.addressDepth == 0u && frame.descriptorBytes != 0u && runtime.descriptorScope != nullptr;
+    if (scoped) static_cast<void>(runtime.descriptorScope(runtime.userContext, bytes));
+    const bool ok = runtime.readSpan(runtime.userContext, address, value.dwords.data(), count);
+    if (scoped) static_cast<void>(runtime.descriptorScope(runtime.userContext, 0u));
+    if (!ok) return Batch::Failed;
+    for (std::uint32_t dword = 0; dword < count; ++dword) {
+        frame.states[roots[dword]] = 1u;
+        frame.values[roots[dword]] = value.dwords[dword];
+    }
+    batchedReads.fetch_add(1, std::memory_order_relaxed);
+    return Batch::Read;
+}
+
 bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) const {
     if (node.op == Op::LogicalAnd || node.op == Op::LogicalOr) {
         const bool decisive = node.op == Op::LogicalOr;
@@ -388,20 +496,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
     }
     std::array<std::uint64_t, 5> operand{};
     std::int32_t origin = -1;
-    const bool addressCone = node.op == Op::Read || node.op == Op::ReadConstBuffer;
-    for (std::uint8_t index = 0; index < node.argumentCount; ++index) {
-        if (index == 0 && node.baseWord >= 0 && frame.runtime.userDataUse != nullptr && static_cast<std::size_t>(node.baseWord) < frame.runtime.userData.size()) {
-            origin = node.baseWord;
-            operand[0] = frame.runtime.userData[static_cast<std::size_t>(origin)];
-            frame.runtime.userDataUse->asBase |= std::uint64_t {1} << origin;
-            continue;
-        }
-        const bool nestedAddress = addressCone || (node.op == Op::Select && index == 0u);
-        if (nestedAddress) ++frame.addressDepth;
-        const bool ok = evaluate(frame, node.arguments[index], operand[index]);
-        if (nestedAddress) --frame.addressDepth;
-        if (!ok) return false;
-    }
+    if (!operands(frame, node, operand, origin)) return false;
     const auto a = operand[0];
     const auto b = operand[1];
     const auto c = operand[2];
@@ -663,7 +758,14 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         const auto& source = plan.descriptorSources[sourceIndex];
         DescriptorValue value;
         value.dwordCount = source.dwordCount;
-        if (active[sourceIndex]) {
+        auto batch = Batch::Skipped;
+        if (active[sourceIndex] && runtime.batchedDescriptorReads && batchable[sourceIndex] != 0u) {
+            frame.descriptorBytes = static_cast<std::size_t>(source.dwordCount) * sizeof(std::uint32_t);
+            batch = readBatch(frame, sourceIndex, source.dwordCount, value);
+            frame.descriptorBytes = 0u;
+            if (batch == Batch::Failed) return refuse();
+        }
+        if (active[sourceIndex] && batch == Batch::Skipped) {
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
                 std::uint64_t word = 0;
                 frame.descriptorBytes = source.dwordCount > 1u ? static_cast<std::size_t>(source.dwordCount - dword) * sizeof(std::uint32_t) : 0u;

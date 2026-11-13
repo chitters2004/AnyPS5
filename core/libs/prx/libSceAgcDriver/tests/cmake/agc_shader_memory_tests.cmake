@@ -4,6 +4,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
         Graphics/src/GuestTextureResource.cpp
+        Graphics/src/RuntimeSwitches.cpp
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureFormat.cpp
 )
@@ -28,6 +29,19 @@ if(BUILD_TESTING)
     set_tests_properties(agc_shader_selected_records_image_limit agc_shader_selected_records_pair_limit agc_shader_selected_records_direct_image_limit agc_shader_selected_records_direct_pair_limit agc_shader_sampler_limits agc_shader_image_limits_table agc_shader_image_limits_mixed agc_shader_image_limits_refusals PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_shader_srt_read_patching COMMAND agc_shader_memory_tests --srt-read-patching)
     set_tests_properties(agc_shader_srt_read_patching PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_shader_sized_read_log COMMAND agc_shader_memory_tests --sized-read-log)
+    set_tests_properties(agc_shader_sized_read_log PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    add_test(NAME agc_shader_batched_descriptor_reads COMMAND agc_shader_memory_tests --batched-descriptor-reads)
+    set_tests_properties(agc_shader_batched_descriptor_reads PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    add_test(NAME agc_shader_memory_slow_capture COMMAND agc_shader_memory_tests)
+    add_test(NAME agc_shader_descriptor_phis_batched_verify COMMAND agc_shader_memory_tests --descriptor-phis)
+    set_tests_properties(agc_shader_memory_slow_capture PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_FAST_CAPTURE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_shader_descriptor_phis_batched_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_BATCHED_DESCRIPTOR_READS=1;APS5_VERIFY_SRT_TAPE=1;APS5_VERIFY_SRT_COMPACT=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_shader_memory_slow_capture agc_shader_descriptor_phis_batched_verify PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_shader_plan_facts COMMAND agc_shader_memory_tests --plan-facts)
+    set_tests_properties(agc_shader_plan_facts PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     add_test(NAME agc_shader_descriptor_phis COMMAND agc_shader_memory_tests --descriptor-phis)
     set_tests_properties(agc_shader_descriptor_phis PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_SRT_TAPE=1;APS5_VERIFY_SRT_COMPACT=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 30)
     if(WIN32)

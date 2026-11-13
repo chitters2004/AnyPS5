@@ -391,6 +391,44 @@ bool ApplySourceBlockGuards(const IrResourcePlan& program, std::span<const std::
     return true;
 }
 
+struct UnbatchedWalk {
+    bool ok = false;
+    std::vector<DescriptorValue> results;
+    std::vector<std::uint32_t> flat;
+    std::vector<std::uint8_t> active;
+    SrtUserDataUse use;
+    SrtReadTrace trace;
+};
+
+UnbatchedWalk walkUnbatched(const SrtTape& tape, const IrResourcePlan& program, const SrtRuntime& runtime) {
+    UnbatchedWalk walk;
+    SrtRuntime unbatched = runtime;
+    unbatched.batchedDescriptorReads = false;
+    if (runtime.userDataUse != nullptr) {
+        walk.use = *runtime.userDataUse;
+        unbatched.userDataUse = &walk.use;
+    }
+    if (runtime.readTrace != nullptr) {
+        walk.trace = *runtime.readTrace;
+        unbatched.readTrace = &walk.trace;
+    }
+    walk.ok = tape.Run(program, unbatched, walk.results, walk.flat, walk.active);
+    return walk;
+}
+
+void verifyBatchedReads(const IrResourcePlan& program, const UnbatchedWalk& expected, bool ok, const SrtRuntime& runtime, const std::vector<DescriptorValue>& results, const std::vector<std::uint32_t>& flat, const std::vector<std::uint8_t>& activeSources) {
+    const char* difference = nullptr;
+    if (ok != expected.ok) difference = "outcome";
+    else if (ok && expected.results != results) difference = "descriptors";
+    else if (ok && expected.flat != flat) difference = "flat slots";
+    else if (ok && expected.active != activeSources) difference = "active sources";
+    else if (runtime.userDataUse != nullptr && (expected.use.asBase != runtime.userDataUse->asBase || expected.use.asValue != runtime.userDataUse->asValue || expected.use.reads != runtime.userDataUse->reads)) difference = "user-data use";
+    else if (runtime.readTrace != nullptr && (expected.trace.leaves != runtime.readTrace->leaves || expected.trace.otherReads != runtime.readTrace->otherReads || expected.trace.leaf != runtime.readTrace->leaf)) difference = "traced reads";
+    if (difference == nullptr) return;
+    std::fprintf(stderr, "[srt-tape] verify: shader %016llx: the batched descriptor reads differ from the per-dword reads in the walk's %s\n", static_cast<unsigned long long>(program.shaderHash), difference);
+    std::abort();
+}
+
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) {
     const bool planInputs = evaluateFlat && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
     if (planInputs) {
@@ -399,7 +437,11 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
             std::optional<SrtUserDataUse> useBefore;
             if (SrtTape::Verified() && runtime.userDataUse != nullptr) useBefore = *runtime.userDataUse;
-            if (tape->Run(program, runtime, results, flat, activeSources)) {
+            std::optional<UnbatchedWalk> unbatched;
+            if (SrtTape::BatchVerified() && runtime.batchedDescriptorReads) unbatched = walkUnbatched(*tape, program, runtime);
+            const bool ran = tape->Run(program, runtime, results, flat, activeSources);
+            if (unbatched) verifyBatchedReads(program, *unbatched, ran, runtime, results, flat, activeSources);
+            if (ran) {
                 if (poison != nullptr) poison->clear();
                 if (nullRootReads != nullptr) *nullRootReads = 0;
                 if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, useBefore ? &*useBefore : nullptr);

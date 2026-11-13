@@ -1774,15 +1774,19 @@ bool disabledBufferAccesses(const IrResourcePlan& plan, std::uint32_t index, con
     return accessed;
 }
 
-void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot) {
+bool memoryAccessedBuffer(const IrResourcePlan& plan, std::uint32_t buffer, bool planFacts) {
+    if (planFacts && plan.memoryAccessedBuffers.size() == plan.info.buffers.size()) return plan.memoryAccessedBuffers[buffer] != 0u;
+    return std::any_of(plan.memoryInfo.begin(), plan.memoryInfo.end(), [buffer](const MemoryInfo& memory) { return memory.kind == ResourceKind::Buffer && memory.resource == buffer; });
+}
+
+void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, bool planFacts) {
     for (std::uint32_t i = 0u; i < plan.info.buffers.size(); ++i) {
         const auto& buffer = plan.info.buffers[i];
         if (disabledBufferAccesses(plan, i, snapshot.buffers.at(i))) {
             auto& words = snapshot.buffers.at(i).dwords;
             std::fill(words.begin(), words.begin() + 4, 0u);
         }
-        const bool scalarOnly = buffer.scalar && !buffer.written && !buffer.atomic && !buffer.formatted && buffer.imageAlias == BufferResource::NoImageAlias
-            && std::none_of(plan.memoryInfo.begin(), plan.memoryInfo.end(), [i](const MemoryInfo& memory) { return memory.kind == ResourceKind::Buffer && memory.resource == i; });
+        const bool scalarOnly = buffer.scalar && !buffer.written && !buffer.atomic && !buffer.formatted && buffer.imageAlias == BufferResource::NoImageAlias && !memoryAccessedBuffer(plan, i, planFacts);
         if (scalarOnly) {
             snapshot.buffers.at(i).dwords[1] &= ~0x40000000u;
             snapshot.buffers.at(i).dwords[3] = 0u;
@@ -2757,6 +2761,13 @@ void ownPlanValues(IrResourcePlan& plan) {
     }
 }
 
+void buildPlanFacts(IrResourcePlan& plan) {
+    plan.memoryAccessedBuffers.assign(plan.info.buffers.size(), 0u);
+    for (const auto& memory : plan.memoryInfo) {
+        if (memory.kind == ResourceKind::Buffer && memory.resource < plan.memoryAccessedBuffers.size()) plan.memoryAccessedBuffers[memory.resource] = 1u;
+    }
+}
+
 void buildCompactPlan(IrResourcePlan& plan) {
     if (!plan.denseValueIds || plan.valueStorage.Size() >= CompactResourcePlan::NoValue) return;
     CompactResourcePlan compact;
@@ -2865,12 +2876,14 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);
+    buildPlanFacts(plan);
     buildCompactPlan(plan);
     return plan;
 }
 
 void ResourceMaterializer::CompactPlan(IrResourcePlan& plan) {
     plan.compact = {};
+    buildPlanFacts(plan);
     buildCompactPlan(plan);
 }
 
@@ -2913,7 +2926,7 @@ void ResourceMaterializer::Materialize(const IrResourcePlan& program, const SrtR
                 nextSnapshot.imageAllocationGeneration = nextSnapshot.registeredImages.empty() ? 0u : afterImageGeneration;
                 const auto started = MaterializeProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                 materializeForcedDegamma(plan, nextSnapshot);
-                materializeTables(plan, nextSnapshot);
+                materializeTables(plan, nextSnapshot, runtime.fastCapture);
                 materializeSrtGuards(plan, nextSnapshot);
                 if (MaterializeProfiled()) specializationNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
                 completed = true;

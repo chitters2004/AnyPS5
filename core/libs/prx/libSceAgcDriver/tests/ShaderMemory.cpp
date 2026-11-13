@@ -2711,6 +2711,282 @@ void verifySnapshotAllocationMoves() {
             "snapshot allocation moves: after the page holding T# was remapped during the capture, the snapshot kept the T# read before the remap");
 }
 
+struct BatchedReadLog {
+    std::vector<std::array<std::uint64_t, 3>> events;
+    bool wordChecksOnly = false;
+};
+
+void verifyBatchedDescriptorReads() {
+    using namespace ShaderRecompiler;
+    alignas(256) static std::array<std::uint32_t, 64> block{};
+    alignas(16) static std::array<std::uint64_t, 2> pointer{};
+    block.fill(0u);
+    const auto blockAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block.data()));
+    pointer[0] = blockAddress;
+    for (const std::uint32_t offset : {0x20u, 0x60u}) {
+        const auto word = offset / 4u;
+        const auto base = blockAddress + 0x100u * (offset / 0x20u);
+        block[word] = static_cast<std::uint32_t>(base);
+        block[word + 1u] = static_cast<std::uint32_t>(base >> 32u);
+        block[word + 2u] = 0x100u + offset;
+        block[word + 3u] = 0x00027facu;
+    }
+    block[0x40u / 4u] = 0x1234u;
+    const auto pointerAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(pointerAddress), static_cast<std::uint32_t>(pointerAddress >> 32u)};
+    const std::vector<std::uint32_t> code{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080602u, 0xfa000060u, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto request = FrontendRequest(code, userData);
+    constexpr std::uint64_t Read = 'r';
+    constexpr std::uint64_t Words = 'w';
+    constexpr std::uint64_t Scope = 's';
+    constexpr std::uint64_t Probe = 'a';
+    const auto read = +[](void* context, std::uint64_t address, std::uint32_t* value) {
+        static_cast<BatchedReadLog*>(context)->events.push_back({Read, address, 1u});
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto readSpan = +[](void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+        static_cast<BatchedReadLog*>(context)->events.push_back({Words, address, count});
+        std::memcpy(values, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), static_cast<std::size_t>(count) * sizeof(*values));
+        return true;
+    };
+    const auto scope = +[](void* context, std::size_t bytes) -> std::uint64_t {
+        if (bytes != 0u) static_cast<BatchedReadLog*>(context)->events.push_back({Scope, bytes, 0u});
+        return 0u;
+    };
+    const auto accessible = +[](void* context, std::uint64_t address, std::uint64_t bytes) {
+        auto& log = *static_cast<BatchedReadLog*>(context);
+        if (!log.wordChecksOnly || bytes <= sizeof(std::uint32_t)) return true;
+        log.events.push_back({Probe, address, bytes});
+        return false;
+    };
+    const auto capture = [&](bool batched, BatchedReadLog& log) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.readSpan = readSpan;
+        runtime.descriptorScope = scope;
+        runtime.accessible = accessible;
+        runtime.userContext = &log;
+        runtime.batchedDescriptorReads = batched;
+        return CaptureResources(request, runtime);
+    };
+    const auto count = [](const BatchedReadLog& log, std::uint64_t kind) { return std::ranges::count_if(log.events, [&](const auto& event) { return event[0] == kind; }); };
+    const auto same = [](const auto& left, const auto& right) {
+        return left->userDataUse.asBase == right->userDataUse.asBase && left->userDataUse.asValue == right->userDataUse.asValue && left->userDataUse.reads == right->userDataUse.reads &&
+            left->readTrace.leaves == right->readTrace.leaves && left->readTrace.otherReads == right->readTrace.otherReads &&
+            left->snapshot.buffers.size() == right->snapshot.buffers.size() && std::ranges::equal(left->snapshot.buffers, right->snapshot.buffers, [](const DescriptorValue& a, const DescriptorValue& b) { return a.dwords == b.dwords; });
+    };
+    BatchedReadLog plainLog;
+    const auto batchesBefore = Detail::SrtTape::BatchedReads();
+    const auto plain = capture(false, plainLog);
+    require(Detail::SrtTape::BatchedReads() == batchesBefore && count(plainLog, Words) == 0, "batched descriptor reads: a capture without the switch read a descriptor in bulk");
+    require(plain->snapshot.buffers.size() == 2u && plain->userDataUse.reads.size() == 11u && plain->snapshot.buffers[0].dwords[2] != plain->snapshot.buffers[1].dwords[2], "batched descriptor reads: the pointer-chasing program does not read two distinct V#s through eleven reads");
+    for (const bool wordChecksOnly : {false, true}) {
+        BatchedReadLog log;
+        log.wordChecksOnly = wordChecksOnly;
+        const auto before = Detail::SrtTape::BatchedReads();
+        const auto batched = capture(true, log);
+        require(Detail::SrtTape::BatchedReads() == before + 2u, "batched descriptor reads: a capture with the switch did not read both V#s in bulk");
+        require(same(plain, batched), "batched descriptor reads: the batched capture's user-data use, traced reads or buffers differ from the per-dword capture's");
+        std::vector<std::uint64_t> bulk;
+        for (std::size_t i = 0; i < log.events.size(); ++i) {
+            if (log.events[i][0] != Words) continue;
+            require(log.events[i][2] == 4u && i != 0u && log.events[i - 1u] == std::array<std::uint64_t, 3>{Scope, 16u, 0u}, "batched descriptor reads: a V# was not read as four words under a sixteen-byte descriptor scope");
+            bulk.push_back(log.events[i][1]);
+        }
+        std::ranges::sort(bulk);
+        require(bulk == std::vector<std::uint64_t>{blockAddress + 0x20u, blockAddress + 0x60u}, "batched descriptor reads: the bulk reads are not the two V#s");
+        require(std::ranges::none_of(log.events, [&](const auto& event) { return event[0] == Read && (event[1] - blockAddress - 0x20u < 16u || event[1] - blockAddress - 0x60u < 16u); }), "batched descriptor reads: a batched V# dword was also read alone");
+        require(wordChecksOnly == (count(log, Probe) == 2), "batched descriptor reads: the span accessibility check was not made once per V#");
+    }
+    block[0x70u / 4u] = 0x300u;
+    block[0x74u / 4u] = 0x00027facu;
+    block[0x68u / 4u] = 0xdeadu;
+    block[0x6cu / 4u] = 0xbeefu;
+    const std::vector<std::uint32_t> split{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4040602u, 0xfa000060u, 0xf4040682u, 0xfa000070u, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto splitRequest = FrontendRequest(split, userData);
+    const auto splitCapture = [&](bool batched, BatchedReadLog& log) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.readSpan = readSpan;
+        runtime.descriptorScope = scope;
+        runtime.userContext = &log;
+        runtime.batchedDescriptorReads = batched;
+        return CaptureResources(splitRequest, runtime);
+    };
+    BatchedReadLog splitPlainLog;
+    BatchedReadLog splitLog;
+    const auto splitPlain = splitCapture(false, splitPlainLog);
+    const auto splitBefore = Detail::SrtTape::BatchedReads();
+    const auto splitBatched = splitCapture(true, splitLog);
+    require(splitPlain->snapshot.buffers.size() == 2u && std::ranges::any_of(splitPlain->snapshot.buffers, [](const DescriptorValue& value) { return value.dwords[2] == 0x300u; }), "batched descriptor reads: the split program does not read a V# from two separate loads");
+    require(Detail::SrtTape::BatchedReads() == splitBefore + 1u && count(splitLog, Words) == 1, "batched descriptor reads: a V# loaded from two separate pairs of words was read in bulk, or the whole V# was not");
+    require(same(splitPlain, splitBatched), "batched descriptor reads: the split program's batched capture differs from its per-dword capture");
+    const auto nestedBase = blockAddress + 0x80u;
+    block[0x20u / 4u] = static_cast<std::uint32_t>(nestedBase);
+    block[0x24u / 4u] = static_cast<std::uint32_t>(nestedBase >> 32u);
+    block[0x28u / 4u] = 0x100u;
+    block[0x2cu / 4u] = 0x00027facu;
+    block[0x80u / 4u] = static_cast<std::uint32_t>(blockAddress + 0xc0u);
+    block[0x84u / 4u] = static_cast<std::uint32_t>((blockAddress + 0xc0u) >> 32u);
+    block[0x88u / 4u] = 0x200u;
+    block[0x8cu / 4u] = 0x00027facu;
+    const std::vector<std::uint32_t> nested{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xf408060eu, 0xfa000000u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto nestedRequest = FrontendRequest(nested, userData);
+    const auto nestedCapture = [&](bool batched, BatchedReadLog& log) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.readSpan = readSpan;
+        runtime.descriptorScope = scope;
+        runtime.userContext = &log;
+        runtime.batchedDescriptorReads = batched;
+        return CaptureResources(nestedRequest, runtime);
+    };
+    BatchedReadLog nestedPlainLog;
+    BatchedReadLog nestedLog;
+    const auto nestedPlain = nestedCapture(false, nestedPlainLog);
+    const auto nestedBefore = Detail::SrtTape::BatchedReads();
+    const auto nestedBatched = nestedCapture(true, nestedLog);
+    require(nestedPlain->snapshot.buffers.size() == 2u && nestedPlain->snapshot.buffers[0].dwords[2] == 0x200u && nestedPlain->snapshot.buffers[1].dwords[2] == 0x100u, "batched descriptor reads: the nested program does not walk the V# loaded through another V#'s base first");
+    require(Detail::SrtTape::BatchedReads() == nestedBefore + 1u && count(nestedLog, Words) == 1 && std::ranges::find(nestedLog.events, std::array<std::uint64_t, 3>{Words, nestedBase, 4u}) != nestedLog.events.end(), "batched descriptor reads: a V# whose dwords an earlier V# already read was read in bulk, or the earlier V# was not");
+    require(same(nestedPlain, nestedBatched), "batched descriptor reads: the nested program's batched capture differs from its per-dword capture");
+    const bool fast = std::getenv("APS5_NO_FAST_CAPTURE") == nullptr;
+    AgcDriver::ShaderMemory memory({});
+    const auto driverBefore = Detail::SrtTape::BatchedReads();
+    const auto driver = memory.Capture(nestedRequest);
+    const auto* nestedTape = Detail::SrtTape::For(*driver->plan);
+    require(nestedTape != nullptr && (Detail::SrtTape::BatchedReads() == driverBefore + 1u) == fast && (driver->userDataUse.reads.capacity() == nestedTape->Reads()) == fast, "batched descriptor reads: a driver capture did not batch its V#s and size its read log exactly when APS5_NO_FAST_CAPTURE is unset");
+    require(same(nestedPlain, driver), "batched descriptor reads: the driver capture differs from the per-dword capture");
+}
+
+void requireBatchedReads() {
+    if (std::getenv("APS5_NO_FAST_CAPTURE") != nullptr) return;
+    require(ShaderRecompiler::Detail::SrtTape::BatchedReads() != 0u, "batched descriptor reads: no driver capture read a descriptor in bulk without APS5_NO_FAST_CAPTURE");
+}
+
+void verifySizedReadLog() {
+    using namespace ShaderRecompiler;
+    alignas(256) static std::array<std::uint32_t, 64> block{};
+    alignas(16) static std::array<std::uint64_t, 2> pointer{};
+    block.fill(0u);
+    const auto blockAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block.data()));
+    pointer[0] = blockAddress;
+    for (const std::uint32_t offset : {0x20u, 0x60u}) {
+        const auto word = offset / 4u;
+        const auto base = blockAddress + 0x100u * (offset / 0x20u);
+        block[word] = static_cast<std::uint32_t>(base);
+        block[word + 1u] = static_cast<std::uint32_t>(base >> 32u);
+        block[word + 2u] = 0x100u;
+        block[word + 3u] = 0x00027facu;
+    }
+    const auto pointerAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(pointer.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(pointerAddress), static_cast<std::uint32_t>(pointerAddress >> 32u)};
+    const std::vector<std::uint32_t> code{0xf4040100u, 0xfa000000u, 0xbf8cc07fu, 0xf4080602u, 0xfa000060u, 0xf4080702u, 0xfa000020u, 0xf4000302u, 0xfa000040u, 0xbf8cc07fu, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0xe0700000u, 0x0c070b00u, 0xbf810000u};
+    const auto request = FrontendRequest(code, userData);
+    const auto read = +[](void*, std::uint64_t address, std::uint32_t* value) {
+        std::memcpy(value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), sizeof(*value));
+        return true;
+    };
+    const auto capture = [&](bool sized) {
+        SrtRuntime runtime;
+        runtime.userData = userData;
+        runtime.readMemory = read;
+        runtime.readSpecializationMemory = read;
+        runtime.sizedReadLog = sized;
+        return CaptureResources(request, runtime);
+    };
+    const auto plain = capture(false);
+    const auto sized = capture(true);
+    const auto* tape = Detail::SrtTape::For(*sized->plan);
+    require(tape != nullptr && tape->Reads() == 11u, "sized read log: the pointer-chasing program's tape does not hold its eleven reads");
+    const auto& left = plain->userDataUse;
+    const auto& right = sized->userDataUse;
+    require(!left.reads.empty() && left.asBase == right.asBase && left.asValue == right.asValue && left.reads == right.reads, "sized read log: the sized capture's user-data use differs from the plain capture's");
+    require(right.reads.size() <= tape->Reads() && right.reads.capacity() == tape->Reads(), "sized read log: the sized capture's read log was not reserved to its tape's reads, or grew past them");
+    require(plain->readTrace.leaves == sized->readTrace.leaves && plain->readTrace.otherReads == sized->readTrace.otherReads, "sized read log: the sized capture's traced reads differ");
+    require(plain->snapshot.buffers.size() == sized->snapshot.buffers.size() && std::ranges::equal(plain->snapshot.buffers, sized->snapshot.buffers, [](const DescriptorValue& a, const DescriptorValue& b) { return a.dwords == b.dwords; }), "sized read log: the sized capture's buffers differ");
+}
+
+void verifyPlanFactsMaterialization() {
+    using namespace ShaderRecompiler;
+    {
+        const std::vector<std::uint32_t> code{0xf4080600u, 0xfa000060u, 0xbf8cc07fu, 0x7e140300u, 0x4a141481u, 0x34141482u, 0xe0301000u, 0x80060b0au, 0xbf8c0000u, 0x7e28050bu, 0xf4000540u, 0x28000000u, 0xf4080700u, 0xfa000020u, 0xbf8c0000u, 0xbf078015u, 0xbf840002u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+        const std::array<std::uint32_t, 2> userData{0x10000u, 0u};
+        const auto extracted = GetResourcePlan(FrontendRequest(code, userData));
+        std::vector<std::uint8_t> expected(extracted->info.buffers.size(), 0u);
+        for (const auto& memory : extracted->memoryInfo) {
+            if (memory.kind == ResourceKind::Buffer) expected.at(memory.resource) = 1u;
+        }
+        require(!expected.empty() && std::ranges::count(expected, 1u) != 0u && extracted->memoryAccessedBuffers == expected, "plan facts: ExtractPlan did not record the buffers memory instructions read");
+    }
+    constexpr std::array<std::array<std::uint32_t, 4>, 3> words{{{0x00010000u, 0x40000000u, 0x00000100u, 0x00027facu}, {0x00020000u, 0x40000000u, 0x00000100u, 0x00027facu}, {0x00030000u, 0x40000000u, 0x00000100u, 0x00027facu}}};
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    plan.userDataCount = 0u;
+    std::vector<std::unique_ptr<IrValue>> values;
+    for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) {
+        DescriptorSource source;
+        source.dwordCount = 4u;
+        for (std::uint32_t i = 0u; i < 4u; ++i) {
+            auto value = std::make_unique<IrValue>(IrOpcode::Void, IrType::U32, buffer * 4u + i);
+            value->SetImmediateU32(words[buffer][i]);
+            source.dwords[i] = value.get();
+            values.push_back(std::move(value));
+        }
+        plan.descriptorSources.push_back(source);
+        plan.materializationSources.push_back(buffer);
+        BufferResource resource;
+        resource.source = buffer;
+        resource.read = true;
+        resource.scalar = true;
+        plan.info.buffers.push_back(resource);
+    }
+    for (std::uint32_t i = 0u; i < 336u; ++i) plan.memoryInfo.push_back(MemoryInfo{.kind = i % 2u == 0u ? ResourceKind::Lds : ResourceKind::Image, .resource = 0u});
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Buffer, .resource = 1u});
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Image, .resource = 2u});
+
+    const auto materialize = [&](bool fastCapture) {
+        SrtRuntime runtime;
+        runtime.fastCapture = fastCapture;
+        ResourceSnapshot snapshot;
+        ResourceMaterializer{}.Materialize(plan, runtime, snapshot);
+        require(snapshot.buffers.size() == plan.info.buffers.size(), "plan facts: the snapshot does not hold every buffer");
+        return snapshot;
+    };
+    const auto check = [&](const ResourceSnapshot& snapshot, const char* message) {
+        for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) {
+            const auto& dwords = snapshot.buffers[buffer].dwords;
+            const bool scalarOnly = buffer != 1u;
+            require(dwords[0] == words[buffer][0] && dwords[2] == words[buffer][2], message);
+            require(scalarOnly ? (dwords[1] == (words[buffer][1] & ~0x40000000u) && dwords[3] == 0u) : (dwords[1] == words[buffer][1] && dwords[3] == words[buffer][3]), message);
+        }
+    };
+
+    require(plan.memoryAccessedBuffers.empty(), "plan facts: a hand-built plan already holds facts");
+    check(materialize(true), "plan facts: without facts the fast capture did not scan memoryInfo");
+    ResourceMaterializer::CompactPlan(plan);
+    require(plan.memoryAccessedBuffers == std::vector<std::uint8_t>{0u, 1u, 0u}, "plan facts: CompactPlan did not record only the buffer a memory instruction reads");
+    const auto slow = materialize(false);
+    const auto fast = materialize(true);
+    check(slow, "plan facts: the scanned capture rewrote the wrong buffers");
+    check(fast, "plan facts: the fast capture rewrote the wrong buffers");
+    for (std::uint32_t buffer = 0u; buffer < words.size(); ++buffer) require(slow.buffers[buffer].dwords == fast.buffers[buffer].dwords, "plan facts: the fast and scanned captures differ");
+
+    plan.memoryAccessedBuffers = {0u, 0u, 0u};
+    plan.info.buffers.push_back(plan.info.buffers[0]);
+    plan.materializationSources.push_back(0u);
+    plan.memoryInfo.push_back(MemoryInfo{.kind = ResourceKind::Buffer, .resource = 3u});
+    const auto grown = materialize(true);
+    require(grown.buffers.size() == 4u && grown.buffers[1].dwords[3] == words[1][3] && grown.buffers[3].dwords[3] == words[0][3], "plan facts: facts sized for another buffer list were trusted");
+}
+
 void verifyUnsetFormatImageMaterialization() {
     using namespace ShaderRecompiler;
     constexpr std::array<std::uint32_t, 8> measuredImage{0xffffffffu, 0xffffffffu, 0x00000019u, 0xc0017901u, 0x00000342u, 0xc8000000u, 0xc0064900u, 0x0000062fu};
@@ -12200,8 +12476,24 @@ int main(int argc, char** argv) {
             std::cout << "TYPE=0 image descriptor materialization passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--batched-descriptor-reads") {
+            verifyBatchedDescriptorReads();
+            std::cout << "Batched descriptor reads passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--sized-read-log") {
+            verifySizedReadLog();
+            std::cout << "Sized read log passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--plan-facts") {
+            verifyPlanFactsMaterialization();
+            std::cout << "Plan facts materialization passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-phis") {
             verifyDescriptorPhis();
+            requireBatchedReads();
             return 0;
         }
         require(argc == 1, "unknown shader memory test arguments");
@@ -12212,6 +12504,9 @@ int main(int argc, char** argv) {
         verifySignedSrtComparison();
         verifyTypeZeroImageMaterialization();
         verifyUnsetFormatImageMaterialization();
+        verifyPlanFactsMaterialization();
+        verifySizedReadLog();
+        verifyBatchedDescriptorReads();
         verifyOutOfRangeConstantReads();
         verifyDescriptorWebLaneIndexFold();
         verifyDescriptorWebTexelFold();
