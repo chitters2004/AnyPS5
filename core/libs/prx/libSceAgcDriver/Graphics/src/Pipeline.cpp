@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +25,7 @@
 #include <cstring>
 #include <list>
 #include <mutex>
+#include <set>
 #include <spirv/unified1/spirv.hpp>
 #include <string>
 #include <string_view>
@@ -385,9 +387,66 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
+struct MonolithicSelection {
+    bool enabled = false;
+    std::uint64_t mask = 0;
+    std::uint64_t value = 0;
+};
+
+std::uint64_t HexWord(std::string_view text) {
+    if (text.starts_with("0x") || text.starts_with("0X")) text.remove_prefix(2);
+    std::uint64_t value = 0;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, 16);
+    Require(!text.empty() && error == std::errc{} && end == text.data() + text.size(), "APS5_DIAG_MONOLITHIC_PIPELINES takes all or <hex mask>:<hex value>, not '" + std::string(text) + "'");
+    return value;
+}
+
+const MonolithicSelection& DiagnosticMonolithic() {
+    static const MonolithicSelection selection = [] {
+        MonolithicSelection result;
+        const char* text = std::getenv("APS5_DIAG_MONOLITHIC_PIPELINES");
+        if (text == nullptr || *text == '\0') return result;
+        result.enabled = true;
+        const std::string_view value(text);
+        if (value == "all") return result;
+        const auto colon = value.find(':');
+        Require(colon != std::string_view::npos, "APS5_DIAG_MONOLITHIC_PIPELINES takes all or <hex mask>:<hex value>, not '" + std::string(value) + "'");
+        result.mask = HexWord(value.substr(0, colon));
+        result.value = HexWord(value.substr(colon + 1));
+        return result;
+    }();
+    return selection;
+}
+
+bool diagnosticMonolithic(std::span<const CompiledShader> shaders) {
+    const auto& selection = DiagnosticMonolithic();
+    if (!selection.enabled) return false;
+    std::uint64_t hash = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        const auto identity = shader.program->Identity();
+        hash ^= identity.low ^ (identity.high * 0x9e3779b97f4a7c15ull);
+    }
+    if ((hash & selection.mask) != selection.value) return false;
+    static AgcDriver::Mutex reportMutex;
+    static std::set<std::uint64_t> reported;
+    std::lock_guard lock(reportMutex);
+    if (reported.insert(hash).second) {
+        std::string stages;
+        for (const auto& shader : shaders) {
+            if (shader.program == nullptr) continue;
+            char text[96];
+            std::snprintf(text, sizeof(text), " stage%u variant 0x%llx identity 0x%016llx", static_cast<unsigned>(shader.stage), static_cast<unsigned long long>(shader.program->variantId), static_cast<unsigned long long>(shader.program->Identity().low));
+            stages += text;
+        }
+        std::fprintf(stderr, "[monolithic-diag] pipeline 0x%016llx linked whole:%s\n", static_cast<unsigned long long>(hash), stages.c_str());
+    }
+    return true;
+}
+
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
+    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || context.libraryPartsOff != 0u || UsesMeshWindow(shaders) || FragmentInterlock(shaders) || diagnosticMonolithic(shaders)) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -507,7 +566,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout) {}
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(DynamicRendering(context)) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
@@ -1488,6 +1547,27 @@ void ClearCachedPipelines(VkDevice device) {
     ClearPipelineLibraries(device);
     ReleasePixelFunctionLds(device);
     ReleaseMeshWindow(device);
+}
+
+std::uint32_t LibraryPartsOff() {
+    static const std::uint32_t parts = [] {
+        const char* text = std::getenv("APS5_DIAG_GPL_PARTS");
+        if (text == nullptr || *text == '\0') return 0u;
+        constexpr std::array<std::pair<std::string_view, std::uint32_t>, 5> names{{{"rendering", LibraryPartRendering | LibraryPartPush}, {"sets", LibraryPartSets}, {"minlod", LibraryPartMinLod}, {"maint5", LibraryPartMaintenance5}, {"all", LibraryPartRendering | LibraryPartPush | LibraryPartSets | LibraryPartMinLod | LibraryPartMaintenance5}}};
+        std::uint32_t result = 0u;
+        std::string_view rest(text);
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            const auto name = rest.substr(0u, comma);
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1u);
+            const auto found = std::ranges::find_if(names, [&](const auto& entry) { return entry.first == name; });
+            Require(found != names.end(), "APS5_DIAG_GPL_PARTS takes a comma list of rendering, sets, minlod, maint5 or all, not '" + std::string(name) + "'");
+            result |= found->second;
+        }
+        std::fprintf(stderr, "[gpl-parts] off:%s%s%s%s; every graphics pipeline is linked whole\n", (result & LibraryPartRendering) != 0u ? " rendering" : "", (result & LibraryPartSets) != 0u ? " sets" : "", (result & LibraryPartMinLod) != 0u ? " minlod" : "", (result & LibraryPartMaintenance5) != 0u ? " maint5" : "");
+        return result;
+    }();
+    return parts;
 }
 
 }
