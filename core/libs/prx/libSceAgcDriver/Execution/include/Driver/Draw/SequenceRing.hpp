@@ -70,6 +70,8 @@ public:
     };
 
     struct Totals {
+        std::uint64_t issued = 0;
+        std::uint64_t pushed = 0;
         std::uint64_t worked = 0;
         std::uint64_t busyCpuNs = 0;
         std::uint64_t busyWallNs = 0;

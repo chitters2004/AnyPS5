@@ -467,10 +467,14 @@ void TheRingSwitchesBetweenSubmissions() {
         Require(waited, "the ring mode changed before the finisher had run the held draw");
         Require(flipped && DrawFinisher::Sequenced() == !before, "flipping APS5_NO_SEQUENCE_RING between submissions did not change the ring mode");
         Require(!DrawFinisher::Busy(), "the finisher still held work after the ring mode changed");
+        const auto ringBefore = DrawFinisher::RingTotals();
         for (int frame = 0; frame < 3; ++frame) MixedFrame(log, index, frame);
         DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
         DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Other);
         DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        const auto ringAfter = DrawFinisher::RingTotals();
+        if (DrawFinisher::Sequenced()) Require(ringAfter.issued > ringBefore.issued && ringAfter.pushed > ringBefore.pushed, "draws with the sequence ring on did not go through it (issued " + std::to_string(ringAfter.issued - ringBefore.issued) + ", pushed " + std::to_string(ringAfter.pushed - ringBefore.pushed) + ", worked " + std::to_string(ringAfter.worked - ringBefore.worked) + ")");
+        else Require(ringAfter.issued == ringBefore.issued && ringAfter.pushed == ringBefore.pushed && ringAfter.worked == ringBefore.worked, "the sequence ring numbered or prepared items while APS5_NO_SEQUENCE_RING was set");
         Require(log.committed == log.expected, std::string("items were lost or reordered across a switch to ") + (before ? "the drained hand-off" : "the sequence ring"));
     }
     AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoSequenceRing, !started);

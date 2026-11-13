@@ -255,6 +255,8 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
 
 SequenceRing::Totals SequenceRing::CurrentTotals() const {
     Totals totals;
+    totals.issued = issued.load(std::memory_order_acquire);
+    totals.pushed = pushed.load(std::memory_order_acquire);
     totals.worked = worked.load(std::memory_order_relaxed);
     totals.busyCpuNs = busyCpuNs.load(std::memory_order_relaxed);
     totals.busyWallNs = busyWallNs.load(std::memory_order_relaxed);

@@ -642,6 +642,10 @@ std::uint64_t DrawFinisher::PreparerRoomWaitNs() {
     return preparerRoomWaitNs.load(std::memory_order_relaxed);
 }
 
+SequenceRing::Totals DrawFinisher::RingTotals() {
+    return Get().Ring().CurrentTotals();
+}
+
 std::pair<std::uint64_t, std::uint64_t> DrawFinisher::DrainWaitTotals() {
     return {finisherDrainWaits.load(std::memory_order_relaxed), finisherDrainWaitNs.load(std::memory_order_relaxed)};
 }

@@ -40,6 +40,8 @@ AbSample Take(std::uint64_t present, double seconds) {
     for (std::size_t index = 0; index < sites.size(); ++index) sample.drainSites.push_back({DriverDetail::DrawFinisher::WaitSiteNames[index], sites[index].waits, sites[index].waitNs, sites[index].queued});
     const auto relocation = DriverDetail::DrawRelocationLearningTotals();
     sample.relocation = {relocation.lookups, relocation.misses, relocation.relocatedHits, relocation.learned, relocation.late, relocation.never, relocation.held};
+    const auto ring = DriverDetail::DrawFinisher::RingTotals();
+    sample.ring = {ring.issued, ring.pushed, ring.worked, ring.busyWallNs};
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (auto threads = PerformanceTrace::ThreadTotals()) {
             sample.threads = std::move(*threads);

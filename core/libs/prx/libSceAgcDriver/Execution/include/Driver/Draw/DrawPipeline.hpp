@@ -216,6 +216,7 @@ public:
     static std::pair<std::uint64_t, std::uint64_t> DrainWaitTotals();
     static std::array<SiteWait, static_cast<std::size_t>(WaitSite::Count)> SiteWaitTotals();
     static std::uint64_t PreparerRoomWaitNs();
+    static SequenceRing::Totals RingTotals();
     void Settle();
     void ReleaseRan();
     void RethrowFailure();

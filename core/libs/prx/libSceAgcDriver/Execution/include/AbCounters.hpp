@@ -25,6 +25,10 @@ struct AbRelocation {
     std::uint64_t lookups = 0, misses = 0, relocatedHits = 0, learned = 0, late = 0, never = 0, held = 0;
 };
 
+struct AbRing {
+    std::uint64_t issued = 0, pushed = 0, worked = 0, busyWallNs = 0;
+};
+
 struct AbSample {
     double seconds = 0;
     std::uint64_t present = 0;
@@ -33,6 +37,7 @@ struct AbSample {
     std::uint64_t preparerRoomWaitNs = 0;
     std::vector<AbDrainSite> drainSites;
     AbRelocation relocation;
+    AbRing ring;
     std::vector<TraceThreadTotals> threads;
 };
 
@@ -82,6 +87,10 @@ public:
             number(prefix + ".ms", ms(site.waitNs - base.waitNs));
             count(prefix + ".queued", site.queued - base.queued);
         }
+        count("rq.issued", to.ring.issued - from.ring.issued);
+        count("rq.pushed", to.ring.pushed - from.ring.pushed);
+        count("rq.worked", to.ring.worked - from.ring.worked);
+        number("rq.busy_ms", ms(to.ring.busyWallNs - from.ring.busyWallNs));
         const auto& ra = from.relocation;
         const auto& rb = to.relocation;
         if (rb.lookups != ra.lookups) {
