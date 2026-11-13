@@ -29,20 +29,27 @@ DrawVertexFetches PlanDrawVertexFetches(std::optional<std::pair<std::uint64_t, s
 
 class PreparedDrawInputs;
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool committerBehind);
+bool DrawInputsAheadAdmitted(bool committerBehind);
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
 const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared);
 
 class PreparedDrawInputsScope {
 public:
-    explicit PreparedDrawInputsScope(std::shared_ptr<PreparedDrawInputs> prepared);
-    ~PreparedDrawInputsScope();
+    explicit PreparedDrawInputsScope(std::shared_ptr<PreparedDrawInputs> prepared) : prepared(std::move(prepared)) {
+        if (this->prepared != nullptr) enter();
+    }
+    ~PreparedDrawInputsScope() {
+        if (prepared != nullptr) leave();
+    }
     PreparedDrawInputsScope(const PreparedDrawInputsScope&) = delete;
     PreparedDrawInputsScope& operator=(const PreparedDrawInputsScope&) = delete;
 
 private:
+    void enter();
+    void leave();
     std::shared_ptr<PreparedDrawInputs> prepared;
-    std::shared_ptr<PreparedDrawInputs> previous;
+    PreparedDrawInputs* previous = nullptr;
 };
 
 struct AdoptedDrawInput {

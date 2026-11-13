@@ -399,7 +399,7 @@ int main() {
             Switches::Assign(RuntimeSwitch::EarlyDrawInputsAlways, initial);
             const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
             std::printf("committer not behind: the draw is %s; behind: %s; APS5_EARLY_DRAW_INPUTS_ALWAYS: %s; %llu counted as shallow\n", idle == nullptr ? "left to the committer" : "prepared ahead", behind == nullptr ? "left to the committer" : "prepared ahead", always == nullptr ? "left to the committer" : "prepared ahead", static_cast<unsigned long long>(after.shallow - before.shallow));
-            Require(idle == nullptr && afterIdle.shallow - before.shallow == 1, "prepared vertex inputs: a draw was prepared ahead although the committer was not behind");
+            Require(idle == nullptr && afterIdle.shallow - before.shallow == (std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr ? 1u : 0u), "prepared vertex inputs: a draw was prepared ahead although the committer was not behind");
             Require(afterIdle.opened == before.opened && after.opened - afterIdle.opened == 2, "prepared vertex inputs: the adaptive gate's opens were not counted once per draw it let through");
             Require(behind != nullptr && always != nullptr && after.shallow == afterIdle.shallow, "prepared vertex inputs: a draw behind a busy committer, or one with APS5_EARLY_DRAW_INPUTS_ALWAYS, was not prepared ahead");
             {
