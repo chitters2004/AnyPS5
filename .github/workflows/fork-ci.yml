@@ -99,7 +99,7 @@ env:
     -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
   UPSTREAM: https://github.com/boykopovar/AnyPS5.git
   # Bump when the report job, a test step or the result format changes: a base result of another version is never reused.
-  REUSE_VERSION: 3
+  REUSE_VERSION: 4
   VVL_VERSION: 1.4.363.1
   MESA_VERSION: 26.2.6
   WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
@@ -199,7 +199,7 @@ jobs:
           print(f"shard {shard}/{shards}: {len(mine)} of {len(names)} tests ({len(known)} timed); expected load per shard (s): {[round(x) for x in loads]}")
           SHARDPY
           # Reuse the base result of an earlier run for the same base sha, test set and tool versions.
-          # The artifact base-reuse-<os>-<key> is uploaded only by a base job that finished successfully.
+          # The artifacts base-reuse-<os>-<key>-s1 and -s2 are uploaded by base shards that finished successfully; both must come from one run.
           # The result is downloaded and checked here, so a missing or broken artifact falls back to running the base job.
           reuse_notes=""
           reuse_linux=false
@@ -207,25 +207,48 @@ jobs:
           key_linux=""
           key_windows=""
           mkdir -p reuse/out
+          cat > reuse/pick.py <<'PICKPY'
+          # Reads "<shard> <run> <artifact> <created>" lines; prints "<run> <artifact1> <artifact2>" of the newest run that holds both shards.
+          import collections, sys
+          by = collections.defaultdict(dict)
+          for line in sys.stdin:
+              n, run, art, created = line.split()
+              by[run][n] = (art, created)
+          ok = [(v["1"][1], run, v["1"][0], v["2"][0]) for run, v in by.items() if "1" in v and "2" in v]
+          if ok:
+              created, run, a1, a2 = max(ok)
+              print(run, a1, a2)
+          PICKPY
           for os in linux windows; do
             case "$os" in linux) wanted=linux-gate ;; windows) wanted=windows ;; esac
             case ",$(printf '%s' "$JOBS" | tr -d ' ')," in *",$wanted,"*) ;; *) continue ;; esac
             key=$(printf '%s\n' "v$REUSE_VERSION" "$os" "$REPOSITORY" "$base_sha" "$TESTS" "$MUTANTS" "$REDUCED" "$VVL_VERSION" "$MESA_VERSION" "$WINLIBS_ZIP" | sha256sum | cut -c1-24)
             eval "key_$os=$key"
             if [ "$FRESH_BASE" = true ]; then reuse_notes="$reuse_notes$os: fresh_base requested; "; continue; fi
-            found=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=base-reuse-$os-$key&per_page=20" \
-              --jq "[.artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID)] | sort_by(.created_at) | reverse | .[0] | select(. != null) | (.id|tostring) + \" \" + (.workflow_run.id|tostring)" || true)
+            found=$(for n in 1 2; do
+              gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=base-reuse-$os-$key-s$n&per_page=20" \
+                --jq ".artifacts[] | select(.expired == false and .workflow_run.id != $GITHUB_RUN_ID) | [\"$n\", (.workflow_run.id|tostring), (.id|tostring), .created_at] | join(\" \")" || true
+            done | python3 reuse/pick.py)
             if [ -z "$found" ]; then reuse_notes="$reuse_notes$os: no earlier base result; "; continue; fi
-            art_id=${found% *}; from_run=${found#* }
-            mkdir -p "reuse/$os-dl"
-            if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$art_id/zip" > "reuse/$os.zip" && unzip -q -o "reuse/$os.zip" -d "reuse/$os-dl" && [ -f "reuse/$os-dl/result.json" ]; then
-              mkdir -p "reuse/out/$os"
-              cp -r "reuse/$os-dl/." "reuse/out/$os/"
-              echo "$from_run" > "reuse/out/$os/from-run.txt"
+            from_run=${found%% *}; arts=${found#* }
+            got=0
+            for n in 1 2; do
+              art_id=$(echo "$arts" | cut -d' ' -f"$n")
+              rm -rf "reuse/$os-dl$n"; mkdir -p "reuse/$os-dl$n"
+              if gh api "repos/$GITHUB_REPOSITORY/actions/artifacts/$art_id/zip" > "reuse/$os-$n.zip" && unzip -q -o "reuse/$os-$n.zip" -d "reuse/$os-dl$n" && [ -f "reuse/$os-dl$n/result.json" ]; then
+                got=$((got + 1))
+              fi
+            done
+            if [ "$got" = 2 ]; then
+              for n in 1 2; do
+                mkdir -p "reuse/out/$os/s$n"
+                cp -r "reuse/$os-dl$n/." "reuse/out/$os/s$n/"
+                echo "$from_run" > "reuse/out/$os/s$n/from-run.txt"
+              done
               eval "reuse_$os=true"
               reuse_notes="$reuse_notes$os: base result of run $from_run; "
             else
-              reuse_notes="$reuse_notes$os: artifact $art_id of run $from_run could not be downloaded, running the base; "
+              reuse_notes="$reuse_notes$os: artifacts of run $from_run could not be downloaded, running the base; "
             fi
           done
           echo "reuse notes: $reuse_notes"
@@ -251,8 +274,11 @@ jobs:
                                       shard=shard, shards=2, cache_key=ref_key, cache_restore=plain_restore, cache_max="4G",
                                       cache_save="true" if shard == 1 else "false"))
               if os.environ["reuse_linux"] != "true":
-                  include.append(dict(id="gate-base", kind="gate", side="base", sha=base_sha, group="plain", cache_family="", reuse_name="base-reuse-linux-" + os.environ["key_linux"],
-                                      cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+                  for shard in (1, 2):
+                      include.append(dict(id=f"gate-base-s{shard}", kind="gate", side="base", sha=base_sha, group="plain", cache_family="",
+                                          shard=shard, shards=2, reuse_name=f"base-reuse-linux-{os.environ['key_linux']}-s{shard}",
+                                          cache_key="plain-base", cache_restore=plain_restore, cache_max="4G",
+                                          cache_save="true" if shard == 1 else "false"))
           for san in ("asan", "tsan"):
               if san in jobs:
                   include.append(dict(id=san, kind=san, side="ref", sha=ref_sha, group=san,
@@ -284,12 +310,14 @@ jobs:
               if "windows" in jobs:
                   # The test step of the ref dominates the job (about 16 min of agc_.* on 4 cores), so two runners each take
                   # a share of the selected tests, balanced by measured time (plan-times/shard.py); the report merges the shards.
-                  # The base stays one job: its result is normally reused. Only the first shard saves the compiler cache.
+                  # The base runs in the same two shards when it is not reused. Only the first shard saves the compiler cache.
                   for shard in (1, 2):
                       win.append(dict(id=f"windows-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, cache_family=family,
                                       shard=shard, shards=2, shard_save="true" if shard == 1 else "false"))
                   if os.environ["reuse_windows"] != "true":
-                      win.append(dict(id="windows-base", kind="gate", side="base", sha=base_sha, cache_family="", reuse_name="base-reuse-windows-" + os.environ["key_windows"]))
+                      for shard in (1, 2):
+                          win.append(dict(id=f"windows-base-s{shard}", kind="gate", side="base", sha=base_sha, cache_family="", shard=shard, shards=2,
+                                          reuse_name=f"base-reuse-windows-{os.environ['key_windows']}-s{shard}", shard_save="true" if shard == 1 else "false"))
               if "warm" in jobs:
                   win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha, cache_family=""))
               if "warm-stack" in jobs:
