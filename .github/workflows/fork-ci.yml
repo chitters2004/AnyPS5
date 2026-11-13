@@ -1274,8 +1274,11 @@ jobs:
               for part in parts:
                   m["tests"].update(part["tests"])
               m["total"] = sum(p["total"] or 0 for p in parts) if any(p["total"] is not None for p in parts) else None
-              if sum(len(p["tests"]) for p in parts) != len(m["tests"]):
-                  fail(f"{rid}: a test ran in more than one shard")
+              counts = collections.Counter(n for p in parts for n in p["tests"])
+              twice = sorted(n for n, c in counts.items() if c > 1)
+              w(f"- {rid}: shard sizes {[len(p['tests']) for p in parts]} (ctest totals {[p['total'] for p in parts]}), {len(counts)} distinct tests")
+              if twice:
+                  fail(f"{rid}: {len(twice)} test(s) ran in more than one shard: {twice}")
               m["per_test"] = collections.defaultdict(collections.Counter)
               m["vuid_ids"] = collections.Counter()
               m["replay"] = {}
