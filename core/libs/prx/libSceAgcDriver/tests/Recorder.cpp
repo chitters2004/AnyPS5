@@ -75,6 +75,7 @@
 #include <unistd.h>
 #endif
 #include <functional>
+#include <type_traits>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -17096,6 +17097,424 @@ int pipelineMonolithicDiagnosticTests(const Device& device, bool expectLibraries
     return 0;
 }
 
+struct CapturedCalls {
+    static inline std::vector<std::string> calls;
+
+    template<typename... A>
+    static void Note(const char* name, const A&... values) {
+        std::string line = name;
+        ((line += " " + Text(values)), ...);
+        calls.push_back(std::move(line));
+    }
+
+    template<typename T>
+    static std::string Text(const T& value) {
+        if constexpr (std::is_pointer_v<T>) return std::to_string(reinterpret_cast<std::uintptr_t>(value));
+        else if constexpr (std::is_enum_v<T>) return std::to_string(static_cast<std::int64_t>(value));
+        else return std::to_string(value);
+    }
+
+    static VKAPI_ATTR void VKAPI_CALL BindPipeline(VkCommandBuffer, VkPipelineBindPoint point, VkPipeline pipeline) { Note("bindPipeline", point, pipeline); }
+    static VKAPI_ATTR void VKAPI_CALL SetViewport(VkCommandBuffer, std::uint32_t first, std::uint32_t count, const VkViewport* viewports) { Note("viewport", first, count, viewports[0].x, viewports[0].y, viewports[0].width, viewports[0].height, viewports[0].minDepth, viewports[0].maxDepth); }
+    static VKAPI_ATTR void VKAPI_CALL SetScissor(VkCommandBuffer, std::uint32_t first, std::uint32_t count, const VkRect2D* scissors) { Note("scissor", first, count, scissors[0].offset.x, scissors[0].offset.y, scissors[0].extent.width, scissors[0].extent.height); }
+    static VKAPI_ATTR void VKAPI_CALL SetColorWriteMask(VkCommandBuffer, std::uint32_t first, std::uint32_t count, const VkColorComponentFlags* masks) {
+        std::string list;
+        for (std::uint32_t index = 0; index < count; ++index) list += std::to_string(masks[index]) + ",";
+        Note("masks", first, count);
+        calls.back() += " " + list;
+    }
+    static VKAPI_ATTR void VKAPI_CALL SetStencilReference(VkCommandBuffer, VkStencilFaceFlags face, std::uint32_t value) { Note("stencilReference", face, value); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthBias(VkCommandBuffer, float constant, float clamp, float slope) { Note("depthBias", constant, clamp, slope); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthBounds(VkCommandBuffer, float low, float high) { Note("depthBounds", low, high); }
+    static VKAPI_ATTR void VKAPI_CALL SetCullMode(VkCommandBuffer, VkCullModeFlags mode) { Note("cull", mode); }
+    static VKAPI_ATTR void VKAPI_CALL SetFrontFace(VkCommandBuffer, VkFrontFace face) { Note("front", face); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthTestEnable(VkCommandBuffer, VkBool32 on) { Note("depthTest", on); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthWriteEnable(VkCommandBuffer, VkBool32 on) { Note("depthWrite", on); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthCompareOp(VkCommandBuffer, VkCompareOp op) { Note("depthCompare", op); }
+    static VKAPI_ATTR void VKAPI_CALL SetDepthBoundsTestEnable(VkCommandBuffer, VkBool32 on) { Note("boundsTest", on); }
+    static VKAPI_ATTR void VKAPI_CALL SetStencilTestEnable(VkCommandBuffer, VkBool32 on) { Note("stencilTest", on); }
+    static VKAPI_ATTR void VKAPI_CALL SetStencilOp(VkCommandBuffer, VkStencilFaceFlags face, VkStencilOp fail, VkStencilOp pass, VkStencilOp depthFail, VkCompareOp compare) { Note("stencilOp", face, fail, pass, depthFail, compare); }
+    static VKAPI_ATTR void VKAPI_CALL SetStencilCompareMask(VkCommandBuffer, VkStencilFaceFlags face, std::uint32_t mask) { Note("compareMask", face, mask); }
+    static VKAPI_ATTR void VKAPI_CALL SetStencilWriteMask(VkCommandBuffer, VkStencilFaceFlags face, std::uint32_t mask) { Note("writeMask", face, mask); }
+    static VKAPI_ATTR void VKAPI_CALL BindDescriptorSets(VkCommandBuffer, VkPipelineBindPoint point, VkPipelineLayout layout, std::uint32_t first, std::uint32_t count, const VkDescriptorSet* sets, std::uint32_t offsets, const std::uint32_t*) { Note("bindSets", point, layout, first, count, sets[0], offsets); }
+    static VKAPI_ATTR void VKAPI_CALL PushConstants(VkCommandBuffer, VkPipelineLayout layout, VkShaderStageFlags stages, std::uint32_t offset, std::uint32_t size, const void* values) {
+        std::uint64_t hash = 1469598103934665603ull;
+        for (std::uint32_t index = 0; index < size; ++index) hash = (hash ^ static_cast<const std::uint8_t*>(values)[index]) * 1099511628211ull;
+        Note("push", layout, stages, offset, size, hash);
+    }
+
+    static DeviceFunctions Table() {
+        DeviceFunctions table;
+        table.cmdBindPipeline = &BindPipeline;
+        table.cmdSetViewport = &SetViewport;
+        table.cmdSetScissor = &SetScissor;
+        table.cmdSetColorWriteMask = &SetColorWriteMask;
+        table.cmdSetStencilReference = &SetStencilReference;
+        table.cmdSetDepthBias = &SetDepthBias;
+        table.cmdSetDepthBounds = &SetDepthBounds;
+        table.cmdSetCullMode = &SetCullMode;
+        table.cmdSetFrontFace = &SetFrontFace;
+        table.cmdSetDepthTestEnable = &SetDepthTestEnable;
+        table.cmdSetDepthWriteEnable = &SetDepthWriteEnable;
+        table.cmdSetDepthCompareOp = &SetDepthCompareOp;
+        table.cmdSetDepthBoundsTestEnable = &SetDepthBoundsTestEnable;
+        table.cmdSetStencilTestEnable = &SetStencilTestEnable;
+        table.cmdSetStencilOp = &SetStencilOp;
+        table.cmdSetStencilCompareMask = &SetStencilCompareMask;
+        table.cmdSetStencilWriteMask = &SetStencilWriteMask;
+        table.cmdBindDescriptorSets = &BindDescriptorSets;
+        table.cmdPushConstants = &PushConstants;
+        return table;
+    }
+};
+
+void runDrawStateRecordBytes(const DrawStateOps& ops, VkCommandBuffer commands, const DeviceFunctions& table) {
+    const auto opBytes = sizeof(DrawStateOp) * ops.state.Ops().size();
+    std::vector<std::byte> payload(CommandEncoder::Aligned(sizeof(DrawStateRecord)) + CommandEncoder::Aligned(opBytes) + ops.record.pushBytes + CommandEncoder::RecordAlign);
+    auto* base = payload.data() + (CommandEncoder::RecordAlign - reinterpret_cast<std::uintptr_t>(payload.data()) % CommandEncoder::RecordAlign) % CommandEncoder::RecordAlign;
+    new (base) DrawStateRecord(ops.record);
+    if (opBytes != 0) std::memcpy(base + CommandEncoder::Aligned(sizeof(DrawStateRecord)), ops.state.Ops().data(), opBytes);
+    if (ops.record.pushBytes != 0) std::memcpy(base + CommandEncoder::Aligned(sizeof(DrawStateRecord)) + CommandEncoder::Aligned(opBytes), ops.push, ops.record.pushBytes);
+    RunDrawStateRecord(base, commands, table);
+}
+
+void drawStateOpsTests(const Device& device) {
+    if (!device.Graphics()) {
+        std::cout << "no graphics queue: draw state ops tests not run\n";
+        return;
+    }
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    const auto table = CapturedCalls::Table();
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.variantId = 31;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.variantId = 32;
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    struct Case {
+        const char* name;
+        std::function<void(State&)> adjust;
+        bool masked;
+        VkShaderStageFlags pushStages;
+        std::uint32_t sets;
+    };
+    const std::vector<Case> cases{
+        {"plain", [](State&) {}, false, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+        {"stencil reference, both sets", [](State& state) { state.stencilReplayReference = 0x5au; }, false, VK_SHADER_STAGE_VERTEX_BIT, 2},
+        {"masked outputs, no push", [](State& state) { state.viewport = {3.0f, 5.0f, 640.0f, 360.0f, 0.25f, 0.75f}; state.scissor = {{7, 9}, {100, 50}}; }, true, 0, 0},
+        {"depth bias and bounds", [&context](State& state) {
+            state.depth = DepthTarget{0x100000u, 0, {256, 256}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+            state.depthTest = true;
+            state.depthBias = true;
+            state.depthBiasConstant = 2.0f;
+            state.depthBiasSlope = 1.5f;
+            state.depthBoundsTest = context.depthBounds;
+            state.minDepthBounds = 0.125f;
+            state.maxDepthBounds = 0.875f;
+        }, false, VK_SHADER_STAGE_FRAGMENT_BIT, 1},
+    };
+    const auto changed = [](const State& base) {
+        auto state = base;
+        state.viewport.x += 1.0f;
+        state.scissor.offset.y += 2;
+        state.blends[0].colorWriteMask = 5;
+        if (state.stencilReplayReference) state.stencilReplayReference = *state.stencilReplayReference + 1u;
+        state.cullMode = VK_CULL_MODE_BACK_BIT;
+        state.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        if (state.depth) {
+            state.depthBiasConstant += 1.0f;
+            state.depthWrite = !state.depthWrite;
+            state.depthCompare = VK_COMPARE_OP_LESS;
+            state.stencilFront.writeMask = 0x0fu;
+            state.stencilFront.reference = state.stencilBack.reference + 3u;
+            state.maxDepthBounds = 0.75f;
+        }
+        return state;
+    };
+    int compared = 0;
+    int plainCompared = 0;
+    for (const bool suppress : {true, false})
+    for (const bool libraries : {true, false})
+    for (const auto& item : cases) {
+        State state{};
+        state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+        state.hasColorTarget = true;
+        state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+        state.colors.push_back(state.color);
+        state.blend.colorWriteMask = 15;
+        state.blends.push_back(state.blend);
+        state.viewport = {0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f};
+        state.scissor = {{0, 0}, {256, 256}};
+        item.adjust(state);
+        auto captured = context;
+        captured.functions = &table;
+        captured.graphicsPipelineLibrary = libraries && context.graphicsPipelineLibrary;
+        std::shared_ptr<Pipeline> shadow;
+        try {
+            const ShaderResources resources(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0);
+            shadow = std::make_shared<Pipeline>(captured, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        } catch (const std::exception& error) {
+            std::cout << "draw state ops: case '" << item.name << "' not compared, its pipeline did not build (" << error.what() << ")\n";
+            continue;
+        }
+        const auto other = changed(state);
+        const std::array<const State*, 5> sequence{&state, &state, &other, &state, &other};
+        std::array<std::optional<State>, 5> maskedStates;
+        for (std::size_t draw = 0; draw < sequence.size(); ++draw) {
+            if (!item.masked) continue;
+            maskedStates[draw] = *sequence[draw];
+            maskedStates[draw]->blends[0].colorWriteMask = 0;
+        }
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        for (std::size_t index = 0; index < push.size(); ++index) push[index] = static_cast<std::byte>(index * 7u + 3u);
+        const std::array<VkDescriptorSet, 2> sets{reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x1111}), reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x2222})};
+        const std::array<std::uint32_t, 2> firstSets{0, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet};
+        const std::array<VkDescriptorSet, 2> opSets{item.sets > 0 ? sets[0] : VK_NULL_HANDLE, item.sets > 1 ? sets[1] : VK_NULL_HANDLE};
+        const auto commands = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0x77});
+        WaitForOptimizedPipelines(context.device);
+        const auto perCall = [&](CommandState& recording, std::size_t draw) {
+            shadow->Continue(recording, *sequence[draw], maskedStates[draw] ? &*maskedStates[draw] : nullptr);
+            for (std::uint32_t index = 0; index < item.sets; ++index) table.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow->Layout(), firstSets[index], 1, &sets[index], 0, nullptr);
+            shadow->PushConstants(commands, item.pushStages, push);
+        };
+        const auto compose = [&](DrawStateOps& ops, CommandState& recording, std::size_t draw) {
+            push[0] = static_cast<std::byte>(draw);
+            shadow->DrawOps(ops, recording, *sequence[draw], maskedStates[draw] ? &*maskedStates[draw] : nullptr, opSets, item.pushStages, push);
+            Require(CanRunDrawStateOps(ops, table), std::string("draw state ops: a complete function table was refused for case '") + item.name + "'");
+        };
+        enum class Path { Records, Alternating, Issued };
+        const auto trace = [&](std::optional<Path> path) {
+            std::vector<std::vector<std::string>> draws;
+            CommandState recording;
+            recording.Begin(commands, suppress);
+            for (std::size_t draw = 0; draw < sequence.size(); ++draw) {
+                CapturedCalls::calls.clear();
+                push[0] = static_cast<std::byte>(draw);
+                if (!path || (path == Path::Alternating && draw % 2 == 1)) {
+                    perCall(recording, draw);
+                } else {
+                    DrawStateOps ops;
+                    compose(ops, recording, draw);
+                    if (path == Path::Issued) {
+                        shadow->Issue(recording, ops.state);
+                        for (std::uint32_t index = 0; index < item.sets; ++index) table.cmdBindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, shadow->Layout(), firstSets[index], 1, &sets[index], 0, nullptr);
+                        shadow->PushConstants(commands, item.pushStages, push);
+                    } else {
+                        runDrawStateRecordBytes(ops, commands, table);
+                    }
+                }
+                draws.push_back(CapturedCalls::calls);
+            }
+            return draws;
+        };
+        const auto expected = trace(std::nullopt);
+        for (const auto [path, label] : {std::pair{Path::Records, "records"}, std::pair{Path::Alternating, "records alternating with calls"}, std::pair{Path::Issued, "captured state issued as calls"}}) {
+            const auto actual = trace(path);
+            for (std::size_t draw = 0; draw < sequence.size(); ++draw) {
+                if (actual[draw] == expected[draw]) continue;
+                std::string report;
+                for (std::size_t index = 0; index < std::max(actual[draw].size(), expected[draw].size()); ++index) report += "\n  today: " + (index < expected[draw].size() ? expected[draw][index] : std::string("-")) + " | ops: " + (index < actual[draw].size() ? actual[draw][index] : std::string("-"));
+                throw std::runtime_error(std::string("AGC graphics: draw ") + std::to_string(draw) + " of case '" + item.name + "' (" + label + (suppress ? ", suppressed" : ", unsuppressed") + ") differs from today's calls:" + report);
+            }
+        }
+        if (suppress) {
+            Require(expected[1].size() < expected[0].size(), std::string("draw state ops: case '") + item.name + "' repeated its state commands for an unchanged draw, so the sequence does not check suppression");
+            Require(expected[3].size() > expected[1].size(), std::string("draw state ops: case '") + item.name + "' set no state when its state changed back, so the sequence does not check changed slots");
+        }
+        ++compared;
+        if (!captured.graphicsPipelineLibrary) ++plainCompared;
+        std::cout << "draw state ops: case '" << item.name << "' matches today's calls over " << sequence.size() << " draws (" << expected[0].size() << ", " << expected[1].size() << ", " << expected[2].size() << ", " << expected[3].size() << ", " << expected[4].size() << " calls" << (suppress ? ", suppressed" : ", unsuppressed") << (captured.graphicsPipelineLibrary ? ", pipeline libraries)" : ", one pipeline)") << "\n";
+    }
+    Require(compared >= 12 && plainCompared >= 6, "draw state ops: fewer than three cases were compared in each pipeline form and suppression mode");
+    auto captured = context;
+    captured.functions = &table;
+    CommandState recording;
+    const auto commands = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0x78});
+    recording.Begin(commands);
+    const VkViewport viewport{0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f};
+    recording.SetViewport(captured, viewport);
+    DrawStateCapture full;
+    for (std::size_t index = 0; index < DrawStateCapture::Capacity; ++index) full.Add(DrawStateOp::CullMode, 0, VkCullModeFlags{VK_CULL_MODE_NONE});
+    bool threw = false;
+    try {
+        CommandState::Capturing capturing(recording, full);
+        recording.SetScissor(captured, VkRect2D{{0, 0}, {64, 64}});
+        capturing.Composed();
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    Require(threw, "draw state ops: a full draw state record accepted another command");
+    CapturedCalls::calls.clear();
+    recording.SetViewport(captured, viewport);
+    Require(CapturedCalls::calls.size() == 1, "draw state ops: the command state tracker kept its state after a draw state record failed while it composed");
+    DeviceFunctions partial = table;
+    partial.cmdSetColorWriteMask = nullptr;
+    DrawStateOps masks;
+    Require(CanRunDrawStateOps(masks, partial), "draw state ops: a table without the color write mask command was refused for ops that set none");
+    masks.state.Add(DrawStateOp::ColorWriteMask, 1, std::array<VkColorComponentFlags, 8>{15});
+    Require(!CanRunDrawStateOps(masks, partial), "draw state ops: a table without the color write mask command was accepted for ops that set masks");
+    std::cout << "Draw state ops tests passed\n";
+}
+
+std::array<double, DrawStateOp::KindCount> drawStateRates(std::string_view text) {
+    constexpr std::array<std::string_view, DrawStateOp::KindCount> names{"pipeline", "viewport", "scissor", "depthBias", "depthBounds", "cullMode", "frontFace", "depthTest", "depthWrite", "depthCompare", "depthBoundsTest", "stencilTest", "stencilOp", "compareMask", "writeMask", "reference", "colorWriteMask"};
+    std::array<double, DrawStateOp::KindCount> rates{};
+    while (!text.empty()) {
+        const auto comma = text.find(',');
+        const auto entry = text.substr(0, comma);
+        text = comma == std::string_view::npos ? std::string_view{} : text.substr(comma + 1);
+        const auto equals = entry.find('=');
+        Require(equals != std::string_view::npos, "draw state ops benchmark: a rate is not written as kind=rate");
+        const auto found = std::ranges::find(names, entry.substr(0, equals));
+        Require(found != names.end(), "draw state ops benchmark: unknown state kind " + std::string(entry.substr(0, equals)));
+        rates[static_cast<std::size_t>(found - names.begin())] = std::stod(std::string(entry.substr(equals + 1)));
+    }
+    return rates;
+}
+
+int drawStateOpsBenchmark(const Device& device, std::string_view mixed) {
+    if (!CommandEncoder::Enabled() || !device.Graphics()) {
+        std::cout << "draw state ops benchmark: needs the command encoder and a graphics queue\n";
+        return 0;
+    }
+    std::lock_guard gpu(GpuMutex());
+    auto context = device.GetContext();
+    DeviceFunctions table;
+    FillDeviceFunctions(context, table);
+    Recorder recorder(context, false, &table, context.queueFamily);
+    if (!recorder.Encodes()) {
+        std::cout << "draw state ops benchmark: the recorder does not encode\n";
+        return 0;
+    }
+    context.functions = &table;
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.variantId = 33;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    ShaderRecompiler::RecompileResult fragment;
+    fragment.variantId = 34;
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State base{};
+    base.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    base.hasColorTarget = true;
+    base.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    base.colors.push_back(base.color);
+    base.blend.colorWriteMask = 15;
+    base.blends.push_back(base.blend);
+    base.viewport = {0.0f, 0.0f, 256.0f, 256.0f, 0.0f, 1.0f};
+    base.scissor = {{0, 0}, {256, 256}};
+    base.depth = DepthTarget{0x100000u, 0, {256, 256}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    base.depthTest = true;
+    base.depthBias = true;
+    base.depthBiasConstant = 2.0f;
+    base.depthBoundsTest = context.depthBounds;
+    base.maxDepthBounds = 1.0f;
+    base.stencilReplayReference = 1u;
+    base.stencilFront.reference = base.stencilBack.reference = 1u;
+    const ShaderResources resources(context, shaders, base.color, static_cast<std::uint32_t>(base.colors.size()), 0, 0);
+    const std::array<std::unique_ptr<Pipeline>, 2> pipelines{std::make_unique<Pipeline>(context, base, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL), std::make_unique<Pipeline>(context, base, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL)};
+    WaitForOptimizedPipelines(context.device);
+    constexpr int draws = 4096;
+    constexpr int rounds = 32;
+    const auto flip = [](State& state, std::size_t kind) {
+        switch (static_cast<DrawStateOp::Kind>(kind)) {
+        case DrawStateOp::Viewport: state.viewport.x = state.viewport.x == 0.0f ? 1.0f : 0.0f; break;
+        case DrawStateOp::Scissor: state.scissor.offset.x ^= 1; break;
+        case DrawStateOp::DepthBias: state.depthBiasConstant = state.depthBiasConstant == 2.0f ? 3.0f : 2.0f; break;
+        case DrawStateOp::DepthBounds: state.maxDepthBounds = state.maxDepthBounds == 1.0f ? 0.75f : 1.0f; break;
+        case DrawStateOp::CullMode: state.cullMode = state.cullMode == VK_CULL_MODE_NONE ? VK_CULL_MODE_BACK_BIT : VK_CULL_MODE_NONE; break;
+        case DrawStateOp::FrontFace: state.frontFace = state.frontFace == VK_FRONT_FACE_CLOCKWISE ? VK_FRONT_FACE_COUNTER_CLOCKWISE : VK_FRONT_FACE_CLOCKWISE; break;
+        case DrawStateOp::DepthTest: state.depthTest = !state.depthTest; break;
+        case DrawStateOp::DepthWrite: state.depthWrite = !state.depthWrite; break;
+        case DrawStateOp::DepthCompare: state.depthCompare = state.depthCompare == VK_COMPARE_OP_LESS ? VK_COMPARE_OP_GREATER : VK_COMPARE_OP_LESS; break;
+        case DrawStateOp::StencilTest: state.stencilTest = !state.stencilTest; break;
+        case DrawStateOp::StencilOp: state.stencilFront.failOp = state.stencilBack.failOp = state.stencilFront.failOp == VK_STENCIL_OP_KEEP ? VK_STENCIL_OP_ZERO : VK_STENCIL_OP_KEEP; break;
+        case DrawStateOp::CompareMask: state.stencilFront.compareMask = state.stencilBack.compareMask ^= 1u; break;
+        case DrawStateOp::WriteMask: state.stencilFront.writeMask = state.stencilBack.writeMask ^= 1u; break;
+        case DrawStateOp::Reference: state.stencilReplayReference = *state.stencilReplayReference ^ 1u; state.stencilFront.reference = state.stencilBack.reference = *state.stencilReplayReference; break;
+        case DrawStateOp::ColorWriteMask: state.blends[0].colorWriteMask = state.blends[0].colorWriteMask == 15 ? 5 : 15; break;
+        default: break;
+        }
+    };
+    const auto run = [&](const char* name, const std::array<double, DrawStateOp::KindCount>& rates) {
+        std::vector<State> states;
+        std::vector<std::size_t> bound;
+        states.reserve(draws);
+        std::mt19937 random(12345);
+        std::uniform_real_distribution<double> roll(0.0, 1.0);
+        State state = base;
+        std::size_t pipeline = 0;
+        for (int draw = 0; draw < draws; ++draw) {
+            for (std::size_t kind = 0; kind < rates.size(); ++kind) {
+                if (rates[kind] <= 0.0 || roll(random) >= rates[kind]) continue;
+                if (kind == DrawStateOp::BindPipeline) pipeline ^= 1u;
+                else flip(state, kind);
+            }
+            states.push_back(state);
+            bound.push_back(pipeline);
+        }
+        std::array<std::byte, PipelinePushConstantBytes> push{};
+        constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        std::uint64_t stateOps = 0;
+        const auto sample = [&](bool ops) {
+            const auto commands = recorder.Commands();
+            const auto before = recorder.EncoderCounts();
+            std::chrono::steady_clock::time_point start;
+            std::chrono::steady_clock::time_point stop;
+            if (ops) stateOps = 0;
+            {
+                const Recorder::EncodingWindow window(recorder);
+                auto* encoder = recorder.DeferringEncoder(commands);
+                Require(encoder != nullptr, "draw state ops benchmark: the encoding window did not defer the recorder's commands");
+                CommandState recording;
+                recording.Begin(commands);
+                start = std::chrono::steady_clock::now();
+                for (int draw = 0; draw < draws; ++draw) {
+                    push[0] = static_cast<std::byte>(draw);
+                    const auto& target = *pipelines[bound[static_cast<std::size_t>(draw)]];
+                    const auto& drawn = states[static_cast<std::size_t>(draw)];
+                    if (ops) {
+                        DrawStateOps record;
+                        target.DrawOps(record, recording, drawn, nullptr, {}, stages, push);
+                        EmplaceDrawStateOps(*encoder, record);
+                        stateOps += record.record.opCount;
+                    } else {
+                        target.Continue(recording, drawn);
+                        target.PushConstants(commands, stages, push);
+                    }
+                }
+                stop = std::chrono::steady_clock::now();
+            }
+            recorder.Submit();
+            recorder.Sync();
+            const auto after = recorder.EncoderCounts();
+            return std::pair{static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()) / draws, static_cast<double>(after.encodeNs - before.encodeNs) / draws};
+        };
+        std::array<std::vector<double>, 2> caller;
+        std::array<std::vector<double>, 2> encoded;
+        for (int round = 0; round < rounds; ++round) {
+            for (const bool ops : {round % 2 == 0, round % 2 != 0}) {
+                const auto [callerNs, encodeNs] = sample(ops);
+                caller[ops ? 1 : 0].push_back(callerNs);
+                encoded[ops ? 1 : 0].push_back(encodeNs);
+            }
+        }
+        const auto median = [](std::vector<double> values) {
+            std::ranges::sort(values);
+            return values[values.size() / 2];
+        };
+        std::printf("draw state ops benchmark, %s mix (%d continued draws, %.2f state commands per record, median of %d, %s): caller %.1f ns/draw per call, %.1f ns/draw one record; encoder thread %.1f ns/draw per call, %.1f ns/draw one record\n", name, draws, static_cast<double>(stateOps) / draws, rounds, context.graphicsPipelineLibrary ? "pipeline libraries" : "one pipeline", median(caller[0]), median(caller[1]), median(encoded[0]), median(encoded[1]));
+    };
+    std::array<double, DrawStateOp::KindCount> every{};
+    every.fill(1.0);
+    run("same-state", {});
+    run("all-changing", every);
+    if (!mixed.empty()) run("given", drawStateRates(mixed));
+    return 0;
+}
+
 void pipelineLibraryTests(const Device& device) {
     std::lock_guard gpu(GpuMutex());
     const auto& context = device.GetContext();
@@ -17761,6 +18180,7 @@ int main(int argc, char** argv) {
             pipelineLibraryTests(device);
             return 0;
         }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--benchmark-draw-state-ops") return drawStateOpsBenchmark(device, argc == 3 ? std::string_view(argv[2]) : std::string_view{});
         if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--benchmark-pipeline-store-memory") return pipelineStoreMemoryBench(device, argc == 3 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 4096u);
         if (argc == 2 && (std::string_view(argv[1]) == "--benchmark-pipeline-cache" || std::string_view(argv[1]) == "--pipeline-cache-only")) {
             pipelineCacheTests(device, std::string_view(argv[1]) == "--benchmark-pipeline-cache");
@@ -18363,6 +18783,7 @@ int main(int argc, char** argv) {
         suffixCancellationTests(device, VK_SUCCESS);
         suffixCancellationTests(device, VK_ERROR_OUT_OF_HOST_MEMORY);
         timelineAllocationFailureTests(device);
+        drawStateOpsTests(device);
         latchedCompletionTests(device);
         encoderAcknowledgementTests(device);
         admissionTests(device);

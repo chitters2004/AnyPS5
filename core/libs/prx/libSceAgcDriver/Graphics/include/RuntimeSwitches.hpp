@@ -54,6 +54,7 @@ enum class RuntimeSwitch : std::size_t {
     NoTargetMemoOverlapCache,
     NoRecordEncoder,
     EncoderPostChunks,
+    DrawOps,
     Count,
 };
 
