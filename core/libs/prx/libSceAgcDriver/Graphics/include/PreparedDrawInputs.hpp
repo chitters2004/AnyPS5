@@ -111,6 +111,7 @@ struct PreparedDrawInputCounts {
     std::uint64_t notReady = 0;
     std::uint64_t waited = 0;
     std::uint64_t unused = 0;
+    std::uint64_t abandoned = 0;
     std::uint64_t checks = 0;
     std::uint64_t checkNanoseconds = 0;
     std::uint64_t verifyDiffered = 0;
@@ -160,6 +161,7 @@ struct PreparedUploadCounts {
 PreparedUploadCounts PreparedUploadCounters();
 void SetDrawInputPreparers(unsigned count);
 void SetPreparedDrawInputsHook(void (*hook)(PreparedDrawInputs& prepared));
+void SetDrawInputPreparerHook(void (*hook)());
 void HoldDrawInputPreparers(bool held);
 void ShutdownDrawInputPreparers();
 void ClearDrawInputStash(VkDevice device);

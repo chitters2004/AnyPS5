@@ -49,6 +49,7 @@ enum class RuntimeSwitch : std::size_t {
     WholePendingBumps,
     NoCertifiedDrawInputs,
     NoSharedPreparerContext,
+    NoDrawInputAbandon,
     Count,
 };
 
