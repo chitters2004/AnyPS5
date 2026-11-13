@@ -787,6 +787,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
             throw std::runtime_error("control flow graph contains duplicate block id " + std::to_string(sourceBlock.id));
         }
         auto regions = regionsOf(sourceBlock);
+        program.Metadata().nanSpeculationCandidates += static_cast<std::uint32_t>(regions.size());
         std::size_t current = blocks.size();
         blocks.push_back(&program.CreateBlock());
         blockInfos.push_back(BlockInfo{sourceBlock.id, sourceBlock.startProgramCounter, sourceBlock.endProgramCounter, sourceBlock.terminator});
@@ -928,6 +929,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                 for (std::uint32_t inner = region->begin; inner < region->end; ++inner) translateOne(inner);
                 ++program.Metadata().nanSpeculationDeclines;
             }
+            if (seen == nullptr && !declined) ++program.Metadata().nanSpeculationClean;
             if (seen == nullptr || declined) {
                 IrBlock& merge = *blocks[region->mergeIndex];
                 std::erase(fast.Successors(), &merge);
@@ -942,6 +944,7 @@ IrProgram InstructionTranslator::Translate(const RdnaProgram& decoded, const Con
                 ++region;
                 continue;
             }
+            ++program.Metadata().nanSpeculationKept;
             IrValue* first = before < instructions.size() ? *std::next(instructions.begin(), static_cast<std::ptrdiff_t>(before)) : nullptr;
             std::vector<std::pair<IrValue*, IrValue*>> restores;
             std::unordered_set<std::uint64_t> restored;
