@@ -220,6 +220,15 @@ private:
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+enum class MappingSite : std::uint8_t { OwnedProof, PreparedRange, Count };
+struct MappingCounts {
+    std::uint64_t held = 0;
+    std::uint64_t dropped = 0;
+    std::uint64_t avoided = 0;
+};
+bool MappingHolds(MappingSite site, std::uint64_t keptRegistry, std::uint64_t currentRegistry, std::uint64_t keptForget, std::uint64_t address, std::size_t bytes);
+MappingCounts MappingCountsFor(MappingSite site);
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).

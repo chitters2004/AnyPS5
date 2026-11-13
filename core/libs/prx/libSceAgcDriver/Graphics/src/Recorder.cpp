@@ -4145,6 +4145,40 @@ std::size_t SnapshotPool(Recorder::SnapshotUse use) {
 bool MappingUnchanged(std::uint64_t forgetSerial, std::uint64_t address, std::size_t bytes) {
     return (forgetSerial & 1u) == 0 && (GuestMemory::ForgetSerial() & 1u) == 0 && GuestMemory::ForgetStamp(address, bytes) <= forgetSerial;
 }
+
+struct MappingTally {
+    std::atomic<std::uint64_t> held{0};
+    std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> avoided{0};
+};
+
+std::array<MappingTally, static_cast<std::size_t>(MappingSite::Count)> mappingTallies;
+constexpr std::array<std::array<const char*, 3>, static_cast<std::size_t>(MappingSite::Count)> MappingNames{{
+    {"Mapping.owned_held", "Mapping.owned_dropped", "Mapping.owned_avoided"},
+    {"Mapping.prepared_held", "Mapping.prepared_dropped", "Mapping.prepared_avoided"},
+}};
+
+void countMapping(MappingSite site, std::size_t kind) {
+    auto& tally = mappingTallies[static_cast<std::size_t>(site)];
+    (kind == 0 ? tally.held : kind == 1 ? tally.dropped : tally.avoided).fetch_add(1, std::memory_order_relaxed);
+    PerformanceTrace::CountOwnedDraw(MappingNames[static_cast<std::size_t>(site)][kind], 1);
+}
+}
+
+bool MappingHolds(MappingSite site, std::uint64_t keptRegistry, std::uint64_t currentRegistry, std::uint64_t keptForget, std::uint64_t address, std::size_t bytes) {
+    const bool global = keptRegistry == currentRegistry && keptForget == GuestMemory::ForgetSerial();
+    if (RuntimeSwitches::Set(RuntimeSwitch::GlobalProofChecks)) {
+        countMapping(site, global ? 0 : 1);
+        return global;
+    }
+    const bool ranged = MappingUnchanged(keptForget, address, bytes);
+    countMapping(site, !ranged ? 1 : global ? 0 : 2);
+    return ranged;
+}
+
+MappingCounts MappingCountsFor(MappingSite site) {
+    const auto& tally = mappingTallies[static_cast<std::size_t>(site)];
+    return {tally.held.load(std::memory_order_relaxed), tally.dropped.load(std::memory_order_relaxed), tally.avoided.load(std::memory_order_relaxed)};
 }
 
 void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry) {
@@ -4450,7 +4484,7 @@ bool Recorder::ownedDrawInputHolds(std::uint64_t address, std::size_t bytes, con
     GuestMemory::AssertGpuLockHeld("check owned draw input");
     OwnedDrawTraceCount("OwnedDraw.proof_check");
     if (proof.words.empty() || proof.since == 0 || (proof.forget & 1u) != 0 || !GuestMemory::WriteWatched()) return false;
-    if (proof.registry != GuestAllocations::GuestAllocationsGeneration_nid_postfix() || proof.forget != GuestMemory::ForgetSerial()) return false;
+    if (!MappingHolds(MappingSite::OwnedProof, proof.registry, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), proof.forget, address, bytes)) return false;
     if (PendingWriteOverlaps(address, bytes) || proof.note != NewestWriteNote(address, bytes) || GuestMemory::NewestStamp(address, bytes) > proof.since) return false;
     OwnedDrawTraceCount("OwnedDraw.arena_check");
     OwnedDrawTraceCount("OwnedDraw.check_blocks_requested", proof.words.size());

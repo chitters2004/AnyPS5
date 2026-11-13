@@ -829,7 +829,7 @@ private:
 thread_local std::shared_ptr<PreparedDrawInputs> currentPrepared;
 
 bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorder, std::uint64_t registryGeneration) {
-    if (range.registry != registryGeneration || range.forget != GuestMemory::ForgetSerial()) return false;
+    if (!MappingHolds(MappingSite::PreparedRange, range.registry, registryGeneration, range.forget, range.address, range.readable)) return false;
     if (recorder != nullptr && recorder->PendingWriteOverlaps(range.address, range.readable)) return false;
     return GuestMemory::UnchangedSince(range.address, range.readable, range.generation);
 }
