@@ -277,7 +277,7 @@ void Driver::execute(const Submission& submission) {
     struct ClearAhead {
         ~ClearAhead() { clearResolvedAhead(); }
     } clearAhead;
-    if (submission.queue == 0 && DrawFinisher::Enabled()) DrawFinisher::FollowSequenceSwitch();
+    if (submission.queue == 0) DrawFinisher::FollowSequenceSwitch();
     const bool ownsHandOffs = DrawFinisher::Sequenced() && executingSubmission().get() == &submission;
     struct SettleFinisher {
         bool queue0;
