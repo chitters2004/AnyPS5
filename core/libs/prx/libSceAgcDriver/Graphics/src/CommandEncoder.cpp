@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/CommandEncoder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ReplayScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -757,6 +758,7 @@ void CommandEncoder::execute(Chunk& chunk) {
     const auto start = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(poolMutex);
+        const Replay::Scope replay;
         if (testDelay()) testDelay()();
         for (std::size_t at = 0; at < chunk.used;) {
             const auto record = *std::launder(reinterpret_cast<const Record*>(chunk.bytes.data() + at));
