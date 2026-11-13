@@ -409,6 +409,21 @@ public:
         std::uint64_t objectsNanoseconds = 0;
     };
     static DrawBindingSplit TakeDrawBindingSplit();
+    static constexpr std::size_t DrawSetSizeBuckets = 5;
+    struct DrawSetSplit {
+        std::uint64_t calls = 0;
+        std::uint64_t recountNanoseconds = 0;
+        std::uint64_t allocateNanoseconds = 0;
+        std::uint64_t buildNanoseconds = 0;
+        std::uint64_t updateNanoseconds = 0;
+        std::uint64_t rebound = 0;
+        std::uint64_t writes = 0;
+        std::uint64_t patched = 0;
+        std::array<std::uint64_t, 2> buffers{};
+        std::array<std::uint64_t, 2> images{};
+        std::array<std::array<std::uint64_t, DrawSetSizeBuckets>, 2> bufferSizes{};
+    };
+    static DrawSetSplit TakeDrawSetSplit();
     static std::array<std::uint64_t, static_cast<std::size_t>(FastFail::Count)> FullWalkNanoseconds();
     // Why a Pending failure was left to the full walk instead of the own-object refresh (T1, see
     // refreshOwnObjects); Count: it was not.
