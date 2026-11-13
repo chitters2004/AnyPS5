@@ -3,3 +3,4 @@ called_from_lib:libLLVM
 called_from_lib:libpulsecommon
 race:libLLVM
 deadlock:libLLVM
+race:AgcDriver::Graphics::PreparedDrawInputs::copyRange
