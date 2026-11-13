@@ -3029,6 +3029,13 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     return complete;
 }
 
+bool threadMemoCovers(std::uint64_t first, std::uint64_t stop, std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
+    if (epochCollectMapEnabled() && epochCollectMap(epoch, unwatched, mapping).Covers(first, stop)) return true;
+    return std::ranges::any_of(threadCollectMemo().entries, [&](const auto& entry) {
+        return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
+    });
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
@@ -3044,25 +3051,13 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool useMemo = memoized && collectMemoEnabled() && bytes != 0;
     const bool epochal = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
-    if (useMemo && epochal && !sharedCollectMemo()) {
-        // An entry exists only for a completed walk of an in-arena range, so the tracker is
-        // initialized and watched; nothing below the lock needs asking.
-        if (epochCollectMapEnabled()) {
-            const auto& map = epochCollectMap(epoch, unwatched, mapping);
-            if (map.Covers(first, stop)) {
-                collectMemoHits.Add();
-                return tracker.stable.load(std::memory_order_acquire);
-            }
-        }
-        for (const auto& entry : threadCollectMemo().entries) {
-            if (entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end) {
-                // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
-                // overlapping collect) were written before this caller reads, and an older value would
-                // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.Add();
-                return tracker.stable.load(std::memory_order_acquire);
-            }
-        }
+    // An entry exists only for a completed walk of an in-arena range, so the tracker is initialized
+    // and watched; nothing below the lock needs asking. A hit returns the current generation, not the
+    // memoized one: blocks stamped since (MarkWritten, an overlapping collect) were written before this
+    // caller reads, and an older value would make every later UnchangedSince fail until the epoch ends.
+    if (useMemo && epochal && !sharedCollectMemo() && threadMemoCovers(first, stop, epoch, unwatched, mapping)) {
+        collectMemoHits.Add();
+        return tracker.stable.load(std::memory_order_acquire);
     }
     auto lock = lockTracker(tracker);
     tracker.initialize();
@@ -3122,6 +3117,15 @@ std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
     return collectWrites(address, bytes, false);
+}
+
+bool CollectMemoCovers(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !collectMemoEnabled() || sharedCollectMemo()) return false;
+    if (HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() == 0) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    return stop > first && threadMemoCovers(first, stop, currentCollectEpoch(), unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
 }
 
 std::uint64_t WriteGeneration() {

@@ -372,7 +372,16 @@ int main() {
             return std::array<std::uint64_t, 3>{after.epochFollows - before.epochFollows, after.stashHits[0] - before.stashHits[0], after.stashReturned - before.stashReturned};
         };
         const auto ringSlices = AgcDriver::Graphics::DrawInputRingCounters().slices;
+        const auto batchesBefore = AgcDriver::Graphics::PreparedDrawInputCounters().collectBatches;
         const auto sliced = prepareUnused((std::uint64_t{1} << 62u) - 8u);
+        const auto batchesAfter = AgcDriver::Graphics::PreparedDrawInputCounters().collectBatches;
+        std::printf("collect batches of three preparations in epochs E, E and E+1: %llu batches, %llu ranges, %llu walks if merged, %llu answered by the memo alone\n", static_cast<unsigned long long>(batchesAfter.batches - batchesBefore.batches), static_cast<unsigned long long>(batchesAfter.ranges - batchesBefore.ranges), static_cast<unsigned long long>(batchesAfter.runs - batchesBefore.runs), static_cast<unsigned long long>(batchesAfter.memoOnly - batchesBefore.memoOnly));
+        if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+            Require(batchesAfter.batches - batchesBefore.batches == 6 && batchesAfter.ranges - batchesBefore.ranges == 6, "prepared vertex inputs: three preparations of an indexed draw did not count an index batch and a vertex batch of one range each");
+            Require(batchesAfter.memoOnly - batchesBefore.memoOnly == 2 && batchesAfter.runs - batchesBefore.runs == 4, "prepared vertex inputs: the second preparation in the same collect epoch was not answered by the collect memo alone, or the preparations in a new epoch did not each need a walk per batch");
+        } else {
+            Require(batchesAfter.batches == batchesBefore.batches, "prepared vertex inputs: collect batches were counted without APS5_PROFILE_DRAW");
+        }
         std::printf("three unused preparations in ring slices: %llu ring slices, %llu staging buffers taken from the stash, %llu returned to it\n", static_cast<unsigned long long>(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices), static_cast<unsigned long long>(sliced[1]), static_cast<unsigned long long>(sliced[2]));
         Require(AgcDriver::Graphics::DrawInputRingCounters().slices - ringSlices == 6 && sliced[1] == 0 && sliced[2] == 0, "prepared vertex inputs: preparations of ring-sized ranges did not take ring slices, or put slices in the stash of whole buffers");
         AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawInputRing, true);

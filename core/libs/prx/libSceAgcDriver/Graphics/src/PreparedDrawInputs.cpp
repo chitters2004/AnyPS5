@@ -94,6 +94,20 @@ struct PreparedRange {
     }
 };
 
+struct CollectBatchTotals {
+    std::atomic<std::uint64_t> batches{0};
+    std::atomic<std::uint64_t> ranges{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> memoOnly{0};
+
+    PreparedCollectBatchCounts Load() const {
+        return {batches.load(std::memory_order_relaxed), ranges.load(std::memory_order_relaxed), runs.load(std::memory_order_relaxed), memoOnly.load(std::memory_order_relaxed)};
+    }
+};
+
+constexpr std::array<const char*, 4> DrawCollectBatchNames{"DrawInputPrep.collect_batches", "DrawInputPrep.collect_batch_ranges", "DrawInputPrep.collect_batch_runs", "DrawInputPrep.collect_batch_memo_only"};
+constexpr std::array<const char*, 4> RegionCollectBatchNames{"UploadPrep.region_collect_batches", "UploadPrep.region_collect_batch_ranges", "UploadPrep.region_collect_batch_runs", "UploadPrep.region_collect_batch_memo_only"};
+
 struct Counters {
     std::atomic<std::uint64_t> requests{0};
     std::atomic<std::uint64_t> ranges{0};
@@ -111,6 +125,7 @@ struct Counters {
     std::atomic<std::uint64_t> requestNanoseconds{0};
     std::atomic<std::uint64_t> epochFollows{0};
     std::atomic<std::uint64_t> collectNanoseconds{0};
+    CollectBatchTotals collectBatches;
     std::array<std::atomic<std::uint64_t>, 2> allocNanoseconds{};
     std::array<std::atomic<std::uint64_t>, 2> poolWaitNanoseconds{};
     std::array<std::atomic<std::uint64_t>, 2> stashHits{};
@@ -256,6 +271,7 @@ struct UploadCounters {
     std::atomic<std::uint64_t> regionCollectNanoseconds{0};
     std::atomic<std::uint64_t> regionSpareReused{0};
     std::atomic<std::uint64_t> regionVerifyDiffered{0};
+    CollectBatchTotals regionCollectBatches;
 };
 
 UploadCounters& uploadCounters() {
@@ -468,6 +484,9 @@ public:
     std::uint64_t epoch = 0;
     bool followedEpoch = false;
     std::uint64_t collectNanoseconds = 0;
+    PreparedCollectBatchCounts collectBatches;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> batchMisses;
+    std::uint64_t batchRanges = 0;
     StagingCost staging;
     std::atomic<JobState> state{JobState::Queued};
     std::vector<PreparedRange> ranges;
@@ -508,6 +527,30 @@ public:
     }
 
 protected:
+    void closeCollectBatch() {
+        if (batchRanges == 0) return;
+        ++collectBatches.batches;
+        collectBatches.ranges += batchRanges;
+        if (batchMisses.empty()) ++collectBatches.memoOnly;
+        std::ranges::sort(batchMisses);
+        std::uint64_t end = 0;
+        for (std::size_t index = 0; index < batchMisses.size(); ++index) {
+            if (index == 0 || batchMisses[index].first > end) ++collectBatches.runs;
+            end = index == 0 ? batchMisses[index].second : std::max(end, batchMisses[index].second);
+        }
+        batchMisses.clear();
+        batchRanges = 0;
+    }
+
+    void countCollectBatches(CollectBatchTotals& total, const std::array<const char*, 4>& names, void (*count)(std::atomic<std::uint64_t>&, const char*, std::uint64_t)) {
+        closeCollectBatch();
+        if (collectBatches.batches == 0) return;
+        count(total.batches, names[0], collectBatches.batches);
+        count(total.ranges, names[1], collectBatches.ranges);
+        count(total.runs, names[2], collectBatches.runs);
+        count(total.memoOnly, names[3], collectBatches.memoOnly);
+    }
+
     std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
         const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
             ++refusedRanges;
@@ -528,6 +571,11 @@ protected:
         const auto pending = Recorder::PendingWriteSnapshot();
         if (Recorder::SnapshotOverlaps(pending.get(), address, readable)) return refuse(PreparedRefusal::Pending);
         const bool timed = DrawInputSourcesTimed();
+        if (timed) {
+            ++batchRanges;
+            constexpr std::uint64_t page = 4096;
+            if (!GuestMemory::CollectMemoCovers(address, readable)) batchMisses.emplace_back(address & ~(page - 1), (address + readable + page - 1) & ~(page - 1));
+        }
         const auto collectStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         range.generation = GuestMemory::CollectWrites(address, readable);
         if (timed) collectNanoseconds += nanosecondsSince(collectStart);
@@ -608,6 +656,7 @@ public:
         }
         if (timed) stageANanoseconds = nanosecondsSince(start);
         if (!regionsWanted || stageA == nullptr) return;
+        closeCollectBatch();
         for (const auto& [begin, end] : stageA->OffDeviceCopies()) static_cast<void>(copyRange(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Storage, RegionCopyUsage(false), static_cast<std::size_t>(end - begin)));
         if (!stageAWanted) stageA.reset();
     }
@@ -658,6 +707,7 @@ public:
         }
         if (attributes.empty() || layout == nullptr) return;
         const auto planned = PlanDrawVertexFetches(colorTarget, draw, attributes, *layout, maxIndex);
+        closeCollectBatch();
         for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(countedCopy(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, DrawInputUsage, static_cast<std::size_t>(end - begin)));
         for (const auto solo : planned.soloFetches) {
             const auto& fetch = planned.fetches[solo];
@@ -682,6 +732,7 @@ public:
             counted(total.waited, "DrawInputPrep.waited", waited ? 1 : 0);
             counted(total.epochFollows, "DrawInputPrep.epoch_follows", !cancelled && followedEpoch ? 1 : 0);
             if (!cancelled && collectNanoseconds != 0) counted(total.collectNanoseconds, "DrawInputPrep.collect_ns", collectNanoseconds);
+            if (!cancelled) countCollectBatches(total.collectBatches, DrawCollectBatchNames, counted);
             if (!cancelled) countStaging(StagingRole::Preparer, staging);
             if (returned != 0) counted(total.stashReturned, "DrawInputPrep.stash_returned", returned);
         }
@@ -723,6 +774,7 @@ void PreparedDrawResources::Finish() {
     countedUpload(total.regionsRefused, "UploadPrep.regions_refused", refusedRanges);
     for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) countedUpload(total.regionsRefusedBy[reason], RegionRefusalNames[reason], refusedBy[reason]);
     if (collectNanoseconds != 0) countedUpload(total.regionCollectNanoseconds, "UploadPrep.region_collect_ns", collectNanoseconds);
+    countCollectBatches(total.regionCollectBatches, RegionCollectBatchNames, countedUpload);
     countStaging(StagingRole::Preparer, staging);
     if (returned != 0) counted(counters().stashReturned, "DrawInputPrep.stash_returned", returned);
     stageA.reset();
@@ -1002,6 +1054,7 @@ PreparedUploadCounts PreparedUploadCounters() {
     for (std::size_t reason = 0; reason < PreparedRefusalCount; ++reason) counts.regionsRefusedBy[reason] = total.regionsRefusedBy[reason].load(std::memory_order_relaxed);
     counts.regionSpareReused = total.regionSpareReused.load(std::memory_order_relaxed);
     counts.regionVerifyDiffered = total.regionVerifyDiffered.load(std::memory_order_relaxed);
+    counts.regionCollectBatches = total.regionCollectBatches.Load();
     return counts;
 }
 
@@ -1121,6 +1174,7 @@ PreparedDrawInputCounts PreparedDrawInputCounters() {
     counts.requestNanoseconds = total.requestNanoseconds.load(std::memory_order_relaxed);
     counts.epochFollows = total.epochFollows.load(std::memory_order_relaxed);
     counts.collectNanoseconds = total.collectNanoseconds.load(std::memory_order_relaxed);
+    counts.collectBatches = total.collectBatches.Load();
     for (std::size_t role = 0; role < 2; ++role) {
         counts.allocNanoseconds[role] = total.allocNanoseconds[role].load(std::memory_order_relaxed);
         counts.poolWaitNanoseconds[role] = total.poolWaitNanoseconds[role].load(std::memory_order_relaxed);
