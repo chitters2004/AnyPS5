@@ -371,6 +371,7 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
         noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}), *result, NanCheckWord);
         return result;
     }
+    ++program.Metadata().nanSpeculationRepairedOps;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* bits = &ir.BitCastU32(*result);
     const bool normalFactor = multiplication && std::any_of(sources.begin(), sources.end(), [](const IrValue* source) {
@@ -396,6 +397,7 @@ IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValu
         noteNan(ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {result}), *result, NanCheckWord);
         return result;
     }
+    ++program.Metadata().nanSpeculationRepairedOps;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* nan = &ir.Constant(0xffc00000u);
     for (auto source = sources.end(); source != sources.begin();) {
@@ -424,6 +426,7 @@ IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*>
 }
 
 void TranslationContext::noteNan(IrValue& condition, IrValue& value, std::uint8_t lanes) {
+    ++program.Metadata().nanSpeculationFastOps;
     nanSeen = nanSeen == nullptr ? &condition : &ir.LogicalOr(*nanSeen, condition);
     program.Metadata().nanSpeculationChecks.push_back({&condition, &value, lanes, nanRegion});
 }

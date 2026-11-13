@@ -1,11 +1,17 @@
+#include "Translation/InstructionTranslator.hpp"
 #include "Translation/TranslationContext.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace ShaderRecompiler {
 
@@ -115,11 +121,78 @@ const NanSpeculationConfig& NanSpeculation() {
             const auto value = std::strtoul(text, &end, 10);
             return end != text && *end == '\0' && value > 0u && value <= 4096u ? static_cast<std::uint32_t>(value) : fallback;
         };
+        constexpr std::array<std::pair<std::string_view, ShaderStageKind>, 6> names{{{"compute", ShaderStageKind::Compute}, {"vertex", ShaderStageKind::Vertex}, {"pixel", ShaderStageKind::Pixel}, {"fetch", ShaderStageKind::Fetch}, {"mesh", ShaderStageKind::Mesh}, {"unknown", ShaderStageKind::Unknown}}};
+        if (const char* stages = std::getenv("APS5_NAN_SPECULATION_STAGES"); stages != nullptr && *stages != '\0') {
+            result.stageMask = 0u;
+            std::string_view rest(stages);
+            while (!rest.empty()) {
+                const auto comma = rest.find(',');
+                const auto name = rest.substr(0u, comma);
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1u);
+                for (const auto& [text, kind] : names) {
+                    if (name == text || name == "all") result.stageMask |= 1u << static_cast<std::uint32_t>(kind);
+                }
+            }
+        }
         result.minimumVectorInstructions = number("APS5_NAN_SPECULATION_MIN", result.minimumVectorInstructions);
-        result.maximumVectorInstructions = std::max(result.minimumVectorInstructions, number("APS5_NAN_SPECULATION_MAX", result.maximumVectorInstructions));
+        result.stageMinimum.fill(result.minimumVectorInstructions);
+        if (const char* minimum = std::getenv("APS5_NAN_SPECULATION_MIN"); minimum != nullptr && std::strchr(minimum, ':') != nullptr) {
+            std::string_view rest(minimum);
+            while (!rest.empty()) {
+                const auto comma = rest.find(',');
+                const auto entry = rest.substr(0u, comma);
+                rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1u);
+                const auto colon = entry.find(':');
+                if (colon == std::string_view::npos) continue;
+                const auto name = entry.substr(0u, colon);
+                const std::string digits(entry.substr(colon + 1u));
+                char* end = nullptr;
+                const auto value = std::strtoul(digits.c_str(), &end, 10);
+                if (end == digits.c_str() || *end != '\0' || value == 0u || value > 4096u) continue;
+                for (const auto& [text, kind] : names) {
+                    if (name == text || name == "all") result.stageMinimum[static_cast<std::size_t>(kind)] = static_cast<std::uint32_t>(value);
+                }
+            }
+        }
+        std::uint32_t lowest = result.stageMinimum[0];
+        for (const auto value : result.stageMinimum) lowest = std::min(lowest, value);
+        result.minimumVectorInstructions = lowest;
+        result.maximumVectorInstructions = std::max(*std::ranges::max_element(result.stageMinimum), number("APS5_NAN_SPECULATION_MAX", result.maximumVectorInstructions));
+        const char* count = std::getenv("APS5_NAN_SPECULATION_COUNT");
+        result.count = result.enabled && count != nullptr && *count != '\0' && std::strcmp(count, "0") != 0;
         return result;
     }();
     return config;
+}
+
+namespace {
+
+std::mutex& CounterMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::vector<NanSpeculationCounterSite>& CounterSites() {
+    static std::vector<NanSpeculationCounterSite> sites;
+    return sites;
+}
+
+}
+
+std::uint32_t NanSpeculationCounterSlot(std::uint64_t address, std::uint32_t stage) {
+    const std::lock_guard lock(CounterMutex());
+    auto& sites = CounterSites();
+    for (const auto& site : sites) {
+        if (site.address == address && site.stage == stage) return site.slot;
+    }
+    if (sites.size() >= NanSpeculationCounterSlots) return NanSpeculationCounterSlots;
+    sites.push_back({address, stage, static_cast<std::uint32_t>(sites.size())});
+    return sites.back().slot;
+}
+
+std::vector<NanSpeculationCounterSite> NanSpeculationCounterSites() {
+    const std::lock_guard lock(CounterMutex());
+    return CounterSites();
 }
 
 bool ExactF32Arithmetic() {

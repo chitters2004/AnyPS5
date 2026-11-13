@@ -45,6 +45,7 @@ public:
     }
     [[nodiscard]] IrValue& WaveAny(IrValue& flag);
     void SetNativeInteger16(bool enabled) { nativeInteger16 = enabled; }
+    void CountNanSpeculation(std::uint32_t byteOffset, bool perWave);
     void SetFloat32DenormPreserve(bool enabled) { float32DenormPreserve = enabled; }
     void SetFloat32FlushToZero(bool enabled) { float32FlushToZero = enabled; }
     void SetFloat32FlushDeclared(bool enabled) { float32FlushDeclared = enabled; }
