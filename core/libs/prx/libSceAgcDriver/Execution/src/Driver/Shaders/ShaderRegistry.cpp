@@ -2012,7 +2012,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto wave = Graphics::StageWaveSize(decoded.state.stages, program.binary.stage);
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
-        auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;
+        auto room = Graphics::StagePushRoom(fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity, pushOffset, fixedSlots);
         if (decoded.state.depthRemap.mode != 0u && offset < Graphics::PipelinePushSlotBytes) {
             room = std::min(room, ShaderRecompiler::DepthRemapPushOffsetBytes - offset);
         }

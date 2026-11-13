@@ -15353,6 +15353,7 @@ void pipelineLibraryTests(const Device& device) {
     static_cast<void>(lookup());
     Require(counters().built == std::array<std::uint64_t, 4>{2, 1, 1, 2} && counters().linked == 4, "a vertex input change rebuilt more than the vertex input library");
     Require(StagePushOffset(88, ShaderRecompiler::ShaderStage::Fragment, true) == PipelinePushSlotBytes && StagePushOffset(88, ShaderRecompiler::ShaderStage::Fragment, false) == 88 && StagePushOffset(40, ShaderRecompiler::ShaderStage::TessellationEvaluation, true) == 40, "a stage got the wrong push offset");
+    Require(StagePushRoom(PipelinePushSlotBytes, PipelinePushSlotBytes, false) == 0u && StagePushRoom(PipelinePushSlotBytes, 88, false) == 40u && StagePushRoom(PipelinePushSlotBytes, PipelinePushSlotBytes, true) == PipelinePushSlotBytes && StagePushRoom(PipelinePushSlotBytes, 40, true) == 88u, "a stage got push room outside the pipeline push constant range");
     const auto beforeSlots = counters().built;
     ShaderRecompiler::RecompileResult otherVertex = vertex;
     otherVertex.spirv[2] ^= 1u;

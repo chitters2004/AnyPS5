@@ -34,6 +34,11 @@ inline std::uint32_t StagePushOffset(std::uint32_t cursor, ShaderRecompiler::Sha
     return fixedSlots && stage == ShaderRecompiler::ShaderStage::Fragment ? PipelinePushSlotBytes : cursor;
 }
 
+inline std::uint32_t StagePushRoom(std::uint32_t limit, std::uint32_t offset, bool fixedSlots) {
+    if (fixedSlots) return limit - offset % PipelinePushSlotBytes;
+    return offset < limit ? limit - offset : 0u;
+}
+
 struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
