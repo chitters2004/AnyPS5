@@ -375,8 +375,11 @@ int main() {
             const AgcDriver::Pm4::DrawParameters draw{reinterpret_cast<std::uintptr_t>(IndexBlock), static_cast<std::uint32_t>(Indices.size()), 2, 1, 0, true};
             const bool initial = Switches::Set(RuntimeSwitch::NoEarlyDrawInputs);
             Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, true);
+            const auto gateBefore = AgcDriver::Graphics::PreparedDrawInputCounters();
             const auto refused = device->PrepareDrawInputsAhead(DrawState(), draw, programs->shaders, true);
+            const auto gateAfter = AgcDriver::Graphics::PreparedDrawInputCounters();
             Switches::Assign(RuntimeSwitch::NoEarlyDrawInputs, initial);
+            Require(gateAfter.opened == gateBefore.opened && gateAfter.shallow == gateBefore.shallow, "prepared vertex inputs: a draw under APS5_NO_EARLY_DRAW_INPUTS was counted at the adaptive gate");
             std::printf("APS5_NO_EARLY_DRAW_INPUTS: the draw is %s\n", refused == nullptr ? "left to the committer" : "prepared ahead");
             Require(refused == nullptr, "prepared vertex inputs: APS5_NO_EARLY_DRAW_INPUTS did not stop a draw's inputs being prepared ahead of its commit");
         }
@@ -397,6 +400,7 @@ int main() {
             const auto after = AgcDriver::Graphics::PreparedDrawInputCounters();
             std::printf("committer not behind: the draw is %s; behind: %s; APS5_EARLY_DRAW_INPUTS_ALWAYS: %s; %llu counted as shallow\n", idle == nullptr ? "left to the committer" : "prepared ahead", behind == nullptr ? "left to the committer" : "prepared ahead", always == nullptr ? "left to the committer" : "prepared ahead", static_cast<unsigned long long>(after.shallow - before.shallow));
             Require(idle == nullptr && afterIdle.shallow - before.shallow == 1, "prepared vertex inputs: a draw was prepared ahead although the committer was not behind");
+            Require(afterIdle.opened == before.opened && after.opened - afterIdle.opened == 2, "prepared vertex inputs: the adaptive gate's opens were not counted once per draw it let through");
             Require(behind != nullptr && always != nullptr && after.shallow == afterIdle.shallow, "prepared vertex inputs: a draw behind a busy committer, or one with APS5_EARLY_DRAW_INPUTS_ALWAYS, was not prepared ahead");
             {
                 const AgcDriver::Graphics::PreparedDrawInputsScope first(std::move(behind));

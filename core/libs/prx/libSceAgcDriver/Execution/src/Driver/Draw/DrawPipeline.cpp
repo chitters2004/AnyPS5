@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PreparedDrawInputs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -430,6 +432,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawKeysSeenRecently.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSameAsPrevious.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(drawShapesSeenRecently.exchange(0, std::memory_order_relaxed)));
+    static Graphics::PreparedDrawInputCounts reportedInputs;
+    const auto inputs = Graphics::PreparedDrawInputCounters();
+    const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    AgcDriver::ProfilePrint_nid_no_patch("[early-inputs] (10 s, opens at %zu queued; %s%s): gate closed %llu, open %llu; %llu prepared over %llu ranges, %llu refused; %llu adopted, %llu waited, %llu not ready, %llu unused, %llu abandoned\n", std::max<std::size_t>(2, Depth() / 2), Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoEarlyDrawInputs) ? "APS5_NO_EARLY_DRAW_INPUTS" : "adaptive", Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::EarlyDrawInputsAlways) ? ", APS5_EARLY_DRAW_INPUTS_ALWAYS" : "", delta(inputs.shallow, reportedInputs.shallow), delta(inputs.opened, reportedInputs.opened), delta(inputs.prepared, reportedInputs.prepared), delta(inputs.ranges, reportedInputs.ranges), delta(inputs.refused, reportedInputs.refused), delta(inputs.adopted, reportedInputs.adopted), delta(inputs.waited, reportedInputs.waited), delta(inputs.notReady, reportedInputs.notReady), delta(inputs.unused, reportedInputs.unused), delta(inputs.abandoned, reportedInputs.abandoned));
+    reportedInputs = inputs;
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};

@@ -64,6 +64,7 @@ void CountDrawInputSource(DrawInputSource source, std::size_t bytes, std::uint64
 struct PreparedDrawInputCounts {
     std::uint64_t requests = 0;
     std::uint64_t shallow = 0;
+    std::uint64_t opened = 0;
     std::uint64_t ranges = 0;
     std::uint64_t prepared = 0;
     std::uint64_t refused = 0;
