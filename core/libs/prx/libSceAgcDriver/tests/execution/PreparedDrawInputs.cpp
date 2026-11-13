@@ -131,7 +131,7 @@ void SetRegister(std::vector<std::uint32_t>& words, std::uint32_t opcode, std::u
     words.push_back(value);
 }
 
-std::vector<std::uint32_t> Draw() {
+std::vector<std::uint32_t> Draw(bool degenerateFirst = false) {
     const auto colorAddress = reinterpret_cast<std::uintptr_t>(ColorMemory);
     const auto poolAddress = reinterpret_cast<std::uintptr_t>(Pool);
     const auto indexAddress = reinterpret_cast<std::uintptr_t>(IndexMemory);
@@ -139,6 +139,10 @@ std::vector<std::uint32_t> Draw() {
     const auto pixelAddress = reinterpret_cast<std::uintptr_t>(PixelCode.data());
     const auto vertices = poolAddress + VertexOffset;
     std::vector<std::uint32_t> words;
+    if (degenerateFirst) {
+        const auto second = indexAddress + sizeof(std::uint32_t);
+        words.insert(words.end(), {0xc0043700u, 0x00100200u, static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u), Degenerate[1], Degenerate[2]});
+    }
     for (const auto& [offset, value] : ContextBaseline) SetRegister(words, SetContextReg, offset, value);
     SetRegister(words, SetContextReg, 0x207, DistanceVector);
     SetRegister(words, SetContextReg, 0x318, static_cast<std::uint32_t>(colorAddress >> 8u));
@@ -230,7 +234,7 @@ struct Outcome {
     std::uint64_t copied() const { return after.sources[static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied)] - before.sources[static_cast<std::size_t>(AgcDriver::Graphics::DrawInputSource::Copied)]; }
 };
 
-Outcome DrawOnce(Change change) {
+Outcome DrawOnce(Change change, bool degenerateFirst = false) {
     WriteIndices(Indices);
     WriteVertices(0.0f);
     std::memset(ColorMemory, 0, ColorBytes);
@@ -238,7 +242,7 @@ Outcome DrawOnce(Change change) {
     outcome.before = AgcDriver::Graphics::PreparedDrawInputCounters();
     const auto hooks = HookRuns.load();
     Armed.store(change);
-    Submit(Draw());
+    Submit(Draw(degenerateFirst));
     AgcDriverWaitIdle_nid_postfix();
     outcome.after = AgcDriver::Graphics::PreparedDrawInputCounters();
     outcome.hooks = HookRuns.load() - hooks;
@@ -278,6 +282,14 @@ void IndicesChangedAfterPreparationAreCopiedAgain() {
     Require(outcome.written == 0, "prepared draw inputs: the draw drew the indices prepared before the CPU made them degenerate");
 }
 
+void GpuWriteBeforeTheDrawReachesItsIndices() {
+    const auto outcome = DrawOnce(Change::None, true);
+    Print("a queued write of degenerate indices ahead of the draw", outcome);
+    Require(outcome.hooks == 1 && outcome.requests() == 1, "prepared draw inputs: the draw behind the index write was not prepared ahead of its commit");
+    Require(outcome.written == 0, "prepared draw inputs: the draw read the indices from before the write the queue ordered ahead of it");
+    Require(std::memcmp(IndexMemory + sizeof(std::uint32_t), &Degenerate[1], 2 * sizeof(std::uint32_t)) == 0, "prepared draw inputs: the index write never reached guest memory");
+}
+
 void NoPreparersCopyOnTheCommitter() {
     AgcDriver::Graphics::SetDrawInputPreparers(0);
     const auto outcome = DrawOnce(Change::None);
@@ -314,6 +326,7 @@ int main() {
         VerticesChangedAfterPreparationAreCopiedAgain();
         IndicesChangedAfterPreparationAreCopiedAgain();
         UnchangedInputsAreAdopted();
+        GpuWriteBeforeTheDrawReachesItsIndices();
         NoPreparersCopyOnTheCommitter();
         AgcDriver::Graphics::SetPreparedDrawInputsHook(nullptr);
         std::puts("prepared draw inputs: copies made before the commit are adopted only while the CPU left their ranges unchanged");
