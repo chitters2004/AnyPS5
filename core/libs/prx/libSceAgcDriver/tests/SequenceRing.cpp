@@ -559,6 +559,45 @@ void ReclaimSurvivesOlderVisits() {
     std::cout << "older items visited while preparing: " << visited.load() << '\n';
 }
 
+void ReclaimWaitsForAPausedOlderVisit() {
+    std::vector<std::uint64_t> published;
+    SequenceRing ring(Parallel(8, 2, published));
+    std::atomic<bool> firstOpen{false};
+    std::atomic<bool> visitOpen{false};
+    std::atomic<bool> visiting{false};
+    std::atomic<std::uint64_t> keyAfterReclaim{0};
+    const OpenOnExit firstOpener{firstOpen};
+    const OpenOnExit visitOpener{visitOpen};
+    const auto waitFor = [](const std::atomic<bool>& flag) {
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (!flag.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+    };
+    SequenceRing::Held first;
+    first.unknown = false;
+    first.key = 1;
+    first.writes = {{0x100, 0x104}};
+    ring.Push([&] { waitFor(firstOpen); }, std::move(first));
+    SequenceRing::Held second;
+    second.unknown = false;
+    second.key = 2;
+    ring.Push([&] {
+        ring.AnyOlderNewestFirst([&](const SequenceRing::Held& older) {
+            if (older.key != 1) return false;
+            visiting.store(true, std::memory_order_release);
+            waitFor(visitOpen);
+            keyAfterReclaim.store(older.key, std::memory_order_release);
+            return false;
+        });
+    }, std::move(second));
+    WaitUntil([&] { return visiting.load(std::memory_order_acquire); }, "the second item's preparer to start reading the first item");
+    firstOpen.store(true, std::memory_order_release);
+    WaitUntil([&] { return ring.PreparedSequence() >= 1; }, "the first item to publish");
+    ring.Push([] {}, {});
+    visitOpen.store(true, std::memory_order_release);
+    ring.Drain();
+    Require(keyAfterReclaim.load() == 1, "the producer reclaimed an older item while a paused preparer was still reading it");
+}
+
 std::atomic<bool> singlePreparer{false};
 
 void SinglePreparerSwitchParksTheOthers() {
@@ -706,6 +745,7 @@ int main(int argc, char** argv) {
         OlderUnpublishedItemsAreVisible();
         AwaitTurnWaitsForOlderPublishes();
         ReclaimSurvivesOlderVisits();
+        ReclaimWaitsForAPausedOlderVisit();
         SinglePreparerSwitchParksTheOthers();
         ParallelTeardownPublishesWaitingItems();
         SimultaneousFinishesNeverStrandAnItem();
