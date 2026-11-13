@@ -1479,7 +1479,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             return copy;
         }
         if (copy.generation != 0) {
-            if (auto adopted = AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration)) {
+            if (auto adopted = AdoptPreparedDrawInput(context, recorder, address, bytes, use, copy.registryGeneration, bytes)) {
                 copy.buffer = std::move(adopted->buffer);
                 copy.derived = adopted->derived;
                 copy.prepared = true;
@@ -1496,12 +1496,12 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes, std::size_t stride) {
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
-    auto readable = validBytes;
-    if (stride != 0 && !GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes)) {
-        const auto ranges = GuestMemory::CommittedRanges(address, validBytes);
-        const std::size_t prefix = !ranges.empty() && ranges.front().first == address ? static_cast<std::size_t>(ranges.front().second - address) : 0;
-        if (validBytes - prefix < stride) readable = prefix;
-    }
+    const bool timed = DrawInputSourcesTimed();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto counted = [&](DrawInputSource source) {
+        CountDrawInputSource(source, bytes, timed ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()) : 0u);
+    };
+    const auto readable = ZeroPaddedReadableBytes(address, validBytes, stride);
     if (readable != 0) GuestMemory::FlushGpuWrites(address, readable);
     DrawInputCopy copy;
     auto* recorder = context.recorder;
@@ -1513,15 +1513,26 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, Recorder::SnapshotUse::PaddedVertex, &keptReadable);
         if (copy.buffer != nullptr && keptReadable == readable) {
             copy.reused = true;
+            counted(DrawInputSource::SnapshotReused);
             return copy;
         }
         copy.buffer = nullptr;
+        if (copy.generation != 0) {
+            if (auto adopted = AdoptPreparedDrawInput(context, recorder, address, bytes, Recorder::SnapshotUse::PaddedVertex, copy.registryGeneration, readable)) {
+                copy.buffer = std::move(adopted->buffer);
+                copy.prepared = true;
+                recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
+                counted(DrawInputSource::Adopted);
+                return copy;
+            }
+        }
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     const auto span = copy.buffer->Bytes();
     GuestMemory::Read(address, span.subspan(0, readable), 1);
     std::fill(span.begin() + static_cast<std::ptrdiff_t>(readable), span.end(), std::byte{0});
     if (keep) recorder->KeepDrawSnapshot(address, bytes, copy.generation, copy.registryGeneration, copy.buffer, Recorder::SnapshotUse::PaddedVertex, static_cast<std::uint32_t>(readable));
+    counted(DrawInputSource::Copied);
     return copy;
 }
 

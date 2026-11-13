@@ -73,6 +73,7 @@ enum class JobState : std::uint32_t { Queued, Running, Done, Cancelled };
 struct PreparedRange {
     std::uint64_t address = 0;
     std::size_t bytes = 0;
+    std::size_t readable = 0;
     Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
     std::uint64_t generation = 0;
     std::uint64_t registry = 0;
@@ -157,7 +158,7 @@ public:
         std::uint32_t maxIndex = 0;
         if (draw.indexed) {
             const auto bytes = static_cast<std::size_t>(draw.indexCount) * draw.indexSize;
-            const auto index = copyRange(draw.indexAddress, bytes, indexUse, VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            const auto index = copyRange(draw.indexAddress, bytes, indexUse, VK_BUFFER_USAGE_INDEX_BUFFER_BIT, bytes);
             if (!index) return;
             auto& range = ranges[*index];
             const auto highest = HighestDrawIndex(range.buffer->Bytes().first(bytes), draw.indexSize, skipRestart);
@@ -175,7 +176,14 @@ public:
         }
         if (attributes.empty() || layout == nullptr) return;
         const auto planned = PlanDrawVertexFetches(colorTarget, draw, attributes, *layout, maxIndex);
-        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(copyRange(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT));
+        for (const auto& [begin, end] : planned.plan.copies) static_cast<void>(copyRange(begin, static_cast<std::size_t>(end - begin), Recorder::SnapshotUse::Vertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, static_cast<std::size_t>(end - begin)));
+        for (const auto solo : planned.soloFetches) {
+            const auto& fetch = planned.fetches[solo];
+            const auto bytes = static_cast<std::size_t>(fetch.end - fetch.begin);
+            const auto readable = ZeroPaddedReadableBytes(fetch.begin, planned.fetchValid[solo], fetch.stride);
+            if (readable == 0 || readable > std::numeric_limits<std::uint32_t>::max()) continue;
+            if (const auto index = copyRange(fetch.begin, bytes, Recorder::SnapshotUse::PaddedVertex, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, readable)) ranges[*index].derived = static_cast<std::uint32_t>(readable);
+        }
     }
 
     void Resolve() {
@@ -236,29 +244,32 @@ public:
     }
 
 private:
-    std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage) {
+    std::optional<std::size_t> copyRange(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, VkBufferUsageFlags usage, std::size_t readable) {
         counters().ranges.fetch_add(1, std::memory_order_relaxed);
         const auto refuse = [&](PreparedRefusal reason) -> std::optional<std::size_t> {
             ++refusedRanges;
             ++refusedBy[static_cast<std::size_t>(reason)];
             return std::nullopt;
         };
-        if (bytes == 0 || bytes > PreparedRangeLimit || bytes > std::numeric_limits<std::uint64_t>::max() - address) return refuse(PreparedRefusal::Size);
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return refuse(PreparedRefusal::Inaccessible);
+        if (bytes == 0 || readable == 0 || readable > bytes || bytes > PreparedRangeLimit || bytes > std::numeric_limits<std::uint64_t>::max() - address) return refuse(PreparedRefusal::Size);
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), readable)) return refuse(PreparedRefusal::Inaccessible);
         PreparedRange range;
         range.address = address;
         range.bytes = bytes;
+        range.readable = readable;
         range.use = use;
         range.forget = GuestMemory::ForgetSerial();
         if ((range.forget & 1u) != 0) return refuse(PreparedRefusal::Forget);
         range.registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto pending = Recorder::PendingWriteSnapshot();
-        if (Recorder::SnapshotOverlaps(pending.get(), address, bytes)) return refuse(PreparedRefusal::Pending);
-        range.generation = GuestMemory::CollectWrites(address, bytes);
+        if (Recorder::SnapshotOverlaps(pending.get(), address, readable)) return refuse(PreparedRefusal::Pending);
+        range.generation = GuestMemory::CollectWrites(address, readable);
         if (range.generation == 0) return refuse(PreparedRefusal::Unwatched);
         std::atomic_thread_fence(std::memory_order_seq_cst);
         range.buffer = std::make_shared<Buffer>(context, bytes, usage);
-        GuestMemory::CopyGuestBytes(range.buffer->Bytes().data(), reinterpret_cast<const void*>(address), bytes);
+        const auto target = range.buffer->Bytes();
+        GuestMemory::CopyGuestBytes(target.data(), reinterpret_cast<const void*>(address), readable);
+        std::fill(target.begin() + static_cast<std::ptrdiff_t>(readable), target.begin() + static_cast<std::ptrdiff_t>(bytes), std::byte{0});
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (Recorder::PendingWriteSnapshot() != pending) return refuse(PreparedRefusal::SnapshotChanged);
         ranges.push_back(std::move(range));
@@ -358,8 +369,8 @@ thread_local std::shared_ptr<PreparedDrawInputs> currentPrepared;
 
 bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorder, std::uint64_t registryGeneration) {
     if (range.registry != registryGeneration || range.forget != GuestMemory::ForgetSerial()) return false;
-    if (recorder != nullptr && recorder->PendingWriteOverlaps(range.address, range.bytes)) return false;
-    return GuestMemory::UnchangedSince(range.address, range.bytes, range.generation);
+    if (recorder != nullptr && recorder->PendingWriteOverlaps(range.address, range.readable)) return false;
+    return GuestMemory::UnchangedSince(range.address, range.readable, range.generation);
 }
 
 }
@@ -417,12 +428,19 @@ PreparedDrawInputsScope::~PreparedDrawInputsScope() {
     if (prepared != nullptr) prepared->Finish();
 }
 
-std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration) {
+std::size_t ZeroPaddedReadableBytes(std::uint64_t address, std::size_t validBytes, std::size_t stride) {
+    if (stride == 0 || GuestMemory::Accessible(reinterpret_cast<const void*>(address), validBytes)) return validBytes;
+    const auto ranges = GuestMemory::CommittedRanges(address, validBytes);
+    const std::size_t prefix = !ranges.empty() && ranges.front().first == address ? static_cast<std::size_t>(ranges.front().second - address) : 0;
+    return validBytes - prefix < stride ? prefix : validBytes;
+}
+
+std::optional<AdoptedDrawInput> AdoptPreparedDrawInput(const Context& context, const Recorder* recorder, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::uint64_t registryGeneration, std::size_t readable) {
     auto* job = currentPrepared.get();
     if (job == nullptr || job->context.device != context.device) return std::nullopt;
     job->Resolve();
     if (job->cancelled) return std::nullopt;
-    const auto found = std::find_if(job->ranges.begin(), job->ranges.end(), [&](const PreparedRange& range) { return !range.consumed && range.address == address && range.bytes == bytes && range.use == use; });
+    const auto found = std::find_if(job->ranges.begin(), job->ranges.end(), [&](const PreparedRange& range) { return !range.consumed && range.address == address && range.bytes == bytes && range.readable == readable && range.use == use; });
     if (found == job->ranges.end()) return std::nullopt;
     found->consumed = true;
     const bool timed = DrawInputSourcesTimed();
