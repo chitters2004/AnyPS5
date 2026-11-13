@@ -338,7 +338,7 @@ bool TranslationContext::float16NativeFma(const RdnaInstruction& inst, bool accu
 
 IrF32 TranslationContext::fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend) {
     IrValue& product = ir.Emit(IrOpcode::FPMul32, IrType::F32, {&lhs.Value(), &rhs.Value()});
-    IrValue& sum = ir.Emit(IrOpcode::FPFma32, IrType::F32, {&lhs.Value(), &rhs.Value(), &addend.Value()});
+    IrValue& sum = ir.Emit(IrOpcode::FPAdd32, IrType::F32, {&product, &addend.Value()});
     IrValue& addendPart = ir.Emit(IrOpcode::FPSub32, IrType::F32, {&sum, &product});
     IrValue& productPart = ir.Emit(IrOpcode::FPSub32, IrType::F32, {&sum, &addendPart});
     IrValue& productError = ir.Emit(IrOpcode::FPSub32, IrType::F32, {&product, &productPart});
@@ -348,7 +348,8 @@ IrF32 TranslationContext::fmaF16RoundedToOdd(IrF32 lhs, IrF32 rhs, IrF32 addend)
     IrValue& sumBits = ir.BitCastU32(sum);
     IrValue& sameSign = ir.IEqual(ir.BitwiseAnd(ir.BitwiseXor(sumBits, ir.BitCastU32(error)), ir.Constant(0x80000000u)), ir.Constant(0u));
     IrValue& towardZero = ir.Select(sameSign, sumBits, ir.ISub(sumBits, ir.Constant(1u)));
-    return IrF32(ir.BitCastF32(ir.Select(inexact, ir.BitwiseOr(towardZero, ir.Constant(1u)), sumBits)));
+    IrValue& fused = ir.BitCastU32(ir.Emit(IrOpcode::FPFma32, IrType::F32, {&lhs.Value(), &rhs.Value(), &addend.Value()}));
+    return IrF32(ir.BitCastF32(ir.Select(inexact, ir.BitwiseOr(towardZero, ir.Constant(1u)), fused)));
 }
 
 IrU32 TranslationContext::readF16Bits(const RdnaOperand& operand) {
