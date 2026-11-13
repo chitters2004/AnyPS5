@@ -5,8 +5,10 @@ if(BUILD_TESTING)
     configure_windows_unwind(agc_address_wait_tests)
     add_test(NAME agc_address_wait COMMAND agc_address_wait_tests)
     set_tests_properties(agc_address_wait PROPERTIES TIMEOUT 30)
+    add_test(NAME agc_address_wait_parked COMMAND agc_address_wait_tests)
+    set_tests_properties(agc_address_wait_parked PROPERTIES TIMEOUT 120 ENVIRONMENT APS5_NO_NATIVE_WAITS=1)
     if(WIN32)
-        set_tests_properties(agc_address_wait PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_address_wait agc_address_wait_parked PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -2,12 +2,17 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_ADDRESSWAIT_HPP
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stop_token>
 #include <thread>
 #include <type_traits>
@@ -193,16 +198,65 @@ void WakeAll(const std::atomic<TValue>& word) noexcept {
 
 #endif
 
+struct alignas(64) ParkedBucket {
+    std::mutex mutex;
+    std::condition_variable parked;
+};
+
+inline ParkedBucket& ParkedBucketOf(const void* address) noexcept {
+    static auto* const buckets = new std::array<ParkedBucket, 64>;
+    const auto bits = reinterpret_cast<std::uintptr_t>(address);
+    return (*buckets)[(bits >> 2 ^ bits >> 8) % buckets->size()];
+}
+
+inline bool ParkedOff() noexcept {
+    static const bool off = [] {
+        const char* value = std::getenv("APS5_NO_NATIVE_WAITS");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return off;
+}
+
+inline void ParkedWait(const void* address, bool (*unchanged)(const void* address, std::uint32_t old), std::uint32_t old, const Clock::time_point* deadline) noexcept {
+    auto& bucket = ParkedBucketOf(address);
+    std::unique_lock lock(bucket.mutex);
+    if (!unchanged(address, old)) return;
+    if (deadline == nullptr) {
+        bucket.parked.wait(lock);
+    } else {
+        bucket.parked.wait_until(lock, *deadline);
+    }
+}
+
+inline void ParkedWake(const void* address) noexcept {
+    auto& bucket = ParkedBucketOf(address);
+    { std::lock_guard lock(bucket.mutex); }
+    bucket.parked.notify_all();
+}
+
+template<AddressWord TValue>
+bool Unchanged(const void* address, std::uint32_t old) {
+    return Bits(static_cast<const std::atomic<TValue>*>(address)->load(std::memory_order_seq_cst)) == old;
+}
+
+}
+
+inline bool NativeWaitsOff() noexcept {
+    return AddressWaitDetail::ParkedOff();
 }
 
 inline bool NativeAddressWait() noexcept {
-    return AddressWaitDetail::Native;
+    return AddressWaitDetail::Native && !NativeWaitsOff();
 }
 
 inline constexpr int AddressWaitSpins = 64;
 
 template<AddressWord TValue>
 void AddressWait(const std::atomic<TValue>& word, std::type_identity_t<TValue> old) noexcept {
+    if (NativeWaitsOff()) {
+        AddressWaitDetail::ParkedWait(&word, &AddressWaitDetail::Unchanged<TValue>, AddressWaitDetail::Bits(old), nullptr);
+        return;
+    }
     for (int spin = 0; spin < AddressWaitSpins; ++spin) {
         if (AddressWaitDetail::Bits(word.load(std::memory_order_relaxed)) != AddressWaitDetail::Bits(old)) return;
         AddressWaitDetail::Pause();
@@ -216,6 +270,10 @@ bool AddressWaitUntil(const std::atomic<TValue>& word, std::type_identity_t<TVal
     const auto remaining = deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero()) return false;
     if (AddressWaitDetail::Bits(word.load(std::memory_order_relaxed)) != AddressWaitDetail::Bits(old)) return true;
+    if (NativeWaitsOff()) {
+        AddressWaitDetail::ParkedWait(&word, &AddressWaitDetail::Unchanged<TValue>, AddressWaitDetail::Bits(old), &deadline);
+        return std::chrono::steady_clock::now() < deadline;
+    }
     AddressWaitDetail::WaitFor(word, old, remaining);
     return std::chrono::steady_clock::now() < deadline;
 }
@@ -227,11 +285,19 @@ bool AddressWaitFor(const std::atomic<TValue>& word, std::type_identity_t<TValue
 
 template<AddressWord TValue>
 void AddressWakeOne(const std::atomic<TValue>& word) noexcept {
+    if (NativeWaitsOff()) {
+        AddressWaitDetail::ParkedWake(&word);
+        return;
+    }
     AddressWaitDetail::WakeOne(word);
 }
 
 template<AddressWord TValue>
 void AddressWakeAll(const std::atomic<TValue>& word) noexcept {
+    if (NativeWaitsOff()) {
+        AddressWaitDetail::ParkedWake(&word);
+        return;
+    }
     AddressWaitDetail::WakeAll(word);
 }
 

@@ -46,21 +46,35 @@ class Watchdog {
 public:
     explicit Watchdog(std::chrono::seconds limit) : thread([this, limit](std::stop_token token) {
         std::unique_lock lock(mutex);
-        if (wake.wait_for(lock, token, limit, [] { return false; }) || token.stop_requested()) return;
+        for (auto seen = generation; wake.wait_for(lock, token, limit, [&] { return generation != seen; }); seen = generation) {}
+        if (token.stop_requested()) return;
         std::fprintf(stderr, "address wait tests: '%s' made no progress for %lld s, a wakeup was lost\n", phase.c_str(), static_cast<long long>(limit.count()));
         std::fflush(stderr);
         std::_Exit(1);
     }) {}
 
     void Phase(std::string name) {
-        std::lock_guard lock(mutex);
-        phase = std::move(name);
+        {
+            std::lock_guard lock(mutex);
+            phase = std::move(name);
+            ++generation;
+        }
+        wake.notify_all();
+    }
+
+    void Progress() {
+        {
+            std::lock_guard lock(mutex);
+            ++generation;
+        }
+        wake.notify_all();
     }
 
 private:
     std::mutex mutex;
     std::condition_variable_any wake;
     std::string phase = "start";
+    std::uint64_t generation = 0;
     std::jthread thread;
 };
 
@@ -152,6 +166,7 @@ void EncoderHandoff(Watchdog& watchdog) {
         posted.fetch_add(1, std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_seq_cst)) AddressWakeOne(posted);
         if (chunk % 3 == 0) await(chunk);
+        if (chunk % 1024 == 0) watchdog.Progress();
     }
     await(Chunks);
     settling.store(false, std::memory_order_release);
@@ -393,6 +408,25 @@ void StopTokenWait(Watchdog& watchdog) {
         waiter.join();
         Require(!result.load(), "a wait ended by its stop token reported the predicate");
     }
+}
+
+void WaiterLeftAtExit(Watchdog& watchdog) {
+    watchdog.Phase("waiters left sleeping at exit");
+    static std::atomic<std::uint32_t> word{0};
+    static std::mutex mutex;
+    static AddressCondition changed;
+    std::atomic<int> started{0};
+    std::thread([&started] {
+        started.fetch_add(1);
+        AgcDriver::AddressWait(word, 0u);
+    }).detach();
+    std::thread([&started] {
+        std::unique_lock lock(mutex);
+        started.fetch_add(1);
+        changed.WaitFor(lock, 1h, [] { return false; });
+    }).detach();
+    while (started.load() < 2) std::this_thread::yield();
+    std::this_thread::sleep_for(20ms);
 }
 
 std::uint64_t Stamp() {
@@ -728,6 +762,10 @@ int main(int argc, char** argv) {
     try {
         if (argc > 1 && std::strcmp(argv[1], "--benchmark") == 0) return Benchmark();
         Watchdog watchdog(20s);
+        const char* off = std::getenv("APS5_NO_NATIVE_WAITS");
+        const bool parked = off != nullptr && std::strcmp(off, "0") != 0;
+        Require(AgcDriver::NativeWaitsOff() == parked, "APS5_NO_NATIVE_WAITS did not select the parked waits");
+        Require(!parked || !AgcDriver::NativeAddressWait(), "the parked waits still report native address waits");
         CheckSemantics();
         PingPong<std::uint32_t>(watchdog, "32-bit");
         PingPong<std::int32_t>(watchdog, "signed 32-bit");
@@ -739,7 +777,8 @@ int main(int argc, char** argv) {
         MutexContention(watchdog);
         TimedWaits(watchdog);
         StopTokenWait(watchdog);
-        std::cout << "address wait tests passed\n";
+        WaiterLeftAtExit(watchdog);
+        std::cout << (parked ? "address wait tests passed with parked waits\n" : "address wait tests passed\n");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
