@@ -1433,16 +1433,6 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
             program.snapshot = std::move(snapshot);
         }
     }
-    if (tail.drawHit && !tail.userPatches.empty()) {
-        if (verifyDrawRecipe()) {
-            std::lock_guard cacheLock(drawCacheMutex);
-            ++drawEntryCounters.restartPatchSkipped;
-        } else {
-            auto patched = std::make_shared<DrawDecode>(*tail.decode);
-            for (const auto& patch : tail.userPatches) patched->programs[patch.program].userData[patch.index] = patch.value;
-            tail.decode = std::move(patched);
-        }
-    }
     const auto& programs = *tail.programs;
     const auto& graphics = tail.decode->state;
     const auto& roles = tail.decode->roles;
