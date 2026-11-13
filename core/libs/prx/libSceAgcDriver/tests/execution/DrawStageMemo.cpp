@@ -729,7 +729,9 @@ ShaderRecompiler::ShaderPixelStageInfo InterpolatingPixel(std::uint32_t beyondTh
 alignas(256) constexpr std::array<std::uint32_t, 7> ReadsAttributeOneWithP0{0xc8120402u, 0xc8160502u, 0xc81a0602u, 0xc81e0702u, 0xf800180fu, 0x07060504u, 0xbf810000u};
 
 ShaderRecompiler::RecompileResult CompileInterpolatingPixel(std::uint32_t beyondTheCount) {
-    const ShaderRecompiler::SpirvTarget target{};
+    ShaderRecompiler::SpirvTarget target{};
+    target.vulkanVersion = 0x00403000u;
+    target.spirvVersion = 0x00010600u;
     ShaderRecompiler::RecompileRequest request{};
     request.shader = {ShaderRecompiler::ShaderStage::Fragment, reinterpret_cast<std::uintptr_t>(ReadsAttributeOneWithP0.data()), ReadsAttributeOneWithP0, 0, {}};
     request.context.waveSize = 64;
