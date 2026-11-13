@@ -140,7 +140,8 @@ std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
 
 class PreparedDrawInputs {
 public:
-    Context context;
+    std::shared_ptr<const Context> shared;
+    const Context& context;
     Pm4::DrawParameters draw{};
     std::vector<ShaderRecompiler::VertexAttribute> attributes;
     std::shared_ptr<const VertexInputLayout> layout;
@@ -156,7 +157,7 @@ public:
     bool cancelled = false;
     bool waited = false;
 
-    explicit PreparedDrawInputs(const Context& context) : context(context) {}
+    explicit PreparedDrawInputs(std::shared_ptr<const Context> shared) : shared(std::move(shared)), context(*this->shared) {}
 
     void Prepare() {
         ranges.reserve(attributes.size() + 1u);
@@ -365,7 +366,8 @@ bool PreparedInputStillValid(const PreparedRange& range, const Recorder* recorde
 
 }
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& shared, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    const Context& context = *shared;
     if (context.drawInputsInPlace || (draw.indirect && !draw.indexed) || (!draw.indirect && draw.instanceCount == 0) || draw.indexCount == 0 || state.quadList || RuntimeSwitches::Set(RuntimeSwitch::NoEarlyDrawInputs)) return nullptr;
     if (shaders.empty() || shaders.front().program == nullptr || !GuestMemory::WriteWatched()) return nullptr;
     const bool listTopology = state.topology == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_LINE_LIST || state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -377,7 +379,7 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
     if (preparers == nullptr) return nullptr;
     const bool timed = DrawInputSourcesTimed();
     const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    auto job = std::make_shared<PreparedDrawInputs>(context);
+    auto job = std::make_shared<PreparedDrawInputs>(shared);
     job->draw = draw;
     job->attributes.assign(attributes.begin(), attributes.end());
     if (!attributes.empty()) {
@@ -406,6 +408,10 @@ std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& contex
 
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared) {
     prepared.Await();
+}
+
+const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared) {
+    return prepared.context;
 }
 
 PreparedDrawInputsScope::PreparedDrawInputsScope(std::shared_ptr<PreparedDrawInputs> prepared) : prepared(std::move(prepared)), previous(std::exchange(currentPrepared, this->prepared)) {

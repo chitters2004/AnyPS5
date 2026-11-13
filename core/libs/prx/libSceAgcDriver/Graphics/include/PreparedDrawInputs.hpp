@@ -29,8 +29,9 @@ DrawVertexFetches PlanDrawVertexFetches(std::optional<std::pair<std::uint64_t, s
 
 class PreparedDrawInputs;
 
-std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
+std::shared_ptr<PreparedDrawInputs> PrepareDrawInputsAhead(const std::shared_ptr<const Context>& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 void AwaitPreparedDrawInputs(PreparedDrawInputs& prepared);
+const Context& PreparedDrawInputsContext(const PreparedDrawInputs& prepared);
 
 class PreparedDrawInputsScope {
 public:

@@ -63,6 +63,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -693,6 +694,7 @@ struct VulkanDevice::State {
     Graphics::DeviceFunctions deviceFunctions;
     bool functionsReady = false;
     Graphics::Context context;
+    std::shared_ptr<const Graphics::Context> preparerContext;
     bool contextReady = false;
     std::unique_ptr<Graphics::TextureDetiler> detiler;
     std::unique_ptr<Graphics::Recorder> recorder;
@@ -1227,6 +1229,7 @@ struct VulkanDevice::State {
             scaler.reset();
             hdrScaler.reset();
             pipelineCache.reset();
+            preparerContext.reset();
             context.bufferPool.reset();
             bufferPool.reset();
             const auto destroyFence = reinterpret_cast<PFN_vkDestroyFence>(deviceProc(device, "vkDestroyFence"));
@@ -2700,6 +2703,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
     state->context = buildContext();
+    state->preparerContext = std::make_shared<const Graphics::Context>(state->context);
     state->contextReady = true;
     if (window != nullptr) {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
@@ -4767,6 +4771,12 @@ Graphics::Context VulkanDevice::graphicsContext() const {
     return buildContext();
 }
 
+std::shared_ptr<const Graphics::Context> VulkanDevice::preparerContext() const {
+    static const bool noCache = std::getenv("APS5_NO_CONTEXT_CACHE") != nullptr;
+    if (state->contextReady && !noCache && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSharedPreparerContext)) return state->preparerContext;
+    return std::make_shared<const Graphics::Context>(graphicsContext());
+}
+
 Graphics::Context VulkanDevice::buildContext() const {
     auto context = Graphics::Context{
         state->device,
@@ -4967,7 +4977,7 @@ bool VulkanDevice::DrawInputsInPlace() const {
 
 std::shared_ptr<Graphics::PreparedDrawInputs> VulkanDevice::PrepareDrawInputsAhead(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const {
     if (state->drawInputsInPlace || (draw.indirect && !draw.indexed)) return nullptr;
-    return Graphics::PrepareDrawInputsAhead(graphicsContext(), graphics, draw, shaders);
+    return Graphics::PrepareDrawInputsAhead(preparerContext(), graphics, draw, shaders);
 }
 
 namespace {
