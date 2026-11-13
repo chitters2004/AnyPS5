@@ -334,7 +334,7 @@ bool FallbackAfterEncodedState(AgcDriver::VulkanDevice& device, const Shaders& c
     RuntimeSwitches::Assign(RuntimeSwitch::DrawOps, false);
     const auto unchanged = MaskSets.load();
     AgcDriver::Graphics::Draw(context, StateFor(all, true, false), FullScreen, shaders);
-    ExpectSets(unchanged, 0u, "a fallback draw with the mask an encoded draw state record just set");
+    ExpectSets(unchanged, std::getenv("APS5_NO_STATE_SUPPRESSION") == nullptr ? 0u : 1u, "a fallback draw with the mask an encoded draw state record just set");
     const auto sets = MaskSets.load();
     AgcDriver::Graphics::Draw(context, StateFor(redBlue, true, false), FullScreen, shaders);
     ExpectSets(sets, 1u, "a fallback draw after an encoded draw state record");
