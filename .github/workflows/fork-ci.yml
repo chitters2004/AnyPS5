@@ -245,8 +245,11 @@ jobs:
           ref_key = "plain-stack-ref" if family else "plain-ref"
           include = []
           if "linux-gate" in jobs:
-              include.append(dict(id="gate-ref", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
-                                  cache_key=ref_key, cache_restore=plain_restore, cache_max="4G", cache_save="true"))
+              # Two runners each take a share of the selected tests, balanced by measured time; the report merges them.
+              for shard in (1, 2):
+                  include.append(dict(id=f"gate-ref-s{shard}", kind="gate", side="ref", sha=ref_sha, group="plain", cache_family=family,
+                                      shard=shard, shards=2, cache_key=ref_key, cache_restore=plain_restore, cache_max="4G",
+                                      cache_save="true" if shard == 1 else "false"))
               if os.environ["reuse_linux"] != "true":
                   include.append(dict(id="gate-base", kind="gate", side="base", sha=base_sha, group="plain", cache_family="", reuse_name="base-reuse-linux-" + os.environ["key_linux"],
                                       cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
@@ -329,6 +332,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ matrix.sha }}
           persist-credentials: false
+      - uses: actions/download-artifact@v8
+        if: ${{ matrix.shards }}
+        with:
+          name: plan-${{ inputs.tag }}times
+          path: plan-times
       - id: submodules
         name: Key the submodules on their commits
         run: |
@@ -556,11 +564,26 @@ jobs:
           LD_LIBRARY_PATH: /home/runner/vvl/lib
           VK_LOADER_DEBUG: layer
           GALLIUM_OVERRIDE_CPU_CAPS: avx
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ matrix.shards }}
         run: |
           mkdir -p result
           start=$(date +%s)
           set +e
-          ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 -j "$(nproc)" --test-load "$(nproc)" --output-junit ctest.xml 2>&1 | tee ctest.log
+          if [ -n "$SHARD" ]; then
+            # This shard runs its own list of the selected tests; no test is in two shards.
+            ctest --version | head -1
+            python3 plan-times/shard.py "$SHARD" "$SHARDS" linux | tee shard.txt
+            if [ ! -s build/shard-tests.txt ]; then
+              echo "No tests were found for this shard" | tee ctest.log
+              echo "TEST_RC=0" >> "$GITHUB_ENV"
+              echo "TEST_S=0" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            ctest --test-dir build --tests-from-file "$PWD/build/shard-tests.txt" -V --no-tests=error --timeout 120 -j "$(nproc)" --test-load "$(nproc)" --output-junit ctest.xml 2>&1 | tee ctest.log
+          else
+            ctest --test-dir build -R "$TESTS" -V --no-tests=error --timeout 120 -j "$(nproc)" --test-load "$(nproc)" --output-junit ctest.xml 2>&1 | tee ctest.log
+          fi
           echo "TEST_RC=${PIPESTATUS[0]}" >> "$GITHUB_ENV"
           echo "TEST_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
           exit 0
@@ -1177,7 +1200,7 @@ jobs:
                   replay[os.path.basename(rp)] = collections.Counter(VUID.findall(read(rp)))
               data["replay"] = replay
               results[data["id"]] = data
-          # Merge the shards of one side (windows-ref-s1, windows-ref-s2) into the single result windows-ref.
+          # Merge the shards of one side (windows-ref-s1, windows-ref-s2; gate-ref-s1, gate-ref-s2) into one result.
           shards = collections.defaultdict(list)
           raw = {}
           for rid in list(results):
@@ -1208,7 +1231,7 @@ jobs:
               rcs = [p["test_rc"] for p in parts]
               m["test_rc"] = None if None in rcs else max(rcs)
               m["layer_proof"] = all(p["layer_proof"] for p in parts)
-              m["vk_device"] = all(p["vk_device"] for p in parts)
+              m["vk_device"] = all(p.get("vk_device") for p in parts)
               m["skips"] = "\n".join(p["skips"] for p in parts)
               w_note = f"{rid}: merged {len(parts)} shards ({', '.join(p['id'] for p in parts)})"
               print(w_note)
