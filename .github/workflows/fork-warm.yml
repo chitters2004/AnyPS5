@@ -66,6 +66,63 @@ jobs:
       tests: none
       jobs: warm
 
+  check-stack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      stale: ${{ steps.verdict.outputs.stale }}
+    steps:
+      - id: head
+        run: echo "sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/draft/cloud/integration/stack | cut -f1)" >> "$GITHUB_OUTPUT"
+      - id: marker
+        if: ${{ steps.head.outputs.sha != '' }}
+        uses: actions/cache/restore@v6
+        with:
+          path: marker
+          key: warm-stack-done-${{ steps.head.outputs.sha }}
+          lookup-only: true
+      - id: verdict
+        env:
+          HIT: ${{ steps.marker.outputs.cache-hit }}
+          FORCE: ${{ inputs.force }}
+          SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          if [ -z "$SHA" ] || { [ "$HIT" = true ] && [ "$FORCE" != true ]; }; then
+            echo "stale=false" >> "$GITHUB_OUTPUT"
+            echo "stack head ${SHA:-none} was warmed before (or the branch is missing); nothing to do" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+            echo "warming the stack head $SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+  warm-stack:
+    needs: check-stack
+    if: ${{ needs.check-stack.outputs.stale == 'true' }}
+    permissions:
+      contents: read
+      actions: write
+    uses: ./.github/workflows/fork-ci.yml
+    with:
+      ref: ${{ needs.check-stack.outputs.sha }}
+      base: ${{ needs.check-stack.outputs.sha }}
+      tests: none
+      jobs: warm-stack
+
+  mark-stack:
+    needs: [check-stack, warm-stack]
+    if: ${{ needs.warm-stack.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          mkdir marker
+          echo "${{ needs.check-stack.outputs.sha }}" > marker/head
+      - uses: actions/cache/save@v6
+        with:
+          path: marker
+          key: warm-stack-done-${{ needs.check-stack.outputs.sha }}
+
   mark:
     needs: [check, warm]
     if: ${{ needs.warm.result == 'success' }}
@@ -81,7 +138,7 @@ jobs:
           key: warm-done-${{ needs.check.outputs.sha }}
 
   prune:
-    needs: [check, warm, mark]
+    needs: [check, warm, mark, check-stack, warm-stack, mark-stack]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -99,7 +156,7 @@ jobs:
           rows = [line.split() for line in open("caches.tsv")]
           groups = {}
           for cid, key, created, size, ref in rows:
-              m = re.match(r"(ccache-[a-z]+(?:-[a-z]+)?)-\d{4}-", key)
+              m = re.match(r"(ccache-[a-z]+(?:-[a-z]+)*)-\d{4}-", key)
               if m:
                   groups.setdefault((ref, m[1]), []).append((created, cid))
           for name, items in groups.items():

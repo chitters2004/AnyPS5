@@ -18,7 +18,7 @@ on:
         required: true
         type: string
       jobs:
-        description: Comma list from linux-gate, windows, asan, tsan, census, mutants, warm, bundle
+        description: Comma list from linux-gate, windows, asan, tsan, census, mutants, warm, warm-stack, bundle
         required: false
         default: linux-gate,windows
         type: string
@@ -235,7 +235,7 @@ jobs:
           python3 - <<'PY'
           import json, os, re
           jobs = {j.strip() for j in os.environ["JOBS"].split(",") if j.strip()}
-          unknown = jobs - {"linux-gate", "windows", "asan", "tsan", "census", "mutants", "warm", "bundle"}
+          unknown = jobs - {"linux-gate", "windows", "asan", "tsan", "census", "mutants", "warm", "warm-stack", "bundle"}
           if unknown:
               raise SystemExit(f"unknown jobs: {sorted(unknown)}")
           ref_sha, base_sha = os.environ["ref_sha"], os.environ["base_sha"]
@@ -262,6 +262,10 @@ jobs:
                                   cache_key="plain-base", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
               include.append(dict(id="warm-tsan", kind="warm", side="base", sha=ref_sha, group="tsan",
                                   cache_key="tsan", cache_restore="tsan", cache_max="2G", cache_save="true"))
+          if "warm-stack" in jobs:
+              # A full build of the stack head into the stack ccache, so a gate run on the stack starts warm.
+              include.append(dict(id="warm-linux-stack", kind="warm", side="ref", sha=ref_sha, group="plain", cache_family="stack",
+                                  cache_key="plain-stack-ref", cache_restore=plain_restore, cache_max="4G", cache_save="true"))
           if "census" in jobs:
               include.append(dict(id="census", kind="census", side="ref", sha=ref_sha, group="plain",
                                   cache_key="plain-census", cache_restore=plain_restore, cache_max="4G", cache_save="false"))
@@ -273,9 +277,9 @@ jobs:
           with open(os.environ["GITHUB_OUTPUT"], "a") as out:
               out.write("matrix=" + json.dumps({"include": include}) + "\n")
               out.write("has_linux=" + ("true" if include else "false") + "\n")
-              out.write("windows=" + ("true" if jobs & {"windows", "warm", "bundle"} else "false") + "\n")
-              out.write("warm=" + ("true" if "warm" in jobs else "false") + "\n")
-              out.write("report=" + ("true" if jobs - {"warm", "bundle"} else "false") + "\n")
+              out.write("windows=" + ("true" if jobs & {"windows", "warm", "warm-stack", "bundle"} else "false") + "\n")
+              out.write("warm=" + ("true" if jobs & {"warm", "warm-stack"} else "false") + "\n")
+              out.write("report=" + ("true" if jobs - {"warm", "warm-stack", "bundle"} else "false") + "\n")
               win = []
               if "windows" in jobs:
                   # The test step of the ref dominates the job (about 16 min of agc_.* on 4 cores), so two runners each take
@@ -288,6 +292,8 @@ jobs:
                       win.append(dict(id="windows-base", kind="gate", side="base", sha=base_sha, cache_family="", reuse_name="base-reuse-windows-" + os.environ["key_windows"]))
               if "warm" in jobs:
                   win.append(dict(id="windows-warm", kind="warm", side="base", sha=ref_sha, cache_family=""))
+              if "warm-stack" in jobs:
+                  win.append(dict(id="windows-warm-stack", kind="warm", side="ref", sha=ref_sha, cache_family="stack"))
               if "bundle" in jobs:
                   win.append(dict(id="windows-bundle", kind="bundle", side="ref", sha=ref_sha, cache_family=""))
               out.write("win_matrix=" + json.dumps({"include": win}) + "\n")
