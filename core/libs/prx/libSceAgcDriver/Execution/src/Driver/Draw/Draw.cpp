@@ -41,6 +41,8 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+constexpr std::size_t MaxPendingRelocations = 1024;
+
 bool TraceShaderCorrelation() {
     static const bool enabled = std::getenv("APS5_TRACE_SHADER_CORRELATION") != nullptr;
     return enabled && AgcDriver::CaptureTrace::Enabled();
@@ -453,10 +455,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
+            if (drawRelocationMissed.exchange(false, std::memory_order_relaxed) && DrawFinisher::Busy() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RelocationDrain)) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Relocation);
+            noteRelocationLookup();
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
-            learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -475,7 +477,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
             const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
-            if (drain) DrawFinisher::Get().Drain();
+            if (drain) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Lookup);
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
         std::unique_lock cacheLock(drawCacheMutex);
@@ -493,7 +495,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
                 cacheLock.lock();
             }
-            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            if (drawIdentity != 0) {
+                if (drawRelocationsPending.size() >= MaxPendingRelocations) {
+                    noteRelocationsDropped(drawRelocationsPending.size());
+                    drawRelocationsPending.clear();
+                }
+                if (drawRelocationsPending.insert_or_assign(drawKey, DrawRelocationPending{drawKey, drawAlias, drawIdentity, relocationLookupSequence()}).second) noteRelocationHeld();
+                drawRelocationMissed.store(true, std::memory_order_relaxed);
+                noteRelocationMiss();
+            }
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -637,7 +647,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (DrawFinisher::Busy()) {
         const bool drain = !DrawFinisher::Overlap();
-        if (drain) DrawFinisher::Get().Drain();
+        if (drain) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Reads);
         else DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Reads, false);
     }
     auto& memory = tail.memory;
@@ -722,6 +732,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
+            noteRelocatedHit();
             ++drawRelocationTrials[drawIdentity].hits;
             if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
                 const auto donor = drawCache.find(alias->second);
@@ -832,7 +843,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     noteFinisherHandOff(false);
     if (DrawFinisher::Busy()) {
-        DrawFinisher::Get().Drain();
+        DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Kept);
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
     tail.queue = &queue;

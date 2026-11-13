@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AbCounters.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -34,6 +35,11 @@ AbSample Take(std::uint64_t present, double seconds) {
     const auto totals = DriverDetail::DrawPipeline::Queue0().LifetimeTotals();
     const auto finisherDrains = DriverDetail::DrawFinisher::DrainWaitTotals();
     sample.committer = {totals.commits, totals.commitNs, totals.drawCommits, totals.drawNs, totals.enqueued, totals.fullWaitNs, totals.wakes, totals.drains, totals.drainWaitNs, finisherDrains.first, finisherDrains.second};
+    sample.preparerRoomWaitNs = DriverDetail::DrawFinisher::PreparerRoomWaitNs();
+    const auto sites = DriverDetail::DrawFinisher::SiteWaitTotals();
+    for (std::size_t index = 0; index < sites.size(); ++index) sample.drainSites.push_back({DriverDetail::DrawFinisher::WaitSiteNames[index], sites[index].waits, sites[index].waitNs, sites[index].queued});
+    const auto relocation = DriverDetail::DrawRelocationLearningTotals();
+    sample.relocation = {relocation.lookups, relocation.misses, relocation.relocatedHits, relocation.learned, relocation.late, relocation.never, relocation.held};
     for (int attempt = 0; attempt < 100; ++attempt) {
         if (auto threads = PerformanceTrace::ThreadTotals()) {
             sample.threads = std::move(*threads);

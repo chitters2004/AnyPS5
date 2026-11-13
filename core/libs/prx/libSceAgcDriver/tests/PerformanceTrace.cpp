@@ -478,6 +478,9 @@ void AbCountersLine() {
     from.threads = {{"queue worker 0x0", {{"Driver.Packet", nullptr, milliseconds(100), 5}, {"Driver.Packet", "memory_wait", milliseconds(10), 1}, {"Driver.WorkerWait", nullptr, milliseconds(20), 3}}},
                     {"draw finisher", {{"Driver.DrawFinish", nullptr, milliseconds(30), 4}}},
                     {"presenter", {{"Driver.Present", nullptr, milliseconds(5), 1}}}};
+    from.preparerRoomWaitNs = 2'000'000;
+    from.drainSites = {{"lookup", 10, 7'000'000, 300}, {"packet", 4, 3'000'000, 90}, {"end", 2, 1'000'000, 20}};
+    from.relocation = {1000, 900, 50, 700, 30, 10, 40};
     AgcDriver::AbSample to;
     to.seconds = 25;
     to.present = 580;
@@ -487,6 +490,9 @@ void AbCountersLine() {
     to.threads = {{"queue worker 0x0", {{"Driver.Packet", nullptr, milliseconds(600), 25}, {"Driver.Packet", "memory_wait", milliseconds(50), 4}, {"Driver.WorkerWait", nullptr, milliseconds(120), 9}, {"GpuMutex.wait", nullptr, milliseconds(7), 2}}},
                   {"draw finisher", {{"Driver.DrawFinish", nullptr, milliseconds(530), 49}}},
                   {"presenter", {{"Driver.Present", nullptr, milliseconds(5), 1}}}};
+    to.preparerRoomWaitNs = 5'500'000;
+    to.relocation = {4000, 3600, 250, 3000, 1300, 25, 70};
+    to.drainSites = {{"lookup", 25, 19'000'000, 720}, {"packet", 4, 3'000'000, 90}, {"end", 7, 3'500'000, 60}, {"capture", 1, 250'000, 8}};
     std::vector<double> flips;
     for (int index = 0; index < 5; ++index) flips.push_back(10.0 + 0.03 * index);
     const auto line = AgcDriver::AbCounters::Line('B', 3, from, to, flips);
@@ -496,11 +502,17 @@ void AbCountersLine() {
     Check(has(" gpu_busy_ms=12000.000") && has(" gpu_gap_ms=300.000"), "the A/B GPU counters differ");
     Check(has(" commits=200") && has(" commit_ms=30.000") && has(" draws=170") && has(" draw_commit_ms=22.000"), "the A/B committer counters are not the phase's difference");
     Check(has(" enqueued=210") && has(" room_wait_ms=5.000") && has(" wakes=20") && has(" drains=10") && has(" drain_wait_ms=10.000") && has(" finisher_drains=10") && has(" finisher_drain_wait_ms=8.000"), "the A/B queue counters are not the phase's difference");
+    Check(has(" finisher_room_wait_ms=3.500"), "the finisher's room wait is not the phase's difference");
+    Check(has(" fd.lookup.n=15 fd.lookup.ms=12.000 fd.lookup.queued=420") && has(" fd.end.n=5 fd.end.ms=2.500 fd.end.queued=40") && has(" fd.capture.n=1 fd.capture.ms=0.250 fd.capture.queued=8"), "the per-site finisher drains are not the phase's difference");
+    Check(!has("fd.packet."), "a drain site without drains in the phase was listed");
+    Check(has(" rl.lookups=3000 rl.misses=2700 rl.hits=200 rl.learned=2300 rl.late=1270 rl.never=15 rl.held=70"), "the relocation learning counters are not the phase's difference with the held relocations at its end");
     Check(has(" t.queue_worker_0x0.busy_ms=500.000") && has(" t.queue_worker_0x0.idle_ms=100.000") && has(" t.queue_worker_0x0.memory_wait_ms=40.000") && has(" t.queue_worker_0x0.lock_wait_ms=7.000"), "the A/B worker counters are not the phase's difference");
     Check(has(" t.draw_finisher.busy_ms=500.000") && has(" t.draw_finisher.jobs=45"), "the A/B finisher counters are not the phase's difference");
     Check(!has("t.presenter") && !has("threads=none"), "a thread without work in the phase was listed or the threads were called unrecorded");
     to.threads.clear();
     Check(AgcDriver::AbCounters::Line('A', 4, from, to, flips).find(" threads=none") != std::string::npos, "a phase without trace totals does not say so");
+    to.relocation = from.relocation;
+    Check(AgcDriver::AbCounters::Line('A', 5, from, to, flips).find(" rl.") == std::string::npos, "a phase without relocation lookups listed relocation counters");
 }
 
 void IntervalSummaryFields() {

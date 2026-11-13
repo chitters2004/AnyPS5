@@ -191,7 +191,7 @@ void Driver::stop() {
         if (worker.thread.joinable()) worker.thread.join();
     }
     try {
-        DrawFinisher::Get().Drain();
+        DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Shutdown);
     } catch (...) {
     }
     DrawPipeline::Queue0().Stop();

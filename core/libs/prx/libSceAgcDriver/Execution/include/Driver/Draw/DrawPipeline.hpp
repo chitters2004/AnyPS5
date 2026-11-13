@@ -203,8 +203,18 @@ public:
     void Enqueue(Job job, Pending held, std::uint8_t tag);
     std::uint64_t Bypass();
     DrawPipeline::QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
-    void Drain();
+    enum class WaitSite : std::uint8_t { Relocation, Lookup, Reads, Kept, Packet, PacketDispatch, PacketSampleDump, Dispatch, End, EnqueueReads, Enqueue, Capture, Pipeline, Shutdown, Other, Count };
+    struct SiteWait {
+        std::uint64_t waits = 0;
+        std::uint64_t waitNs = 0;
+        std::uint64_t queued = 0;
+    };
+    static constexpr std::array<const char*, static_cast<std::size_t>(WaitSite::Count)> WaitSiteNames{"relocation", "lookup", "reads", "kept", "packet", "packet_dispatch", "packet_sample_dump", "dispatch", "end", "enqueue_reads", "enqueue", "capture", "pipeline", "shutdown", "other"};
+    static WaitSite PacketWaitSite(std::span<const std::uint32_t> packet);
+    void Drain(WaitSite site = WaitSite::Other);
     static std::pair<std::uint64_t, std::uint64_t> DrainWaitTotals();
+    static std::array<SiteWait, static_cast<std::size_t>(WaitSite::Count)> SiteWaitTotals();
+    static std::uint64_t PreparerRoomWaitNs();
     void Settle();
     void ReleaseRan();
     void RethrowFailure();

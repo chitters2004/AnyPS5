@@ -53,6 +53,7 @@ enum class RuntimeSwitch : std::size_t {
     NoSharedPreparerContext,
     NoTargetMemoOverlapCache,
     PipelineDispatchMisses,
+    RelocationDrain,
     Count,
 };
 

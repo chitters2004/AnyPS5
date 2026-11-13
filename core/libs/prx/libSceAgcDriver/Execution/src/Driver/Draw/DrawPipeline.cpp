@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
@@ -601,20 +602,50 @@ void DrawFinisher::Settle() {
 namespace {
 std::atomic<std::uint64_t> finisherDrainWaits{0};
 std::atomic<std::uint64_t> finisherDrainWaitNs{0};
+struct SiteWaitCounters {
+    std::atomic<std::uint64_t> waits{0};
+    std::atomic<std::uint64_t> waitNs{0};
+    std::atomic<std::uint64_t> queued{0};
+};
+std::array<SiteWaitCounters, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> siteWaits{};
+std::atomic<std::uint64_t> preparerRoomWaitNs{0};
+}
+
+DrawFinisher::WaitSite DrawFinisher::PacketWaitSite(std::span<const std::uint32_t> packet) {
+    if (packet.empty()) return WaitSite::Packet;
+    if (((packet[0] >> 8u) & 0xffu) == 0x15u) return WaitSite::PacketDispatch;
+    return Pm4::SampleDump(packet) ? WaitSite::PacketSampleDump : WaitSite::Packet;
+}
+
+std::array<DrawFinisher::SiteWait, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> DrawFinisher::SiteWaitTotals() {
+    std::array<SiteWait, static_cast<std::size_t>(WaitSite::Count)> totals{};
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = {siteWaits[index].waits.load(std::memory_order_relaxed), siteWaits[index].waitNs.load(std::memory_order_relaxed), siteWaits[index].queued.load(std::memory_order_relaxed)};
+    return totals;
+}
+
+std::uint64_t DrawFinisher::PreparerRoomWaitNs() {
+    return preparerRoomWaitNs.load(std::memory_order_relaxed);
 }
 
 std::pair<std::uint64_t, std::uint64_t> DrawFinisher::DrainWaitTotals() {
     return {finisherDrainWaits.load(std::memory_order_relaxed), finisherDrainWaitNs.load(std::memory_order_relaxed)};
 }
 
-void DrawFinisher::Drain() {
+void DrawFinisher::Drain(WaitSite site) {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
-    const auto start = Busy() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool busy = Busy();
+    const auto start = busy ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const std::uint64_t queued = !busy ? 0 : Sequenced() ? ring->Waiting() : outstanding.load(std::memory_order_acquire);
     const auto noted = [&] {
         if (start == std::chrono::steady_clock::time_point{}) return;
+        const auto waited = elapsedNs(start);
         finisherDrainWaits.fetch_add(1, std::memory_order_relaxed);
-        finisherDrainWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        finisherDrainWaitNs.fetch_add(waited, std::memory_order_relaxed);
+        auto& counters = siteWaits[static_cast<std::size_t>(site)];
+        counters.waits.fetch_add(1, std::memory_order_relaxed);
+        counters.waitNs.fetch_add(waited, std::memory_order_relaxed);
+        counters.queued.fetch_add(queued, std::memory_order_relaxed);
     };
     if (Sequenced()) {
         ring->Drain();
@@ -858,7 +889,7 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 
 void DrawPipeline::enqueue(Item item) {
     if (!DrawFinisher::Sequenced()) {
-        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Enqueue);
         admit(std::move(item));
         return;
     }
@@ -870,7 +901,7 @@ void DrawPipeline::enqueue(Item item) {
             return;
         }
     } else if (Active()) {
-        if (!item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
+        if (!item.reads.empty() && DrawFinisher::Busy()) finisher.Drain(DrawFinisher::WaitSite::EnqueueReads);
         if (DrawFinisher::Busy()) {
             DrawFinisher::Pending held;
             held.unknown = false;
@@ -891,7 +922,7 @@ void DrawPipeline::enqueue(Item item) {
         }
         item.sequence = finisher.Bypass();
     } else if (DrawFinisher::Busy()) {
-        finisher.Drain();
+        finisher.Drain(DrawFinisher::WaitSite::Enqueue);
     }
     admit(std::move(item));
 }
@@ -919,7 +950,9 @@ void DrawPipeline::admit(Item item) {
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
         resumeAt = 0;
-        fullWaitNs += elapsedNs(start);
+        const auto waited = elapsedNs(start);
+        fullWaitNs += waited;
+        if (DrawFinisher::OnFinisherThread()) preparerRoomWaitNs.fetch_add(waited, std::memory_order_relaxed);
         rethrowFailure();
     }
     if (item.sequence != 0) {
@@ -1212,7 +1245,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
-    if (finisherBusy) DrawFinisher::Get().Drain();
+    if (finisherBusy) DrawFinisher::Get().Drain(reason == DrainReason::Capture ? DrawFinisher::WaitSite::Capture : DrawFinisher::WaitSite::Pipeline);
     else DrawFinisher::Get().RethrowFailure();
     DrawFinisher::Get().AwaitTurn();
     if (!Busy()) {
@@ -1244,7 +1277,7 @@ void DrawPipeline::DrainThrough(std::span<const Range> reads, CaptureSite site, 
     reasonRequests[static_cast<std::size_t>(DrainReason::Capture)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(DrainReason::Capture)) + ", opcode " + std::to_string(opcode) + ")");
-    if (finisherBusy) DrawFinisher::Get().Drain();
+    if (finisherBusy) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Capture);
     else DrawFinisher::Get().RethrowFailure();
     DrawFinisher::Get().AwaitTurn();
     const auto start = std::chrono::steady_clock::now();

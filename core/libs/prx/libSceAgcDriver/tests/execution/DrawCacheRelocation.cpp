@@ -18,10 +18,11 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,7 @@
 #include <iostream>
 #include <memory>
 #include <span>
+#include <thread>
 #include <string>
 #include <utility>
 #include <vector>
@@ -154,6 +156,92 @@ void MovedDataHitsTheCache(bool libraries) {
     Require(other.lookups == 9 && other.hits == 4, mode + ": a draw whose moved data holds another value reused the cached draw");
     const auto again = draw({same[0].data()});
     Require(again.lookups == 10 && again.hits == 5, mode + ": a draw at an address seen before did not reuse the cached draw (" + std::to_string(again.hits) + " hits)");
+}
+
+std::atomic<bool> finisherHeld{false};
+std::atomic<bool> finisherTimedOut{false};
+std::atomic<std::uint64_t> finisherReleaseLookups{0};
+
+void HoldFinisherUntilNextLookup() {
+    if (!AgcDriver::DriverDetail::DrawFinisher::OnFinisherThread() || !finisherHeld.exchange(false)) return;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters().lookups < finisherReleaseLookups.load()) {
+        if (std::chrono::steady_clock::now() >= deadline) {
+            finisherTimedOut = true;
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void FinisherIsNotDrainedToLearnRelocations(bool libraries, bool drain) {
+    Require(AgcDriver::DriverDetail::DrawFinisher::Enabled(), "the draw finisher is off (run with APS5_DRAW_PIPELINE=1)");
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const auto submit = [](std::initializer_list<const void*> sources) {
+        auto commands = DrawFrom(sources);
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    static std::array<std::array<float, 4>, 6> same{};
+    for (auto& entry : same) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    AgcDriver::DriverDetail::DrawEntryCounters taught{};
+    const auto untaught = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    for (std::size_t i = 0; i < 4; ++i) taught = submit({same[i].data()});
+    const auto learning = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    Require(learning.learned > untaught.learned && learning.never == untaught.never && learning.late == untaught.late, mode + ": the teaching draws learned " + std::to_string(learning.learned - untaught.learned) + " relocations when their entries were inserted, " + std::to_string(learning.late - untaught.late) + " of them after the next lookup and " + std::to_string(learning.never - untaught.never) + " never, expected at least 1, 0 and 0");
+    Require(taught.inserts == 2 && taught.hits == 0, mode + ": the draws that teach the moved pointer and its contents made " + std::to_string(taught.hits) + " hits and " + std::to_string(taught.inserts) + " inserts, expected 0 and 2");
+    const auto before = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    finisherReleaseLookups = taught.lookups + 2;
+    finisherTimedOut = false;
+    finisherHeld = true;
+    AgcDriver::DriverDetail::Driver::SetCaptureCheckHook(&HoldFinisherUntilNextLookup);
+    const auto packet = submit({Other.data(), same[4].data(), same[5].data()});
+    AgcDriver::DriverDetail::Driver::SetCaptureCheckHook(nullptr);
+    Require(!finisherHeld, mode + ": no draw of the packet was finished on the draw finisher (run with APS5_DRAW_PIPELINE=1 and APS5_PIPELINED_DRAWS)");
+    const auto after = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    if (drain) Require(finisherTimedOut, mode + ": with APS5_RELOCATION_DRAIN the worker looked up the next draw before the draw finisher finished the missed draw");
+    else Require(!finisherTimedOut, mode + ": the worker waited for the draw finisher to finish a missed draw before it looked up the next draw of the packet");
+    Require(after.lookups - before.lookups == 3 && after.misses - before.misses == 3, mode + ": the packet counted " + std::to_string(after.lookups - before.lookups) + " relocation lookups and " + std::to_string(after.misses - before.misses) + " register-key misses, expected 3 and 3");
+    Require(after.held - before.held == after.misses - before.misses - (after.learned - before.learned) - (after.never - before.never), mode + ": the pending relocations held do not add up to the misses that were neither learned nor dropped");
+    Require(after.relocatedHits - before.relocatedHits == 2, mode + ": " + std::to_string(after.relocatedHits - before.relocatedHits) + " draws hit through a relocated entry, expected 2");
+    Require(packet.lookups - taught.lookups == 3, mode + ": the packet of three draws made " + std::to_string(packet.lookups - taught.lookups) + " lookups");
+    Require(packet.hits - taught.hits == 2, mode + ": the two draws of the packet whose data moved made " + std::to_string(packet.hits - taught.hits) + " hits behind a missed draw the finisher still held, expected 2");
+}
+
+void TwoMissesInFlightAreBothLearned(bool libraries) {
+    Require(AgcDriver::DriverDetail::DrawFinisher::Enabled(), "the draw finisher is off (run with APS5_DRAW_PIPELINE=1)");
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    Registered(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    static std::array<float, 4> first{1.0f, 0.0f, 0.0f, 0.0f};
+    const auto submit = [] {
+        auto commands = DrawFrom({first.data()});
+        const auto second = DrawFrom({Other.data()}, SecondVertexCode.data());
+        commands.insert(commands.end(), second.begin(), second.end());
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        return AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    };
+    const auto seen = submit();
+    Require(seen.inserts == 0, mode + ": two draws seen once were inserted " + std::to_string(seen.inserts) + " times, expected 0");
+    const auto before = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    finisherReleaseLookups = seen.lookups + 2;
+    finisherTimedOut = false;
+    finisherHeld = true;
+    AgcDriver::DriverDetail::Driver::SetCaptureCheckHook(&HoldFinisherUntilNextLookup);
+    const auto again = submit();
+    AgcDriver::DriverDetail::Driver::SetCaptureCheckHook(nullptr);
+    const auto after = AgcDriver::DriverDetail::DrawRelocationLearningTotals();
+    Require(!finisherHeld && !finisherTimedOut, mode + ": the finisher did not hold the first draw while the worker looked up the second");
+    Require(after.misses - before.misses == 2 && again.inserts - seen.inserts == 2, mode + ": two new draws of two shader sets made " + std::to_string(after.misses - before.misses) + " misses and " + std::to_string(again.inserts - seen.inserts) + " inserts, expected 2 and 2");
+    Require(after.learned - before.learned == 2, mode + ": two misses pending on the finisher at once had " + std::to_string(after.learned - before.learned) + " relocations learned when their entries were inserted, expected 2");
+    Require(after.late - before.late >= 1, mode + ": the first miss was not counted as learned after the second draw's lookup");
 }
 
 void EvictedEntriesServeNoRelocation(bool libraries) {
@@ -404,7 +492,10 @@ int main(int argc, char** argv) {
     try {
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
         const bool kept = argc == 2 && std::string(argv[1]) == "--kept";
-        if (!evicted && !kept) SplitRunsNameTheirSharedWords();
+        const bool finisher = argc == 2 && std::string(argv[1]) == "--finisher";
+        const bool finisherDrain = argc == 2 && std::string(argv[1]) == "--finisher-drain";
+        const bool inFlight = argc == 2 && std::string(argv[1]) == "--in-flight";
+        if (!evicted && !kept && !finisher && !finisherDrain && !inFlight) SplitRunsNameTheirSharedWords();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -416,6 +507,18 @@ int main(int argc, char** argv) {
             EvictedEntriesServeNoRelocation(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "An evicted draw served no relocation " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (inFlight) {
+            TwoMissesInFlightAreBothLearned(libraries);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "Two missed draws on the finisher at once were both learned " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (finisher || finisherDrain) {
+            FinisherIsNotDrainedToLearnRelocations(libraries, finisherDrain);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "The draw finisher kept a missed draw while the next draw was looked up " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
         }
         if (kept) {

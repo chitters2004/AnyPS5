@@ -16,11 +16,23 @@ struct AbCommitterTotals {
     std::uint64_t commits = 0, commitNs = 0, drawCommits = 0, drawNs = 0, enqueued = 0, fullWaitNs = 0, wakes = 0, drains = 0, drainWaitNs = 0, finisherDrains = 0, finisherDrainWaitNs = 0;
 };
 
+struct AbDrainSite {
+    std::string_view name;
+    std::uint64_t waits = 0, waitNs = 0, queued = 0;
+};
+
+struct AbRelocation {
+    std::uint64_t lookups = 0, misses = 0, relocatedHits = 0, learned = 0, late = 0, never = 0, held = 0;
+};
+
 struct AbSample {
     double seconds = 0;
     std::uint64_t present = 0;
     double gpuBusyMs = 0, gpuGapMs = 0;
     AbCommitterTotals committer;
+    std::uint64_t preparerRoomWaitNs = 0;
+    std::vector<AbDrainSite> drainSites;
+    AbRelocation relocation;
     std::vector<TraceThreadTotals> threads;
 };
 
@@ -60,6 +72,27 @@ public:
         number("drain_wait_ms", ms(b.drainWaitNs - a.drainWaitNs));
         count("finisher_drains", b.finisherDrains - a.finisherDrains);
         number("finisher_drain_wait_ms", ms(b.finisherDrainWaitNs - a.finisherDrainWaitNs));
+        number("finisher_room_wait_ms", ms(to.preparerRoomWaitNs - from.preparerRoomWaitNs));
+        for (const auto& site : to.drainSites) {
+            const auto before = std::find_if(from.drainSites.begin(), from.drainSites.end(), [&](const AbDrainSite& earlier) { return earlier.name == site.name; });
+            const AbDrainSite base = before != from.drainSites.end() ? *before : AbDrainSite{};
+            if (site.waits == base.waits) continue;
+            const std::string prefix = "fd." + std::string(site.name);
+            count(prefix + ".n", site.waits - base.waits);
+            number(prefix + ".ms", ms(site.waitNs - base.waitNs));
+            count(prefix + ".queued", site.queued - base.queued);
+        }
+        const auto& ra = from.relocation;
+        const auto& rb = to.relocation;
+        if (rb.lookups != ra.lookups) {
+            count("rl.lookups", rb.lookups - ra.lookups);
+            count("rl.misses", rb.misses - ra.misses);
+            count("rl.hits", rb.relocatedHits - ra.relocatedHits);
+            count("rl.learned", rb.learned - ra.learned);
+            count("rl.late", rb.late - ra.late);
+            count("rl.never", rb.never - ra.never);
+            count("rl.held", rb.held);
+        }
         bool recorded = false;
         for (std::size_t index = 0; index < to.threads.size(); ++index) {
             const auto before = index < from.threads.size() && from.threads[index].name == to.threads[index].name ? std::span<const TraceThread::Total>(from.threads[index].totals) : std::span<const TraceThread::Total>();

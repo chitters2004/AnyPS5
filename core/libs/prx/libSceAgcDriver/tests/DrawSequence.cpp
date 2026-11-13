@@ -351,6 +351,56 @@ void AbWindowReportsTheSettledPhase() {
     Require(log.committed == log.expected, "draws around the A/B window committed out of order");
 }
 
+void PacketDrainsAreSplitByClass() {
+    using Site = DrawFinisher::WaitSite;
+    const std::array<std::uint32_t, 4> dispatch{0xC0031500u, 8u, 8u, 1u};
+    const std::array<std::uint32_t, 4> sampleDump{0xC0024600u, 0x39u, 0x1000u, 0u};
+    const std::array<std::uint32_t, 4> otherEvent{0xC0024600u, 0x16u, 0x1000u, 0u};
+    const std::array<std::uint32_t, 3> nop{0xC0011000u, 0u, 0u};
+    Require(DrawFinisher::PacketWaitSite(dispatch) == Site::PacketDispatch, "a dispatch packet drain was not counted as packet_dispatch");
+    Require(DrawFinisher::PacketWaitSite(sampleDump) == Site::PacketSampleDump, "a sample-count dump drain was not counted as packet_sample_dump");
+    Require(DrawFinisher::PacketWaitSite(otherEvent) == Site::Packet, "an EVENT_WRITE that is not a sample dump left the packet site");
+    Require(DrawFinisher::PacketWaitSite(nop) == Site::Packet, "a plain packet left the packet site");
+    Require(std::string(DrawFinisher::WaitSiteNames[static_cast<std::size_t>(Site::PacketDispatch)]) == "packet_dispatch", "the packet_dispatch site is misnamed");
+    Require(std::string(DrawFinisher::WaitSiteNames[static_cast<std::size_t>(Site::PacketSampleDump)]) == "packet_sample_dump", "the packet_sample_dump site is misnamed");
+}
+
+void DrainWaitsAreCountedBySite() {
+    using Site = DrawFinisher::WaitSite;
+    const auto index = [](Site site) { return static_cast<std::size_t>(site); };
+    const auto before = DrawFinisher::SiteWaitTotals();
+    Log log;
+    const auto heldDrain = [&](Site site, int first, int draws) {
+        Gate gate;
+        gate.Close();
+        Draw(log, first, &gate);
+        for (int extra = 1; extra < draws; ++extra) Draw(log, first + extra);
+        std::thread opener([&gate] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            gate.Open();
+        });
+        DrawFinisher::Get().Drain(site);
+        opener.join();
+    };
+    heldDrain(Site::Packet, 0, 3);
+    heldDrain(Site::Lookup, 3, 1);
+    DrawFinisher::Get().Drain(Site::Packet);
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    const auto after = DrawFinisher::SiteWaitTotals();
+    const auto waits = [&](Site site) { return after[index(site)].waits - before[index(site)].waits; };
+    const auto waitNs = [&](Site site) { return after[index(site)].waitNs - before[index(site)].waitNs; };
+    const auto queued = [&](Site site) { return after[index(site)].queued - before[index(site)].queued; };
+    Require(waits(Site::Packet) == 1, "a packet drain of a busy finisher was not counted once, or an idle one was counted");
+    Require(waits(Site::Lookup) == 1, "a lookup drain of a busy finisher was not counted at its own site");
+    Require(waitNs(Site::Packet) >= 15'000'000 && waitNs(Site::Lookup) >= 15'000'000, "a drain's wait was not timed to the held draw's release");
+    Require(queued(Site::Packet) >= 2 && queued(Site::Lookup) >= 1, "the items queued at a drain's entry were not counted");
+    for (std::size_t site = 0; site < after.size(); ++site) {
+        if (site == index(Site::Packet) || site == index(Site::Lookup)) continue;
+        Require(after[site].waits == before[site].waits, std::string("a drain was counted at the wrong site: ") + DrawFinisher::WaitSiteNames[site]);
+    }
+    Require(log.committed == log.expected, "draws committed out of order around counted drains");
+}
+
 void FailedPrepareReachesTheWorker() {
     Log log;
     DrawFinisher::Get().Enqueue([] { throw std::runtime_error("prepare failed"); }, {});
@@ -400,6 +450,8 @@ int main() {
         PreparerWaitsForAnOlderUnpublishedWrite();
         OlderBufferedReadsHoldAYoungerFlush();
         AbWindowReportsTheSettledPhase();
+        DrainWaitsAreCountedBySite();
+        PacketDrainsAreSplitByClass();
         DriverThreadsAreNamed();
         std::cout << "draw sequence tests passed (" << (DrawFinisher::Sequenced() ? "sequence ring" : "drained hand-off") << ")\n";
         return 0;
