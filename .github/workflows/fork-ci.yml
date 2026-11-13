@@ -597,7 +597,7 @@ jobs:
           known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
           names = set()
           for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
-              for line in open(path, encoding="utf-8", errors="replace"):
+              for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in selected:
                       for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
@@ -605,15 +605,6 @@ jobs:
                           for candidate in (name, name[:-4] if name.endswith(".exe") else name):
                               if candidate in known:
                                   names.add(candidate)
-          if not names:
-              probe = sorted(selected)[0]
-              files = glob.glob("build/**/CTestTestfile.cmake", recursive=True)
-              print(f"target scan found nothing: {len(selected)} selected, {len(known)} ninja names, {len(files)} CTestTestfiles; probe {probe}", file=sys.stderr)
-              for path in files:
-                  for line in open(path, encoding="utf-8", errors="replace"):
-                      if probe in line and "add_test" in line:
-                          print("probe line:", path, repr(line[:400]), file=sys.stderr)
-              print("known with 'dcc_mip' or 'memo':", sorted(k for k in known if "dcc_mip" in k or "target_memo" in k)[:10], file=sys.stderr)
           print(" ".join(sorted(names)))
           PY
             echo "targets: $(cat build/targets.txt)"
@@ -971,7 +962,7 @@ jobs:
           known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
           names = set()
           for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
-              for line in open(path, encoding="utf-8", errors="replace"):
+              for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in selected:
                       for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
@@ -1090,7 +1081,7 @@ jobs:
           path_dirs = set()
           exes = set()
           for path in glob.glob(build + "/**/CTestTestfile.cmake", recursive=True):
-              for line in open(path, encoding="utf-8", errors="replace"):
+              for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
                   tm = re.match(r"\s*(?:add_test|set_tests_properties)\(\[=\[(.*?)\]=\]", line)
                   if tm and tm.group(1) in chosen:
                       for ref in re.findall(re.escape(build_ci) + r"[^\s;\"\)\]]*", line, re.I):
