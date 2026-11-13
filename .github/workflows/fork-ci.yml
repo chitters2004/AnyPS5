@@ -592,22 +592,19 @@ jobs:
               return 0
             fi
             python3 - <<'PY' > build/targets.txt
-          import json, os, re, subprocess, sys
+          import glob, os, re, subprocess
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
           known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
-          # ctest resolves the test commands itself; scanning CTestTestfile.cmake broke when a newer CMake wrote them in another form.
           names = set()
-          out = subprocess.run(["ctest", "--test-dir", "build", "-N", "-R", os.environ["TESTS"], "--show-only=json-v1"], capture_output=True, text=True).stdout
-          for test in json.loads(out)["tests"]:
-              if test["name"] in selected:
-                  for word in test.get("command", []):
-                      name = os.path.basename(word.replace("\\", "/"))
-                      for candidate in (name, name[:-4] if name.endswith(".exe") else name):
-                          if candidate in known:
-                              names.add(candidate)
-          _t = [x for x in json.loads(out)["tests"] if x["name"] in selected]
-          print("target scan sample:", [(x["name"], x.get("command")) for x in _t[:2]], "memo targets known:", sorted(k for k in known if "memo" in k)[:8], file=sys.stderr)
-          print(f"target scan: {len(selected)} selected tests, {len(known)} ninja target names, {len(names)} matched", file=sys.stderr)
+          for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in selected:
+                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
+                          name = os.path.basename(word.replace("\\", "/"))
+                          for candidate in (name, name[:-4] if name.endswith(".exe") else name):
+                              if candidate in known:
+                                  names.add(candidate)
           print(" ".join(sorted(names)))
           PY
             echo "targets: $(cat build/targets.txt)"
@@ -960,19 +957,19 @@ jobs:
               exit 0
             fi
             python - <<'PY' > build/targets.txt
-          import json, os, re, subprocess
+          import glob, os, re, subprocess
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
           known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
-          # ctest resolves the test commands itself; scanning CTestTestfile.cmake broke when a newer CMake wrote them in another form.
           names = set()
-          out = subprocess.run(["ctest", "--test-dir", "build", "-N", "-R", os.environ["TESTS"], "--show-only=json-v1"], capture_output=True, text=True).stdout
-          for test in json.loads(out)["tests"]:
-              if test["name"] in selected:
-                  for word in test.get("command", []):
-                      name = os.path.basename(word.replace("\\", "/"))
-                      for candidate in (name, name[:-4] if name.endswith(".exe") else name):
-                          if candidate in known:
-                              names.add(candidate)
+          for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
+              for line in open(path, encoding="utf-8", errors="replace"):
+                  m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
+                  if m and m.group(1) in selected:
+                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
+                          name = os.path.basename(word.replace("\\", "/"))
+                          for candidate in (name, name[:-4] if name.endswith(".exe") else name):
+                              if candidate in known:
+                                  names.add(candidate)
           print(" ".join(sorted(names)))
           PY
             echo "targets: $(cat build/targets.txt)"
@@ -1098,7 +1095,7 @@ jobs:
                                   break
                   m = re.match(r"\s*add_test\(\[=\[(.*?)\]=\]\s+(.*)\)\s*$", line)
                   if m and m.group(1) in chosen:
-                      for word in re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(2)):
+                      for word in (q or b for q, b in re.findall(r'"((?:[^"\\]|\\.)*)"|([^\s"]+)', m.group(2))):
                           word = word.replace("\\\\", "/").replace("\\", "/")
                           if os.path.isfile(word) and word.lower().endswith((".exe", ".dll", ".prx", ".py", ".cmake")) and os.path.abspath(word).replace("\\", "/").startswith(build_abs + "/"):
                               exes.add(word)
