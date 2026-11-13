@@ -26,6 +26,9 @@ namespace {
 
 class KeyWriter {
 public:
+    const ShaderRecompiler::ShaderPixelStageInfo* stagePixel = nullptr;
+    const ShaderRecompiler::ShaderVertexStageInfo* stageVertex = nullptr;
+
     explicit KeyWriter(std::vector<std::uint64_t>& words) : words(words) {
         words.resize(std::max(words.capacity(), ReservedWords));
         data = words.data();
@@ -65,6 +68,69 @@ public:
         for (std::uint32_t r = 0; r < vertex.resourcesNum; ++r) AggregateFields::HashLeaves(destinations[r], *this);
         return true;
     }
+
+    bool Member(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SpirvTarget& target) { return &target == &request.target; }
+
+    bool Member(const ShaderRecompiler::RecompileRequest& request, const bool& useCache) { return &useCache == &request.useCache; }
+
+    bool Member(const ShaderRecompiler::RecompileRequest& request, const std::optional<ShaderRecompiler::GraphicsCompileContext>& graphics) {
+        if (&graphics != &request.graphics) return false;
+        AggregateFields::HashLeaves(*graphics, *this);
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::ShaderBinary& binary, const std::span<const std::uint32_t>& code) {
+        if (&code != &binary.code) return false;
+        (*this)(code.size());
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::ShaderBinary& binary, const std::span<const std::byte>& header) {
+        if (&header != &binary.header) return false;
+        (*this)(header.size());
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::GuestContext& context, const std::span<const std::uint32_t>& words) {
+        if (&words == &context.linkedCallFallbacks) return true;
+        if (&words != &context.userData) return false;
+        (*this)(words);
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::GuestContext& context, const ShaderRecompiler::MemoryRegionView& memory) { return &memory == &context.memory; }
+
+    bool Member(const ShaderRecompiler::GuestContext& context, const std::optional<ShaderRecompiler::ShaderPixelStageInfo>& pixel) {
+        if (&pixel != &context.pixel) return false;
+        (*this)(stagePixel != nullptr);
+        if (stagePixel != nullptr) (*this)(*stagePixel);
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::GuestContext& context, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
+        if (&vertex != &context.vertex) return false;
+        (*this)(stageVertex != nullptr);
+        if (stageVertex != nullptr) (*this)(*stageVertex);
+        return true;
+    }
+
+    bool Member(const ShaderRecompiler::GraphicsCompileContext& graphics, const std::span<const ShaderRecompiler::LinkedProgram>& linked) { return &linked == &graphics.linkedPrograms; }
+
+    bool Member(const ShaderRecompiler::GraphicsCompileContext& graphics, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& barycentrics) { return &barycentrics == &graphics.meshBarycentrics; }
+
+    bool Member(const ShaderRecompiler::GraphicsCompileContext& graphics, const ShaderRecompiler::GraphicsDrawParameters& draw) {
+        if (&draw != &graphics.draw) return false;
+        if (graphics.tessellation) {
+            (*this)(draw.indexCount);
+            (*this)(draw.instanceCount);
+        }
+        return true;
+    }
+
+    template<typename TValue>
+    void Leaf(const std::span<TValue>&) { Graphics::Require(false, "draw stage memo: a span member of the request reached the key without a rule"); }
+
+    void Leaf(const ShaderRecompiler::MemoryRegionView&) { Graphics::Require(false, "draw stage memo: the request's memory reached the key without a rule"); }
 
     void operator()(const ShaderRecompiler::ShaderPixelStageInfo& pixel) {
         Graphics::Require(pixel.interpolatorCount <= pixel.interpolatorSettings.size(), "draw stage memo: pixel stage info interpolator count exceeds its table");
@@ -108,6 +174,10 @@ private:
     std::size_t limit = 0;
     std::size_t used = 0;
 };
+
+[[gnu::flatten]] void HashRequestFields(const ShaderRecompiler::RecompileRequest& request, KeyWriter& write) {
+    AggregateFields::HashLeaves(request, write);
+}
 
 }
 
@@ -165,35 +235,9 @@ bool BuildDrawStageKey(const ShaderRecompiler::RecompileRequest& request, const 
     write(reinterpret_cast<std::uintptr_t>(&snapshot));
     write(codeOffset);
     write(deviceSerial);
-    write(request.shader.stage);
-    write(request.shader.codeAddress);
-    write(request.shader.code.size());
-    write(request.shader.headerAddress);
-    write(request.shader.header.size());
-    const auto& context = request.context;
-    write(context.waveSize);
-    write(context.userDataBaseRegister);
-    write(context.userData);
-    write(context.compute);
-    write(pixel != nullptr);
-    if (pixel != nullptr) write(*pixel);
-    write(vertex != nullptr);
-    if (vertex != nullptr) write(*vertex);
-    write(context.floatMode);
-    write(context.convertedSamples);
-    write(context.layerRowSamples);
-    write(request.layout.descriptorSet);
-    write(request.layout.firstBinding);
-    write(request.layout.pushConstantOffsetBytes);
-    write(request.layout.pushConstantSizeBytes);
-    const auto& graphics = *request.graphics;
-    write(graphics.firstUserSgpr);
-    write(graphics.mesh);
-    write(graphics.tessellation);
-    if (graphics.tessellation) {
-        write(graphics.draw.indexCount);
-        write(graphics.draw.instanceCount);
-    }
+    write.stagePixel = pixel;
+    write.stageVertex = vertex;
+    HashRequestFields(request, write);
     write(ShaderRecompiler::DebugProbeActive());
     write(ShaderRecompiler::RayTracingStrict());
     write(ShaderRecompiler::RayTracingMiss());
