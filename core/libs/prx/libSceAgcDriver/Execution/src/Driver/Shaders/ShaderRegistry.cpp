@@ -1163,7 +1163,6 @@ std::atomic<std::uint64_t> hintsRefusedModes{0};
 std::atomic<std::uint64_t> hintsRefusedOther{0};
 std::atomic<bool> convertedSamplesBetweenScopes{false};
 std::atomic<bool> layerRowSamplesBeforeLookup{false};
-std::atomic<bool> movePreparedTable{false};
 
 bool VerifyInvocationKeys() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_STAGE_MEMO") != nullptr;
@@ -1218,7 +1217,6 @@ ShaderRecompiler::PreparedShaderInvocation InvocationWithOneCopy(const ShaderSna
     std::unique_lock lock(prepared.mutex);
     AwaitRegisteredPreparation(prepared, lock);
     if (hint != nullptr && hint->handle != nullptr && layerRowSamplesBeforeLookup.exchange(false, std::memory_order_acq_rel) && std::ranges::find(prepared.layerRowSamples, codeOffset) == prepared.layerRowSamples.end()) prepared.layerRowSamples.push_back(codeOffset);
-    if (hint != nullptr && hint->handle != nullptr && movePreparedTable.exchange(false, std::memory_order_acq_rel)) ++prepared.entriesVersion;
     ApplyPreparedSampleModesLocked(prepared, codeOffset, source.context);
     if (HintServes(hint, prepared, source, !linked.code.empty())) {
         auto handle = hint->handle;
@@ -1304,10 +1302,6 @@ void MarkConvertedSamplesBetweenScopesForTest() {
 
 void MarkLayerRowSamplesBeforeLookupForTest() {
     layerRowSamplesBeforeLookup.store(true, std::memory_order_release);
-}
-
-void MovePreparedTableForTest() {
-    movePreparedTable.store(true, std::memory_order_release);
 }
 
 ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, bool* linkedCode, const PreparedHandleHint* hint, PreparedHandleHint* matched) {

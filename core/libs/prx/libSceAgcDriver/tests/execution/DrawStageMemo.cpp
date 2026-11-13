@@ -753,13 +753,13 @@ void StaleStagesTakeTheirPreparedHandles() {
     Expect(stale.brightest != 255u, "the stale vertex stage bound its old descriptor");
     Expect(stale.counts[MemoCount::Stale] == 1 && stale.hints.served == 1 && stale.hints.refusedVersion + stale.hints.refusedModes + stale.hints.refusedOther == 0, "a stale vertex stage did not take the prepared handle its record kept");
     WriteTable(scene.tables, TableOffset, scene.vertices, true);
-    AgcDriver::DriverDetail::MovePreparedTableForTest();
-    const auto moved = step("a stale vertex stage after its prepared table moved");
-    Expect(moved.brightest == 255u, "the stale vertex stage after its prepared table moved did not draw");
-    Expect(moved.counts[MemoCount::Stale] == 1 && moved.hints.served == 0 && moved.hints.refusedVersion == 1, "a hint was served after its prepared table moved");
+    AgcDriverResolveShaderAbi_nid_postfix(&VertexHeader.shader, {}, {});
+    const auto resolved = step("a stale vertex stage after its shader's ABI was resolved");
+    Expect(resolved.brightest == 255u, "the stale vertex stage after its shader's ABI was resolved did not draw");
+    Expect(resolved.counts[MemoCount::Stale] == 1 && resolved.hints.served == 0 && resolved.hints.refusedVersion == 1, "a hint was served after a preparation transaction swapped its table's entries");
     WriteTable(scene.tables, TableOffset, scene.vertices, false);
-    const auto relearnt = step("a stale vertex stage with the hint learnt again");
-    Expect(relearnt.hints.served == 1, "the hint the moved table's capture recorded was not served");
+    const auto relearnt = step("a stale vertex stage with the hint learnt after the resolution");
+    Expect(relearnt.hints.served == 1, "the hint recorded after the resolution was not served");
     WriteTable(scene.tables, TableOffset, scene.vertices, true);
     AgcDriver::DriverDetail::MarkLayerRowSamplesBeforeLookupForTest();
     const auto modes = step("a stale vertex stage after a sample mode was recorded");
@@ -767,7 +767,7 @@ void StaleStagesTakeTheirPreparedHandles() {
     Expect(modes.hints.served == 0 && modes.hints.refusedModes == 1, "a hint was served after its stage's sample modes changed");
     Switches::Assign(RuntimeSwitch::OneStageRequest, oneRequest);
     Switches::Assign(RuntimeSwitch::StageHandleHints, hints);
-    std::puts("a stale stage takes the prepared handle its record kept, unless its table or sample modes moved");
+    std::puts("a stale stage takes the prepared handle its record kept, unless a preparation transaction swapped its table or its sample modes moved");
 }
 
 int BenchStageKeys() {

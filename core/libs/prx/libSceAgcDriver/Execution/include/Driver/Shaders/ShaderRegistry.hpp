@@ -362,7 +362,6 @@ struct PreparedHandleHintCounts {
 PreparedHandleHintCounts PreparedHandleHints();
 void MarkConvertedSamplesBetweenScopesForTest();
 void MarkLayerRowSamplesBeforeLookupForTest();
-void MovePreparedTableForTest();
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> CaptureInvocation(ShaderMemory& memory, const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::PreparedShaderInvocation& invocation);
 
 }
