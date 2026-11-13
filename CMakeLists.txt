@@ -834,6 +834,17 @@ if(BUILD_TESTING)
             cmake_language(DEFER CALL raise_windows_deferred_tooling_test_timeouts)
         endif()
     endif()
+    if(ANYPS5_ENABLE_TSAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_test_executable(tsan_lavapipe_unload_tests tools/tests/TsanLavapipeUnload.cpp)
+        target_include_directories(tsan_lavapipe_unload_tests PRIVATE ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+        target_link_libraries(tsan_lavapipe_unload_tests PRIVATE ${CMAKE_DL_LIBS})
+        add_test(NAME tsan_lavapipe_unload COMMAND tsan_lavapipe_unload_tests)
+        set_tests_properties(tsan_lavapipe_unload PROPERTIES
+            ENVIRONMENT "TSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tools/tsan-suppressions.txt"
+            PASS_REGULAR_EXPRESSION "loaded and unloaded twice without a sanitizer abort"
+            SKIP_REGULAR_EXPRESSION "skipped, no Vulkan loader or device"
+            TIMEOUT 60)
+    endif()
 endif()
 
 if(ANYPS5_RELINKER_ONLY)
