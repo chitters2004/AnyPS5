@@ -592,7 +592,7 @@ jobs:
               return 0
             fi
             python3 - <<'PY' > build/targets.txt
-          import glob, os, re, subprocess
+          import glob, os, re, subprocess, sys
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
           known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
           names = set()
@@ -605,6 +605,7 @@ jobs:
                           for candidate in (name, name[:-4] if name.endswith(".exe") else name):
                               if candidate in known:
                                   names.add(candidate)
+          print(f"target scan: {len(selected)} selected tests, {len(known)} ninja target names, {len(names)} matched", file=sys.stderr)
           print(" ".join(sorted(names)))
           PY
             echo "targets: $(cat build/targets.txt)"
