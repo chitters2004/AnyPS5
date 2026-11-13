@@ -505,12 +505,54 @@ private:
     bool muted;
 };
 
+constexpr std::size_t TicketSlots = std::size_t{1} << 16;
+constexpr std::uint64_t TicketBlockBytes = 65536;
+constexpr int TicketInFlightSpins = 1024;
+
+struct TicketStamps {
+    std::atomic<std::uint64_t> sequence{1};
+    std::atomic<std::uint64_t> floor{0};
+    std::atomic<std::uint32_t> inFlight{0};
+    std::atomic<int> droppedSource{-1};
+    std::atomic<void (*)()> hook{nullptr};
+    std::atomic<std::uint64_t> held{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TicketRefusal::Count)> refused{};
+    std::array<std::atomic<std::uint64_t>, TicketSlots> slots{};
+};
+
+constinit TicketStamps ticketStamps;
+
+void raiseTicketStamp(std::atomic<std::uint64_t>& stamp, std::uint64_t sequence) {
+    auto seen = stamp.load(std::memory_order_relaxed);
+    while (seen < sequence && !stamp.compare_exchange_weak(seen, sequence, std::memory_order_release, std::memory_order_relaxed)) {
+    }
+}
+
+bool ticketSpanIsWide(std::uint64_t address, std::uint64_t bytes) {
+    return bytes > std::numeric_limits<std::uint64_t>::max() - address || (address + bytes - 1) / TicketBlockBytes - address / TicketBlockBytes >= TicketSlots;
+}
+
+void stampTicket(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+    auto& tickets = ticketStamps;
+    if (bytes == 0 || tickets.droppedSource.load(std::memory_order_relaxed) == static_cast<int>(source)) return;
+    tickets.inFlight.fetch_add(1, std::memory_order_seq_cst);
+    const auto sequence = tickets.sequence.fetch_add(1, std::memory_order_seq_cst) + 1;
+    if (auto* hook = tickets.hook.load(std::memory_order_acquire)) hook();
+    if (ticketSpanIsWide(address, bytes)) raiseTicketStamp(tickets.floor, sequence);
+    else {
+        const auto last = (address + bytes - 1) / TicketBlockBytes;
+        for (auto block = address / TicketBlockBytes; block <= last; ++block) raiseTicketStamp(tickets.slots[block % TicketSlots], sequence);
+    }
+    tickets.inFlight.fetch_sub(1, std::memory_order_release);
+}
+
 bool storeBumpsMutedForTest() {
     const auto mutant = certificateMutant.load(std::memory_order_relaxed);
     return ((mutant == CertificateMutant::HideMarkWrittenBumps || mutant == CertificateMutant::HideOwnStoreBumps) && storeBumpsMuted) || (mutant == CertificateMutant::HidePipelineCommitBumps && coveredCommitMuted);
 }
 
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+    stampTicket(address, bytes, source);
     auto& index = Index();
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
     if (storeBumpsMutedForTest()) return;
@@ -3775,6 +3817,75 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
         if (!tracker.rangeUnchanged(address, bytes, generation)) return false;
     }
     return true;
+}
+
+WriteTicket ObserveTicket() {
+    return {ticketStamps.sequence.load(std::memory_order_acquire)};
+}
+
+bool UnchangedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriteTicket ticket) {
+    auto& tickets = ticketStamps;
+    const auto refuse = [&](TicketRefusal refusal) {
+        tickets.refused[static_cast<std::size_t>(refusal)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (ticket.sequence == 0) return refuse(TicketRefusal::NoTicket);
+    const auto mutant = certificateMutant.load(std::memory_order_relaxed);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        if (ticketSpanIsWide(begin, end - begin)) return refuse(TicketRefusal::Stamped);
+        if (mutant != CertificateMutant::SkipTicketCollect && CollectWrites(begin, static_cast<std::size_t>(end - begin)) == 0) return refuse(TicketRefusal::Unwatched);
+    }
+    {
+        auto& tracker = Tracker();
+        auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (!tracker.watched) return refuse(TicketRefusal::Unwatched);
+        for (const auto& [begin, end] : ranges) {
+            if (end > begin && !tracker.covers(begin, static_cast<std::size_t>(end - begin))) return refuse(TicketRefusal::Unwatched);
+        }
+    }
+    if (mutant != CertificateMutant::IgnoreTicketsInFlight) {
+        int spins = 0;
+        while (tickets.inFlight.load(std::memory_order_seq_cst) != 0) {
+            if (++spins == TicketInFlightSpins) return refuse(TicketRefusal::InFlight);
+        }
+    }
+    if (tickets.floor.load(std::memory_order_acquire) > ticket.sequence) return refuse(TicketRefusal::Stamped);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto last = (end - 1) / TicketBlockBytes;
+        for (auto block = begin / TicketBlockBytes; block <= last; ++block) {
+            if (tickets.slots[block % TicketSlots].load(std::memory_order_acquire) > ticket.sequence) return refuse(TicketRefusal::Stamped);
+        }
+    }
+    tickets.held.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+WriteTicketStats WriteTicketsCounted() {
+    WriteTicketStats stats;
+    stats.held = ticketStamps.held.load(std::memory_order_relaxed);
+    for (std::size_t refusal = 0; refusal < stats.refused.size(); ++refusal) stats.refused[refusal] = ticketStamps.refused[refusal].load(std::memory_order_relaxed);
+    return stats;
+}
+
+const char* TicketRefusalName(TicketRefusal refusal) {
+    constexpr std::array<const char*, static_cast<std::size_t>(TicketRefusal::Count)> names{"no-ticket", "unwatched", "stamped", "in-flight"};
+    const auto index = static_cast<std::size_t>(refusal);
+    return index < names.size() ? names[index] : "invalid";
+}
+
+void ForceWriteBumpForTest(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+    bumpSubscriptions(address, bytes, source);
+}
+
+void DropTicketStampsForTest(std::optional<WriteBumpSource> source) {
+    ticketStamps.droppedSource.store(source ? static_cast<int>(*source) : -1, std::memory_order_relaxed);
+}
+
+void SetTicketStampHookForTest(void (*hook)()) {
+    ticketStamps.hook.store(hook, std::memory_order_release);
 }
 
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {

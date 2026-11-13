@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -844,6 +845,135 @@ void CheckExclusionSources() {
     Require(CompareSiteBytesForTest(firstLine) == Page && CompareSiteBytesForTest(secondLine) == Page, "compared bytes were not attributed to their call sites");
 }
 
+using TicketRange = std::pair<std::uint64_t, std::uint64_t>;
+
+bool HeldAfter(std::uint64_t address, const std::function<void()>& producer) {
+    const std::array<TicketRange, 1> ranges{{{address, address + Page}}};
+    const auto ticket = ObserveTicket();
+    producer();
+    return UnchangedSince(ranges, ticket);
+}
+
+std::uint64_t Refused(TicketRefusal refusal) {
+    return WriteTicketsCounted().refused[static_cast<std::size_t>(refusal)];
+}
+
+std::string TicketCounts() {
+    const auto stats = WriteTicketsCounted();
+    std::string text = " (held " + std::to_string(stats.held);
+    for (std::size_t refusal = 0; refusal < stats.refused.size(); ++refusal) text += std::string(", ") + TicketRefusalName(static_cast<TicketRefusal>(refusal)) + " " + std::to_string(stats.refused[refusal]);
+    return text + ")";
+}
+
+void CollectTicketSpan() {
+    Require(CollectWritesUncached(Base, static_cast<std::size_t>(96 * Block)) != 0, "the ticket span could not be collected");
+}
+
+void CheckTicketProducer(const char* name, WriteBumpSource source, std::uint64_t address, const std::function<void()>& producer) {
+    Require(!HeldAfter(address, producer), std::string("a ticket held over a ") + name + " write");
+    DropTicketStampsForTest(source);
+    const bool caught = HeldAfter(address, producer);
+    DropTicketStampsForTest(std::nullopt);
+    Require(caught, std::string("dropping the ") + name + " stamps still refused the ticket, so the case tests nothing");
+}
+
+std::array<TicketRange, 1> hookRanges{};
+WriteTicket hookTicket{};
+bool hookHeld = false;
+
+void JudgeDuringStamp() {
+    SetTicketStampHookForTest(nullptr);
+    hookHeld = UnchangedSince(hookRanges, hookTicket);
+}
+
+bool HeldDuringStamp(std::uint64_t address) {
+    hookRanges = {{{address, address + Page}}};
+    hookTicket = ObserveTicket();
+    hookHeld = false;
+    SetTicketStampHookForTest(&JudgeDuringStamp);
+    ForceWriteBumpForTest(address, Page, WriteBumpSource::Pending);
+    SetTicketStampHookForTest(nullptr);
+    return hookHeld;
+}
+
+void CheckWriteTickets() {
+    const auto at = Base + 70 * Block;
+    const std::array<TicketRange, 1> range{{{at, at + Page}}};
+    CollectTicketSpan();
+    Require(!UnchangedSince(range, WriteTicket{}), "an empty ticket held");
+    Require(HeldAfter(at, [] {}), "a ticket over an untouched range did not hold" + TicketCounts());
+    Require(HeldAfter(at, [&] { ForceWriteBumpForTest(at + 4 * Block, Page, WriteBumpSource::Pending); }), "a bump of a disjoint block refused the ticket");
+    CheckTicketProducer("guest CPU (uncollected)", WriteBumpSource::Cpu, at, [&] { Store(at); });
+    SetCertificateMutantForTest(CertificateMutant::SkipTicketCollect);
+    const bool uncollectedCaught = HeldAfter(at, [&] { Store(at); });
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(uncollectedCaught, "skipping the collect still refused an uncollected store, so the case tests nothing");
+    Require(!UnchangedSince(range, ObserveTicket()) && UnchangedSince(range, ObserveTicket()), "a store observed before the ticket but collected after it did not refuse once and then hold");
+    CheckTicketProducer("driver", WriteBumpSource::Driver, at, [&] { MarkWritten(at, 4); });
+    CheckTicketProducer("recorded pending", WriteBumpSource::Pending, at, [&] { NoteRecordedPending(at, 4); });
+    CheckTicketProducer("texture pending", WriteBumpSource::Pending, at, [&] { NoteGpuPending(at, 4); });
+    CheckTicketProducer("mirror", WriteBumpSource::Mirror, at, [&] { BumpWrites(at, 4, WriteBumpSource::Mirror); });
+    CheckTicketProducer("depth", WriteBumpSource::Depth, at, [&] { BumpWrites(at, 4, WriteBumpSource::Depth); });
+    for (const auto source : {WriteBumpSource::Forget, WriteBumpSource::Release, WriteBumpSource::Import}) {
+        CheckTicketProducer("forced", source, at, [&] { ForceWriteBumpForTest(at, 4, source); });
+    }
+    const auto wide = Refused(TicketRefusal::Stamped);
+    Require(!HeldAfter(at, [&] { ForceWriteBumpForTest(Base, std::uint64_t{1} << 40, WriteBumpSource::Pending); }) && Refused(TicketRefusal::Stamped) == wide + 1, "a ticket held over a bump wider than the stamp table");
+    const auto unwatchedAt = Base + 80 * Block;
+#ifdef _WIN32
+    const auto unwatched = Refused(TicketRefusal::Unwatched);
+    DropTicketStampsForTest(WriteBumpSource::Unwatch);
+    const bool unwatchHeld = HeldAfter(unwatchedAt, [&] { Unwatch(unwatchedAt, Page); });
+    DropTicketStampsForTest(std::nullopt);
+    Require(!unwatchHeld && Refused(TicketRefusal::Unwatched) == unwatched + 1, "a ticket held over a range that stopped being watched");
+#else
+    CheckTicketProducer("unwatch", WriteBumpSource::Unwatch, unwatchedAt, [&] { Unwatch(unwatchedAt, Page); });
+#endif
+    const auto inFlight = Refused(TicketRefusal::InFlight);
+    Require(!HeldDuringStamp(at) && Refused(TicketRefusal::InFlight) == inFlight + 1, "a ticket held while a bump of its range was stamping");
+    SetCertificateMutantForTest(CertificateMutant::IgnoreTicketsInFlight);
+    const bool inFlightCaught = HeldDuringStamp(at);
+    SetCertificateMutantForTest(CertificateMutant::None);
+    Require(inFlightCaught, "ignoring stamps in flight still refused the ticket, so the case tests nothing");
+}
+
+void BenchWriteTickets() {
+    constexpr int Calls = 20000;
+    std::array<TicketRange, 16> ranges{};
+    for (std::size_t index = 0; index < ranges.size(); ++index) ranges[index] = {Base + index * 3 * Block + 256, Base + index * 3 * Block + 256 + 2048};
+    double observeBest = std::numeric_limits<double>::max();
+    double checkBest = std::numeric_limits<double>::max();
+    std::uint64_t sink = 0;
+    bool held = true;
+    CollectTicketSpan();
+    for (int round = 0; round < 3; ++round) {
+        auto start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) sink += ObserveTicket().sequence;
+        observeBest = std::min(observeBest, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+        const auto ticket = ObserveTicket();
+        start = std::chrono::steady_clock::now();
+        for (int call = 0; call < Calls; ++call) {
+            if (call % 32 == 0) BumpCollectEpoch();
+            held = UnchangedSince(ranges, ticket) && held;
+        }
+        checkBest = std::min(checkBest, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+    }
+    Require(held && sink != 0, "bench: the untouched ranges did not hold" + TicketCounts());
+    std::cout << "bench ObserveTicket, best of 3 x 20000: " << observeBest << " ns per call (wall clock)\n";
+    std::cout << "bench UnchangedSince over 16 held 2 KiB ranges, a collect epoch every 32 calls, best of 3 x 20000: " << checkBest << " ns per call (wall clock)\n";
+    for (const bool stamped : {false, true}) {
+        DropTicketStampsForTest(stamped ? std::nullopt : std::optional<WriteBumpSource>{WriteBumpSource::Pending});
+        double best = std::numeric_limits<double>::max();
+        for (int round = 0; round < 3; ++round) {
+            const auto start = std::chrono::steady_clock::now();
+            for (int call = 0; call < Calls; ++call) NoteGpuPending(Base + static_cast<std::uint64_t>(call % 64) * Block, 4096);
+            best = std::min(best, std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Calls);
+        }
+        std::cout << "bench NoteGpuPending of 4 KiB with no live subscription, ticket stamps " << (stamped ? "on" : "off (before)") << ", best of 3 x 20000: " << best << " ns per call (wall clock)\n";
+    }
+    DropTicketStampsForTest(std::nullopt);
+}
+
 void BenchCompare(const char* arm) {
     constexpr int Calls = 20000;
     std::vector<std::byte> expected(Page);
@@ -871,6 +1001,21 @@ int main(int argc, char** argv) {
             std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
 #endif
             BenchCompare("not profiled");
+            return 0;
+        }
+        if (argc == 2 && (std::string(argv[1]) == "--tickets" || std::string(argv[1]) == "--ticket-bench")) {
+#ifdef _WIN32
+            if (!WriteWatched()) return 77;
+            const Arena arena;
+#else
+            std::vector<std::byte> backing(static_cast<std::size_t>(Span + Block));
+            Base = (reinterpret_cast<std::uint64_t>(backing.data()) + Block - 1) & ~(std::uint64_t{Block} - 1);
+            std::memset(reinterpret_cast<void*>(Base), 0x11, static_cast<std::size_t>(Span));
+#endif
+            if (std::string(argv[1]) == "--tickets") {
+                CheckWriteTickets();
+                std::cout << "write ticket test passed\n";
+            } else BenchWriteTickets();
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--sources") {

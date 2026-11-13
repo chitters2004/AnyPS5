@@ -1,13 +1,28 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <sys/mman.h>
+#endif
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -163,6 +178,107 @@ void OlderDrawReadsBeforeYoungerPublication() {
     Require(older.readAtCommit.load() == Before, "an older draw read " + std::to_string(older.readAtCommit.load()) + " at its commit: a younger item published into memory the draw reads before the draw committed");
 }
 
+
+constexpr std::size_t GateBytes = 1u << 20u;
+constexpr std::size_t GateRead = 4096u;
+
+class WatchedBlock {
+public:
+    WatchedBlock() {
+#ifdef _WIN32
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(GateBytes, 65536));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, GateBytes, PAGE_READWRITE, GateBytes);
+#else
+        void* mapped = mmap(nullptr, GateBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) {
+            block = static_cast<std::uint8_t*>(mapped);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, GateBytes);
+        }
+#endif
+        Require(block != nullptr, "the preparer gate test cannot allocate its guest block");
+        std::fill(block, block + GateBytes, std::uint8_t{0x11});
+        AgcDriver::GuestMemory::CollectWritesUncached(Address(), GateBytes);
+    }
+    ~WatchedBlock() {
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(block, GateBytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, GateBytes);
+#else
+        munmap(block, GateBytes);
+        GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(block, GateBytes);
+#endif
+    }
+    WatchedBlock(const WatchedBlock&) = delete;
+    WatchedBlock& operator=(const WatchedBlock&) = delete;
+    std::uint64_t Address() const { return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(block)); }
+    std::uint8_t* Bytes() const { return block; }
+
+private:
+    std::uint8_t* block = nullptr;
+};
+
+struct GateCase {
+    bool validated = false;
+    bool threw = false;
+};
+
+GateCase CheckRead(const WatchedBlock& guest, std::uint64_t offset, const std::vector<std::byte>& captured, bool turnWaited, const std::function<void()>& between) {
+    const auto ticket = AgcDriver::GuestMemory::ObserveTicket();
+    between();
+    const std::uint64_t untouched = GateBytes / 4u * 3u;
+    const std::array<DrawFinisher::Range, 2> ranges{{{guest.Address() + untouched, guest.Address() + untouched + captured.size()}, {guest.Address() + offset, guest.Address() + offset + captured.size()}}};
+    const std::array<std::span<const std::byte>, 2> bytes{std::span<const std::byte>(captured), std::span<const std::byte>(captured)};
+    GateCase result;
+    try {
+        result.validated = DrawFinisher::CheckPreparerReads(ticket, ranges, bytes, turnWaited);
+    } catch (const std::logic_error&) {
+        result.threw = true;
+    }
+    return result;
+}
+
+void PreparerGateCounts() {
+    using AgcDriver::GuestMemory::TicketRefusal;
+    if (!AgcDriver::GuestMemory::WriteWatched()) {
+        std::cout << "guest memory has no write watch: the preparer read gate is not tested\n";
+        return;
+    }
+    const bool verify = DrawFinisher::VerifyPreparerReads();
+    const bool tickets = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::WriteTickets);
+    WatchedBlock guest;
+    std::vector<std::byte> captured(GateRead, std::byte{0x11});
+    Require(CheckRead(guest, 0, captured, false, [] {}).validated, "the preparer gate refused a capture whose range nobody wrote after the ticket");
+    DrawFinisher::AbWindow(false, 'A', 1);
+    const auto before = DrawFinisher::PreparerReadsCounted();
+    const auto stampsBefore = AgcDriver::GuestMemory::WriteTicketsCounted();
+    const auto clean = CheckRead(guest, 0, captured, false, [] {});
+    Require(clean.validated && !clean.threw, "the preparer gate refused a capture whose range nobody wrote after the ticket");
+    const auto disjoint = CheckRead(guest, 0, captured, false, [&] { AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 8 * 65536, 4, AgcDriver::GuestMemory::WriteBumpSource::Driver); });
+    Require(disjoint.validated && !disjoint.threw, "the preparer gate refused a capture after a write to another 64 KiB block");
+    const auto sameBytes = CheckRead(guest, 0, captured, false, [&] { AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address(), 4, AgcDriver::GuestMemory::WriteBumpSource::Driver); });
+    Require(!sameBytes.validated && !sameBytes.threw, "the preparer gate validated a capture whose range was stamped after the ticket, or failed a verified capture whose bytes are unchanged");
+    const auto waited = CheckRead(guest, 128, captured, true, [&] {
+        guest.Bytes()[128] = 0x33;
+        AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 128, 1, AgcDriver::GuestMemory::WriteBumpSource::Driver);
+    });
+    Require(waited.validated && !waited.threw, "the preparer gate checked a capture whose commit waited for its turn, which no older item can have changed since");
+    const auto changed = CheckRead(guest, 64, captured, false, [&] {
+        guest.Bytes()[64] = 0x22;
+        AgcDriver::GuestMemory::ForceWriteBumpForTest(guest.Address() + 64, 1, AgcDriver::GuestMemory::WriteBumpSource::Driver);
+    });
+    Require(!changed.validated && changed.threw == verify, verify ? "APS5_VERIFY_PREPARER_READS let a capture whose guest bytes changed before the commit through" : "the preparer gate failed a capture outside APS5_VERIFY_PREPARER_READS");
+    const auto after = DrawFinisher::PreparerReadsCounted();
+    const auto stampsAfter = AgcDriver::GuestMemory::WriteTicketsCounted();
+    const auto stamped = static_cast<std::size_t>(TicketRefusal::Stamped);
+    Require(after.validated - before.validated == 2 && after.missed - before.missed == 2 && after.refused - before.refused == 1 && after.changed - before.changed == (verify ? 1u : 0u), "the preparer gate counted " + std::to_string(after.validated - before.validated) + " validated, " + std::to_string(after.missed - before.missed) + " missed, " + std::to_string(after.refused - before.refused) + " refused and " + std::to_string(after.changed - before.changed) + " changed, not 2, 2, 1 and " + (verify ? "1" : "0"));
+    Require(stampsAfter.refused[stamped] - stampsBefore.refused[stamped] == 2, "the preparer gate's two misses were not both stamped refusals, or it asked for a proof of a capture whose commit waited for its turn");
+    Require(after.taken == before.taken && DrawFinisher::PreparerTicket().sequence == 0, "a thread that is not a ring preparer took a preparer write ticket");
+    const auto line = DrawFinisher::AbWindow(true, 'A', 1);
+    const std::string expected = tickets ? "write tickets: 0 taken, 2 validated, 2 missed (no ticket 0, unwatched 0, stamped 2, in flight 0), 1 refused (turn waits)" + std::string(verify ? ", 1 changed (verified)" : "") : "write tickets off";
+    Require(line.find(expected) != std::string::npos, "the [ring-preparers] phase line does not carry the gate counts '" + expected + "': " + line);
+    std::cout << "preparer read gate counted " << (tickets ? "with" : "without") << " write tickets" << (verify ? ", verified" : "") << '\n';
+}
+
 }
 
 int main() {
@@ -174,6 +290,7 @@ int main() {
             for (int round = 0; round < 4; ++round) YoungerCaptureSeesOlderWrite(producer);
         }
         for (int round = 0; round < 4; ++round) OlderDrawReadsBeforeYoungerPublication();
+        PreparerGateCounts();
         std::cout << "preparer oracles passed with " << DrawFinisher::Preparers() << " preparers\n";
         return 0;
     } catch (const std::exception& error) {

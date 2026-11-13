@@ -1,16 +1,21 @@
 if(BUILD_TESTING)
     add_test_executable(agc_driver_preparer_oracles_tests tests/PreparerOracles.cpp)
     target_include_directories(agc_driver_preparer_oracles_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(agc_driver_preparer_oracles_tests PRIVATE libSceAgcDriver)
+    target_link_libraries(agc_driver_preparer_oracles_tests PRIVATE libSceAgcDriver libc)
     set_target_properties(agc_driver_preparer_oracles_tests PROPERTIES CXX_EXTENSIONS OFF)
     configure_windows_unwind(agc_driver_preparer_oracles_tests)
-    foreach(agcOraclePreparers IN ITEMS 1 4)
-        add_test(NAME agc_driver_preparer_oracles_${agcOraclePreparers} COMMAND agc_driver_preparer_oracles_tests)
-        set_tests_properties(agc_driver_preparer_oracles_${agcOraclePreparers} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
-            ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=8;APS5_RING_PREPARERS=${agcOraclePreparers}")
+    set(agcOracleGate_1 "")
+    set(agcOracleGate_4 "")
+    set(agcOracleGate_4_tickets ";APS5_WRITE_TICKETS=1")
+    set(agcOracleGate_4_verified ";APS5_WRITE_TICKETS=1;APS5_VERIFY_PREPARER_READS=1")
+    foreach(agcOracleCase IN ITEMS 1 4 4_tickets 4_verified)
+        string(REGEX MATCH "^[0-9]+" agcOraclePreparers "${agcOracleCase}")
+        add_test(NAME agc_driver_preparer_oracles_${agcOracleCase} COMMAND agc_driver_preparer_oracles_tests)
+        set_tests_properties(agc_driver_preparer_oracles_${agcOracleCase} PROPERTIES TIMEOUT 60 SKIP_RETURN_CODE 77
+            ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=8;APS5_RING_PREPARERS=${agcOraclePreparers}${agcOracleGate_${agcOracleCase}}")
         if(WIN32)
-            set_tests_properties(agc_driver_preparer_oracles_${agcOraclePreparers} PROPERTIES ENVIRONMENT_MODIFICATION
-                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+            set_tests_properties(agc_driver_preparer_oracles_${agcOracleCase} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
 endif()

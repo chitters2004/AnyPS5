@@ -1,10 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -13,6 +16,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -111,6 +115,39 @@ void TargetBlock(std::vector<std::uint32_t>& commands, std::uint32_t draw) {
 
 }
 
+void HeldItemTicketsYoungerDraws() {
+    using AgcDriver::DriverDetail::DrawFinisher;
+    if (!DrawFinisher::Sequenced() || DrawFinisher::Preparers() < 2) return;
+    const bool tickets = AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::WriteTickets);
+    const auto draws = static_cast<std::uint32_t>(std::min<std::size_t>(DrawFinisher::Preparers(), Draws));
+    const std::uint64_t younger = tickets ? draws - 1u : 0u;
+    auto commands = Setup();
+    for (std::uint32_t draw = 0; draw < draws; ++draw) {
+        TargetBlock(commands, draw);
+        Append(commands, 0x2d, {3, 2});
+    }
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission that fills the draw cache failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto before = DrawFinisher::PreparerReadsCounted();
+    std::atomic<bool> held{false};
+    std::atomic<bool> reached{false};
+    DrawFinisher::HoldNextItemForTest([&] {
+        held.store(true, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (DrawFinisher::PreparerReadsCounted().taken - before.taken < younger && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+        reached.store(DrawFinisher::PreparerReadsCounted().taken - before.taken >= younger, std::memory_order_release);
+    });
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the held draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto after = DrawFinisher::PreparerReadsCounted();
+    Require(held.load(std::memory_order_acquire), "the held draw submission never ran the item hold");
+    Require(reached.load(std::memory_order_acquire), "the draws behind a held item did not take write tickets while it was unpublished: " + std::to_string(after.taken - before.taken) + " of " + std::to_string(younger));
+    const auto checked = (after.validated - before.validated) + (after.missed - before.missed) + (after.refused - before.refused);
+    Require(after.taken - before.taken == younger && checked == younger, "the draws behind a held item took " + std::to_string(after.taken - before.taken) + " write tickets and checked " + std::to_string(checked) + ", expected " + std::to_string(younger) + " of each");
+    std::cout << "the draws behind a held item " << (tickets ? "checked their captures at commit" : "took no write tickets with the switch off") << '\n';
+}
+
 int main() {
     try {
         bool libraries = false;
@@ -141,6 +178,7 @@ int main() {
             const auto expected = static_cast<unsigned>((ConstantFor(draw) + 0.25f) * 255.0f + 0.5f);
             Require(brightest + 2 >= expected && brightest <= expected + 2, "draw " + std::to_string(draw) + " wrote " + std::to_string(brightest) + ", expected " + std::to_string(expected) + " from the constant stored just before it (" + std::to_string(DrawFinisher::Preparers()) + " preparers)");
         }
+        HeldItemTicketsYoungerDraws();
         AgcDriverShutdown_nid_postfix();
         std::cout << "each draw read the constant stored just before it with " << DrawFinisher::Preparers() << " preparers\n";
         return 0;

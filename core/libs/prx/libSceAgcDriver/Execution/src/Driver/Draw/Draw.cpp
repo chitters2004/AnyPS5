@@ -121,6 +121,18 @@ std::string_view TrimmedReason(std::string_view reason) {
     return reason;
     }
 
+void checkPreparerReads(GuestMemory::WriteTicket ticket, std::span<const ShaderRecompiler::MemoryRegion> memory, bool turnWaited) {
+    thread_local std::vector<DrawFinisher::Range> ranges;
+    thread_local std::vector<std::span<const std::byte>> captured;
+    ranges.clear();
+    captured.clear();
+    for (const auto& region : memory) {
+        ranges.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+        captured.push_back(region.bytes);
+    }
+    DrawFinisher::CheckPreparerReads(ticket, ranges, captured, turnWaited);
+}
+
 }
 
 
@@ -150,6 +162,7 @@ struct DrawTail {
     std::vector<DrawProgram> writablePrograms;
     const std::vector<DrawProgram>* programs = nullptr;
     std::vector<ShaderRecompiler::MemoryRegion> memory;
+    GuestMemory::WriteTicket preparerTicket{};
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
     std::vector<std::vector<Graphics::DecodeRead>> decodeReads;
@@ -797,6 +810,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 job.phaseMs[DrawRowEpilogue] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - job.phaseLap).count();
                 addDrawPhases(job.phaseMs, false, job.captures, true);
             };
+            job.preparerTicket = DrawFinisher::PreparerTicket();
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
@@ -1382,7 +1396,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 preparedInputs = localDevice->PrepareDrawResourcesAhead(std::move(preparedInputs), graphics, direct, stages, snapshots, epoch);
                 const auto preparedResources = preparedInputs;
                 phaseTiming.Phase(DrawRowInputsAhead);
-                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), preparedInputs = std::move(preparedInputs), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)] {
+                auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), direct, stages = std::move(stages), preparedInputs = std::move(preparedInputs), snapshots = std::move(snapshots), commitQueue, commitPacket, epoch, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), preparerTicket = tail.preparerTicket, preparerTurnWaited = tail.preparerTicket.sequence != 0 && DrawPipeline::PreparerDirect()] {
+                    if (preparerTicket.sequence != 0) checkPreparerReads(preparerTicket, memory, preparerTurnWaited);
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, nullptr, {}, 0, nullptr, preparedInputs);
@@ -1464,7 +1479,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         if (recipe == nullptr) preparedInputs = localDevice->PrepareDrawResourcesAhead(std::move(preparedInputs), graphics, drawParameters, stages, snapshots, epoch);
         const auto preparedResources = preparedInputs;
         phaseTiming.Phase(DrawRowInputsAhead);
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), preparedInputs = std::move(preparedInputs), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, planKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), preparedInputs = std::move(preparedInputs), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, planKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), preparerTicket = tail.preparerTicket, preparerTurnWaited = tail.preparerTicket.sequence != 0 && DrawPipeline::PreparerDirect()]() mutable {
+            if (preparerTicket.sequence != 0) checkPreparerReads(preparerTicket, memory, preparerTurnWaited);
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, planKey, std::move(preparedInputs));
