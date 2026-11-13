@@ -208,6 +208,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     if (const auto pending = drawRelocationsPending.find(key); pending != drawRelocationsPending.end()) {
         const auto learned = pending->second;
         drawRelocationsPending.erase(pending);
+        noteRelocationReleased();
         learnPendingRelocation(learned);
     }
     while (drawCache.size() > drawCacheEntries() || (drawCache.size() > 1 && drawCacheVariantBytes > DrawCacheBytes())) {

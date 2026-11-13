@@ -455,6 +455,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
+            if (drawRelocationMissed.exchange(false, std::memory_order_relaxed) && DrawFinisher::Busy() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RelocationDrain)) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Relocation);
+            noteRelocationLookup();
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
             std::lock_guard cacheLock(drawCacheMutex);
             const auto known = drawRelocations.find(drawIdentity);
@@ -494,8 +496,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 cacheLock.lock();
             }
             if (drawIdentity != 0) {
-                if (drawRelocationsPending.size() >= MaxPendingRelocations) drawRelocationsPending.clear();
-                drawRelocationsPending[drawKey] = {drawKey, drawAlias, drawIdentity};
+                if (drawRelocationsPending.size() >= MaxPendingRelocations) {
+                    noteRelocationsDropped(drawRelocationsPending.size());
+                    drawRelocationsPending.clear();
+                }
+                if (drawRelocationsPending.insert_or_assign(drawKey, DrawRelocationPending{drawKey, drawAlias, drawIdentity, relocationLookupSequence()}).second) noteRelocationHeld();
+                drawRelocationMissed.store(true, std::memory_order_relaxed);
+                noteRelocationMiss();
             }
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
@@ -725,6 +732,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::lock_guard cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
+            noteRelocatedHit();
             ++drawRelocationTrials[drawIdentity].hits;
             if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
                 const auto donor = drawCache.find(alias->second);

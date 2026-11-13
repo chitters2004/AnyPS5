@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cstdlib>
 #include <cstring>
@@ -17,6 +18,15 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+struct RelocationLearningCounters {
+    std::atomic<std::uint64_t> lookups{0}, misses{0}, relocatedHits{0}, learned{0}, late{0}, never{0}, held{0};
+};
+
+RelocationLearningCounters& relocationLearning() {
+    static RelocationLearningCounters counters;
+    return counters;
+}
 
 constexpr std::size_t MaxAliases = 16384;
 constexpr std::size_t MaxContentWords = 64;
@@ -210,13 +220,53 @@ std::size_t dropEveryOther(TMap& map) {
 
 }
 
+DrawRelocationLearning DrawRelocationLearningTotals() {
+    auto& counters = relocationLearning();
+    return {counters.lookups.load(std::memory_order_relaxed), counters.misses.load(std::memory_order_relaxed), counters.relocatedHits.load(std::memory_order_relaxed), counters.learned.load(std::memory_order_relaxed), counters.late.load(std::memory_order_relaxed), counters.never.load(std::memory_order_relaxed), counters.held.load(std::memory_order_relaxed)};
+}
+
+void Driver::noteRelocationLookup() {
+    relocationLearning().lookups.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t Driver::relocationLookupSequence() {
+    return relocationLearning().lookups.load(std::memory_order_relaxed);
+}
+
+void Driver::noteRelocationMiss() {
+    relocationLearning().misses.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Driver::noteRelocatedHit() {
+    relocationLearning().relocatedHits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Driver::noteRelocationsDropped(std::uint64_t count) {
+    relocationLearning().never.fetch_add(count, std::memory_order_relaxed);
+    relocationLearning().held.fetch_sub(count, std::memory_order_relaxed);
+}
+
+void Driver::noteRelocationHeld() {
+    relocationLearning().held.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Driver::noteRelocationReleased() {
+    relocationLearning().held.fetch_sub(1, std::memory_order_relaxed);
+}
+
 void Driver::learnPendingRelocation(const DrawRelocationPending& pending) {
     if (pending.key == 0) return;
+    auto& counters = relocationLearning();
     const auto inserted = drawCache.find(pending.key);
-    if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
+    const bool usable = inserted != drawCache.end() && inserted->second->decode != nullptr && inserted->second->stages.size() == inserted->second->decode->programs.size();
+    if (!usable) {
+        counters.never.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counters.learned.fetch_add(1, std::memory_order_relaxed);
+    if (counters.lookups.load(std::memory_order_relaxed) > pending.lookup) counters.late.fetch_add(1, std::memory_order_relaxed);
     const auto& entry = *inserted->second;
     const auto& programs = entry.decode->programs;
-    if (entry.stages.size() != programs.size()) return;
     const auto known = drawRelocations.find(pending.identity);
     auto shape = std::make_shared<DrawRelocation>();
     if (known != drawRelocations.end()) *shape = *known->second;

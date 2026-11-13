@@ -21,6 +21,10 @@ struct AbDrainSite {
     std::uint64_t waits = 0, waitNs = 0, queued = 0;
 };
 
+struct AbRelocation {
+    std::uint64_t lookups = 0, misses = 0, relocatedHits = 0, learned = 0, late = 0, never = 0, held = 0;
+};
+
 struct AbSample {
     double seconds = 0;
     std::uint64_t present = 0;
@@ -28,6 +32,7 @@ struct AbSample {
     AbCommitterTotals committer;
     std::uint64_t preparerRoomWaitNs = 0;
     std::vector<AbDrainSite> drainSites;
+    AbRelocation relocation;
     std::vector<TraceThreadTotals> threads;
 };
 
@@ -76,6 +81,17 @@ public:
             count(prefix + ".n", site.waits - base.waits);
             number(prefix + ".ms", ms(site.waitNs - base.waitNs));
             count(prefix + ".queued", site.queued - base.queued);
+        }
+        const auto& ra = from.relocation;
+        const auto& rb = to.relocation;
+        if (rb.lookups != ra.lookups) {
+            count("rl.lookups", rb.lookups - ra.lookups);
+            count("rl.misses", rb.misses - ra.misses);
+            count("rl.hits", rb.relocatedHits - ra.relocatedHits);
+            count("rl.learned", rb.learned - ra.learned);
+            count("rl.late", rb.late - ra.late);
+            count("rl.never", rb.never - ra.never);
+            count("rl.held", rb.held);
         }
         bool recorded = false;
         for (std::size_t index = 0; index < to.threads.size(); ++index) {

@@ -233,6 +233,13 @@ private:
     static bool drawRelocationEnabled();
     static void patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value);
     void learnPendingRelocation(const DrawRelocationPending& pending);
+    static void noteRelocationLookup();
+    static std::uint64_t relocationLookupSequence();
+    static void noteRelocationMiss();
+    static void noteRelocatedHit();
+    static void noteRelocationsDropped(std::uint64_t count);
+    static void noteRelocationHeld();
+    static void noteRelocationReleased();
     void relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches);
     void reportDrawRelocation();
     static bool sameVertexInfo(const ShaderRecompiler::ShaderVertexStageInfo& a, const ShaderRecompiler::ShaderVertexStageInfo& b);
@@ -497,6 +504,7 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<const DrawRelocation>> drawRelocations;
     std::unordered_map<std::uint64_t, std::uint64_t> drawAliases;
     std::unordered_map<std::uint64_t, DrawRelocationPending> drawRelocationsPending;
+    std::atomic<bool> drawRelocationMissed{false};
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
     AgcDriver::Mutex drawCacheMutex;

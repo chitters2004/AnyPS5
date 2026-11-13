@@ -165,8 +165,14 @@ struct DrawUserPatch {
 };
 
 struct DrawRelocationPending {
-    std::uint64_t key = 0, alias = 0, identity = 0;
+    std::uint64_t key = 0, alias = 0, identity = 0, lookup = 0;
 };
+
+struct DrawRelocationLearning {
+    std::uint64_t lookups = 0, misses = 0, relocatedHits = 0, learned = 0, late = 0, never = 0, held = 0;
+};
+
+DrawRelocationLearning DrawRelocationLearningTotals();
 
 struct DrawRelocationTrial {
     static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384, ProbationAdmissions = 2;
