@@ -547,8 +547,6 @@ std::atomic<std::uint64_t> passesFused{0};
 std::atomic<std::uint64_t> passEndsSettled{0};
 std::atomic<std::uint64_t> fencedKeyOnlyBreaks{0};
 std::atomic<std::uint64_t> trailingsFused{0};
-std::atomic<std::uint64_t> fencedKeyOnlyShared{0};
-std::atomic<std::uint64_t> fencedKeyOnlyApart{0};
 std::atomic<std::uint64_t> writeBackJoins{0};
 constexpr BarrierMask LabelLeadingBarrier{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT};
 std::atomic<std::int64_t> pendingLabelSince{NoPendingLabel};
@@ -2414,10 +2412,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     const bool fuse = !merge && MergeBarriers() && !pass.afterPass && FuseBarriers() && !DiagNoPassBarriers();
-    if (hazard == PassHazard::None && (fenced || pass.fenced)) {
-        fencedKeyOnlyBreaks.fetch_add(1, std::memory_order_relaxed);
-        (open->passHazards.SharesAttachment(access) ? fencedKeyOnlyShared : fencedKeyOnlyApart).fetch_add(1, std::memory_order_relaxed);
-    }
+    if (hazard == PassHazard::None && (fenced || pass.fenced)) fencedKeyOnlyBreaks.fetch_add(1, std::memory_order_relaxed);
     endOpenRenderPass(reason, !merge && !fuse);
     const auto commands = Commands();
     ++open->passes;
@@ -2498,7 +2493,7 @@ bool Recorder::FuseBarriers() {
 }
 
 Recorder::FusionStatistics Recorder::FusionCounts() {
-    return FusionStatistics{passesFused.load(std::memory_order_relaxed), passEndsSettled.load(std::memory_order_relaxed), fencedKeyOnlyBreaks.load(std::memory_order_relaxed), trailingsFused.load(std::memory_order_relaxed), fencedKeyOnlyShared.load(std::memory_order_relaxed), fencedKeyOnlyApart.load(std::memory_order_relaxed)};
+    return FusionStatistics{passesFused.load(std::memory_order_relaxed), passEndsSettled.load(std::memory_order_relaxed), fencedKeyOnlyBreaks.load(std::memory_order_relaxed), trailingsFused.load(std::memory_order_relaxed)};
 }
 
 void Recorder::SealPassWriteOnly() {
@@ -3009,26 +3004,14 @@ void reportBarriers() {
         const auto destination = static_cast<std::uint32_t>(masks[i].second & 0xffffffffu);
         maskLine += " " + StageText(source) + ">" + StageText(destination) + " x" + std::to_string(masks[i].first);
     }
-    static std::uint64_t reportedPassesFused = 0;
-    const auto fusedTotal = passesFused.load(std::memory_order_relaxed);
-    const auto fused = fusedTotal - std::exchange(reportedPassesFused, fusedTotal);
-    static std::uint64_t reportedPassEndsSettled = 0;
-    const auto settledTotal = passEndsSettled.load(std::memory_order_relaxed);
-    const auto settled = settledTotal - std::exchange(reportedPassEndsSettled, settledTotal);
-    static std::uint64_t reportedShared = 0, reportedApart = 0, reportedKeyOnly = 0;
-    const auto keyOnlyTotal = fencedKeyOnlyBreaks.load(std::memory_order_relaxed);
-    const auto keyOnly = keyOnlyTotal - std::exchange(reportedKeyOnly, keyOnlyTotal);
-    const auto sharedTotal = fencedKeyOnlyShared.load(std::memory_order_relaxed);
-    const auto shared = sharedTotal - std::exchange(reportedShared, sharedTotal);
-    const auto apartTotal = fencedKeyOnlyApart.load(std::memory_order_relaxed);
-    const auto apart = apartTotal - std::exchange(reportedApart, apartTotal);
-    static std::uint64_t reportedTrailingsFused = 0;
-    const auto trailingTotal = trailingsFused.load(std::memory_order_relaxed);
-    const auto trailing = trailingTotal - std::exchange(reportedTrailingsFused, trailingTotal);
+    const auto fused = passesFused.exchange(0, std::memory_order_relaxed);
+    const auto settled = passEndsSettled.exchange(0, std::memory_order_relaxed);
+    const auto keyOnly = fencedKeyOnlyBreaks.exchange(0, std::memory_order_relaxed);
+    const auto trailing = trailingsFused.exchange(0, std::memory_order_relaxed);
     static std::uint64_t reportedJoins = 0;
     const auto joins = writeBackJoins.load(std::memory_order_relaxed);
     const auto newJoins = joins - std::exchange(reportedJoins, joins);
-    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s; pass end and start fused %llu, owed barriers recorded alone %llu, fenced key-only pass breaks %llu (sharing a read-only attachment %llu, sharing none %llu), trailing barriers fused into a pass start %llu, storage write-backs joined to a run %llu\n", maskLine.c_str(), static_cast<unsigned long long>(fused), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(keyOnly), static_cast<unsigned long long>(shared), static_cast<unsigned long long>(apart), static_cast<unsigned long long>(trailing), static_cast<unsigned long long>(newJoins));
+    AgcDriver::ProfilePrint_nid_no_patch("[barrier-masks] (10 s, src>dst stages, through Recorder::recordBarrier, RecordMemoryBarrier and the draw pass start):%s; pass end and start fused %llu, owed barriers recorded alone %llu, fenced key-only pass breaks %llu, trailing barriers fused into a pass start %llu, storage write-backs joined to a run %llu\n", maskLine.c_str(), static_cast<unsigned long long>(fused), static_cast<unsigned long long>(settled), static_cast<unsigned long long>(keyOnly), static_cast<unsigned long long>(trailing), static_cast<unsigned long long>(newJoins));
     if (Recorder::BarrierValidate()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;

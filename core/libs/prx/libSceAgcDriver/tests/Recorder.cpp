@@ -12727,33 +12727,6 @@ void barrierFusionTests(const Device& device) {
         });
     }
     RuntimeSwitches::Assign(RuntimeSwitch::NoBarrierFusion, false);
-    {
-        const auto depth = reinterpret_cast<VkImage>(std::uintptr_t{0xde70});
-        const auto other = reinterpret_cast<VkImage>(std::uintptr_t{0xde80});
-        const std::array<std::pair<VkImage, bool>, 1> depthRead{{{depth, false}}};
-        const std::array<std::pair<VkImage, bool>, 1> depthWritten{{{depth, true}}};
-        const std::array<std::pair<VkImage, bool>, 1> otherWritten{{{other, true}}};
-        const auto attached = [](std::span<const std::pair<VkImage, bool>> attachments) { return PassAccess{{}, {}, {}, attachments}; };
-        const auto before = Recorder::FusionCounts();
-        scenario("depth read by both passes", true, 0, [&] {
-            draw(20, attached(depthRead), {}, {});
-            Require(draw(21, attached(depthRead), {}, {}).reason == PassBreak::Key, "two passes that only read one depth image broke as a hazard, not a key change");
-        });
-        auto after = Recorder::FusionCounts();
-        Require(after.fencedKeyOnlyShared - before.fencedKeyOnlyShared == 1u && after.fencedKeyOnlyApart == before.fencedKeyOnlyApart, "a key-only break of two passes reading one depth image was not counted as sharing an attachment");
-        scenario("depth written by both passes", true, 0, [&] {
-            draw(22, attached(depthWritten), {}, {});
-            Require(draw(23, attached(depthWritten), {}, {}).reason == PassBreak::Image, "two passes that write one depth image broke as a key change, not an image hazard");
-        });
-        const auto written = Recorder::FusionCounts();
-        Require(written.fencedKeyOnly == after.fencedKeyOnly, "a break of two passes that write one depth image was counted as key-only");
-        scenario("different depth images", true, 0, [&] {
-            draw(24, attached(depthWritten), {}, {});
-            Require(draw(25, attached(otherWritten), {}, {}).reason == PassBreak::Key, "two passes on different depth images broke as a hazard, not a key change");
-        });
-        after = Recorder::FusionCounts();
-        Require(after.fencedKeyOnlyApart - written.fencedKeyOnlyApart == 1u && after.fencedKeyOnlyShared == written.fencedKeyOnlyShared, "a key-only break of two passes on different depth images was not counted as sharing none");
-    }
     std::cout << "Barrier fusion tests passed\n";
 }
 

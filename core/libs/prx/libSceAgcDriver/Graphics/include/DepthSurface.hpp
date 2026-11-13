@@ -24,7 +24,6 @@ bool DepthTargetOverlaps(const DepthTarget& target, std::uint64_t address, std::
 const char* DepthPlanesObligation(VkDevice device, std::uint64_t address, std::uint64_t bytes);
 const char* DepthTargetObligation(const Context& context, const DepthTarget& target, bool depthWritten);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
-VkImage DepthSurfaceImage(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope = DepthPlaneScope::Overlapped);

@@ -3631,14 +3631,6 @@ SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTar
     throw std::runtime_error("AGC graphics: the multisampled depth surface whose samples are put in the guest's order is not resident");
 }
 
-VkImage DepthSurfaceImage(const Context& context, const DepthTarget& target) {
-    std::unique_lock lock(surfacesMutex());
-    for (const auto& candidate : surfaces()) {
-        if (candidate->active->load(std::memory_order_acquire) && candidate->context.device == context.device && holdsTarget(candidate->target, target)) return candidate->image;
-    }
-    return VK_NULL_HANDLE;
-}
-
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::unique_lock lock(surfacesMutex());
