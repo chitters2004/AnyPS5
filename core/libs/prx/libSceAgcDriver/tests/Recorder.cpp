@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
@@ -4971,6 +4972,64 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
                 Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "snapshot update changed an image descriptor");
             }
         }
+        snapshots.Sync();
+    }
+    recorder.Activate();
+}
+
+void drawSetCountTests(const Device& device, Recorder& recorder) {
+    const bool counted = DrawSetCountsProfiled();
+    auto context = device.GetContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(data);
+        data.binding = 7;
+        program.bindings.push_back(data);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        TakeDrawSetCounts();
+        const std::array<std::uint32_t, 8> words{5, 6, 7, 8, 9, 10, 11, 12};
+        const std::vector<std::uint32_t> large((Recorder::DrawUploadChunk + 16) / sizeof(std::uint32_t), 13u);
+        const ShaderResources::MovedBuffer small{0, 0, 16, std::span(words).first(4)};
+        const ShaderResources::MovedBuffer wide{0, 0, 32, words};
+        const std::array<ShaderResources::MovedBuffer, 2> both{wide, ShaderResources::MovedBuffer{1, 0, large.size() * sizeof(std::uint32_t), large}};
+        Require(resources.PrepareDrawBindings(snapshots, std::span(&small, 1)) != nullptr, "the first counted draw made no draw sets");
+        Require(resources.PrepareDrawBindings(snapshots, std::span(&small, 1)) != nullptr, "the second counted draw made no draw sets");
+        Require(resources.PrepareDrawBindings(snapshots, std::span(&wide, 1)) != nullptr, "the widened counted draw made no draw sets");
+        const auto last = resources.PrepareDrawBindings(snapshots, both);
+        Require(last != nullptr && last->snapshots.size() == 2, "the last counted draw did not snapshot both buffers");
+        const auto counts = TakeDrawSetCounts();
+        const auto expect = [&](std::uint64_t actual, std::uint64_t expected, const char* what) {
+            if (actual == (counted ? expected : 0u)) return;
+            std::cerr << what << ": " << actual << " (expected " << (counted ? expected : 0u) << ")\n";
+            Require(false, "draw set counts disagree with the scripted draws");
+        };
+        expect(counts.draws, 4, "draws");
+        expect(counts.dynamicElements, 8, "dynamic elements");
+        expect(counts.overEight, 0, "draws over 8");
+        expect(counts.overSixteen, 0, "draws over 16");
+        expect(counts.patched, 5, "patched elements");
+        expect(counts.rangeCompares, 6, "range compares");
+        expect(counts.rangeChanges, 2, "range changes");
+        expect(counts.rangeChangeDraws, 2, "draws with a range change");
+        expect(counts.ringSnapshots, 4, "ring snapshots");
+        expect(counts.otherSnapshots, 1, "other snapshots");
+        expect(counts.otherDraws, 1, "draws with other snapshots");
+        expect(counts.ringBuffers, 4, "ring buffers");
+        expect(counts.multiRingDraws, 0, "draws with several ring buffers");
+        expect(counts.uploadChunks, 2, "upload chunks");
+        expect(counts.reboundDraws, 0, "rebound draws");
+        expect(counts.faultDraws, 0, "fault draws");
         snapshots.Sync();
     }
     recorder.Activate();
@@ -16782,6 +16841,11 @@ int main(int argc, char** argv) {
             multisampleGuestAccessTests(device, recorder);
             oneFragmentFmaskGuardTests(device);
             fmaskDecompressMsaaTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-set-counts-only") {
+            drawSetCountTests(device, recorder);
+            std::cout << "Draw set counts passed (" << (DrawSetCountsProfiled() ? "counted" : "off") << ")\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {

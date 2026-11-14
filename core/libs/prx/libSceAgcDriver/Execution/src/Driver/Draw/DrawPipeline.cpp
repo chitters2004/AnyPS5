@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -411,7 +412,7 @@ void DrawPipeline::enqueue(Item item) {
         wake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats && !Graphics::EpochProofCountsProfiled() && !GuestMemory::ScopedProofsProfiled()) return;
+    if (!profile && !stats && !Graphics::EpochProofCountsProfiled() && !GuestMemory::ScopedProofsProfiled() && !Graphics::DrawSetCountsProfiled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     if (profile || stats) {
@@ -419,8 +420,9 @@ void DrawPipeline::enqueue(Item item) {
     } else {
         lastReport = now;
     }
-    Graphics::ReportEpochProofCounts();
+    if (profile || stats || Graphics::EpochProofCountsProfiled()) Graphics::ReportEpochProofCounts();
     if (GuestMemory::ScopedProofsProfiled()) Graphics::ReportScopedProofCounts();
+    if (Graphics::DrawSetCountsProfiled()) Graphics::ReportDrawSetCounts();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {

@@ -7,6 +7,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -3474,6 +3475,7 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
         drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         offset = 0;
+        if (DrawSetCountsProfiled()) DrawSetCountTallies().uploadChunks.Add();
     }
     drawUploadUsed = offset + bytes;
     return {drawUpload, offset, drawUpload->Bytes().data() + offset};

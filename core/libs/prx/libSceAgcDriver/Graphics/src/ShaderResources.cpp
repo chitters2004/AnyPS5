@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
@@ -4128,6 +4129,46 @@ void ReportEpochProofCounts() {
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s, proofs %s): resource proofs reused %llu, proved %llu; storage refreshes reused %llu; address spaces reused %llu, refreshed %llu\n", ShaderResources::EpochProofs() ? "on" : "off", static_cast<unsigned long long>(counts.resourceReuses.Take()), static_cast<unsigned long long>(counts.resourceProofs.Take()), static_cast<unsigned long long>(counts.storageReuses.Take()), static_cast<unsigned long long>(counts.mirrorReuses.Take()), static_cast<unsigned long long>(counts.mirrorRefreshes.Take()));
 }
 
+DrawSetCounters& DrawSetCountTallies() {
+    static DrawSetCounters counters;
+    return counters;
+}
+
+bool DrawSetCountsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW_SETS") != nullptr;
+    return profiled;
+}
+
+DrawSetCounts TakeDrawSetCounts() {
+    auto& tallies = DrawSetCountTallies();
+    DrawSetCounts counts;
+    counts.draws = tallies.draws.Take();
+    counts.dynamicElements = tallies.dynamicElements.Take();
+    counts.overEight = tallies.overEight.Take();
+    counts.overSixteen = tallies.overSixteen.Take();
+    counts.patched = tallies.patched.Take();
+    counts.rangeCompares = tallies.rangeCompares.Take();
+    counts.rangeChanges = tallies.rangeChanges.Take();
+    counts.rangeChangeDraws = tallies.rangeChangeDraws.Take();
+    counts.ringSnapshots = tallies.ringSnapshots.Take();
+    counts.otherSnapshots = tallies.otherSnapshots.Take();
+    counts.otherDraws = tallies.otherDraws.Take();
+    counts.ringBuffers = tallies.ringBuffers.Take();
+    counts.multiRingDraws = tallies.multiRingDraws.Take();
+    counts.reboundDraws = tallies.reboundDraws.Take();
+    counts.faultDraws = tallies.faultDraws.Take();
+    counts.uploadChunks = tallies.uploadChunks.Take();
+    return counts;
+}
+
+void ReportDrawSetCounts() {
+    const auto counts = TakeDrawSetCounts();
+    const auto perDraw = [&](std::uint64_t value) { return counts.draws == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(counts.draws); };
+    const auto percent = [](std::uint64_t part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole); };
+    const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-sets] (10 s): %llu draws; dynamic elements %.2f per draw, %llu draws over 8, %llu over 16; %.2f patched per draw; ranges %llu compared, %llu changed (%.2f%%), %llu draws with a change (%.2f%%); snapshots %llu ring, %llu other in %llu draws; ring buffers %.2f per draw, %llu draws with more than one; %llu upload chunks; %llu rebound draws, %llu fault draws\n", count(counts.draws), perDraw(counts.dynamicElements), count(counts.overEight), count(counts.overSixteen), perDraw(counts.patched), count(counts.rangeCompares), count(counts.rangeChanges), percent(counts.rangeChanges, counts.rangeCompares), count(counts.rangeChangeDraws), percent(counts.rangeChangeDraws, counts.draws), count(counts.ringSnapshots), count(counts.otherSnapshots), count(counts.otherDraws), perDraw(counts.ringBuffers), count(counts.multiRingDraws), count(counts.uploadChunks), count(counts.reboundDraws), count(counts.faultDraws));
+}
+
 namespace {
 void noteEpochProof(bool reused, bool verified, bool failed) {
     (reused ? EpochProofCounts().resourceReuses : EpochProofCounts().resourceProofs).Add();
@@ -7200,6 +7241,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
+    const bool counted = DrawSetCountsProfiled();
+    thread_local std::vector<const Buffer*>* ringSlot = nullptr;
+    auto& ring = ShaderRecompiler::ThreadOwned(ringSlot);
+    ring.clear();
+    std::uint64_t other = 0;
+    const auto classify = [&](const Buffer* buffer, bool pooled) {
+        if (!counted) return;
+        if (!pooled) {
+            ++other;
+            return;
+        }
+        if (std::find(ring.begin(), ring.end(), buffer) == ring.end()) ring.push_back(buffer);
+    };
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
         if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
         result->snapshots.push_back(std::move(snapshot));
@@ -7214,6 +7268,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < override->size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
+            classify(slice.buffer.get(), override->size <= Recorder::DrawUploadChunk);
             keep({0, std::move(slice.buffer), slice.offset, override->size});
             continue;
         }
@@ -7267,18 +7322,31 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
         }
         selected.push_back(index);
+        classify(buffer.get(), bytes != 0 && bytes <= uploadLimit);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
-    writeDrawSets(*result, selected, faultRecord);
+    if (counted) {
+        auto& tallies = DrawSetCountTallies();
+        tallies.draws.Add();
+        tallies.patched.Add(selected.size());
+        tallies.ringSnapshots.Add(selected.size() - other);
+        tallies.otherSnapshots.Add(other);
+        if (other != 0) tallies.otherDraws.Add();
+        tallies.ringBuffers.Add(ring.size());
+        if (ring.size() > 1) tallies.multiRingDraws.Add();
+        if (rebound) tallies.reboundDraws.Add();
+        if (faultRecord != nullptr) tallies.faultDraws.Add();
+    }
+    writeDrawSets(*result, selected, faultRecord, counted);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     return result;
 }
 
-void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool counted) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
@@ -7321,6 +7389,9 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
     auto& snapshotIndices = ShaderRecompiler::ThreadOwned(indicesSlot);
     snapshotIndices.assign(allocations.size(), selected.size());
     for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
+    thread_local std::vector<VkDeviceSize>* rangesSlot = nullptr;
+    auto& ranges = ShaderRecompiler::ThreadOwned(rangesSlot);
+    ranges.clear();
     auto nextWrite = writes.begin();
     for (const auto& binding : bindings) {
         const auto original = setOf(binding) == 0 ? _set : fragment.set;
@@ -7332,13 +7403,16 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
             write.pBufferInfo = buffers.data() + offset;
             for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
-                if (snapshotIndex == selected.size()) continue;
-                const auto& snapshot = result.snapshots[snapshotIndex];
-                buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+                if (snapshotIndex != selected.size()) {
+                    const auto& snapshot = result.snapshots[snapshotIndex];
+                    buffers[offset + element] = wholeDwordRange({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+                }
+                if (counted) ranges.push_back(buffers[offset + element].range);
             }
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    if (counted) countDrawSetRanges(ranges);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
@@ -7363,6 +7437,23 @@ std::shared_ptr<ShaderResources::DrawUse> ShaderResources::BeginDrawUse(Recorder
 
 void ShaderResources::CompleteDrawUse(const DrawUse& use) const {
     if (bda != nullptr) bda->CheckUse(use.record.get());
+}
+
+void ShaderResources::countDrawSetRanges(std::span<const VkDeviceSize> ranges) const {
+    auto& tallies = DrawSetCountTallies();
+    tallies.dynamicElements.Add(ranges.size());
+    if (ranges.size() > 8) tallies.overEight.Add();
+    if (ranges.size() > 16) tallies.overSixteen.Add();
+    thread_local std::unordered_map<const ShaderResources*, std::vector<VkDeviceSize>>* historySlot = nullptr;
+    auto& previous = ShaderRecompiler::ThreadOwned(historySlot)[this];
+    if (previous.size() == ranges.size()) {
+        std::uint64_t changes = 0;
+        for (std::size_t element = 0; element < ranges.size(); ++element) changes += previous[element] != ranges[element] ? 1 : 0;
+        tallies.rangeCompares.Add(ranges.size());
+        tallies.rangeChanges.Add(changes);
+        if (changes != 0) tallies.rangeChangeDraws.Add();
+    }
+    previous.assign(ranges.begin(), ranges.end());
 }
 
 void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const {
