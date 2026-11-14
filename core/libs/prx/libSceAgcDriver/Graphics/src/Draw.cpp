@@ -3429,7 +3429,7 @@ constexpr std::array<const char*, static_cast<std::size_t>(TargetMemoEvent::Coun
     "lookup", "hit", "overlap cached", "overlap computed", "accept", "accept without depth", "depth hit", "avoided refresh lookups",
     "invalid", "thread changed", "descriptor", "resident gone", "resident evicted", "depth overlap", "metadata",
     "epoch", "proofs", "pending", "unwatch", "allocations", "surfaces", "released", "claims", "recorder", "device",
-    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked"
+    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked", "proofs or pending only"
 };
 
 std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count)>& targetMemoEvents() {
@@ -3479,6 +3479,10 @@ bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     note(before.claims != after.claims, TargetMemoEvent::Claims);
     note(before.recorder != after.recorder, TargetMemoEvent::Recorder);
     note(before.device != after.device, TargetMemoEvent::Device);
+    auto rest = after;
+    rest.proofs = before.proofs;
+    rest.pending = before.pending;
+    note(rest == before, TargetMemoEvent::ProofsOrPendingOnly);
     return false;
 }
 

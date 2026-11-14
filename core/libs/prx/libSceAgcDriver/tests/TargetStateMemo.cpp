@@ -1031,6 +1031,7 @@ void colorMemoProofBreak(AgcDriver::VulkanDevice& device) {
     const MemoEvents events;
     mustLookUp(device, color, {.scissor = Right, .depth = depth, .compare = VK_COMPARE_OP_ALWAYS}, "a proof break allowed color reuse while depth fell back");
     requireMemoEvent(events, TargetMemoEvent::Proofs, memoServes() && memoCounted() ? 1u : 0u, "an explicit proof break");
+    requireMemoEvent(events, TargetMemoEvent::ProofsOrPendingOnly, memoServes() && memoCounted() ? 1u : 0u, "an explicit proof break");
     requireMemoEvent(events, TargetMemoEvent::Hit, 0u, "an explicit proof break");
     expect(device, color, [](std::uint32_t x) { return x < LeftWidth || x >= Width - LeftWidth ? Drawn : Old; }, "proof-break fallback");
 }

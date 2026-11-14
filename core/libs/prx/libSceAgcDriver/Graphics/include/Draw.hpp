@@ -197,7 +197,7 @@ enum class TargetMemoEvent : std::uint8_t {
     Lookup, Hit, OverlapCached, OverlapComputed, Accept, AcceptWithDepthMiss, DepthHit, AvoidedRefreshLookups,
     Invalid, ThreadChanged, Descriptor, ResidentGone, ResidentEvicted, DepthOverlap, Metadata,
     Epoch, Proofs, Pending, Unwatch, Allocations, Surfaces, Released, Claims, Recorder, Device,
-    PostDepthInvalidated, DepthFallback, Admission, RecipeInvalidated, Build, VerifyChecked, Count
+    PostDepthInvalidated, DepthFallback, Admission, RecipeInvalidated, Build, VerifyChecked, ProofsOrPendingOnly, Count
 };
 std::uint64_t TargetMemoEvents(TargetMemoEvent event);
 const char* TargetMemoEventName(TargetMemoEvent event);
