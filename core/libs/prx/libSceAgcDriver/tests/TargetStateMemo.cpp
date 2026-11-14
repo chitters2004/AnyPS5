@@ -1314,6 +1314,195 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
+bool tierRuns() {
+    static const bool runs = DrawPipelineEnabled() && std::getenv("APS5_NO_TARGET_MEMO") == nullptr && std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr;
+    return runs && !RuntimeSwitches::Set(RuntimeSwitch::NoTargetResolutionTier);
+}
+
+void mustResolve(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, const std::string& what) {
+    const auto before = TargetResolutionHitsForTest();
+    draw(device, color, options);
+    Require(!tierRuns() || TargetResolutionHitsForTest() == before + 1, what);
+}
+
+void mustNotResolve(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, const std::string& what) {
+    const auto before = TargetResolutionHitsForTest();
+    draw(device, color, options);
+    Require(TargetResolutionHitsForTest() == before, what);
+}
+
+void flushTarget(AgcDriver::VulkanDevice& device, const ColorTarget& color) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "test");
+    device.WaitIdle();
+}
+
+void tierRefresh(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    AgcDriver::GuestMemory::BreakProofs();
+    mustResolve(device, color, {.scissor = Right}, "a draw whose targets only lost their content proof did not take the resolution tier");
+    expect(device, color, [](std::uint32_t x) { return x < LeftWidth || x >= Width - LeftWidth ? Drawn : Old; }, "a resolved target lost a draw");
+    reset(device, color);
+    arm(device, color);
+    flushTarget(device, color);
+    std::vector<std::byte> texels(PlaneBytes);
+    for (std::size_t offset = 0; offset < texels.size(); offset += 4) std::memcpy(texels.data() + offset, &New, 4);
+    AgcDriver::GuestMemory::Write(color.address, texels);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    mustResolve(device, color, {.scissor = Right}, "a draw after a CPU write to its target did not take the resolution tier");
+    expect(device, color, [](std::uint32_t x) { return x >= Width - LeftWidth ? Drawn : New; }, "a resolved target missed a CPU write");
+}
+
+void tierForeignMetadata(AgcDriver::VulkanDevice& device) {
+    auto* followed = allocateWatched(Keys.size());
+    auto* named = allocateWatched(Keys.size());
+    std::memset(followed, 0xff, Keys.size());
+    std::memset(named, 0xff, Keys.size());
+    auto first = colorTarget(true);
+    first.dccAddress = address(followed);
+    auto second = first;
+    second.dccAddress = address(named);
+    reset(device, first);
+    arm(device, first);
+    const auto resident = StorageTexture::FindLive(first.address, first.bytes);
+    Require(resident != nullptr && resident->Descriptor().dccAddress == first.dccAddress, "the fixture's image does not follow the first metadata");
+    arm(device, second);
+    Require(StorageTexture::FindLive(second.address, second.bytes) == resident && resident->Cached(), "the fixture's image does not serve the second metadata");
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, second, {.scissor = Right}, "a target naming metadata its image does not follow took the resolution tier");
+    std::memset(named, 0x20, Keys.size());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    mustNotResolve(device, second, {.scissor = Right}, "a target whose named metadata was cleared took the resolution tier");
+    std::memset(named, 0xff, Keys.size());
+}
+
+void tierClearedCache(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    const auto resident = StorageTexture::FindLive(color.address, color.bytes);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        ClearCachedTextures(device.Device());
+    }
+    Require(resident != nullptr && !resident->Cached(), "clearing the cache kept the resolved image");
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "an image cleared from the storage cache took the resolution tier");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a draw after the storage cache was cleared");
+}
+
+void tierChainGrowth(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    const auto resident = StorageTexture::FindLive(color.address, color.bytes);
+    const auto chains = ExtendedChainsGeneration();
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        auto grown = SurfaceForTarget(color);
+        grown.allocatedMipCount = grown.mipCount;
+        grown.mipCount += 1;
+        Require(RepeatStorageSurface(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), grown, resident) == nullptr, "a grown chain repeated the image of the shorter one");
+    }
+    Require(ExtendedChainsGeneration() != chains, "growing the surface's mip chain did not move the chain generation");
+    Require(resident != nullptr && resident->Cached(), "growing the mip chain evicted the resolved image, so the case does not isolate the chain generation");
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "a target whose surface's mip chain grew took the resolution tier");
+    Require(StorageTexture::FindLive(color.address, color.bytes) != resident, "the draw after the chain grew kept the shorter chain's image");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a draw after the mip chain grew");
+}
+
+void tierStaleDepthPlane(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    const auto disjoint = depthTarget(true);
+    auto onSurface = disjoint;
+    onSurface.address = color.address;
+    Require(DepthTargetOverlaps(onSurface, color.address, color.bytes), "the depth plane does not overlap the color");
+    draw(device, color, {.depth = onSurface, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
+    reset(device, color);
+    const DrawOptions armed{.depth = disjoint, .compare = VK_COMPARE_OP_ALWAYS};
+    arm(device, color, armed);
+    const ProofFields before;
+    AgcDriver::GuestMemory::BreakProofs();
+    requireMoved(before, "proofs", "breaking proofs over a memo armed beside a known plane");
+    mustNotResolve(device, color, {.depth = onSurface, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS, .depthValue = 0.25f}, "a target under a depth plane written over it took the resolution tier");
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, armed, "a target after a depth plane was written over it took the resolution tier");
+}
+
+void tierArrayTarget(AgcDriver::VulkanDevice& device) {
+    auto color = colorTarget();
+    color.address = color.surfaceAddress = color.arrayAddress = address(OuterStorage.data());
+    color.arrayLastSlice = 1;
+    color.layers = 1;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        StorageTexture::FlushPending(color.address, OuterStorage.size(), nullptr, "test");
+        device.WaitIdle();
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    arm(device, color);
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "an array target took the resolution tier instead of refreshing its layers");
+}
+
+void tierSlotReuse(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    std::weak_ptr<StorageTexture> old = StorageTexture::FindLive(color.address, color.bytes);
+    std::shared_ptr<StorageTexture> fresh;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        ClearCachedTextures(device.Device());
+        device.WaitIdle();
+        fresh = CachedStorageSurface(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), SurfaceForTarget(color));
+    }
+    const auto previous = old.lock();
+    Require(fresh != nullptr && fresh != previous && fresh->Cached() && (previous == nullptr || !previous->Cached()), "the surface's image was not replaced");
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "a replaced image took the resolution tier");
+    Require(StorageTexture::FindLive(color.address, color.bytes) == fresh, "the draw after the replacement did not use the cache's image");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a draw after its image was replaced");
+}
+
+void tierCrossThreadRetirement(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    arm(device, color);
+    std::thread([&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        ClearCachedTextures(device.Device());
+    }).join();
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "an image retired on another thread took the resolution tier");
+    arm(device, color);
+    auto other = colorTarget();
+    other.address = other.surfaceAddress = address(SourceStorage.data());
+    std::thread([&] {
+        AgcDriver::GuestMemory::MarkProofThread();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        draw(device, other);
+    }).join();
+    AgcDriver::GuestMemory::BreakProofs();
+    mustNotResolve(device, color, {}, "a target resolved before another thread took over the memo took the resolution tier");
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a draw after another thread retired its image");
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 8> TierScenarios{{
+    {"refresh", tierRefresh},
+    {"foreign-dcc", tierForeignMetadata},
+    {"cleared-cache", tierClearedCache},
+    {"chain-growth", tierChainGrowth},
+    {"stale-depth-plane", tierStaleDepthPlane},
+    {"array", tierArrayTarget},
+    {"slot-reuse", tierSlotReuse},
+    {"cross-thread", tierCrossThreadRetirement}
+}};
+
 const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 13> R3Scenarios{{
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
@@ -1398,7 +1587,16 @@ int main(int argc, char** argv) {
         }
         AgcDriver::GuestMemory::MarkProofThread();
         AgcDriver::GuestMemory::BumpCollectEpoch();
-        if (argc == 3 && std::string(argv[1]) == "--r3") {
+        if (argc == 3 && std::string(argv[1]) == "--tier") {
+            bool found = false;
+            for (const auto& [name, scenario] : TierScenarios) {
+                if (std::string(argv[2]) != name) continue;
+                found = true;
+                std::cout << name << '\n' << std::flush;
+                scenario(*device);
+            }
+            Require(found, "unknown resolution tier scenario");
+        } else if (argc == 3 && std::string(argv[1]) == "--r3") {
             bool found = false;
             for (const auto& [name, scenario] : R3Scenarios) {
                 if (std::string(argv[2]) != name) continue;

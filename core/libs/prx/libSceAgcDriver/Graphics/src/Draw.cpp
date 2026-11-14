@@ -3289,9 +3289,13 @@ struct TargetProof {
     std::uint64_t surfaces = 0;
     std::uint64_t released = 0;
     std::uint64_t claims = 0;
+    std::uint64_t chains = 0;
     const Recorder* recorder = nullptr;
     VkDevice device = VK_NULL_HANDLE;
     bool operator==(const TargetProof&) const = default;
+    bool Resolves(const TargetProof& other) const {
+        return unwatch == other.unwatch && allocations == other.allocations && surfaces == other.surfaces && released == other.released && claims == other.claims && chains == other.chains && recorder == other.recorder && device == other.device;
+    }
     const char* MovedBefore(const TargetProof& after) const {
         if (epoch != after.epoch) return "epoch";
         if (surfaces != after.surfaces) return "surfaces";
@@ -3300,13 +3304,13 @@ struct TargetProof {
 };
 
 TargetProof currentTargetProof(const Context& context) {
-    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), MultisampleClaimSerial(), Recorder::Active(), context.device};
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), MultisampleClaimSerial(), ExtendedChainsGeneration(), Recorder::Active(), context.device};
 }
 
 enum class ColorMemoEvent {
     Accept, AcceptWithDepthMiss, Invalid, Descriptor, Resident, DepthOverlap,
-    Epoch, Proofs, Pending, Unwatch, Allocations, Surfaces, Released, Claims, Recorder, Device, Metadata,
-    PostDepthInvalidated, DepthFallback, AvoidedRefreshLookups, Count
+    Epoch, Proofs, Pending, Unwatch, Allocations, Surfaces, Released, Claims, Chains, Recorder, Device, Metadata,
+    PostDepthInvalidated, DepthFallback, AvoidedRefreshLookups, Resolved, ResolutionInvalidated, Count
 };
 
 struct DepthFootprint {
@@ -3344,6 +3348,7 @@ struct ColorMemo {
         VkImageView view = VK_NULL_HANDLE;
     };
     bool valid = false;
+    bool resolved = false;
     TargetProof proof;
     std::vector<ColorTarget> descriptors;
     std::vector<Attachment> attachments;
@@ -3361,6 +3366,7 @@ struct TargetMemo {
     DepthMemo depth;
     void Invalidate() {
         colors.valid = false;
+        colors.resolved = false;
         depth.valid = false;
     }
 };
@@ -3380,8 +3386,8 @@ void noteColorMemo(ColorMemoEvent event, std::uint64_t count = 1) {
         "ColorMemo.Miss.Descriptor", "ColorMemo.Miss.Resident", "ColorMemo.Miss.DepthOverlap",
         "ColorMemo.Miss.Epoch", "ColorMemo.Miss.Proofs", "ColorMemo.Miss.Pending",
         "ColorMemo.Miss.Unwatch", "ColorMemo.Miss.Allocations", "ColorMemo.Miss.Surfaces",
-        "ColorMemo.Miss.Released", "ColorMemo.Miss.Claims", "ColorMemo.Miss.Recorder", "ColorMemo.Miss.Device", "ColorMemo.Miss.Metadata",
-        "ColorMemo.PostDepthInvalidated", "DepthMemo.Fallback", "ColorMemo.AvoidedRefreshLookups"
+        "ColorMemo.Miss.Released", "ColorMemo.Miss.Claims", "ColorMemo.Miss.Chains", "ColorMemo.Miss.Recorder", "ColorMemo.Miss.Device", "ColorMemo.Miss.Metadata",
+        "ColorMemo.PostDepthInvalidated", "DepthMemo.Fallback", "ColorMemo.AvoidedRefreshLookups", "ColorMemo.Resolved", "ColorMemo.ResolutionInvalidated"
     };
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ColorMemoEvent::Count)> counts{};
     const auto index = static_cast<std::size_t>(event);
@@ -3400,6 +3406,7 @@ bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     note(before.surfaces != after.surfaces, ColorMemoEvent::Surfaces);
     note(before.released != after.released, ColorMemoEvent::Released);
     note(before.claims != after.claims, ColorMemoEvent::Claims);
+    note(before.chains != after.chains, ColorMemoEvent::Chains);
     note(before.recorder != after.recorder, ColorMemoEvent::Recorder);
     note(before.device != after.device, ColorMemoEvent::Device);
     return false;
@@ -3434,22 +3441,37 @@ bool metadataProved(const ColorTarget& color) {
     return proved;
 }
 
-void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
+bool TargetResolutionTierEnabled() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoTargetResolutionTier);
+}
+
+bool resolvable(const TargetBinding& binding) {
+    const auto& color = binding.color;
+    if (color.arrayLastSlice != 0 || (!binding.gpuTiling && ColorTileModeIsLinear(color.tileMode))) return false;
+    const auto requested = SurfaceForTarget(color).dccAddress;
+    return requested == 0 || requested == binding.resident->Descriptor().dccAddress;
+}
+
+void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof, bool contentStable) {
     ++targetMemoBuilds;
     auto& colors = ThreadTargetMemo().colors;
     auto& depth = ThreadTargetMemo().depth;
     const bool enabled = TargetMemoEnabled() && proof.epoch != 0;
-    colors.valid = enabled && !targets.empty() && std::ranges::all_of(targets, [&](const TargetBinding& binding) {
-        return binding.resident != nullptr && binding.resident->Cached() && !binding.multisampled && binding.color.fmaskAddress == 0 && !colorOverlapsDepth(state, binding) && metadataProved(binding.color);
-    });
-    if (colors.valid) {
+    const auto attachable = [&](const TargetBinding& binding) {
+        return binding.resident != nullptr && binding.resident->Cached() && !binding.multisampled && binding.color.fmaskAddress == 0 && !colorOverlapsDepth(state, binding);
+    };
+    const bool attachables = enabled && !targets.empty() && std::ranges::all_of(targets, attachable);
+    const bool proved = attachables && std::ranges::all_of(targets, [](const TargetBinding& binding) { return metadataProved(binding.color); });
+    colors.valid = proved && contentStable;
+    colors.resolved = proved && TargetResolutionTierEnabled() && std::ranges::all_of(targets, resolvable);
+    if (colors.valid || colors.resolved) {
         colors.proof = proof;
         colors.clearOfDepth = depthFootprint(state.depth);
         colors.descriptors.assign(state.colors.begin(), state.colors.end());
         colors.attachments.resize(targets.size());
         for (std::size_t index = 0; index < targets.size(); ++index) colors.attachments[index] = {targets[index].resident, targets[index].proxied, views[index]};
     }
-    depth.valid = enabled && (!state.depth || state.depth->samples == 1u);
+    depth.valid = enabled && contentStable && (!state.depth || state.depth->samples == 1u);
     if (depth.valid) {
         depth.proof = proof;
         depth.descriptor = state.depth;
@@ -3462,11 +3484,11 @@ void reportColorMemo(ColorMemoCounts& counts) {
     counts.reported = now;
     using Event = ColorMemoEvent;
     const auto at = [&](Event event) { return static_cast<unsigned long long>(counts.events[static_cast<std::size_t>(event)]); };
-    AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (cumulative, this thread): %llu hits (%llu with the depth overlap known, %llu computed), %llu accepted by the draw (%llu without a repeated depth); misses: invalid %llu, proofs %llu (epoch %llu, proofs %llu, pending %llu, unwatch %llu, allocations %llu, surfaces %llu, released %llu, claims %llu, recorder %llu, device %llu), descriptor %llu, resident %llu, depth overlap %llu, metadata %llu; after the hit: depth fallback %llu, invalidated %llu\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (cumulative, this thread): %llu hits (%llu with the depth overlap known, %llu computed), %llu accepted by the draw (%llu without a repeated depth); misses: invalid %llu, proofs %llu (epoch %llu, proofs %llu, pending %llu, unwatch %llu, allocations %llu, surfaces %llu, released %llu, claims %llu, recorder %llu, device %llu), descriptor %llu, resident %llu, depth overlap %llu, metadata %llu; after the hit: depth fallback %llu, invalidated %llu; resolution tier: hits %llu, invalidated after depth %llu, chains misses %llu\n",
         static_cast<unsigned long long>(counts.hits), static_cast<unsigned long long>(counts.overlapsCached), static_cast<unsigned long long>(counts.overlapsComputed), at(Event::Accept), at(Event::AcceptWithDepthMiss),
         at(Event::Invalid), at(Event::Epoch) + at(Event::Proofs) + at(Event::Pending) + at(Event::Unwatch) + at(Event::Allocations) + at(Event::Surfaces) + at(Event::Released) + at(Event::Claims) + at(Event::Recorder) + at(Event::Device),
         at(Event::Epoch), at(Event::Proofs), at(Event::Pending), at(Event::Unwatch), at(Event::Allocations), at(Event::Surfaces), at(Event::Released), at(Event::Claims), at(Event::Recorder), at(Event::Device),
-        at(Event::Descriptor), at(Event::Resident), at(Event::DepthOverlap), at(Event::Metadata), at(Event::DepthFallback), at(Event::PostDepthInvalidated));
+        at(Event::Descriptor), at(Event::Resident), at(Event::DepthOverlap), at(Event::Metadata), at(Event::DepthFallback), at(Event::PostDepthInvalidated), at(Event::Resolved), at(Event::ResolutionInvalidated), at(Event::Chains));
 }
 
 bool repeatColors(const Context& context, const State& state, const TargetProof& proof, std::vector<TargetBinding>& targets, std::vector<VkImageView>& views) {
@@ -3737,7 +3759,48 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             targetViews.push_back(binding.target->View());
         }
     };
-    if (!repeatedColors) prepareColors();
+    const auto resolveColors = [&] {
+        auto& memo = ThreadTargetMemo().colors;
+        if (!memo.resolved || !TargetResolutionTierEnabled() || state.colors.empty() || !memo.proof.Resolves(targetProof) || memo.descriptors != state.colors) return false;
+        const auto footprint = depthFootprint(state.depth);
+        const bool overlapKnown = footprint == memo.clearOfDepth;
+        targets.clear();
+        targets.resize(state.colors.size());
+        targetsUsed = true;
+        for (std::size_t index = 0; index < targets.size(); ++index) {
+            auto& binding = targets[index];
+            binding.resident = memo.attachments[index].resident.lock();
+            if (binding.resident == nullptr || !binding.resident->Cached()) return false;
+            binding.color = state.colors[index];
+            binding.gpuTiling = binding.color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+            if (!overlapKnown && colorOverlapsDepth(state, binding)) return false;
+        }
+        targetViews.clear();
+        for (auto& binding : targets) {
+            const auto& color = binding.color;
+            timer.phase(PhaseSetup);
+            static_cast<void>(FlushDepthPlanes(color.address, ColorTargetLayout(color.extent.width, color.extent.height, color.tileMode, color.elementBytes).Bytes(), DepthPlaneScope::Whole));
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
+            const auto resident = binding.resident;
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+                resident->Refresh();
+                return resident;
+            });
+            if (binding.resident == nullptr) return false;
+            binding.resident->NoteUsed();
+            timer.phase(PhaseReadTarget);
+            binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
+            targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+        }
+        memo.clearOfDepth = footprint;
+        return true;
+    };
+    bool resolvedColors = false;
+    if (memoActive && !repeatedColors) {
+        resolvedColors = resolveColors();
+        if (resolvedColors) noteColorMemo(ColorMemoEvent::Resolved);
+    }
+    if (!repeatedColors && !resolvedColors) prepareColors();
     const auto prepareDepth = [&] {
         noteColorMemo(ColorMemoEvent::DepthFallback);
         return DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
@@ -3748,6 +3811,14 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (repeatedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !colorProofMatches(targetProof, currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.resident->Cached(); }))) {
         noteColorMemo(ColorMemoEvent::PostDepthInvalidated);
         repeatedColors = false;
+        admissionProof = currentTargetProof(context);
+        prepareColors();
+        if (state.depth) depthView = prepareDepth();
+        repeatedDepth = false;
+    }
+    if (resolvedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !targetProof.Resolves(currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.resident->Cached(); }))) {
+        noteColorMemo(ColorMemoEvent::ResolutionInvalidated);
+        resolvedColors = false;
         admissionProof = currentTargetProof(context);
         prepareColors();
         if (state.depth) depthView = prepareDepth();
@@ -3764,14 +3835,14 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         if (!VerifyTargetMemo()) noteColorMemo(ColorMemoEvent::AvoidedRefreshLookups, targets.size());
 #endif
     }
-    if ((repeatedColors || repeatedDepth) && VerifyTargetMemo()) {
+    if ((repeatedColors || resolvedColors || repeatedDepth) && VerifyTargetMemo()) {
         const auto verifyProof = currentTargetProof(context);
         const auto ownProofBreaks = GuestMemory::OwnProofBreaks();
         const auto ownPendingMoves = StorageTexture::OwnPendingMoves();
         const auto ownRefreshWork = StorageTexture::OwnRefreshWork();
-        const auto* owed = targetObligation(context, state, repeatedColors ? std::span<const TargetBinding>(targets) : std::span<const TargetBinding>{}, repeatedDepth);
+        const auto* owed = targetObligation(context, state, repeatedColors || resolvedColors ? std::span<const TargetBinding>(targets) : std::span<const TargetBinding>{}, repeatedDepth);
         Require(owed == nullptr, std::string("APS5_VERIFY_TARGET_MEMO: a repeated target skipped ") + (owed != nullptr ? owed : ""));
-        if (repeatedColors) {
+        if (repeatedColors || resolvedColors) {
             const auto repeatedViews = targetViews;
             std::vector<std::shared_ptr<StorageTexture>> repeatedResidents;
             for (const auto& binding : targets) repeatedResidents.push_back(binding.resident);
@@ -3795,7 +3866,12 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const bool unchanged = retainedOwner && repeatedColors && ThreadTargetMemo().colors.valid &&
             ThreadTargetMemo().colors.proof == preparedProof && unchangedDepth;
         if (admissionProof == preparedProof) {
-            if (!unchanged) rememberTargets(state, targets, targetViews, preparedProof);
+            if (!unchanged) rememberTargets(state, targets, targetViews, preparedProof, true);
+        } else if (TargetResolutionTierEnabled() && retainedOwner && admissionProof.Resolves(preparedProof)) {
+            if (resolvedColors) {
+                ThreadTargetMemo().colors.valid = false;
+                ThreadTargetMemo().depth.valid = false;
+            } else rememberTargets(state, targets, targetViews, preparedProof, false);
         } else ThreadTargetMemo().Invalidate();
     }
     timer.phase(PhasePrepare);
@@ -4785,6 +4861,10 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop) {
 
 std::uint64_t TargetMemoBuildsForTest() {
     return targetMemoBuilds;
+}
+
+std::uint64_t TargetResolutionHitsForTest() {
+    return ThreadTargetMemo().colors.counts.events[static_cast<std::size_t>(ColorMemoEvent::Resolved)];
 }
 
 std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const State& state, std::size_t repeats, std::size_t& hits) {

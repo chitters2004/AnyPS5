@@ -1404,6 +1404,7 @@ struct ExtendedSurfaces {
     AgcDriver::Mutex mutex;
     std::map<std::array<std::uint32_t, 8>, std::uint32_t> levels;
     std::atomic<bool> any{false};
+    std::atomic<std::uint64_t> generation{0};
 };
 
 ExtendedSurfaces& ExtendedChains() {
@@ -1425,7 +1426,10 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
     std::lock_guard lock(surfaces.mutex);
     if (extended) {
         auto& levels = surfaces.levels[identity];
-        levels = std::max(levels, viewed.mipCount);
+        if (viewed.mipCount > levels) {
+            levels = viewed.mipCount;
+            surfaces.generation.fetch_add(1, std::memory_order_release);
+        }
         surfaces.any.store(true, std::memory_order_release);
         surface.mipCount = levels;
     } else if (const auto it = surfaces.levels.find(identity); it != surfaces.levels.end()) {
@@ -1841,6 +1845,10 @@ bool StorageImagesCached(const Context& context, std::span<const StorageTexture*
     return true;
 }
 
+}
+
+std::uint64_t ExtendedChainsGeneration() {
+    return ExtendedChains().generation.load(std::memory_order_acquire);
 }
 
 std::shared_ptr<StorageTexture> CachedStorageSurface(const Context& context, const GuestTextureResource& resource) {
