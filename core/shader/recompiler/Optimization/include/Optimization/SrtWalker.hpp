@@ -109,6 +109,7 @@ struct SrtRuntime {
     SrtMemoryProbe accessible = nullptr;
     SrtMemoryProbe pendingWrite = nullptr;
     SrtMemoryBulkReader readWords = nullptr;
+    SrtMemoryBulkReader readSpan = nullptr;
     SrtMemoryStamper stampWrites = nullptr;
     SrtMemoryUnchanged unchangedSince = nullptr;
     SrtMemorySupplier supplyWords = nullptr;
@@ -117,6 +118,9 @@ struct SrtRuntime {
     SrtImageViewNormalizer normalizeImageView = nullptr;
     SrtImageViewGeneration imageViewGeneration = nullptr;
     SrtSnapshotCurrent snapshotCurrent = nullptr;
+    bool fastCapture = false;
+    bool sizedReadLog = false;
+    bool batchedDescriptorReads = false;
 };
 
 struct SrtForceSyncScope {
