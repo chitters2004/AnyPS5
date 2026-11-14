@@ -1463,7 +1463,20 @@ static WrittenStorage WrittenStorageBytes(const GuestTextureResource& viewed, st
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+std::unique_lock<AgcDriver::Mutex> lockStorageCache(AgcDriver::Mutex& mutex) {
+    if (!LookupOutcomes::Profiled()) return std::unique_lock(mutex);
+    auto& split = ThreadTargetLookupSplit();
+    ++split.cacheLocks;
+    std::unique_lock lock(mutex, std::try_to_lock);
+    if (lock.owns_lock()) return lock;
+    const TargetLookupSpan waited(&TargetLookupSplit::cacheLockWaitNs);
+    lock.lock();
+    ++split.cacheLockWaits;
+    return lock;
+}
+
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, std::uint32_t mip, std::uint64_t guestBytes, bool written, std::optional<std::pair<std::uint32_t, std::uint32_t>> layers) {
+    TargetLookupSpan preparing(&TargetLookupSplit::prepNs);
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (viewed.baseAddress != requested.baseAddress) guestBytes = 0;
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -1495,8 +1508,9 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     auto& cache = StorageTextures();
     std::vector<std::shared_ptr<StorageTexture>> evicted;
     std::shared_ptr<StorageTexture> texture;
+    preparing.Stop();
     {
-        std::lock_guard lock(cache.mutex);
+        const auto lock = lockStorageCache(cache.mutex);
         const CacheHold held(storageCacheHeld);
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
@@ -1850,6 +1864,7 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
 std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled || stored == nullptr) return nullptr;
+    TargetLookupSpan preparing(&TargetLookupSplit::prepNs);
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
     const auto viewedBytes = DescribeSurface(viewed).guestBytes;
@@ -1861,7 +1876,8 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto resource = StorageSurface(context, viewed);
     auto& cache = StorageTextures();
-    std::lock_guard lock(cache.mutex);
+    preparing.Stop();
+    const auto lock = lockStorageCache(cache.mutex);
     const CacheHold held(storageCacheHeld);
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());

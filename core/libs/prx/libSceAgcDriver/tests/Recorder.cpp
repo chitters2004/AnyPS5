@@ -12706,6 +12706,80 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
     std::cout << "Repeated storage surface guard tests passed\n";
 }
 
+void targetLookupSplitTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (!device.NullDescriptors()) {
+        std::cout << "nullDescriptor unavailable: target lookup split not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t bytes = side * side * 4;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the target lookup split block");
+    std::memset(block, 0, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } unregister{base, block};
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    context.nullDescriptors = true;
+    TextureCache cache(context);
+    context.textureCache = &cache;
+    GuestTextureResource resource{};
+    resource.baseAddress = reinterpret_cast<std::uint64_t>(block);
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    const auto before = ThreadTargetLookupSplit();
+    const auto stored = CachedStorageSurface(context, resource);
+    Require(stored != nullptr, "the storage surface has no image");
+    Require(CachedStorageSurface(context, resource) == stored, "the second lookup took another image");
+    const auto looked = ThreadTargetLookupSplit() - before;
+    Require(looked.cacheLocks == 2 && looked.prepNs > 0, "the storage cache lookups were not counted with their surface preparation");
+    Require(RepeatStorageSurface(context, resource, stored) == stored, "the repeat lookup took another image");
+    const auto repeated = ThreadTargetLookupSplit() - before - looked;
+    Require(repeated.cacheLocks == 1 && repeated.prepNs > 0 && repeated.refreshes == 1, "the repeat lookup was not counted with its surface preparation and refresh");
+    const auto split = ThreadTargetLookupSplit() - before;
+    Require(split.cacheLocks == 3 && split.cacheLockWaits == 0 && split.cacheLockWaitNs == 0, "the storage cache locks of three uncontended lookups were not counted");
+    Require(split.prepNs > 0, "the surface preparation before the storage cache lock was not timed");
+    Require(split.refreshes == 2 && split.refreshNs > 0, "the two hits' refreshes were not counted");
+    Require(split.refreshesProved <= split.refreshes && split.flushesSlow <= split.flushes && split.flushes <= split.refreshes, "the refresh outcomes do not nest");
+    Require(split.completeNs + split.proofNs + split.flushNs + split.collectNs + split.keysNs + split.unchangedNs <= split.refreshNs, "the refresh steps took longer than their refreshes");
+    recorder.Submit();
+    device.WaitQueue();
+    recorder.Sync();
+    std::cout << "Target lookup split tests passed\n";
+}
+
 void oneFragmentFmaskGuardTests(const Device& device) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
@@ -15959,6 +16033,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--target-lookup-split-only") {
+            targetLookupSplitTests(device, recorder);
+            return device.NullDescriptors() ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--command-reuse-only") {
             if (device.GetContext().hostImportAlignment == 0) return 77;
             const auto before = Recorder::StoreCounts().stores;

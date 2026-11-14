@@ -778,6 +778,7 @@ struct DrawOutcome {
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
     GuestMemory::CollectCounts lookupCollects;
+    TargetLookupSplit lookupSplit;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -844,6 +845,7 @@ struct DrawProfile {
     double slowLookupWaitUs = 0;
     double lookupWaitUs = 0;
     GuestMemory::CollectCounts lookupCollects;
+    TargetLookupSplit lookupSplit;
     // Resource cache outcomes: hits, misses (built and inserted when reusable), entries that failed
     // Revalidate, and draws that could not use the cache (synchronous, no variant id, or disabled).
     // Which key words the misses differ in is the cache's own "[rescache] miss churn" line
@@ -953,6 +955,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
     profile.lookupCollects += outcome.lookupCollects;
+    profile.lookupSplit += outcome.lookupSplit;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -989,8 +992,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
         if (i == PhaseReadTarget && room()) {
             const auto& collects = profile.lookupCollects;
+            const auto& split = profile.lookupSplit;
             const auto microseconds = [](std::uint64_t nanoseconds) { return static_cast<double>(nanoseconds) / 1000.0; };
-            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f, GPU waits %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, GPU waits %.0f us; collects: memo hits %llu, walks %llu, requested %.0f KiB, watched %llu pages; tracker lock %llu of %llu waited %.0f us; mapping lock %llu of %llu waited %.0f us; GetWriteWatch %llu calls %.0f us; collect calls %.0f us; dirty pages %llu stamped in %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, profile.slowLookupWaitUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.lookupWaitUs, static_cast<unsigned long long>(collects.memoHits), static_cast<unsigned long long>(collects.walks), static_cast<double>(collects.requestedBytes) / 1024.0, static_cast<unsigned long long>(collects.walkedPages), static_cast<unsigned long long>(collects.trackerWaits), static_cast<unsigned long long>(collects.trackerLocks), microseconds(collects.trackerWaitNs), static_cast<unsigned long long>(collects.mappingWaits), static_cast<unsigned long long>(collects.mappingLocks), microseconds(collects.mappingWaitNs), static_cast<unsigned long long>(collects.watchCalls), microseconds(collects.watchNs), microseconds(collects.collectNs), static_cast<unsigned long long>(collects.stampedPages), microseconds(collects.stampNs));
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f, GPU waits %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, GPU waits %.0f us; collects: memo hits %llu, walks %llu, requested %.0f KiB, watched %llu pages; tracker lock %llu of %llu waited %.0f us; mapping lock %llu of %llu waited %.0f us; GetWriteWatch %llu calls %.0f us; collect calls %.0f us; dirty pages %llu stamped in %.0f us; split us: lookup %.0f (surface prep %.0f, storage cache lock %llu of %llu waited %.0f, refresh %.0f in %llu, %llu proved: pending CPU writes %.0f, proof %.0f, FlushPending %.0f in %llu, %llu slow, collect %.0f, keys %.0f, unchanged and metadata checks %.0f), clears %.0f)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, profile.slowLookupWaitUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.lookupWaitUs, static_cast<unsigned long long>(collects.memoHits), static_cast<unsigned long long>(collects.walks), static_cast<double>(collects.requestedBytes) / 1024.0, static_cast<unsigned long long>(collects.walkedPages), static_cast<unsigned long long>(collects.trackerWaits), static_cast<unsigned long long>(collects.trackerLocks), microseconds(collects.trackerWaitNs), static_cast<unsigned long long>(collects.mappingWaits), static_cast<unsigned long long>(collects.mappingLocks), microseconds(collects.mappingWaitNs), static_cast<unsigned long long>(collects.watchCalls), microseconds(collects.watchNs), microseconds(collects.collectNs), static_cast<unsigned long long>(collects.stampedPages), microseconds(collects.stampNs), microseconds(split.lookupNs), microseconds(split.prepNs), static_cast<unsigned long long>(split.cacheLockWaits), static_cast<unsigned long long>(split.cacheLocks), microseconds(split.cacheLockWaitNs), microseconds(split.refreshNs), static_cast<unsigned long long>(split.refreshes), static_cast<unsigned long long>(split.refreshesProved), microseconds(split.completeNs), microseconds(split.proofNs), microseconds(split.flushNs), static_cast<unsigned long long>(split.flushes), static_cast<unsigned long long>(split.flushesSlow), microseconds(split.collectNs), microseconds(split.keysNs), microseconds(split.unchangedNs), microseconds(split.clearsNs));
         }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -1058,6 +1062,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
     profile.lookupCollects = {};
+    profile.lookupSplit = {};
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -2053,10 +2058,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto collectedBefore = profile ? GuestMemory::ThreadCollectCounts() : GuestMemory::CollectCounts{};
+    const auto splitBefore = profile ? ThreadTargetLookupSplit() : TargetLookupSplit{};
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     std::shared_ptr<StorageTexture> resident;
     try {
-        resident = lookup();
+        {
+            const TargetLookupSpan looking(&TargetLookupSplit::lookupNs);
+            resident = lookup();
+        }
+        const TargetLookupSpan clearing(&TargetLookupSplit::clearsNs);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
     } catch (const std::exception& error) {
         resident = nullptr;
@@ -2065,7 +2075,10 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         std::lock_guard lock(reportMutex);
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
-    if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (resident != nullptr) {
+        const TargetLookupSpan clearing(&TargetLookupSplit::clearsNs);
+        materializeCmaskClear(context, color, resident);
+    }
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         const auto waitedUs = (Recorder::ThreadWaitedMs() - waitedBefore) * 1000.0;
@@ -2080,6 +2093,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         const auto collected = GuestMemory::ThreadCollectCounts() - collectedBefore;
         outcome.pagesWalked += collected.requestedBytes / 4096;
         outcome.lookupCollects += collected;
+        outcome.lookupSplit += ThreadTargetLookupSplit() - splitBefore;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }

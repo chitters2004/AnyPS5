@@ -24,6 +24,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -2424,6 +2425,11 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+TargetLookupSplit& ThreadTargetLookupSplit() {
+    struct Slot {};
+    return ThreadScratch<TargetLookupSplit, Slot>();
+}
+
 bool StorageTexture::Refresh() {
     return refresh(0, trackedLayers);
 }
@@ -2462,6 +2468,8 @@ std::atomic<int> flushFailureFiredForTest{0};
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const TargetLookupSpan refreshing(&TargetLookupSplit::refreshNs);
+    if (profile) ++ThreadTargetLookupSplit().refreshes;
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     const bool epochProofs = ShaderResources::EpochProofs();
     const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
@@ -2469,13 +2477,20 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         epochRefreshes.fetch_add(1, std::memory_order_relaxed);
+        if (profile) ++ThreadTargetLookupSplit().refreshesProved;
         return true;
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
-    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    {
+        const TargetLookupSpan completing(&TargetLookupSplit::completeNs);
+        CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    }
+    TargetLookupSpan proving(&TargetLookupSplit::proofNs);
+    const bool proved = refreshProved();
+    proving.Stop();
+    if (proved) {
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2484,6 +2499,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         }
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
+        if (profile) ++ThreadTargetLookupSplit().refreshesProved;
         if (profile && keyProof.pendingNote != 0) refreshesProvedPendingKeys.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
@@ -2541,6 +2557,8 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
                 GpuOrderedSkipped() = previousSkipped || skipped;
             }
         } ordered{orderedEligible};
+        const TargetLookupSpan flushing(&TargetLookupSplit::flushNs);
+        if (profile && !handOverKeys.has_value()) ++ThreadTargetLookupSplit().flushes;
         flushed = !handOverKeys.has_value() && FlushPending(scopeBegin, scopeBytes, alias.get(), "storage refresh", PublishScope::None);
         orderedSkipped = orderedEligible && GpuOrderedSkipped();
     }
@@ -2550,8 +2568,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
+    TargetLookupSpan collecting(&TargetLookupSplit::collectNs);
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto scopedCurrent = current != 0 || !scoped ? current : GuestMemory::CollectWrites(scopeBegin, scopeBytes);
+    collecting.Stop();
     std::vector<std::uint64_t> collected;
     if (scopedCurrent == 0) {
         collected.resize(trackedLayers);
@@ -2608,8 +2628,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             }
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        TargetLookupSpan keying(&TargetLookupSplit::keysNs);
         keys = handOverKeys.has_value() ? *handOverKeys : ProvedKeys();
+        keying.Stop();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        const TargetLookupSpan checking(&TargetLookupSplit::unchangedNs);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -4956,6 +4979,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         return scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes);
     };
     if (nothingToStore()) return false;
+    if (LookupOutcomes::Profiled()) ++ThreadTargetLookupSplit().flushesSlow;
     if (AgcDriver::DriverDetail::DrawPipeline::HeldReads(address, bytes)) {
         queuedReadHeld.fetch_add(1, std::memory_order_relaxed);
         return false;

@@ -13,6 +13,7 @@
 #include <bit>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -901,6 +902,87 @@ struct LookupOutcomes {
     std::array<double, Count> ms{};
 };
 LookupOutcomes& ThreadLookupOutcomes();
+struct TargetLookupSplit {
+    std::uint64_t lookupNs = 0;
+    std::uint64_t prepNs = 0;
+    std::uint64_t cacheLocks = 0;
+    std::uint64_t cacheLockWaits = 0;
+    std::uint64_t cacheLockWaitNs = 0;
+    std::uint64_t refreshes = 0;
+    std::uint64_t refreshesProved = 0;
+    std::uint64_t refreshNs = 0;
+    std::uint64_t completeNs = 0;
+    std::uint64_t proofNs = 0;
+    std::uint64_t flushes = 0;
+    std::uint64_t flushesSlow = 0;
+    std::uint64_t flushNs = 0;
+    std::uint64_t collectNs = 0;
+    std::uint64_t keysNs = 0;
+    std::uint64_t unchangedNs = 0;
+    std::uint64_t clearsNs = 0;
+
+    TargetLookupSplit& operator+=(const TargetLookupSplit& other) {
+        lookupNs += other.lookupNs;
+        prepNs += other.prepNs;
+        cacheLocks += other.cacheLocks;
+        cacheLockWaits += other.cacheLockWaits;
+        cacheLockWaitNs += other.cacheLockWaitNs;
+        refreshes += other.refreshes;
+        refreshesProved += other.refreshesProved;
+        refreshNs += other.refreshNs;
+        completeNs += other.completeNs;
+        proofNs += other.proofNs;
+        flushes += other.flushes;
+        flushesSlow += other.flushesSlow;
+        flushNs += other.flushNs;
+        collectNs += other.collectNs;
+        keysNs += other.keysNs;
+        unchangedNs += other.unchangedNs;
+        clearsNs += other.clearsNs;
+        return *this;
+    }
+
+    TargetLookupSplit operator-(const TargetLookupSplit& before) const {
+        TargetLookupSplit delta;
+        delta.lookupNs = lookupNs - before.lookupNs;
+        delta.prepNs = prepNs - before.prepNs;
+        delta.cacheLocks = cacheLocks - before.cacheLocks;
+        delta.cacheLockWaits = cacheLockWaits - before.cacheLockWaits;
+        delta.cacheLockWaitNs = cacheLockWaitNs - before.cacheLockWaitNs;
+        delta.refreshes = refreshes - before.refreshes;
+        delta.refreshesProved = refreshesProved - before.refreshesProved;
+        delta.refreshNs = refreshNs - before.refreshNs;
+        delta.completeNs = completeNs - before.completeNs;
+        delta.proofNs = proofNs - before.proofNs;
+        delta.flushes = flushes - before.flushes;
+        delta.flushesSlow = flushesSlow - before.flushesSlow;
+        delta.flushNs = flushNs - before.flushNs;
+        delta.collectNs = collectNs - before.collectNs;
+        delta.keysNs = keysNs - before.keysNs;
+        delta.unchangedNs = unchangedNs - before.unchangedNs;
+        delta.clearsNs = clearsNs - before.clearsNs;
+        return delta;
+    }
+};
+TargetLookupSplit& ThreadTargetLookupSplit();
+
+class TargetLookupSpan {
+public:
+    explicit TargetLookupSpan(std::uint64_t TargetLookupSplit::*field) : field(LookupOutcomes::Profiled() ? field : nullptr), start(this->field != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~TargetLookupSpan() { Stop(); }
+    TargetLookupSpan(const TargetLookupSpan&) = delete;
+    TargetLookupSpan& operator=(const TargetLookupSpan&) = delete;
+
+    void Stop() {
+        if (field == nullptr) return;
+        ThreadTargetLookupSplit().*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        field = nullptr;
+    }
+
+private:
+    std::uint64_t TargetLookupSplit::*field;
+    std::chrono::steady_clock::time_point start;
+};
 
 }
 
