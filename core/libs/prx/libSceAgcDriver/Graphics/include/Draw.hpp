@@ -113,6 +113,19 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // resource cache and kept by the batch).
 enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Buffers, Count };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
+
+enum class LookupPiece : std::size_t { Key, Find, Space, Revalidate, Moved, Aliases, Template, Prove, RecipeMoved, RecipeAliases, DepthNote, Touch, Count };
+enum class LookupOutcome : std::size_t { Uncacheable, Absent, SpaceRefused, InUse, Invalid, MovedRefused, TemplateHit, RecipeTemplateGone, RecipeRefused, RecipeBuffers, RecipeHit, Count };
+struct LookupSplitCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(LookupPiece::Count)> ns{};
+    std::array<std::uint64_t, static_cast<std::size_t>(LookupPiece::Count)> calls{};
+    std::array<std::uint64_t, static_cast<std::size_t>(LookupOutcome::Count)> outcomes{};
+    std::array<std::array<std::uint64_t, 4>, 2> proofPaths{};
+    std::array<std::array<std::uint64_t, 4>, 2> proofPathNs{};
+    std::array<std::array<std::uint64_t, 7>, 2> proofFailures{};
+};
+bool LookupSplitProfiled();
+LookupSplitCounts LookupSplitTotals();
 struct DrawRecipeOutcome {
     bool recorded = false;
     DrawRecipeMiss miss = DrawRecipeMiss::None;

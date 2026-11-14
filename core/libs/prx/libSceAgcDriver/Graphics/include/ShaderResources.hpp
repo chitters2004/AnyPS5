@@ -363,6 +363,7 @@ public:
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
+        bool epoch = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
