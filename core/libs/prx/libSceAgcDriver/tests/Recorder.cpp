@@ -5835,7 +5835,8 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
 }
 
 bool drawBindingCountTests(const Device& device) {
-    const bool counted = DrawBindingCountsProfiled();
+    const bool counted = std::getenv("APS5_PROFILE_DRAW_BINDINGS") != nullptr;
+    Require(DrawBindingCountsProfiled() == counted, "draw binding counting does not follow APS5_PROFILE_DRAW_BINDINGS");
     TakeDrawBindingCounts();
     const auto& context = device.GetContext();
     {
