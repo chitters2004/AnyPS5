@@ -2592,7 +2592,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
         // collects cost the same wherever they run.
         if (precollectImages()) phase(BuildPhase::Precollect);
         if (drawBuild && !usesBda && std::all_of(allocations.begin(), allocations.end(), [&](const Allocation& allocation) { return !allocation.guest || allocation.pushByte >= 0 || (allocation.dataAllocation >= 0 && allocation.dataByte < allocations[static_cast<std::size_t>(allocation.dataAllocation)].size); })) guestMemory.AllowAdjustedRegions();
-        requireGuestBuffers();
+        requireGuestBuffers({}, RecordSplit::GuardCaller::BuildPrepare);
         guestMemory.UploadPrepare(usesBda);
         timing.uploadMs = phase(BuildPhase::Upload);
         splitSets = SplitsSets(context, shaders);
@@ -2857,7 +2857,7 @@ void ShaderResources::buildComplete() {
         resolveImageTables();
         Require(registeredImageViewsCurrent(registeredImageViews), "AGC graphics: registered image range changed during resource materialization");
         timing.bindingsMs += phase(BuildPhase::Images);
-        requireGuestBuffers();
+        requireGuestBuffers({}, RecordSplit::GuardCaller::BuildComplete);
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, faultReportOnly);
@@ -7036,7 +7036,7 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
     RecordSplit::Lap lap;
     RecordSplit::Count(RecordSplit::Event::BindingCalls);
-    requireGuestBuffers(moved);
+    requireGuestBuffers(moved, RecordSplit::GuardCaller::DrawBindings);
     lap.To(RecordSplit::Span::SetsGuard);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) {
         RecordSplit::Count(RecordSplit::Event::BindingEarlyOuts);
@@ -7281,7 +7281,7 @@ void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout lay
         Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
         return;
     }
-    requireGuestBuffers();
+    requireGuestBuffers({}, RecordSplit::GuardCaller::BindDrawUse);
     const auto set = use->bindings->allocation.set;
     const auto fragmentSet = use->bindings->fragmentAllocation.set;
     NoteGraphicsSets(commands, layout, set, fragmentSet);
@@ -7316,8 +7316,9 @@ GuardMemo& guardMemo() {
 
 }
 
-void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved, RecordSplit::GuardCaller caller) const {
     RecordSplit::Count(RecordSplit::Event::GuardCalls);
+    RecordSplit::GuardLap lap(caller);
     const auto guestRange = [&](std::size_t index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
@@ -7341,6 +7342,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         }
         if (guardMemo().Covers(key, PendingDepthOverwriteProofs_nid_no_patch())) {
             RecordSplit::Count(RecordSplit::Event::GuardMemoHits);
+            lap.Buffers(key.count);
             if (!GuardMemoVerifyDue()) return;
             RecordSplit::Count(RecordSplit::Event::GuardMemoVerified);
             bool clear = true;
@@ -7354,9 +7356,11 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
         }
     }
     bool clear = memoize && key.fits;
+    std::uint64_t guests = 0;
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         if (!allocations[index].guest) continue;
         RecordSplit::Count(RecordSplit::Event::GuardAllocations);
+        lap.Buffers(++guests);
         const auto [address, bytes] = guestRange(index);
         if (clear && clearOfGuards(address, bytes)) continue;
         clear = false;
@@ -7369,7 +7373,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    requireGuestBuffers();
+    requireGuestBuffers({}, RecordSplit::GuardCaller::Bind);
     prepareFaultSlot();
     if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) NoteGraphicsSets(commands, layout, _set, fragment.set);
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);

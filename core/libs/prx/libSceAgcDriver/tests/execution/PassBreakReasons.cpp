@@ -155,6 +155,11 @@ void ExpectGuardMemo(const RecordSplit::Window& window, bool memoized) {
     const auto described = RecordSplit::Describe(window, 1);
     const auto hits = event(RecordSplit::Event::GuardMemoHits);
     Expect(event(RecordSplit::Event::GuardCalls) >= 1, "the draw ran no guest buffer guard: " + described);
+    std::uint64_t timed = 0;
+    for (std::size_t index = 0; index < RecordSplit::GuardCallers; ++index) timed += window.guardCalls[index];
+    const auto guards = RecordSplit::DescribeGuards(window, 1);
+    Expect(timed == event(RecordSplit::Event::GuardCalls) && window.guardCalls[static_cast<std::size_t>(RecordSplit::GuardCaller::Bind)] >= 1, "the guard timer did not time every guest buffer guard by caller: " + guards);
+    Expect(guards.rfind("[guard-time]", 0) == 0, "the guard time line has no tag: " + guards);
     if (!memoized) {
         Expect(hits == 0 && event(RecordSplit::Event::GuardMemoStores) == 0, "the guard memo served a draw while switched off: " + described);
         return;

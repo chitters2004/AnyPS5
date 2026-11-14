@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -218,7 +219,7 @@ public:
     VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
     bool SplitSets() const { return splitSets; }
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
-    void RequireGuestBuffers() const { requireGuestBuffers(); }
+    void RequireGuestBuffers() const { requireGuestBuffers({}, RecordSplit::GuardCaller::RecordDraw); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
@@ -534,7 +535,7 @@ private:
     std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read, std::uint32_t extent);
     std::uint64_t guestBufferBytes(std::span<const std::uint32_t> words) const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
-    void requireGuestBuffers(std::span<const MovedBuffer> moved = {}) const;
+    void requireGuestBuffers(std::span<const MovedBuffer> moved, RecordSplit::GuardCaller caller) const;
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
     void addImageBinding(const ShaderRecompiler::DescriptorBinding& binding, VkShaderStageFlags flags);

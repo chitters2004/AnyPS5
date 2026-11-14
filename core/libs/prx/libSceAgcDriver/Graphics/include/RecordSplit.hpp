@@ -108,7 +108,13 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(Span::Count)> 
 inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated", "pipeline schedules", "write mask rebuilds", "guest buffer guards", "guarded allocations", "depth guard checks", "depth proofs pending", "depth guard armed", "depth guard near", "color guard checks", "color guard armed", "color guard near", "guard memo hits", "guard memo stores", "guard memo verified", "guard memo misses", "pass state skips"};
 inline constexpr std::array<const char*, StateSlots> StateSlotNames{"viewport", "scissor", "depth bias", "depth bounds", "cull mode", "front face", "depth test", "depth write", "depth compare", "depth bounds test", "stencil test", "stencil op front", "stencil op back", "compare mask front", "compare mask back", "write mask front", "write mask back", "reference front", "reference back", "color write mask", "pipeline"};
 
-static_assert(SpanNames.back() != nullptr && EventNames.back() != nullptr && StateSlotNames.back() != nullptr);
+enum class GuardCaller : std::size_t { BuildPrepare, BuildComplete, DrawBindings, BindDrawUse, Bind, RecordDraw, Count };
+
+inline constexpr std::size_t GuardCallers = static_cast<std::size_t>(GuardCaller::Count);
+
+inline constexpr std::array<const char*, GuardCallers> GuardCallerNames{"build prepare", "build complete", "draw bindings", "bind draw use", "bind", "record draw"};
+
+static_assert(SpanNames.back() != nullptr && EventNames.back() != nullptr && StateSlotNames.back() != nullptr && GuardCallerNames.back() != nullptr);
 
 bool Enabled();
 
@@ -117,6 +123,9 @@ struct Counters {
     std::array<AgcDriver::ProfileCounter, static_cast<std::size_t>(Event::Count)> events{};
     std::array<AgcDriver::ProfileCounter, StateSlots> emitted{};
     std::array<AgcDriver::ProfileCounter, StateSlots> suppressed{};
+    std::array<AgcDriver::ProfileCounter, GuardCallers> guardNs{};
+    std::array<AgcDriver::ProfileCounter, GuardCallers> guardCalls{};
+    std::array<AgcDriver::ProfileCounter, GuardCallers> guardBuffers{};
 };
 
 Counters& Shared();
@@ -168,6 +177,31 @@ private:
 
     bool on;
     Clock::time_point mark;
+};
+
+class GuardLap {
+public:
+    using Clock = std::chrono::steady_clock;
+
+    explicit GuardLap(GuardCaller caller) : on(Enabled()), slot(static_cast<std::size_t>(caller)), start(on ? Clock::now() : Clock::time_point{}) {}
+    GuardLap(const GuardLap&) = delete;
+    GuardLap& operator=(const GuardLap&) = delete;
+
+    ~GuardLap() {
+        if (!on) return;
+        auto& counters = Shared();
+        counters.guardNs[slot].Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count()));
+        counters.guardCalls[slot].Add(1);
+        counters.guardBuffers[slot].Add(buffers);
+    }
+
+    void Buffers(std::uint64_t count) { buffers = count; }
+
+private:
+    bool on;
+    std::size_t slot;
+    Clock::time_point start;
+    std::uint64_t buffers = 0;
 };
 
 class Fingerprint {
@@ -297,6 +331,9 @@ struct Window {
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> events{};
     std::array<std::uint64_t, StateSlots> emitted{};
     std::array<std::uint64_t, StateSlots> suppressed{};
+    std::array<std::uint64_t, GuardCallers> guardNs{};
+    std::array<std::uint64_t, GuardCallers> guardCalls{};
+    std::array<std::uint64_t, GuardCallers> guardBuffers{};
 };
 
 inline Window Take() {
@@ -307,6 +344,11 @@ inline Window Take() {
     for (std::size_t index = 0; index < StateSlots; ++index) {
         window.emitted[index] = counters.emitted[index].Take();
         window.suppressed[index] = counters.suppressed[index].Take();
+    }
+    for (std::size_t index = 0; index < GuardCallers; ++index) {
+        window.guardNs[index] = counters.guardNs[index].Take();
+        window.guardCalls[index] = counters.guardCalls[index].Take();
+        window.guardBuffers[index] = counters.guardBuffers[index].Take();
     }
     return window;
 }
@@ -347,6 +389,17 @@ inline std::string DescribeState(const Window& window, std::uint64_t draws) {
     }
     std::snprintf(part, sizeof(part), "; total %.3f/%.3f; schedules %.3f, write mask rebuilds %.3f", perDraw(emitted), perDraw(suppressed), perDraw(window.events[static_cast<std::size_t>(Event::StateSchedules)]), perDraw(window.events[static_cast<std::size_t>(Event::StateMaskRebuilds)]));
     line += part;
+    return line;
+}
+
+inline std::string DescribeGuards(const Window& window, std::uint64_t draws) {
+    std::string line = "[guard-time] (10 s, all threads) guest buffer guards by caller over " + std::to_string(draws) + " draws, calls per draw, ns per call, ns per guest buffer:";
+    char part[200];
+    const auto ratio = [](std::uint64_t value, std::uint64_t over) { return over != 0 ? static_cast<double>(value) / static_cast<double>(over) : 0.0; };
+    for (std::size_t index = 0; index < GuardCallers; ++index) {
+        std::snprintf(part, sizeof(part), "%s %s %.3f/%.1f/%.1f", index == 0 ? "" : ",", GuardCallerNames[index], ratio(window.guardCalls[index], draws), ratio(window.guardNs[index], window.guardCalls[index]), ratio(window.guardNs[index], window.guardBuffers[index]));
+        line += part;
+    }
     return line;
 }
 
