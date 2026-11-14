@@ -788,15 +788,19 @@ void dccClear(AgcDriver::VulkanDevice& device) {
 }
 
 void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
-    const auto color = colorTarget(false, true);
+    auto color = colorTarget(false, true);
+    color.cmaskAddress = address(allocateWatched(65536));
     reset(device, color);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
     bool repeated = false;
     for (int repeat = 0; repeat < 64 && !repeated; ++repeat) {
         const auto before = lookups();
         draw(device, color);
         repeated = lookups() == before;
     }
-    std::cout << "a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
+    const bool watched = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
+    std::cout << "the CMASK is " << (watched ? "" : "not ") << "write-watched; a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
+    Require(!LookupOutcomes::Profiled() || memoResolves() || repeated || !watched, "a target over a write-watched CMASK did not repeat, so its proof break cannot be tested");
     if (!repeated) return;
     AgcDriver::GuestMemory::BreakProofs();
     const MemoEvents events;
