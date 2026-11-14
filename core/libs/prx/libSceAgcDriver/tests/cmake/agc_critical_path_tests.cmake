@@ -1,0 +1,7 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_critical_path_tests tests/CriticalPath.cpp Execution/src/CriticalPath.cpp)
+    target_include_directories(agc_critical_path_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_windows_unwind(agc_critical_path_tests)
+    add_test(NAME agc_critical_path COMMAND agc_critical_path_tests)
+    set_tests_properties(agc_critical_path PROPERTIES TIMEOUT 20)
+endif()

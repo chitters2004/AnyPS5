@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/CriticalPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -193,6 +194,7 @@ void Driver::run(std::uint32_t id) noexcept {
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
                 PerformanceTimer timing("Driver.WorkerWait");
+                const CriticalPath::Span idle(CriticalPath::Measure::WorkerIdle);
                 std::unique_lock lock(mutex);
                 timing.Mark("mutex_wait");
                 auto& worker = workers.at(id);

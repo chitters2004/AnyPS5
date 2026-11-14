@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CriticalPath.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <array>
 #include <cstdlib>
@@ -215,6 +216,7 @@ double seconds(Clock::duration elapsed) {
 }
 
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
+    CriticalPath::BindThread(name);
     if (local != nullptr) return;
     if (!Configured()) {
         localName = name;
@@ -365,6 +367,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         presentCount.fetch_add(1, std::memory_order_relaxed);
         buffering.store(true, std::memory_order_relaxed);
         recording.store(true, std::memory_order_relaxed);
+        CriticalPath::OpenWindow(present);
         ProfilePrint_nid_no_patch("[trace] recording %s from present %llu%s\n", state.window->Describe().c_str(), static_cast<unsigned long long>(present), state.gpuClock ? "" : "; no GPU track: the device has no calibrated timestamps");
         return;
     }
@@ -376,7 +379,11 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     }
     state.presents.push_back(now);
     presentCount.fetch_add(1, std::memory_order_relaxed);
-    if (edge != TraceWindow::Edge::Close) return;
+    if (edge != TraceWindow::Edge::Close) {
+        CriticalPath::Present(present);
+        return;
+    }
+    CriticalPath::CloseWindow(present, traceDirectory(), "aps5-critical-" + std::string(APS5_TRACE_COMMIT) + "-" + std::to_string(processId()) + ".jsonl");
     state.windowOpen = false;
     buffering.store(false, std::memory_order_relaxed);
     recording.store(state.interval.has_value(), std::memory_order_relaxed);

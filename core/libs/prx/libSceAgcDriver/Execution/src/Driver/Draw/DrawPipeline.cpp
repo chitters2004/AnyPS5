@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CriticalPath.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
@@ -192,7 +193,10 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (jobs.size() >= depth) {
+        const CriticalPath::Span room(CriticalPath::Measure::FinisherRoomWait);
+        idle.wait(lock, [&] { return jobs.size() < depth; });
+    }
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -213,8 +217,9 @@ void DrawFinisher::run() {
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
+            const CriticalPath::Span waiting(CriticalPath::Measure::FinisherIdle);
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
             std::unique_lock lock(mutex);
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
@@ -224,6 +229,8 @@ void DrawFinisher::run() {
         }
         std::exception_ptr error;
         try {
+            const CriticalPath::Span busy(CriticalPath::Measure::FinisherBusy);
+            if (CriticalPath::Active()) CriticalPath::Add(CriticalPath::Measure::FinisherJobs, 1);
             if (!failed) (*job)();
         } catch (...) {
             error = std::current_exception();
@@ -241,6 +248,7 @@ void DrawFinisher::run() {
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    const CriticalPath::Span waiting(CriticalPath::Measure::DrainWait);
     std::unique_lock lock(mutex);
     idle.wait(lock, [&] { return jobs.empty(); });
 }
@@ -248,6 +256,7 @@ void DrawFinisher::Settle() {
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const CriticalPath::Span waiting(CriticalPath::Measure::DrainWait);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
@@ -357,8 +366,16 @@ void DrawPipeline::enqueue(Item item) {
         item.commit();
         return;
     }
+    if (CriticalPath::Active()) {
+        CriticalPath::SetRingDepth(Depth());
+        CriticalPath::Add(CriticalPath::Measure::Enqueues, 1);
+        CriticalPath::Add(CriticalPath::Measure::OccupancySum, items.size());
+        CriticalPath::Max(CriticalPath::Measure::OccupancyMax, items.size());
+    }
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
+        const CriticalPath::Span room(CriticalPath::Measure::RoomWait);
+        if (CriticalPath::Active()) CriticalPath::Add(CriticalPath::Measure::RoomWaits, 1);
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
@@ -449,6 +466,7 @@ void DrawPipeline::run() {
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
+        const auto idleStart = CriticalPath::Active() ? CriticalPath::NowNs() : 0;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -459,6 +477,7 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
         }
+        if (idleStart != 0 && CriticalPath::Active()) CriticalPath::Add(CriticalPath::Measure::CommitIdle, CriticalPath::NowNs() - idleStart);
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
@@ -476,6 +495,10 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (CriticalPath::Active()) {
+            CriticalPath::Add(CriticalPath::Measure::CommitBusy, spent);
+            CriticalPath::Add(CriticalPath::Measure::Commits, 1);
+        }
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
@@ -524,6 +547,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
+    const CriticalPath::Span waiting(CriticalPath::Measure::DrainWait);
     const auto start = std::chrono::steady_clock::now();
     SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     std::unique_lock lock(mutex);

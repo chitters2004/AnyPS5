@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CriticalPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
@@ -1834,6 +1835,12 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (CriticalPath::Active()) {
+            criticalLock();
+            if (!profile) return;
+            trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         if (!profile) {
             lock.lock();
             return;
@@ -1845,13 +1852,17 @@ public:
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
     ~TrackerLock() {
-        if (lock.owns_lock()) publish();
+        if (lock.owns_lock()) {
+            publish();
+            CriticalPath::Released(CriticalPath::Lock::Tracker);
+        }
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
 
     void Unlock() {
         publish();
+        CriticalPath::Released(CriticalPath::Lock::Tracker);
         lock.unlock();
     }
 
@@ -1860,10 +1871,15 @@ public:
     }
 
     void Suspend() {
+        CriticalPath::Released(CriticalPath::Lock::Tracker);
         lock.unlock();
     }
 
     void Resume() {
+        if (CriticalPath::Active()) {
+            criticalLock();
+            return;
+        }
         lock.lock();
     }
 
@@ -1885,6 +1901,16 @@ public:
     };
 
 private:
+    void criticalLock() {
+        if (!lock.try_lock()) {
+            const auto owner = CriticalPath::Owner(CriticalPath::Lock::Tracker);
+            const auto start = CriticalPath::NowNs();
+            lock.lock();
+            CriticalPath::Waited(CriticalPath::Lock::Tracker, owner, CriticalPath::NowNs() - start);
+        }
+        CriticalPath::Acquired(CriticalPath::Lock::Tracker);
+    }
+
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
         if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);
@@ -2047,6 +2073,8 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     ++tracker.generation;
     observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
+    const CriticalPath::Span collecting(CriticalPath::Measure::Collect);
+    if (CriticalPath::Active()) CriticalPath::Add(CriticalPath::Measure::Collects, 1);
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
 #else
@@ -3101,8 +3129,22 @@ namespace {
 std::atomic<std::uint64_t> gpuHoldSerial{0};
 }
 
+namespace {
+void lockGpuWaiting(Mutex& mutex) {
+    if (!CriticalPath::Active()) {
+        LockSpinning(mutex, HandoffSpinWindow());
+        return;
+    }
+    const auto holder = CriticalPath::Owner(CriticalPath::Lock::Gpu);
+    const auto start = CriticalPath::NowNs();
+    LockSpinning(mutex, HandoffSpinWindow());
+    CriticalPath::Waited(CriticalPath::Lock::Gpu, holder, CriticalPath::NowNs() - start);
+}
+}
+
 void GpuMutexType::enter() {
-    if (!HeldByThisThread()) LockSpinning(mutex, HandoffSpinWindow());
+    if (HeldByThisThread() || mutex.try_lock()) return;
+    lockGpuWaiting(mutex);
 }
 
 bool GpuMutexType::tryEnter() {
@@ -3114,6 +3156,7 @@ void GpuMutexType::acquired() {
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) BreakProofs();
+        if (CriticalPath::Active()) CriticalPath::Acquired(CriticalPath::Lock::Gpu);
     }
 }
 
@@ -3152,6 +3195,7 @@ std::uint64_t GpuHoldSerial() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
+        CriticalPath::Released(CriticalPath::Lock::Gpu);
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
@@ -3189,7 +3233,7 @@ void GpuMutexType::lock() {
             const auto site = static_cast<std::size_t>(std::exchange(LockStats().nextSite, GpuLockSite::Other));
             if (!tryEnter()) {
                 const auto start = std::chrono::steady_clock::now();
-                LockSpinning(mutex, HandoffSpinWindow());
+                lockGpuWaiting(mutex);
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
@@ -3207,7 +3251,7 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
-        LockSpinning(mutex, HandoffSpinWindow());
+        lockGpuWaiting(mutex);
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
