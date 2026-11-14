@@ -121,6 +121,11 @@ struct RangeVersionCounts {
 };
 bool ScopedProofsProfiled();
 RangeVersionCounts TakeRangeVersionCounts();
+struct GpuMutexEntryCount {
+    unsigned long long caller = 0;
+    std::uint64_t entries = 0;
+};
+std::vector<GpuMutexEntryCount> TakeGpuMutexEntryCounts();
 std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> UnscopedVersionsByKind();
 const char* RangeSourceName(RangeSource source);
 const char* UnscopedSourceName(UnscopedSource source);
@@ -246,7 +251,7 @@ public:
 private:
     void enter();
     bool tryEnter();
-    void acquired();
+    void acquired(const void* caller);
     Mutex mutex;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.

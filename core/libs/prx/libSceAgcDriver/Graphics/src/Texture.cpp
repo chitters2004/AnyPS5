@@ -2582,6 +2582,14 @@ void ReportScopedProofCounts() {
     }
     std::snprintf(item, sizeof(item), "%s, hits %llu, %llu after a collect, verified %llu, disagreements %llu", RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) ? "off" : "on", static_cast<unsigned long long>(counters.hits.Take()), static_cast<unsigned long long>(counters.collectedHits.Take()), static_cast<unsigned long long>(counters.verified.Take()), static_cast<unsigned long long>(scopedDisagreements.load(std::memory_order_relaxed)));
     AgcDriver::ProfilePrint_nid_no_patch("[scoped-proofs] (10 s, scoped proofs %s): range bumps calls/granules:%s; unscoped bumps:%s; full refreshes by scoped verdict proved/unchanged/written:%s; unscoped moves seen by refreshes:%s; refused proofs by reason unchanged/written:%s\n", item, bumps.c_str(), unscoped.c_str(), refreshes.c_str(), movedBy.c_str(), refusals.c_str());
+    std::string holders;
+    const auto entries = GuestMemory::TakeGpuMutexEntryCounts();
+    for (std::size_t index = 0; index < std::min<std::size_t>(entries.size(), 16); ++index) {
+        if (entries[index].caller == 0) std::snprintf(item, sizeof(item), " unlisted %llu", static_cast<unsigned long long>(entries[index].entries));
+        else std::snprintf(item, sizeof(item), " +0x%llx %llu", entries[index].caller, static_cast<unsigned long long>(entries[index].entries));
+        holders += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[scoped-proofs] (10 s) GPU mutex entries off the proof thread by caller (module offset, named with nm):%s\n", holders.empty() ? " none" : holders.c_str());
 }
 
 std::size_t StorageTexture::scopedVerdict(const GuestMemory::RangeVersionParts& current) const {

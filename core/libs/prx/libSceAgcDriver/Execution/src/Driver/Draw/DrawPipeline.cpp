@@ -421,7 +421,10 @@ void DrawPipeline::enqueue(Item item) {
         lastReport = now;
     }
     if (profile || stats || Graphics::EpochProofCountsProfiled()) Graphics::ReportEpochProofCounts();
-    if (GuestMemory::ScopedProofsProfiled()) Graphics::ReportScopedProofCounts();
+    if (GuestMemory::ScopedProofsProfiled()) {
+        Graphics::ReportScopedProofCounts();
+        ReportEpochBumpKinds();
+    }
     if (Graphics::DrawSetCountsProfiled()) Graphics::ReportDrawSetCounts();
 }
 

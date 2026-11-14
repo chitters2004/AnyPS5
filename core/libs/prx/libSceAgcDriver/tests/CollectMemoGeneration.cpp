@@ -659,6 +659,17 @@ void CheckRangeVersions() {
     Require(ScopedHolds(proof, held), "a valid scoped proof did not hold with nothing bumped");
     BumpUnscopedVersion(UnscopedSource::Labels);
     Require(!ScopedHolds(proof, held), "a scoped proof held over an unscoped bump");
+    TakeGpuMutexEntryCounts();
+    std::thread holder([] {
+        for (int entry = 0; entry < 3; ++entry) {
+            std::lock_guard outer(GpuMutex());
+            std::lock_guard nested(GpuMutex());
+        }
+    });
+    holder.join();
+    const auto entries = TakeGpuMutexEntryCounts();
+    Require(entries.size() == 1 && entries[0].entries == 3 && entries[0].caller != 0, "GPU mutex entries off the proof thread were not counted once per outermost hold by caller");
+    Require(TakeGpuMutexEntryCounts().empty(), "taking the GPU mutex entry counts did not reset them");
 }
 int main(int argc, char** argv) {
     try {
