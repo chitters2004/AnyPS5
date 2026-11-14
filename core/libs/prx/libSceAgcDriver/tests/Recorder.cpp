@@ -365,6 +365,24 @@ void gpuTimingKeyTests() {
     Require(Recorder::TimingKeyLabel(Recorder::DrawTimingKey(0x123456789abcdefull)) == "draw 0x123456789abcdef", "a wide variant id was cut in the label");
 }
 
+void epochKindTests() {
+    using AgcDriver::DriverDetail::CountEpochBump;
+    using AgcDriver::DriverDetail::EpochBumps;
+    using AgcDriver::DriverDetail::TakeEpochBumpKinds;
+    Require(AgcDriver::GuestMemory::ScopedProofsProfiled(), "the epoch kind tests need APS5_PROFILE_SCOPED_PROOFS");
+    TakeEpochBumpKinds();
+    CountEpochBump(&EpochBumps::submissions);
+    for (int wait = 0; wait < 2; ++wait) CountEpochBump(&EpochBumps::waits);
+    for (int drain = 0; drain < 3; ++drain) CountEpochBump(&EpochBumps::drains);
+    for (int reap = 0; reap < 4; ++reap) CountEpochBump(&EpochBumps::reaps);
+    for (int packet = 0; packet < 5; ++packet) CountEpochBump(&EpochBumps::packets);
+    for (int ordered = 0; ordered < 6; ++ordered) CountEpochBump(&EpochBumps::waitsOrdered);
+    const auto taken = TakeEpochBumpKinds();
+    Require(taken.submissions == 1 && taken.waits == 2 && taken.drains == 3 && taken.reaps == 4 && taken.packets == 5 && taken.waitsOrdered == 6, "an epoch bump was counted under the wrong kind");
+    const auto again = TakeEpochBumpKinds();
+    Require(again.submissions + again.waits + again.drains + again.reaps + again.packets + again.waitsOrdered == 0, "taking the epoch kinds did not reset them");
+}
+
 void deviceSelectionTests() {
     const auto properties = [](const char* name, VkPhysicalDeviceType type) {
         VkPhysicalDeviceProperties result{};
@@ -16248,6 +16266,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--partial-watch-restoration-only") {
             if (!partialWatchRestorationTests()) return 77;
             std::cout << "partial private write-watch restoration tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--epoch-kinds-only") {
+            epochKindTests();
+            std::cout << "epoch kind tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--gpu-timing-key-only") {

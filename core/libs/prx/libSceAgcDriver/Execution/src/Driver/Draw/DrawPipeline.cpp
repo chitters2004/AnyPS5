@@ -420,7 +420,10 @@ void DrawPipeline::enqueue(Item item) {
         lastReport = now;
     }
     Graphics::ReportEpochProofCounts();
-    if (GuestMemory::ScopedProofsProfiled()) Graphics::ReportScopedProofCounts();
+    if (GuestMemory::ScopedProofsProfiled()) {
+        Graphics::ReportScopedProofCounts();
+        ReportEpochBumpKinds();
+    }
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
