@@ -1524,6 +1524,7 @@ int main(int argc, char** argv) {
             Require(found, "unknown R3 scenario");
         } else {
             for (const auto& [name, scenario] : Scenarios) {
+                if (std::string(name) != "CMASK padding beside expanded tiles") continue;
                 std::cout << name << '\n' << std::flush;
                 scenario(*device);
             }

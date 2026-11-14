@@ -562,7 +562,7 @@ std::unordered_map<std::uint64_t, CmaskProof>& cmaskProofs() {
 }
 
 bool cmaskProved(std::uint64_t address, std::size_t bytes) {
-    if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(address, bytes) != std::uint64_t{0xffffffffffffffffull}) return false;
     std::lock_guard lock(cmaskProofMutex());
     const auto found = cmaskProofs().find(address);
     return found != cmaskProofs().end() && found->second.bytes == bytes && !GuestMemory::StoredOver(address, bytes, found->second.generation);
