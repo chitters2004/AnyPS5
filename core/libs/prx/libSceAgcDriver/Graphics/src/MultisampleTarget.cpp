@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
@@ -1918,7 +1919,12 @@ void ReportGuardSpanMiss(const char* list, std::uint64_t address, std::uint64_t 
 }
 
 void RequireNoMultisampleColorTarget(std::uint64_t address, std::size_t bytes, const char* access) {
-    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire) || !mayOverlapGuarded(address, bytes)) return;
+    if (bytes == 0) return;
+    RecordSplit::Count(RecordSplit::Event::ColorGuardChecks);
+    if (!anyGuarded().load(std::memory_order_acquire)) return;
+    RecordSplit::Count(RecordSplit::Event::ColorGuardArmed);
+    if (!mayOverlapGuarded(address, bytes)) return;
+    RecordSplit::Count(RecordSplit::Event::ColorGuardNear);
     const auto overlaps = [&](const GuardedRange& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     const auto refuse = [&](const GuardedRange& range) {
         char text[320];

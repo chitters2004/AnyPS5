@@ -7307,9 +7307,11 @@ void ShaderResources::prepareFaultSlot() const {
 }
 
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
+    RecordSplit::Count(RecordSplit::Event::GuardCalls);
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         if (!item.guest) continue;
+        RecordSplit::Count(RecordSplit::Event::GuardAllocations);
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const auto address = override != moved.end() ? override->address : item.address;
         const auto bytes = override != moved.end() ? override->size : item.size;
