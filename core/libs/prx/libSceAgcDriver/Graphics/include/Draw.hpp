@@ -126,6 +126,14 @@ struct LookupSplitCounts {
 };
 bool LookupSplitProfiled();
 LookupSplitCounts LookupSplitTotals();
+enum class LookupC2Count : std::size_t { SlotsBuilt, SlotUses, SlotSearches, AliasSkips, AliasChecks, Verified, Disagreed, Count };
+using LookupC2Counts = std::array<std::uint64_t, static_cast<std::size_t>(LookupC2Count::Count)>;
+void NoteLookupC2(LookupC2Count count);
+LookupC2Counts LookupC2Totals();
+bool LookupC2VerifyDue();
+enum class LookupC2Mutant : std::uint8_t { None, SlotOffByOne, AliasIgnoresWords };
+void SetLookupC2MutantForTest(LookupC2Mutant mutant);
+LookupC2Mutant LookupC2MutantForTest();
 struct DrawRecipeOutcome {
     bool recorded = false;
     DrawRecipeMiss miss = DrawRecipeMiss::None;

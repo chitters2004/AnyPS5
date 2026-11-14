@@ -6829,6 +6829,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    delete bindingSlots.load(std::memory_order_acquire);
     release();
 }
 
@@ -6903,15 +6904,60 @@ ShaderResources::DrawBindings::~DrawBindings() {
     release(fragmentLayout, fragmentAllocation);
 }
 
+std::uint64_t ShaderResources::NextSerial() {
+    static std::atomic<std::uint64_t> next{1};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+const ShaderResources::BindingSlots* ShaderResources::movedBindingSlots() const {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2)) return nullptr;
+    if (const auto* slots = bindingSlots.load(std::memory_order_acquire)) return slots;
+    if (bindings.size() >= NoBindingSlot) return nullptr;
+    auto built = std::make_unique<BindingSlots>();
+    built->slot.fill(NoBindingSlot);
+    const std::size_t shift = LookupC2MutantForTest() == LookupC2Mutant::SlotOffByOne ? 1u : 0u;
+    for (std::size_t index = bindings.size(); index-- > 0;) {
+        const auto number = bindings[index].layout.binding;
+        if (number < BindingSlotCount) built->slot[number] = static_cast<std::uint16_t>(std::min(index + shift, bindings.size()));
+    }
+    const BindingSlots* expected = nullptr;
+    if (bindingSlots.compare_exchange_strong(expected, built.get(), std::memory_order_acq_rel, std::memory_order_acquire)) {
+        NoteLookupC2(LookupC2Count::SlotsBuilt);
+        return built.release();
+    }
+    return expected;
+}
+
+std::vector<ShaderResources::Binding>::const_iterator ShaderResources::keptBinding(std::uint32_t number, const BindingSlots* slots) const {
+    const auto search = [&] { return std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == number; }); };
+    if (slots == nullptr || number >= BindingSlotCount) {
+        if (slots != nullptr) NoteLookupC2(LookupC2Count::SlotSearches);
+        return search();
+    }
+    const auto slot = slots->slot[number];
+    const auto planned = slot == NoBindingSlot ? bindings.end() : bindings.begin() + static_cast<std::ptrdiff_t>(slot);
+    if (LookupC2VerifyDue()) {
+        NoteLookupC2(LookupC2Count::Verified);
+        const auto found = search();
+        if (found != planned) {
+            NoteLookupC2(LookupC2Count::Disagreed);
+            return found;
+        }
+    }
+    return planned;
+}
+
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData) const {
     std::vector<MovedBuffer> moved;
     std::size_t movedBytes = 0;
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return moved;
+    const auto* slots = movedBindingSlots();
+    if (slots != nullptr) NoteLookupC2(LookupC2Count::SlotUses);
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
-                const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+                const auto kept = keptBinding(binding.binding, slots);
                 if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
                 const auto index = kept->allocations.front();
                 const auto& item = allocations[index];
@@ -6928,7 +6974,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 continue;
             }
             if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
+            const auto kept = keptBinding(binding.binding, slots);
             if (kept == bindings.end() || kept->allocations.size() != binding.count || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 4u) return std::nullopt;
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;

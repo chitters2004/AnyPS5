@@ -260,6 +260,7 @@ public:
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
+    std::uint64_t Serial() const { return serial; }
     enum class MoveRefusal : std::size_t { None, Shape, NotGuest, Written, Limit, Inaccessible, Overlap, Bindings, Count };
     struct MoveProof {
         MoveRefusal refusal = MoveRefusal::None;
@@ -794,6 +795,16 @@ private:
     // still to look up (index into `bindings`; the DescriptorBinding lives in the compiled shader),
     // the descriptor counts the set was sized for, and the compute stage of a deferred build.
     std::vector<Binding> bindings;
+    static constexpr std::size_t BindingSlotCount = 512;
+    static constexpr std::uint16_t NoBindingSlot = 0xffffu;
+    struct BindingSlots {
+        std::array<std::uint16_t, BindingSlotCount> slot;
+    };
+    mutable std::atomic<const BindingSlots*> bindingSlots{nullptr};
+    const BindingSlots* movedBindingSlots() const;
+    std::vector<Binding>::const_iterator keptBinding(std::uint32_t number, const BindingSlots* slots) const;
+    std::uint64_t serial = NextSerial();
+    static std::uint64_t NextSerial();
     std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
     std::vector<VkDescriptorBindingFlags> fragmentBindingFlags;
     std::vector<std::uint32_t> refreshResourceKey;

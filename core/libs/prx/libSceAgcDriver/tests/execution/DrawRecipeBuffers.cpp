@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -28,6 +29,7 @@
 #include <iostream>
 #include <mutex>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -174,6 +176,7 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         }
         CheckPixels(state.color, {255, 0, 0, 255});
     }
+    const auto c2Before = LookupC2Totals();
     for (const bool second : {true, true, false}) {
         select(second);
         {
@@ -182,6 +185,31 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
             Require(hit.recorded, "a safe buffer change refused its recipe");
         }
         CheckPixels(state.color, second ? std::array<std::uint8_t, 4>{0, 255, 0, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 255});
+    }
+    const auto c2After = LookupC2Totals();
+    const auto c2 = [&](LookupC2Count count) { return c2After[static_cast<std::size_t>(count)] - c2Before[static_cast<std::size_t>(count)]; };
+    const bool verifying = std::getenv("APS5_VERIFY_LOOKUP_C2") != nullptr;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2) || !(LookupSplitProfiled() || verifying)) {
+        Require(c2After == c2Before, "lookup C2 counts moved with APS5_NO_LOOKUP_C2 or without APS5_PROFILE_LOOKUP");
+    } else {
+        Require(c2(LookupC2Count::SlotUses) == 3, "three recipe hits made " + std::to_string(c2(LookupC2Count::SlotUses)) + " moved-buffer checks on binding slots, expected 3");
+        if (!dataWords) Require(c2(LookupC2Count::AliasSkips) != 0, "a recipe hit repeating the buffers of the hit before it ran the alias check again (" + std::to_string(c2(LookupC2Count::AliasChecks)) + " checks run, none skipped)");
+        if (verifying) Require(c2(LookupC2Count::Verified) != 0, "APS5_VERIFY_LOOKUP_C2 verified no binding slot or alias skip");
+    }
+    if (!dataWords) {
+        const auto target = block.Address();
+        fragment.bindings.front().guestDescriptor = {static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(target >> 32u) & 0xffffu, sizeof(red), 0x31000000u};
+        bool recorded = false;
+        std::string failure;
+        try {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            recorded = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe).recorded;
+        } catch (const std::exception& error) {
+            failure = error.what();
+        }
+        Require(!recorded, "a recipe hit served a buffer that moved onto its render target");
+        Require(failure.empty() || failure.find("aliases the render target") != std::string::npos, "a buffer moved onto the render target failed with: " + failure);
+        std::cout << (failure.empty() ? "a buffer moved onto the render target fell back to the ordinary draw path\n" : "a buffer moved onto the render target failed its alias check\n");
     }
     const auto refused = [&] {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
@@ -208,6 +236,7 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         CheckPixels(state.color, {0, 0, 0, 0});
     }
     device.WaitIdle();
+    Require(LookupC2Totals()[static_cast<std::size_t>(LookupC2Count::Disagreed)] == 0, "APS5_VERIFY_LOOKUP_C2 found a binding slot or alias skip that disagreed with the full check");
     return true;
 }
 
@@ -219,6 +248,7 @@ int main(int argc, char** argv) {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const bool dataWords = argc == 2 && std::string_view(argv[1]) == "--data";
+        if (const char* mutant = std::getenv("APS5_TEST_LOOKUP_C2_MUTANT")) SetLookupC2MutantForTest(static_cast<LookupC2Mutant>(std::strtoul(mutant, nullptr, 10)));
         if (!CheckBindings(*device, block, dataWords)) return VulkanTestSkipped;
         std::cout << "draw recipes consume relocated buffers and changed shader data\n";
         return 0;

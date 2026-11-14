@@ -26,6 +26,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_recipe_data COMMAND agc_driver_draw_recipe_buffers_tests --data)
     set_tests_properties(agc_driver_draw_recipe_buffers agc_driver_draw_recipe_data PROPERTIES
             SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_recipe_buffers_lookup_c2 COMMAND agc_driver_draw_recipe_buffers_tests)
+    add_test(NAME agc_driver_draw_recipe_data_lookup_c2 COMMAND agc_driver_draw_recipe_buffers_tests --data)
+    set_tests_properties(agc_driver_draw_recipe_buffers_lookup_c2 agc_driver_draw_recipe_data_lookup_c2 PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_LOOKUP=1;APS5_VERIFY_LOOKUP_C2=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_recipe_buffers_lookup_c2_off COMMAND agc_driver_draw_recipe_buffers_tests)
+    set_tests_properties(agc_driver_draw_recipe_buffers_lookup_c2_off PROPERTIES
+            SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_LOOKUP=1;APS5_NO_LOOKUP_C2=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_draw_recipe_buffers_lookup_c2 agc_driver_draw_recipe_data_lookup_c2 agc_driver_draw_recipe_buffers_lookup_c2_off PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     if(WIN32)
         set_tests_properties(agc_driver_draw_recipe_data PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
