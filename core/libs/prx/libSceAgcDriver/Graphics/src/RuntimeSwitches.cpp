@@ -28,6 +28,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_TARGET_MEMO_OVERLAP_CACHE",
     "APS5_NO_SCOPED_PROOFS",
     "APS5_NO_LOOKUP_C2",
+    "APS5_NO_PERSISTENT_DRAW_SETS",
+    "APS5_NO_DRAW_UPLOAD_POOL",
 };
 
 struct SwitchValues {
@@ -45,6 +47,8 @@ struct SwitchValues {
             std::getenv("APS5_NO_TARGET_MEMO_OVERLAP_CACHE") != nullptr,
             std::getenv("APS5_NO_SCOPED_PROOFS") != nullptr,
             std::getenv("APS5_NO_LOOKUP_C2") != nullptr,
+            std::getenv("APS5_NO_PERSISTENT_DRAW_SETS") != nullptr,
+            std::getenv("APS5_NO_DRAW_UPLOAD_POOL") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

@@ -3469,13 +3469,37 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+std::size_t Recorder::DrawUploadChunkBytes() {
+    return RuntimeSwitches::Set(RuntimeSwitch::NoDrawUploadPool) ? DrawUploadChunk : PooledDrawUploadChunk;
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
     if (drawUpload == nullptr || offset + bytes > drawUpload->Bytes().size()) {
-        drawUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        const auto chunk = DrawUploadChunkBytes();
+        std::shared_ptr<Buffer> next;
+        if (chunk == PooledDrawUploadChunk && bytes <= chunk) {
+            if (drawUpload != nullptr && drawUpload->Bytes().size() == PooledDrawUploadChunk) drawUploadPool.push_back(std::move(drawUpload));
+            const auto idle = std::find_if(drawUploadPool.begin(), drawUploadPool.end(), [](const std::shared_ptr<Buffer>& held) { return held.use_count() == 1; });
+            if (idle != drawUploadPool.end()) {
+                std::atomic_thread_fence(std::memory_order_acquire);
+                next = std::move(*idle);
+                drawUploadPool.erase(idle);
+                if (DrawSetCountsProfiled()) DrawSetCountTallies().pooledChunks.Add();
+            }
+            while (drawUploadPool.size() > DrawUploadPoolEntries) {
+                const auto spare = std::find_if(drawUploadPool.begin(), drawUploadPool.end(), [](const std::shared_ptr<Buffer>& held) { return held.use_count() == 1; });
+                if (spare == drawUploadPool.end()) break;
+                drawUploadPool.erase(spare);
+            }
+        }
+        if (next == nullptr) {
+            next = std::make_shared<Buffer>(context, std::max(chunk, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            if (DrawSetCountsProfiled()) DrawSetCountTallies().uploadChunks.Add();
+        }
+        drawUpload = std::move(next);
         offset = 0;
-        if (DrawSetCountsProfiled()) DrawSetCountTallies().uploadChunks.Add();
     }
     drawUploadUsed = offset + bytes;
     return {drawUpload, offset, drawUpload->Bytes().data() + offset};

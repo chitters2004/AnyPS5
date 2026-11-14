@@ -244,6 +244,10 @@ public:
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, std::size_t from = 0, std::uint32_t lowest = 0, bool ownedInsertion = false);
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
+    static constexpr std::size_t PooledDrawUploadChunk = std::size_t{16} << 20u;
+    static constexpr std::size_t DrawUploadPoolEntries = 8;
+    static std::size_t DrawUploadChunkBytes();
+    std::size_t DrawUploadPoolSize() const { return drawUploadPool.size(); }
     struct UploadSlice {
         std::shared_ptr<Buffer> buffer;
         VkDeviceSize offset = 0;
@@ -1042,6 +1046,7 @@ private:
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
     std::shared_ptr<Buffer> drawUpload;
+    std::vector<std::shared_ptr<Buffer>> drawUploadPool;
     VkDeviceSize drawUploadUsed = 0;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
