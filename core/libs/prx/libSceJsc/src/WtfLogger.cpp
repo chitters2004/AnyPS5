@@ -1,3 +1,4 @@
+// Derived from Source/WTF/wtf/Logger.cpp@c55364d53f971f63a709976f168d932d558b8909
 /*
  * Copyright (C) 2019 Apple Inc. All rights reserved.
  *
