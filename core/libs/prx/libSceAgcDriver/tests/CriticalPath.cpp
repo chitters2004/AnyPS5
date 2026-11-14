@@ -52,6 +52,20 @@ void testFormat() {
     check(text == "{\"present\":7,\"begin_ns\":100,\"end_ns\":33100,\"ring_depth\":64,\"threads\":[{\"name\":\"draw \\\"committer\\\"\",\"role\":\"committer\",\"cpu_ns\":30000,\"commit_busy_ns\":29000,\"commits\":3,\"gpu_wait_behind_ns\":{\"worker\":500}}]}", "the row format is wrong: " + text);
 }
 
+void testCompareFrames() {
+    const auto draw = [](std::uint32_t index, std::uint64_t exact, std::uint64_t masked, std::uint64_t shaders) {
+        return CP::RepeatDraw{0, 0, index, {exact, masked, shaders}};
+    };
+    std::vector<CP::RepeatDraw> previous{draw(4, 1, 2, 3), draw(0, 1, 2, 3), draw(1, 1, 2, 3), draw(2, 1, 2, 3), draw(3, 1, 2, 3)};
+    std::vector<CP::RepeatDraw> current{draw(0, 1, 2, 3), draw(1, 1, 2, 3), draw(2, 9, 2, 3), draw(3, 1, 2, 3), draw(4, 9, 9, 3), draw(5, 1, 2, 3)};
+    const auto stats = CP::CompareFrames(previous, current);
+    check(stats.draws == 6 && stats.positioned == 5, "the draw counts are wrong");
+    check(stats.matched[0] == 3 && stats.matched[1] == 4 && stats.matched[2] == 4, "the match counts are wrong");
+    check(stats.runs[0] == 2 && stats.runP50[0] == 1 && stats.runMax[0] == 2, "the exact runs are wrong");
+    check(stats.runs[1] == 1 && stats.runP50[1] == 4 && stats.runP90[1] == 4 && stats.runMax[1] == 4, "the masked runs are wrong");
+    check(stats.runs[2] == 1 && stats.runMax[2] == 4 && stats.inLongRuns[2] == 0, "a shader match counted without a masked match");
+}
+
 std::vector<std::string> lines(const std::filesystem::path& path) {
     std::ifstream file(path);
     std::vector<std::string> result;
@@ -77,8 +91,12 @@ void testWindow(const std::filesystem::path& directory) {
         CP::Add(CP::Measure::Collects, 1);
     });
     other.join();
+    CP::NoteDraw(0, 5, {1, 2, 3});
+    CP::NoteDraw(0, 5, {4, 5, 6});
     CP::Present(11);
     CP::Add(CP::Measure::RoomWait, 900);
+    CP::NoteDraw(0, 9, {1, 2, 3});
+    CP::NoteDraw(0, 9, {7, 5, 6});
     CP::CloseWindow(12, directory, "critical.jsonl");
     check(!CP::Active(), "the recorder is active after its window closes");
     CP::Add(CP::Measure::RoomWait, 1);
@@ -88,6 +106,8 @@ void testWindow(const std::filesystem::path& directory) {
     check(contains(rows[1], "\"present\":11") && contains(rows[1], "\"name\":\"draw committer\",\"role\":\"committer\",\"cpu_ns\":"), "the first frame misses the committer: " + rows[1]);
     check(contains(rows[1], "\"commit_busy_ns\":2500,\"commits\":2,\"occupancy_max\":5") && contains(rows[1], "\"gpu_acquires\":1"), "the first frame misses the committer's measures: " + rows[1]);
     check(contains(rows[1], "\"name\":\"\",\"role\":\"other\"") && contains(rows[1], "\"gpu_wait_ns\":700") && contains(rows[1], "\"gpu_wait_behind_ns\":{\"committer\":700}") && contains(rows[1], "\"collects\":1"), "the first frame misses the unbound thread's lock wait and collect: " + rows[1]);
+    check(contains(rows[1], "\"repeat\":{\"draws\":2,\"positioned\":0,\"exact\":{\"matched\":0"), "the first frame misses its draw census: " + rows[1]);
+    check(contains(rows[2], "\"repeat\":{\"draws\":2,\"positioned\":2,\"exact\":{\"matched\":1,\"runs\":1,\"run_p50\":1,\"run_p90\":1,\"run_max\":1,\"in_runs_16\":0},\"masked\":{\"matched\":2,\"runs\":1,\"run_p50\":2"), "the second frame's census is wrong: " + rows[2]);
     check(contains(rows[2], "\"present\":12") && contains(rows[2], "\"room_wait_ns\":900") && !contains(rows[2], "commit_busy"), "the second frame is wrong: " + rows[2]);
 }
 
@@ -96,15 +116,18 @@ void testWindow(const std::filesystem::path& directory) {
 int main() {
 #ifdef _WIN32
     _putenv_s("APS5_TRACE_CRITICAL", "1");
+    _putenv_s("APS5_TRACE_REPEAT", "1");
     const auto process = static_cast<unsigned long>(_getpid());
 #else
     setenv("APS5_TRACE_CRITICAL", "1", 1);
+    setenv("APS5_TRACE_REPEAT", "1", 1);
     const auto process = static_cast<unsigned long>(getpid());
 #endif
     const auto directory = std::filesystem::temp_directory_path() / ("aps5-critical-path-test-" + std::to_string(process));
     std::filesystem::remove_all(directory);
     testRoles();
     testFormat();
+    testCompareFrames();
     testWindow(directory);
     std::filesystem::remove_all(directory);
     std::puts("critical path tests passed");

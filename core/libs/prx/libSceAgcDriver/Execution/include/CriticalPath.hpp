@@ -63,12 +63,37 @@ struct ThreadRow {
     std::array<std::array<std::uint64_t, RoleCount>, LockCount> waitedBehind{};
 };
 
+constexpr std::size_t RepeatLevels = 3;
+
+struct RepeatDraw {
+    std::uint32_t queue = 0;
+    std::uint32_t submission = 0;
+    std::uint32_t index = 0;
+    std::array<std::uint64_t, RepeatLevels> hashes{};
+};
+
+struct RepeatStats {
+    std::uint64_t draws = 0;
+    std::uint64_t positioned = 0;
+    std::array<std::uint64_t, RepeatLevels> matched{};
+    std::array<std::uint64_t, RepeatLevels> runs{};
+    std::array<std::uint64_t, RepeatLevels> runP50{};
+    std::array<std::uint64_t, RepeatLevels> runP90{};
+    std::array<std::uint64_t, RepeatLevels> runMax{};
+    std::array<std::uint64_t, RepeatLevels> inLongRuns{};
+};
+
+constexpr std::uint64_t LongRun = 16;
+
+RepeatStats CompareFrames(std::vector<RepeatDraw> previous, std::vector<RepeatDraw> current);
+
 struct FrameRow {
     std::uint64_t present = 0;
     std::uint64_t beginNs = 0;
     std::uint64_t endNs = 0;
     std::uint64_t ringDepth = 0;
     std::vector<ThreadRow> threads;
+    std::optional<RepeatStats> repeat;
 };
 
 std::string FormatRow(const FrameRow& row);
@@ -81,6 +106,15 @@ inline bool Active() {
     static const bool switched = Switched();
     return switched && Window.load(std::memory_order_relaxed);
 }
+
+bool RepeatSwitched();
+
+inline bool RepeatActive() {
+    static const bool switched = RepeatSwitched();
+    return switched && Window.load(std::memory_order_relaxed);
+}
+
+void NoteDraw(std::uint32_t queue, std::uint64_t submissionSerial, const std::array<std::uint64_t, RepeatLevels>& hashes);
 
 std::uint64_t NowNs();
 void BindThread(const char* name);

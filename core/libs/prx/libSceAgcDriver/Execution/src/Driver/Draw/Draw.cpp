@@ -2,7 +2,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CriticalPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
@@ -13,6 +15,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
 #include <array>
@@ -307,8 +310,74 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
 
 }
 
+namespace {
+
+void noteRepeatDraw(const QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission) {
+    static const auto arena = [] {
+        std::pair<std::uintptr_t, std::size_t> range{};
+        GuestArena::GuestArenaRange_nid_postfix(&range.first, &range.second);
+        return range;
+    }();
+    const auto guestAddress = [](std::uint32_t low, std::uint32_t high) {
+        const auto address = static_cast<std::uint64_t>(low) | (static_cast<std::uint64_t>(high & 0xffffu) << 32u);
+        return address >= arena.first && address - arena.first < arena.second;
+    };
+    std::uint64_t exact = 0xcbf29ce484222325ull;
+    std::uint64_t masked = 0xcbf29ce484222325ull;
+    const auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull; };
+    const auto mixWords = [&](std::span<const std::uint32_t> words, std::span<const std::uint32_t> offsets) {
+        for (std::size_t i = 0; i < words.size(); ++i) {
+            const auto offset = offsets.empty() ? 0u : offsets[i];
+            mix(exact, offset);
+            mix(exact, words[i]);
+            mix(masked, offset);
+            const bool pair = i + 1 < words.size() && (offsets.empty() || offsets[i + 1] == offset + 1);
+            if (pair && guestAddress(words[i], words[i + 1])) {
+                mix(exact, words[i + 1]);
+                mix(masked, offset + 1);
+                mix(masked, words[i + 1] & 0xffff0000u);
+                ++i;
+                continue;
+            }
+            mix(masked, words[i]);
+        }
+    };
+    mixWords(packet, {});
+    std::array<std::uint32_t, 116> userWords{};
+    std::array<std::uint32_t, 116> userOffsets{};
+    std::size_t users = 0;
+    const auto collect = [&](std::uint32_t base, std::uint32_t count) {
+        for (auto it = queue.shader.lower_bound(base); it != queue.shader.end() && it->first < base + count && users < userWords.size(); ++it) {
+            userOffsets[users] = it->first;
+            userWords[users++] = it->second;
+        }
+    };
+    collect(0x00cu, 32);
+    collect(0x04cu, 16);
+    collect(0x08cu, 32);
+    collect(0x10cu, 32);
+    collect(0x082u, 2);
+    collect(0x102u, 2);
+    mixWords(std::span(userWords).first(users), std::span(userOffsets).first(users));
+    std::uint64_t shape = 0;
+    mix(exact, RegisterStateKey(queue, true, true, &shape));
+    mix(masked, shape);
+    mix(exact, queue.indexBase);
+    mix(exact, queue.drawIndirectBase);
+    for (const auto value : {static_cast<std::uint64_t>(queue.indexBufferSize.value_or(~0u)), std::uint64_t{queue.indexType}, std::uint64_t{queue.instanceCount}}) {
+        mix(exact, value);
+        mix(masked, value);
+    }
+    auto shaders = masked;
+    if (submission.shaders != nullptr) mix(shaders, DrawShaderSetKey(queue, *submission.shaders));
+    CriticalPath::NoteDraw(submission.queue, submission.serial, {exact, masked, shaders});
+}
+
+}
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
+    if (CriticalPath::RepeatActive()) noteRepeatDraw(queue, packet, submission);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;

@@ -88,6 +88,22 @@ class CriticalPathTests(unittest.TestCase):
         self.assertIn("5 frames, frame p50 30.0 ms; verdicts: committer 1, producer 1, shared-lock 1, write-watch 1, mixed 1", text)
         self.assertIn("... 3 more frames", text)
 
+    def test_repeat_census(self):
+        census = {"draws": 200, "positioned": 190, "exact": {"matched": 50, "runs": 10, "run_p50": 4, "run_p90": 9, "run_max": 12, "in_runs_16": 0},
+                  "masked": {"matched": 150, "runs": 5, "run_p50": 20, "run_p90": 40, "run_max": 60, "in_runs_16": 120},
+                  "masked_shaders": {"matched": 140, "runs": 6, "run_p50": 18, "run_p90": 40, "run_max": 60, "in_runs_16": 110}}
+        first = dict(ROWS[0], repeat={"draws": 180, "positioned": 0})
+        second = dict(ROWS[1], repeat=census)
+        result = self.run_json(self.write([first, second]))
+        self.assertAlmostEqual(result["frames"][1]["repeat"]["masked"]["share"], 0.75)
+        self.assertAlmostEqual(result["frames"][1]["repeat"]["masked_shaders"]["share_in_runs_16"], 0.55)
+        self.assertEqual(result["summary"]["repeat"]["frames"], 1)
+        self.assertAlmostEqual(result["summary"]["repeat"]["exact"]["share"], 0.25)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(critical_path.main([str(self.write([first, second]))]), 0)
+        self.assertIn("median over 1 frames of 200 draws: exact  25.0% (runs p50 4, p90 9,   0.0% in runs of 16+), masked  75.0%", out.getvalue())
+
     def test_rejects_other_files(self):
         path = self.write([], header={"format": "other"})
         with redirect_stdout(io.StringIO()):

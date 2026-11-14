@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 #ifdef _WIN32
 #include <intrin.h>
@@ -34,6 +35,40 @@ struct Slot {
     bool timed = false;
     std::uint64_t lastCpu = 0;
 };
+
+struct QueuePosition {
+    std::uint64_t serial = 0;
+    std::uint32_t submission = 0;
+    std::uint32_t index = 0;
+    bool seen = false;
+};
+
+struct Census {
+    std::mutex mutex;
+    std::vector<RepeatDraw> current;
+    std::vector<RepeatDraw> previous;
+    std::array<QueuePosition, 16> positions{};
+    bool hasPrevious = false;
+};
+
+Census& census() {
+    static auto& value = *new Census();
+    return value;
+}
+
+std::optional<RepeatStats> takeCensus() {
+    if (!RepeatSwitched()) return std::nullopt;
+    auto& c = census();
+    std::lock_guard lock(c.mutex);
+    std::optional<RepeatStats> stats;
+    if (c.hasPrevious) stats = CompareFrames(c.previous, c.current);
+    else stats = RepeatStats{.draws = c.current.size()};
+    std::swap(c.previous, c.current);
+    c.current.clear();
+    c.positions = {};
+    c.hasPrevious = true;
+    return stats;
+}
 
 struct State {
     std::mutex mutex;
@@ -130,6 +165,7 @@ void collect(State& s, std::uint64_t present, std::uint64_t now) {
     }
     auto shared = take(s.shared, false);
     if (!emptyRow(shared)) row.threads.push_back(std::move(shared));
+    row.repeat = takeCensus();
     s.rows.push_back(std::move(row));
     s.lastNs = now;
 }
@@ -210,8 +246,102 @@ std::string FormatRow(const FrameRow& row) {
         }
         text += '}';
     }
-    text += "]}";
+    text += ']';
+    if (row.repeat.has_value()) {
+        const auto& r = *row.repeat;
+        text += ",\"repeat\":{\"draws\":";
+        appendNumber(text, r.draws);
+        text += ",\"positioned\":";
+        appendNumber(text, r.positioned);
+        constexpr std::array<std::string_view, RepeatLevels> levels{"exact", "masked", "masked_shaders"};
+        for (std::size_t l = 0; l < RepeatLevels; ++l) {
+            text += ",\"";
+            text += levels[l];
+            text += "\":{\"matched\":";
+            appendNumber(text, r.matched[l]);
+            text += ",\"runs\":";
+            appendNumber(text, r.runs[l]);
+            text += ",\"run_p50\":";
+            appendNumber(text, r.runP50[l]);
+            text += ",\"run_p90\":";
+            appendNumber(text, r.runP90[l]);
+            text += ",\"run_max\":";
+            appendNumber(text, r.runMax[l]);
+            text += ",\"in_runs_16\":";
+            appendNumber(text, r.inLongRuns[l]);
+            text += '}';
+        }
+        text += '}';
+    }
+    text += '}';
     return text;
+}
+
+RepeatStats CompareFrames(std::vector<RepeatDraw> previous, std::vector<RepeatDraw> current) {
+    const auto position = [](const RepeatDraw& draw) { return std::tuple(draw.queue, draw.submission, draw.index); };
+    const auto before = [&](const RepeatDraw& a, const RepeatDraw& b) { return position(a) < position(b); };
+    std::ranges::sort(previous, before);
+    std::ranges::sort(current, before);
+    RepeatStats stats;
+    stats.draws = current.size();
+    std::array<std::vector<std::uint64_t>, RepeatLevels> lengths;
+    std::array<std::uint64_t, RepeatLevels> run{};
+    const auto close = [&](std::size_t level) {
+        if (run[level] == 0) return;
+        lengths[level].push_back(run[level]);
+        if (run[level] >= LongRun) stats.inLongRuns[level] += run[level];
+        run[level] = 0;
+    };
+    auto old = previous.begin();
+    for (const auto& draw : current) {
+        while (old != previous.end() && position(*old) < position(draw)) ++old;
+        const bool placed = old != previous.end() && position(*old) == position(draw);
+        if (placed) ++stats.positioned;
+        bool lower = true;
+        for (std::size_t level = 0; level < RepeatLevels; ++level) {
+            const bool same = placed && old->hashes[level] == draw.hashes[level] && (level < 2 || lower);
+            if (level == 1) lower = same;
+            if (same) {
+                ++stats.matched[level];
+                ++run[level];
+            } else {
+                close(level);
+            }
+        }
+    }
+    for (std::size_t level = 0; level < RepeatLevels; ++level) {
+        close(level);
+        auto& values = lengths[level];
+        stats.runs[level] = values.size();
+        if (values.empty()) continue;
+        std::ranges::sort(values);
+        stats.runP50[level] = values[(values.size() - 1) / 2];
+        stats.runP90[level] = values[(values.size() - 1) * 9 / 10];
+        stats.runMax[level] = values.back();
+    }
+    return stats;
+}
+
+bool RepeatSwitched() {
+    static const bool switched = [] {
+        const char* value = std::getenv("APS5_TRACE_REPEAT");
+        return value != nullptr && *value != '\0' && std::string_view(value) != "0";
+    }();
+    return switched;
+}
+
+void NoteDraw(std::uint32_t queue, std::uint64_t submissionSerial, const std::array<std::uint64_t, RepeatLevels>& hashes) {
+    auto& c = census();
+    std::lock_guard lock(c.mutex);
+    auto& at = c.positions[queue % c.positions.size()];
+    if (!at.seen || at.serial != submissionSerial) {
+        if (at.seen) ++at.submission;
+        at.serial = submissionSerial;
+        at.index = 0;
+        at.seen = true;
+    }
+    if (c.current.capacity() == 0) c.current.reserve(65536);
+    c.current.push_back({queue, at.submission, at.index++, hashes});
 }
 
 bool Switched() {
@@ -285,8 +415,16 @@ void SetRingDepth(std::uint64_t depth) {
 }
 
 void OpenWindow(std::uint64_t present) {
-    static const bool switched = Switched();
+    static const bool switched = Switched() || RepeatSwitched();
     if (!switched) return;
+    if (RepeatSwitched()) {
+        auto& c = census();
+        std::lock_guard lock(c.mutex);
+        c.current.clear();
+        c.previous.clear();
+        c.positions = {};
+        c.hasPrevious = false;
+    }
     auto& s = state();
     std::lock_guard lock(s.mutex);
     for (auto& entry : s.slots) take(*entry, true);
@@ -300,14 +438,14 @@ void OpenWindow(std::uint64_t present) {
 }
 
 void Present(std::uint64_t present) {
-    if (!Active()) return;
+    if (!Active() && !RepeatActive()) return;
     auto& s = state();
     std::lock_guard lock(s.mutex);
     collect(s, present, NowNs());
 }
 
 void CloseWindow(std::uint64_t present, const std::filesystem::path& directory, const std::string& name) {
-    if (!Active()) return;
+    if (!Active() && !RepeatActive()) return;
     Window.store(false, std::memory_order_relaxed);
     auto& s = state();
     std::vector<FrameRow> rows;

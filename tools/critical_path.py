@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Turn one APS5_TRACE_CRITICAL file into a per-frame verdict on what limits the frame."""
+"""Turn one APS5_TRACE_CRITICAL file into a per-frame verdict on what limits the frame, and report the
+APS5_TRACE_REPEAT census of draws that repeat the previous frame's draw at the same stream position."""
 
 import argparse
 import json
@@ -8,6 +9,7 @@ import sys
 from pathlib import Path
 
 VERDICTS = ("committer", "producer", "shared-lock", "write-watch", "mixed")
+LEVELS = ("exact", "masked", "masked_shaders")
 WAITS = ("commit_idle_ns", "room_wait_ns", "finisher_room_wait_ns", "finisher_idle_ns", "drain_wait_ns", "worker_idle_ns", "gpu_wait_ns", "tracker_wait_ns")
 
 
@@ -53,6 +55,24 @@ def producer_of(threads):
     if not producers:
         return None
     return max(producers, key=lambda thread: thread.get("enqueues", 0))
+
+
+def repeat_of(row):
+    census = row.get("repeat")
+    if census is None:
+        return None
+    draws = census.get("draws", 0)
+    result = {"draws": draws, "positioned": census.get("positioned", 0)}
+    for level in LEVELS:
+        values = census.get(level, {})
+        result[level] = {
+            "share": values.get("matched", 0) / draws if draws else 0.0,
+            "run_p50": values.get("run_p50", 0),
+            "run_p90": values.get("run_p90", 0),
+            "run_max": values.get("run_max", 0),
+            "share_in_runs_16": values.get("in_runs_16", 0) / draws if draws else 0.0,
+        }
+    return result
 
 
 def frame(row, limits):
@@ -108,6 +128,7 @@ def frame(row, limits):
         "gpu_wait_behind_committer_side": behind(threads, "gpu", "committer"),
         "gpu_wait_behind_worker_side": behind(threads, "gpu", "worker"),
         "not_running_unrecorded": unaccounted,
+        "repeat": repeat_of(row),
     }
 
 
@@ -119,8 +140,14 @@ def summarize(frames):
     if frames:
         for key in frames[0]["shares"]:
             medians[key] = statistics.median(entry["shares"][key] for entry in frames)
+    compared = [entry["repeat"] for entry in frames if entry.get("repeat") and entry["repeat"]["positioned"]]
+    repeat = None
+    if compared:
+        repeat = {"frames": len(compared), "draws_p50": statistics.median(entry["draws"] for entry in compared)}
+        for level in LEVELS:
+            repeat[level] = {key: statistics.median(entry[level][key] for entry in compared) for key in ("share", "run_p50", "run_p90", "share_in_runs_16")}
     leading = max(VERDICTS, key=lambda verdict: counts[verdict]) if frames else None
-    return {"frames": len(frames), "verdicts": counts, "leading": leading, "median_shares": medians,
+    return {"frames": len(frames), "verdicts": counts, "leading": leading, "median_shares": medians, "repeat": repeat,
             "frame_ms_p50": statistics.median(entry["frame_ms"] for entry in frames) if frames else 0.0}
 
 
@@ -132,6 +159,10 @@ def report(header, frames, summary, out, limit):
     out.write(f"{summary['frames']} frames, frame p50 {summary['frame_ms_p50']:.1f} ms; verdicts: " + ", ".join(f"{name} {count}" for name, count in summary["verdicts"].items() if count) + "\n")
     out.write(f"leading: {summary['leading']}\n")
     out.write("median shares of the frame: " + ", ".join(f"{name} {percent(value)}" for name, value in summary["median_shares"].items()) + "\n")
+    repeat = summary.get("repeat")
+    if repeat:
+        out.write(f"draws repeating the previous frame at the same position, median over {repeat['frames']} frames of {repeat['draws_p50']:.0f} draws: ")
+        out.write(", ".join(f"{level} {percent(repeat[level]['share'])} (runs p50 {repeat[level]['run_p50']:.0f}, p90 {repeat[level]['run_p90']:.0f}, {percent(repeat[level]['share_in_runs_16'])} in runs of 16+)" for level in LEVELS) + "\n")
     out.write("present  frame_ms  verdict      commit busy  idle   room wait  ring occ/depth  gpu lock  tracker  collect\n")
     for entry in frames[:limit]:
         shares = entry["shares"]
@@ -142,7 +173,7 @@ def report(header, frames, summary, out, limit):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("file", type=Path, help="aps5-critical-<commit>-<pid>.jsonl written by an APS5_TRACE_CRITICAL=1 trace window")
+    parser.add_argument("file", type=Path, help="aps5-critical-<commit>-<pid>.jsonl written by an APS5_TRACE_CRITICAL=1 or APS5_TRACE_REPEAT=1 trace window")
     parser.add_argument("--busy", type=float, default=0.85, help="committer busy share of the frame that counts as saturated (default 0.85)")
     parser.add_argument("--wait", type=float, default=0.10, help="share of the frame a wait must reach to count (default 0.10)")
     parser.add_argument("--full", type=float, default=0.75, help="mean ring occupancy, as a share of its depth, that counts as full (default 0.75)")
