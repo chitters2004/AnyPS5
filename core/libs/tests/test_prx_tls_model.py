@@ -19,7 +19,7 @@ R_X86_64_TPOFF64 = 18
 R_X86_64_TLSDESC = 36
 
 DIRECTORY = None
-EXPECT_DESCRIPTORS = False
+FIXTURES = {}
 
 
 class Library:
@@ -80,9 +80,23 @@ class PrxTlsModelTest(unittest.TestCase):
         static = [f"{library.path.name} ({library.tls_bytes} bytes of TLS)" for library in self.libraries() if library.flags & DF_STATIC_TLS]
         self.assertEqual(static, [], "these libraries are marked DF_STATIC_TLS, so a dlopen after startup fails once their TLS no longer fits glibc's static surplus: " + ", ".join(static))
 
+    def test_each_language_uses_descriptors(self):
+        if not any(expected for expected, _ in FIXTURES.values()):
+            self.skipTest("neither the C nor the C++ compiler takes -mtls-dialect=gnu2")
+        for language, (expected, path) in FIXTURES.items():
+            with self.subTest(language=language):
+                if not expected:
+                    continue
+                fixture = Library(Path(path))
+                self.assertGreater(fixture.tls_bytes, 0, f"the {language} fixture {fixture.path.name} has no thread-local storage")
+                self.assertFalse(fixture.flags & DF_STATIC_TLS, f"the {language} fixture {fixture.path.name} is marked DF_STATIC_TLS")
+                self.assertFalse(fixture.relocations.get(R_X86_64_DTPMOD64), f"the {language} compiler took -mtls-dialect=gnu2, but {fixture.path.name} still reaches thread-local storage through __tls_get_addr")
+                self.assertTrue(fixture.relocations.get(R_X86_64_TLSDESC), f"the {language} compiler took -mtls-dialect=gnu2, but {fixture.path.name} has no TLS descriptor")
+
     def test_thread_locals_use_descriptors(self):
-        if not EXPECT_DESCRIPTORS:
-            self.skipTest("the compiler does not take -mtls-dialect=gnu2")
+        missing = [language for language, (expected, _) in FIXTURES.items() if not expected]
+        if missing:
+            self.skipTest("the " + " and ".join(missing) + " compiler does not take -mtls-dialect=gnu2, and a library mixes both languages")
         libraries = self.libraries()
         dynamic = [f"{library.path.name} ({library.relocations[R_X86_64_DTPMOD64]})" for library in libraries if library.relocations.get(R_X86_64_DTPMOD64)]
         self.assertEqual(dynamic, [], "these libraries still reach thread-local storage through __tls_get_addr (R_X86_64_DTPMOD64 relocations): " + ", ".join(dynamic))
@@ -90,9 +104,13 @@ class PrxTlsModelTest(unittest.TestCase):
         self.assertTrue(described, "no library reaches its thread-local storage through a TLS descriptor")
 
 
+def enabled(value):
+    return value not in ("", "0", "OFF", "FALSE")
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        sys.exit("usage: test_prx_tls_model.py <prx directory> <descriptors expected: 0 or 1>")
+    if len(sys.argv) != 6:
+        sys.exit("usage: test_prx_tls_model.py <prx directory> <C descriptors: 0 or 1> <C fixture> <C++ descriptors: 0 or 1> <C++ fixture>")
     DIRECTORY = sys.argv[1]
-    EXPECT_DESCRIPTORS = sys.argv[2] not in ("", "0", "OFF", "FALSE")
+    FIXTURES = {"C": (enabled(sys.argv[2]), sys.argv[3]), "C++": (enabled(sys.argv[4]), sys.argv[5])}
     unittest.main(argv=sys.argv[:1])
