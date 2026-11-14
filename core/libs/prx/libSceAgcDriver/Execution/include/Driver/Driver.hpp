@@ -86,6 +86,10 @@ public:
     void ReleaseSettled();
     bool SettledHeld();
     bool Settled();
+    void EnablePollPause();
+    void PausePolls();
+    void ResumePolls();
+    std::uint64_t GuardedProbes() const;
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void AttachWindow(const PresentationWindow& window);
@@ -445,6 +449,32 @@ private:
     static bool stillAwaited(const AwaitedSlot& slot, std::uint64_t awaited);
     void noteWaitFields(std::uint32_t queue, std::span<const std::uint32_t> packet);
     std::atomic<bool> captureHold{false};
+    std::atomic<bool> pollPauseEnabled{false};
+    std::atomic<std::uint32_t> pollPauses{0};
+    std::atomic<std::uint32_t> activeProbes{0};
+    std::atomic<std::uint64_t> guardedProbes{0};
+    template <typename Probe>
+    auto probeGuest(Probe&& probe) {
+        if (!pollPauseEnabled.load(std::memory_order_relaxed)) [[likely]] return probe();
+        return pausedProbe(std::forward<Probe>(probe));
+    }
+    template <typename Probe>
+    auto pausedProbe(Probe&& probe) {
+        guardedProbes.fetch_add(1, std::memory_order_relaxed);
+        for (;;) {
+            activeProbes.fetch_add(1, std::memory_order_seq_cst);
+            if (pollPauses.load(std::memory_order_seq_cst) == 0) {
+                struct Leave {
+                    std::atomic<std::uint32_t>& probes;
+                    ~Leave() { probes.fetch_sub(1, std::memory_order_release); }
+                } leave{activeProbes};
+                return probe();
+            }
+            activeProbes.fetch_sub(1, std::memory_order_release);
+            waitPollsResumed();
+        }
+    }
+    void waitPollsResumed();
     std::atomic<std::uint64_t> flipSerial{0};
     std::atomic<std::uint64_t> flipBatchesUnsignaled{0};
 

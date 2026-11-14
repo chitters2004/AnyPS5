@@ -337,6 +337,10 @@ std::pair<std::uint64_t, std::uint64_t> progress() {
 struct Replay {
     const Options& options;
     const FrameCaptureReader& reader;
+    const bool pausesPolls = [] {
+        AgcDriverEnablePollPause_nid_postfix();
+        return true;
+    }();
     Frames& frames = *new Frames;
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
@@ -368,6 +372,13 @@ struct Replay {
         ~SettledHold() {
             if (held) AgcDriverReleaseSettled_nid_postfix();
         }
+    };
+
+    struct PausedPolls {
+        PausedPolls() { AgcDriverPausePolls_nid_postfix(); }
+        ~PausedPolls() { AgcDriverResumePolls_nid_postfix(); }
+        PausedPolls(const PausedPolls&) = delete;
+        PausedPolls& operator=(const PausedPolls&) = delete;
     };
 
     double paceWaitedSeconds() const {
@@ -503,6 +514,7 @@ struct Replay {
                 paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
                 if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
                 parkedAsCaptured = !pacing || !settled || call.values.size() < 2 || atCapturedPark(call);
+                const PausedPolls paused;
                 staged = restoreGroup(call.values.at(0), false, heldWaits());
             }
             releaseStaged(staged);
@@ -538,6 +550,7 @@ struct Replay {
             if (atCapturedPark(call) && AgcDriverHoldSettled_nid_postfix(0)) {
                 const SettledHold hold{true};
                 if (!atCapturedPark(call)) continue;
+                const PausedPolls paused;
                 restoreGroup(call.values.at(0), true);
                 ++parkRestores;
                 break;
@@ -625,6 +638,7 @@ struct Replay {
             std::memcpy(&value, bytes.data() + (wait.address - chunk->address), sizeof(value));
             if ((value & AgcDriver::Pm4::RewindValid) == 0 || !AgcDriverHoldSettled_nid_postfix(0)) return false;
             const SettledHold hold{true};
+            const PausedPolls paused;
             restoreGroup(call.values.at(0), false);
             return true;
         }

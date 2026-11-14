@@ -1202,6 +1202,78 @@ void testWorkerFailure() {
     check(expectFailure([&] { sceAgcDriverSubmitAcb(0x20, &packet); }) == messages[0], "subsequent ACB lost worker failure");
 }
 
+std::uint32_t loadAcquire(volatile std::uint32_t* address) {
+    return std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(address)).load(std::memory_order_acquire);
+}
+
+void storeRelease(volatile std::uint32_t* address, std::uint32_t value) {
+    std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(address)).store(value, std::memory_order_release);
+}
+
+void awaitParked(volatile std::uint32_t* gate, std::uint32_t queue, const char* message) {
+    const auto address = reinterpret_cast<std::uintptr_t>(gate);
+    const auto start = std::chrono::steady_clock::now();
+    while (AgcDriver::DriverDetail::DriverTestAccess::AwaitedAddress(queue) != address) {
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
+void awaitValue(volatile std::uint32_t* address, std::uint32_t value, const char* message) {
+    const auto start = std::chrono::steady_clock::now();
+    while (loadAcquire(address) != value) {
+        check(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), message);
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+}
+
+void testPollPauseDisabled() {
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    alignas(64) static volatile std::uint32_t gate = 0, done = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), writeData(&done, 1)));
+    awaitParked(&gate, 0x20, "the queue never parked on its gate");
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    storeRelease(&gate, 1);
+    awaitValue(&done, 1, "the queue never passed its released gate");
+    AgcDriverWaitIdle_nid_postfix();
+    check(driver.GuardedProbes() == 0, "a parked wait took the guarded probe without the poll pause enabled");
+    check(expectFailure([] { AgcDriverPausePolls_nid_postfix(); }).find("not enabled") != std::string::npos, "the polls paused without the poll pause enabled");
+    alignas(64) static volatile std::uint32_t parkedGate = 0;
+    submit(0x20, commands(waitEqual(&parkedGate, 1)));
+    awaitParked(&parkedGate, 0x20, "the queue never parked on its second gate");
+    check(expectFailure([] { AgcDriverEnablePollPause_nid_postfix(); }).find("while every queue is idle") != std::string::npos, "the poll pause was enabled while a queue was parked");
+    storeRelease(&parkedGate, 1);
+    AgcDriverWaitIdle_nid_postfix();
+    check(driver.GuardedProbes() == 0, "a parked wait took the guarded probe without the poll pause enabled");
+}
+
+void testPollPause() {
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    alignas(64) static volatile std::uint32_t warm = 0;
+    submit(0x20, commands(writeData(&warm, 1)));
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverEnablePollPause_nid_postfix();
+    AgcDriverEnablePollPause_nid_postfix();
+    alignas(64) static volatile std::uint32_t gate = 0, done = 0;
+    submit(0x20, commands(waitEqual(&gate, 1), writeData(&done, 1)));
+    awaitParked(&gate, 0x20, "the queue never parked on its gate");
+    check(driver.GuardedProbes() != 0, "a parked wait did not take the guarded probe with the poll pause enabled");
+    for (int round = 0; round < 3; ++round) {
+        AgcDriverPausePolls_nid_postfix();
+        AgcDriverPausePolls_nid_postfix();
+        const std::uint32_t open = round == 2 ? 1u : 0u;
+        std::memcpy(const_cast<std::uint32_t*>(&gate), &open, sizeof(open));
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        check(loadAcquire(&done) == 0, "the queue read its gate while the polls were paused");
+        AgcDriverResumePolls_nid_postfix();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        check(loadAcquire(&done) == 0, "the queue read its gate while one pause was still held");
+        AgcDriverResumePolls_nid_postfix();
+    }
+    awaitValue(&done, 1, "the queue never saw the gate written during the pause");
+    AgcDriverWaitIdle_nid_postfix();
+}
+
 void testWaitProducerChain() {
     using AgcDriver::DriverDetail::DriverTestAccess;
     alignas(64) static volatile std::uint32_t gateFrozen = 0, gateA = 0, gateB = 0, gateC = 0;
@@ -1277,6 +1349,18 @@ int main(int argc, char** argv) {
             testReadOnlyResummarize();
             LibcRunShutdown_nid_postfix();
             std::puts("Read-only resummarize submission passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--poll-pause") {
+            testPollPause();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC poll pause holds parked waits off guest memory");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--poll-pause-disabled") {
+            testPollPauseDisabled();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC poll pause stays off the wait path until enabled");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--walk-matches-copy") {

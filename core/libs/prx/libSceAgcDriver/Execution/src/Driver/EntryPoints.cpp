@@ -195,6 +195,18 @@ extern "C" bool AgcDriverSettled_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().Settled();
 }
 
+extern "C" void AgcDriverEnablePollPause_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().EnablePollPause();
+}
+
+extern "C" void AgcDriverPausePolls_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().PausePolls();
+}
+
+extern "C" void AgcDriverResumePolls_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().ResumePolls();
+}
+
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
     auto* const recorder = AgcDriver::FrameRecorder::Active();
     if (recorder == nullptr) {

@@ -688,7 +688,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
     static const bool ring = ReadSubmissionRingSettings();
     if (ring) PrepareSubmissionRing(stalled.queue);
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
-    if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
+    const auto tailReleased = [&] { return probeGuest([&] { return (control.load(std::memory_order_acquire) & Pm4::RewindValid) != 0; }); };
+    if (!tailReleased()) {
         noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
         struct BlockedWait {
             Driver& driver;
@@ -696,7 +697,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
             ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
         } blocked{*this, stalled.queue};
         StallWatch stall(stalled.queue);
-        while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
+        while (!tailReleased()) {
             CheckFailure();
             checkStopping();
             noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));

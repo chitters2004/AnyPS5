@@ -145,11 +145,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     } epochPoint{awaited, awaitedBytes};
     bool ownStoreUnlanded = false;
     const auto memorySatisfied = [&] {
-        ownStoreUnlanded = false;
-        if (!Pm4::WaitSatisfiedUnchecked(packet)) return false;
-        if (requireMemory || !OwnStoreRejects(packet, awaited, awaitedBytes, queue)) return true;
-        ownStoreUnlanded = true;
-        return false;
+        return probeGuest([&] {
+            ownStoreUnlanded = false;
+            if (!Pm4::WaitSatisfiedUnchecked(packet)) return false;
+            if (requireMemory || !OwnStoreRejects(packet, awaited, awaitedBytes, queue)) return true;
+            ownStoreUnlanded = true;
+            return false;
+        });
     };
     const auto storedByOwnLabel = [&] {
         std::uint32_t writer = queue;
@@ -157,7 +159,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
-                               static_cast<std::uint32_t>(Pm4::LoadLabel(awaited, 4)));
+                               static_cast<std::uint32_t>(probeGuest([&] { return Pm4::LoadLabel(awaited, 4); })));
     if (memorySatisfied()) {
         ++outcomes.atEntry;
         if (storedByOwnLabel()) epochPoint.bump = false;
@@ -415,7 +417,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
             const std::uint64_t reference = wide ? packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u) : packet[4];
             const std::uint64_t mask = wide ? packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u) : packet[5];
-            const std::uint64_t current = Pm4::LoadLabel(awaited, awaitedBytes);
+            const std::uint64_t current = probeGuest([&] { return Pm4::LoadLabel(awaited, awaitedBytes); });
             std::fprintf(stderr, "[gpu] queue 0x%x WAIT_REG_MEM%s%s at 0x%llx timed out after %dms (function %u ref 0x%llx mask 0x%llx value 0x%llx)\n", queue, wide ? "_64" : "", requireMemory ? " (landing)" : "",
                          static_cast<unsigned long long>(awaited), waitTimeoutMs(), packet[1] & 7u, static_cast<unsigned long long>(reference), static_cast<unsigned long long>(mask), static_cast<unsigned long long>(current));
             const auto address = awaited;

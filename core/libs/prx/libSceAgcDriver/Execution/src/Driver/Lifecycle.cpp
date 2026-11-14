@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
@@ -345,6 +346,35 @@ void Driver::ReleaseSettled() {
         captureHold.store(false, std::memory_order_release);
     }
     changed.notify_all();
+}
+
+void Driver::EnablePollPause() {
+    if (pollPauseEnabled.load(std::memory_order_relaxed)) return;
+    std::lock_guard lock(mutex);
+    require(completed >= accepted, "the poll pause must be enabled while every queue is idle");
+    pollPauseEnabled.store(true, std::memory_order_relaxed);
+}
+
+void Driver::PausePolls() {
+    require(pollPauseEnabled.load(std::memory_order_relaxed), "the poll pause is not enabled");
+    pollPauses.fetch_add(1, std::memory_order_seq_cst);
+    while (activeProbes.load(std::memory_order_seq_cst) != 0) std::this_thread::yield();
+}
+
+void Driver::ResumePolls() {
+    pollPauses.fetch_sub(1, std::memory_order_release);
+}
+
+std::uint64_t Driver::GuardedProbes() const {
+    return guardedProbes.load(std::memory_order_relaxed);
+}
+
+void Driver::waitPollsResumed() {
+    while (pollPauses.load(std::memory_order_acquire) != 0) {
+        CheckFailure();
+        checkStopping();
+        PollSleep();
+    }
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
