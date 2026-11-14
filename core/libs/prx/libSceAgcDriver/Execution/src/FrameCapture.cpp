@@ -226,8 +226,9 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
     requireCapture(calls.good(), "cannot write " + (directory / CallsName).string());
 }
 
-void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access) {
+void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access, const FrameRangeState& state) {
     FrameMemoryChunk chunk;
+    chunk.state = state;
     chunk.kind = FrameMemoryKind::Range;
     chunk.rangeKind = kind;
     chunk.protection = protection;
@@ -340,12 +341,13 @@ void FrameCaptureWriter::writeChunk(const FrameMemoryChunk& chunk, std::span<con
     encoder.Put(static_cast<std::uint32_t>(chunk.rangeKind));
     encoder.Put(chunk.protection);
     encoder.Put(chunk.access);
-    encoder.Put(chunk.group);
-    encoder.Put(chunk.completed);
+    const bool range = chunk.kind == FrameMemoryKind::Range;
+    encoder.Put(range ? chunk.state.sectionKey : chunk.group);
+    encoder.Put(range ? chunk.state.sectionOffset : chunk.completed);
     encoder.Put(chunk.address);
     encoder.Put(chunk.bytes);
     encoder.Put(static_cast<std::uint64_t>(payload.size()));
-    encoder.Put(std::uint64_t{0});
+    encoder.Put(range ? std::uint64_t{chunk.state.watch} : std::uint64_t{0});
     memory.write(reinterpret_cast<const char*>(encoder.bytes.data()), static_cast<std::streamsize>(encoder.bytes.size()));
     memory.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
     requireCapture(memory.good(), "cannot write " + (directory / MemoryName).string());
@@ -428,6 +430,13 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
         chunk.bytes = decoder.Take<std::uint64_t>("bytes");
         chunk.compressedBytes = decoder.Take<std::uint64_t>("compressed bytes");
         requireCapture((chunk.kind == FrameMemoryKind::Range) == (chunk.compressedBytes == 0), memoryPath.string() + ": chunk payload does not match its kind at byte " + std::to_string(offset));
+        const auto state = decoder.Take<std::uint64_t>("range state");
+        if (chunk.kind == FrameMemoryKind::Range) {
+            requireCapture(state == 0 || state == FrameRangeWatch::Recorded || state == (FrameRangeWatch::Recorded | FrameRangeWatch::Watched), memoryPath.string() + ": corrupt range state at byte " + std::to_string(offset));
+            chunk.state = {static_cast<std::uint32_t>(state), chunk.group, chunk.completed};
+            chunk.group = 0;
+            chunk.completed = 0;
+        }
         chunk.offset = offset + ChunkHeaderBytes;
         if (size - chunk.offset < chunk.compressedBytes) {
             truncated = true;

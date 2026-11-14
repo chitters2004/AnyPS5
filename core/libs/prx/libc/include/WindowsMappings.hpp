@@ -306,6 +306,33 @@ public:
         }
     }
 
+    void SectionRuns(void (*visit)(void* context, std::uintptr_t address, std::size_t bytes, std::uintptr_t key, std::uint64_t offset), void* context) {
+        struct Run {
+            std::uintptr_t address;
+            std::size_t bytes;
+            std::uintptr_t key;
+            std::uint64_t offset;
+        };
+        std::vector<Run> runs;
+        {
+            std::lock_guard lock(mutex);
+            std::unordered_map<const Physical*, std::pair<std::uintptr_t, std::uint64_t>> owners;
+            owners.reserve(physical.size());
+            for (const auto& [where, slot] : physical) {
+                if (slot) owners.emplace(slot.get(), where);
+            }
+            for (const auto& [base, view] : views) {
+                if (view.resident || !view.slot) continue;
+                const auto owner = owners.find(view.slot.get());
+                if (owner == owners.end()) continue;
+                const auto [key, offset] = owner->second;
+                if (!runs.empty() && runs.back().address + runs.back().bytes == base && runs.back().key == key && runs.back().offset + runs.back().bytes == offset) runs.back().bytes += pageBytes;
+                else runs.push_back({base, pageBytes, key, offset});
+            }
+        }
+        for (const auto& run : runs) visit(context, run.address, run.bytes, run.key, run.offset);
+    }
+
     void ComparedPages(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool unreported) {
         std::lock_guard lock(mutex);
         const auto capacity = *count;

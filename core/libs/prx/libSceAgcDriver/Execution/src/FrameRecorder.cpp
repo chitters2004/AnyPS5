@@ -30,6 +30,7 @@ extern char** environ;
 #endif
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include <sys/stat.h>
 #include <sys/uio.h>
 #endif
 
@@ -370,6 +371,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::newRanges() {
             auto piece = range;
             piece.address = at;
             piece.bytes = (next == covered.end() ? end : std::min(end, next->first)) - at;
+            if (piece.state.sectionKey != 0) piece.state.sectionOffset += at - range.address;
             added.push_back(piece);
             at += piece.bytes;
         }
@@ -461,7 +463,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     bool any = false;
     std::vector<std::byte> bytes;
     for (const auto& range : added) {
-        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+        writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access, range.state);
         auto& stored = ranges.emplace_back(range);
         const bool collected = stored.kind == FrameRangeKind::Watched || stored.kind == FrameRangeKind::Unwatched;
         if (collected) stored.since = GuestMemory::CollectWrittenBlocks(stored.address, static_cast<std::size_t>(stored.bytes), std::numeric_limits<std::uint64_t>::max(), written);
@@ -513,7 +515,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
 }
 
 void FrameRecorder::snapshot(const Range& range) {
-    writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access);
+    writer->WriteRange(range.address, range.bytes, range.kind, range.protection, range.access, range.state);
     if (!range.readable) {
         unreadableBytes += range.bytes;
         return;
@@ -666,7 +668,104 @@ std::string FrameRecorder::header() const {
     return text + "]}\n";
 }
 
+namespace {
+
+struct SectionRun {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::uint64_t key = 0;
+    std::uint64_t offset = 0;
+};
+
+#ifdef __linux__
+void backingRuns(std::uint64_t begin, std::uint64_t end, std::vector<SectionRun>& runs) {
+    int file = -1;
+    std::uint64_t offset = 0;
+    if (GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), &file, &offset)) {
+        struct stat status {};
+        const bool known = fstat(file, &status) == 0;
+        close(file);
+        if (known) runs.push_back({begin, end, static_cast<std::uint64_t>(status.st_ino), offset});
+        return;
+    }
+    constexpr std::uint64_t page = 16384;
+    const auto middle = (begin + (end - begin) / 2) & ~(page - 1);
+    if (middle <= begin || middle >= end) return;
+    backingRuns(begin, middle, runs);
+    backingRuns(middle, end, runs);
+}
+#endif
+
+std::vector<SectionRun> sectionRuns(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& shared) {
+    std::vector<SectionRun> runs;
+#ifdef _WIN32
+    static_cast<void>(shared);
+    GuestArena::GuestArenaSectionRuns_nid_no_patch([](void* context, std::uintptr_t address, std::size_t bytes, std::uintptr_t key, std::uint64_t offset) {
+        static_cast<std::vector<SectionRun>*>(context)->push_back({address, address + bytes, key, offset});
+    }, &runs);
+#elif defined(__linux__)
+    for (const auto& [begin, end] : shared) backingRuns(begin, end, runs);
+#else
+    static_cast<void>(shared);
+#endif
+    std::ranges::sort(runs, {}, &SectionRun::begin);
+    return runs;
+}
+
+}
+
+std::vector<FrameRecorder::Range> FrameRecorder::annotate(const std::vector<Range>& ranges) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> shared;
+    for (const auto& range : ranges) {
+        if (range.shared && range.kind != FrameRangeKind::Host) shared.emplace_back(range.address, range.address + range.bytes);
+    }
+    const auto runs = sectionRuns(shared);
+    std::vector<Range> result;
+    result.reserve(ranges.size());
+    for (const auto& range : ranges) {
+        const auto end = range.address + range.bytes;
+        if (range.kind == FrameRangeKind::Host) {
+            result.push_back(range);
+            continue;
+        }
+        const auto unwatched = GuestMemory::UnwatchedSpans(range.address, static_cast<std::size_t>(range.bytes));
+        std::vector<std::uint64_t> cuts{range.address, end};
+        for (const auto& [begin, stop] : unwatched) cuts.insert(cuts.end(), {begin, stop});
+        auto run = std::ranges::upper_bound(runs, range.address, {}, &SectionRun::begin);
+        if (run != runs.begin()) --run;
+        for (auto at = run; at != runs.end() && at->begin < end; ++at) cuts.insert(cuts.end(), {at->begin, at->end});
+        std::erase_if(cuts, [&](std::uint64_t cut) { return cut < range.address || cut > end; });
+        std::ranges::sort(cuts);
+        cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
+        const auto first = result.size();
+        auto span = unwatched.begin();
+        for (std::size_t index = 0; index + 1 < cuts.size(); ++index) {
+            auto piece = range;
+            piece.address = cuts[index];
+            piece.bytes = cuts[index + 1] - cuts[index];
+            while (span != unwatched.end() && span->second <= piece.address) ++span;
+            const bool watched = span == unwatched.end() || span->first > piece.address;
+            piece.state = {FrameRangeWatch::Recorded | (watched ? FrameRangeWatch::Watched : 0u), 0, 0};
+            if (piece.kind == FrameRangeKind::Watched || piece.kind == FrameRangeKind::Unwatched) piece.kind = watched ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
+            const auto covering = std::ranges::upper_bound(runs, piece.address, {}, &SectionRun::begin);
+            if (covering != runs.begin() && std::prev(covering)->end > piece.address) {
+                piece.state.sectionKey = std::prev(covering)->key;
+                piece.state.sectionOffset = std::prev(covering)->offset + (piece.address - std::prev(covering)->begin);
+            }
+            const bool continues = result.size() > first && result.back().kind == piece.kind && result.back().state.watch == piece.state.watch && result.back().state.sectionKey == piece.state.sectionKey &&
+                                   (piece.state.sectionKey == 0 || result.back().state.sectionOffset + result.back().bytes == piece.state.sectionOffset);
+            if (continues) result.back().bytes += piece.bytes;
+            else result.push_back(piece);
+        }
+    }
+    return result;
+}
+
 std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
+    return annotate(mappedRanges());
+}
+
+std::vector<FrameRecorder::Range> FrameRecorder::mappedRanges() {
 #ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -692,11 +791,12 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
                 range.access = access;
                 const auto page = info.Protect & 0xffu;
                 range.readable = (info.Protect & PAGE_GUARD) == 0 && (page == PAGE_READONLY || page == PAGE_READWRITE || page == PAGE_WRITECOPY || page == PAGE_EXECUTE_READ || page == PAGE_EXECUTE_READWRITE || page == PAGE_EXECUTE_WRITECOPY);
+                range.shared = info.Type != MEM_PRIVATE;
                 if (host) range.kind = FrameRangeKind::Host;
                 else if (info.Type == MEM_PRIVATE) range.kind = GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes)) ? FrameRangeKind::Watched : FrameRangeKind::Unwatched;
                 else range.kind = FrameRangeKind::Section;
                 auto& last = result.empty() ? range : result.back();
-                if (result.size() > firstRange && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+                if (result.size() > firstRange && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access && last.shared == range.shared) last.bytes += range.bytes;
                 else result.push_back(range);
             }
             address = regionEnd;
@@ -726,12 +826,13 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
                 range.protection = windowsProtection(mapping);
                 range.access = access;
                 range.readable = readable;
+                range.shared = mapping.shared;
                 if (host) range.kind = FrameRangeKind::Host;
                 else if (GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes))) range.kind = FrameRangeKind::Watched;
                 else if (!mapping.shared && mapping.inode == 0) range.kind = FrameRangeKind::Unwatched;
                 else range.kind = FrameRangeKind::Section;
                 auto& last = result.empty() ? range : result.back();
-                if (result.size() > firstRange && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+                if (result.size() > firstRange && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access && last.shared == range.shared) last.bytes += range.bytes;
                 else result.push_back(range);
             };
             const auto address = std::max<std::uint64_t>(first, mapping.start);

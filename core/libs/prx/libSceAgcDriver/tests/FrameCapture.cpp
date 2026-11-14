@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -240,6 +241,38 @@ void testCorrupt(const std::filesystem::path& source, const std::filesystem::pat
     checkThrows([&] { FrameCaptureReader reader(directory); }, "a file without the magic does not throw");
 }
 
+void testRangeState(const std::filesystem::path& directory) {
+    using AgcDriver::FrameRangeState;
+    using AgcDriver::FrameRangeWatch;
+    const std::array<FrameRangeState, 3> states{{{FrameRangeWatch::Recorded | FrameRangeWatch::Watched, 0x7f00000000001234ull, 0x5678000}, {FrameRangeWatch::Recorded, 0, 0}, {}}};
+    {
+        FrameCaptureWriter writer(directory);
+        for (std::size_t index = 0; index < states.size(); ++index) writer.WriteRange(0x3000000000ull + index * 0x10000, 0x10000, FrameRangeKind::Section, 4, AgcDriver::FrameRangeAccess::Readable, states[index]);
+        writer.WriteDelta(5, 9, 0x3000000000ull, std::vector<std::byte>(16, std::byte{1}));
+        writer.Finish("{}");
+    }
+    {
+        const FrameCaptureReader reader(directory);
+        check(reader.Chunks().size() == states.size() + 1, "range state capture holds the wrong number of chunks");
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            const auto& chunk = reader.Chunks()[index];
+            check(chunk.state == states[index] && chunk.group == 0 && chunk.completed == 0, "range state " + std::to_string(index) + " does not round-trip");
+        }
+        const auto& delta = reader.Chunks().back();
+        check(delta.group == 5 && delta.completed == 9 && delta.state == FrameRangeState{}, "a delta after ranges with state does not keep its group and serial");
+    }
+    const auto stateAt = static_cast<std::streamoff>(FrameCaptureWriter::MemoryMagic.size() + 56);
+    for (const std::uint64_t corrupt : {std::uint64_t{2}, std::uint64_t{4}, std::uint64_t{1} << 32}) {
+        {
+            std::fstream file(directory / FrameCaptureWriter::MemoryName, std::ios::binary | std::ios::in | std::ios::out);
+            file.seekp(stateAt);
+            file.write(reinterpret_cast<const char*>(&corrupt), sizeof(corrupt));
+            check(file.good(), "cannot write a corrupt range state");
+        }
+        checkThrows([&] { FrameCaptureReader reader(directory); }, "range state " + std::to_string(corrupt) + " does not throw");
+    }
+}
+
 void testWriter(const std::filesystem::path& directory) {
     FrameCaptureWriter writer(directory);
     writer.Finish("{}");
@@ -402,6 +435,7 @@ int main(int argc, char** argv) {
     testTruncated(root / "capture", root / "truncated");
     testVersionOne(root / "capture", root / "version-one");
     testCorrupt(root / "capture", root / "corrupt");
+    testRangeState(root / "range-state");
     testWriter(root / "writer");
     std::filesystem::remove_all(root);
     std::puts("frame capture tests passed");

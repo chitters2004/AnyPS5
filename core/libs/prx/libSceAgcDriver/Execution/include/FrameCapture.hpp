@@ -61,6 +61,19 @@ struct FrameRangeAccess {
     static constexpr std::uint32_t Gpu = 4;
 };
 
+struct FrameRangeWatch {
+    static constexpr std::uint32_t Recorded = 1;
+    static constexpr std::uint32_t Watched = 2;
+};
+
+struct FrameRangeState {
+    std::uint32_t watch = 0;
+    std::uint64_t sectionKey = 0;
+    std::uint64_t sectionOffset = 0;
+
+    bool operator==(const FrameRangeState&) const = default;
+};
+
 struct FrameMemoryChunk {
     FrameMemoryKind kind = FrameMemoryKind::Range;
     FrameRangeKind rangeKind = FrameRangeKind::Watched;
@@ -72,6 +85,7 @@ struct FrameMemoryChunk {
     std::uint64_t bytes = 0;
     std::uint64_t compressedBytes = 0;
     std::uint64_t offset = 0;
+    FrameRangeState state;
 };
 
 class FrameCaptureWriter {
@@ -90,7 +104,7 @@ public:
     FrameCaptureWriter& operator=(const FrameCaptureWriter&) = delete;
 
     void WriteCall(const FrameCall& call);
-    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
+    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access, const FrameRangeState& state = {});
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
     void WriteReference(std::uint64_t index, std::uint64_t address, std::span<const std::byte> pixels);
