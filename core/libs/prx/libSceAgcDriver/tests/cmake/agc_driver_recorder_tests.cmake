@@ -481,10 +481,15 @@ if(BUILD_TESTING)
     set_tests_properties(agc_graphics_state_recorder_unsuppressed PROPERTIES ENVIRONMENT "APS5_NO_STATE_SUPPRESSION=1")
     add_test(NAME agc_draw_descriptors COMMAND agc_driver_recorder_tests --draw-descriptors-only)
     set_tests_properties(agc_draw_descriptors PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    add_test(NAME agc_draw_set_counts COMMAND agc_driver_recorder_tests --draw-set-counts-only)
+    add_test(NAME agc_draw_set_counts_off COMMAND agc_driver_recorder_tests --draw-set-counts-only)
+    set_tests_properties(agc_draw_set_counts agc_draw_set_counts_off PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+    set_tests_properties(agc_draw_set_counts PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW_SETS=1")
     if(WIN32)
-        set_tests_properties(agc_pending_key_stores agc_shadowed_key_stores agc_sample_dumps agc_snapshot_read_into_staging agc_uncounted_passes agc_graphics_state_recorder agc_graphics_state_recorder_unsuppressed agc_draw_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_pending_key_stores agc_shadowed_key_stores agc_sample_dumps agc_snapshot_read_into_staging agc_uncounted_passes agc_graphics_state_recorder agc_graphics_state_recorder_unsuppressed agc_draw_descriptors agc_draw_set_counts agc_draw_set_counts_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    set_property(TEST agc_draw_set_counts_off APPEND PROPERTY ENVIRONMENT_MODIFICATION "APS5_PROFILE_DRAW_SETS=unset:")
     set_property(TEST agc_snapshot_read_into_staging APPEND PROPERTY ENVIRONMENT_MODIFICATION
         "APS5_SYNC_TEXTURE_UPLOAD=unset:" "APS5_DUMP_TEXTURE=unset:" "APS5_NO_TEXTURE_CACHE=unset:"
         "APS5_BUFFER_POOL_SLOTS=unset:" "APS5_BUFFER_POOL_SHARED=unset:" "APS5_NO_BUFFER_CLASSES=unset:" "APS5_STAGING_POOL_MIB=unset:")
