@@ -126,7 +126,7 @@ void Draw(const Context& context, AgcDriver::VulkanDevice& device, const Shaders
     AgcDriver::Graphics::Draw(context, state, draw, shaders);
 }
 
-void ExpectContinuedSplit(const RecordSplit::Window& window) {
+void ExpectContinuedSplit(const RecordSplit::Window& window, bool skipped) {
     const auto event = [&](RecordSplit::Event which) { return window.events[static_cast<std::size_t>(which)]; };
     const auto described = RecordSplit::Describe(window, 1);
     Expect(event(RecordSplit::Event::Draws) == 1 && event(RecordSplit::Event::PassesContinued) == 1 && event(RecordSplit::Event::PassesBegun) == 0, "the record split did not count one continued draw: " + described);
@@ -140,7 +140,12 @@ void ExpectContinuedSplit(const RecordSplit::Window& window) {
     const auto state = RecordSplit::DescribeState(window, 1);
     const auto pipeline = RecordSplit::StateSlots - 1;
     Expect(window.emitted[pipeline] == 0 && window.suppressed[pipeline] == 1, "the repeated draw did not suppress its pipeline bind: " + state);
-    Expect(window.emitted[0] == 0 && window.suppressed[0] == 1 && window.emitted[1] == 0 && window.suppressed[1] == 1, "the repeated draw did not suppress its viewport and scissor: " + state);
+    const auto skips = event(RecordSplit::Event::PassStateSkips);
+    if (skipped) {
+        Expect(skips == 1 && window.emitted[0] == 0 && window.suppressed[0] == 0 && window.emitted[1] == 0 && window.suppressed[1] == 0, "the repeated draw did not skip its pass state: " + state + " " + described);
+    } else {
+        Expect(skips == 0 && window.emitted[0] == 0 && window.suppressed[0] == 1 && window.emitted[1] == 0 && window.suppressed[1] == 1, "the repeated draw did not suppress its viewport and scissor: " + state + " " + described);
+    }
     Expect(event(RecordSplit::Event::GuardCalls) >= 1, "the record split counted no guest buffer guard: " + described);
     Expect(state.rfind("[pass-state]", 0) == 0, "the pass state line has no tag: " + state);
 }
@@ -202,7 +207,14 @@ int main() {
         Draw(context, *device, shaders, ColorA, depthA);
         after = Snapshot();
         Expect(after.passes.passesContinued - before.passes.passesContinued == 1 && after.breaks == before.breaks, "a draw with the open pass's key and no hazard did not continue it: " + Describe(before, after));
-        ExpectContinuedSplit(RecordSplit::Take());
+        ExpectContinuedSplit(RecordSplit::Take(), true);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoPassStateSkip, true);
+        before = Snapshot();
+        Draw(context, *device, shaders, ColorA, depthA);
+        after = Snapshot();
+        Expect(after.passes.passesContinued - before.passes.passesContinued == 1, "a repeated draw with the pass state skip switched off did not continue the pass: " + Describe(before, after));
+        ExpectContinuedSplit(RecordSplit::Take(), false);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoPassStateSkip, false);
         RuntimeSwitches::Assign(RuntimeSwitch::NoGuardMemo, true);
         Draw(context, *device, shaders, ColorA, depthA);
         ExpectGuardMemo(RecordSplit::Take(), false);

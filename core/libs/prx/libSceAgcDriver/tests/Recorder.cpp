@@ -12185,6 +12185,48 @@ void graphicsStateTests(const Device& device) {
     }
     {
         Recorder recorder(context);
+        recorder.Commands();
+        auto& recording = recorder.GraphicsState();
+        const auto all = CommandState::DynamicSlots(PipelineLibraryDynamicStates());
+        const auto fewer = all & ~CommandState::Mask(CommandState::Scissor);
+        const VkViewport viewport{0.0f, 0.0f, 64.0f, 32.0f, 0.0f, 1.0f};
+        const auto repeats = [&](float width) {
+            recording.NextPassInputs().Put(width);
+            return recording.RepeatsPassState();
+        };
+        const auto noted = [&](VkPipeline pipeline, std::uint32_t slots, float width) {
+            recording.BindPipeline(context, pipeline, slots);
+            recording.NextPassInputs().Put(width);
+            recording.SetViewport(context, viewport);
+            recording.NotePassState();
+        };
+        recording.BindPipeline(context, first, all);
+        Require(!repeats(1.0f), "the first pass state of a command buffer repeated");
+        noted(first, all, 1.0f);
+        Require(repeats(1.0f) == suppressing, "equal pass inputs with no state written since did not repeat");
+        Require(!repeats(2.0f), "changed pass inputs repeated");
+        recording.SetViewport(context, viewport);
+        Require(repeats(1.0f) == suppressing, "a suppressed equal state write stopped the pass state repeating");
+        recording.BindPipeline(context, second, all);
+        Require(repeats(1.0f) == suppressing, "another pipeline with the same dynamic slots stopped the pass state repeating");
+        recording.SetViewport(context, VkViewport{0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f});
+        Require(!repeats(1.0f), "a state write since the last pass state let it repeat");
+        noted(first, all, 1.0f);
+        recording.BindPipeline(context, second, fewer);
+        Require(!repeats(1.0f), "a pipeline that dropped a dynamic slot let the pass state repeat");
+        noted(first, fewer, 1.0f);
+        recording.BindPipeline(context, second, all);
+        Require(!repeats(1.0f), "a pipeline with another dynamic slot let the pass state repeat");
+        noted(first, all, 1.0f);
+        recording.Invalidate();
+        recording.BindPipeline(context, first, all);
+        Require(!repeats(1.0f), "an invalidated graphics state let the pass state repeat");
+        recorder.Submit();
+        recorder.Sync();
+        stateLog.clear();
+    }
+    {
+        Recorder recorder(context);
         drawn(recorder, first);
         expectStateLog(full, "the draw before raw state commands");
         const VkViewport moved{0.0f, 0.0f, 8.0f, 8.0f, 0.0f, 1.0f};

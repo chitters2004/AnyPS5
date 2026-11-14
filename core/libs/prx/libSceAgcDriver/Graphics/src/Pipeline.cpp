@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -1001,6 +1002,61 @@ void Pipeline::Continue(CommandState& recording, const State& state, const State
     }
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoPassStateSkip)) {
+        continueState(recording, state, masked);
+        return;
+    }
+    putPassInputs(recording, state, masked);
+    if (recording.RepeatsPassState()) {
+        RecordSplit::Count(RecordSplit::Event::PassStateSkips);
+        return;
+    }
+    continueState(recording, state, masked);
+    recording.NotePassState();
+}
+
+void Pipeline::putPassInputs(CommandState& recording, const State& state, const State* masked) const {
+    auto& inputs = recording.NextPassInputs();
+    const auto flag = [&](bool value) { inputs.Put(static_cast<std::uint8_t>(value ? 1u : 0u)); };
+    flag(libraries);
+    flag(depthBias);
+    flag(depthBounds);
+    flag(context.dynamicColorWriteMask);
+    inputs.Put(state.viewport);
+    inputs.Put(state.scissor);
+    flag(state.stencilReplayReference.has_value());
+    inputs.Put(state.stencilReplayReference.value_or(0u));
+    flag(state.depth.has_value());
+    inputs.Put(state.depth.has_value() ? state.depth->format : VK_FORMAT_UNDEFINED);
+    inputs.Put(state.depthBiasConstant);
+    inputs.Put(state.depthBiasClamp);
+    inputs.Put(state.depthBiasSlope);
+    inputs.Put(state.minDepthBounds);
+    inputs.Put(state.maxDepthBounds);
+    inputs.Put(state.cullMode);
+    inputs.Put(state.frontFace);
+    flag(state.depthTest);
+    flag(state.depthWrite);
+    inputs.Put(state.depthCompare);
+    flag(state.stencilTest);
+    inputs.Put(state.stencilFront);
+    inputs.Put(state.stencilBack);
+    inputs.Put(static_cast<std::uint32_t>(state.blends.size()));
+    for (const auto& blend : state.blends) inputs.Put(blend);
+    flag(masked != nullptr);
+    if (masked != nullptr) {
+        inputs.Put(static_cast<std::uint32_t>(masked->blends.size()));
+        for (const auto& blend : masked->blends) inputs.Put(blend.colorWriteMask);
+    }
+    inputs.Put(static_cast<std::uint32_t>(state.colors.size()));
+    for (const auto& color : state.colors) {
+        inputs.Put(color.componentMapping);
+        inputs.Put(color.partialWriteMask);
+        inputs.Put(color.exportIndex);
+    }
+}
+
+void Pipeline::continueState(CommandState& recording, const State& state, const State* masked) const {
     recording.SetViewport(context, state.viewport);
     recording.SetScissor(context, state.scissor);
     setColorWriteMasks(recording, state, masked, false);

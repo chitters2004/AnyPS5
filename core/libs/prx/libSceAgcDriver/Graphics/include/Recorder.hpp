@@ -11,6 +11,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <array>
 #include <deque>
 #include <mutex>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <span>
 #include <tuple>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
 #include <string>
@@ -59,6 +61,30 @@ public:
     static constexpr std::uint32_t Mask(Slot slot) { return 1u << slot; }
     static std::uint32_t DynamicSlots(std::span<const VkDynamicState> states);
 
+    class PassInputs {
+    public:
+        template<typename TValue>
+        void Put(const TValue& value) {
+            static_assert(std::is_trivially_copyable_v<TValue>);
+            if (sizeof(TValue) > bytes.size() - size) {
+                overflow = true;
+                return;
+            }
+            std::memcpy(bytes.data() + size, &value, sizeof(TValue));
+            size += static_cast<std::uint32_t>(sizeof(TValue));
+        }
+        void Clear() {
+            size = 0;
+            overflow = false;
+        }
+        bool Same(const PassInputs& other) const { return !overflow && !other.overflow && size == other.size && std::memcmp(bytes.data(), other.bytes.data(), size) == 0; }
+
+    private:
+        std::array<std::byte, 768> bytes;
+        std::uint32_t size = 0;
+        bool overflow = false;
+    };
+
     CommandState() = default;
     CommandState(const CommandState&) = delete;
     CommandState& operator=(const CommandState&) = delete;
@@ -85,6 +111,9 @@ public:
     void SetStencilWriteMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask);
     void SetStencilReference(const Context& context, VkStencilFaceFlags faces, std::uint32_t reference);
     void SetColorWriteMasks(const Context& context, std::span<const VkColorComponentFlags> masks);
+    PassInputs& NextPassInputs();
+    bool RepeatsPassState() const;
+    void NotePassState();
 
 private:
     struct StencilOps {
@@ -98,7 +127,11 @@ private:
         std::uint32_t count;
         std::array<VkColorComponentFlags, 8> masks;
     };
-    void wrote(std::uint32_t slots) { valid |= slots & trackable; overwritten |= slots; }
+    void wrote(std::uint32_t slots) {
+        valid |= slots & trackable;
+        overwritten |= slots;
+        ++writes;
+    }
     template<typename TValue, typename TEqual, typename TEmit>
     void apply(Slot slot, TValue CommandState::*field, const TValue& value, TEqual equal, TEmit emit);
     template<typename TValue, typename TEmit>
@@ -111,6 +144,12 @@ private:
     std::uint32_t dynamicSlots = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     bool pipelineKnown = false;
+    std::uint64_t writes = 0;
+    std::array<PassInputs, 2> passInputs;
+    std::uint32_t passCurrent = 0;
+    std::uint64_t passWrites = 0;
+    std::uint32_t passSlots = 0;
+    bool passKnown = false;
     VkViewport viewport{};
     VkRect2D scissor{};
     std::array<float, 3> depthBias{};

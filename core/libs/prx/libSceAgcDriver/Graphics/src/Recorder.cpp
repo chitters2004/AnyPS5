@@ -1567,6 +1567,8 @@ void CommandState::Begin(VkCommandBuffer recording, bool suppress) {
 }
 
 void CommandState::Invalidate() noexcept {
+    ++writes;
+    passKnown = false;
     valid = 0;
     overwritten = 0;
     dynamicSlots = 0;
@@ -1615,8 +1617,26 @@ void CommandState::BindPipeline(const Context& context, VkPipeline bound, std::u
     pipeline = bound;
     pipelineKnown = trackable != 0 && bound != VK_NULL_HANDLE;
     dynamicSlots = slots;
+    if ((valid & ~slots) != 0) ++writes;
     valid &= slots;
     overwritten = 0;
+}
+
+CommandState::PassInputs& CommandState::NextPassInputs() {
+    auto& next = passInputs[1u - passCurrent];
+    next.Clear();
+    return next;
+}
+
+bool CommandState::RepeatsPassState() const {
+    return passKnown && passWrites == writes && passSlots == dynamicSlots && passInputs[1u - passCurrent].Same(passInputs[passCurrent]);
+}
+
+void CommandState::NotePassState() {
+    passCurrent = 1u - passCurrent;
+    passWrites = writes;
+    passSlots = dynamicSlots;
+    passKnown = trackable != 0;
 }
 
 void CommandState::SetViewport(const Context& context, const VkViewport& value) {
