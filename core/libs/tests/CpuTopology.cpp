@@ -59,6 +59,39 @@ static void ReservedCoreTests() {
         if (set.logical == set.core) everyCore.push_back(set);
     }
     Require(!ChooseReservedCore(eight, everyCore, std::nullopt).has_value(), "no core is left once every core is reserved");
+    const auto worker = ChooseReservedCore(eight, {committer->chosen, finisher->chosen}, std::nullopt);
+    Require(worker.has_value() && worker->chosen.logical == 10 && worker->chosen.core == 10, "a third reservation takes the core below the finisher's");
+    Require(worker->others == IdsExcept(eight, {10, 11, 12, 13, 14, 15}), "three reservations leave five cores to the other threads");
+    const auto fourth = ChooseReservedCore(eight, {committer->chosen, finisher->chosen, worker->chosen}, std::nullopt);
+    Require(fourth.has_value() && fourth->chosen.logical == 8, "a fourth reservation that leaves four cores is allowed");
+    Require(!ChooseReservedCore(eight, {committer->chosen, finisher->chosen, worker->chosen, fourth->chosen}, std::nullopt).has_value(), "a reservation that would leave three cores is refused");
+    const auto workerFirst = ChooseReservedCore(eight, {committer->chosen, finisher->chosen}, std::nullopt);
+    const auto committerAfter = ChooseReservedCore(eight, {workerFirst->chosen}, std::nullopt);
+    Require(committerAfter.has_value() && committerAfter->chosen.logical == 14, "a committer reserved after the worker keeps the highest core");
+    const auto finisherAfter = ChooseReservedCore(eight, {workerFirst->chosen, committerAfter->chosen}, std::nullopt);
+    Require(finisherAfter.has_value() && finisherAfter->chosen.logical == 12, "a finisher reserved after the worker keeps the next core");
+    Require(finisherAfter->others == worker->others, "the reservation order leaves the same CPU sets to the other threads");
+
+    std::vector<CpuTopology::CpuSet> six;
+    AddCores(six, 6, 2, 0, 0);
+    const auto sixCommitter = ChooseReservedCore(six, {}, std::nullopt);
+    const auto sixFinisher = ChooseReservedCore(six, {sixCommitter->chosen}, std::nullopt);
+    Require(sixFinisher.has_value() && sixFinisher->chosen.logical == 8, "a six-core host reserves two cores");
+    Require(!ChooseReservedCore(six, {sixCommitter->chosen, sixFinisher->chosen}, std::nullopt).has_value(), "a six-core host refuses a third reservation");
+    const auto sixRequested = ChooseReservedCore(six, {sixCommitter->chosen, sixFinisher->chosen}, 0u);
+    Require(sixRequested.has_value() && sixRequested->chosen.logical == 0, "a requested logical processor is not held to the cores left");
+    std::vector<CpuTopology::CpuSet> seven;
+    AddCores(seven, 7, 2, 0, 0);
+    std::vector<CpuTopology::CpuSet> sevenHeld;
+    for (const auto expected : {12u, 10u, 8u}) {
+        const auto next = ChooseReservedCore(seven, sevenHeld, std::nullopt);
+        Require(next.has_value() && next->chosen.logical == expected, "a seven-core host reserves three cores");
+        sevenHeld.push_back(next->chosen);
+    }
+    Require(!ChooseReservedCore(seven, sevenHeld, std::nullopt).has_value(), "a seven-core host refuses a fourth reservation");
+    auto sevenParked = seven;
+    sevenParked[0].parked = true;
+    Require(ChooseReservedCore(sevenParked, {sevenHeld[0], sevenHeld[1]}, std::nullopt)->chosen.logical == 8, "a parked core still counts among the cores left");
 
     auto parked = eight;
     parked[15].parked = true;
@@ -94,6 +127,9 @@ static void ReservedCoreTests() {
     AddCores(fewPerformance, 4, 2, 1, 0);
     AddCores(fewPerformance, 8, 1, 0, 0);
     Require(!ChooseReservedCore(fewPerformance, {}, std::nullopt).has_value(), "a hybrid host with fewer than six performance cores reserves none");
+    const auto performanceFinisher = ChooseReservedCore(hybrid, {performance->chosen}, std::nullopt);
+    Require(performanceFinisher.has_value() && performanceFinisher->chosen.efficiencyClass == 1, "a hybrid host with six performance cores reserves a second one");
+    Require(!ChooseReservedCore(hybrid, {performance->chosen, performanceFinisher->chosen}, std::nullopt).has_value(), "a hybrid host does not count efficiency cores among the cores left");
     auto performanceParked = hybrid;
     for (std::size_t index = 0; index < 12; ++index) performanceParked[index].parked = true;
     Require(!ChooseReservedCore(performanceParked, {}, std::nullopt).has_value(), "a hybrid host with every performance core parked reserves none");
@@ -104,6 +140,10 @@ static void ReservedCoreTests() {
     const auto firstCache = ChooseReservedCore(dual, {}, std::nullopt);
     Require(firstCache.has_value() && firstCache->chosen.logical == 14, "two last-level caches reserve within the cache of the first logical processor");
     Require(firstCache->others == IdsExcept(dual, {14, 15}), "two last-level caches leave the other cache to the other threads");
+    const auto dualFinisher = ChooseReservedCore(dual, {firstCache->chosen}, std::nullopt);
+    const auto dualWorker = ChooseReservedCore(dual, {firstCache->chosen, dualFinisher->chosen}, std::nullopt);
+    Require(dualWorker.has_value() && dualWorker->chosen.logical == 10 && dualWorker->chosen.lastLevelCache == 0, "a third reservation stays in the cache of the first two");
+    Require(CpuTopology::PipelineCacheSet(dual, {firstCache->chosen, dualFinisher->chosen, dualWorker->chosen}) == IdsExcept(dual, {10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31}), "the other queue workers keep the five free cores of the reserved cache");
     auto secondParked = dual;
     for (std::size_t index = 16; index < secondParked.size(); ++index) secondParked[index].parked = true;
     const auto cacheKept = ChooseReservedCore(secondParked, {}, std::nullopt);

@@ -79,6 +79,7 @@ namespace {
 struct CoreSwitches {
     bool committer = false;
     bool finisher = false;
+    bool worker = false;
     std::optional<unsigned> logical;
 };
 
@@ -89,9 +90,10 @@ struct Reservation {
 
 constexpr std::size_t CommitterSlot = 0;
 constexpr std::size_t FinisherSlot = 1;
+constexpr std::size_t WorkerSlot = 2;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 2> reservations;
+std::array<std::optional<Reservation>, 3> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -106,9 +108,16 @@ const CoreSwitches& Switches() {
         const bool workersPinned = WorkerAffinityMask() != 0;
         result.committer = result.logical.has_value() || !workersPinned;
         result.finisher = !workersPinned && std::getenv("APS5_NO_FINISHER_CORE") == nullptr;
+        result.worker = !workersPinned && std::getenv("APS5_NO_WORKER_CORE") == nullptr;
         return result;
     }();
     return switches;
+}
+
+bool SlotEnabled(std::size_t slot) {
+    if (slot == CommitterSlot) return Switches().committer;
+    if (slot == FinisherSlot) return Switches().finisher;
+    return Switches().worker;
 }
 
 #ifdef _WIN32
@@ -197,12 +206,14 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     for (const auto& held : reservations) {
         if (held.has_value()) taken.push_back(held->set);
     }
-    if (slot == FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
-        if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
+    for (std::size_t earlier = 0; earlier < slot; ++earlier) {
+        if (reservations[earlier].has_value() || !SlotEnabled(earlier)) continue;
+        if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, earlier == CommitterSlot ? Switches().logical : std::nullopt)) taken.push_back(ahead->chosen);
     }
     const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
     if (!reservation.has_value()) {
         if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
+        else if (slot == WorkerSlot) std::fprintf(stderr, "[affinity] %s: no core reserved, the host has no free core that leaves four to the other threads beside %zu reserved\n", role, taken.size());
         return;
     }
     std::size_t moved = 0;
@@ -250,7 +261,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     if (!pipelineCpus.empty()) {
         std::size_t kept = 0;
         for (const auto worker : workerThreads) {
-            if (!OwnThread(worker)) continue;
+            if (!OwnThread(worker) || HoldsReservation(worker)) continue;
             kept += PinTo(static_cast<pid_t>(worker), pipelineCpus) ? 1u : 0u;
         }
         std::fprintf(stderr, "[affinity] %zu queue workers kept on the %zu other CPUs of the reserved cores' last-level cache\n", kept, pipelineCpus.size());
@@ -272,6 +283,14 @@ void ReserveCommitterCore() {
 void ReserveFinisherCore() {
 #if defined(_WIN32) || defined(__linux__)
     if (Switches().finisher) Reserve(FinisherSlot, "draw finisher", std::nullopt);
+#endif
+}
+
+void ReserveWorkerCore(const char* role) {
+#if defined(_WIN32) || defined(__linux__)
+    if (Switches().worker) Reserve(WorkerSlot, role, std::nullopt);
+#else
+    static_cast<void>(role);
 #endif
 }
 
