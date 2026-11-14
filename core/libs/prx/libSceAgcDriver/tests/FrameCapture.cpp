@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -459,6 +460,38 @@ void testAllZero() {
     check(!AgcDriver::AllZero(bytes), "a nonzero word is missed");
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> fakeUnwatched(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const auto& span : {std::pair<std::uint64_t, std::uint64_t>{0x2000, 0x3000}, {0x8000, 0x9000}}) {
+        if (span.first < address + bytes && span.second > address) spans.push_back(span);
+    }
+    return spans;
+}
+
+void testWatchDrift() {
+    const std::vector<AgcDriver::WatchDriftRange> ranges{{0x6000, 0x4000, false}, {0x1000, 0x3000, true}, {0x4000, 0x2000, true}};
+    const std::vector<AgcDriver::WatchDriftSurface> refused{{.address = 0x8000, .bytes = 0x400, .refusals = 2}, {.address = 0x2000, .bytes = 0x800, .refusals = 5}, {.address = 0x20000, .bytes = 0x100, .refusals = 1}, {.address = 0x3800, .bytes = 0x1000, .refusals = 1}};
+    const auto drift = AgcDriver::MeasureWatchDrift(ranges, refused, fakeUnwatched);
+    check(drift.recordedWatchedBytes == 0x5000 && drift.recordedUnwatchedBytes == 0x4000, "watch drift: the recorded byte totals are wrong");
+    check(drift.unwatchedSinceBytes == 0x1000, "watch drift: a recorded-watched span unwatched since the start is not counted");
+    check(drift.watchedSinceBytes == 0x3000, "watch drift: a recorded-unwatched span watched since the start is not counted");
+    check(drift.driftedRanges == 2, "watch drift: the drifted range count is wrong");
+    check(drift.surfaces.size() == 4 && drift.surfaces.front().address == 0x2000, "watch drift: the surfaces are not sorted by address");
+    const auto& unwatchedSince = drift.surfaces[0];
+    check(unwatchedSince.recordedWatchedBytes == 0x800 && unwatchedSince.unwatchedSinceBytes == 0x800 && unwatchedSince.nowUnwatchedBytes == 0x800 && unwatchedSince.outsideBytes == 0 && unwatchedSince.refusals == 5, "watch drift: a surface unwatched since the start is misclassified");
+    const auto& straddling = drift.surfaces[1];
+    check(straddling.recordedWatchedBytes == 0x1000 && straddling.unwatchedSinceBytes == 0 && straddling.outsideBytes == 0, "watch drift: a surface over two watched ranges is misclassified");
+    const auto& recordedUnwatched = drift.surfaces[2];
+    check(recordedUnwatched.recordedUnwatchedBytes == 0x400 && recordedUnwatched.watchedSinceBytes == 0 && recordedUnwatched.nowUnwatchedBytes == 0x400, "watch drift: a surface recorded unwatched is misclassified");
+    const auto& outside = drift.surfaces[3];
+    check(outside.outsideBytes == 0x100 && outside.recordedWatchedBytes == 0 && outside.recordedUnwatchedBytes == 0, "watch drift: a surface outside the ranges is misclassified");
+    check(drift.surfacesUnwatchedSince == 1 && drift.surfacesRecordedUnwatched == 1 && drift.surfacesOutside == 1, "watch drift: the surface verdict counts are wrong");
+    const auto text = AgcDriver::FormatWatchDrift(drift);
+    check(text.find("unwatched_since_bytes 4096\n") != std::string::npos, "watch drift: the report misses the drift total");
+    check(text.find("\n0x2000 2048 5 0 2048 0 2048 2048 0\n") != std::string::npos, "watch drift: the report misses a surface line");
+    check(std::ranges::count(text, '\n') == 7 + 4, "watch drift: the report has the wrong line count");
+}
+
 void testReusedStreams(const std::filesystem::path& directory) {
     std::vector<std::vector<std::byte>> deltas;
     for (std::size_t index = 0; index < 6; ++index) {
@@ -559,6 +592,7 @@ int main(int argc, char** argv) {
     }
     testAllZero();
     testReadAroundRanges();
+    testWatchDrift();
     testRoundTrip(root / "capture");
     testTruncated(root / "capture", root / "truncated");
     testOlderVersion(root / "capture", root / "version-one", "aps5-frame-calls 1\n", 1);

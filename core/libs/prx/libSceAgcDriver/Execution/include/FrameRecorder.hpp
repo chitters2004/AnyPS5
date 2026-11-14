@@ -104,6 +104,7 @@ private:
     void writeReferenceFrames();
     bool abandonIfDiskLow();
     void stop(const char* reason);
+    void reportWatchDrift() const;
     std::string header() const;
     std::vector<Range> committedRanges();
     std::vector<Range> mappedRanges();

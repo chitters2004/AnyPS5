@@ -185,6 +185,40 @@ bool AllZero(std::span<const std::byte> bytes);
 using GuestRead = void (*)(std::uint64_t address, std::span<std::byte> destination);
 std::uint64_t ReadAroundRanges(std::uint64_t address, std::span<std::byte> bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> skipped, GuestRead read);
 
+struct WatchDriftRange {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    bool watched = false;
+};
+
+struct WatchDriftSurface {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t refusals = 0;
+    std::uint64_t outsideBytes = 0;
+    std::uint64_t recordedWatchedBytes = 0;
+    std::uint64_t recordedUnwatchedBytes = 0;
+    std::uint64_t nowUnwatchedBytes = 0;
+    std::uint64_t unwatchedSinceBytes = 0;
+    std::uint64_t watchedSinceBytes = 0;
+};
+
+struct WatchDrift {
+    std::uint64_t recordedWatchedBytes = 0;
+    std::uint64_t recordedUnwatchedBytes = 0;
+    std::uint64_t unwatchedSinceBytes = 0;
+    std::uint64_t watchedSinceBytes = 0;
+    std::uint64_t driftedRanges = 0;
+    std::uint64_t surfacesUnwatchedSince = 0;
+    std::uint64_t surfacesRecordedUnwatched = 0;
+    std::uint64_t surfacesOutside = 0;
+    std::vector<WatchDriftSurface> surfaces;
+};
+
+using UnwatchedSpanQuery = std::vector<std::pair<std::uint64_t, std::uint64_t>> (*)(std::uint64_t address, std::size_t bytes);
+WatchDrift MeasureWatchDrift(std::vector<WatchDriftRange> ranges, std::span<const WatchDriftSurface> refused, UnwatchedSpanQuery unwatched);
+std::string FormatWatchDrift(const WatchDrift& drift);
+
 }
 
 #endif

@@ -393,6 +393,12 @@ public:
         std::uint64_t bytes = 0;
     };
     static CollectRefusals CollectRefusalCounts();
+    struct RefusedSurface {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t refusals = 0;
+    };
+    static std::vector<RefusedSurface> CaptureRefusedSurfaces();
     struct PendingFails {
         std::uint64_t foreign = 0;
         std::uint64_t snapshot = 0;

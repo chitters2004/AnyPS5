@@ -3404,8 +3404,37 @@ void countFullWalkTime(FastFail reason, std::chrono::steady_clock::time_point st
 
 constexpr std::size_t RefusedSurfaceLimit = 65536;
 
+struct CaptureRefusals {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, ShaderResources::RefusedSurface> surfaces;
+};
+
+CaptureRefusals& captureRefusals() {
+    static CaptureRefusals refusals;
+    return refusals;
+}
+
+bool captureConfigured() {
+    static const bool configured = [] {
+        const char* directory = std::getenv("APS5_FRAME_CAPTURE");
+        return directory != nullptr && *directory != '\0';
+    }();
+    return configured;
+}
+
 void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes) {
-    if (!BuildProfiled() || indexProof) return;
+    if (indexProof) return;
+    if (captureConfigured()) {
+        auto& refusals = captureRefusals();
+        std::lock_guard lock(refusals.mutex);
+        if (refusals.surfaces.size() < RefusedSurfaceLimit || refusals.surfaces.contains(address)) {
+            auto& surface = refusals.surfaces[address];
+            surface.address = address;
+            surface.bytes = std::max<std::uint64_t>(surface.bytes, bytes);
+            ++surface.refusals;
+        }
+    }
+    if (!BuildProfiled()) return;
     auto& profile = Revalidations();
     (storage ? profile.refusedStorage : profile.refusedSampled).fetch_add(1, std::memory_order_relaxed);
     const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes);
@@ -3607,6 +3636,18 @@ void ShaderResources::captureValidation() {
     trim(logged);
     trim(objects);
     trim(indices);
+}
+
+std::vector<ShaderResources::RefusedSurface> ShaderResources::CaptureRefusedSurfaces() {
+    auto& refusals = captureRefusals();
+    std::vector<RefusedSurface> surfaces;
+    {
+        std::lock_guard lock(refusals.mutex);
+        surfaces.reserve(refusals.surfaces.size());
+        for (const auto& entry : refusals.surfaces) surfaces.push_back(entry.second);
+    }
+    std::ranges::sort(surfaces, {}, &RefusedSurface::address);
+    return surfaces;
 }
 
 ShaderResources::CollectRefusals ShaderResources::CollectRefusalCounts() {

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -809,6 +810,7 @@ void FrameRecorder::finish() {
     std::tie(end.accepted, end.completed) = DriverDetail::Driver::Get().SerialProgress();
     writer->WriteCall(end);
     writeReferenceFrames();
+    reportWatchDrift();
     writer->Finish(header());
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
@@ -816,6 +818,24 @@ void FrameRecorder::finish() {
     writer.reset();
     endGpuStores();
     state = State::Done;
+}
+
+void FrameRecorder::reportWatchDrift() const {
+    std::vector<WatchDriftRange> recorded;
+    for (const auto& range : ranges) {
+        if (range.kind == FrameRangeKind::Host || (range.state.watch & FrameRangeWatch::Recorded) == 0) continue;
+        recorded.push_back({range.address, range.bytes, (range.state.watch & FrameRangeWatch::Watched) != 0});
+    }
+    std::vector<WatchDriftSurface> refused;
+    for (const auto& surface : Graphics::ShaderResources::CaptureRefusedSurfaces()) refused.push_back({.address = surface.address, .bytes = surface.bytes, .refusals = surface.refusals});
+    const auto drift = MeasureWatchDrift(std::move(recorded), refused, GuestMemory::UnwatchedSpans);
+    const auto path = directory / "watch-drift.txt";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file << FormatWatchDrift(drift);
+    std::fprintf(stderr, "[frame-capture] watch drift at capture end: %llu of %llu recorded-watched bytes now unwatched, %llu of %llu recorded-unwatched bytes now watched, %llu ranges drifted; %llu refused surfaces: %llu became unwatched since the start, %llu recorded unwatched, %llu outside the captured ranges (%s)\n",
+                 static_cast<unsigned long long>(drift.unwatchedSinceBytes), static_cast<unsigned long long>(drift.recordedWatchedBytes), static_cast<unsigned long long>(drift.watchedSinceBytes),
+                 static_cast<unsigned long long>(drift.recordedUnwatchedBytes), static_cast<unsigned long long>(drift.driftedRanges), static_cast<unsigned long long>(drift.surfaces.size()),
+                 static_cast<unsigned long long>(drift.surfacesUnwatchedSince), static_cast<unsigned long long>(drift.surfacesRecordedUnwatched), static_cast<unsigned long long>(drift.surfacesOutside), file ? path.string().c_str() : "not written");
 }
 
 std::string FrameRecorder::header() const {

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cstdio>
 #include <cstring>
 #include <future>
 #include <iterator>
@@ -173,6 +174,82 @@ std::uint64_t ReadAroundRanges(std::uint64_t address, std::span<std::byte> bytes
     }
     read(cursor, bytes.subspan(static_cast<std::size_t>(cursor - address)));
     return zeroed;
+}
+
+namespace {
+
+std::uint64_t unwatchedWithin(std::uint64_t address, std::uint64_t bytes, UnwatchedSpanQuery unwatched) {
+    if (bytes == 0) return 0;
+    const auto end = address + bytes;
+    std::uint64_t total = 0;
+    for (const auto& [begin, stop] : unwatched(address, static_cast<std::size_t>(bytes))) {
+        const auto first = std::max(begin, address);
+        const auto last = std::min(stop, end);
+        if (last > first) total += last - first;
+    }
+    return std::min(total, bytes);
+}
+
+}
+
+WatchDrift MeasureWatchDrift(std::vector<WatchDriftRange> ranges, std::span<const WatchDriftSurface> refused, UnwatchedSpanQuery unwatched) {
+    WatchDrift drift;
+    std::ranges::sort(ranges, {}, &WatchDriftRange::address);
+    for (const auto& range : ranges) {
+        const auto now = unwatchedWithin(range.address, range.bytes, unwatched);
+        const auto changed = range.watched ? now : range.bytes - now;
+        (range.watched ? drift.recordedWatchedBytes : drift.recordedUnwatchedBytes) += range.bytes;
+        (range.watched ? drift.unwatchedSinceBytes : drift.watchedSinceBytes) += changed;
+        if (changed != 0) ++drift.driftedRanges;
+    }
+    for (auto surface : refused) {
+        surface.outsideBytes = surface.recordedWatchedBytes = surface.recordedUnwatchedBytes = surface.unwatchedSinceBytes = surface.watchedSinceBytes = 0;
+        const auto end = surface.address + surface.bytes;
+        surface.nowUnwatchedBytes = unwatchedWithin(surface.address, surface.bytes, unwatched);
+        std::uint64_t covered = 0;
+        auto range = std::ranges::upper_bound(ranges, surface.address, {}, &WatchDriftRange::address);
+        if (range != ranges.begin()) --range;
+        for (; range != ranges.end() && range->address < end; ++range) {
+            const auto first = std::max(range->address, surface.address);
+            const auto last = std::min(range->address + range->bytes, end);
+            if (last <= first) continue;
+            const auto overlap = last - first;
+            const auto now = unwatchedWithin(first, overlap, unwatched);
+            covered += overlap;
+            if (range->watched) {
+                surface.recordedWatchedBytes += overlap;
+                surface.unwatchedSinceBytes += now;
+            } else {
+                surface.recordedUnwatchedBytes += overlap;
+                surface.watchedSinceBytes += overlap - now;
+            }
+        }
+        surface.outsideBytes = surface.bytes - std::min(covered, surface.bytes);
+        if (surface.unwatchedSinceBytes != 0) ++drift.surfacesUnwatchedSince;
+        if (surface.recordedUnwatchedBytes != 0) ++drift.surfacesRecordedUnwatched;
+        if (surface.outsideBytes != 0) ++drift.surfacesOutside;
+        drift.surfaces.push_back(surface);
+    }
+    std::ranges::sort(drift.surfaces, {}, &WatchDriftSurface::address);
+    return drift;
+}
+
+std::string FormatWatchDrift(const WatchDrift& drift) {
+    std::string text = "recorded_watched_bytes " + std::to_string(drift.recordedWatchedBytes) + "\n";
+    text += "recorded_unwatched_bytes " + std::to_string(drift.recordedUnwatchedBytes) + "\n";
+    text += "unwatched_since_bytes " + std::to_string(drift.unwatchedSinceBytes) + "\n";
+    text += "watched_since_bytes " + std::to_string(drift.watchedSinceBytes) + "\n";
+    text += "drifted_ranges " + std::to_string(drift.driftedRanges) + "\n";
+    text += "refused_surfaces " + std::to_string(drift.surfaces.size()) + " unwatched_since " + std::to_string(drift.surfacesUnwatchedSince) + " recorded_unwatched " + std::to_string(drift.surfacesRecordedUnwatched) + " outside " + std::to_string(drift.surfacesOutside) + "\n";
+    text += "address bytes refusals outside recorded_watched recorded_unwatched now_unwatched unwatched_since watched_since\n";
+    for (const auto& surface : drift.surfaces) {
+        char line[256];
+        std::snprintf(line, sizeof(line), "0x%llx %llu %llu %llu %llu %llu %llu %llu %llu\n", static_cast<unsigned long long>(surface.address), static_cast<unsigned long long>(surface.bytes), static_cast<unsigned long long>(surface.refusals),
+                      static_cast<unsigned long long>(surface.outsideBytes), static_cast<unsigned long long>(surface.recordedWatchedBytes), static_cast<unsigned long long>(surface.recordedUnwatchedBytes),
+                      static_cast<unsigned long long>(surface.nowUnwatchedBytes), static_cast<unsigned long long>(surface.unwatchedSinceBytes), static_cast<unsigned long long>(surface.watchedSinceBytes));
+        text += line;
+    }
+    return text;
 }
 
 bool AllZero(std::span<const std::byte> bytes) {
