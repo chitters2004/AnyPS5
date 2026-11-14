@@ -30,6 +30,7 @@ struct VulkanDeviceTestAccess {
 namespace {
 
 using AgcDriver::FrameCaptureWriter;
+using AgcDriver::FrameRangeWatch;
 
 constexpr std::uint32_t ReadWrite = 0x04;
 
@@ -1432,6 +1433,12 @@ void writeInspectionCapture(const std::filesystem::path& directory) {
     writer.WriteRange(Commands + 6, sizeof(commands) - 6, FrameRangeKind::Host, ReadWrite, FrameRangeAccess::Readable);
     writer.WriteRange(Header, sizeof(shader), FrameRangeKind::Host, ReadWrite, FrameRangeAccess::Readable);
     writer.WriteRange(Code, code.size(), FrameRangeKind::Host, ReadWrite, FrameRangeAccess::Readable);
+    constexpr auto Watched = FrameRangeWatch::Recorded | FrameRangeWatch::Watched;
+    writer.WriteRange(0x6000000000ull, 0x10000, FrameRangeKind::Watched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu, {Watched, 0, 0});
+    writer.WriteRange(0x6000010000ull, 0x2000, FrameRangeKind::Unwatched, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable, {FrameRangeWatch::Recorded, 0, 0});
+    writer.WriteRange(0x6000020000ull, 0x30000, FrameRangeKind::Section, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu, {FrameRangeWatch::Recorded, 7, 0x10000});
+    writer.WriteRange(0x6000050000ull, 0x1000, FrameRangeKind::Section, ReadWrite, FrameRangeAccess::Readable, {Watched, 7, 0x20000});
+    writer.WriteRange(0x6000060000ull, 0x4000, FrameRangeKind::Section, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu, {Watched, 9, 0});
     writer.WriteSnapshot(Header, std::as_bytes(std::span(&shader, 1)));
     writer.WriteSnapshot(Code, std::as_bytes(std::span(code)));
     writer.WriteDelta(1, 0, Commands, std::as_bytes(std::span(commands)));

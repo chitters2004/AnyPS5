@@ -76,6 +76,7 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
+std::vector<std::pair<std::uint64_t, std::uint64_t>> UnwatchedSpans(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
 bool WriteIndexEnabled();

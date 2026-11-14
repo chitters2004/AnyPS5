@@ -63,6 +63,19 @@ struct FrameRangeAccess {
     static constexpr std::uint32_t Gpu = 4;
 };
 
+struct FrameRangeWatch {
+    static constexpr std::uint32_t Recorded = 1;
+    static constexpr std::uint32_t Watched = 2;
+};
+
+struct FrameRangeState {
+    std::uint32_t watch = 0;
+    std::uint64_t sectionKey = 0;
+    std::uint64_t sectionOffset = 0;
+
+    bool operator==(const FrameRangeState&) const = default;
+};
+
 struct FrameMemoryChunk {
     FrameMemoryKind kind = FrameMemoryKind::Range;
     FrameRangeKind rangeKind = FrameRangeKind::Watched;
@@ -74,6 +87,7 @@ struct FrameMemoryChunk {
     std::uint64_t bytes = 0;
     std::uint64_t compressedBytes = 0;
     std::uint64_t offset = 0;
+    FrameRangeState state;
 };
 
 class FrameCaptureWriter {
@@ -84,7 +98,8 @@ public:
     static constexpr std::string_view CallsMagic = "aps5-frame-calls 3\n";
     static constexpr std::string_view CallsMagicV2 = "aps5-frame-calls 2\n";
     static constexpr std::string_view CallsMagicV1 = "aps5-frame-calls 1\n";
-    static constexpr std::string_view MemoryMagic = "aps5-frame-memory 2\n";
+    static constexpr std::string_view MemoryMagic = "aps5-frame-memory 3\n";
+    static constexpr std::string_view MemoryMagicV2 = "aps5-frame-memory 2\n";
     static constexpr std::string_view MemoryMagicV1 = "aps5-frame-memory 1\n";
     static constexpr std::size_t BlockBytes = 64u * 1024u;
     static constexpr std::size_t ChunkBytes = 4u * 1024u * 1024u;
@@ -96,7 +111,7 @@ public:
     FrameCaptureWriter& operator=(const FrameCaptureWriter&) = delete;
 
     void WriteCall(const FrameCall& call);
-    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
+    void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access, const FrameRangeState& state = {});
     std::uint64_t WriteSnapshot(std::uint64_t address, std::span<const std::byte> bytes);
     void WriteDelta(std::uint64_t group, std::uint64_t completed, std::uint64_t address, std::span<const std::byte> bytes);
     void WriteReference(std::uint64_t index, std::uint64_t address, std::span<const std::byte> pixels);

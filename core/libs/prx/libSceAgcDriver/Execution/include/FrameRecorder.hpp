@@ -65,6 +65,8 @@ private:
         std::uint32_t protection = 0;
         std::uint32_t access = 0;
         bool readable = false;
+        bool shared = false;
+        FrameRangeState state;
         std::uint64_t since = 0;
     };
 
@@ -104,6 +106,8 @@ private:
     void stop(const char* reason);
     std::string header() const;
     std::vector<Range> committedRanges();
+    std::vector<Range> mappedRanges();
+    static std::vector<Range> annotate(const std::vector<Range>& ranges);
     std::vector<Range> newRanges();
     std::uint64_t blockSince(std::uint64_t block) const;
 

@@ -18,7 +18,8 @@ namespace {
 
 static_assert(std::endian::native == std::endian::little, "frame captures are stored in little-endian order");
 
-constexpr std::size_t ChunkHeaderBytes = 64;
+constexpr std::size_t ChunkHeaderBytes = 72;
+constexpr std::size_t ChunkHeaderBytesV2 = 64;
 
 std::array<std::uint64_t, 2> hashDelta(std::span<const std::byte> bytes) {
     return {XXH64(bytes.data(), bytes.size(), 0), XXH64(bytes.data(), bytes.size(), 0x9e3779b97f4a7c15ull)};
@@ -234,8 +235,9 @@ void FrameCaptureWriter::WriteCall(const FrameCall& call) {
     requireCapture(calls.good(), "cannot write " + (directory / CallsName).string());
 }
 
-void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access) {
+void FrameCaptureWriter::WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access, const FrameRangeState& state) {
     FrameMemoryChunk chunk;
+    chunk.state = state;
     chunk.kind = FrameMemoryKind::Range;
     chunk.rangeKind = kind;
     chunk.protection = protection;
@@ -364,12 +366,14 @@ std::uint64_t FrameCaptureWriter::writeChunk(const FrameMemoryChunk& chunk, std:
     encoder.Put(static_cast<std::uint32_t>(chunk.rangeKind));
     encoder.Put(chunk.protection);
     encoder.Put(chunk.access);
-    encoder.Put(chunk.group);
-    encoder.Put(chunk.completed);
+    const bool range = chunk.kind == FrameMemoryKind::Range;
+    encoder.Put(range ? chunk.state.sectionKey : chunk.group);
+    encoder.Put(range ? chunk.state.sectionOffset : chunk.completed);
     encoder.Put(chunk.address);
     encoder.Put(chunk.bytes);
     encoder.Put(static_cast<std::uint64_t>(payload.size()));
     encoder.Put(sharedOffset);
+    encoder.Put(range ? std::uint64_t{chunk.state.watch} : std::uint64_t{0});
     memory.write(reinterpret_cast<const char*>(encoder.bytes.data()), static_cast<std::streamsize>(encoder.bytes.size()));
     memory.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
     requireCapture(memory.good(), "cannot write " + (directory / MemoryName).string());
@@ -446,20 +450,23 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
     std::string magic(FrameCaptureWriter::MemoryMagic.size(), '\0');
     memory.seekg(0);
     memory.read(magic.data(), static_cast<std::streamsize>(magic.size()));
-    requireCapture(memory.good() && (magic == FrameCaptureWriter::MemoryMagic || magic == FrameCaptureWriter::MemoryMagicV1), memoryPath.string() + " is not a frame capture file");
-    const bool sharing = magic == FrameCaptureWriter::MemoryMagic;
+    requireCapture(memory.good() && (magic == FrameCaptureWriter::MemoryMagic || magic == FrameCaptureWriter::MemoryMagicV2 || magic == FrameCaptureWriter::MemoryMagicV1),
+                   memoryPath.string() + " is not a frame capture file");
+    const bool watching = magic == FrameCaptureWriter::MemoryMagic;
+    const bool sharing = watching || magic == FrameCaptureWriter::MemoryMagicV2;
+    const std::size_t headerBytes = watching ? ChunkHeaderBytes : ChunkHeaderBytesV2;
     std::map<std::uint64_t, std::size_t> payloads;
     std::uint64_t offset = magic.size();
     while (offset < size) {
-        if (size - offset < ChunkHeaderBytes) {
+        if (size - offset < headerBytes) {
             truncated = true;
             break;
         }
         std::array<std::byte, ChunkHeaderBytes> raw{};
         memory.seekg(static_cast<std::streamoff>(offset));
-        memory.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+        memory.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(headerBytes));
         requireCapture(memory.good(), "cannot read " + memoryPath.string());
-        Decoder decoder(raw);
+        Decoder decoder(std::span<const std::byte>(raw).first(headerBytes));
         FrameMemoryChunk chunk;
         const auto kind = decoder.Take<std::uint32_t>("memory kind");
         const auto rangeKind = decoder.Take<std::uint32_t>("range kind");
@@ -474,6 +481,7 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
         chunk.bytes = decoder.Take<std::uint64_t>("bytes");
         const auto stored = decoder.Take<std::uint64_t>("compressed bytes");
         const auto shared = sharing ? decoder.Take<std::uint64_t>("shared payload") : 0;
+        const auto state = watching ? decoder.Take<std::uint64_t>("range state") : 0;
         if (shared != 0) {
             const auto found = payloads.find(shared);
             requireCapture(chunk.kind == FrameMemoryKind::Delta && found != payloads.end() && chunks[found->second].address == chunk.address && chunks[found->second].bytes == chunk.bytes && stored == 0,
@@ -481,12 +489,18 @@ FrameCaptureReader::FrameCaptureReader(const std::filesystem::path& directory) :
             chunk.offset = shared;
             chunk.compressedBytes = chunks[found->second].compressedBytes;
             chunks.push_back(chunk);
-            offset += ChunkHeaderBytes;
+            offset += headerBytes;
             continue;
         }
         chunk.compressedBytes = stored;
         requireCapture((chunk.kind == FrameMemoryKind::Range) == (chunk.compressedBytes == 0), memoryPath.string() + ": chunk payload does not match its kind at byte " + std::to_string(offset));
-        chunk.offset = offset + ChunkHeaderBytes;
+        if (chunk.kind == FrameMemoryKind::Range) {
+            requireCapture(state == 0 || state == FrameRangeWatch::Recorded || state == (FrameRangeWatch::Recorded | FrameRangeWatch::Watched), memoryPath.string() + ": corrupt range state at byte " + std::to_string(offset));
+            chunk.state = {static_cast<std::uint32_t>(state), chunk.group, chunk.completed};
+            chunk.group = 0;
+            chunk.completed = 0;
+        }
+        chunk.offset = offset + headerBytes;
         if (size - chunk.offset < chunk.compressedBytes) {
             truncated = true;
             break;
