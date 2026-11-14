@@ -797,7 +797,7 @@ void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
         repeated = lookups() == before;
     }
     std::cout << "a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
-    if (!repeated) return;
+    Require(repeated, "mutant-3 probe: a target with a CMASK never repeated on this host, so the scenario is unreachable here");
     AgcDriver::GuestMemory::BreakProofs();
     const MemoEvents events;
     mustLookUp(device, color, {}, "a proof break let a target with a CMASK repeat on a scoped certificate");
