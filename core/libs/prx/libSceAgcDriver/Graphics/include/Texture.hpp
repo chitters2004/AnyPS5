@@ -559,20 +559,21 @@ public:
 
 private:
     std::array<std::pair<std::uint64_t, std::uint64_t>, 2> ownRanges() const;
-    void classifyScopedShadow();
+    void classifyScopedProof();
     bool scopedHit(std::uint64_t epoch);
-    void noteScopedShadow(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch);
+    void completeOwnCpuWrites() const;
+    void certifyScopedProof(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch);
     std::size_t scopedVerdict(const GuestMemory::RangeVersionParts& current) const;
     GuestMemory::ScopedProof scopedProof{};
-    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> shadowUnscoped{};
-    std::uint64_t shadowGeneration = 0;
-    DccKeys shadowKeys = DccKeys::Uncompressed;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> certUnscoped{};
+    std::uint64_t certGeneration = 0;
+    DccKeys certKeys = DccKeys::Uncompressed;
     std::uint64_t certGpuPending = 0;
     std::uint64_t certTexturePending = 0;
     std::uint64_t certOwnPending = 0;
     mutable std::atomic<std::uint64_t> ownPendingBumps{0};
     std::uint64_t ownStampDelta() const;
-    std::size_t shadowCause = 0;
+    std::size_t verdictSeen = 0;
     std::size_t refusal = RefusedNoProof;
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
