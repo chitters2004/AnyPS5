@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawBindingCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
@@ -5831,6 +5832,106 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         snapshotRecorder.Sync();
     }
     recorder.Activate();
+}
+
+bool drawBindingCountTests(const Device& device) {
+    const bool counted = DrawBindingCountsProfiled();
+    TakeDrawBindingCounts();
+    const auto& context = device.GetContext();
+    {
+        Recorder cache(context);
+        const auto buffer = std::make_shared<Buffer>(context, 16, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        constexpr std::uint64_t address = 0x20000000;
+        const std::array<std::uint64_t, 3> stamp{1, 1, 1};
+        const std::array<std::uint64_t, 3> next{1, 2, 1};
+        cache.NoteUnwrittenDrawSnapshot(address, 16, stamp, buffer);
+        Require(cache.UnwrittenDrawSnapshot(address, 16, stamp) == buffer, "a noted unwritten snapshot is not found under its stamp");
+        Require(cache.UnwrittenDrawSnapshot(address, 32, stamp) == nullptr, "an unwritten snapshot answered a different size");
+        cache.NoteUnwrittenDrawSnapshot(address, 32, stamp, buffer);
+        cache.NoteUnwrittenDrawSnapshot(address + 64, Recorder::DrawSnapshotBudget, stamp, buffer);
+        Require(cache.UnwrittenDrawSnapshot(address, 32, next) == nullptr, "an unwritten snapshot outlived a newer stamp");
+        Require(cache.UnwrittenDrawSnapshot(address, 32, next) == nullptr, "an unwritten snapshot came back after its stamp retired");
+    }
+    const auto map = TakeDrawBindingCounts();
+    const auto expect = [&](std::uint64_t value) { return counted ? value : 0; };
+    Require(map.unwrittenLookups == expect(4) && map.unwrittenHits == expect(1), "unwritten snapshot lookups and hits are miscounted");
+    Require(map.unwrittenNotes == expect(3) && map.unwrittenInserts == expect(2) && map.unwrittenReplaced == expect(1) && map.unwrittenRefused == expect(1), "unwritten snapshot notes are miscounted");
+    Require(map.unwrittenRetires == expect(1) && map.unwrittenRetired == expect(1), "unwritten snapshot retires are miscounted");
+    Require(map.calls == 0 && map.overrideUploads == 0 && map.rangeUploads == 0 && map.keepProbes == 0, "the unwritten snapshot map counted draw binding work");
+    const auto limit = ShaderResources::DrawUploadLimit();
+    if (limit < 256 || limit > 16384) {
+        std::cout << "draw upload limit outside 256..16384 bytes: draw binding walk counts not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 65536;
+    void* block = context.hostImportAlignment != 0 ? AllocateWatched(bytes, 65536) : nullptr;
+    if (block == nullptr) {
+        std::cout << "host imports or write watching unavailable: draw binding walk counts not tested\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    for (std::size_t index = 0; index < bytes; ++index) static_cast<std::uint8_t*>(block)[index] = static_cast<std::uint8_t>(index * 5u + 3u);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: draw binding walk counts not tested\n";
+        return false;
+    }
+    const std::array<std::uint64_t, 3> elements{address + 4096, address + 8192, address + 32768};
+    const std::array<std::size_t, 3> sizes{256, 128, limit + 256};
+    ShaderRecompiler::RecompileResult program;
+    for (std::uint32_t index = 0; index < elements.size(); ++index) {
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = index;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(elements[index]), static_cast<std::uint32_t>(elements[index] >> 32u) & 0xffffu, static_cast<std::uint32_t>(sizes[index]), 0x31000000u};
+        binding.bufferWritten = {false};
+        program.bindings.push_back(binding);
+    }
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto snapshotContext = context;
+    DescriptorCache descriptors(snapshotContext);
+    snapshotContext.descriptorCache = &descriptors;
+    Recorder recorder(snapshotContext);
+    recorder.Activate();
+    ShaderResources resources(snapshotContext, compute);
+    std::array<std::uint32_t, 16> words{};
+    for (std::size_t index = 0; index < words.size(); ++index) words[index] = static_cast<std::uint32_t>(0x1000u + index);
+    const std::array<ShaderResources::MovedBuffer, 2> moved{ShaderResources::MovedBuffer{1, elements[1], 64, words}, ShaderResources::MovedBuffer{0, elements[0], sizes[0], {}}};
+    const auto bindings = resources.PrepareDrawBindings(recorder, moved);
+    Require(bindings != nullptr && bindings->snapshots.size() == elements.size(), "the counted draw did not snapshot its inputs");
+    Require(bindings->snapshots[0].buffer == bindings->snapshots[1].buffer && bindings->snapshots[2].buffer != bindings->snapshots[0].buffer, "the counted draw did not share one upload chunk between its uploads");
+    const auto walk = TakeDrawBindingCounts();
+    Require(walk.calls == expect(1) && walk.allocations == expect(3) && walk.moved == expect(2), "draw binding calls, allocations or moved buffers are miscounted");
+    Require(walk.walkPairs == expect(6) && walk.walkScans == expect(5), "the binding walk's moved pairs or compares are miscounted");
+    Require(walk.overrideUploads == expect(1) && walk.overrideBytes == expect(64), "override word uploads are miscounted");
+    Require(walk.rangeUploads == expect(1) && walk.rangeBytes == expect(sizes[0]), "small guest range uploads are miscounted");
+    Require(walk.unwrittenLookups == expect(2), "the walk's unwritten snapshot lookups are miscounted");
+    Require(walk.keepProbes == expect(3) && walk.keepOwners == expect(2), "kept buffer probes or new owners are miscounted");
+    const auto kept = recorder.OpenKeptBytes();
+    Require(kept == bindings->snapshots[0].buffer->Bytes().size() + bindings->snapshots[2].buffer->Bytes().size(), "kept bytes did not count each kept buffer once");
+    if (counted) ReportDrawBindingCounts();
+    return true;
 }
 
 void vertexWindowSeriesTests(const Device& device, Recorder& recorder) {
@@ -16790,6 +16891,11 @@ int main(int argc, char** argv) {
             overlappedRangeTests(recorder);
             spaceWriteSyncTests(device, recorder);
             std::cout << "Address space pending write tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-binding-counts-only") {
+            if (!drawBindingCountTests(device)) return 77;
+            std::cout << "Draw binding count tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--untracked-forget-only") {

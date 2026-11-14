@@ -7,6 +7,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawBindingCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -3437,10 +3438,12 @@ void Recorder::dropStaleHoldKept() {
     if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
 }
 
-void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
-    if (owner == nullptr || bytes == 0) return;
+bool Recorder::KeepBytes(const void* owner, std::size_t bytes) {
+    if (owner == nullptr || bytes == 0) return false;
     ensureOpen();
-    if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
+    if (!open->keptOwners.insert(owner).second) return false;
+    open->keptBytes += bytes;
+    return true;
 }
 
 void Recorder::BoundKeptBytes() {
@@ -3479,8 +3482,54 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     return {drawUpload, offset, drawUpload->Bytes().data() + offset};
 }
 
+bool DrawBindingCountsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW_BINDINGS") != nullptr;
+    return profiled;
+}
+
+DrawBindingCounters& DrawBindingCountTallies() {
+    static DrawBindingCounters counters;
+    return counters;
+}
+
+DrawBindingCounts TakeDrawBindingCounts() {
+    auto& tallies = DrawBindingCountTallies();
+    DrawBindingCounts counts;
+    counts.calls = tallies.calls.Take();
+    counts.allocations = tallies.allocations.Take();
+    counts.moved = tallies.moved.Take();
+    counts.walkPairs = tallies.walkPairs.Take();
+    counts.walkScans = tallies.walkScans.Take();
+    counts.overrideUploads = tallies.overrideUploads.Take();
+    counts.overrideBytes = tallies.overrideBytes.Take();
+    counts.rangeUploads = tallies.rangeUploads.Take();
+    counts.rangeBytes = tallies.rangeBytes.Take();
+    counts.unwrittenLookups = tallies.unwrittenLookups.Take();
+    counts.unwrittenHits = tallies.unwrittenHits.Take();
+    counts.unwrittenNotes = tallies.unwrittenNotes.Take();
+    counts.unwrittenInserts = tallies.unwrittenInserts.Take();
+    counts.unwrittenReplaced = tallies.unwrittenReplaced.Take();
+    counts.unwrittenRefused = tallies.unwrittenRefused.Take();
+    counts.unwrittenRetires = tallies.unwrittenRetires.Take();
+    counts.unwrittenRetired = tallies.unwrittenRetired.Take();
+    counts.keepProbes = tallies.keepProbes.Take();
+    counts.keepOwners = tallies.keepOwners.Take();
+    return counts;
+}
+
+void ReportDrawBindingCounts() {
+    const auto counts = TakeDrawBindingCounts();
+    const auto perCall = [&](std::uint64_t value) { return counts.calls == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(counts.calls); };
+    const auto meanBytes = [](std::uint64_t bytes, std::uint64_t uploads) { return uploads == 0 ? 0.0 : static_cast<double>(bytes) / static_cast<double>(uploads); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-bindings] (10 s): %llu calls; walk %.2f allocations x %.2f moved per call, %.2f pairs, %.2f moved compares; uploads %llu override (%.2f per call, %.0f B each), %llu small range (%.2f per call, %.0f B each); unwritten snapshots %llu lookups, %llu hits, %llu notes: %llu inserted, %llu replaced, %llu refused; %llu retires dropping %llu entries; keeps %llu probes, %llu new owners (%.2f, %.2f per call)\n", static_cast<unsigned long long>(counts.calls), perCall(counts.allocations), perCall(counts.moved), perCall(counts.walkPairs), perCall(counts.walkScans), static_cast<unsigned long long>(counts.overrideUploads), perCall(counts.overrideUploads), meanBytes(counts.overrideBytes, counts.overrideUploads), static_cast<unsigned long long>(counts.rangeUploads), perCall(counts.rangeUploads), meanBytes(counts.rangeBytes, counts.rangeUploads), static_cast<unsigned long long>(counts.unwrittenLookups), static_cast<unsigned long long>(counts.unwrittenHits), static_cast<unsigned long long>(counts.unwrittenNotes), static_cast<unsigned long long>(counts.unwrittenInserts), static_cast<unsigned long long>(counts.unwrittenReplaced), static_cast<unsigned long long>(counts.unwrittenRefused), static_cast<unsigned long long>(counts.unwrittenRetires), static_cast<unsigned long long>(counts.unwrittenRetired), static_cast<unsigned long long>(counts.keepProbes), static_cast<unsigned long long>(counts.keepOwners), perCall(counts.keepProbes), perCall(counts.keepOwners));
+}
+
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     if (stamp == unwrittenStamp) return;
+    if (DrawBindingCountsProfiled() && !unwrittenSnapshots.empty()) {
+        DrawBindingCountTallies().unwrittenRetires.Add();
+        DrawBindingCountTallies().unwrittenRetired.Add(unwrittenSnapshots.size());
+    }
     unwrittenSnapshots.clear();
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
@@ -3489,20 +3538,32 @@ void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stam
 std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset) {
     retireUnwrittenSnapshots(stamp);
     const auto found = unwrittenSnapshots.find(address);
-    if (found == unwrittenSnapshots.end() || found->second.bytes != bytes) return {};
+    const bool hit = found != unwrittenSnapshots.end() && found->second.bytes == bytes;
+    if (DrawBindingCountsProfiled()) {
+        DrawBindingCountTallies().unwrittenLookups.Add();
+        if (hit) DrawBindingCountTallies().unwrittenHits.Add();
+    }
+    if (!hit) return {};
     if (offset != nullptr) *offset = found->second.offset;
     return found->second.buffer;
 }
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
     retireUnwrittenSnapshots(stamp);
+    const bool counted = DrawBindingCountsProfiled();
+    if (counted) DrawBindingCountTallies().unwrittenNotes.Add();
     if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
         unwrittenBytes -= found->second.bytes;
         unwrittenSnapshots.erase(found);
+        if (counted) DrawBindingCountTallies().unwrittenReplaced.Add();
     }
-    if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
+    if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) {
+        if (counted) DrawBindingCountTallies().unwrittenRefused.Add();
+        return;
+    }
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
     unwrittenBytes += bytes;
+    if (counted) DrawBindingCountTallies().unwrittenInserts.Add();
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset, std::size_t from, std::uint32_t* lowest) {

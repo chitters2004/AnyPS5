@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawBindingCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <atomic>
@@ -7007,6 +7008,14 @@ std::size_t ShaderResources::DrawUploadLimit() {
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
     requireGuestBuffers(moved);
     if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    const bool counted = DrawBindingCountsProfiled();
+    if (counted) {
+        auto& tallies = DrawBindingCountTallies();
+        tallies.calls.Add();
+        tallies.allocations.Add(allocations.size());
+        tallies.moved.Add(moved.size());
+        tallies.walkPairs.Add(allocations.size() * moved.size());
+    }
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -7027,7 +7036,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        if (counted) DrawBindingCountTallies().walkScans.Add(override != moved.end() ? static_cast<std::size_t>(override - moved.begin()) + 1 : moved.size());
         if (override != moved.end() && !override->words.empty()) {
+            if (counted) {
+                DrawBindingCountTallies().overrideUploads.Add();
+                DrawBindingCountTallies().overrideBytes.Add(override->size);
+            }
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
@@ -7070,6 +7084,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
+                if (counted) {
+                    DrawBindingCountTallies().rangeUploads.Add();
+                    DrawBindingCountTallies().rangeBytes.Add(bytes);
+                }
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
@@ -7094,7 +7112,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     if (selected.empty() && !rebound) return {};
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    std::uint64_t owners = 0;
+    for (const auto& snapshot : result->snapshots) owners += recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size()) ? 1 : 0;
+    if (counted) {
+        DrawBindingCountTallies().keepProbes.Add(result->snapshots.size());
+        DrawBindingCountTallies().keepOwners.Add(owners);
+    }
     return result;
 }
 
