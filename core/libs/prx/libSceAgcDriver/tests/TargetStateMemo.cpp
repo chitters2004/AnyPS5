@@ -1483,15 +1483,32 @@ void scopedProofOracle(AgcDriver::VulkanDevice& device) {
     const auto certified = StorageTexture::ScopedProofHits();
     certify();
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != certified, "a target drawn alone took no scoped proof");
+    const auto resident = StorageTexture::FindLive(covered.address, covered.bytes);
     const auto covering = StorageTexture::FindLive(grown.address, grown.bytes);
-    Require(covering != nullptr, "the covering image is not live");
+    Require(resident != nullptr && covering != nullptr && resident != covering, "the target and the covering image are not both live");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        StorageTexture::FlushPending(covered.address, covered.bytes, nullptr, "test");
+        device.WaitIdle();
+    }
+    rewatch();
+    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(grown.address, grown.bytes));
+    const auto refreshAlone = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::BreakProofs();
+        static_cast<void>(resident->Refresh());
+    };
+    refreshAlone();
+    refreshAlone();
+    const auto settled = StorageTexture::ScopedProofHits();
+    refreshAlone();
+    Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != settled, "a target with no pending results took no scoped proof");
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         covering->MarkDirty();
     }
     const auto beforeGrowth = StorageTexture::ScopedProofHits();
-    rewatch();
-    draw(device, covered);
+    refreshAlone();
     Require(StorageTexture::ScopedProofHits() == beforeGrowth && StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof held after another image's results grew into the target");
     flushGrown();
     reset(device, plain);
