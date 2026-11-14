@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -25,6 +26,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace AgcDriver {
@@ -269,11 +271,55 @@ void RetiredSurfaceCase(AgcDriver::VulkanDevice& device, const DepthFastClearHar
 
 }
 
-int main() {
+void StencilStorageNoteCase(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, bool reuseOff) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, reuseOff);
+    GuestBlock block;
+    auto* depth = block.Plane(0);
+    auto* stencil = block.Plane(1);
+    const auto stencilBase = Address(stencil);
+    const std::string arm = std::string("with collect reuse ") + (reuseOff ? "off" : "on");
+    const auto swizzle = AgcDriver::Graphics::XorSwizzleMode(AgcDriver::Graphics::TextureTileMode::kZ64KBX);
+    const DepthFastClearHarness::Surface surface{Address(depth), stencilBase, 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 0, swizzle};
+    constexpr VkStencilOpState equalZero{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 0u};
+    constexpr VkStencilOpState equalOne{VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_STENCIL_OP_KEEP, VK_COMPARE_OP_EQUAL, 0xffu, 0u, 1u};
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equalZero}), Covered, "a mirrored D32S8 depth surface " + arm + " before its stencil plane takes a storage write, tested EQUAL to 0");
+    StoreStencilRow(device, stencil);
+    Require(AgcDriver::Graphics::StorageTexture::FindPending(stencilBase, Width * Height) != nullptr, "the stencil row is not pending in an R8_UINT storage image");
+    if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(stencilBase, PlaneBytes) || !AgcDriver::GuestMemory::Watched(Address(depth), PlaneBytes)) {
+        std::puts("the planes are not write-watched after the storage write here: the stencil note after a storage take is not exercised");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, false);
+        return;
+    }
+    const auto reusedBefore = AgcDriver::Graphics::DepthCollectReuses();
+    RequireCount(DepthFastClearHarness::Draw(device, shaders, surface, {.depthTest = false, .stencilTest = true, .stencil = equalOne}), Threads, "a mirrored D32S8 depth surface " + arm + " that took a pending R8_UINT storage write of its stencil plane, tested EQUAL to 1");
+    const auto reused = AgcDriver::Graphics::DepthCollectReuses() - reusedBefore;
+    if (reused != (reuseOff ? 0u : 1u)) failures.push_back("a draw " + arm + " whose stencil plane was taken from a storage write reused " + std::to_string(reused) + " plane collects; the stencil collect taken before the take must not be its note");
+    const auto note = AgcDriver::Graphics::DepthMemoryNoteAt(device.graphicsContext().device, Address(depth));
+    Require(note.has_value() && note->stencil != 0u, "a draw " + arm + " over a watched stencil plane left no stencil note");
+    AgcDriver::GuestMemory::CollectWritesUncached(stencilBase, PlaneBytes);
+    if (AgcDriver::GuestMemory::WrittenSince(stencilBase, PlaneBytes, note->stencil)) failures.push_back("the stencil note of a draw " + arm + " that took a storage write reports a write from before the draw, so its stencil results would not be stored");
+    AgcDriver::Graphics::RetireDepthSurfaces(device.graphicsContext().device, Address(depth), PlaneBytes);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, false);
+}
+
+int main(int argc, char** argv) {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto shaders = DepthFastClearHarness::Compile(*device);
+        if (argc == 2 && std::string_view(argv[1]) == "--stencil-storage-note") {
+            StencilStorageNoteCase(*device, shaders, false);
+            StencilStorageNoteCase(*device, shaders, true);
+            if (!failures.empty()) {
+                std::string text;
+                for (const auto& failure : failures) text += failure + "\n";
+                throw std::runtime_error(text);
+            }
+            std::puts("stencil storage note tests passed");
+            return 0;
+        }
         GuestBlock block;
         NewSurfaceCase(*device, shaders, block.Plane(0), VK_FORMAT_D32_SFLOAT, false, "a new D32 depth surface over a pending R32F storage write");
         NewSurfaceCase(*device, shaders, block.Plane(1), VK_FORMAT_D16_UNORM, false, "a new D16 depth surface over a pending R16 unorm storage write");
