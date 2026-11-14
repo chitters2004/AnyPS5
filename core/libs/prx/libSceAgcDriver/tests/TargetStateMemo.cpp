@@ -1,3 +1,4 @@
+#include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
@@ -731,6 +732,14 @@ std::byte* allocateWatched(std::size_t bytes) {
     return static_cast<std::byte*>(memory);
 }
 
+std::uint64_t mapDirectMemory(std::size_t bytes) {
+    std::int64_t physical = -1;
+    Require(sceKernelAllocateDirectMemory(0, 0x10000000000ll, bytes, 65536, 3, &physical) == 0, "cannot allocate direct memory");
+    void* memory = nullptr;
+    Require(sceKernelMapDirectMemory(&memory, bytes, 3, 0, physical, 65536) == 0, "cannot map direct memory");
+    return address(memory);
+}
+
 struct HitCase {
     const char* name;
     bool metadata;
@@ -789,7 +798,8 @@ void dccClear(AgcDriver::VulkanDevice& device) {
 
 void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
     auto color = colorTarget(false, true);
-    color.cmaskAddress = address(allocateWatched(65536));
+    color.cmaskAddress = mapDirectMemory(65536);
+    const bool watchedWhenMapped = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
     reset(device, color);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     bool repeated = false;
@@ -799,7 +809,7 @@ void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
         repeated = lookups() == before;
     }
     const bool watched = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
-    std::cout << "the CMASK is " << (watched ? "" : "not ") << "write-watched; a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
+    std::cout << "the direct-memory CMASK is " << (watchedWhenMapped ? "" : "not ") << "write-watched when mapped and " << (watched ? "" : "not ") << "after the draws; a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
     Require(!LookupOutcomes::Profiled() || memoResolves() || repeated || !watched, "a target over a write-watched CMASK did not repeat, so its proof break cannot be tested");
     if (!repeated) return;
     AgcDriver::GuestMemory::BreakProofs();

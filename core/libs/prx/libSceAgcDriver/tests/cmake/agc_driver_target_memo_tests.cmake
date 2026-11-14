@@ -13,6 +13,7 @@ target_include_directories(agc_driver_target_memo_tests PRIVATE
 target_link_libraries(agc_driver_target_memo_tests PRIVATE
         libSceAgcDriver
         SDL2-static
+        libkernel
         libc
 )
 
@@ -47,6 +48,11 @@ if(BUILD_TESTING)
     set_property(TEST agc_driver_target_memo_verify APPEND PROPERTY ENVIRONMENT APS5_VERIFY_TARGET_MEMO=1)
     set_property(TEST agc_driver_target_memo_disabled APPEND PROPERTY ENVIRONMENT APS5_NO_TARGET_MEMO=1)
     set_property(TEST agc_driver_target_memo_c2_off APPEND PROPERTY ENVIRONMENT APS5_NO_TARGET_MEMO_C2=1)
+    if(NOT WIN32)
+        add_test(NAME agc_driver_target_memo_watched_imports COMMAND agc_driver_target_memo_tests)
+        set_tests_properties(agc_driver_target_memo_watched_imports PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+                ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_DRAW=1;APS5_WRITE_WATCH_IMPORTS=watch")
+    endif()
     set_tests_properties(agc_driver_target_memo agc_driver_target_memo_draw_pipeline PROPERTIES TIMEOUT 30)
     foreach(scenario IN ITEMS descriptor msaa proof metadata eviction fallback baseline held-baseline switch-flip unchanged depth-proof claim untracked-dcc untracked-cmask resident-dcc)
         foreach(mode IN ITEMS enabled disabled verify)
