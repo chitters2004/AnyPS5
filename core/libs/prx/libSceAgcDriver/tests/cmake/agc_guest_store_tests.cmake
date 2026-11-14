@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_guest_store_tests tests/GuestStore.cpp)
+    target_include_directories(agc_guest_store_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_guest_store_tests PRIVATE libc)
+    configure_windows_unwind(agc_guest_store_tests)
+    add_test(NAME agc_guest_store COMMAND agc_guest_store_tests)
+    add_test(NAME agc_guest_store_concurrent COMMAND agc_guest_store_tests concurrent)
+    set_tests_properties(agc_guest_store agc_guest_store_concurrent PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_guest_store agc_guest_store_concurrent PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

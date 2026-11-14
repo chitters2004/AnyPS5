@@ -153,6 +153,14 @@ void copyFrame(std::uint32_t* words, const Layout& layout, std::byte* target) {
     copy(words, CommandBytes, layout.source, target, layout.label);
 }
 
+void waitUntil(const std::function<bool()>& done, const char* message) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!done()) {
+        check(std::chrono::steady_clock::now() < deadline, message);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
+
 void flip() {
     AgcDriverSubmitFlip_nid_postfix(AgcDriver::FlipInfo{Handle, -1, 1, 0});
 }
@@ -283,9 +291,11 @@ void testConcurrentCopies(const std::filesystem::path& tool) {
     });
     for (std::size_t frame = 0; frame + 1 < Frames; ++frame) {
         const auto bytes = pattern(static_cast<std::uint8_t>(frame));
+        auto* const landed = layout.label + 4 + frame;
         std::memcpy(layout.source, bytes.data(), bytes.size());
-        copyFrame(layout.firstCommands, layout, layout.firstTarget);
+        copy(layout.firstCommands, CommandBytes, layout.source, layout.firstTarget, landed);
         flip();
+        waitUntil([&] { return std::atomic_ref<std::uint32_t>(*landed).load(std::memory_order_acquire) == Done; }, "the frame's copy did not finish");
     }
     copier.join();
     flip();
@@ -436,14 +446,6 @@ void releaseMem(CommandBuffer& buffer, const std::uint32_t* label) {
     buffer.cursor_up += words.size();
 }
 
-void waitUntil(const std::function<bool()>& done, const char* message) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (!done()) {
-        check(std::chrono::steady_clock::now() < deadline, message);
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-}
-
 bool parkedOn(const volatile void* address) {
     std::array<AgcDriver::AwaitedWait, 8> waits{};
     const auto count = AgcDriverAwaitedWaits_nid_postfix(waits.data(), waits.size());
@@ -484,12 +486,15 @@ void testStoreAfterGatedCopy(const std::filesystem::path& tool) {
 
     flip();
     auto* const gate = layout.label + 1;
+    auto* const landed = layout.label + 2;
     auto* const control = submitRewound(layout.firstCommands, [&](CommandBuffer& buffer) {
         sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, gate, Done, 0xffffffffu, 0);
         sceAgcDcbDmaData(&buffer, 0, DmaMemory, 0, at(layout.firstTarget), DmaMemory, 0, at(layout.source), DataBytes, 0, 1, 0);
+        writeDone(buffer, landed);
     }, [&](CommandBuffer& buffer) { writeDone(buffer, layout.label); });
     std::atomic_ref<std::uint32_t>(*gate).store(Done, std::memory_order_release);
-    waitUntil([&] { return equal(layout.firstTarget, copied); }, "the copy before the REWIND did not land");
+    waitUntil([&] { return std::atomic_ref<std::uint32_t>(*landed).load(std::memory_order_acquire) == Done; }, "the copy before the REWIND did not finish");
+    check(equal(layout.firstTarget, copied), "the copy before the REWIND did not land");
     std::memcpy(layout.firstTarget, stored.data(), stored.size());
     flip();
     release(control);
@@ -634,17 +639,15 @@ void testFilledRewindTail(const std::filesystem::path& tool) {
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
     auto called = commands(layout.secondCommands);
     writeDone(called, layout.label);
-    const auto build = [&](const std::uint32_t* target, std::uint32_t words) {
-        auto buffer = commands(layout.firstCommands);
-        auto* const control = sceAgcDcbRewind(&buffer, 0) + 1;
-        sceAgcDcbJump(&buffer, 0, 0, target, words);
-        return std::pair{control, Packet{layout.firstCommands, static_cast<std::uint32_t>(buffer.cursor_up - layout.firstCommands), 0, {}}};
-    };
-    auto [control, packet] = build(nullptr, 0);
+    auto buffer = commands(layout.firstCommands);
+    auto* const control = sceAgcDcbRewind(&buffer, 0) + 1;
+    sceAgcDcbJump(&buffer, 0, 0, nullptr, 0);
+    Packet packet{layout.firstCommands, static_cast<std::uint32_t>(buffer.cursor_up - layout.firstCommands), 0, {}};
 
     flip();
     check(sceAgcDriverSubmitDcb(&packet) == 0, "submission failed");
-    build(layout.secondCommands, static_cast<std::uint32_t>(called.cursor_up - layout.secondCommands));
+    auto tail = commands(control + 1);
+    sceAgcDcbJump(&tail, 0, 0, layout.secondCommands, static_cast<std::uint32_t>(called.cursor_up - layout.secondCommands));
     release(control);
     waitUntil([&] { return std::atomic_ref<std::uint32_t>(*layout.label).load() == Done; }, "the filled REWIND tail did not run");
     flip();
@@ -687,7 +690,7 @@ void testFenceReused(const std::filesystem::path& tool) {
     std::memcpy(layout.source, copied.data(), copied.size());
     auto output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
-    auto* const fence = layout.label + 1;
+    auto* const fence = reinterpret_cast<std::uint32_t*>(reinterpret_cast<std::byte*>(layout.label) + DataBytes);
     const auto gatedCopy = [&](std::uint32_t* words, std::byte* target, std::uint32_t* label) {
         auto buffer = commands(words);
         sceAgcDcbWaitRegMem(&buffer, 0, 3, 0, 0, fence, Done, 0xffffffffu, 0);

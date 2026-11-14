@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestStore.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -569,8 +570,7 @@ struct Replay {
             const SettledHold hold{true};
             if (!settled) return;
             AgcDriverPrepareCommandWrite_nid_no_patch(word.address, word.value.size());
-            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(word.address)), word.value.data(), word.value.size());
-            std::atomic_thread_fence(std::memory_order_seq_cst);
+            AgcDriver::GuestStore::StoreLabel(reinterpret_cast<void*>(static_cast<std::uintptr_t>(word.address)), word.value);
         }
     }
 
@@ -632,9 +632,8 @@ struct Replay {
     }
 
     static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
-        std::uint64_t value = 0;
-        std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes);
-        return value;
+        const auto* const label = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address));
+        return bytes == 8 ? AgcDriver::GuestStore::Load<std::uint64_t>(label) : AgcDriver::GuestStore::Load<std::uint32_t>(label);
     }
 
     static bool satisfies(const AgcDriver::AwaitedWait& wait, std::uint64_t value) {
@@ -673,14 +672,15 @@ struct Replay {
         for (const auto* chunk : found->second) {
             if (chunk->address > address || address + 4 > chunk->address + chunk->bytes || skipped.Overlaps(*chunk)) continue;
             const auto bytes = reader.Read(*chunk);
-            const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(wait.bytes == 8 ? 8 : 4, chunk->address + chunk->bytes - address));
+            const std::size_t length = wait.bytes == 8 ? 8 : 4;
+            if (address + length > chunk->address + chunk->bytes) continue;
             const auto* const recorded = bytes.data() + (address - chunk->address);
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(address));
-            if (std::memcmp(target, recorded, length) == 0) return false;
             std::uint64_t value = 0;
             std::memcpy(&value, recorded, length);
+            if (load(address, length) == value) return false;
             if (wait.function != 0 && !satisfies(wait, value)) return false;
-            std::memcpy(target, recorded, length);
+            AgcDriver::GuestStore::StoreLabel(target, std::span(recorded, length));
             return true;
         }
         return false;
@@ -706,7 +706,7 @@ struct Replay {
             }
             if (!released && options.synthesize) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
-                    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
+                    AgcDriver::GuestStore::StoreLabel(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), std::as_bytes(std::span(&*value, 1)).first(bytes));
                     ++syntheticReleases;
                     released = true;
                 }

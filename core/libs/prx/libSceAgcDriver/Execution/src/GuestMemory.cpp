@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestStore.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
@@ -3812,6 +3813,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     StoreOwnBytes(address, source.size(), [&](std::span<std::byte> image) {
         CheckRange(destination, source.size(), alignment, true);
         if (source.size() >= PageBytes) copyOwnBytes(address, source);
+        else if (GuestStore::IsLabel(destination, source.size())) GuestStore::StoreLabel(destination, source);
         else std::memcpy(destination, source.data(), source.size());
         if (!image.empty()) std::memcpy(image.data(), source.data(), source.size());
     });
