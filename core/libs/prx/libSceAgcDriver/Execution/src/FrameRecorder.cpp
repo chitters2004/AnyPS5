@@ -563,10 +563,14 @@ void FrameRecorder::stop(const char* reason) {
     state = State::Done;
 }
 
+void FrameRecorder::SetStartIdleWaitForTest(std::function<bool()> wait) {
+    startIdleWaitForTest = std::move(wait);
+}
+
 void FrameRecorder::start() {
     ++startAttempts;
     auto& driver = DriverDetail::Driver::Get();
-    if (unrecordedAccepts.load(std::memory_order_acquire) != 0 || !driver.WaitIdleUnlessTitleWaitsFor(std::chrono::seconds(10))) {
+    if (unrecordedAccepts.load(std::memory_order_acquire) != 0 || !(startIdleWaitForTest ? startIdleWaitForTest() : driver.WaitIdleUnlessTitleWaitsFor(std::chrono::seconds(10)))) {
         if (startAttempts >= 600) {
             std::fprintf(stderr, "[frame-capture] giving up: the driver was not idle, or a guest call was still being accepted, at all of %llu frame boundaries\n", static_cast<unsigned long long>(startAttempts));
             state = State::Done;

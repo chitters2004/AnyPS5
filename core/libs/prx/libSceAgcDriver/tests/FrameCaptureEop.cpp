@@ -282,14 +282,12 @@ void testWaitingRecorderAdmitsBesideBlockedFlip() {
     auto* const block = allocate();
     auto output = std::make_shared<HeldOutput>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
-    auto* const gate = reinterpret_cast<std::uint32_t*>(block + BlockBytes / 2);
-    auto* const done = gate + 2;
+    auto* const done = reinterpret_cast<std::uint32_t*>(block + BlockBytes / 2);
     auto* const registers = reinterpret_cast<std::uint32_t*>(block + BlockBytes / 2 + 256);
-    registers[0] = 0x00ffffffu;
+    registers[0] = 0x10;
     registers[1] = 74;
     const auto at = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
-    const std::array<std::uint32_t, 17> listed{
-        0xc0053c00u, 0x13u, static_cast<std::uint32_t>(at(gate)), static_cast<std::uint32_t>(at(gate) >> 32u), 1u, 0xffffffffu, 0x19u,
+    const std::array<std::uint32_t, 10> listed{
         0xc0039f00u, static_cast<std::uint32_t>(at(registers)), static_cast<std::uint32_t>(at(registers) >> 32u), 0x80000000u, 1u,
         0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(at(done)), static_cast<std::uint32_t>(at(done) >> 32u), 1u};
     submitWords(listed, block);
@@ -311,8 +309,6 @@ void testWaitingRecorderAdmitsBesideBlockedFlip() {
         admitted.set_value();
     });
     const bool besideFlip = admission.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-    registers[0] = 0x10;
-    std::atomic_ref<std::uint32_t>(*gate).store(1);
     output->Open();
     writer.join();
     flipper.join();
@@ -320,7 +316,7 @@ void testWaitingRecorderAdmitsBesideBlockedFlip() {
     AgcDriverWaitIdle_nid_postfix();
     check(held, "the flip submission did not wait for flip room");
     check(besideFlip, "with the frame recorder waiting for its trigger, a submission waited for another thread's submission that was waiting for flip room");
-    check(std::atomic_ref<std::uint32_t>(*done).load() == 1, "a register list written after its submission was not read where the packet executes");
+    check(std::atomic_ref<std::uint32_t>(*done).load() == 1, "the register list submitted before the flip was not executed");
     check(!std::filesystem::exists(captureDirectory()) || std::filesystem::is_empty(captureDirectory()), "the frame recorder started without its trigger");
 }
 
@@ -372,6 +368,17 @@ void testRecorderStartsAfterAdmittedCalls() {
     std::filesystem::remove(trigger);
     std::filesystem::remove_all(directory);
     const auto started = [&] { return std::filesystem::exists(directory / FrameCaptureWriter::MemoryName); };
+    std::atomic<bool> holding{false};
+    std::atomic<std::uint64_t> waits{0};
+    std::atomic<std::uint64_t> waitsWhileHeld{0};
+    AgcDriver::FrameRecorder::SetStartIdleWaitForTest([&] {
+        waits.fetch_add(1);
+        if (holding.load()) waitsWhileHeld.fetch_add(1);
+        return AgcDriver::DriverDetail::Driver::Get().WaitIdleUnlessTitleWaitsFor(std::chrono::seconds(10));
+    });
+    struct Restore {
+        ~Restore() { AgcDriver::FrameRecorder::SetStartIdleWaitForTest({}); }
+    } restore;
     auto* const block = allocate();
     const std::array<std::uint32_t, 2> nop{0xc0001000u, 0};
     std::memcpy(block, nop.data(), sizeof(nop));
@@ -400,6 +407,7 @@ void testRecorderStartsAfterAdmittedCalls() {
     std::thread admitted([&] {
         try {
             recorder->Submit(labelled, 0, [&] {
+                holding.store(true);
                 entered.Open();
                 check(release.Wait(), "the test did not release the call held in its acceptance");
                 check(sceAgcDriverSubmitDcb(const_cast<Packet*>(&labelled)) == 0, "the held call's submission was refused");
@@ -412,12 +420,15 @@ void testRecorderStartsAfterAdmittedCalls() {
     { std::ofstream(trigger) << 1; }
     finishedWithin([&] { recorder->FrameBoundary(); }, "a frame boundary while a call was being accepted");
     const bool deferred = !started();
+    holding.store(false);
     release.Open();
     admitted.join();
     if (failure) std::rethrow_exception(failure);
     check(deferred, "the frame recorder started while a call it does not record was still being accepted");
+    check(waitsWhileHeld.load() == 0, "the frame recorder waited for the driver to go idle while a call it does not record was still being accepted");
     finishedWithin([&] { recorder->FrameBoundary(); }, "a frame boundary after the held call");
     check(started(), "the frame recorder did not start once no call was being accepted, so a call whose acceptance threw or re-entered is still counted");
+    check(waits.load() == 1, "the frame recorder did not wait for the driver to go idle exactly once, at the start");
     finishedWithin([&] { recorder->FrameBoundary(); }, "the frame boundary that ends the capture");
     AgcDriverWaitIdle_nid_postfix();
     const FrameCaptureReader reader(directory);
@@ -428,7 +439,7 @@ void testRecorderStartsAfterAdmittedCalls() {
         std::memcpy(&value, bytes.data() + (address - chunk.address), sizeof(value));
         return value == 1;
     });
-    check(snapshotted, "the snapshot was taken before the GPU work of a call accepted before the start had written its label");
+    check(snapshotted, "the snapshot does not hold the label written by the GPU work of a call accepted before the start");
 }
 
 }
