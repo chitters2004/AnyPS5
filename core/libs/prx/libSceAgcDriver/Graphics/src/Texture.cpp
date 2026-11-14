@@ -2513,15 +2513,15 @@ std::atomic<int> flushFailureFiredForTest{0};
 
 namespace {
 
-enum ShadowCause : std::size_t { ShadowNone, ShadowGeneration, ShadowHeld, ShadowOwnPending, ShadowOtherPending, ShadowMoved, ShadowUnscoped, ShadowCauses };
-enum ShadowOutcome : std::size_t { ShadowProved, ShadowUnchanged, ShadowWritten, ShadowOutcomes };
-constexpr std::array<const char*, ShadowCauses> ShadowCauseNames{"uncertified", "generation", "held", "ownpending", "otherpending", "moved", "unscoped"};
+enum ScopedVerdict : std::size_t { VerdictUncertified, VerdictGeneration, VerdictHeld, VerdictOwnPending, VerdictOtherPending, VerdictMoved, VerdictUnscoped, ScopedVerdicts };
+enum RefreshOutcome : std::size_t { OutcomeProved, OutcomeUnchanged, OutcomeWritten, RefreshOutcomes };
+constexpr std::array<const char*, ScopedVerdicts> ScopedVerdictNames{"uncertified", "generation", "held", "ownpending", "otherpending", "moved", "unscoped"};
 constexpr std::array<const char*, StorageTexture::RefusalReasons> RefusalNames{"noproof", "generation", "unlocked", "collect", "keys", "stamped", "pending"};
 
-struct ScopedShadowCounters {
-    std::array<std::array<ProfileCounter, ShadowOutcomes>, ShadowCauses> refreshes;
+struct ScopedProofCounters {
+    std::array<std::array<ProfileCounter, RefreshOutcomes>, ScopedVerdicts> refreshes;
     std::array<ProfileCounter, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> unscopedBy;
-    std::array<std::array<ProfileCounter, ShadowOutcomes>, StorageTexture::RefusalReasons> refused;
+    std::array<std::array<ProfileCounter, RefreshOutcomes>, StorageTexture::RefusalReasons> refused;
     ProfileCounter hits;
     ProfileCounter collectedHits;
     ProfileCounter verified;
@@ -2538,8 +2538,8 @@ std::uint64_t scopedVerifyInterval() {
     return interval;
 }
 
-ScopedShadowCounters& scopedShadowCounters() {
-    static auto* counters = new ScopedShadowCounters;
+ScopedProofCounters& scopedProofCounters() {
+    static auto* counters = new ScopedProofCounters;
     return *counters;
 }
 
@@ -2559,13 +2559,13 @@ void ReportScopedProofCounts() {
         std::snprintf(item, sizeof(item), " %s %llu", GuestMemory::UnscopedSourceName(static_cast<GuestMemory::UnscopedSource>(kind)), static_cast<unsigned long long>(versions.unscoped[kind]));
         unscoped += item;
     }
-    auto& counters = scopedShadowCounters();
+    auto& counters = scopedProofCounters();
     std::string refreshes;
-    for (std::size_t cause = 0; cause < ShadowCauses; ++cause) {
-        const auto proved = counters.refreshes[cause][ShadowProved].Take();
-        const auto unchanged = counters.refreshes[cause][ShadowUnchanged].Take();
-        const auto written = counters.refreshes[cause][ShadowWritten].Take();
-        std::snprintf(item, sizeof(item), " %s %llu/%llu/%llu", ShadowCauseNames[cause], static_cast<unsigned long long>(proved), static_cast<unsigned long long>(unchanged), static_cast<unsigned long long>(written));
+    for (std::size_t cause = 0; cause < ScopedVerdicts; ++cause) {
+        const auto proved = counters.refreshes[cause][OutcomeProved].Take();
+        const auto unchanged = counters.refreshes[cause][OutcomeUnchanged].Take();
+        const auto written = counters.refreshes[cause][OutcomeWritten].Take();
+        std::snprintf(item, sizeof(item), " %s %llu/%llu/%llu", ScopedVerdictNames[cause], static_cast<unsigned long long>(proved), static_cast<unsigned long long>(unchanged), static_cast<unsigned long long>(written));
         refreshes += item;
     }
     std::string movedBy;
@@ -2575,72 +2575,71 @@ void ReportScopedProofCounts() {
     }
     std::string refusals;
     for (std::size_t reason = 0; reason < StorageTexture::RefusalReasons; ++reason) {
-        const auto unchanged = counters.refused[reason][ShadowUnchanged].Take();
-        const auto written = counters.refused[reason][ShadowWritten].Take();
+        const auto unchanged = counters.refused[reason][OutcomeUnchanged].Take();
+        const auto written = counters.refused[reason][OutcomeWritten].Take();
         std::snprintf(item, sizeof(item), " %s %llu/%llu", RefusalNames[reason], static_cast<unsigned long long>(unchanged), static_cast<unsigned long long>(written));
         refusals += item;
     }
     std::snprintf(item, sizeof(item), "%s, hits %llu, %llu after a collect, verified %llu, disagreements %llu", RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) ? "off" : "on", static_cast<unsigned long long>(counters.hits.Take()), static_cast<unsigned long long>(counters.collectedHits.Take()), static_cast<unsigned long long>(counters.verified.Take()), static_cast<unsigned long long>(scopedDisagreements.load(std::memory_order_relaxed)));
-    AgcDriver::ProfilePrint_nid_no_patch("[scoped-proofs] (10 s, scoped proofs %s): range bumps calls/granules:%s; unscoped bumps:%s; full refreshes by shadow cert proved/unchanged/written:%s; unscoped moves seen by refreshes:%s; refused proofs by reason unchanged/written:%s\n", item, bumps.c_str(), unscoped.c_str(), refreshes.c_str(), movedBy.c_str(), refusals.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[scoped-proofs] (10 s, scoped proofs %s): range bumps calls/granules:%s; unscoped bumps:%s; full refreshes by scoped verdict proved/unchanged/written:%s; unscoped moves seen by refreshes:%s; refused proofs by reason unchanged/written:%s\n", item, bumps.c_str(), unscoped.c_str(), refreshes.c_str(), movedBy.c_str(), refusals.c_str());
 }
 
 std::size_t StorageTexture::scopedVerdict(const GuestMemory::RangeVersionParts& current) const {
-    if (current.stamp == scopedProof.stamp) return ShadowHeld;
-    if (current.stamp.unscoped != scopedProof.stamp.unscoped) return ShadowUnscoped;
+    if (current.stamp == scopedProof.stamp) return VerdictHeld;
+    if (current.stamp.unscoped != scopedProof.stamp.unscoped) return VerdictUnscoped;
     const auto gpuPending = current.gpuPending - certGpuPending;
     const auto texturePending = current.texturePending - certTexturePending;
-    if (current.stamp.sum - scopedProof.stamp.sum != gpuPending + texturePending) return ShadowMoved;
-    return texturePending == (ownPendingBumps.load(std::memory_order_relaxed) - certOwnPending) * ownStampDelta() ? ShadowOwnPending : ShadowOtherPending;
+    if (current.stamp.sum - scopedProof.stamp.sum != gpuPending + texturePending) return VerdictMoved;
+    return texturePending == (ownPendingBumps.load(std::memory_order_relaxed) - certOwnPending) * ownStampDelta() ? VerdictOwnPending : VerdictOtherPending;
 }
 
-void StorageTexture::classifyScopedShadow() {
+void StorageTexture::classifyScopedProof() {
     if (!scopedProof.valid) {
-        shadowCause = ShadowNone;
+        verdictSeen = VerdictUncertified;
         return;
     }
-    if (generation != shadowGeneration || uploadedKeys != shadowKeys) {
-        shadowCause = ShadowGeneration;
+    if (generation != certGeneration || uploadedKeys != certKeys) {
+        verdictSeen = VerdictGeneration;
         return;
     }
-    shadowCause = scopedVerdict(GuestMemory::RangeVersionPartsOf(ownRanges()));
-    if (shadowCause != ShadowUnscoped) return;
+    verdictSeen = scopedVerdict(GuestMemory::RangeVersionPartsOf(ownRanges()));
+    if (verdictSeen != VerdictUnscoped) return;
     const auto totals = GuestMemory::UnscopedVersionsByKind();
-    auto& counters = scopedShadowCounters();
+    auto& counters = scopedProofCounters();
     for (std::size_t kind = 0; kind < totals.size(); ++kind) {
-        if (totals[kind] != shadowUnscoped[kind]) counters.unscopedBy[kind].Add();
+        if (totals[kind] != certUnscoped[kind]) counters.unscopedBy[kind].Add();
     }
 }
 
-void StorageTexture::noteScopedShadow(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch) {
+void StorageTexture::certifyScopedProof(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch) {
     if (GuestMemory::ScopedProofsProfiled()) {
-        scopedShadowCounters().refreshes[shadowCause][outcome].Add();
-        if (outcome != ShadowProved) scopedShadowCounters().refused[refusal][outcome].Add();
+        scopedProofCounters().refreshes[verdictSeen][outcome].Add();
+        if (outcome != OutcomeProved) scopedProofCounters().refused[refusal][outcome].Add();
     }
-    scopedProof.valid = outcome != ShadowWritten && refreshProof.generation != 0;
+    scopedProof.valid = outcome != OutcomeWritten && refreshProof.generation != 0;
     scopedProof.stamp = before.stamp;
     scopedProof.epoch = epoch;
     certGpuPending = before.gpuPending;
     certTexturePending = before.texturePending;
     certOwnPending = ownPendingBefore;
-    shadowUnscoped = unscopedBefore;
-    shadowGeneration = generation;
-    shadowKeys = uploadedKeys;
+    certUnscoped = unscopedBefore;
+    certGeneration = generation;
+    certKeys = uploadedKeys;
 }
 
 bool StorageTexture::scopedHit(std::uint64_t epoch) {
-    if (!scopedProof.valid || refreshProof.generation == 0 || generation != shadowGeneration || uploadedKeys != shadowKeys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    if (!scopedProof.valid || refreshProof.generation == 0 || generation != certGeneration || uploadedKeys != certKeys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto ranges = ownRanges();
     const auto holds = [&] {
         const auto verdict = scopedVerdict(GuestMemory::RangeVersionPartsOf(ranges));
-        return verdict == ShadowHeld || verdict == ShadowOwnPending;
+        return verdict == VerdictHeld || verdict == VerdictOwnPending;
     };
     if (!holds()) return false;
     const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
     if (descriptor.dccAddress != 0 && (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof))) return false;
     const bool collected = scopedProof.epoch != epoch;
     if (collected) {
-        CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-        if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+        completeOwnCpuWrites();
         if (GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == 0) return false;
         if (descriptor.dccAddress != 0 && GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
         if (!holds()) return false;
@@ -2648,19 +2647,21 @@ bool StorageTexture::scopedHit(std::uint64_t epoch) {
     }
     const auto hit = scopedHits.fetch_add(1, std::memory_order_relaxed) + 1;
     const bool profiled = GuestMemory::ScopedProofsProfiled();
-    if (profiled) (collected ? scopedShadowCounters().collectedHits : scopedShadowCounters().hits).Add();
+    if (profiled) (collected ? scopedProofCounters().collectedHits : scopedProofCounters().hits).Add();
     const auto interval = scopedVerifyInterval();
     if (interval == 0 || hit % interval != 0) return true;
-    if (profiled) scopedShadowCounters().verified.Add();
-    if (!collected) {
-        CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-        if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    }
+    if (profiled) scopedProofCounters().verified.Add();
+    if (!collected) completeOwnCpuWrites();
     if (refreshProved()) return true;
     const auto disagreements = scopedDisagreements.fetch_add(1, std::memory_order_relaxed) + 1;
     if (disagreements <= 8) std::fprintf(stderr, "[scoped-proofs] verify: a scoped hit on storage image 0x%llx+0x%llx the full proof refused (%s)\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), RefusalNames[refusal]);
     scopedProof.valid = false;
     return false;
+}
+
+void StorageTexture::completeOwnCpuWrites() const {
+    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
 }
 
 std::uint64_t StorageTexture::ScopedProofHits() {
@@ -2696,17 +2697,16 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
-    const bool shadowed = GuestMemory::ScopedProofsProfiled();
-    const bool certifying = shadowed || scopedProofs;
+    const bool scopedProfiled = GuestMemory::ScopedProofsProfiled();
+    const bool certifying = scopedProfiled || scopedProofs;
     const auto ownPendingBefore = ownPendingBumps.load(std::memory_order_relaxed);
     const auto rangeBefore = certifying ? GuestMemory::RangeVersionPartsOf(ownRanges()) : GuestMemory::RangeVersionParts{};
-    const auto unscopedBefore = shadowed ? GuestMemory::UnscopedVersionsByKind() : std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>{};
-    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    const auto unscopedBefore = scopedProfiled ? GuestMemory::UnscopedVersionsByKind() : std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>{};
+    completeOwnCpuWrites();
     const bool proved = refreshProved();
-    if (shadowed) classifyScopedShadow();
+    if (scopedProfiled) classifyScopedProof();
     if (proved) {
-        if (certifying) noteScopedShadow(ShadowProved, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
+        if (certifying) certifyScopedProof(OutcomeProved, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2969,11 +2969,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         }
         refreshGeneration();
         if (layerBehind.empty()) takeRefreshProof(alias != nullptr);
-        if (certifying) noteScopedShadow(ShadowUnchanged, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
+        if (certifying) certifyScopedProof(OutcomeUnchanged, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
-    if (certifying) noteScopedShadow(ShadowWritten, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
+    if (certifying) certifyScopedProof(OutcomeWritten, rangeBefore, unscopedBefore, ownPendingBefore, epoch);
     CaptureTrace::Log("refresh image=%llx bytes=%llu generation=%llu dirty=%d keysChanged=%d cpuWrote=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), dirty, keysChanged, cpuWrote);
     // Debug aid: APS5_TRACE_UPLOAD names why a storage image is uploaded again.
     static const bool traceUpload = std::getenv("APS5_TRACE_UPLOAD") != nullptr;
@@ -3454,8 +3454,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
 void StorageTexture::upload(const std::vector<bool>* layers) {
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    completeOwnCpuWrites();
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;

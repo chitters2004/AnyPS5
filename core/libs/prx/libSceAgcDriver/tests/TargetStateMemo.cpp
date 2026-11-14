@@ -1435,11 +1435,84 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15>
     {"eviction", colorMemoResidentEviction}
 }};
 
+struct WatchedGranules {
+    std::byte* base = nullptr;
+    std::size_t bytes = 0;
+
+    void rewatch() const {
+#ifdef _WIN32
+        const std::pair<std::uint64_t, std::uint64_t> range{address(base), address(base) + bytes};
+        AgcDriver::GuestMemory::Rewatch(std::span(&range, 1));
+#else
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(base, bytes);
+#endif
+    }
+};
+
+WatchedGranules watchedGranules(std::size_t count) {
+    constexpr std::size_t Granule = AgcDriver::GuestMemory::RangeGranuleBytes;
+    auto* block = allocateWatched((count + 1) * Granule);
+    return {reinterpret_cast<std::byte*>((address(block) + Granule - 1) & ~std::uint64_t{Granule - 1}), count * Granule};
+}
+
+void flushTarget(AgcDriver::VulkanDevice& device, const ColorTarget& target) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(target.address, target.bytes, nullptr, "test");
+    device.WaitIdle();
+}
+
+void scopedProofForeignGrowth(AgcDriver::VulkanDevice& device) {
+    const auto block = watchedGranules(2);
+    auto target = colorTarget();
+    target.address = address(block.base) + AgcDriver::GuestMemory::RangeGranuleBytes;
+    target.surfaceAddress = target.address;
+    auto covering = besideTargets().outer;
+    covering.address = target.address - PlaneBytes;
+    covering.surfaceAddress = covering.address;
+    const bool scopedProofs = !RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs);
+    reset(device, target);
+    block.rewatch();
+    draw(device, covering);
+    flushTarget(device, covering);
+    const auto drawAfterBreak = [&] {
+        AgcDriver::GuestMemory::BreakProofs();
+        block.rewatch();
+        draw(device, target);
+    };
+    for (int pass = 0; pass < 3; ++pass) drawAfterBreak();
+    const auto drawnHits = StorageTexture::ScopedProofHits();
+    drawAfterBreak();
+    Require(!scopedProofs || StorageTexture::ScopedProofHits() != drawnHits, "a target drawn alone took no scoped proof");
+    const auto targetImage = StorageTexture::FindLive(target.address, target.bytes);
+    const auto coveringImage = StorageTexture::FindLive(covering.address, covering.bytes);
+    Require(targetImage != nullptr && coveringImage != nullptr && targetImage != coveringImage, "the target and the covering image are not both live");
+    flushTarget(device, target);
+    block.rewatch();
+    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(covering.address, covering.bytes));
+    const auto refreshAfterBreak = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::BreakProofs();
+        static_cast<void>(targetImage->Refresh());
+    };
+    refreshAfterBreak();
+    refreshAfterBreak();
+    const auto settledHits = StorageTexture::ScopedProofHits();
+    refreshAfterBreak();
+    Require(!scopedProofs || StorageTexture::ScopedProofHits() != settledHits, "a target with no pending results took no scoped proof");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        coveringImage->MarkDirty();
+    }
+    const auto grownHits = StorageTexture::ScopedProofHits();
+    refreshAfterBreak();
+    Require(StorageTexture::ScopedProofHits() == grownHits && StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof held after another image's results grew into the target");
+    flushTarget(device, covering);
+}
+
 void scopedProofOracle(AgcDriver::VulkanDevice& device) {
     constexpr std::size_t Granule = AgcDriver::GuestMemory::RangeGranuleBytes;
-    constexpr std::size_t WatchedBytes = 4 * Granule;
-    auto* watched = allocateWatched(WatchedBytes + Granule);
-    watched = reinterpret_cast<std::byte*>((address(watched) + Granule - 1) & ~std::uint64_t{Granule - 1});
+    const auto block = watchedGranules(3);
+    auto* watched = block.base;
     auto plain = colorTarget();
     plain.address = address(watched);
     plain.surfaceAddress = plain.address;
@@ -1450,67 +1523,7 @@ void scopedProofOracle(AgcDriver::VulkanDevice& device) {
     targets.inner.surfaceAddress = targets.inner.address;
     const std::span<std::byte> elsewhere{watched + 2 * Granule, PlaneBytes};
     const std::span<std::byte> besidePlain{watched + PlaneBytes, PlaneBytes};
-    const auto rewatch = [&] {
-#ifdef _WIN32
-        const std::pair<std::uint64_t, std::uint64_t> range{address(watched), address(watched) + WatchedBytes};
-        AgcDriver::GuestMemory::Rewatch(std::span(&range, 1));
-#else
-        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(watched, WatchedBytes);
-#endif
-    };
     const auto hitsBefore = StorageTexture::ScopedProofHits();
-    auto covered = colorTarget();
-    covered.address = address(watched) + 3 * Granule;
-    covered.surfaceAddress = covered.address;
-    auto grown = targets.outer;
-    grown.address = covered.address - PlaneBytes;
-    grown.surfaceAddress = grown.address;
-    const auto flushGrown = [&] {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        StorageTexture::FlushPending(grown.address, grown.bytes, nullptr, "test");
-        device.WaitIdle();
-    };
-    reset(device, covered);
-    rewatch();
-    draw(device, grown);
-    flushGrown();
-    const auto certify = [&] {
-        AgcDriver::GuestMemory::BreakProofs();
-        rewatch();
-        draw(device, covered);
-    };
-    for (int pass = 0; pass < 3; ++pass) certify();
-    const auto certified = StorageTexture::ScopedProofHits();
-    certify();
-    Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != certified, "a target drawn alone took no scoped proof");
-    const auto resident = StorageTexture::FindLive(covered.address, covered.bytes);
-    const auto covering = StorageTexture::FindLive(grown.address, grown.bytes);
-    Require(resident != nullptr && covering != nullptr && resident != covering, "the target and the covering image are not both live");
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        StorageTexture::FlushPending(covered.address, covered.bytes, nullptr, "test");
-        device.WaitIdle();
-    }
-    rewatch();
-    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(grown.address, grown.bytes));
-    const auto refreshAlone = [&] {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        AgcDriver::GuestMemory::BreakProofs();
-        static_cast<void>(resident->Refresh());
-    };
-    refreshAlone();
-    refreshAlone();
-    const auto settled = StorageTexture::ScopedProofHits();
-    refreshAlone();
-    Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != settled, "a target with no pending results took no scoped proof");
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        covering->MarkDirty();
-    }
-    const auto beforeGrowth = StorageTexture::ScopedProofHits();
-    refreshAlone();
-    Require(StorageTexture::ScopedProofHits() == beforeGrowth && StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof held after another image's results grew into the target");
-    flushGrown();
     reset(device, plain);
     reset(device, targets.inner);
     reset(device, targets.outer);
@@ -1526,7 +1539,7 @@ void scopedProofOracle(AgcDriver::VulkanDevice& device) {
         return address(span.data()) + next(span.size() / 4) * 4;
     };
     for (int step = 0; step < 400; ++step) {
-        const auto event = next(13);
+        const auto event = next(11);
         const std::uint32_t value = next(2) == 0 ? New : Old;
         if (event == 0) {
             std::memcpy(reinterpret_cast<void*>(anyAddress()), &value, 4);
@@ -1553,48 +1566,16 @@ void scopedProofOracle(AgcDriver::VulkanDevice& device) {
             AgcDriver::GuestMemory::BumpCollectEpoch();
         } else if (event == 8) {
             draw(device, targets.outer, {.scissor = Right});
-        } else if (event == 11) {
-            draw(device, targets.outer);
-            {
-                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-                StorageTexture::FlushPending(targets.inner.address, PlaneBytes, nullptr, "test");
-                device.WaitIdle();
-            }
-            for (int pass = 0; pass < 2; ++pass) {
-                AgcDriver::GuestMemory::BreakProofs();
-                rewatch();
-                draw(device, targets.inner);
-            }
-            if (const auto outer = StorageTexture::FindPending(targets.outer.address, targets.outer.bytes)) {
-                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-                outer->MarkDirty();
-            }
-        } else if (event == 12) {
-            {
-                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-                StorageTexture::FlushPending(targets.outer.address, targets.outer.bytes, nullptr, "test");
-                device.WaitIdle();
-            }
-            for (int pass = 0; pass < 2; ++pass) {
-                AgcDriver::GuestMemory::BreakProofs();
-                rewatch();
-                draw(device, targets.inner);
-            }
-            draw(device, targets.outer);
         } else {
             draw(device, *drawn[next(drawn.size())]);
         }
         for (const auto* target : drawn) {
-            rewatch();
+            block.rewatch();
             draw(device, *target);
         }
         Require(StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof hit where the full proof refused, after event " + std::to_string(event) + " at step " + std::to_string(step));
     }
-    for (const auto* target : drawn) {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        StorageTexture::FlushPending(target->address, target->bytes, nullptr, "test");
-        device.WaitIdle();
-    }
+    for (const auto* target : drawn) flushTarget(device, *target);
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != hitsBefore, "the oracle sequence never took a scoped proof");
 }
 
@@ -1667,6 +1648,7 @@ int main(int argc, char** argv) {
         AgcDriver::GuestMemory::MarkProofThread();
         AgcDriver::GuestMemory::BumpCollectEpoch();
         if (argc == 2 && std::string(argv[1]) == "--scoped-oracle") {
+            scopedProofForeignGrowth(*device);
             scopedProofOracle(*device);
             std::cout << "refreshes proved " << StorageTexture::RefreshesProved() << "\n";
             std::cout << "scoped proof oracle: " << StorageTexture::ScopedProofHits() << " scoped hits, " << StorageTexture::ScopedProofDisagreements() << " disagreements\n";
