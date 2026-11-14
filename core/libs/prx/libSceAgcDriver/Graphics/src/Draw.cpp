@@ -1429,6 +1429,148 @@ const char* DrawRecipeMissName(DrawRecipeMiss miss) {
 
 namespace {
 
+struct LookupSplitCounters {
+    std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> ns;
+    std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> calls;
+    std::array<ProfileCounter, static_cast<std::size_t>(LookupOutcome::Count)> outcomes;
+    std::array<std::array<ProfileCounter, 4>, 2> proofPaths;
+    std::array<std::array<ProfileCounter, 4>, 2> proofPathNs;
+    std::array<std::array<ProfileCounter, 7>, 2> proofFailures;
+};
+
+LookupSplitCounters& lookupSplit() {
+    static auto* counters = new LookupSplitCounters();
+    return *counters;
+}
+
+std::chrono::steady_clock::time_point lookupMark() {
+    return LookupSplitProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+std::uint64_t lookupNs(std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(to - from).count());
+}
+
+std::chrono::steady_clock::time_point chargeLookup(LookupPiece piece, std::chrono::steady_clock::time_point from) {
+    if (!LookupSplitProfiled()) return from;
+    const auto now = std::chrono::steady_clock::now();
+    auto& counters = lookupSplit();
+    counters.ns[static_cast<std::size_t>(piece)].Add(lookupNs(from, now));
+    counters.calls[static_cast<std::size_t>(piece)].Add();
+    return now;
+}
+
+void noteLookup(LookupOutcome outcome) {
+    if (LookupSplitProfiled()) lookupSplit().outcomes[static_cast<std::size_t>(outcome)].Add();
+}
+
+void noteLookupProof(bool recipe, bool proved, const ShaderResources::ProofReport& report, std::chrono::steady_clock::time_point from, std::chrono::steady_clock::time_point to) {
+    if (!LookupSplitProfiled()) return;
+    auto& counters = lookupSplit();
+    const std::size_t context = recipe ? 1u : 0u;
+    const std::size_t path = report.epoch ? 3u : static_cast<std::size_t>(report.path);
+    if (path < 4u) {
+        counters.proofPaths[context][path].Add();
+        counters.proofPathNs[context][path].Add(lookupNs(from, to));
+    }
+    const auto failure = static_cast<std::size_t>(report.failure);
+    if (!proved && failure < 7u) counters.proofFailures[context][failure].Add();
+}
+
+void maybeReportLookupSplit() {
+    if (!LookupSplitProfiled()) return;
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (due == 0) {
+        nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed)) return;
+    auto& counters = lookupSplit();
+    LookupSplitCounts taken;
+    for (std::size_t index = 0; index < taken.ns.size(); ++index) {
+        taken.ns[index] = counters.ns[index].Take();
+        taken.calls[index] = counters.calls[index].Take();
+    }
+    for (std::size_t index = 0; index < taken.outcomes.size(); ++index) taken.outcomes[index] = counters.outcomes[index].Take();
+    for (std::size_t context = 0; context < 2u; ++context) {
+        for (std::size_t path = 0; path < 4u; ++path) {
+            taken.proofPaths[context][path] = counters.proofPaths[context][path].Take();
+            taken.proofPathNs[context][path] = counters.proofPathNs[context][path].Take();
+        }
+        for (std::size_t failure = 0; failure < 7u; ++failure) taken.proofFailures[context][failure] = counters.proofFailures[context][failure].Take();
+    }
+    constexpr std::array<const char*, static_cast<std::size_t>(LookupPiece::Count)> pieces{"key", "find", "space", "revalidate", "moved", "aliases", "template", "prove", "recipe moved", "recipe aliases", "depth note", "touch"};
+    constexpr std::array<const char*, static_cast<std::size_t>(LookupOutcome::Count)> outcomes{"uncacheable", "absent", "space refused", "in use", "invalid", "moved refused", "template hit", "recipe template gone", "recipe proof refused", "recipe buffers", "recipe hit"};
+    constexpr std::array<const char*, 4> paths{"fast", "own refreshed", "full", "epoch"};
+    constexpr std::array<const char*, 7> failures{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
+    const auto full = taken.calls[static_cast<std::size_t>(LookupPiece::Key)];
+    const auto recipe = taken.calls[static_cast<std::size_t>(LookupPiece::Template)];
+    const auto draws = full + recipe;
+    std::uint64_t totalNs = 0;
+    for (const auto value : taken.ns) totalNs += value;
+    std::string text;
+    char line[256];
+    std::snprintf(line, sizeof(line), "[lookup-split] 10 s: %llu lookups (%llu keyed full path, %llu recipe), %.2f us per lookup;", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(full), static_cast<unsigned long long>(recipe), draws != 0u ? static_cast<double>(totalNs) / static_cast<double>(draws) / 1000.0 : 0.0);
+    text += line;
+    for (std::size_t index = 0; index < pieces.size(); ++index) {
+        if (taken.calls[index] == 0u) continue;
+        std::snprintf(line, sizeof(line), " %s %llu x %.0f ns = %.2f us/lookup;", pieces[index], static_cast<unsigned long long>(taken.calls[index]), static_cast<double>(taken.ns[index]) / static_cast<double>(taken.calls[index]), draws != 0u ? static_cast<double>(taken.ns[index]) / static_cast<double>(draws) / 1000.0 : 0.0);
+        text += line;
+    }
+    text += " outcomes:";
+    for (std::size_t index = 0; index < outcomes.size(); ++index) {
+        if (taken.outcomes[index] == 0u) continue;
+        std::snprintf(line, sizeof(line), " %s %llu,", outcomes[index], static_cast<unsigned long long>(taken.outcomes[index]));
+        text += line;
+    }
+    for (std::size_t context = 0; context < 2u; ++context) {
+        text += context == 0u ? " revalidate paths:" : " prove paths:";
+        for (std::size_t path = 0; path < 4u; ++path) {
+            if (taken.proofPaths[context][path] == 0u) continue;
+            std::snprintf(line, sizeof(line), " %s %llu x %.0f ns,", paths[path], static_cast<unsigned long long>(taken.proofPaths[context][path]), static_cast<double>(taken.proofPathNs[context][path]) / static_cast<double>(taken.proofPaths[context][path]));
+            text += line;
+        }
+        text += " refused by";
+        for (std::size_t failure = 0; failure < 7u; ++failure) {
+            if (taken.proofFailures[context][failure] == 0u) continue;
+            std::snprintf(line, sizeof(line), " %s %llu,", failures[failure], static_cast<unsigned long long>(taken.proofFailures[context][failure]));
+            text += line;
+        }
+        text += ";";
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", text.c_str());
+}
+
+}
+
+bool LookupSplitProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    return profiled;
+}
+
+LookupSplitCounts LookupSplitTotals() {
+    auto& counters = lookupSplit();
+    LookupSplitCounts totals;
+    for (std::size_t index = 0; index < totals.ns.size(); ++index) {
+        totals.ns[index] = counters.ns[index].Sum();
+        totals.calls[index] = counters.calls[index].Sum();
+    }
+    for (std::size_t index = 0; index < totals.outcomes.size(); ++index) totals.outcomes[index] = counters.outcomes[index].Sum();
+    for (std::size_t context = 0; context < 2u; ++context) {
+        for (std::size_t path = 0; path < 4u; ++path) {
+            totals.proofPaths[context][path] = counters.proofPaths[context][path].Sum();
+            totals.proofPathNs[context][path] = counters.proofPathNs[context][path].Sum();
+        }
+        for (std::size_t failure = 0; failure < 7u; ++failure) totals.proofFailures[context][failure] = counters.proofFailures[context][failure].Sum();
+    }
+    return totals;
+}
+
+namespace {
+
 // APS5_PROFILE_DRAW: the per-phase timers of one draw (DrawPhase), shared by Draw's parts and
 // DrawWithRecipe.
 struct DrawTimer {
@@ -1742,7 +1884,9 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto splitStart = lookupMark();
         plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+        static_cast<void>(chargeLookup(LookupPiece::Key, splitStart));
         timer.charge(PhaseLookup, keyStart);
     }
     return plan;
@@ -2189,7 +2333,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
         resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        auto split = lookupMark();
+        auto found = SharedResourceCache().Find(resolved.contentKey);
+        split = chargeLookup(LookupPiece::Find, split);
+        if (found == nullptr) noteLookup(LookupOutcome::Absent);
+        if (auto cached = std::move(found)) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2221,14 +2369,28 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && cached->Revalidate(shaders);
-            if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
+            split = chargeLookup(LookupPiece::Space, split);
+            ShaderResources::ProofReport splitReport;
+            const bool valid = spaceHeld && cached->Revalidate(shaders, LookupSplitProfiled() ? &splitReport : nullptr);
+            if (spaceHeld) {
+                const auto proofStart = split;
+                split = chargeLookup(LookupPiece::Revalidate, split);
+                noteLookupProof(false, valid, splitReport, proofStart, split);
+            }
             auto* recorder = Recorder::Active();
+            if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             bool patched = false;
-            if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+            if (valid && recorder != nullptr) {
+                moved = cached->MovedReadOnlyBuffers(shaders, *recorder, &state.color, &patched);
+                split = chargeLookup(LookupPiece::Moved, split);
+            }
             if (moved.has_value()) {
-                if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                if (trimKey) {
+                    CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                    split = chargeLookup(LookupPiece::Aliases, split);
+                }
+                noteLookup(LookupOutcome::TemplateHit);
                 if (counted && verifyAddressDrawReuse()) verifyServedSpace(context, state, draw, shaders, snapshots, indexBytes, *cached);
                 static_cast<void>(heldSpace.release());
                 resolved.resources = std::move(cached);
@@ -2237,18 +2399,22 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
+                noteLookup(inUse && !valid ? LookupOutcome::InUse : LookupOutcome::MovedRefused);
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                noteLookup(spaceHeld ? LookupOutcome::Invalid : LookupOutcome::SpaceRefused);
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
     } else {
+        noteLookup(LookupOutcome::Uncacheable);
         countCache(&DrawProfile::uncacheable);
     }
+    maybeReportLookupSplit();
     timer.phase(PhaseLookup);
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots, recordable && drawStagingEnabled());
@@ -4710,13 +4876,26 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
     // key leaves to a hit repeated; a failure removes the template from the cache (the batch keeps
     // it) and the caller rebuilds.
+    auto split = lookupMark();
     auto resources = recipe.templateRef.lock();
-    if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
+    split = chargeLookup(LookupPiece::Template, split);
+    if (resources == nullptr) {
+        noteLookup(LookupOutcome::RecipeTemplateGone);
+        maybeReportLookupSplit();
+        return miss(DrawRecipeMiss::TemplateGone);
+    }
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();
+    {
+        const auto splitProof = split;
+        split = chargeLookup(LookupPiece::Prove, split);
+        noteLookupProof(true, proved, result.proof, splitProof, split);
+    }
     if (!proved) {
+        noteLookup(LookupOutcome::RecipeRefused);
+        maybeReportLookupSplit();
         SharedResourceCache().Remove(recipe.key, resources.get());
         countCache(&DrawProfile::cacheInvalidated);
         resources->KeepStorageImageBytes(*recorder);
@@ -4725,10 +4904,22 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         return miss(DrawRecipeMiss::Proof);
     }
     const auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
-    if (!moved.has_value()) return miss(DrawRecipeMiss::Buffers);
+    split = chargeLookup(LookupPiece::RecipeMoved, split);
+    if (!moved.has_value()) {
+        noteLookup(LookupOutcome::RecipeBuffers);
+        maybeReportLookupSplit();
+        return miss(DrawRecipeMiss::Buffers);
+    }
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
-    if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
+    split = chargeLookup(LookupPiece::RecipeAliases, split);
+    if (recipe.hasDepth && writesDepthTarget(state)) {
+        NoteDepthSurfaceWrite(context, *state.depth);
+        split = chargeLookup(LookupPiece::DepthNote, split);
+    }
     SharedResourceCache().Touch(recipe.key);
+    static_cast<void>(chargeLookup(LookupPiece::Touch, split));
+    noteLookup(LookupOutcome::RecipeHit);
+    maybeReportLookupSplit();
     countCache(&DrawProfile::cacheHits);
     timer.phase(PhaseLookup);
     outcome.completion = resources->ChecksFaults();

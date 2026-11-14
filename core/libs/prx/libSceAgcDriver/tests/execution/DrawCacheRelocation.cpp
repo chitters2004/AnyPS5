@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
@@ -285,12 +286,28 @@ void RelocatedDrawsReuseTheirRecipe(bool libraries) {
     for (std::size_t i = 0; i < 4; ++i) draw(moved[i].data());
     const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     const auto recipesBefore = AgcDriver::VulkanDevice::DrawRecipeHits();
+    const auto splitBefore = AgcDriver::Graphics::LookupSplitTotals();
     AgcDriver::DriverDetail::DrawEntryCounters counters = start;
     for (std::size_t i = 4; i < moved.size(); ++i) counters = draw(moved[i].data());
     const auto recipeHits = AgcDriver::VulkanDevice::DrawRecipeHits() - recipesBefore;
     const auto hits = counters.hits - start.hits;
     Require(hits == moved.size() - 4, mode + ": draws whose data moved again made " + std::to_string(hits) + " draw-cache hits, expected " + std::to_string(moved.size() - 4));
     Require(recipeHits == hits, mode + ": " + std::to_string(recipeHits) + " of " + std::to_string(hits) + " draws served by a relocated entry were recorded from the cached draw's recipe, expected all");
+    const auto splitAfter = AgcDriver::Graphics::LookupSplitTotals();
+    using Piece = AgcDriver::Graphics::LookupPiece;
+    using Outcome = AgcDriver::Graphics::LookupOutcome;
+    const auto calls = [&](Piece piece) { return splitAfter.calls[static_cast<std::size_t>(piece)] - splitBefore.calls[static_cast<std::size_t>(piece)]; };
+    const auto ns = [&](Piece piece) { return splitAfter.ns[static_cast<std::size_t>(piece)] - splitBefore.ns[static_cast<std::size_t>(piece)]; };
+    const auto outcome = [&](Outcome value) { return splitAfter.outcomes[static_cast<std::size_t>(value)] - splitBefore.outcomes[static_cast<std::size_t>(value)]; };
+    std::uint64_t recipeProofs = 0;
+    for (const auto count : splitAfter.proofPaths[1]) recipeProofs += count;
+    for (const auto count : splitBefore.proofPaths[1]) recipeProofs -= count;
+    if (AgcDriver::Graphics::LookupSplitProfiled()) {
+        Require(outcome(Outcome::RecipeHit) == recipeHits && calls(Piece::Prove) >= recipeHits && recipeProofs == calls(Piece::Prove) && calls(Piece::Touch) == recipeHits && ns(Piece::Prove) != 0,
+            mode + ": APS5_PROFILE_LOOKUP did not count every recipe hit's proof, touch and outcome: " + std::to_string(outcome(Outcome::RecipeHit)) + " recipe hits, " + std::to_string(calls(Piece::Prove)) + " proofs (" + std::to_string(recipeProofs) + " by path), " + std::to_string(calls(Piece::Touch)) + " touches, " + std::to_string(ns(Piece::Prove)) + " ns, for " + std::to_string(recipeHits) + " recipe hits");
+    } else {
+        Require(splitAfter.calls == splitBefore.calls && splitAfter.outcomes == splitBefore.outcomes, mode + ": lookup split counts moved without APS5_PROFILE_LOOKUP");
+    }
 }
 
 void UnrelocatedAliasesStayOut(bool libraries) {
