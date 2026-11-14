@@ -789,7 +789,7 @@ void dccClear(AgcDriver::VulkanDevice& device) {
 
 void cmaskClearRecorded(AgcDriver::VulkanDevice& device) {
     auto color = colorTarget(false, true);
-    color.cmaskAddress = mapDirectMemory(65536);
+    color.cmaskAddress = mapDirectMemory(2u << 20u);
     auto* cmask = reinterpret_cast<std::byte*>(color.cmaskAddress);
     const bool watchedWhenMapped = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
     std::memset(cmask, 0xff, color.cmaskBytes);
@@ -879,7 +879,7 @@ void depthPlaneWrittenByCpu(AgcDriver::VulkanDevice& device) {
 
 void cmaskPaddingBesideExpandedTiles(AgcDriver::VulkanDevice& device) {
     auto color = colorTarget(false, true);
-    color.cmaskAddress = mapDirectMemory(65536);
+    color.cmaskAddress = mapDirectMemory(2u << 20u);
     auto* cmask = reinterpret_cast<std::uint8_t*>(color.cmaskAddress);
     const bool watchedWhenMapped = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
     reset(device, color);
