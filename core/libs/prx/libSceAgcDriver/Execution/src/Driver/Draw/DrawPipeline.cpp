@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -41,6 +42,8 @@ bool scopedNonDraw(DrawPipeline::CommitKind kind) {
     case Kind::Completion:
     case Kind::BufferFill:
         return true;
+    case Kind::ColorMetadata:
+        return Graphics::RangedGpuEntries();
     default:
         return false;
     }

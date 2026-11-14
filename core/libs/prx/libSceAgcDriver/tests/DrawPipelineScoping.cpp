@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
 #include <cstdint>
 #include <exception>
@@ -40,16 +41,27 @@ void CheckScoping() {
     Check(StampOf(Written) != during, "a scoped commit did not bump its writes after it ran");
     Check(StampOf(Elsewhere) == elsewhere, "a scoped commit moved a range it does not write");
     const auto proofs = ProofSerial();
-    const std::array scoped{Kind::SampleDump, Kind::DmaWrite, Kind::DmaCopy, Kind::Store, Kind::EndOfPipe, Kind::Seal, Kind::SubmitEnd, Kind::Completion, Kind::BufferFill};
+    const std::array scoped{Kind::SampleDump, Kind::DmaWrite, Kind::DmaCopy, Kind::Store, Kind::EndOfPipe, Kind::Seal, Kind::SubmitEnd, Kind::Completion, Kind::BufferFill, Kind::ColorMetadata};
     for (const auto kind : scoped) Commit(kind, {});
     Check(StampOf(Elsewhere) == elsewhere, "an audited non-draw kind bumped the unscoped version");
     Check(ProofSerial() != proofs, "non-draw commits no longer break the global proof serial");
-    const std::array unscoped{Kind::Other, Kind::IndirectDraw, Kind::ColorMetadata, Kind::Dispatch};
+    const std::array unscoped{Kind::Other, Kind::IndirectDraw, Kind::Dispatch};
     for (const auto kind : unscoped) {
         const auto before = StampOf(Elsewhere);
         Commit(kind, {});
         Check(StampOf(Elsewhere).unscoped != before.unscoped, "an unaudited non-draw kind left the unscoped version");
     }
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto metadataWritten = StampOf(Written);
+    RangeStamp metadataDuring;
+    Commit(Kind::ColorMetadata, {{Written, Written + 64}}, [&] { metadataDuring = StampOf(Written); });
+    Check(metadataDuring != metadataWritten && StampOf(Written) != metadataDuring && StampOf(Written).unscoped == metadataWritten.unscoped, "a color metadata commit did not bump its writes before and after it ran without the unscoped version");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoRangedGpuEntries, true);
+    const auto switched = StampOf(Elsewhere);
+    Commit(Kind::ColorMetadata, {{Written, Written + 64}});
+    RuntimeSwitches::Assign(RuntimeSwitch::NoRangedGpuEntries, false);
+    Check(StampOf(Elsewhere).unscoped != switched.unscoped, "a color metadata commit with APS5_NO_RANGED_GPU_ENTRIES left the unscoped version");
     const auto drawn = StampOf(Written);
     const auto drawnElsewhere = StampOf(Elsewhere);
     Commit(Kind::Draw, {{Written, Written + 64}}, [] {}, true);
