@@ -555,8 +555,60 @@ int AssertsWithOpenBatch() {
     std::_Exit(1);
 }
 
+int NoteReadBench(int argc, char** argv) {
+    const std::size_t notes = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 4096;
+    const int rounds = argc > 3 ? std::atoi(argv[3]) : 9;
+    if (notes == 0 || rounds <= 0) {
+        std::fprintf(stderr, "usage: --note-read-bench [notes per batch] [rounds]\n");
+        return 2;
+    }
+    const std::size_t queries = std::max<std::size_t>(notes / 4, 1);
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+    const bool flipped = Recorder::FlipReadCheck();
+    constexpr std::uint64_t base = 0x7f0000400000ull;
+    constexpr std::uint64_t stride = 0x100;
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    for (const std::size_t repeatPercent : {0u, 50u, 90u, 99u}) {
+        const std::size_t distinct = std::max<std::size_t>(notes * (100 - repeatPercent) / 100, 1);
+        std::array<std::vector<double>, 2> noteNs;
+        std::array<std::vector<double>, 2> queryNs;
+        for (int round = 0; round < rounds; ++round) {
+            for (const int arm : {0, 1}) {
+                RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, arm == 1);
+                const auto repeatedBefore = Recorder::ReadCounts().repeated;
+                const auto noteStart = std::chrono::steady_clock::now();
+                for (std::size_t index = 0; index < notes; ++index) recorder.NotePendingRead(base + (index % distinct) * stride, stride / 2, Kind::CopySource);
+                const auto noteEnd = std::chrono::steady_clock::now();
+                const auto repeated = Recorder::ReadCounts().repeated - repeatedBefore;
+                const std::uint64_t expected = arm == 0 && !flipped ? notes - distinct : 0;
+                Expect(repeated == expected, "the bench skipped " + std::to_string(repeated) + " notes, not " + std::to_string(expected));
+                std::size_t hits = 0;
+                const auto queryStart = std::chrono::steady_clock::now();
+                for (std::size_t query = 0; query < queries; ++query) hits += recorder.PendingReadOverlaps(base + (query % distinct) * stride + stride / 2, stride / 4) ? 1 : 0;
+                const auto queryEnd = std::chrono::steady_clock::now();
+                Expect(hits == 0, "a query between the noted ranges overlapped one");
+                recorder.Submit();
+                for (auto& [fence, signaled] : mock.signaled) signaled = true;
+                recorder.Reap();
+                noteNs[arm].push_back(std::chrono::duration<double, std::nano>(noteEnd - noteStart).count() / static_cast<double>(notes));
+                queryNs[arm].push_back(std::chrono::duration<double, std::nano>(queryEnd - queryStart).count() / static_cast<double>(queries));
+            }
+        }
+        std::printf("note-read bench: %zu notes per batch, %zu%% repeats, %zu queries, median of %d: dedupe on %.1f ns/note %.1f ns/query; off %.1f ns/note %.1f ns/query\n", notes, repeatPercent, queries, rounds, median(noteNs[0]), median(queryNs[0]), median(noteNs[1]), median(queryNs[1]));
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, environment);
+    return failures == 0 ? 0 : 1;
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--assert-open-batch") return AssertsWithOpenBatch();
+    if (argc >= 2 && std::string_view(argv[1]) == "--note-read-bench") return NoteReadBench(argc, argv);
     try {
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();

@@ -4176,6 +4176,79 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+bool effectScreenTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: the effect set screen is not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the effect screen block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the effect screen block refused: the screen is not tested\n";
+        return false;
+    }
+    const auto program = [&](std::uint64_t element) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, 1024, 0x31000000u};
+        binding.bufferWritten = {false};
+        result.bindings.push_back(binding);
+        return result;
+    };
+    const auto programA = program(address + 4096);
+    const auto programB = program(address + 8192);
+    const bool screened = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    {
+        ShaderResources first(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &programA, 0});
+        ShaderResources second(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &programB, 0});
+        const auto before = ShaderResources::EffectScreen();
+        first.MarkGpuWrites(recorder);
+        first.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        first.MarkGpuWrites(recorder);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        first.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto after = ShaderResources::EffectScreen();
+        const auto sets = after.sets - before.sets;
+        const auto unchanged = after.unchanged - before.unchanged;
+        const auto changed = after.changed - before.changed;
+        Require(sets == (screened ? 7u : 0u), "the screen counted " + std::to_string(sets) + " effect sets for 7 marks");
+        Require(unchanged == (screened ? 3u : 0u), "the screen counted " + std::to_string(unchanged) + " unchanged repeats, not the 3 within one batch");
+        Require(changed == 0, "a resources object with fixed reads counted a changed repeat");
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << (screened ? "effect set screen: ok\n" : "effect set screen: off without APS5_PROFILE_DRAW, nothing counted\n");
+    return true;
+}
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -16719,6 +16792,9 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--slice-dirty-only") {
             sliceDirtyTests(device, recorder);
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--effect-screen-only") {
+            return effectScreenTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {
             markRepeatTests(device, recorder);
