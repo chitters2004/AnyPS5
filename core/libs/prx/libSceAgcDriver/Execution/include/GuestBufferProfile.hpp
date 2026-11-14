@@ -18,7 +18,12 @@ bool Enabled();
 void NoteCommandWrite(std::uint64_t address, std::size_t bytes);
 void NoteSubmitted(std::uint64_t serial, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords, bool flip, bool cpuFlip);
 void NoteFlip();
+enum class PacketEffect : std::uint8_t { Other, Draw, Dispatch, Wait, Label };
+
+bool Recording();
 void NotePacket(std::uint32_t opcode, std::span<const std::uint32_t> packet);
+void NotePacketEffect(PacketEffect effect, std::uint64_t address = 0);
+void NoteStoreSignal(std::uint64_t address);
 void NoteRange(std::uint64_t address, std::size_t bytes, bool write);
 void NoteWaitNs(std::uint64_t nanoseconds);
 std::uint64_t Current();

@@ -1,7 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
@@ -22,7 +20,6 @@ constexpr std::uint64_t PagesPerRange = 4096;
 constexpr std::uint64_t BuilderPagesPerSubmission = 64;
 constexpr std::size_t CompactPages = 65536;
 constexpr std::size_t DetailBuffers = 24;
-constexpr std::uint64_t StoreSignalBytes = 64;
 constexpr std::uint64_t AbandonFrames = 16;
 
 struct Record {
@@ -430,30 +427,36 @@ void NoteFlip() {
     ++shared.frame;
 }
 
-void NotePacket(std::uint32_t opcode, std::span<const std::uint32_t> packet) {
+bool Recording() {
+    return current() != nullptr;
+}
+
+void NotePacketEffect(PacketEffect effect, std::uint64_t address) {
     auto* const record = current();
     if (record == nullptr) return;
     record->quiet = false;
-    if (Pm4::DrawOpcode(opcode)) {
+    switch (effect) {
+    case PacketEffect::Draw:
         ++record->draws;
-    } else if (opcode == 0x15 || opcode == 0x16) {
+        break;
+    case PacketEffect::Dispatch:
         ++record->dispatches;
-    } else if ((opcode == 0x3c || opcode == 0x93) && packet[0] != RenderingWaitPacketHeader && packet.size() >= 4) {
-        const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
-        const std::uint64_t awaited = (packet[2] & (awaitedBytes == 8 ? ~7u : ~3u)) | (static_cast<std::uint64_t>(packet[3]) << 32u);
-        record->waits.push_back(awaited & ~std::uint64_t{7});
+        break;
+    case PacketEffect::Wait:
+        record->waits.push_back(address & ~std::uint64_t{7});
         record->quiet = true;
-    } else if (opcode == 0x37 || opcode == 0x49) {
-        if (const auto label = Pm4::DecodeLabelWrite(packet)) {
-            record->signals.push_back(label->address & ~std::uint64_t{7});
-            record->quiet = true;
-        }
-    } else if (opcode == 0x40 || opcode == 0x50 || opcode == 0x83) {
-        for (const auto& store : Pm4::DecodeStores(packet)) {
-            if (store.bytes == 0 || store.bytes > StoreSignalBytes) continue;
-            for (auto address = store.address & ~std::uint64_t{7}; address < store.address + store.bytes; address += 8) record->signals.push_back(address);
-        }
+        break;
+    case PacketEffect::Label:
+        record->signals.push_back(address & ~std::uint64_t{7});
+        record->quiet = true;
+        break;
+    case PacketEffect::Other:
+        break;
     }
+}
+
+void NoteStoreSignal(std::uint64_t address) {
+    if (auto* const record = current()) record->signals.push_back(address);
 }
 
 void NoteRange(std::uint64_t address, std::size_t bytes, bool write) {

@@ -2,6 +2,7 @@ if(BUILD_TESTING)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/GuestBufferProfile.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
     target_include_directories(agc_collect_memo_generation_tests PRIVATE ${LIBS_INCLUDE_DIR})
