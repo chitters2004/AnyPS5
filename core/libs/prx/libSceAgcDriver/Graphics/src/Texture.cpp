@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -4570,7 +4571,7 @@ void StorageTexture::ClearLayoutWritesForTest() {
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    if (auto& records = LayoutWrites(); layoutStripeSerial == 0 || LayoutStripe(records, descriptor.baseAddress).load(std::memory_order_acquire) != layoutStripeSerial || records.clears.load(std::memory_order_acquire) != layoutClears) {
+    if (auto& records = LayoutWrites(); layoutStripeSerial == 0 || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) || LayoutStripe(records, descriptor.baseAddress).load(std::memory_order_acquire) != layoutStripeSerial || records.clears.load(std::memory_order_acquire) != layoutClears) {
         std::lock_guard lock(records.mutex);
         if (records.byAddress.size() >= 65536u) {
             records.byAddress.clear();
@@ -4639,7 +4640,10 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         layerPending.SetRange(first, count, true);
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
-    if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        pendingSinceFirst = pendingSinceEnd = 0;
+        StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+    } else if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
         pendingSinceLoopsSkipped.Add(1);
     } else {
         const bool everyUnit = StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
