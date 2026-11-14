@@ -7,9 +7,10 @@ output = run.stdout.decode(errors="replace")
 sys.stdout.write(output)
 sys.stdout.flush()
 code = run.returncode
-if code == 0:
+fatal = "FATAL:" in output
+if code == 0 and not fatal:
     sys.exit(0)
-print(f"[symbolize] exit code {code & 0xffffffff:#x}")
+print(f"[symbolize] exit code {code & 0xffffffff:#x}, FATAL {'seen' if fatal else 'not seen'}")
 offsets = {}
 for name, offset in re.findall(r"([A-Za-z0-9_.+-]+\.(?:exe|prx|dll))\+0x([0-9a-fA-F]+)", output):
     if name.lower() in modules:

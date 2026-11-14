@@ -121,7 +121,7 @@ endif()
 
 if(BUILD_TESTING)
     find_package(Python3 QUIET COMPONENTS Interpreter)
-    foreach(repeat RANGE 1 10)
+    foreach(repeat RANGE 1 20)
         if(WIN32 AND Python3_Interpreter_FOUND AND CMAKE_NM AND CMAKE_OBJDUMP)
             add_test(NAME agc_shader_memory_repeat_${repeat} COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/ci_symbolize_run.py ${CMAKE_NM} ${CMAKE_OBJDUMP} $<TARGET_FILE:agc_shader_memory_tests> $<TARGET_FILE:libc>)
         else()
