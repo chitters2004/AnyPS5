@@ -798,7 +798,7 @@ void dccClear(AgcDriver::VulkanDevice& device) {
 
 void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
     auto color = colorTarget(false, true);
-    color.cmaskAddress = mapDirectMemory(65536);
+    color.cmaskAddress = mapDirectMemory(2u << 20u);
     const bool watchedWhenMapped = AgcDriver::GuestMemory::Watched(color.cmaskAddress, color.cmaskBytes);
     reset(device, color);
     AgcDriver::GuestMemory::BumpCollectEpoch();
