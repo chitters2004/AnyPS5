@@ -367,12 +367,12 @@ void DrawPipeline::enqueue(Item item) {
         resumeAt = 0;
         const auto waited = elapsedNs(start);
         fullWaitNs += waited;
-        if (profile) GuestBufferProfile::NoteWaitNs(waited);
+        GuestBufferProfile::NoteWaitNs(waited);
         rethrowFailure();
     }
     depthSum += items.size();
     ++enqueued;
-    if (profile) {
+    if (GuestBufferProfile::Enabled()) {
         item.guestBuffer = GuestBufferProfile::Current();
         for (const auto& [begin, end] : item.reads) {
             if (end > begin) GuestBufferProfile::NoteRange(begin, static_cast<std::size_t>(end - begin), false);

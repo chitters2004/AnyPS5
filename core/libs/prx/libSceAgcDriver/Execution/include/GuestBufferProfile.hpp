@@ -17,7 +17,9 @@ inline constexpr std::size_t PairLimit = 256;
 bool Enabled();
 void NoteCommandWrite(std::uint64_t address, std::size_t bytes);
 void NoteSubmitted(std::uint64_t serial, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords, bool flip, bool cpuFlip);
+void NoteRewindTail(std::uint64_t serial, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords, bool flip);
 void NoteFlip();
+void EndSegment();
 enum class PacketEffect : std::uint8_t { Other, Draw, Dispatch, Wait, Label };
 
 bool Recording();
@@ -27,7 +29,7 @@ void NoteStoreSignal(std::uint64_t address);
 void NoteRange(std::uint64_t address, std::size_t bytes, bool write);
 void NoteWaitNs(std::uint64_t nanoseconds);
 std::uint64_t Current();
-void AddCommitterNs(std::uint64_t serial, std::uint64_t nanoseconds);
+void AddCommitterNs(std::uint64_t id, std::uint64_t nanoseconds);
 
 class SubmitGroup {
 public:
@@ -47,11 +49,11 @@ public:
     Execution& operator=(const Execution&) = delete;
 private:
     bool active = false;
-    std::chrono::steady_clock::time_point start{};
 };
 
 struct Totals {
     std::uint64_t frames = 0;
+    std::uint64_t rewindTails = 0;
     std::array<std::uint64_t, 2> submissions{};
     std::array<std::uint64_t, 2> buffers{};
     std::array<std::uint64_t, 2> mostBuffers{};
@@ -87,6 +89,7 @@ struct HeldFrames {
     std::uint64_t running = 0;
     std::uint64_t unexecuted = 0;
     std::uint64_t holderSerial = 0;
+    std::uint64_t holderSegment = 0;
     std::uint32_t holderQueue = 0;
     std::uint64_t holderAge = 0;
     std::uint64_t holderNs = 0;

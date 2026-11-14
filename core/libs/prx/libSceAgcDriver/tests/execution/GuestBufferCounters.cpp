@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -8,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,7 +34,7 @@ constexpr std::uint32_t Unwritten = 0xdeadbeefu;
 constexpr std::uint32_t LabelValue = 1;
 constexpr std::size_t LabelOffset = 0x400;
 
-enum Page : std::size_t { First, Second, Third, Fourth, Fifth, StoreA, StoreB, Count };
+enum Page : std::size_t { First, Second, Third, Fourth, Fifth, StoreA, StoreB, Rewound, Labels, Count };
 
 alignas(256) constexpr std::array<std::uint32_t, 4> StoreCode{
     0x34020082, 0xe0701000, 0x80000001, 0xbf810000,
@@ -136,6 +138,45 @@ void ExpectStored(const std::uint32_t* target, const std::string& what) {
 
 }
 
+int RewindTails() {
+    Arena arena;
+    auto output = std::make_shared<Output>();
+    AgcDriverRegisterVideoOutput_nid_postfix(OutputHandle, output);
+    constexpr std::uint32_t Frames = 6;
+    for (std::uint32_t frame = 0; frame < Frames; ++frame) {
+        const auto token = AgcDriverReserveEopFlip_nid_postfix(AgcDriver::FlipInfo{OutputHandle, 0, 1, static_cast<std::int64_t>(frame)});
+        Require(token != 0, "the EOP flip of frame " + std::to_string(frame) + " was not reserved");
+        auto* const words = arena.At(Rewound) + frame * 64;
+        auto* const label = arena.At(Labels) + frame * 2;
+        const std::array<std::uint32_t, 10> commands{0xc0005900u, 0u, 0xc0064900u, 0x06200504u, 0x42010000u, Low(label), High(label), 1u, 0u, token};
+        std::copy(commands.begin(), commands.end(), words);
+        const Packet packet{words, static_cast<std::uint32_t>(commands.size()), 0, {}};
+        AgcDriver::Submit(&packet, 0);
+        std::atomic_ref<std::uint32_t>(words[1]).store(AgcDriver::Pm4::RewindValid, std::memory_order_release);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (output->ready.load() < static_cast<int>(frame + 1)) {
+            Require(std::chrono::steady_clock::now() < deadline, "the rewind tail of frame " + std::to_string(frame) + " did not flip");
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    const auto held = Profile::Held();
+    const auto steady = Profile::Closed();
+    Profile::CloseFinished();
+    const auto totals = Profile::Closed();
+    AgcDriverUnregisterVideoOutput_nid_postfix(OutputHandle, output);
+    AgcDriverShutdown_nid_postfix();
+    Expect(steady.frames, Frames - 1, "frames closed by flips in rewind tails before the last flip ended");
+    Expect(held.frames, 0, "frames held after every tail ran");
+    Expect(totals.frames, Frames, "frames ended by flips in rewind tails");
+    Expect(totals.buffers[0], 2 * Frames, "graphics buffers, each submission and its rewind tail");
+    Expect(totals.rewindTails, Frames, "rewind tails");
+    Expect(totals.submissions[0], 2 * Frames, "graphics submissions, a tail released apart from its submission");
+    Require(totals.workerNs > 0, "no worker time was counted");
+    std::puts("guest buffer counters rewind tail tests passed");
+    return 0;
+}
+
 int HeldFrame() {
     Profile::NoteSubmitted(1, 0, nullptr, 0, false, false);
     std::atomic<bool> started{false};
@@ -171,12 +212,13 @@ int HeldFrame() {
 
 int main(int argc, char** argv) {
 #ifdef _WIN32
-    _putenv_s("APS5_PROFILE_DRAW", "1");
+    _putenv_s("APS5_PROFILE_GUEST_CBS", "1");
 #else
-    setenv("APS5_PROFILE_DRAW", "1", 1);
+    setenv("APS5_PROFILE_GUEST_CBS", "1", 1);
 #endif
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--held-frame") return HeldFrame();
+        if (argc == 2 && std::string_view(argv[1]) == "--rewind-tails") return RewindTails();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;

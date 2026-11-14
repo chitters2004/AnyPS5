@@ -685,6 +685,7 @@ std::vector<std::uint64_t> BoundGraphicsPrograms(const Submission& submission) {
 }
 
 void Driver::executeRewindTail(const Submission& stalled) {
+    GuestBufferProfile::EndSegment();
     PerformanceTimer timing("Driver.Rewind");
     static const bool ring = ReadSubmissionRingSettings();
     if (ring) PrepareSubmissionRing(stalled.queue);
@@ -736,6 +737,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
         if (!tail.flips.empty()) rewindTailFlips.fetch_add(1, std::memory_order_acq_rel);
         tail.shaders = shaders;
         tail.serial = stalled.serial;
+        GuestBufferProfile::NoteRewindTail(tail.serial, tail.queue, stalled.rewindTail, stalled.rewindWords, tail.queue == 0 && !tail.flips.empty());
         tail.received = ++eventSerial;
         const auto& waiting = workers[tail.queue].pending;
         retiredTakes = waiting.empty() ? tail.received : std::min(tail.received, waiting.front().received);
@@ -834,7 +836,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
                                 static_cast<const void*>(descriptor.addr), cpuFlip ? " (cpu flip)" : "");
 
         submission.received = ++eventSerial;
-        if (profile) GuestBufferProfile::NoteSubmitted(submission.serial, queue, descriptor.addr, descriptor.dw_num, queue == 0 && !submission.flips.empty(), cpuFlip);
+        GuestBufferProfile::NoteSubmitted(submission.serial, queue, descriptor.addr, descriptor.dw_num, queue == 0 && !submission.flips.empty(), cpuFlip);
         const auto now = std::chrono::steady_clock::now();
         submission.enqueuedAt = now;
         if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);

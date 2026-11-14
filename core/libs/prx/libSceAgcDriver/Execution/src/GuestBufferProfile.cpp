@@ -1,15 +1,18 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestBufferProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::GuestBufferProfile {
@@ -23,7 +26,9 @@ constexpr std::size_t DetailBuffers = 24;
 constexpr std::uint64_t AbandonFrames = 16;
 
 struct Record {
+    std::uint64_t id = 0;
     std::uint64_t serial = 0;
+    std::uint64_t segment = 0;
     std::uint64_t frame = 0;
     std::uint64_t group = 0;
     std::uint32_t queue = 0;
@@ -41,6 +46,7 @@ struct Record {
     std::uint64_t committerNs = 0;
     std::uint32_t running = 0;
     std::chrono::steady_clock::time_point started{};
+    std::chrono::steady_clock::time_point segmentStart{};
     bool executed = false;
     bool quiet = false;
 };
@@ -53,12 +59,16 @@ struct Group {
 struct State {
     std::mutex mutex;
     std::map<std::uint64_t, std::unique_ptr<Record>> records;
+    std::map<std::uint64_t, std::uint64_t> latest;
     std::map<std::uint64_t, std::vector<std::uint64_t>> frames;
     std::uint64_t frame = 0;
     std::uint64_t groups = 0;
+    std::uint64_t ids = 0;
     Totals total;
     Totals window;
-    std::uint64_t windowSubmissions = 0;
+    ProfileCounter windowSubmissions;
+    ProfileCounter windowTails;
+    ProfileCounter windowFlips;
     HeldFrames held;
     std::string detail;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
@@ -133,6 +143,7 @@ std::uint64_t cost(const Record& record) {
 
 void accumulate(Totals& into, const Totals& from) {
     into.frames += from.frames;
+    into.rewindTails += from.rewindTails;
     for (std::size_t kind = 0; kind < 2; ++kind) {
         into.submissions[kind] += from.submissions[kind];
         into.buffers[kind] += from.buffers[kind];
@@ -173,7 +184,7 @@ std::string describe(const std::vector<Record*>& records, const std::vector<std:
         std::string builders;
         for (const auto builder : record.builders) builders += (builders.empty() ? "" : ",") + std::to_string(builder);
         char item[200];
-        std::snprintf(item, sizeof(item), " q%x#%llu t%u/%s d%llu c%llu %.2f+%.2f ms r%zu w%zu x%u;", record.queue, static_cast<unsigned long long>(record.serial), record.submitter, builders.empty() ? "-" : builders.c_str(),
+        std::snprintf(item, sizeof(item), " q%x#%llu.%llu t%u/%s d%llu c%llu %.2f+%.2f ms r%zu w%zu x%u;", record.queue, static_cast<unsigned long long>(record.serial), static_cast<unsigned long long>(record.segment), record.submitter, builders.empty() ? "-" : builders.c_str(),
                       static_cast<unsigned long long>(record.draws), static_cast<unsigned long long>(record.dispatches), static_cast<double>(record.workerNs - std::min(record.workerNs, record.waitNs)) / 1e6,
                       static_cast<double>(record.committerNs) / 1e6, record.reads.size(), record.writes.size(), partners[index]);
         text += item;
@@ -185,7 +196,7 @@ std::string describe(const std::vector<Record*>& records, const std::vector<std:
 Totals analyse(std::vector<Record*>& records, std::string& detail) {
     Totals result;
     result.frames = 1;
-    std::ranges::sort(records, {}, &Record::serial);
+    std::ranges::sort(records, {}, &Record::id);
     const auto count = records.size();
     std::array<std::set<std::uint64_t>, 2> groupsOfKind;
     std::map<std::uint64_t, std::uint64_t> groupSizes;
@@ -196,6 +207,7 @@ Totals analyse(std::vector<Record*>& records, std::string& detail) {
         const auto& record = *records[index];
         const std::size_t kind = record.queue == 0 ? 0 : 1;
         ++result.buffers[kind];
+        if (record.segment != 0) ++result.rewindTails;
         groupsOfKind[kind].insert(record.group);
         ++groupSizes[record.group];
         ++result.draws[workBin(record.draws)];
@@ -317,8 +329,8 @@ void closeFrames(State& shared, bool all) {
         std::vector<Record*> records;
         bool finished = true;
         const Record* runner = nullptr;
-        for (const auto serial : frame->second) {
-            const auto found = shared.records.find(serial);
+        for (const auto id : frame->second) {
+            const auto found = shared.records.find(id);
             if (found == shared.records.end()) continue;
             if (!found->second->executed) finished = false;
             if (found->second->running != 0 && (runner == nullptr || found->second->started < runner->started)) runner = found->second.get();
@@ -332,6 +344,7 @@ void closeFrames(State& shared, bool all) {
                 if (ran >= held.holderNs) {
                     held.holderNs = ran;
                     held.holderSerial = runner->serial;
+                    held.holderSegment = runner->segment;
                     held.holderQueue = runner->queue;
                     held.holderAge = shared.frame - index;
                 }
@@ -346,7 +359,13 @@ void closeFrames(State& shared, bool all) {
             accumulate(shared.total, totals);
             accumulate(shared.window, totals);
         }
-        for (const auto serial : frame->second) shared.records.erase(serial);
+        for (const auto id : frame->second) {
+            const auto found = shared.records.find(id);
+            if (found == shared.records.end()) continue;
+            const auto last = shared.latest.find(found->second->serial);
+            if (last != shared.latest.end() && last->second == id) shared.latest.erase(last);
+            shared.records.erase(found);
+        }
         frame = shared.frames.erase(frame);
     }
     shared.held = held;
@@ -359,18 +378,27 @@ double perFrame(std::uint64_t value, std::uint64_t frames) {
 void report(State& shared, bool now) {
     const auto time = std::chrono::steady_clock::now();
     if (!now && time - shared.reported < std::chrono::seconds(10)) return;
-    if (shared.window.frames == 0 && shared.windowSubmissions == 0 && shared.held.frames == 0) return;
+    const auto submitted = shared.windowSubmissions.Take();
+    const auto tails = shared.windowTails.Take();
+    const auto flips = shared.windowFlips.Take();
+    if (shared.window.frames == 0 && submitted == 0 && flips == 0 && shared.held.frames == 0) return;
     const auto seconds = std::chrono::duration<double>(time - shared.reported).count();
     shared.reported = time;
     const auto& h = shared.held;
     if (h.frames != 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] held at %.0f s: %llu frames not closed (oldest %llu frames back), %llu by a running buffer, %llu by unexecuted buffers; longest running buffer 0x%x#%llu, %.1f ms so far, submitted %llu frames back\n", seconds,
-            static_cast<unsigned long long>(h.frames), static_cast<unsigned long long>(h.oldestAge), static_cast<unsigned long long>(h.running), static_cast<unsigned long long>(h.unexecuted), h.holderQueue, static_cast<unsigned long long>(h.holderSerial),
+        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] held at %.0f s: %llu frames not closed (oldest %llu frames back), %llu by a running buffer, %llu by unexecuted buffers; longest running buffer 0x%x#%llu.%llu, %.1f ms so far, submitted %llu frames back\n", seconds,
+            static_cast<unsigned long long>(h.frames), static_cast<unsigned long long>(h.oldestAge), static_cast<unsigned long long>(h.running), static_cast<unsigned long long>(h.unexecuted), h.holderQueue, static_cast<unsigned long long>(h.holderSerial), static_cast<unsigned long long>(h.holderSegment),
             static_cast<double>(h.holderNs) / 1e6, static_cast<unsigned long long>(h.holderAge));
     }
     if (shared.window.frames == 0) {
-        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] %.0f s, 0 frames closed, %llu buffers submitted\n", seconds, static_cast<unsigned long long>(shared.windowSubmissions));
-        shared.windowSubmissions = 0;
+        std::uint64_t openFrames = 0;
+        std::uint64_t oldest = 0;
+        for (const auto& [index, ids] : shared.frames) {
+            if (index >= shared.frame) continue;
+            if (openFrames++ == 0) oldest = shared.frame - index;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] %.0f s, 0 frames closed, %llu buffers submitted (%llu rewind tails), %llu flips seen; %zu buffers open in %llu ended frames, oldest %llu flips back\n", seconds,
+            static_cast<unsigned long long>(submitted), static_cast<unsigned long long>(tails), static_cast<unsigned long long>(flips), shared.records.size(), static_cast<unsigned long long>(openFrames), static_cast<unsigned long long>(oldest));
         return;
     }
     const auto& w = shared.window;
@@ -382,11 +410,11 @@ void report(State& shared, bool now) {
         return text;
     };
     AgcDriver::ProfilePrint_nid_no_patch(
-        "[guest-cbs] %.0f s, %llu frames: graphics %.1f submits and %.1f buffers per frame (most %llu), compute %.1f submits and %.1f buffers per frame (most %llu); buffers per submit 1/2-3/4-7/8+ %s; "
+        "[guest-cbs] %.0f s, %llu frames: graphics %.1f submits and %.1f buffers per frame (most %llu, %.1f of them rewind tails), compute %.1f submits and %.1f buffers per frame (most %llu); buffers per submit 1/2-3/4-7/8+ %s; "
         "draws per buffer 0/1-9/10-99/100-999/1000+ %s, dispatches %s; threads per frame: %.1f submitting (most %llu), %.1f building (most %llu), %llu buffers built off their submitting thread, %llu with no builder seen; "
         "sharing: %llu of %llu pairs share a 64 KiB page with a writer, %.1f buffers per frame in such a pair, %llu label edges, %llu waits on the buffer's own label, %llu on labels from outside the frame, %llu frames over %zu buffers, %llu cyclic, %llu ranges truncated; "
         "per frame: worker %.2f ms, committer %.2f ms (%.2f ms after its frame closed), critical path %.2f ms (ceiling %.2fx), largest buffer %.0f%%, %.1f buffers make 80%%\n",
-        seconds, static_cast<unsigned long long>(frames), perFrame(w.submissions[0], frames), perFrame(w.buffers[0], frames), static_cast<unsigned long long>(w.mostBuffers[0]), perFrame(w.submissions[1], frames), perFrame(w.buffers[1], frames),
+        seconds, static_cast<unsigned long long>(frames), perFrame(w.submissions[0], frames), perFrame(w.buffers[0], frames), static_cast<unsigned long long>(w.mostBuffers[0]), perFrame(w.rewindTails, frames), perFrame(w.submissions[1], frames), perFrame(w.buffers[1], frames),
         static_cast<unsigned long long>(w.mostBuffers[1]), bins(w.buffersPerSubmission).c_str(), bins(w.draws).c_str(), bins(w.dispatches).c_str(), perFrame(w.submitThreads, frames), static_cast<unsigned long long>(w.mostSubmitThreads),
         perFrame(w.buildThreads, frames), static_cast<unsigned long long>(w.mostBuildThreads), static_cast<unsigned long long>(w.builtElsewhere), static_cast<unsigned long long>(w.unbuilt), static_cast<unsigned long long>(w.conflictingPairs),
         static_cast<unsigned long long>(w.pairs), perFrame(w.conflictingBuffers, frames), static_cast<unsigned long long>(w.labelEdges), static_cast<unsigned long long>(w.ownWaits), static_cast<unsigned long long>(w.outsideWaits),
@@ -395,13 +423,15 @@ void report(State& shared, bool now) {
         perFrame(w.coveringBuffers, frames));
     AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] last frame (queue#serial tsubmit/builders draws dispatches worker+committer reads writes sharing):%s\n", shared.detail.c_str());
     shared.window = Totals{};
-    shared.windowSubmissions = 0;
 }
 
 }
 
 bool Enabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool enabled = [] {
+        const char* configured = std::getenv("APS5_PROFILE_GUEST_CBS");
+        return configured != nullptr && *configured != '\0' && std::strcmp(configured, "0") != 0;
+    }();
     return enabled;
 }
 
@@ -418,49 +448,70 @@ void NoteCommandWrite(std::uint64_t address, std::size_t bytes) {
     }
 }
 
+namespace {
+
+void addRecord(State& shared, std::uint64_t serial, std::uint64_t segment, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords) {
+    auto record = std::make_unique<Record>();
+    record->id = ++shared.ids;
+    record->serial = serial;
+    record->segment = segment;
+    record->frame = shared.frame;
+    record->queue = queue;
+    record->submitter = threadIndex();
+    auto& submitGroup = group();
+    record->group = segment == 0 && submitGroup.active ? submitGroup.id : ++shared.groups;
+    if (commands != nullptr && dwords != 0) {
+        const auto address = reinterpret_cast<std::uint64_t>(commands);
+        const auto first = address >> PageShift;
+        const auto last = std::min((address + dwords * sizeof(std::uint32_t) - 1) >> PageShift, first + BuilderPagesPerSubmission - 1);
+        auto& table = builderTable();
+        for (auto page = first; page <= last; ++page) {
+            const auto value = table[page % BuilderSlots].load(std::memory_order_relaxed);
+            if ((value >> 16u) != page) continue;
+            const auto builder = static_cast<std::uint32_t>(value & 0xffffu);
+            if (std::ranges::find(record->builders, builder) == record->builders.end()) record->builders.push_back(builder);
+        }
+        std::ranges::sort(record->builders);
+    }
+    shared.frames[shared.frame].push_back(record->id);
+    shared.latest[serial] = record->id;
+    shared.records[record->id] = std::move(record);
+    shared.windowSubmissions.Add();
+    if (segment != 0) shared.windowTails.Add();
+}
+
+void advanceFrame(State& shared) {
+    ++shared.frame;
+    shared.windowFlips.Add();
+    closeFrames(shared, false);
+    report(shared, false);
+}
+
+}
+
 void NoteSubmitted(std::uint64_t serial, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords, bool flip, bool cpuFlip) {
     if (!Enabled()) return;
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
-    if (!cpuFlip) {
-        auto record = std::make_unique<Record>();
-        record->serial = serial;
-        record->frame = shared.frame;
-        record->queue = queue;
-        record->submitter = threadIndex();
-        auto& submitGroup = group();
-        record->group = submitGroup.active ? submitGroup.id : ++shared.groups;
-        if (commands != nullptr && dwords != 0) {
-            const auto address = reinterpret_cast<std::uint64_t>(commands);
-            const auto first = address >> PageShift;
-            const auto last = std::min((address + dwords * sizeof(std::uint32_t) - 1) >> PageShift, first + BuilderPagesPerSubmission - 1);
-            auto& table = builderTable();
-            for (auto page = first; page <= last; ++page) {
-                const auto value = table[page % BuilderSlots].load(std::memory_order_relaxed);
-                if ((value >> 16u) != page) continue;
-                const auto builder = static_cast<std::uint32_t>(value & 0xffffu);
-                if (std::ranges::find(record->builders, builder) == record->builders.end()) record->builders.push_back(builder);
-            }
-            std::ranges::sort(record->builders);
-        }
-        shared.frames[shared.frame].push_back(serial);
-        shared.records[serial] = std::move(record);
-        ++shared.windowSubmissions;
-    }
-    if (flip || cpuFlip) {
-        ++shared.frame;
-        closeFrames(shared, false);
-        report(shared, false);
-    }
+    if (!cpuFlip) addRecord(shared, serial, 0, queue, commands, dwords);
+    if (flip || cpuFlip) advanceFrame(shared);
+}
+
+void NoteRewindTail(std::uint64_t serial, std::uint32_t queue, const std::uint32_t* commands, std::size_t dwords, bool flip) {
+    if (!Enabled()) return;
+    auto& shared = state();
+    std::lock_guard lock(shared.mutex);
+    const auto previous = shared.latest.find(serial);
+    const auto segment = previous == shared.latest.end() ? 1 : shared.records.at(previous->second)->segment + 1;
+    addRecord(shared, serial, segment, queue, commands, dwords);
+    if (flip) advanceFrame(shared);
 }
 
 void NoteFlip() {
     if (!Enabled()) return;
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
-    ++shared.frame;
-    closeFrames(shared, false);
-    report(shared, false);
+    advanceFrame(shared);
 }
 
 bool Recording() {
@@ -520,14 +571,14 @@ void NoteWaitNs(std::uint64_t nanoseconds) {
 std::uint64_t Current() {
     if (!Enabled()) return 0;
     const auto* const record = current();
-    return record == nullptr ? 0 : record->serial;
+    return record == nullptr ? 0 : record->id;
 }
 
-void AddCommitterNs(std::uint64_t serial, std::uint64_t nanoseconds) {
-    if (!Enabled() || serial == 0) return;
+void AddCommitterNs(std::uint64_t id, std::uint64_t nanoseconds) {
+    if (!Enabled() || id == 0) return;
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
-    const auto found = shared.records.find(serial);
+    const auto found = shared.records.find(id);
     if (found != shared.records.end()) {
         found->second->committerNs += nanoseconds;
         return;
@@ -551,33 +602,50 @@ SubmitGroup::~SubmitGroup() {
     if (active) group().active = false;
 }
 
+namespace {
+
+void finish(State& shared, Record& record, std::chrono::steady_clock::time_point now) {
+    sortPages(record.reads);
+    sortPages(record.writes);
+    record.workerNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - record.segmentStart).count());
+    record.executed = --record.running == 0;
+    closeFrames(shared, false);
+    report(shared, false);
+}
+
+}
+
 Execution::Execution(std::uint64_t serial) {
     if (!Enabled() || current() != nullptr) return;
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
-    const auto found = shared.records.find(serial);
-    if (found == shared.records.end()) return;
-    auto& record = *found->second;
-    if (record.running++ == 0) record.started = std::chrono::steady_clock::now();
+    const auto last = shared.latest.find(serial);
+    if (last == shared.latest.end()) return;
+    auto& record = *shared.records.at(last->second);
+    const auto now = std::chrono::steady_clock::now();
+    if (record.running++ == 0) record.started = now;
+    record.segmentStart = now;
     record.executed = false;
     current() = &record;
     active = true;
-    start = std::chrono::steady_clock::now();
 }
 
 Execution::~Execution() {
-    if (!active) return;
-    const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-    auto* const record = current();
-    current() = nullptr;
-    sortPages(record->reads);
-    sortPages(record->writes);
+    if (!active || current() == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto* const record = std::exchange(current(), nullptr);
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
-    record->workerNs += spent;
-    record->executed = --record->running == 0;
-    closeFrames(shared, false);
-    report(shared, false);
+    finish(shared, *record, now);
+}
+
+void EndSegment() {
+    if (!Enabled() || current() == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    auto* const record = std::exchange(current(), nullptr);
+    auto& shared = state();
+    std::lock_guard lock(shared.mutex);
+    finish(shared, *record, now);
 }
 
 HeldFrames Held() {

@@ -145,7 +145,13 @@ template <typename TWork>
 void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!report) {
+        if (bucket != &WorkerProfile::waitMs || !GuestBufferProfile::Enabled()) {
+            work();
+            return;
+        }
+        const auto begin = std::chrono::steady_clock::now();
         work();
+        GuestBufferProfile::NoteWaitNs(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - begin).count()));
         return;
     }
     struct Slot {};
@@ -264,6 +270,7 @@ void Driver::execute(Submission& submission) {
     PacketHistory recent{submission.commands};
 
     static const bool profilePackets = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool guestBuffers = GuestBufferProfile::Enabled();
 
     thread_local PacketProfile* packetProfileSlot = nullptr;
     auto& packetProfile = ShaderRecompiler::ThreadOwned(packetProfileSlot);
@@ -304,7 +311,7 @@ void Driver::execute(Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
-        if (profilePackets) GuestBufferProfile::NotePacket(opcode, packet);
+        if (guestBuffers) GuestBufferProfile::NotePacket(opcode, packet);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
