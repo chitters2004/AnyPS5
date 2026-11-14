@@ -3112,6 +3112,12 @@ std::uint64_t ShaderResources::InPlaceReadReuses() {
     return inPlaceReadReuses.Sum();
 }
 
+ProfileCounter effectSetsMarked, effectSetsUnchanged, effectSetsChanged;
+
+ShaderResources::EffectScreenCounts ShaderResources::EffectScreen() {
+    return {effectSetsMarked.Sum(), effectSetsUnchanged.Sum(), effectSetsChanged.Sum()};
+}
+
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
     return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
@@ -7300,24 +7306,38 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    static const bool screen = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto screenReads = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, const void* list) {
+        if (!screen) return;
+        effectSetsMarked.Add(1);
+        const auto repeat = effectScreen.Note(&recorder, recorder.OpenSerial(), EffectReadPrint(reads, list, static_cast<std::uint32_t>(kind)));
+        if (repeat == EffectRepeat::Unchanged) effectSetsUnchanged.Add(1);
+        else if (repeat == EffectRepeat::Changed) effectSetsChanged.Add(1);
+    };
     if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
         if (auto split = guestMemory.SplitInPlaceReads()) {
+            screenReads(split->own, split->space.get());
             recorder.NotePendingReadList(std::move(split->space), kind);
             recorder.NotePendingReads(split->own, kind);
         } else {
-            recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+            const auto reads = guestMemory.InPlaceReads();
+            screenReads(reads, nullptr);
+            recorder.NotePendingReads(reads, kind);
         }
     } else {
         thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
         auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
         auto reads = std::move(ownedReads);
         const auto capacity = reads.capacity();
+        const void* list = nullptr;
         if (auto space = guestMemory.SplitInPlaceReads(reads)) {
+            list = space.get();
             recorder.NotePendingReadList(std::move(space), kind);
         } else {
             guestMemory.InPlaceReads(reads);
         }
         if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.Add(1);
+        screenReads(reads, list);
         recorder.NotePendingReads(reads, kind);
         ownedReads = std::move(reads);
     }
