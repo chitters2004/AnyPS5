@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadTally.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -1818,6 +1819,7 @@ public:
     using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
     iterator begin() { return textures.begin(); }
     iterator end() { return textures.end(); }
+    std::size_t size() const { return textures.size(); }
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
         changed();
@@ -2430,6 +2432,21 @@ TargetLookupSplit& ThreadTargetLookupSplit() {
     return ThreadScratch<TargetLookupSplit, Slot>();
 }
 
+TargetProofCounts& ThreadTargetProofCounts() {
+    struct Slot {};
+    return ThreadScratch<TargetProofCounts, Slot>();
+}
+
+const char* EpochExitName(std::size_t exit) {
+    static constexpr std::array<const char*, EpochExitCount> names{"hit", "epoch", "proof", "epoch+proof", "pending", "epoch+pending", "proof+pending", "epoch+proof+pending", "off"};
+    return names[exit];
+}
+
+const char* ProofCheckName(ProofCheck check) {
+    static constexpr std::array<const char*, ProofCheckCount> names{"proved", "no proof", "version", "unheld", "collect", "keys", "unchanged", "overlap"};
+    return names[static_cast<std::size_t>(check)];
+}
+
 bool StorageTexture::Refresh() {
     return refresh(0, trackedLayers);
 }
@@ -2473,6 +2490,10 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool scoped = firstLayer != 0 || lastLayer != trackedLayers;
     const bool epochProofs = ShaderResources::EpochProofs();
     const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
+    if (profile) {
+        const auto moved = epoch == 0 ? EpochExitOff : (provedEpoch.load(std::memory_order_relaxed) != epoch ? EpochMoved : 0) | (provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? ProofMoved : 0) | (provedPending.load(std::memory_order_relaxed) != PendingSerial() ? PendingMoved : 0);
+        ++ThreadTargetProofCounts().exits[moved];
+    }
     if (epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -2488,8 +2509,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     }
     TargetLookupSpan proving(&TargetLookupSplit::proofNs);
-    const bool proved = refreshProved();
+    const auto check = refreshProved();
     proving.Stop();
+    if (profile) {
+        auto& counts = ThreadTargetProofCounts();
+        ++counts.proofCalls;
+        ++counts.checks[static_cast<std::size_t>(check)];
+    }
+    const bool proved = check == ProofCheck::Proved;
     if (proved) {
         layerBehind.clear();
         if (epoch != 0) {
@@ -2870,31 +2897,37 @@ std::uint64_t StorageTexture::LinearImportRetiles() {
 bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
+    if (LookupOutcomes::Profiled()) {
+        auto& counts = ThreadTargetProofCounts();
+        ++counts.overlapScans;
+        counts.overlapEntries += pending.textures.size() + pending.flushing.size();
+    }
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+ProofCheck StorageTexture::refreshProved() {
+    if (refreshProof.generation == 0) return ProofCheck::NoProof;
+    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys) return ProofCheck::Version;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) return ProofCheck::Unheld;
     const auto bytes = static_cast<std::size_t>(guestBytes);
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return ProofCheck::Collect;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return ProofCheck::Keys;
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return ProofCheck::Collect;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return ProofCheck::Unchanged;
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) return ProofCheck::Overlap;
         refreshProof.pendingSerial = serial;
     }
-    return true;
+    return ProofCheck::Proved;
 }
 
 void StorageTexture::takeRefreshProof(bool aliased) {
@@ -4604,12 +4637,12 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent) BumpPendingSerial(PendingBump::Relent);
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
-    BumpPendingSerial();
+    BumpPendingSerial(PendingBump::Dirtied);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4621,7 +4654,7 @@ void StorageTexture::reconcilePending() {
     dirty = any;
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
-    BumpPendingSerial();
+    BumpPendingSerial(PendingBump::Reconciled);
 }
 
 bool StorageTexture::Dirty() const {
@@ -4854,7 +4887,7 @@ void StorageTexture::Flush(const char* reason) {
         if (!dirty) return;
         dirty = false;
         pending.textures.remove(this);
-        BumpPendingSerial();
+        BumpPendingSerial(PendingBump::Flushed);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, reason);
@@ -5042,7 +5075,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         // Still pending for the adjacency rule of writeBack until each one is stored.
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-        if (!flush.empty()) BumpPendingSerial();
+        if (!flush.empty()) BumpPendingSerial(PendingBump::FlushStarted);
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
         }
@@ -5063,7 +5096,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             std::lock_guard lock(pending.mutex);
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::FlushStored);
         }
     } unregister{flush};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
@@ -6018,8 +6051,23 @@ bool StorageTexture::OrderedFlushArmedForTest() {
     return GpuOrderedFlush();
 }
 
-void StorageTexture::BumpPendingSerial() {
+namespace {
+struct PendingBumpSlot {};
+using PendingBumpTally = ThreadTally<PendingBumpCount, PendingBumpSlot>;
+}
+
+void StorageTexture::BumpPendingSerial(PendingBump by) {
     pendingSerial.fetch_add(1, std::memory_order_release);
+    if (LookupOutcomes::Profiled()) PendingBumpTally::Add(static_cast<std::size_t>(by));
+}
+
+const char* StorageTexture::PendingBumpName(PendingBump by) {
+    static constexpr std::array<const char*, PendingBumpCount> names{"dirtied", "relent", "reconciled", "flushed", "flush started", "flush stored", "discarded", "key fill", "layer write-back", "retiled"};
+    return names[static_cast<std::size_t>(by)];
+}
+
+std::array<std::uint64_t, PendingBumpCount> StorageTexture::PendingBumps() {
+    return PendingBumpTally::Fold();
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
@@ -6090,7 +6138,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             ++it;
         }
     }
-    if (discarded != 0) BumpPendingSerial();
+    if (discarded != 0) BumpPendingSerial(PendingBump::Discarded);
     return discarded;
 }
 
@@ -6248,7 +6296,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::KeyFill);
         }
     }
     const auto commands = recorder->Commands();
@@ -7614,7 +7662,7 @@ StorageTexture::~StorageTexture() {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(PendingBump::LayerWriteBack);
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }

@@ -12706,20 +12706,29 @@ void repeatStorageGuardTests(const Device& device, Recorder& recorder) {
     std::cout << "Repeated storage surface guard tests passed\n";
 }
 
-void targetLookupSplitTests(const Device& device, Recorder& recorder) {
+bool withLookupSurface(const Device& device, Recorder& recorder, bool watched, const std::function<void(const Context&, const GuestTextureResource&)>& body) {
     const auto& base = device.GetContext();
     if (!device.NullDescriptors()) {
-        std::cout << "nullDescriptor unavailable: target lookup split not tested\n";
-        return;
+        std::cout << "nullDescriptor unavailable: target lookups not tested\n";
+        return false;
     }
     constexpr std::uint32_t side = 256;
     constexpr std::size_t bytes = side * side * 4;
+    void* block = nullptr;
+    if (watched) {
+        block = AllocateWatched(bytes, 65536);
+        if (block == nullptr) {
+            std::cout << "no write watching: watched target lookups not tested\n";
+            return false;
+        }
+    } else {
 #ifdef _WIN32
-    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
 #else
-    void* block = std::aligned_alloc(65536, bytes);
+        block = std::aligned_alloc(65536, bytes);
 #endif
-    Require(block != nullptr, "cannot allocate the target lookup split block");
+    }
+    Require(block != nullptr, "cannot allocate the target lookup block");
     std::memset(block, 0, bytes);
     {
         GuestAllocations::Mutation mutation;
@@ -12728,19 +12737,21 @@ void targetLookupSplitTests(const Device& device, Recorder& recorder) {
     struct Unregister {
         const Context& context;
         void* block;
+        bool watched;
         ~Unregister() {
             ClearCachedTextures(context.device);
             {
                 GuestAllocations::Mutation mutation;
                 mutation.Remove(block);
             }
+            if (watched) return;
 #ifdef _WIN32
             VirtualFree(block, 0, MEM_RELEASE);
 #else
             std::free(block);
 #endif
         }
-    } unregister{base, block};
+    } unregister{base, block, watched};
     TextureDetiler detiler(base);
     auto context = base;
     context.detiler = &detiler;
@@ -12759,25 +12770,109 @@ void targetLookupSplitTests(const Device& device, Recorder& recorder) {
     resource.dstSelY = 5;
     resource.dstSelZ = 6;
     resource.dstSelW = 7;
-    const auto before = ThreadTargetLookupSplit();
-    const auto stored = CachedStorageSurface(context, resource);
-    Require(stored != nullptr, "the storage surface has no image");
-    Require(CachedStorageSurface(context, resource) == stored, "the second lookup took another image");
-    const auto looked = ThreadTargetLookupSplit() - before;
-    Require(looked.cacheLocks == 2 && looked.prepNs > 0, "the storage cache lookups were not counted with their surface preparation");
-    Require(RepeatStorageSurface(context, resource, stored) == stored, "the repeat lookup took another image");
-    const auto repeated = ThreadTargetLookupSplit() - before - looked;
-    Require(repeated.cacheLocks == 1 && repeated.prepNs > 0 && repeated.refreshes == 1, "the repeat lookup was not counted with its surface preparation and refresh");
-    const auto split = ThreadTargetLookupSplit() - before;
-    Require(split.cacheLocks == 3 && split.cacheLockWaits == 0 && split.cacheLockWaitNs == 0, "the storage cache locks of three uncontended lookups were not counted");
-    Require(split.prepNs > 0, "the surface preparation before the storage cache lock was not timed");
-    Require(split.refreshes == 2 && split.refreshNs > 0, "the two hits' refreshes were not counted");
-    Require(split.refreshesProved <= split.refreshes && split.flushesSlow <= split.flushes && split.flushes <= split.refreshes, "the refresh outcomes do not nest");
-    Require(split.completeNs + split.proofNs + split.flushNs + split.collectNs + split.keysNs + split.unchangedNs <= split.refreshNs, "the refresh steps took longer than their refreshes");
+    body(context, resource);
     recorder.Submit();
     device.WaitQueue();
     recorder.Sync();
+    return true;
+}
+
+void targetLookupSplitTests(const Device& device, Recorder& recorder) {
+    withLookupSurface(device, recorder, false, [](const Context& context, const GuestTextureResource& resource) {
+        const auto before = ThreadTargetLookupSplit();
+        const auto stored = CachedStorageSurface(context, resource);
+        Require(stored != nullptr, "the storage surface has no image");
+        Require(CachedStorageSurface(context, resource) == stored, "the second lookup took another image");
+        const auto looked = ThreadTargetLookupSplit() - before;
+        Require(looked.cacheLocks == 2 && looked.prepNs > 0, "the storage cache lookups were not counted with their surface preparation");
+        Require(RepeatStorageSurface(context, resource, stored) == stored, "the repeat lookup took another image");
+        const auto repeated = ThreadTargetLookupSplit() - before - looked;
+        Require(repeated.cacheLocks == 1 && repeated.prepNs > 0 && repeated.refreshes == 1, "the repeat lookup was not counted with its surface preparation and refresh");
+        const auto split = ThreadTargetLookupSplit() - before;
+        Require(split.cacheLocks == 3 && split.cacheLockWaits == 0 && split.cacheLockWaitNs == 0, "the storage cache locks of three uncontended lookups were not counted");
+        Require(split.prepNs > 0, "the surface preparation before the storage cache lock was not timed");
+        Require(split.refreshes == 2 && split.refreshNs > 0, "the two hits' refreshes were not counted");
+        Require(split.refreshesProved <= split.refreshes && split.flushesSlow <= split.flushes && split.flushes <= split.refreshes, "the refresh outcomes do not nest");
+        Require(split.completeNs + split.proofNs + split.flushNs + split.collectNs + split.keysNs + split.unchangedNs <= split.refreshNs, "the refresh steps took longer than their refreshes");
+    });
     std::cout << "Target lookup split tests passed\n";
+}
+
+bool targetProofCountTests(const Device& device, Recorder& recorder) {
+    {
+        const auto before = AgcDriver::GuestMemory::ProofBreaks();
+        std::thread([] {
+            AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::WrittenBack);
+            AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::WrittenBack);
+        }).join();
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::RecordedWork);
+        const auto after = AgcDriver::GuestMemory::ProofBreaks();
+        for (std::size_t i = 0; i < AgcDriver::GuestMemory::ProofBreakCount; ++i) {
+            const auto expected = i == static_cast<std::size_t>(AgcDriver::GuestMemory::ProofBreak::WrittenBack) ? 2u : i == static_cast<std::size_t>(AgcDriver::GuestMemory::ProofBreak::RecordedWork) ? 1u : 0u;
+            Require(after[i] - before[i] == expected, "a proof break was not tallied under its cause, or an exited thread's breaks were lost");
+        }
+    }
+    const auto watch = PrepareImportWatch(device.GetContext());
+    SetImportWatch(device.GetContext(), ImportWatch::Watch);
+    struct RestoreWatch {
+        const Context& context;
+        ImportWatch watch;
+        ~RestoreWatch() { SetImportWatch(context, watch); }
+    } restoreWatch{device.GetContext(), watch};
+    const bool tested = withLookupSurface(device, recorder, true, [](const Context& context, const GuestTextureResource& resource) {
+        std::unique_lock gpu(GpuMutex());
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const auto before = ThreadTargetProofCounts();
+        const auto splitBefore = ThreadTargetLookupSplit();
+        const auto stored = CachedStorageSurface(context, resource);
+        Require(stored != nullptr, "the storage surface has no image");
+        Require(CachedStorageSurface(context, resource) == stored, "the second lookup took another image");
+        const auto cached = ThreadTargetProofCounts() - before;
+        Require(cached.storageMade == 1 && cached.storageHits == 1, "the storage cache's made and hit lookups were not counted");
+        const auto exits = [&](const TargetProofCounts& counts, std::size_t moved) { return counts.exits[moved]; };
+        const auto repeat = [&] {
+            const auto at = ThreadTargetProofCounts();
+            Require(RepeatStorageSurface(context, resource, stored) == stored, "the repeat lookup took another image");
+            return ThreadTargetProofCounts() - at;
+        };
+        static_cast<void>(repeat());
+        const auto settled = repeat();
+        Require(settled.repeatHits == 1 && exits(settled, 0) == 1, "a repeat lookup with nothing moved did not take the epoch exit");
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::NonDrawCommit);
+        const auto broken = repeat();
+        Require(exits(broken, ProofMoved) == 1 && broken.checks[static_cast<std::size_t>(ProofCheck::Proved)] == 1, "a broken proof serial was not the epoch exit's miss, or the re-proof failed");
+        Require(exits(repeat(), 0) == 1, "the re-proof did not restore the epoch exit");
+        const auto bumpsBefore = StorageTexture::PendingBumps();
+        StorageTexture::BumpPendingSerial(PendingBump::Discarded);
+        const auto bumpsAfter = StorageTexture::PendingBumps();
+        for (std::size_t i = 0; i < PendingBumpCount; ++i) Require(bumpsAfter[i] - bumpsBefore[i] == (i == static_cast<std::size_t>(PendingBump::Discarded) ? 1u : 0u), "a pending serial bump was not tallied under its site");
+        const auto moved = repeat();
+        Require(exits(moved, PendingMoved) == 1 && moved.checks[static_cast<std::size_t>(ProofCheck::Proved)] == 1 && moved.overlapScans == 1, "a moved pending serial was not the epoch exit's miss, or its overlap scan was not counted");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(exits(repeat(), EpochMoved) == 1, "a new collect epoch was not the epoch exit's miss");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::NonDrawCommit);
+        StorageTexture::BumpPendingSerial(PendingBump::Discarded);
+        Require(exits(repeat(), EpochMoved | ProofMoved | PendingMoved) == 1, "three moved serials were not one epoch exit miss with all three bits");
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::NonDrawCommit);
+        StorageTexture::BumpPendingSerial(PendingBump::Discarded);
+        Require(exits(repeat(), ProofMoved | PendingMoved) == 1, "two moved serials were not one epoch exit miss with both bits");
+        const auto total = ThreadTargetProofCounts() - before;
+        const auto split = ThreadTargetLookupSplit() - splitBefore;
+        std::uint64_t exited = 0;
+        std::uint64_t checked = 0;
+        for (const auto count : total.exits) exited += count;
+        for (const auto count : total.checks) checked += count;
+        Require(total.proofCalls == checked, "the refreshProved calls do not match their outcomes");
+        Require(exited == split.refreshes && checked == split.refreshes - exits(total, 0), "every refresh did not take one epoch exit outcome and every miss one re-proof outcome");
+        Require(exits(total, 0) + total.checks[static_cast<std::size_t>(ProofCheck::Proved)] == split.refreshesProved, "the proved outcomes do not match the proved refreshes");
+        ClearCachedTextures(context.device);
+        const auto evicted = ThreadTargetProofCounts();
+        Require(RepeatStorageSurface(context, resource, stored) == nullptr, "a repeat lookup served an evicted image");
+        Require((ThreadTargetProofCounts() - evicted).repeatMisses == 1, "the evicted repeat lookup was not counted as a miss");
+    });
+    if (tested) std::cout << "Target proof count tests passed\n";
+    return tested;
 }
 
 void oneFragmentFmaskGuardTests(const Device& device) {
@@ -16033,6 +16128,9 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--target-proof-counts-only") {
+            return targetProofCountTests(device, recorder) ? 0 : 77;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--target-lookup-split-only") {
             targetLookupSplitTests(device, recorder);
             return device.NullDescriptors() ? 0 : 77;

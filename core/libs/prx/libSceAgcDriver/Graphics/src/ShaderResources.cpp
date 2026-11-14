@@ -1530,7 +1530,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
             texture = it->texture;
             if (TextureCountersReported()) counters.storageHits.fetch_add(1, std::memory_order_relaxed);
-            if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+            if (profile) {
+                LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+                ++ThreadTargetProofCounts().storageHits;
+            }
         } else {
             if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
             bool flushed = false;
@@ -1559,7 +1562,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             cache.byImage[texture.get()] = cache.entries.begin();
             texture->SetCached(true);
             counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
-            if (profile) LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
+            if (profile) {
+                LookupOutcomes::Add(LookupOutcomes::StorageMade, start);
+                ++ThreadTargetProofCounts().storageMade;
+            }
         }
     }
     for (const auto& image : evicted) {
@@ -1861,9 +1867,9 @@ bool StorageImageServesKeys(const StorageTexture& image, std::uint64_t dccAddres
     return !MetadataMoved(image, resource);
 }
 
-std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
-    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if (disabled || stored == nullptr) return nullptr;
+namespace {
+
+std::shared_ptr<StorageTexture> repeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
     TargetLookupSpan preparing(&TargetLookupSplit::prepNs);
     const auto viewed = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     Require(viewed.dimension != TextureDimension::k2DMsaa, "storage image access to a multisampled texture is not implemented");
@@ -1887,6 +1893,16 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     TextureCounts().storageHits.fetch_add(1, std::memory_order_relaxed);
     if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
     return it->texture;
+}
+
+}
+
+std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, const GuestTextureResource& requested, const std::shared_ptr<StorageTexture>& stored) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (disabled || stored == nullptr) return nullptr;
+    auto repeated = repeatStorageSurface(context, requested, stored);
+    if (LookupOutcomes::Profiled()) ++(repeated != nullptr ? ThreadTargetProofCounts().repeatHits : ThreadTargetProofCounts().repeatMisses);
+    return repeated;
 }
 
 namespace {
@@ -7203,7 +7219,7 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
-    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs(GuestMemory::ProofBreak::DrawWrites);
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;

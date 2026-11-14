@@ -779,6 +779,7 @@ struct DrawOutcome {
     double lookupUs = 0;
     GuestMemory::CollectCounts lookupCollects;
     TargetLookupSplit lookupSplit;
+    TargetProofCounts proofCounts;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -846,6 +847,7 @@ struct DrawProfile {
     double lookupWaitUs = 0;
     GuestMemory::CollectCounts lookupCollects;
     TargetLookupSplit lookupSplit;
+    TargetProofCounts proofCounts;
     // Resource cache outcomes: hits, misses (built and inserted when reusable), entries that failed
     // Revalidate, and draws that could not use the cache (synchronous, no variant id, or disabled).
     // Which key words the misses differ in is the cache's own "[rescache] miss churn" line
@@ -870,6 +872,8 @@ struct DrawProfile {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawSkip::Count)> skips{};
     std::array<double, static_cast<std::size_t>(DrawSkip::Count)> skipUs{};
     AddressDrawReuseCounts addressSeen{};
+    std::array<std::uint64_t, GuestMemory::ProofBreakCount> breaksSeen{};
+    std::array<std::uint64_t, PendingBumpCount> bumpsSeen{};
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 constexpr std::array<const char*, static_cast<std::size_t>(DrawSkip::Count)> DrawSkipNames{"nothing to draw", "prechecked", "thrown"};
@@ -902,6 +906,25 @@ void completeSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
 DrawProfile& Profile() {
     static DrawProfile profile;
     return profile;
+}
+
+void printTargetProofs(DrawProfile& profile) {
+    const auto& counts = profile.proofCounts;
+    const auto breaks = GuestMemory::ProofBreaks();
+    const auto bumps = StorageTexture::PendingBumps();
+    char line[2048];
+    int n = std::snprintf(line, sizeof(line), "[readtarget-proof] (10 s) %llu draws, %llu resident lookups, %llu refreshes, %llu refreshProved calls; epoch exit (hit, or the serials that moved):", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.lookupSplit.refreshes), static_cast<unsigned long long>(counts.proofCalls));
+    const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
+    for (std::size_t i = 0; i < EpochExitCount && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s %llu", i == 0 ? "" : ",", EpochExitName(i), static_cast<unsigned long long>(counts.exits[i]));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; re-proofs:");
+    for (std::size_t i = 0; i < ProofCheckCount && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s %llu", i == 0 ? "" : ",", ProofCheckName(static_cast<ProofCheck>(i)), static_cast<unsigned long long>(counts.checks[i]));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; pending overlap scans %llu over %llu entries; repeat lookups hit %llu, missed %llu; storage cache hits %llu, made %llu; proof breaks (all threads):", static_cast<unsigned long long>(counts.overlapScans), static_cast<unsigned long long>(counts.overlapEntries), static_cast<unsigned long long>(counts.repeatHits), static_cast<unsigned long long>(counts.repeatMisses), static_cast<unsigned long long>(counts.storageHits), static_cast<unsigned long long>(counts.storageMade));
+    for (std::size_t i = 0; i < GuestMemory::ProofBreakCount && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s %llu", i == 0 ? "" : ",", GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i)), static_cast<unsigned long long>(breaks[i] - profile.breaksSeen[i]));
+    if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; pending serial bumps (all threads):");
+    for (std::size_t i = 0; i < PendingBumpCount && room(); ++i) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s %s %llu", i == 0 ? "" : ",", StorageTexture::PendingBumpName(static_cast<PendingBump>(i)), static_cast<unsigned long long>(bumps[i] - profile.bumpsSeen[i]));
+    profile.breaksSeen = breaks;
+    profile.bumpsSeen = bumps;
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
@@ -956,6 +979,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lookupUs += outcome.lookupUs;
     profile.lookupCollects += outcome.lookupCollects;
     profile.lookupSplit += outcome.lookupSplit;
+    profile.proofCounts += outcome.proofCounts;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -1027,6 +1051,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    printTargetProofs(profile);
     if (const auto sets = ShaderResources::TakeDrawSetSplit(); sets.calls != 0) {
         const auto calls = static_cast<double>(sets.calls);
         const auto per = [&](std::uint64_t value) { return static_cast<double>(value) / calls; };
@@ -1063,6 +1088,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lookupUs = 0;
     profile.lookupCollects = {};
     profile.lookupSplit = {};
+    profile.proofCounts = {};
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -2059,6 +2085,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto collectedBefore = profile ? GuestMemory::ThreadCollectCounts() : GuestMemory::CollectCounts{};
     const auto splitBefore = profile ? ThreadTargetLookupSplit() : TargetLookupSplit{};
+    const auto proofBefore = profile ? ThreadTargetProofCounts() : TargetProofCounts{};
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     std::shared_ptr<StorageTexture> resident;
     try {
@@ -2094,6 +2121,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         outcome.pagesWalked += collected.requestedBytes / 4096;
         outcome.lookupCollects += collected;
         outcome.lookupSplit += ThreadTargetLookupSplit() - splitBefore;
+        outcome.proofCounts += ThreadTargetProofCounts() - proofBefore;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }
@@ -2577,7 +2605,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             resources->WriteBackBuffers();
         });
         writers->push_back(resources);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters);
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
         else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });

@@ -459,7 +459,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::NonDrawCommit);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

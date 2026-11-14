@@ -266,6 +266,16 @@ private:
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+enum class PendingBump : std::uint8_t { Dirtied, Relent, Reconciled, Flushed, FlushStarted, FlushStored, Discarded, KeyFill, LayerWriteBack, Retiled, Count };
+inline constexpr std::size_t PendingBumpCount = static_cast<std::size_t>(PendingBump::Count);
+inline constexpr std::size_t EpochMoved = 1;
+inline constexpr std::size_t ProofMoved = 2;
+inline constexpr std::size_t PendingMoved = 4;
+inline constexpr std::size_t EpochExitOff = 8;
+inline constexpr std::size_t EpochExitCount = 9;
+enum class ProofCheck : std::uint8_t { Proved, NoProof, Version, Unheld, Collect, Keys, Unchanged, Overlap, Count };
+inline constexpr std::size_t ProofCheckCount = static_cast<std::size_t>(ProofCheck::Count);
+
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     struct CreationHandOver {
@@ -342,7 +352,9 @@ public:
     static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
-    static void BumpPendingSerial();
+    static void BumpPendingSerial(PendingBump by);
+    static const char* PendingBumpName(PendingBump by);
+    static std::array<std::uint64_t, PendingBumpCount> PendingBumps();
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -683,7 +695,7 @@ private:
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     std::uint64_t collectedLayerGeneration(std::uint32_t layer, std::uint64_t whole, bool uncached = false) const;
-    bool refreshProved();
+    ProofCheck refreshProved();
     bool keysReplacedByClear() const;
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
@@ -965,6 +977,47 @@ struct TargetLookupSplit {
     }
 };
 TargetLookupSplit& ThreadTargetLookupSplit();
+struct TargetProofCounts {
+    std::array<std::uint64_t, EpochExitCount> exits{};
+    std::array<std::uint64_t, ProofCheckCount> checks{};
+    std::uint64_t proofCalls = 0;
+    std::uint64_t overlapScans = 0;
+    std::uint64_t overlapEntries = 0;
+    std::uint64_t repeatHits = 0;
+    std::uint64_t repeatMisses = 0;
+    std::uint64_t storageHits = 0;
+    std::uint64_t storageMade = 0;
+
+    TargetProofCounts& operator+=(const TargetProofCounts& other) {
+        for (std::size_t i = 0; i < EpochExitCount; ++i) exits[i] += other.exits[i];
+        for (std::size_t i = 0; i < ProofCheckCount; ++i) checks[i] += other.checks[i];
+        proofCalls += other.proofCalls;
+        overlapScans += other.overlapScans;
+        overlapEntries += other.overlapEntries;
+        repeatHits += other.repeatHits;
+        repeatMisses += other.repeatMisses;
+        storageHits += other.storageHits;
+        storageMade += other.storageMade;
+        return *this;
+    }
+
+    TargetProofCounts operator-(const TargetProofCounts& before) const {
+        TargetProofCounts delta;
+        for (std::size_t i = 0; i < EpochExitCount; ++i) delta.exits[i] = exits[i] - before.exits[i];
+        for (std::size_t i = 0; i < ProofCheckCount; ++i) delta.checks[i] = checks[i] - before.checks[i];
+        delta.proofCalls = proofCalls - before.proofCalls;
+        delta.overlapScans = overlapScans - before.overlapScans;
+        delta.overlapEntries = overlapEntries - before.overlapEntries;
+        delta.repeatHits = repeatHits - before.repeatHits;
+        delta.repeatMisses = repeatMisses - before.repeatMisses;
+        delta.storageHits = storageHits - before.storageHits;
+        delta.storageMade = storageMade - before.storageMade;
+        return delta;
+    }
+};
+TargetProofCounts& ThreadTargetProofCounts();
+const char* EpochExitName(std::size_t exit);
+const char* ProofCheckName(ProofCheck check);
 
 class TargetLookupSpan {
 public:

@@ -146,7 +146,11 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-void BreakProofs();
+enum class ProofBreak : std::uint8_t { NonDrawCommit, DrawWrites, CopiedWriters, GpuMutexEntry, OwnStore, MarkWritten, WriteBack, WriteBackIfHeld, CompletionStore, RecordedWork, WrittenBack, Count };
+inline constexpr std::size_t ProofBreakCount = static_cast<std::size_t>(ProofBreak::Count);
+const char* ProofBreakName(ProofBreak by);
+void BreakProofs(ProofBreak by);
+std::array<std::uint64_t, ProofBreakCount> ProofBreaks();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
