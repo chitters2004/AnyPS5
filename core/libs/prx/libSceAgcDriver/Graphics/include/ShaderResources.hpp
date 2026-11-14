@@ -220,6 +220,10 @@ public:
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    static constexpr std::uint32_t MaxDynamicElements = 32;
+    static bool DynamicBindingLayouts();
+    static std::uint32_t DynamicElementLimit(const Context& context);
+    std::array<std::uint32_t, 2> DynamicCounts() const { return dynamicCounts; }
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -237,6 +241,9 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        std::shared_ptr<const DrawBindings> persistent;
+        std::array<std::uint32_t, MaxDynamicElements> offsets{};
+        std::vector<VkDescriptorBufferInfo> key;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -257,6 +264,7 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
+    void BindDrawBindings(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings& drawBindings) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     static std::uint64_t BytesUpToTarget(std::uint64_t address, std::uint64_t bytes, std::uint64_t stride, const ColorTarget* target);
@@ -476,6 +484,7 @@ private:
         std::vector<std::size_t> imageAllocations;
         VkDescriptorBindingFlags flags = 0;
         std::int32_t set = -1;
+        bool dynamicCapable = false;
     };
 
     struct TableStage {
@@ -730,7 +739,18 @@ private:
     };
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
-    void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool counted = false) const;
+    void writeDrawSets(DrawBindings& result, std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool counted = false, bool persistent = false) const;
+    bool bindPersistentDrawSets(DrawBindings& result, std::span<const std::size_t> selected, bool counted) const;
+    struct DynamicElement {
+        std::size_t allocation;
+        std::size_t buffer;
+    };
+    std::array<std::uint32_t, 2> dynamicCounts{};
+    mutable AgcDriver::Mutex persistentMutex;
+    mutable std::vector<DynamicElement> dynamicPlan;
+    mutable bool dynamicPlanned = false;
+    mutable std::vector<std::shared_ptr<DrawBindings>> persistentSets;
+    static constexpr std::size_t PersistentSetEntries = 4;
     void countDrawSetRanges(std::span<const VkDeviceSize> ranges) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;

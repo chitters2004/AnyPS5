@@ -4254,7 +4254,8 @@ void resourceReadTests(const Device& device, Recorder& recorder) {
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto second = resources.PrepareDrawBindings(snapshotRecorder);
         Require(second != nullptr && second->snapshots.size() == 1, "cached draw input was not snapshotted again");
-        Require(first->allocation.set != second->allocation.set, "in-flight draws share mutable descriptor bindings");
+        const bool ownBindings = first->persistent == nullptr ? first->allocation.set != second->allocation.set : first->persistent != second->persistent || first->offsets[0] != second->offsets[0];
+        Require(ownBindings, "in-flight draws share mutable descriptor bindings");
         std::memset(reinterpret_cast<void*>(element), 0x33, elementBytes);
         AgcDriver::GuestMemory::MarkWritten(element, elementBytes);
         auto downloaded = std::make_shared<Buffer>(snapshotContext, elementBytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4906,7 +4907,7 @@ private:
             contents.written[{write.dstSet, write.dstBinding}] += write.descriptorCount;
             for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
                 const auto key = std::pair{write.dstBinding, write.dstArrayElement + element};
-                if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) contents.buffers[key] = write.pBufferInfo[element];
+                if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC) contents.buffers[key] = write.pBufferInfo[element];
                 else contents.images[key] = write.pImageInfo[element];
             }
         }
@@ -4921,7 +4922,20 @@ private:
     static inline DescriptorUpdates* active = nullptr;
 };
 
+class SwitchScope {
+public:
+    SwitchScope(RuntimeSwitch id, bool set) : id(id), previous(RuntimeSwitches::Set(id)) { RuntimeSwitches::Assign(id, set); }
+    ~SwitchScope() { RuntimeSwitches::Assign(id, previous); }
+    SwitchScope(const SwitchScope&) = delete;
+    SwitchScope& operator=(const SwitchScope&) = delete;
+
+private:
+    RuntimeSwitch id;
+    bool previous;
+};
+
 void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
+    const SwitchScope conventional(RuntimeSwitch::NoPersistentDrawSets, true);
     auto context = device.GetContext();
     DescriptorUpdates updates(context);
     {
@@ -4999,7 +5013,7 @@ void drawSetCountTests(const Device& device, Recorder& recorder) {
         ShaderResources resources(context, shader);
         TakeDrawSetCounts();
         const std::array<std::uint32_t, 8> words{5, 6, 7, 8, 9, 10, 11, 12};
-        const std::vector<std::uint32_t> large((Recorder::DrawUploadChunk + 16) / sizeof(std::uint32_t), 13u);
+        const std::vector<std::uint32_t> large((Recorder::DrawUploadChunkBytes() + 16) / sizeof(std::uint32_t), 13u);
         const ShaderResources::MovedBuffer small{0, 0, 16, std::span(words).first(4)};
         const ShaderResources::MovedBuffer wide{0, 0, 32, words};
         const std::array<ShaderResources::MovedBuffer, 2> both{wide, ShaderResources::MovedBuffer{1, 0, large.size() * sizeof(std::uint32_t), large}};
@@ -5030,12 +5044,173 @@ void drawSetCountTests(const Device& device, Recorder& recorder) {
         expect(counts.uploadChunks, 2, "upload chunks");
         expect(counts.reboundDraws, 0, "rebound draws");
         expect(counts.faultDraws, 0, "fault draws");
+        const bool persistent = resources.DynamicCounts()[0] != 0 && !RuntimeSwitches::Set(RuntimeSwitch::NoPersistentDrawSets);
+        expect(counts.persistentHits, persistent ? 1 : 0, "persistent set hits");
+        expect(counts.persistentWrites, persistent ? 2 : 0, "persistent set writes");
+        expect(counts.persistentFallbacks, persistent ? 1 : 0, "persistent set fallbacks");
         snapshots.Sync();
     }
     recorder.Activate();
 }
 
+int persistentDrawSetTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    if (!ShaderResources::DynamicBindingLayouts() || ShaderResources::DynamicElementLimit(context) < 2u) {
+        std::cout << "dynamic binding layouts off: persistent draw sets not tested\n";
+        return 77;
+    }
+    DescriptorUpdates updates(context);
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(data);
+        data.binding = 7;
+        program.bindings.push_back(data);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        Require(resources.DynamicCounts()[0] == 2u && resources.DynamicCounts()[1] == 0u, "shader data bindings did not become dynamic storage buffers");
+        Require(updates.calls.size() == 1, "building resources did not write one descriptor set");
+        const auto original = updates.calls.front();
+        const auto staticBuffer = original.buffers.at(std::pair{7u, 0u});
+        const auto prepare = [&](std::span<const std::uint32_t> words) {
+            const ShaderResources::MovedBuffer moved{0, 0, words.size_bytes(), words};
+            return resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+        };
+        const auto sameBuffer = [](const VkDescriptorBufferInfo& left, const VkDescriptorBufferInfo& right) { return left.buffer == right.buffer && left.offset == right.offset && left.range == right.range; };
+        const std::array<std::uint32_t, 4> first{5, 6, 7, 8};
+        const std::array<std::uint32_t, 4> second{9, 10, 11, 12};
+        const std::array<std::uint32_t, 8> wide{1, 2, 3, 4, 5, 6, 7, 8};
+        {
+            const SwitchScope persistent(RuntimeSwitch::NoPersistentDrawSets, false);
+            const auto before = updates.calls.size();
+            const auto a = prepare(first);
+            const auto b = prepare(second);
+            Require(a != nullptr && b != nullptr && a->persistent != nullptr && a->persistent == b->persistent, "two draws with one key did not share a persistent set");
+            Require(a->allocation.set == VK_NULL_HANDLE && b->allocation.set == VK_NULL_HANDLE, "a persistent draw also wrote a set of its own");
+            Require(updates.calls.size() == before + 1u, "the persistent set was written more than once");
+            Require(a->snapshots.front().buffer == b->snapshots.front().buffer, "two small uploads left one upload chunk");
+            const auto& written = updates.calls.back();
+            const auto snapshotted = written.buffers.at(std::pair{2u, 0u});
+            Require(snapshotted.buffer == a->snapshots.front().buffer->Handle() && snapshotted.offset == 0u && snapshotted.range == 16u, "the persistent set does not bind the upload chunk from offset 0 with the snapshot's range");
+            Require(sameBuffer(written.buffers.at(std::pair{7u, 0u}), staticBuffer), "the persistent set changed a buffer no draw snapshotted");
+            Require(a->offsets[0] == a->snapshots.front().offset && b->offsets[0] == b->snapshots.front().offset && a->offsets[0] != b->offsets[0], "draws do not carry their own snapshots' dynamic offsets");
+            Require(a->offsets[1] == 0u && b->offsets[1] == 0u, "an unsnapshotted buffer got a dynamic offset");
+            const auto c = prepare(wide);
+            Require(c != nullptr && c->persistent != nullptr && c->persistent != a->persistent && updates.calls.size() == before + 2u, "a draw with another range reused a set written for a different range");
+            Require(updates.calls.back().buffers.at(std::pair{2u, 0u}).range == 32u, "the second persistent set lost its snapshot's exact range");
+            std::vector<std::shared_ptr<ShaderResources::DrawBindings>> filled;
+            for (const std::size_t words : {12u, 16u, 20u}) {
+                const std::vector<std::uint32_t> fill(words, 3u);
+                filled.push_back(prepare(fill));
+                Require(filled.back() != nullptr && filled.back()->persistent != nullptr, "a new range did not get a persistent set");
+            }
+            Require(updates.calls.size() == before + 5u, "each new range did not write exactly one persistent set");
+            const auto again = prepare(first);
+            Require(again != nullptr && again->persistent != nullptr && again->persistent != a->persistent && updates.calls.size() == before + 6u, "an evicted persistent set was reused or the cache kept more than its entries");
+            Require(a->persistent->allocation.set != VK_NULL_HANDLE, "an evicted persistent set was released while a draw still held it");
+        }
+        {
+            const SwitchScope conventional(RuntimeSwitch::NoPersistentDrawSets, true);
+            const auto before = updates.calls.size();
+            const auto d = prepare(first);
+            Require(d != nullptr && d->persistent == nullptr && d->allocation.set != VK_NULL_HANDLE && updates.calls.size() == before + 1u, "the switch did not restore a written set per draw");
+            const auto patched = updates.calls.back().buffers.at(std::pair{2u, 0u});
+            Require(patched.offset == d->snapshots.front().offset && patched.range == 16u, "the per-draw set lost its snapshot offset");
+        }
+        snapshots.Sync();
+    }
+    recorder.Activate();
+    std::cout << "Persistent draw sets passed\n";
+    return 0;
+}
+
+int persistentDrawSetBench(const Device& device, Recorder& recorder, std::uint32_t elements) {
+    auto context = device.GetContext();
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    Recorder snapshots(context);
+    snapshots.Activate();
+    ShaderRecompiler::RecompileResult program;
+    for (std::uint32_t element = 0; element < elements; ++element) {
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2u + element;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        program.bindings.push_back(data);
+    }
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    std::vector<std::array<std::uint32_t, 16>> words(elements);
+    std::vector<ShaderResources::MovedBuffer> moved;
+    for (std::uint32_t element = 0; element < elements; ++element) {
+        words[element].fill(element);
+        moved.push_back({element, 0, sizeof(words[element]), words[element]});
+    }
+    constexpr std::size_t Draws = 20000;
+    constexpr std::size_t Batch = 1000;
+    const auto run = [&](bool conventional) {
+        const SwitchScope backend(RuntimeSwitch::NoPersistentDrawSets, conventional);
+        std::chrono::nanoseconds spent{0};
+        for (std::size_t done = 0; done < Draws; done += Batch) {
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t draw = 0; draw < Batch; ++draw) Require(resources.PrepareDrawBindings(snapshots, moved) != nullptr, "a benchmark draw made no bindings");
+            spent += std::chrono::steady_clock::now() - start;
+            snapshots.Sync();
+        }
+        return static_cast<double>(spent.count()) / static_cast<double>(Draws);
+    };
+    run(false);
+    run(true);
+    std::array<double, 4> arms{run(true), run(false), run(false), run(true)};
+    std::printf("persistent draw sets bench: %u elements, dynamic %u, conventional %.1f ns/draw, persistent %.1f ns/draw (ABBA %.1f %.1f %.1f %.1f)\n", elements, resources.DynamicCounts()[0], (arms[0] + arms[3]) / 2.0, (arms[1] + arms[2]) / 2.0, arms[0], arms[1], arms[2], arms[3]);
+    recorder.Activate();
+    return 0;
+}
+
+int drawUploadPoolTests(const Device& device) {
+    const auto& context = device.GetContext();
+    {
+        const SwitchScope pooled(RuntimeSwitch::NoDrawUploadPool, false);
+        Recorder uploads(context);
+        const auto bytes = Recorder::PooledDrawUploadChunk - 256u;
+        auto held = uploads.DrawUpload(bytes).buffer;
+        Require(held->Bytes().size() == Recorder::PooledDrawUploadChunk, "the pooled ring did not open a pooled chunk");
+        const auto* firstChunk = held.get();
+        auto second = uploads.DrawUpload(bytes).buffer;
+        Require(second.get() != firstChunk, "a chunk a batch still held was reused");
+        Require(uploads.DrawUploadPoolSize() == 1u, "the full chunk did not return to the pool");
+        held.reset();
+        auto third = uploads.DrawUpload(bytes).buffer;
+        Require(third.get() == firstChunk, "a chunk no batch held was not reused");
+        Require(uploads.DrawUploadPoolSize() == 1u, "reusing a chunk did not take it from the pool");
+    }
+    {
+        const SwitchScope unpooled(RuntimeSwitch::NoDrawUploadPool, true);
+        Recorder uploads(context);
+        const auto bytes = Recorder::DrawUploadChunk - 256u;
+        auto first = uploads.DrawUpload(bytes).buffer;
+        Require(first->Bytes().size() == Recorder::DrawUploadChunk, "the unpooled ring changed its chunk size");
+        first.reset();
+        auto second = uploads.DrawUpload(bytes).buffer;
+        Require(uploads.DrawUploadPoolSize() == 0u, "the unpooled ring kept chunks");
+    }
+    std::cout << "Draw upload pool passed\n";
+    return 0;
+}
+
 void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
+    const SwitchScope conventional(RuntimeSwitch::NoPersistentDrawSets, true);
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using ShaderRecompiler::DescriptorKind;
     using ShaderRecompiler::DescriptorRole;
@@ -5885,7 +6060,7 @@ void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
         const auto first = snapshotRecorder.DrawUpload(16);
         const auto second = snapshotRecorder.DrawUpload(16);
         Require(second.buffer == first.buffer && second.offset >= first.offset + 16 && second.offset % alignment == 0, "upload slices overlap or are not aligned");
-        const auto whole = snapshotRecorder.DrawUpload(Recorder::DrawUploadChunk);
+        const auto whole = snapshotRecorder.DrawUpload(Recorder::DrawUploadChunkBytes());
         Require(whole.buffer != second.buffer && whole.offset == 0, "a full upload chunk was not replaced");
         snapshotRecorder.Sync();
     }
@@ -16843,6 +17018,9 @@ int main(int argc, char** argv) {
             fmaskDecompressMsaaTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--persistent-draw-sets-only") return persistentDrawSetTests(device, recorder);
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-upload-pool-only") return drawUploadPoolTests(device);
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--benchmark-persistent-draw-sets") return persistentDrawSetBench(device, recorder, argc == 3 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 4u);
         if (argc == 2 && std::string_view(argv[1]) == "--draw-set-counts-only") {
             drawSetCountTests(device, recorder);
             std::cout << "Draw set counts passed (" << (DrawSetCountsProfiled() ? "counted" : "off") << ")\n";
