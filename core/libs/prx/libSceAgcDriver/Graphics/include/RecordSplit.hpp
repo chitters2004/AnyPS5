@@ -89,20 +89,14 @@ enum class Event : std::size_t {
 inline constexpr std::array<const char*, static_cast<std::size_t>(Span::Count)> SpanNames{"assemble", "flush checks", "access", "draw sets", "pass access", "start pass", "pass setup", "pass state", "binds", "push", "commands", "tail", "leave", "hazard check", "hazard add", "sets guard", "sets walk", "sets snapshots", "sets uploads", "sets write", "sets keeps", "sets recount", "sets allocate", "sets build", "sets update"};
 inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated"};
 
-inline bool Enabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return enabled;
-}
+bool Enabled();
 
 struct Counters {
     std::array<AgcDriver::ProfileCounter, static_cast<std::size_t>(Span::Count)> ns{};
     std::array<AgcDriver::ProfileCounter, static_cast<std::size_t>(Event::Count)> events{};
 };
 
-inline Counters& Shared() {
-    static Counters counters;
-    return counters;
-}
+Counters& Shared();
 
 inline void Charge(Span span, std::uint64_t nanoseconds) {
     Shared().ns[static_cast<std::size_t>(span)].Add(nanoseconds);
