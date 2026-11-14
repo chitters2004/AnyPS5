@@ -244,6 +244,7 @@ public:
         std::shared_ptr<const DrawBindings> persistent;
         std::array<std::uint32_t, MaxDynamicElements> offsets{};
         std::vector<VkDescriptorBufferInfo> key;
+        std::vector<std::weak_ptr<Buffer>> referenced;
         ~DrawBindings();
     };
     struct MovedBuffer {
@@ -740,6 +741,7 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, const BdaResources* faultRecord, bool counted = false, bool persistent = false) const;
+    void dropPersistentSets() const;
     bool bindPersistentDrawSets(DrawBindings& result, std::span<const std::size_t> selected, bool counted) const;
     struct DynamicElement {
         std::size_t allocation;

@@ -5192,6 +5192,30 @@ int persistentDrawSetTests(const Device& device, Recorder& recorder) {
             Require(a->persistent->allocation.set != VK_NULL_HANDLE, "an evicted persistent set was released while a draw still held it");
         }
         {
+            const SwitchScope persistent(RuntimeSwitch::NoPersistentDrawSets, false);
+            const SwitchScope unpooled(RuntimeSwitch::NoDrawUploadPool, true);
+            std::vector<std::pair<VkBuffer, std::shared_ptr<const ShaderResources::DrawBindings>>> destroyed;
+            bool recycled = false;
+            for (int round = 0; round < 64 && !recycled; ++round) {
+                Recorder uploads(context);
+                uploads.Activate();
+                const ShaderResources::MovedBuffer moved{0, 0, sizeof(first), first};
+                auto drawn = resources.PrepareDrawBindings(uploads, std::span(&moved, 1));
+                Require(drawn != nullptr && drawn->persistent != nullptr, "a draw from a fresh upload chunk did not get a persistent set");
+                const auto handle = drawn->snapshots.front().buffer->Handle();
+                for (const auto& [old, set] : destroyed) {
+                    if (old != handle) continue;
+                    recycled = true;
+                    Require(drawn->persistent != set, "a persistent set written for a destroyed upload chunk was bound to a new chunk with its handle");
+                }
+                destroyed.emplace_back(handle, drawn->persistent);
+                drawn.reset();
+                uploads.Sync();
+            }
+            snapshots.Activate();
+            if (!recycled) std::cout << "upload chunk handles were never recycled: the stale persistent set check did not run\n";
+        }
+        {
             const SwitchScope conventional(RuntimeSwitch::NoPersistentDrawSets, true);
             const auto before = updates.calls.size();
             const auto d = prepare(first);

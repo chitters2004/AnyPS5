@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -505,12 +507,50 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
 
 }
 
+std::string DescribeDrawSets(const AgcDriver::Graphics::DrawSetCounts& counts) {
+    char text[256];
+    std::snprintf(text, sizeof(text), "draws %llu, dynamic elements %llu, rebound %llu, persistent hits %llu, writes %llu, fallbacks %llu, dropped %llu", static_cast<unsigned long long>(counts.draws), static_cast<unsigned long long>(counts.dynamicElements), static_cast<unsigned long long>(counts.reboundDraws), static_cast<unsigned long long>(counts.persistentHits), static_cast<unsigned long long>(counts.persistentWrites), static_cast<unsigned long long>(counts.persistentFallbacks), static_cast<unsigned long long>(counts.persistentDropped));
+    return text;
+}
+
+void PersistentRebind(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool previous = Switches::Set(RuntimeSwitch::NoPersistentDrawSets);
+    Switches::Assign(RuntimeSwitch::NoPersistentDrawSets, false);
+    struct Restore {
+        bool previous;
+        ~Restore() { AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoPersistentDrawSets, previous); }
+    } restore{previous};
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "persistent");
+    static_cast<void>(AgcDriver::Graphics::TakeDrawSetCounts());
+    auto outcome = Draw(device, scene);
+    auto counts = AgcDriver::Graphics::TakeDrawSetCounts();
+    if (counts.dynamicElements == 0) {
+        std::puts("persistent: skipped, the draw has no dynamic storage buffers");
+        return;
+    }
+    Require(outcome.brightest == 255u && counts.draws == 1u && counts.persistentHits == 1u && counts.persistentFallbacks == 0u, "persistent: a settled image-table draw with a fault buffer did not reuse its persistent set (" + DescribeDrawSets(counts) + ")");
+    Fill(scene.Texels(Key), 0.0f);
+    outcome = Draw(device, scene);
+    counts = AgcDriver::Graphics::TakeDrawSetCounts();
+    Require(outcome.brightest == 0u, "persistent: the draw that re-bound the written texture sampled the old image (" + outcome.Describe() + ")");
+    Require(counts.reboundDraws == 1u && counts.persistentWrites == 1u && counts.persistentHits == 0u && counts.persistentFallbacks == 0u && counts.persistentDropped >= 1u, "persistent: a re-bound draw did not drop the stale persistent sets and write a new one (" + DescribeDrawSets(counts) + ")");
+    outcome = Draw(device, scene);
+    counts = AgcDriver::Graphics::TakeDrawSetCounts();
+    Require(outcome.brightest == 0u && counts.persistentHits == 1u && counts.persistentFallbacks == 0u, "persistent: the draw after a re-bind did not reuse the rewritten persistent set (" + DescribeDrawSets(counts) + ")");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_TABLE_INDEX", "1");
+        _putenv_s("APS5_PROFILE_DRAW_SETS", "1");
 #else
         setenv("APS5_TABLE_INDEX", "1", 1);
+        setenv("APS5_PROFILE_DRAW_SETS", "1", 1);
 #endif
         std::vector<std::string> args(argv + 1, argv + argc);
         if (const auto flag = std::find(args.begin(), args.end(), "outcome"); flag != args.end()) {
@@ -527,7 +567,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 11> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 12> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}, {"persistent", &PersistentRebind}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

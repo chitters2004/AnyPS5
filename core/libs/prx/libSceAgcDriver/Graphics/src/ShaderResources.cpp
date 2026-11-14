@@ -4212,6 +4212,7 @@ DrawSetCounts TakeDrawSetCounts() {
     counts.persistentHits = tallies.persistentHits.Take();
     counts.persistentWrites = tallies.persistentWrites.Take();
     counts.persistentFallbacks = tallies.persistentFallbacks.Take();
+    counts.persistentDropped = tallies.persistentDropped.Take();
     return counts;
 }
 
@@ -4220,7 +4221,7 @@ void ReportDrawSetCounts() {
     const auto perDraw = [&](std::uint64_t value) { return counts.draws == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(counts.draws); };
     const auto percent = [](std::uint64_t part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole); };
     const auto count = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-sets] (10 s): %llu draws; dynamic elements %.2f per draw, %llu draws over 8, %llu over 16; %.2f patched per draw; ranges %llu compared, %llu changed (%.2f%%), %llu draws with a change (%.2f%%); snapshots %llu ring, %llu other in %llu draws; ring buffers %.2f per draw, %llu draws with more than one; %llu upload chunks, %llu reused from the pool; %llu rebound draws, %llu fault draws; persistent sets %llu hits, %llu writes, %llu fallbacks\n", count(counts.draws), perDraw(counts.dynamicElements), count(counts.overEight), count(counts.overSixteen), perDraw(counts.patched), count(counts.rangeCompares), count(counts.rangeChanges), percent(counts.rangeChanges, counts.rangeCompares), count(counts.rangeChangeDraws), percent(counts.rangeChangeDraws, counts.draws), count(counts.ringSnapshots), count(counts.otherSnapshots), count(counts.otherDraws), perDraw(counts.ringBuffers), count(counts.multiRingDraws), count(counts.uploadChunks), count(counts.pooledChunks), count(counts.reboundDraws), count(counts.faultDraws), count(counts.persistentHits), count(counts.persistentWrites), count(counts.persistentFallbacks));
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-sets] (10 s): %llu draws; dynamic elements %.2f per draw, %llu draws over 8, %llu over 16; %.2f patched per draw; ranges %llu compared, %llu changed (%.2f%%), %llu draws with a change (%.2f%%); snapshots %llu ring, %llu other in %llu draws; ring buffers %.2f per draw, %llu draws with more than one; %llu upload chunks, %llu reused from the pool; %llu rebound draws, %llu fault draws; persistent sets %llu hits, %llu writes, %llu fallbacks, %llu dropped\n", count(counts.draws), perDraw(counts.dynamicElements), count(counts.overEight), count(counts.overSixteen), perDraw(counts.patched), count(counts.rangeCompares), count(counts.rangeChanges), percent(counts.rangeChanges, counts.rangeCompares), count(counts.rangeChangeDraws), percent(counts.rangeChangeDraws, counts.draws), count(counts.ringSnapshots), count(counts.otherSnapshots), count(counts.otherDraws), perDraw(counts.ringBuffers), count(counts.multiRingDraws), count(counts.uploadChunks), count(counts.pooledChunks), count(counts.reboundDraws), count(counts.faultDraws), count(counts.persistentHits), count(counts.persistentWrites), count(counts.persistentFallbacks), count(counts.persistentDropped));
 }
 
 namespace {
@@ -4431,6 +4432,7 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
         rebound = true;
         countIndex(IndexRebound);
     }
+    if (!replaced.empty()) dropPersistentSets();
     const auto& log = lookupLog();
     for (const auto i : elements) {
         const auto found = std::find_if(log.rbegin(), log.rend(), [&](const LookupRecord& record) { return record.object == textures[i].get(); });
@@ -7243,7 +7245,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     const bool dynamic = dynamicCounts[0] + dynamicCounts[1] != 0;
     if (dynamic && !RuntimeSwitches::Set(RuntimeSwitch::NoPersistentDrawSets)) {
-        if (!rebound && faultRecord == nullptr && faultDescriptors.empty() && other == 0 && !selected.empty() && bindPersistentDrawSets(*result, selected, counted)) {
+        if (faultRecord == nullptr && other == 0 && bindPersistentDrawSets(*result, selected, counted)) {
             recorder.Keep(result);
             for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
             return result;
@@ -7446,11 +7448,16 @@ bool ShaderResources::bindPersistentDrawSets(DrawBindings& result, std::span<con
     const auto same = [&](const std::shared_ptr<DrawBindings>& entry) {
         return std::equal(entry->key.begin(), entry->key.end(), key.begin(), key.end(), [](const VkDescriptorBufferInfo& left, const VkDescriptorBufferInfo& right) { return left.buffer == right.buffer && left.offset == right.offset && left.range == right.range; });
     };
+    const auto stale = [](const std::shared_ptr<DrawBindings>& entry) { return std::any_of(entry->referenced.begin(), entry->referenced.end(), [](const std::weak_ptr<Buffer>& buffer) { return buffer.expired(); }); };
+    const auto live = std::remove_if(persistentSets.begin(), persistentSets.end(), stale);
+    if (counted && live != persistentSets.end()) DrawSetCountTallies().persistentDropped.Add(static_cast<std::uint64_t>(persistentSets.end() - live));
+    persistentSets.erase(live, persistentSets.end());
     auto found = std::find_if(persistentSets.begin(), persistentSets.end(), same);
     if (found == persistentSets.end()) {
         auto entry = std::make_shared<DrawBindings>();
         writeDrawSets(*entry, result.snapshots, selected, nullptr, false, true);
         entry->key = key;
+        for (const auto& snapshot : result.snapshots) entry->referenced.push_back(snapshot.buffer);
         if (persistentSets.size() >= PersistentSetEntries) persistentSets.erase(persistentSets.begin());
         persistentSets.push_back(std::move(entry));
         found = persistentSets.end() - 1;
@@ -7463,11 +7470,19 @@ bool ShaderResources::bindPersistentDrawSets(DrawBindings& result, std::span<con
     return true;
 }
 
+void ShaderResources::dropPersistentSets() const {
+    std::lock_guard lock(persistentMutex);
+    if (persistentSets.empty()) return;
+    if (DrawSetCountsProfiled()) DrawSetCountTallies().persistentDropped.Add(persistentSets.size());
+    persistentSets.clear();
+}
+
 void ShaderResources::prepareFaultSlot() const {
     if (bda == nullptr) return;
     const auto* recorder = Recorder::Active();
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
     if (!bda->TakeFaultSlot(context)) return;
+    dropPersistentSets();
     std::vector<VkWriteDescriptorSet> writes;
     writes.reserve(faultDescriptors.size());
     for (const auto& fault : faultDescriptors) {
