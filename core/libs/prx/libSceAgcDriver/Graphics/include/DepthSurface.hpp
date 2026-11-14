@@ -30,6 +30,12 @@ struct DepthPlaneStoreStatistics {
     std::uint64_t bytes = 0;
 };
 DepthPlaneStoreStatistics DepthPlaneStoreCounts();
+struct DepthMemoryNote {
+    std::uint64_t depth = 0;
+    std::uint64_t stencil = 0;
+};
+std::optional<DepthMemoryNote> DepthMemoryNoteAt(VkDevice device, std::uint64_t address);
+std::uint64_t DepthCollectReuses();
 void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
