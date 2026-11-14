@@ -1044,16 +1044,28 @@ private:
     template<typename TKey, typename THash>
     class BatchKeySet {
     public:
-        bool Insert(const TKey& key, std::uint64_t epoch) {
+        struct Probe {
+            std::size_t slot;
+            bool found;
+        };
+        Probe Find(const TKey& key, std::uint64_t epoch) {
             if ((count + 1) * 2 > slots.size()) grow(epoch);
             const auto mask = slots.size() - 1;
             auto index = THash{}(key) & mask;
             while (slots[index].epoch == epoch) {
-                if (slots[index].key == key) return false;
+                if (slots[index].key == key) return {index, true};
                 index = (index + 1) & mask;
             }
-            slots[index] = {key, epoch};
+            return {index, false};
+        }
+        void Place(const Probe& probe, const TKey& key, std::uint64_t epoch) {
+            slots[probe.slot] = {key, epoch};
             ++count;
+        }
+        bool Insert(const TKey& key, std::uint64_t epoch) {
+            const auto probe = Find(key, epoch);
+            if (probe.found) return false;
+            Place(probe, key, epoch);
             return true;
         }
         void Reset() { count = 0; }
@@ -1103,7 +1115,7 @@ private:
         std::size_t operator()(const ReadListKey& key) const { return pointerHash(key.list) ^ static_cast<std::size_t>(key.kind); }
     };
     BatchKeySet<ReadListKey, ReadListKeyHash> notedReadLists;
-    void noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind);
+    bool noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind, bool dedupe);
 
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;

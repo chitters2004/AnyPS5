@@ -4063,29 +4063,46 @@ bool Recorder::ReadTracking() {
     return ReadTrackingEnabled();
 }
 
+namespace {
+
+bool DedupeReads() {
+    return !Recorder::FlipReadCheck() && !RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+}
+
+}
+
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
-    noteRead(address, address + bytes, kind);
+    if (!noteRead(address, address + bytes, kind, DedupeReads())) readsRepeated.Add(1);
     readsNoted.Add(1);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
+    const bool dedupe = DedupeReads();
+    std::uint64_t repeated = 0;
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
-        if (end > begin) noteRead(begin, end, kind);
+        if (end > begin && !noteRead(begin, end, kind, dedupe)) ++repeated;
     }
     readsNoted.Add(ranges.size());
+    if (repeated != 0) readsRepeated.Add(repeated);
 }
 
-void Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind) {
+bool Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind, bool dedupe) {
+    if (!dedupe) {
+        open->reads.push_back({begin, end, kind});
+        return true;
+    }
+    const ReadKey key{begin, end, kind};
+    const auto probe = notedReadKeys.Find(key, batchEpoch);
+    if (probe.found) return false;
     open->reads.push_back({begin, end, kind});
-    if (FlipReadCheck() || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) || notedReadKeys.Insert({begin, end, kind}, batchEpoch)) return;
-    open->reads.pop_back();
-    readsRepeated.Add(1);
+    notedReadKeys.Place(probe, key, batchEpoch);
+    return true;
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
