@@ -607,10 +607,10 @@ void CheckRangeVersions() {
     Require(ScopedProofsProfiled(), "the range version test needs APS5_PROFILE_SCOPED_PROOFS");
     const auto granule = (Base + RangeGranuleBytes - 1) / RangeGranuleBytes * RangeGranuleBytes;
     const auto before = StampOf(granule, RangeGranuleBytes);
-    const auto far = StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes);
+    const auto otherGranule = StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes);
     BumpRangeVersions(granule + 100, 8, RangeSource::TexturePending);
     Require(StampOf(granule, RangeGranuleBytes) != before, "a bump inside the range left its stamp equal");
-    Require(StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes) == far, "a bump in another granule moved the stamp");
+    Require(StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes) == otherGranule, "a bump in another granule moved the stamp");
     const auto spanning = StampOf(granule, 3 * RangeGranuleBytes);
     BumpRangeVersions(granule + 2 * RangeGranuleBytes + 5, 1, RangeSource::DrawWrites);
     Require(StampOf(granule, 3 * RangeGranuleBytes) != spanning, "a bump in a range's last granule left its stamp equal");
