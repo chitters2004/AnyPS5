@@ -3392,6 +3392,22 @@ bool HasResidentDepthGuards_nid_no_patch() {
     return anyDepthGuard().load(std::memory_order_acquire);
 }
 
+std::uint64_t ResidentDepthGuardGeneration_nid_no_patch() {
+    return depthGuardGeneration().load(std::memory_order_acquire);
+}
+
+bool PendingDepthOverwriteProofs_nid_no_patch() {
+    return pendingOverwriteProofs().load(std::memory_order_acquire) != 0u;
+}
+
+bool ResidentDepthReadClear_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0u) return true;
+    if (PendingDepthOverwriteProofs_nid_no_patch()) return false;
+    if (!anyDepthGuard().load(std::memory_order_acquire)) return true;
+    if (address > std::numeric_limits<std::uint64_t>::max() - bytes) return false;
+    return !mayOverlapDepthGuard(address, bytes);
+}
+
 bool ResidentDepthGuardOverlaps_nid_no_patch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return false;
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth overlap range overflows");

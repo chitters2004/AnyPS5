@@ -39,6 +39,7 @@
 #include <optional>
 #include <string>
 #include <span>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -1905,6 +1906,38 @@ void NoteGuardSpans(GuardSpanEvent event) {
     std::array<unsigned long long, static_cast<std::size_t>(GuardSpanEvent::Count)> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
     AgcDriver::ProfilePrint_nid_no_patch("[guard-spans] 10 s: %llu clear without the lock, %llu refills, %llu overlaps; verify %llu checked, %llu missed\n", taken[0], taken[1], taken[2], taken[3], taken[4]);
+}
+
+bool GuardMemoVerifyDue() {
+    static const std::uint64_t every = [] {
+        const char* text = std::getenv("APS5_VERIFY_GUARD_MEMO");
+        if (text == nullptr) return std::uint64_t{0};
+        char* end = nullptr;
+        const auto value = std::strtoull(text, &end, 10);
+        if (*text == '\0' || *end != '\0' || value == 0) throw std::invalid_argument(std::string("APS5_VERIFY_GUARD_MEMO: '") + text + "' is not a positive hit interval");
+        return static_cast<std::uint64_t>(value);
+    }();
+    if (every == 0) return false;
+    struct Hits {
+        std::uint64_t count = 0;
+    };
+    struct HitsStorage {};
+    return ++HostThreadLocal<Hits, HitsStorage>().count % every == 0;
+}
+
+void ReportGuardMemoMiss() {
+    static std::atomic<unsigned> reports{0};
+    if (reports.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[guard-memo] verify: a remembered all-clear guest buffer set now meets a guard\n");
+    RecordSplit::Count(RecordSplit::Event::GuardMemoMisses);
+}
+
+std::uint64_t MultisampleColorGuardGeneration() {
+    return guardSpansGeneration().load(std::memory_order_acquire);
+}
+
+bool MultisampleColorTargetClear(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !anyGuarded().load(std::memory_order_acquire)) return true;
+    return !mayOverlapGuarded(address, bytes);
 }
 
 bool VerifyGuardSpans() {

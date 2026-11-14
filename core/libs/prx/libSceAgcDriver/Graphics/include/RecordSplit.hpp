@@ -94,13 +94,17 @@ enum class Event : std::size_t {
     ColorGuardChecks,
     ColorGuardArmed,
     ColorGuardNear,
+    GuardMemoHits,
+    GuardMemoStores,
+    GuardMemoVerified,
+    GuardMemoMisses,
     Count
 };
 
 inline constexpr std::size_t StateSlots = 21;
 
 inline constexpr std::array<const char*, static_cast<std::size_t>(Span::Count)> SpanNames{"assemble", "flush checks", "access", "draw sets", "pass access", "start pass", "pass setup", "pass state", "binds", "push", "commands", "tail", "leave", "hazard check", "hazard add", "sets guard", "sets walk", "sets snapshots", "sets uploads", "sets write", "sets keeps", "sets recount", "sets allocate", "sets build", "sets update"};
-inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated", "pipeline schedules", "write mask rebuilds", "guest buffer guards", "guarded allocations", "depth guard checks", "depth proofs pending", "depth guard armed", "depth guard near", "color guard checks", "color guard armed", "color guard near"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated", "pipeline schedules", "write mask rebuilds", "guest buffer guards", "guarded allocations", "depth guard checks", "depth proofs pending", "depth guard armed", "depth guard near", "color guard checks", "color guard armed", "color guard near", "guard memo hits", "guard memo stores", "guard memo verified", "guard memo misses"};
 inline constexpr std::array<const char*, StateSlots> StateSlotNames{"viewport", "scissor", "depth bias", "depth bounds", "cull mode", "front face", "depth test", "depth write", "depth compare", "depth bounds test", "stencil test", "stencil op front", "stencil op back", "compare mask front", "compare mask back", "write mask front", "write mask back", "reference front", "reference back", "color write mask", "pipeline"};
 
 static_assert(SpanNames.back() != nullptr && EventNames.back() != nullptr && StateSlotNames.back() != nullptr);

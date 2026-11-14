@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -7306,18 +7307,65 @@ void ShaderResources::prepareFaultSlot() const {
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
 }
 
+namespace {
+
+GuardMemo& guardMemo() {
+    struct GuardMemoStorage {};
+    return HostThreadLocal<GuardMemo, GuardMemoStorage>();
+}
+
+}
+
 void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) const {
     RecordSplit::Count(RecordSplit::Event::GuardCalls);
-    for (std::size_t index = 0; index < allocations.size(); ++index) {
+    const auto guestRange = [&](std::size_t index) {
         const auto& item = allocations[index];
-        if (!item.guest) continue;
-        RecordSplit::Count(RecordSplit::Event::GuardAllocations);
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
-        const auto address = override != moved.end() ? override->address : item.address;
-        const auto bytes = override != moved.end() ? override->size : item.size;
+        return override != moved.end() ? std::pair<std::uint64_t, std::size_t>{override->address, override->size} : std::pair<std::uint64_t, std::size_t>{item.address, item.size};
+    };
+    const auto clearOfGuards = [](std::uint64_t address, std::size_t bytes) { return ResidentDepthReadClear_nid_no_patch(address, bytes) && MultisampleColorTargetClear(address, bytes); };
+    const bool memoize = !RuntimeSwitches::Set(RuntimeSwitch::NoGuardMemo) && !VerifyGuardSpans();
+    GuardMemo::Key key;
+    if (memoize) {
+        key.depth = ResidentDepthGuardGeneration_nid_no_patch();
+        key.color = MultisampleColorGuardGeneration();
+        if (htileClear.has_value()) {
+            key.htile = true;
+            key.htileAddress = htileClear->first;
+            key.htileBytes = htileClear->second;
+        }
+        for (std::size_t index = 0; index < allocations.size() && key.fits; ++index) {
+            if (!allocations[index].guest) continue;
+            const auto [address, bytes] = guestRange(index);
+            key.Push(address, bytes);
+        }
+        if (guardMemo().Covers(key, PendingDepthOverwriteProofs_nid_no_patch())) {
+            RecordSplit::Count(RecordSplit::Event::GuardMemoHits);
+            if (!GuardMemoVerifyDue()) return;
+            RecordSplit::Count(RecordSplit::Event::GuardMemoVerified);
+            bool clear = true;
+            for (std::size_t index = 0; index < allocations.size() && clear; ++index) {
+                if (!allocations[index].guest) continue;
+                const auto [address, bytes] = guestRange(index);
+                clear = clearOfGuards(address, bytes);
+            }
+            if (clear) return;
+            ReportGuardMemoMiss();
+        }
+    }
+    bool clear = memoize && key.fits;
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        if (!allocations[index].guest) continue;
+        RecordSplit::Count(RecordSplit::Event::GuardAllocations);
+        const auto [address, bytes] = guestRange(index);
+        if (clear && clearOfGuards(address, bytes)) continue;
+        clear = false;
         RequireNoResidentDepthRead_nid_no_patch(address, bytes, htileClear);
         RequireNoMultisampleColorTarget(address, bytes, "a shader buffer access");
     }
+    if (!clear) return;
+    guardMemo().Store(key);
+    RecordSplit::Count(RecordSplit::Event::GuardMemoStores);
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {

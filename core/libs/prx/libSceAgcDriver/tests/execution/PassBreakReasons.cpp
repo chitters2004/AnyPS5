@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
@@ -144,14 +145,29 @@ void ExpectContinuedSplit(const RecordSplit::Window& window) {
     Expect(state.rfind("[pass-state]", 0) == 0, "the pass state line has no tag: " + state);
 }
 
+void ExpectGuardMemo(const RecordSplit::Window& window, bool memoized) {
+    const auto event = [&](RecordSplit::Event which) { return window.events[static_cast<std::size_t>(which)]; };
+    const auto described = RecordSplit::Describe(window, 1);
+    const auto hits = event(RecordSplit::Event::GuardMemoHits);
+    Expect(event(RecordSplit::Event::GuardCalls) >= 1, "the draw ran no guest buffer guard: " + described);
+    if (!memoized) {
+        Expect(hits == 0 && event(RecordSplit::Event::GuardMemoStores) == 0, "the guard memo served a draw while switched off: " + described);
+        return;
+    }
+    Expect(hits >= 1, "a repeated draw did not reuse its guest buffer guard result: " + described);
+    Expect(event(RecordSplit::Event::GuardMemoVerified) == hits && event(RecordSplit::Event::GuardMemoMisses) == 0, "the verified guard memo hits did not all stay clear: " + described);
+}
+
 }
 
 int main() {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_PROFILE_DRAW", "1");
+        _putenv_s("APS5_VERIFY_GUARD_MEMO", "1");
 #else
         setenv("APS5_PROFILE_DRAW", "1", 1);
+        setenv("APS5_VERIFY_GUARD_MEMO", "1", 1);
 #endif
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -187,6 +203,12 @@ int main() {
         after = Snapshot();
         Expect(after.passes.passesContinued - before.passes.passesContinued == 1 && after.breaks == before.breaks, "a draw with the open pass's key and no hazard did not continue it: " + Describe(before, after));
         ExpectContinuedSplit(RecordSplit::Take());
+        RuntimeSwitches::Assign(RuntimeSwitch::NoGuardMemo, true);
+        Draw(context, *device, shaders, ColorA, depthA);
+        ExpectGuardMemo(RecordSplit::Take(), false);
+        RuntimeSwitches::Assign(RuntimeSwitch::NoGuardMemo, false);
+        Draw(context, *device, shaders, ColorA, depthA);
+        ExpectGuardMemo(RecordSplit::Take(), true);
         recorder.Commands();
         before = Snapshot();
         Draw(context, *device, shaders, ColorA, depthA);
