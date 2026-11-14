@@ -89,6 +89,35 @@ std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
 enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
+enum class RangeSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, TexturePending, DrawWrites, CopiedWriters, Labels, NonDraw, Count };
+enum class UnscopedSource : std::uint8_t { NonDraw, GpuMutex, Labels, Bda, Count };
+inline constexpr std::uint64_t RangeGranuleBytes = std::uint64_t{1} << 20;
+inline constexpr std::size_t RangeVersionSlots = std::size_t{1} << 16;
+struct RangeStamp {
+    std::uint64_t sum = 0;
+    std::uint64_t unscoped = 0;
+    friend bool operator==(const RangeStamp&, const RangeStamp&) = default;
+};
+void BumpRangeVersions(std::uint64_t address, std::uint64_t bytes, RangeSource source);
+void BumpUnscopedVersion(UnscopedSource source);
+RangeStamp RangeVersionStamp(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool RangeStampHolds(const RangeStamp& recorded, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+struct ScopedProof {
+    RangeStamp stamp;
+    std::uint64_t epoch = 0;
+    bool valid = false;
+};
+bool ScopedHolds(const ScopedProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+struct RangeVersionCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(RangeSource::Count)> calls{};
+    std::array<std::uint64_t, static_cast<std::size_t>(RangeSource::Count)> granules{};
+    std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> unscoped{};
+};
+bool ScopedProofsProfiled();
+RangeVersionCounts TakeRangeVersionCounts();
+std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> UnscopedVersionsByKind();
+const char* RangeSourceName(RangeSource source);
+const char* UnscopedSourceName(UnscopedSource source);
 struct WriteIndexStats {
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;

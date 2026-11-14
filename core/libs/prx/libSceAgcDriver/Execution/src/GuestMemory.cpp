@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
@@ -152,6 +153,38 @@ WriteIndex& Index() {
     return *index;
 }
 
+std::array<std::atomic<std::uint64_t>, RangeVersionSlots> rangeVersions{};
+std::atomic<std::uint64_t> unscopedVersion{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(UnscopedSource::Count)> unscopedByKind{};
+constexpr std::array<const char*, static_cast<std::size_t>(RangeSource::Count)> RangeSourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "texturepending", "drawwrites", "copiedwriters", "labels", "nondraw"};
+constexpr std::array<const char*, static_cast<std::size_t>(UnscopedSource::Count)> UnscopedSourceNames{"nondraw", "gpumutex", "labels", "bda"};
+
+struct RangeVersionCounters {
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeSource::Count)> calls;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeSource::Count)> granules;
+    std::array<ProfileCounter, static_cast<std::size_t>(UnscopedSource::Count)> unscoped;
+};
+
+RangeVersionCounters& rangeVersionCounters() {
+    static auto* counters = new RangeVersionCounters;
+    return *counters;
+}
+
+std::pair<std::uint64_t, std::uint64_t> granulesOf(std::uint64_t address, std::uint64_t bytes) {
+    const auto first = address / RangeGranuleBytes;
+    const auto last = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() / RangeGranuleBytes : (address + bytes - 1) / RangeGranuleBytes;
+    return {first, std::min<std::uint64_t>(last - first + 1, RangeVersionSlots)};
+}
+
+void bumpGranules(std::uint64_t first, std::uint64_t count, RangeSource source) {
+    for (std::uint64_t granule = first; granule < first + count; ++granule) rangeVersions[granule % RangeVersionSlots].fetch_add(1, std::memory_order_acq_rel);
+    if (ScopedProofsProfiled()) {
+        auto& counters = rangeVersionCounters();
+        counters.calls[static_cast<std::size_t>(source)].Add();
+        counters.granules[static_cast<std::size_t>(source)].Add(count);
+    }
+}
+
 bool brokenSource(WriteBumpSource source) {
     static const auto broken = [] {
         std::array<bool, static_cast<std::size_t>(WriteBumpSource::Count)> flags{};
@@ -165,7 +198,8 @@ bool brokenSource(WriteBumpSource source) {
     return broken[static_cast<std::size_t>(source)];
 }
 
-void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source, bool versioned = true) {
+    if (versioned) BumpRangeVersions(address, bytes, static_cast<RangeSource>(source));
     auto& index = Index();
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -227,6 +261,69 @@ void releaseSubscription(WriteSubscription* subscription) {
     delete subscription;
 }
 
+}
+
+static_assert(static_cast<int>(RangeSource::Cpu) == static_cast<int>(WriteBumpSource::Cpu) && static_cast<int>(RangeSource::Import) == static_cast<int>(WriteBumpSource::Import));
+
+bool ScopedProofsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_SCOPED_PROOFS") != nullptr;
+    return profiled;
+}
+
+void BumpRangeVersions(std::uint64_t address, std::uint64_t bytes, RangeSource source) {
+    if (bytes == 0) return;
+    const auto [first, count] = granulesOf(address, bytes);
+    bumpGranules(first, count, source);
+}
+
+void BumpUnscopedVersion(UnscopedSource source) {
+    unscopedVersion.fetch_add(1, std::memory_order_acq_rel);
+    unscopedByKind[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+    if (ScopedProofsProfiled()) rangeVersionCounters().unscoped[static_cast<std::size_t>(source)].Add();
+}
+
+RangeStamp RangeVersionStamp(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    RangeStamp stamp;
+    stamp.unscoped = unscopedVersion.load(std::memory_order_acquire);
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto [first, count] = granulesOf(begin, end - begin);
+        for (std::uint64_t granule = first; granule < first + count; ++granule) stamp.sum += rangeVersions[granule % RangeVersionSlots].load(std::memory_order_acquire);
+    }
+    return stamp;
+}
+
+bool RangeStampHolds(const RangeStamp& recorded, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return RangeVersionStamp(ranges) == recorded;
+}
+
+bool ScopedHolds(const ScopedProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return proof.valid && RangeStampHolds(proof.stamp, ranges);
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> UnscopedVersionsByKind() {
+    std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> totals{};
+    for (std::size_t kind = 0; kind < totals.size(); ++kind) totals[kind] = unscopedByKind[kind].load(std::memory_order_relaxed);
+    return totals;
+}
+
+const char* RangeSourceName(RangeSource source) {
+    return RangeSourceNames[static_cast<std::size_t>(source)];
+}
+
+const char* UnscopedSourceName(UnscopedSource source) {
+    return UnscopedSourceNames[static_cast<std::size_t>(source)];
+}
+
+RangeVersionCounts TakeRangeVersionCounts() {
+    auto& counters = rangeVersionCounters();
+    RangeVersionCounts counts;
+    for (std::size_t source = 0; source < counts.calls.size(); ++source) {
+        counts.calls[source] = counters.calls[source].Take();
+        counts.granules[source] = counters.granules[source].Take();
+    }
+    for (std::size_t source = 0; source < counts.unscoped.size(); ++source) counts.unscoped[source] = counters.unscoped[source].Take();
+    return counts;
 }
 
 bool WriteIndexEnabled() {
@@ -1340,6 +1437,8 @@ struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
     bool watched = false;
+    std::uint64_t versionedGranule = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t versionedGeneration = 0;
     static constexpr std::size_t CoarseBlocks = 64;
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     struct Leaf {
@@ -1819,7 +1918,15 @@ struct WriteTracker {
             coarse = std::max(coarse, stampGeneration);
         }
         if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
-        if (stored) bumpSubscriptions(blockBegin(block), WriteBlockBytes, kind == StampKind::Driver ? WriteBumpSource::Driver : WriteBumpSource::Cpu);
+        if (!stored) return;
+        const auto source = kind == StampKind::Driver ? WriteBumpSource::Driver : WriteBumpSource::Cpu;
+        const auto granule = blockBegin(block) / RangeGranuleBytes;
+        if (granule != versionedGranule || stampGeneration != versionedGeneration) {
+            BumpRangeVersions(blockBegin(block), WriteBlockBytes, static_cast<RangeSource>(source));
+            versionedGranule = granule;
+            versionedGeneration = stampGeneration;
+        }
+        bumpSubscriptions(blockBegin(block), WriteBlockBytes, source, false);
     }
 };
 

@@ -4,6 +4,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -592,6 +593,73 @@ void CheckCoverageThreadAndDriverWrites() {
 
 }
 
+
+RangeStamp StampOf(std::uint64_t address, std::uint64_t bytes) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{std::pair{address, address + bytes}};
+    return RangeVersionStamp(ranges);
+}
+
+std::uint64_t GranuleBumps(RangeSource source) {
+    return TakeRangeVersionCounts().granules[static_cast<std::size_t>(source)];
+}
+
+void CheckRangeVersions() {
+    Require(ScopedProofsProfiled(), "the range version test needs APS5_PROFILE_SCOPED_PROOFS");
+    const auto granule = (Base + RangeGranuleBytes - 1) / RangeGranuleBytes * RangeGranuleBytes;
+    const auto before = StampOf(granule, RangeGranuleBytes);
+    const auto far = StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes);
+    BumpRangeVersions(granule + 100, 8, RangeSource::TexturePending);
+    Require(StampOf(granule, RangeGranuleBytes) != before, "a bump inside the range left its stamp equal");
+    Require(StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes) == far, "a bump in another granule moved the stamp");
+    const auto spanning = StampOf(granule, 3 * RangeGranuleBytes);
+    BumpRangeVersions(granule + 2 * RangeGranuleBytes + 5, 1, RangeSource::DrawWrites);
+    Require(StampOf(granule, 3 * RangeGranuleBytes) != spanning, "a bump in a range's last granule left its stamp equal");
+    const auto straddle = StampOf(granule + 5 * RangeGranuleBytes, 2 * RangeGranuleBytes);
+    BumpRangeVersions(granule + 5 * RangeGranuleBytes - 1, 2, RangeSource::CopiedWriters);
+    Require(StampOf(granule + 5 * RangeGranuleBytes, 2 * RangeGranuleBytes) != straddle, "a bump straddling a range's first byte left its stamp equal");
+    const auto unscoped = StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes);
+    BumpUnscopedVersion(UnscopedSource::NonDraw);
+    Require(StampOf(granule + 4 * RangeGranuleBytes, RangeGranuleBytes) != unscoped, "an unscoped bump left a stamp equal");
+    const auto top = StampOf(std::numeric_limits<std::uint64_t>::max() - 16, 16);
+    BumpRangeVersions(std::numeric_limits<std::uint64_t>::max() - 8, 64, RangeSource::Release);
+    Require(StampOf(std::numeric_limits<std::uint64_t>::max() - 16, 16) != top, "a bump that runs past the address space did not reach the last granule");
+    constexpr std::uint64_t WatchedBytes = 32 * Block;
+    BumpCollectEpoch();
+    Require(CollectWrites(Base, WatchedBytes) != 0, "a collect failed");
+    TakeRangeVersionCounts();
+    const auto collected = StampOf(Base, WatchedBytes);
+    BumpCollectEpoch();
+    Require(CollectWrites(Base, WatchedBytes) != 0, "a collect failed");
+    Require(StampOf(Base, WatchedBytes) == collected && GranuleBumps(RangeSource::Cpu) == 0, "a collect that found nothing bumped range versions");
+    for (std::uint64_t block = 0; block < 8; ++block) Store(Base + block * Block);
+    BumpCollectEpoch();
+    Require(CollectWrites(Base, WatchedBytes) != 0, "a collect failed");
+    Require(StampOf(Base, WatchedBytes) != collected, "CPU stores found by a collect left the stamp equal");
+    const auto granules = (Base + 8 * Block - 1) / RangeGranuleBytes - Base / RangeGranuleBytes + 1;
+    Require(GranuleBumps(RangeSource::Cpu) == granules, "one collect bumped a granule more than once or missed one");
+    const auto marked = StampOf(Base + WatchedBytes - Block, Block);
+    Require(MarkWritten(Base + WatchedBytes - Block, 16) != 0, "MarkWritten failed");
+    Require(StampOf(Base + WatchedBytes - Block, Block) != marked && GranuleBumps(RangeSource::Driver) == 1, "a driver store did not bump its granule once");
+    const auto shared = StampOf(granule + 6 * RangeGranuleBytes, RangeGranuleBytes);
+    constexpr int Threads = 4;
+    constexpr int Bumps = 10000;
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < Threads; ++thread) threads.emplace_back([&] {
+        for (int bump = 0; bump < Bumps; ++bump) BumpRangeVersions(granule + 6 * RangeGranuleBytes + static_cast<std::uint64_t>(bump % 64), 1, RangeSource::Pending);
+    });
+    for (auto& thread : threads) thread.join();
+    Require(StampOf(granule + 6 * RangeGranuleBytes, RangeGranuleBytes).sum == shared.sum + Threads * Bumps, "concurrent bumps were lost");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> held{{{granule, granule + RangeGranuleBytes}}};
+    const auto recorded = RangeVersionStamp(held);
+    Require(RangeStampHolds(recorded, held), "a stamp did not hold with nothing bumped");
+    BumpRangeVersions(granule + RangeGranuleBytes - 1, 1, RangeSource::Labels);
+    Require(!RangeStampHolds(recorded, held), "a stamp held over a bump in its last byte");
+    Require(!ScopedHolds(ScopedProof{RangeVersionStamp(held), 1, false}, held), "an invalid scoped proof held");
+    const ScopedProof proof{RangeVersionStamp(held), 1, true};
+    Require(ScopedHolds(proof, held), "a valid scoped proof did not hold with nothing bumped");
+    BumpUnscopedVersion(UnscopedSource::Labels);
+    Require(!ScopedHolds(proof, held), "a scoped proof held over an unscoped bump");
+}
 int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
@@ -608,6 +676,11 @@ int main(int argc, char** argv) {
 #endif
         if (argc == 2) {
             const std::string selected = argv[1];
+            if (selected == "--range-versions") {
+                CheckRangeVersions();
+                std::cout << "range version test passed\n";
+                return 0;
+            }
             if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
             else if (selected == "--unions") {
                 CheckAdjacentCoverage();
