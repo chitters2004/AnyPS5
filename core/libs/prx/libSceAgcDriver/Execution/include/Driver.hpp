@@ -40,6 +40,7 @@ extern "C" bool AgcDriverSettledHeld_nid_postfix();
 extern "C" bool AgcDriverSettled_nid_postfix();
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
+extern "C" void AgcDriverReportDrawWindow_nid_postfix(const char* window);
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix();
 extern "C" void AgcDriverSetAheadAdoptHook_nid_postfix(void (*hook)());

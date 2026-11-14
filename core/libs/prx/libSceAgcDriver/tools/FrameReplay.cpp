@@ -1240,6 +1240,7 @@ int run(const Options& options) {
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
+    AgcDriverReportDrawWindow_nid_postfix("setup");
     for (std::size_t pass = 0; pass < options.repeat && (pass == 0 || replay.unfinished == 0); ++pass) {
         if (pass > 0) {
             resetMemory(reader, replay.skipped);
@@ -1269,6 +1270,8 @@ int run(const Options& options) {
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+        AgcDriverWaitIdle_nid_postfix();
+        AgcDriverReportDrawWindow_nid_postfix(("pass " + std::to_string(pass + 1)).c_str());
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();

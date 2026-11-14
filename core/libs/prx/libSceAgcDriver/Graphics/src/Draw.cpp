@@ -891,6 +891,10 @@ void completeSnapshotWrites(std::span<const GuestMemorySnapshot> snapshots) {
     }
 }
 
+std::atomic<bool> windowsByCaller{false};
+
+void printDrawWindow(DrawProfile& profile, const char* window);
+
 DrawProfile& Profile() {
     static DrawProfile profile;
     return profile;
@@ -950,12 +954,16 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
     const auto now = std::chrono::steady_clock::now();
-    if (now - profile.lastReport < std::chrono::seconds(10)) return;
+    if (windowsByCaller.load(std::memory_order_relaxed) || now - profile.lastReport < std::chrono::seconds(10)) return;
     profile.lastReport = now;
+    printDrawWindow(profile, "10 s");
+}
+
+void printDrawWindow(DrawProfile& profile, const char* window) {
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
     char line[2048];
-    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun));
+    int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over %s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun", static_cast<unsigned long long>(profile.draws), window, static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     bool listed = false;
     for (std::size_t i = 1; i < PassBreakCount && room(); ++i) {
@@ -1010,7 +1018,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (address != profile.addressSeen) {
         char reuse[512];
         const auto seen = [&](AddressDrawReuse outcome) { return static_cast<unsigned long long>(address[static_cast<std::size_t>(outcome)] - profile.addressSeen[static_cast<std::size_t>(outcome)]); };
-        int at = std::snprintf(reuse, sizeof(reuse), "[rescache] address-based draws (10 s): reused %llu, built %llu; refused:", seen(AddressDrawReuse::Reused), seen(AddressDrawReuse::Built));
+        int at = std::snprintf(reuse, sizeof(reuse), "[rescache] address-based draws (%s): reused %llu, built %llu; refused:", window, seen(AddressDrawReuse::Reused), seen(AddressDrawReuse::Built));
         for (auto outcome = static_cast<std::size_t>(AddressDrawReuse::NotReadOnly); outcome < address.size() && at > 0 && static_cast<std::size_t>(at) < sizeof(reuse); ++outcome) {
             at += std::snprintf(reuse + at, sizeof(reuse) - static_cast<std::size_t>(at), "%s %s %llu", outcome == static_cast<std::size_t>(AddressDrawReuse::NotReadOnly) ? "" : ",", AddressDrawReuseNames[outcome], seen(static_cast<AddressDrawReuse>(outcome)));
         }
@@ -1052,6 +1060,16 @@ void countCache(std::uint64_t DrawProfile::*counter) {
     ++(stats.*counter);
 }
 
+}
+
+void ReportDrawWindow(const char* window) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    windowsByCaller.store(true, std::memory_order_relaxed);
+    auto& stats = Profile();
+    std::lock_guard lock(stats.mutex);
+    printDrawWindow(stats, window);
+    stats.lastReport = std::chrono::steady_clock::now();
 }
 
 // ValidateShaders decodes every SPIR-V instruction of every stage on every draw. Its outcome depends

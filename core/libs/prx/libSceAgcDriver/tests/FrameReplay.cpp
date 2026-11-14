@@ -256,6 +256,24 @@ void testCaptureAndReplay(const std::filesystem::path& tool, bool pipelines) {
     std::size_t passes = 0;
     for (auto found = repeated.find("\"frames\":2,\"p50\""); found != std::string::npos; found = repeated.find("\"frames\":2,\"p50\"", found + 1)) ++passes;
     check(passes == 3, "the repeated replay did not replay both frames in each of three passes: " + repeated);
+#ifdef _WIN32
+    _putenv_s("APS5_PROFILE_DRAW", "1");
+#else
+    setenv("APS5_PROFILE_DRAW", "1", 1);
+#endif
+    replay("--repeat 3", capture / "profiled output.json");
+#ifdef _WIN32
+    _putenv_s("APS5_PROFILE_DRAW", "");
+#else
+    unsetenv("APS5_PROFILE_DRAW");
+#endif
+    const auto profiled = readFile(capture / "profiled output.json.log");
+    const std::string log(reinterpret_cast<const char*>(profiled.data()), profiled.size());
+    for (const auto* window : {"setup", "pass 1", "pass 2", "pass 3"}) {
+        const auto line = std::string("[draws] 0 draws over ") + window + " (";
+        check(log.find(line) != std::string::npos && log.find(line) == log.rfind(line), std::string("the profiled replay did not print one draw summary for ") + window + ": " + log);
+    }
+    check(log.find("draws over 10 s") == std::string::npos && log.find("draws over pass 4") == std::string::npos, "the profiled replay printed a draw summary outside its passes: " + log);
 }
 
 void testConcurrentCopies(const std::filesystem::path& tool) {
