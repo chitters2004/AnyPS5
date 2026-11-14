@@ -126,12 +126,12 @@ struct LookupSplitCounts {
 };
 bool LookupSplitProfiled();
 LookupSplitCounts LookupSplitTotals();
-enum class LookupC2Count : std::size_t { SlotsBuilt, SlotUses, SlotSearches, AliasSkips, AliasChecks, Verified, Disagreed, StampsTaken, CertsStored, ScopedHits, ScopedCollected, MissNoCert, MissCpuWriters, MissStamp, MissCollected, MissUnscopedNonDraw, MissUnscopedGpuMutex, MissUnscopedLabels, MissUnscopedBda, Count };
+enum class LookupC2Count : std::size_t { SlotsBuilt, SlotUses, SlotSearches, AliasSkips, AliasChecks, Verified, Disagreed, StampsTaken, CertsStored, ScopedHits, ScopedCollected, MissNoCert, MissCpuWriters, MissStamp, MissCollected, MissUnscopedNonDraw, MissUnscopedGpuMutex, MissUnscopedLabels, MissUnscopedBda, LeafCertsStored, LeafHits, LeafMisses, LeafUncertified, Count };
 using LookupC2Counts = std::array<std::uint64_t, static_cast<std::size_t>(LookupC2Count::Count)>;
 void NoteLookupC2(LookupC2Count count);
 LookupC2Counts LookupC2Totals();
 bool LookupC2VerifyDue();
-enum class LookupC2Mutant : std::uint8_t { None, SlotOffByOne, AliasIgnoresWords, ScopedIgnoresStamp, ScopedSkipsCollect, ScopedStampAfterProof };
+enum class LookupC2Mutant : std::uint8_t { None, SlotOffByOne, AliasIgnoresWords, ScopedIgnoresStamp, ScopedSkipsCollect, ScopedStampAfterProof, LeafIgnoresStamp };
 void SetLookupC2MutantForTest(LookupC2Mutant mutant);
 LookupC2Mutant LookupC2MutantForTest();
 bool LookupC2Scoped();

@@ -45,21 +45,22 @@ namespace {
 
 using namespace AgcDriver::Graphics;
 constexpr std::size_t Unit = 65536;
+constexpr std::size_t Granule = std::size_t{1} << 20;
 
 class Block {
 public:
     Block() {
 #ifdef _WIN32
-        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Unit));
+        data = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Granule));
         Require(data != nullptr, "cannot reserve recipe test memory");
         GuestArena::GuestArenaCommit_nid_postfix(data, Bytes, PAGE_READWRITE, Bytes);
 #else
-        void* raw = mmap(nullptr, Bytes + Unit, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        void* raw = mmap(nullptr, Bytes + Granule, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         Require(raw != MAP_FAILED, "cannot map recipe test memory");
         const auto begin = reinterpret_cast<std::uintptr_t>(raw);
-        const auto aligned = (begin + Unit - 1) & ~(static_cast<std::uintptr_t>(Unit) - 1);
+        const auto aligned = (begin + Granule - 1) & ~(static_cast<std::uintptr_t>(Granule) - 1);
         if (aligned != begin) munmap(raw, aligned - begin);
-        if (aligned + Bytes != begin + Bytes + Unit) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Unit - aligned);
+        if (aligned + Bytes != begin + Bytes + Granule) munmap(reinterpret_cast<void*>(aligned + Bytes), begin + Granule - aligned);
         data = reinterpret_cast<std::byte*>(aligned);
         GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(data, Bytes);
 #endif
@@ -81,7 +82,7 @@ public:
     std::uint64_t Address(std::size_t offset = 0) const { return reinterpret_cast<std::uintptr_t>(data + offset); }
 
 private:
-    static constexpr std::size_t Bytes = 3 * Unit;
+    static constexpr std::size_t Bytes = 3 * Granule;
     std::byte* data = nullptr;
 };
 
@@ -136,8 +137,8 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
     const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
     const std::array<float, 4> red{1, 0, 0, 1};
     const std::array<float, 4> green{0, 1, 0, 1};
-    AgcDriver::GuestMemory::Write(block.Address(Unit), std::as_bytes(std::span(red)));
-    AgcDriver::GuestMemory::Write(block.Address(2 * Unit), std::as_bytes(std::span(green)));
+    AgcDriver::GuestMemory::Write(block.Address(Granule), std::as_bytes(std::span(red)));
+    AgcDriver::GuestMemory::Write(block.Address(2 * Granule), std::as_bytes(std::span(green)));
     const auto select = [&](bool second) {
         auto& words = fragment.bindings.front().guestDescriptor;
         if (dataWords) {
@@ -145,7 +146,7 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
             words.clear();
             for (const auto value : color) words.push_back(std::bit_cast<std::uint32_t>(value));
         } else {
-            const auto address = block.Address(second ? 2 * Unit : Unit);
+            const auto address = block.Address(second ? 2 * Granule : Granule);
             words = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, sizeof(red), 0x31000000u};
         }
     };
@@ -176,6 +177,7 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         }
         CheckPixels(state.color, {255, 0, 0, 255});
     }
+    AgcDriver::GuestMemory::MarkProofThread();
     const auto c2Before = LookupC2Totals();
     for (const bool second : {true, true, false}) {
         select(second);
@@ -194,7 +196,15 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
     } else {
         Require(c2(LookupC2Count::SlotUses) == 3, "three recipe hits made " + std::to_string(c2(LookupC2Count::SlotUses)) + " moved-buffer checks on binding slots, expected 3");
         if (!dataWords) Require(c2(LookupC2Count::AliasSkips) != 0, "a recipe hit repeating the buffers of the hit before it ran the alias check again (" + std::to_string(c2(LookupC2Count::AliasChecks)) + " checks run, none skipped)");
+        if (!dataWords) Require(c2(LookupC2Count::LeafCertsStored) != 0 && c2(LookupC2Count::LeafHits) != 0, "a recipe hit repeating a moved buffer did not reuse its leaf certificate (" + std::to_string(c2(LookupC2Count::LeafCertsStored)) + " stored, " + std::to_string(c2(LookupC2Count::LeafHits)) + " hits)");
         if (verifying) Require(c2(LookupC2Count::Verified) != 0, "APS5_VERIFY_LOOKUP_C2 verified no binding slot or alias skip");
+    }
+    if (!dataWords) {
+        select(true);
+        context.recorder->NotePendingWrite(block.Address(2 * Granule), sizeof(green));
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const auto hit = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe);
+        Require(!hit.recorded && hit.miss == DrawRecipeMiss::Buffers, "a recipe hit served a moved buffer with a pending write noted after its leaf certificate");
     }
     if (!dataWords) {
         const auto target = block.Address();

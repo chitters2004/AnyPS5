@@ -7054,6 +7054,49 @@ std::vector<ShaderResources::Binding>::const_iterator ShaderResources::keptBindi
     return planned;
 }
 
+namespace {
+
+struct LeafCertificate {
+    std::uint64_t begin = 0;
+    std::uint64_t bytes = 0;
+    GuestMemory::RangeStamp stamp;
+};
+
+bool leafPendingOverlaps(Recorder& recorder, std::uint64_t begin, std::size_t bytes) {
+    const auto overlaps = [&] { return recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes); };
+    if (!LookupC2Scoped()) return overlaps();
+    thread_local std::array<LeafCertificate, 16> certificates;
+    const std::array range{std::pair{begin, begin + bytes}};
+    auto& certificate = certificates[(begin >> 8) % certificates.size()];
+    if (certificate.bytes != 0 && certificate.begin == begin && certificate.bytes == bytes) {
+        if (LookupC2MutantForTest() == LookupC2Mutant::LeafIgnoresStamp || GuestMemory::RangeStampHolds(certificate.stamp, range)) {
+            NoteLookupC2(LookupC2Count::LeafHits);
+            if (LookupC2VerifyDue()) {
+                NoteLookupC2(LookupC2Count::Verified);
+                if (overlaps()) {
+                    NoteLookupC2(LookupC2Count::Disagreed);
+                    certificate.bytes = 0;
+                    return true;
+                }
+            }
+            return false;
+        }
+        NoteLookupC2(LookupC2Count::LeafMisses);
+    }
+    certificate.bytes = 0;
+    const auto stamp = GuestMemory::RangeVersionStamp(range);
+    if (overlaps()) return true;
+    if (Recorder::SnapshotWriteOverlaps(begin, bytes)) {
+        NoteLookupC2(LookupC2Count::LeafUncertified);
+        return false;
+    }
+    certificate = {begin, bytes, stamp};
+    NoteLookupC2(LookupC2Count::LeafCertsStored);
+    return false;
+}
+
+}
+
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData) const {
     std::vector<MovedBuffer> moved;
     std::size_t movedBytes = 0;
@@ -7102,7 +7145,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
                 if (bytes > maxDrawSnapshotBytes - movedBytes) return std::nullopt;
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
-                if (guestMemory.WritesOverlap(begin, bytes) || recorder.PendingWriteOverlaps(begin, bytes) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                if (guestMemory.WritesOverlap(begin, bytes) || leafPendingOverlaps(recorder, begin, bytes)) return std::nullopt;
                 if (moved.empty()) moved.reserve(allocations.size());
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
                 movedBytes += bytes;
