@@ -1,6 +1,7 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4570,8 +4571,8 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
-std::atomic<std::uint64_t> layoutStoresSkipped{0};
-std::atomic<std::uint64_t> pendingSinceLoopsSkipped{0};
+ProfileCounter layoutStoresSkipped;
+ProfileCounter pendingSinceLoopsSkipped;
 }
 
 void StorageTexture::NoteFlip() {
@@ -4583,11 +4584,11 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 }
 
 std::uint64_t StorageTexture::LayoutStoreSkips() {
-    return layoutStoresSkipped.load(std::memory_order_relaxed);
+    return layoutStoresSkipped.Sum();
 }
 
 std::uint64_t StorageTexture::PendingSinceSkips() {
-    return pendingSinceLoopsSkipped.load(std::memory_order_relaxed);
+    return pendingSinceLoopsSkipped.Sum();
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
@@ -4600,7 +4601,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         records.serial.store(serial, std::memory_order_release);
         layoutSerial = serial;
     } else {
-        layoutStoresSkipped.fetch_add(1, std::memory_order_relaxed);
+        layoutStoresSkipped.Add(1);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
@@ -4659,7 +4660,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
     if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
-        pendingSinceLoopsSkipped.fetch_add(1, std::memory_order_relaxed);
+        pendingSinceLoopsSkipped.Add(1);
     } else {
         const bool everyUnit = StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
         if (everyUnit && pendingSince == pendingSinceHeld && first <= pendingSinceEnd && pendingSinceFirst <= first + count) {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -3045,7 +3046,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
-std::atomic<std::uint64_t> inPlaceReadReuses{0};
+ProfileCounter inPlaceReadReuses;
 thread_local bool indexProof = false;
 
 }
@@ -3108,7 +3109,7 @@ std::uint64_t ShaderResources::DepthGuardRefusals() {
 }
 
 std::uint64_t ShaderResources::InPlaceReadReuses() {
-    return inPlaceReadReuses.load(std::memory_order_relaxed);
+    return inPlaceReadReuses.Sum();
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -7308,7 +7309,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     } else {
         guestMemory.InPlaceReads(reads);
     }
-    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.fetch_add(1, std::memory_order_relaxed);
+    if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.Add(1);
     recorder.NotePendingReads(reads, kind);
     ownedReads = std::move(reads);
     const auto inRun = std::exchange(afterRunSelf, nullptr);
