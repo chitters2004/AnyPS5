@@ -7280,9 +7280,6 @@ void ShaderResources::WriteBack() {
     const bool bdaWrites = usesBda && !bdaReadOnly;
     if (!guestMemory.Writes().empty() || storageWrote || bdaWrites) GuestMemory::BreakProofs();
     for (const auto& [begin, end] : guestMemory.Writes()) GuestMemory::BumpRangeVersions(begin, end - begin, GuestMemory::RangeSource::DrawWrites);
-    for (std::size_t index = 0; storageWrote && index < storageTextures.size(); ++index) {
-        if (storageWritten[index] && storageTextures[index] != nullptr) storageTextures[index]->BumpOwnRanges(GuestMemory::RangeSource::DrawWrites);
-    }
     if (bdaWrites) GuestMemory::BumpUnscopedVersion(GuestMemory::UnscopedSource::Bda);
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {

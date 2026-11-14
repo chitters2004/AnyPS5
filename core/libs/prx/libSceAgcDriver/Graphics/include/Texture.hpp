@@ -359,7 +359,7 @@ public:
     // retile) moves it too.
     static void BumpPendingSerial();
     enum Refusal : std::size_t { RefusedNoProof, RefusedGeneration, RefusedUnlocked, RefusedCollect, RefusedKeys, RefusedStamped, RefusedPending, RefusalReasons };
-    void BumpOwnRanges(GuestMemory::RangeSource source) const;
+    void BumpOwnRanges(GuestMemory::RangeSource source, bool ownPending = false) const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -541,6 +541,8 @@ public:
     static std::uint64_t PaddingSeedCopies();
     static std::uint64_t LinearImportRetiles();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t ScopedProofHits();
+    static std::uint64_t ScopedProofDisagreements();
     const char* RefreshObligation(std::uint32_t first = 0, std::uint32_t count = 0) const;
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
@@ -557,19 +559,21 @@ public:
 
 private:
     std::array<std::pair<std::uint64_t, std::uint64_t>, 2> ownRanges() const;
-    GuestMemory::RangeStamp ownRangeStamp() const;
     void classifyScopedShadow();
-    void noteScopedShadow(std::size_t outcome, const GuestMemory::RangeStamp& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownBumpsBefore);
-    GuestMemory::RangeStamp shadowStamp{};
+    bool scopedHit(std::uint64_t epoch);
+    void noteScopedShadow(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch);
+    std::size_t scopedVerdict(const GuestMemory::RangeVersionParts& current) const;
+    GuestMemory::ScopedProof scopedProof{};
     std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> shadowUnscoped{};
     std::uint64_t shadowGeneration = 0;
     DccKeys shadowKeys = DccKeys::Uncompressed;
-    std::uint64_t shadowOwnBumps = 0;
-    mutable std::atomic<std::uint64_t> ownBumps{0};
+    std::uint64_t certGpuPending = 0;
+    std::uint64_t certTexturePending = 0;
+    std::uint64_t certOwnPending = 0;
+    mutable std::atomic<std::uint64_t> ownPendingBumps{0};
     std::uint64_t ownStampDelta() const;
     std::size_t shadowCause = 0;
     std::size_t refusal = RefusedNoProof;
-    bool shadowValid = false;
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};

@@ -154,6 +154,8 @@ WriteIndex& Index() {
 }
 
 std::array<std::atomic<std::uint64_t>, RangeVersionSlots> rangeVersions{};
+std::array<std::atomic<std::uint64_t>, RangeVersionSlots> gpuPendingVersions{};
+std::array<std::atomic<std::uint64_t>, RangeVersionSlots> texturePendingVersions{};
 std::atomic<std::uint64_t> unscopedVersion{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(UnscopedSource::Count)> unscopedByKind{};
 constexpr std::array<const char*, static_cast<std::size_t>(RangeSource::Count)> RangeSourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "texturepending", "drawwrites", "copiedwriters", "labels", "nondraw"};
@@ -177,7 +179,11 @@ std::pair<std::uint64_t, std::uint64_t> granulesOf(std::uint64_t address, std::u
 }
 
 void bumpGranules(std::uint64_t first, std::uint64_t count, RangeSource source) {
-    for (std::uint64_t granule = first; granule < first + count; ++granule) rangeVersions[granule % RangeVersionSlots].fetch_add(1, std::memory_order_acq_rel);
+    auto* part = source == RangeSource::Pending ? &gpuPendingVersions : source == RangeSource::TexturePending ? &texturePendingVersions : nullptr;
+    for (std::uint64_t granule = first; granule < first + count; ++granule) {
+        if (part != nullptr) (*part)[granule % RangeVersionSlots].fetch_add(1, std::memory_order_acq_rel);
+        rangeVersions[granule % RangeVersionSlots].fetch_add(1, std::memory_order_acq_rel);
+    }
     if (ScopedProofsProfiled()) {
         auto& counters = rangeVersionCounters();
         counters.calls[static_cast<std::size_t>(source)].Add();
@@ -299,6 +305,20 @@ bool RangeStampHolds(const RangeStamp& recorded, std::span<const std::pair<std::
 
 bool ScopedHolds(const ScopedProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     return proof.valid && RangeStampHolds(proof.stamp, ranges);
+}
+
+RangeVersionParts RangeVersionPartsOf(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    RangeVersionParts parts;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin) continue;
+        const auto [first, count] = granulesOf(begin, end - begin);
+        for (std::uint64_t granule = first; granule < first + count; ++granule) {
+            parts.gpuPending += gpuPendingVersions[granule % RangeVersionSlots].load(std::memory_order_acquire);
+            parts.texturePending += texturePendingVersions[granule % RangeVersionSlots].load(std::memory_order_acquire);
+        }
+    }
+    parts.stamp = RangeVersionStamp(ranges);
+    return parts;
 }
 
 std::array<std::uint64_t, static_cast<std::size_t>(UnscopedSource::Count)> UnscopedVersionsByKind() {
