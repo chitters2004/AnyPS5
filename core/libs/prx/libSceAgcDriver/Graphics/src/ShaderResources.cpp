@@ -4475,7 +4475,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 noteEpochProof(true, true, !ok);
                 return ok;
             }
-            if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+            if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None, false, true};
             noteEpochProof(true, false, false);
             return true;
         }
