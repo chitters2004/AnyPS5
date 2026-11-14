@@ -1,0 +1,12 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_command_publication_tests tests/CommandPublication.cpp)
+    target_include_directories(agc_command_publication_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_command_publication_tests PRIVATE libSceAgcDriver libc)
+    configure_windows_unwind(agc_command_publication_tests)
+    add_test(NAME agc_command_publication COMMAND agc_command_publication_tests)
+    set_tests_properties(agc_command_publication PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_command_publication PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

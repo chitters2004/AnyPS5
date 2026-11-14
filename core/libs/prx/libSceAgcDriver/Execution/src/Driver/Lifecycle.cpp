@@ -315,7 +315,7 @@ bool Driver::WaitSettledFor(std::chrono::milliseconds timeout) {
         if (failure != nullptr || stopping) return true;
         captureHold.store(true, std::memory_order_relaxed);
         std::atomic_thread_fence(std::memory_order_seq_cst);
-        if (completed >= accepted || parkedOnTitle()) return true;
+        if ((completed >= accepted && !DrawPipeline::Queue0().Busy() && !DrawFinisher::Busy()) || parkedOnTitle()) return true;
         captureHold.store(false, std::memory_order_relaxed);
         return false;
     };

@@ -1,11 +1,13 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMERECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_FRAMERECORDER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/CommandPublication.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "SceShaders.hpp"
 #include "SceTypes.hpp"
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -30,6 +32,9 @@ public:
     static constexpr std::size_t HostPageBytes = 4096;
 
     static FrameRecorder* Active();
+    static void NoteCommandWrite(std::uint64_t address, std::size_t bytes) {
+        if (published.load(std::memory_order_relaxed) != nullptr) Active()->noteCommandWrite(address, bytes);
+    }
 
     void RegisterShader(const Shader* shader);
     void ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);
@@ -59,6 +64,7 @@ private:
     };
 
     FrameRecorder(std::filesystem::path directory, std::filesystem::path trigger, std::uint64_t atBoundary, std::uint64_t frames);
+    void noteCommandWrite(std::uint64_t address, std::size_t bytes);
     struct Span {
         std::uint64_t address = 0;
         std::uint64_t bytes = 0;
@@ -76,7 +82,8 @@ private:
     bool triggered();
     void start();
     void finish();
-    void snapshot(const Range& range);
+    void snapshot(const CommandPublication::Held& commands, const Range& range);
+    void captureGuest(const CommandPublication::Held& commands, std::uint64_t address, std::span<std::byte> bytes, const std::function<void(std::uint64_t, std::span<const std::byte>)>& write);
     void readGuest(std::uint64_t address, std::span<std::byte> bytes);
     void writeReferenceFrames();
     bool abandonIfDiskLow();
@@ -85,6 +92,8 @@ private:
     std::vector<Range> committedRanges();
     std::vector<Range> newRanges();
     std::uint64_t blockSince(std::uint64_t block) const;
+
+    static inline std::atomic<FrameRecorder*> published{nullptr};
 
     std::filesystem::path directory;
     std::filesystem::path trigger;
@@ -116,6 +125,10 @@ private:
     std::uint64_t hostOnlySampleBytes = 0;
     std::uint64_t allocationsGeneration = 0;
     std::uint64_t lateRanges = 0;
+    CommandPublication publication;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> deferred;
+    std::uint64_t lateCommandBytes = 0;
+    std::uint64_t sweptCommandRanges = 0;
     std::vector<std::string> warnings;
     std::chrono::steady_clock::time_point origin;
     std::chrono::steady_clock::time_point startedAt;
