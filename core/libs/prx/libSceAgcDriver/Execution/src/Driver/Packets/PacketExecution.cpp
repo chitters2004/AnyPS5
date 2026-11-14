@@ -3,6 +3,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -462,6 +463,7 @@ void Driver::execute(Submission& submission) {
                     abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
                 }
                 for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+                if (!abLines.empty()) DriverDetail::ApplyWorkerCoreSwitch();
             }
 
             timing.Mark("flip_flush");

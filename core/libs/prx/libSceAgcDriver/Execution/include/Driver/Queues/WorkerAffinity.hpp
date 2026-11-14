@@ -15,6 +15,10 @@ void ReserveFinisherCore();
 
 void ReserveWorkerCore(const char* role);
 
+void ApplyWorkerCoreSwitch();
+
+std::uint64_t WorkerCoreSwitches();
+
 void NameDriverThread(const char* name);
 
 }

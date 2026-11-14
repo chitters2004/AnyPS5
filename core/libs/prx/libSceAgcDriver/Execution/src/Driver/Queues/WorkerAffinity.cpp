@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/general/ThreadName.hpp"
 #include <array>
@@ -86,6 +87,7 @@ struct CoreSwitches {
 struct Reservation {
     CpuTopology::CpuSet set;
     unsigned long thread = 0;
+    bool active = true;
 };
 
 constexpr std::size_t CommitterSlot = 0;
@@ -94,6 +96,7 @@ constexpr std::size_t WorkerSlot = 2;
 
 std::mutex reservationMutex;
 std::array<std::optional<Reservation>, 3> reservations;
+std::uint64_t workerSwitches = 0;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -108,7 +111,7 @@ const CoreSwitches& Switches() {
         const bool workersPinned = WorkerAffinityMask() != 0;
         result.committer = result.logical.has_value() || !workersPinned;
         result.finisher = !workersPinned && std::getenv("APS5_NO_FINISHER_CORE") == nullptr;
-        result.worker = !workersPinned && std::getenv("APS5_NO_WORKER_CORE") == nullptr;
+        result.worker = !workersPinned;
         return result;
     }();
     return switches;
@@ -173,56 +176,91 @@ void NoteWorkerThread() {
 }
 #endif
 
+bool WorkerCoreWanted() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoWorkerCore);
+}
+
+#ifdef _WIN32
+using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
+
+SetCpuSets ProcessDefaultSetter() {
+    static const auto setter = ThreadName::Resolve<SetCpuSets>("SetProcessDefaultCpuSets");
+    return setter;
+}
+
+SetCpuSets ThreadSetter() {
+    static const auto setter = ThreadName::Resolve<SetCpuSets>("SetThreadSelectedCpuSets");
+    return setter;
+}
+
+unsigned long CurrentThread() {
+    return GetCurrentThreadId();
+}
+#endif
+
 bool HoldsReservation(unsigned long thread) {
     for (const auto& held : reservations) {
-        if (held.has_value() && held->thread == thread) return true;
+        if (held.has_value() && held->active && held->thread == thread) return true;
     }
     return false;
 }
 
-void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical) {
-#ifdef _WIN32
-    using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
-    static const auto setDefault = ThreadName::Resolve<SetCpuSets>("SetProcessDefaultCpuSets");
-    static const auto setSelected = ThreadName::Resolve<SetCpuSets>("SetThreadSelectedCpuSets");
-    if (setDefault == nullptr || setSelected == nullptr) return;
-#endif
-    std::lock_guard lock(reservationMutex);
-    auto& own = reservations[slot];
-    if (own.has_value()) {
-#ifdef _WIN32
-        own->thread = GetCurrentThreadId();
-        const ULONG id = own->set.id;
-        const bool selected = setSelected(GetCurrentThread(), &id, 1) != 0;
-#else
-        own->thread = CurrentThread();
-        const bool selected = PinTo(0, {own->set.id});
-#endif
-        std::fprintf(stderr, "[affinity] %s tid=%lu -> core %u logical %u, kept from its previous thread (thread %s)\n", role, CpuTopology::ThreadId(nullptr), static_cast<unsigned>(own->set.core), static_cast<unsigned>(own->set.logical), selected ? "set" : "failed");
-        return;
-    }
-    const auto sets = SystemCpuSets();
-    std::vector<CpuTopology::CpuSet> taken;
-    for (const auto& held : reservations) {
-        if (held.has_value()) taken.push_back(held->set);
-    }
+std::vector<CpuTopology::CpuSet> AheadOf(const std::vector<CpuTopology::CpuSet>& sets, std::size_t slot, std::vector<CpuTopology::CpuSet> taken) {
+    std::vector<CpuTopology::CpuSet> ahead;
     for (std::size_t earlier = 0; earlier < slot; ++earlier) {
         if (reservations[earlier].has_value() || !SlotEnabled(earlier)) continue;
-        if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, earlier == CommitterSlot ? Switches().logical : std::nullopt)) taken.push_back(ahead->chosen);
+        if (const auto choice = CpuTopology::ChooseReservedCore(sets, taken, earlier == CommitterSlot ? Switches().logical : std::nullopt)) {
+            taken.push_back(choice->chosen);
+            ahead.push_back(choice->chosen);
+        }
     }
-    const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
-    if (!reservation.has_value()) {
-        if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
-        else if (slot == WorkerSlot) std::fprintf(stderr, "[affinity] %s: no core reserved, the host has no free core that leaves four to the other threads beside %zu reserved\n", role, taken.size());
-        return;
+    return ahead;
+}
+
+std::vector<CpuTopology::CpuSet> AllReserved() {
+    std::vector<CpuTopology::CpuSet> sets;
+    for (const auto& held : reservations) {
+        if (held.has_value()) sets.push_back(held->set);
     }
+    return sets;
+}
+
+std::vector<CpuTopology::CpuSet> ActiveReserved() {
+    std::vector<CpuTopology::CpuSet> sets;
+    for (const auto& held : reservations) {
+        if (held.has_value() && held->active) sets.push_back(held->set);
+    }
+    return sets;
+}
+
+std::vector<std::uint32_t> OthersExcept(const std::vector<CpuTopology::CpuSet>& sets, const std::vector<CpuTopology::CpuSet>& excluded) {
+    std::vector<std::uint32_t> others;
+    for (const auto& set : sets) {
+        bool held = false;
+        for (const auto& other : excluded) held = held || (other.group == set.group && other.core == set.core);
+        if (!held) others.push_back(set.id);
+    }
+    return others;
+}
+
+bool PinHolder(const Reservation& held) {
+#ifdef _WIN32
+    const ULONG id = held.set.id;
+    if (held.thread == GetCurrentThreadId()) return ThreadSetter()(GetCurrentThread(), &id, 1) != 0;
+    const HANDLE thread = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, held.thread);
+    if (thread == nullptr) return false;
+    const bool set = ThreadSetter()(thread, &id, 1) != 0;
+    CloseHandle(thread);
+    return set;
+#else
+    return PinTo(static_cast<pid_t>(held.thread), {held.set.id});
+#endif
+}
+
+std::size_t MoveThreads(const std::vector<std::uint32_t>& others) {
     std::size_t moved = 0;
 #ifdef _WIN32
-    own = Reservation{reservation->chosen, GetCurrentThreadId()};
-    const std::vector<ULONG> others(reservation->others.begin(), reservation->others.end());
-    const ULONG id = reservation->chosen.id;
-    const bool process = setDefault(GetCurrentProcess(), others.data(), static_cast<ULONG>(others.size())) != 0;
-    const bool thread = setSelected(GetCurrentThread(), &id, 1) != 0;
+    const std::vector<ULONG> ids(others.begin(), others.end());
     if (const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE) {
         THREADENTRY32 entry{};
         entry.dwSize = sizeof(entry);
@@ -231,45 +269,112 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
             if (entry.th32OwnerProcessID != processId || HoldsReservation(entry.th32ThreadID)) continue;
             const HANDLE other = OpenThread(THREAD_SET_LIMITED_INFORMATION, FALSE, entry.th32ThreadID);
             if (other == nullptr) continue;
-            if (setSelected(other, others.data(), static_cast<ULONG>(others.size())) != 0) ++moved;
+            if (ThreadSetter()(other, ids.data(), static_cast<ULONG>(ids.size())) != 0) ++moved;
             CloseHandle(other);
         }
         CloseHandle(snapshot);
     }
-    const char* processState = process ? "set" : "failed";
 #else
-    own = Reservation{reservation->chosen, CurrentThread()};
-    const bool thread = PinTo(0, {reservation->chosen.id});
     if (DIR* tasks = opendir("/proc/self/task"); tasks != nullptr) {
         while (const dirent* entry = readdir(tasks)) {
             char* end = nullptr;
             const unsigned long tid = std::strtoul(entry->d_name, &end, 10);
             if (end == entry->d_name || *end != '\0' || HoldsReservation(tid)) continue;
-            if (PinTo(static_cast<pid_t>(tid), reservation->others)) ++moved;
+            if (PinTo(static_cast<pid_t>(tid), others)) ++moved;
         }
         closedir(tasks);
     }
-    const char* processState = "set for helper threads";
-    std::vector<CpuTopology::CpuSet> held;
-    for (const auto& reserved : reservations) {
-        if (reserved.has_value()) held.push_back(reserved->set);
-    }
-    std::uint64_t unreserved = 0;
-    for (const auto cpu : reservation->others) unreserved |= std::uint64_t{1} << cpu;
-    CpuTopology::UnreservedMask().store(unreserved, std::memory_order_release);
-    pipelineCpus = WorkerAffinityMask() != 0 ? std::vector<std::uint32_t>{} : CpuTopology::PipelineCacheSet(sets, held);
-    if (!pipelineCpus.empty()) {
-        std::size_t kept = 0;
-        for (const auto worker : workerThreads) {
-            if (!OwnThread(worker) || HoldsReservation(worker)) continue;
-            kept += PinTo(static_cast<pid_t>(worker), pipelineCpus) ? 1u : 0u;
-        }
-        std::fprintf(stderr, "[affinity] %zu queue workers kept on the %zu other CPUs of the reserved cores' last-level cache\n", kept, pipelineCpus.size());
-    }
 #endif
-    std::fprintf(stderr, "[affinity] %s tid=%lu -> core %u logical %u reserved (process default %s, thread %s, %zu running threads moved to the %zu other CPU sets)\n", role, CpuTopology::ThreadId(nullptr), static_cast<unsigned>(reservation->chosen.core), static_cast<unsigned>(reservation->chosen.logical), processState, thread ? "set" : "failed", moved, reservation->others.size());
+    return moved;
 }
 
+const char* SetProcessDefault(const std::vector<std::uint32_t>& others) {
+#ifdef _WIN32
+    const std::vector<ULONG> ids(others.begin(), others.end());
+    return ProcessDefaultSetter()(GetCurrentProcess(), ids.data(), static_cast<ULONG>(ids.size())) != 0 ? "set" : "failed";
+#else
+    std::uint64_t unreserved = 0;
+    for (const auto cpu : others) unreserved |= cpu < 64 ? std::uint64_t{1} << cpu : 0;
+    CpuTopology::UnreservedMask().store(unreserved, std::memory_order_release);
+    return "set for helper threads";
+#endif
+}
+
+void KeepWorkersOnCache(const std::vector<CpuTopology::CpuSet>& sets) {
+#ifdef __linux__
+    pipelineCpus = WorkerAffinityMask() != 0 ? std::vector<std::uint32_t>{} : CpuTopology::PipelineCacheSet(sets, ActiveReserved());
+    if (pipelineCpus.empty()) return;
+    std::size_t kept = 0;
+    for (const auto worker : workerThreads) {
+        if (!OwnThread(worker) || HoldsReservation(worker)) continue;
+        kept += PinTo(static_cast<pid_t>(worker), pipelineCpus) ? 1u : 0u;
+    }
+    std::fprintf(stderr, "[affinity] %zu queue workers kept on the %zu other CPUs of the reserved cores' last-level cache\n", kept, pipelineCpus.size());
+#else
+    static_cast<void>(sets);
+#endif
+}
+
+bool CpuSetsAvailable() {
+#ifdef _WIN32
+    return ProcessDefaultSetter() != nullptr && ThreadSetter() != nullptr;
+#else
+    return true;
+#endif
+}
+
+void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical) {
+    if (!CpuSetsAvailable()) return;
+    std::lock_guard lock(reservationMutex);
+    auto& own = reservations[slot];
+    if (own.has_value()) {
+        own->thread = CurrentThread();
+        const bool selected = !own->active || PinHolder(*own);
+        std::fprintf(stderr, "[affinity] %s tid=%lu -> core %u logical %u, kept from its previous thread (thread %s)\n", role, CpuTopology::ThreadId(nullptr), static_cast<unsigned>(own->set.core), static_cast<unsigned>(own->set.logical), own->active ? (selected ? "set" : "failed") : "released by APS5_NO_WORKER_CORE");
+        return;
+    }
+    const auto sets = SystemCpuSets();
+    auto taken = AllReserved();
+    const auto ahead = AheadOf(sets, slot, taken);
+    taken.insert(taken.end(), ahead.begin(), ahead.end());
+    const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
+    if (!reservation.has_value()) {
+        if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
+        else if (slot == WorkerSlot) std::fprintf(stderr, "[affinity] %s: no core reserved, the host has no free core that leaves four to the other threads beside %zu reserved\n", role, taken.size());
+        return;
+    }
+    own = Reservation{reservation->chosen, CurrentThread(), slot != WorkerSlot || WorkerCoreWanted()};
+    auto excluded = ActiveReserved();
+    excluded.insert(excluded.end(), ahead.begin(), ahead.end());
+    const auto others = OthersExcept(sets, excluded);
+    const char* processState = SetProcessDefault(others);
+    const bool thread = !own->active || PinHolder(*own);
+    const std::size_t moved = MoveThreads(others);
+    KeepWorkersOnCache(sets);
+    if (own->active) std::fprintf(stderr, "[affinity] %s tid=%lu -> core %u logical %u reserved (process default %s, thread %s, %zu running threads moved to the %zu other CPU sets)\n", role, CpuTopology::ThreadId(nullptr), static_cast<unsigned>(reservation->chosen.core), static_cast<unsigned>(reservation->chosen.logical), processState, thread ? "set" : "failed", moved, others.size());
+    else std::fprintf(stderr, "[affinity] %s tid=%lu -> core %u logical %u chosen but released while APS5_NO_WORKER_CORE is set (process default %s, %zu running threads moved to the %zu other CPU sets)\n", role, CpuTopology::ThreadId(nullptr), static_cast<unsigned>(reservation->chosen.core), static_cast<unsigned>(reservation->chosen.logical), processState, moved, others.size());
+}
+
+void ApplyWorkerSwitch() {
+    if (!Switches().worker || !CpuSetsAvailable()) return;
+    const bool wanted = WorkerCoreWanted();
+    std::lock_guard lock(reservationMutex);
+    auto& worker = reservations[WorkerSlot];
+    if (!worker.has_value() || worker->active == wanted) return;
+    const auto sets = SystemCpuSets();
+    if (sets.empty()) return;
+    worker->active = wanted;
+    auto excluded = ActiveReserved();
+    const auto ahead = AheadOf(sets, WorkerSlot, AllReserved());
+    excluded.insert(excluded.end(), ahead.begin(), ahead.end());
+    const auto others = OthersExcept(sets, excluded);
+    const char* processState = SetProcessDefault(others);
+    const bool thread = !wanted || PinHolder(*worker);
+    const std::size_t moved = MoveThreads(others);
+    KeepWorkersOnCache(sets);
+    ++workerSwitches;
+    std::fprintf(stderr, "[affinity] queue worker 0 tid=%lu core %u logical %u %s by APS5_NO_WORKER_CORE (switch %llu; process default %s, thread %s, %zu running threads moved to the %zu other CPU sets)\n", worker->thread, static_cast<unsigned>(worker->set.core), static_cast<unsigned>(worker->set.logical), wanted ? "reserved" : "released", static_cast<unsigned long long>(workerSwitches), processState, thread ? "set" : "failed", moved, others.size());
+}
 
 }
 #endif
@@ -291,6 +396,21 @@ void ReserveWorkerCore(const char* role) {
     if (Switches().worker) Reserve(WorkerSlot, role, std::nullopt);
 #else
     static_cast<void>(role);
+#endif
+}
+
+void ApplyWorkerCoreSwitch() {
+#if defined(_WIN32) || defined(__linux__)
+    ApplyWorkerSwitch();
+#endif
+}
+
+std::uint64_t WorkerCoreSwitches() {
+#if defined(_WIN32) || defined(__linux__)
+    std::lock_guard lock(reservationMutex);
+    return workerSwitches;
+#else
+    return 0;
 #endif
 }
 
