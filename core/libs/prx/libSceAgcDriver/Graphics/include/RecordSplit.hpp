@@ -83,20 +83,44 @@ enum class Event : std::size_t {
     VertexRepeated,
     IndexBinds,
     IndexRepeated,
+    StateSchedules,
+    StateMaskRebuilds,
+    GuardCalls,
+    GuardAllocations,
+    DepthGuardChecks,
+    DepthProofsPending,
+    DepthGuardArmed,
+    DepthGuardNear,
+    ColorGuardChecks,
+    ColorGuardArmed,
+    ColorGuardNear,
     Count
 };
 
+inline constexpr std::size_t StateSlots = 21;
+
 inline constexpr std::array<const char*, static_cast<std::size_t>(Span::Count)> SpanNames{"assemble", "flush checks", "access", "draw sets", "pass access", "start pass", "pass setup", "pass state", "binds", "push", "commands", "tail", "leave", "hazard check", "hazard add", "sets guard", "sets walk", "sets snapshots", "sets uploads", "sets write", "sets keeps", "sets recount", "sets allocate", "sets build", "sets update"};
-inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(Event::Count)> EventNames{"draws", "passes begun", "passes continued", "hazard checks", "hazard ranges at check", "hazard images at check", "hazard adds", "hazard ranges offered", "hazard ranges changed", "hazard images offered", "hazard images new", "read ranges", "write ranges", "storage images", "binding calls", "binding early outs", "sets written", "snapshot fast", "snapshot reused", "snapshot new", "uploads", "upload bytes", "sets same as previous", "ranges same as previous", "set binds", "set binds repeated", "push calls", "push repeated", "vertex binds", "vertex binds repeated", "index binds", "index binds repeated", "pipeline schedules", "write mask rebuilds", "guest buffer guards", "guarded allocations", "depth guard checks", "depth proofs pending", "depth guard armed", "depth guard near", "color guard checks", "color guard armed", "color guard near"};
+inline constexpr std::array<const char*, StateSlots> StateSlotNames{"viewport", "scissor", "depth bias", "depth bounds", "cull mode", "front face", "depth test", "depth write", "depth compare", "depth bounds test", "stencil test", "stencil op front", "stencil op back", "compare mask front", "compare mask back", "write mask front", "write mask back", "reference front", "reference back", "color write mask", "pipeline"};
+
+static_assert(SpanNames.back() != nullptr && EventNames.back() != nullptr && StateSlotNames.back() != nullptr);
 
 bool Enabled();
 
 struct Counters {
     std::array<AgcDriver::ProfileCounter, static_cast<std::size_t>(Span::Count)> ns{};
     std::array<AgcDriver::ProfileCounter, static_cast<std::size_t>(Event::Count)> events{};
+    std::array<AgcDriver::ProfileCounter, StateSlots> emitted{};
+    std::array<AgcDriver::ProfileCounter, StateSlots> suppressed{};
 };
 
 Counters& Shared();
+
+inline void NoteState(std::size_t slot, bool emitted) {
+    if (!Enabled() || slot >= StateSlots) return;
+    auto& counters = Shared();
+    (emitted ? counters.emitted : counters.suppressed)[slot].Add(1);
+}
 
 inline void Charge(Span span, std::uint64_t nanoseconds) {
     Shared().ns[static_cast<std::size_t>(span)].Add(nanoseconds);
@@ -266,6 +290,8 @@ inline void NoteBindings(std::uint64_t bindings, std::uint64_t ranges) {
 struct Window {
     std::array<std::uint64_t, static_cast<std::size_t>(Span::Count)> ns{};
     std::array<std::uint64_t, static_cast<std::size_t>(Event::Count)> events{};
+    std::array<std::uint64_t, StateSlots> emitted{};
+    std::array<std::uint64_t, StateSlots> suppressed{};
 };
 
 inline Window Take() {
@@ -273,6 +299,10 @@ inline Window Take() {
     auto& counters = Shared();
     for (std::size_t index = 0; index < window.ns.size(); ++index) window.ns[index] = counters.ns[index].Take();
     for (std::size_t index = 0; index < window.events.size(); ++index) window.events[index] = counters.events[index].Take();
+    for (std::size_t index = 0; index < StateSlots; ++index) {
+        window.emitted[index] = counters.emitted[index].Take();
+        window.suppressed[index] = counters.suppressed[index].Take();
+    }
     return window;
 }
 
@@ -295,6 +325,23 @@ inline std::string Describe(const Window& window, std::uint64_t draws) {
         std::snprintf(part, sizeof(part), "%s %s %llu", index == 0 ? "" : ",", EventNames[index], static_cast<unsigned long long>(window.events[index]));
         line += part;
     }
+    return line;
+}
+
+inline std::string DescribeState(const Window& window, std::uint64_t draws) {
+    std::string line = "[pass-state] (10 s, all threads) per draw over " + std::to_string(draws) + " draws, emitted/suppressed:";
+    char part[160];
+    const auto perDraw = [&](std::uint64_t value) { return draws != 0 ? static_cast<double>(value) / static_cast<double>(draws) : 0.0; };
+    std::uint64_t emitted = 0;
+    std::uint64_t suppressed = 0;
+    for (std::size_t index = 0; index < StateSlots; ++index) {
+        emitted += window.emitted[index];
+        suppressed += window.suppressed[index];
+        std::snprintf(part, sizeof(part), "%s %s %.3f/%.3f", index == 0 ? "" : ",", StateSlotNames[index], perDraw(window.emitted[index]), perDraw(window.suppressed[index]));
+        line += part;
+    }
+    std::snprintf(part, sizeof(part), "; total %.3f/%.3f; schedules %.3f, write mask rebuilds %.3f", perDraw(emitted), perDraw(suppressed), perDraw(window.events[static_cast<std::size_t>(Event::StateSchedules)]), perDraw(window.events[static_cast<std::size_t>(Event::StateMaskRebuilds)]));
+    line += part;
     return line;
 }
 

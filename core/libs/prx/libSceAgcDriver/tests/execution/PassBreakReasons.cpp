@@ -136,6 +136,12 @@ void ExpectContinuedSplit(const RecordSplit::Window& window) {
     for (std::size_t index = 0; index < RecordSplit::RecordSteps; ++index) steps += window.ns[index];
     Expect(steps > 0, "the record split timed nothing: " + described);
     Expect(described.rfind("[record-split]", 0) == 0, "the record split line has no tag: " + described);
+    const auto state = RecordSplit::DescribeState(window, 1);
+    const auto pipeline = RecordSplit::StateSlots - 1;
+    Expect(window.emitted[pipeline] == 0 && window.suppressed[pipeline] == 1, "the repeated draw did not suppress its pipeline bind: " + state);
+    Expect(window.emitted[0] == 0 && window.suppressed[0] == 1 && window.emitted[1] == 0 && window.suppressed[1] == 1, "the repeated draw did not suppress its viewport and scissor: " + state);
+    Expect(event(RecordSplit::Event::GuardCalls) >= 1, "the record split counted no guest buffer guard: " + described);
+    Expect(state.rfind("[pass-state]", 0) == 0, "the pass state line has no tag: " + state);
 }
 
 }

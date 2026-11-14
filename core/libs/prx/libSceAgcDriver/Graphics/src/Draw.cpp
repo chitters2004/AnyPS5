@@ -1007,7 +1007,9 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
-    AgcDriver::ProfilePrint_nid_no_patch("%s\n", RecordSplit::Describe(RecordSplit::Take(), profile.draws).c_str());
+    const auto split = RecordSplit::Take();
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", RecordSplit::Describe(split, profile.draws).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", RecordSplit::DescribeState(split, profile.draws).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {

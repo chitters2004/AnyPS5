@@ -1558,6 +1558,8 @@ std::uint32_t CommandState::DynamicSlots(std::span<const VkDynamicState> states)
     return slots;
 }
 
+static_assert(CommandState::SlotCount + 1 == RecordSplit::StateSlots);
+
 void CommandState::Begin(VkCommandBuffer recording, bool suppress) {
     commands = recording;
     trackable = suppress ? ~0u : 0u;
@@ -1574,7 +1576,11 @@ void CommandState::Invalidate() noexcept {
 
 template<typename TValue, typename TEqual, typename TEmit>
 void CommandState::apply(Slot slot, TValue CommandState::*field, const TValue& value, TEqual equal, TEmit emit) {
-    if (Known(slot) && equal(this->*field, value)) return;
+    if (Known(slot) && equal(this->*field, value)) {
+        RecordSplit::NoteState(slot, false);
+        return;
+    }
+    RecordSplit::NoteState(slot, true);
     emit();
     this->*field = value;
     wrote(Mask(slot));
@@ -1586,7 +1592,9 @@ void CommandState::applyFaces(Slot first, VkStencilFaceFlags faces, std::array<T
     for (std::uint32_t face = 0; face < 2; ++face) {
         const VkStencilFaceFlags bit = 1u << face;
         if ((faces & bit) == 0) continue;
-        if (!Known(static_cast<Slot>(first + face)) || !((this->*field)[face] == value)) needed |= bit;
+        const bool emits = !Known(static_cast<Slot>(first + face)) || !((this->*field)[face] == value);
+        RecordSplit::NoteState(first + face, emits);
+        if (emits) needed |= bit;
     }
     if (needed == 0) return;
     emit(needed);
@@ -1598,7 +1606,11 @@ void CommandState::applyFaces(Slot first, VkStencilFaceFlags faces, std::array<T
 }
 
 void CommandState::BindPipeline(const Context& context, VkPipeline bound, std::uint32_t slots) {
-    if (pipelineKnown && pipeline == bound && dynamicSlots == slots && (overwritten & ~slots) == 0) return;
+    if (pipelineKnown && pipeline == bound && dynamicSlots == slots && (overwritten & ~slots) == 0) {
+        RecordSplit::NoteState(SlotCount, false);
+        return;
+    }
+    RecordSplit::NoteState(SlotCount, true);
     context.tracked(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, bound);
     pipeline = bound;
     pipelineKnown = trackable != 0 && bound != VK_NULL_HANDLE;

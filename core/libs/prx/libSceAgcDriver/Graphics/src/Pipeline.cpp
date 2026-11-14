@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -994,7 +995,10 @@ void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, Vk
 }
 
 void Pipeline::Continue(CommandState& recording, const State& state, const State* masked) const {
-    if (optimized != nullptr) optimized->Schedule();
+    if (optimized != nullptr) {
+        RecordSplit::Count(RecordSplit::Event::StateSchedules);
+        optimized->Schedule();
+    }
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
     recording.SetViewport(context, state.viewport);
@@ -1045,6 +1049,7 @@ void Pipeline::ContinueSecondChannel(CommandState& recording, const State& state
 
 void Pipeline::setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const {
     if (!context.dynamicColorWriteMask || state.blends.empty()) return;
+    RecordSplit::Count(RecordSplit::Event::StateMaskRebuilds);
     const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), secondChannel);
     recording.SetColorWriteMasks(context, std::span(masks).first(state.blends.size()));
 }

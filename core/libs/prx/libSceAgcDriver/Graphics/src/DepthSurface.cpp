@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/FirstSampleCopy.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuardSpans.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -3304,10 +3305,16 @@ void proveOverwrittenPlanes(std::uint64_t address, std::size_t bytes) {
 }
 
 void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t bytes, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, bool allowPublication) {
-    if (bytes != 0u && pendingOverwriteProofs().load(std::memory_order_acquire) != 0u && allowPublication && !HoldsMultisampleTargetsLock()) proveOverwrittenPlanes(address, bytes);
+    if (bytes != 0u) RecordSplit::Count(RecordSplit::Event::DepthGuardChecks);
+    if (bytes != 0u && pendingOverwriteProofs().load(std::memory_order_acquire) != 0u && allowPublication && !HoldsMultisampleTargetsLock()) {
+        RecordSplit::Count(RecordSplit::Event::DepthProofsPending);
+        proveOverwrittenPlanes(address, bytes);
+    }
     if (bytes == 0u || !anyDepthGuard().load(std::memory_order_acquire)) return;
+    RecordSplit::Count(RecordSplit::Event::DepthGuardArmed);
     Require(address <= std::numeric_limits<std::uint64_t>::max() - bytes, "native depth read range overflows");
     if (!mayOverlapDepthGuard(address, bytes)) return;
+    RecordSplit::Count(RecordSplit::Event::DepthGuardNear);
     const auto overlaps = [&](const DepthGuard& range) { return address < range.address + range.bytes && range.address < address + bytes; };
     if (htileClear.has_value() && htileClear->second <= std::numeric_limits<std::uint64_t>::max() - htileClear->first && htileClear->first <= address && bytes <= htileClear->second && address - htileClear->first <= htileClear->second - bytes) {
         std::lock_guard lock(surfacesMutex());
