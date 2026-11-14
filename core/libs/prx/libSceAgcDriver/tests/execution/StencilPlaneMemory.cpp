@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -118,6 +119,59 @@ void CheckConsumedStencilClear(AgcDriver::VulkanDevice& device, const DepthFastC
     Require(AgcDriver::Graphics::FlushDepthPlanes(stencilBase, StencilBytes).empty(), "the consumed stencil clear was stored twice");
 }
 
+
+bool WrittenAfterNote(std::uint64_t address, std::size_t bytes, std::uint64_t noted) {
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    return AgcDriver::GuestMemory::WrittenSince(address, bytes, noted);
+}
+
+void CheckNotedPlaneMemory(AgcDriver::VulkanDevice& device, const DepthFastClearHarness::Shaders& shaders, std::uint32_t swizzle, bool reuseOff) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, reuseOff);
+    auto* blocks = static_cast<std::byte*>(AllocateBlocks(DepthBytes + StencilBytes));
+    auto* depth = reinterpret_cast<float*>(blocks);
+    auto* stencil = reinterpret_cast<std::uint8_t*>(blocks + DepthBytes);
+    std::fill(depth, depth + PlaneTexels, 1.0f);
+    Fill(stencil, 0u);
+    const auto depthBase = reinterpret_cast<std::uintptr_t>(depth);
+    const auto stencilBase = reinterpret_cast<std::uintptr_t>(stencil);
+    if (!AgcDriver::GuestMemory::WriteWatched() || !AgcDriver::GuestMemory::Watched(depthBase, DepthBytes + StencilBytes)) {
+        std::puts("guest memory is not write-watched here: the memory note of a depth draw is not exercised");
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, false);
+        return;
+    }
+    const Surface surface{depthBase, stencilBase, 0, false, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 0, swizzle};
+    const bool mirrored = swizzle != 0u;
+    const std::string arm = std::string(mirrored ? "a mirrored" : "an unmirrored") + " D32S8 surface with collect reuse " + (reuseOff ? "off" : "on");
+    const auto draw = [&] {
+        Require(Draw(device, shaders, surface, {.depthTest = false, .stencilTest = false}, PlaneExtent, Colors) == PlaneTexels, "a read-only draw over " + arm + " did not cover the plane");
+        const auto note = AgcDriver::Graphics::DepthMemoryNoteAt(device.graphicsContext().device, depthBase);
+        Require(note.has_value(), "a draw over " + arm + " left no depth surface");
+        if (AgcDriver::GuestMemory::Watched(depthBase, DepthBytes)) Require(note->depth != 0u, "a draw over " + arm + " left no memory note for its watched depth plane");
+        if (AgcDriver::GuestMemory::Watched(stencilBase, StencilBytes)) Require(note->stencil != 0u, "a draw over " + arm + " left no memory note for its watched stencil plane");
+        return *note;
+    };
+    const auto reusedBefore = AgcDriver::Graphics::DepthCollectReuses();
+    auto note = draw();
+    const auto reused = AgcDriver::Graphics::DepthCollectReuses() - reusedBefore;
+    Require(reused == (mirrored && !reuseOff ? 2u : 0u), "a draw over " + arm + " reused " + std::to_string(reused) + " plane collects");
+    const auto check = [&](const char* when) {
+        Require(!WrittenAfterNote(depthBase, DepthBytes, note.depth) && !WrittenAfterNote(stencilBase, StencilBytes, note.stencil), "the memory note of " + arm + " " + when + " reports a write that came before its draw");
+        depth[PlaneTexels / 2u] = depth[PlaneTexels / 2u] == 0.5f ? 0.25f : 0.5f;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        Require(WrittenAfterNote(depthBase, DepthBytes, note.depth), "a CPU write to the depth plane after a draw over " + arm + " " + when + " is not seen against its memory note");
+        Fill(stencil, static_cast<std::uint8_t>(stencil[0] + 1u));
+        Require(WrittenAfterNote(stencilBase, StencilBytes, note.stencil), "a CPU write to the stencil plane after a draw over " + arm + " " + when + " is not seen against its memory note");
+    };
+    check("at its first draw");
+    note = draw();
+    if (AgcDriver::GuestMemory::Watched(depthBase, DepthBytes) && AgcDriver::GuestMemory::Watched(stencilBase, StencilBytes)) check("after CPU writes to both planes");
+    else std::cout << "the draw after CPU writes over " << arm << " left its planes unwatched\n";
+    AgcDriver::Graphics::RetireDepthSurfaces(device.graphicsContext().device, depthBase, DepthBytes);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDepthCollectReuse, false);
+}
+
 }
 
 int main() {
@@ -175,6 +229,10 @@ int main() {
             Require(draw({.depthTest = false, .stencilTest = true, .stencil = Stencil(VK_COMPARE_OP_EQUAL, VK_STENCIL_OP_KEEP, 0x18u)}) == 0u, "a draw testing stencil EQUAL 0x18 passed after the guest wrote 0x05 over the stored stencil plane");
         }
         Require(readOnlyFailures == 0, "read-only stencil draws dirtied the stored plane");
+        for (const bool reuseOff : {false, true}) {
+            CheckNotedPlaneMemory(*device, shaders, swizzle, reuseOff);
+            CheckNotedPlaneMemory(*device, shaders, 0u, reuseOff);
+        }
 
         Require(draw({.depthTest = false, .stencilTest = true, .stencil = Stencil(VK_COMPARE_OP_ALWAYS, VK_STENCIL_OP_REPLACE, 0x33u)}) == PlaneTexels, "the draw writing stencil 0x33 before the unmap did not cover the plane");
         {

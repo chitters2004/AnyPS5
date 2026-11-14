@@ -1007,6 +1007,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("[depth-collects] %llu depth plane collects reused from the mirror sync since start (APS5_NO_DEPTH_COLLECT_REUSE %s)\n", static_cast<unsigned long long>(DepthCollectReuses()), RuntimeSwitches::Set(RuntimeSwitch::NoDepthCollectReuse) ? "set" : "unset");
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {
         char reuse[512];
