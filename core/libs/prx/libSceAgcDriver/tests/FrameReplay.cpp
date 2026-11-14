@@ -555,8 +555,10 @@ public:
         call.accepted = submitted;
         call.completed = submitted - inFlight;
         call.values = {group, parked.size()};
-        for (const auto index : parked) call.values.push_back(address(index));
-        std::sort(call.values.begin() + 2, call.values.end());
+        std::vector<std::uint64_t> addresses;
+        for (const auto index : parked) addresses.push_back(address(index));
+        std::ranges::sort(addresses);
+        for (const auto parkedAddress : addresses) call.values.insert(call.values.end(), {parkedAddress, 0, 0, 0});
         writer.WriteCall(call);
     }
 
