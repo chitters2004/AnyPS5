@@ -543,6 +543,13 @@ public:
     static std::uint64_t RefreshesProved();
     static std::uint64_t ScopedProofHits();
     static std::uint64_t ScopedProofDisagreements();
+    struct TargetCertificate {
+        GuestMemory::RangeVersionParts parts;
+        std::uint64_t ownPending = 0;
+    };
+    enum class TargetVerdict : std::uint8_t { Held, OwnPending, OtherPending, Moved, Unscoped };
+    TargetCertificate TakeTargetCertificate() const;
+    TargetVerdict TargetVerdictSince(const TargetCertificate& certificate) const;
     const char* RefreshObligation(std::uint32_t first = 0, std::uint32_t count = 0) const;
     static std::uint64_t ClearHandOvers();
     static std::uint64_t CreationHandOvers();
@@ -563,6 +570,7 @@ private:
     bool scopedHit(std::uint64_t epoch);
     void noteScopedShadow(std::size_t outcome, const GuestMemory::RangeVersionParts& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownPendingBefore, std::uint64_t epoch);
     std::size_t scopedVerdict(const GuestMemory::RangeVersionParts& current) const;
+    std::size_t verdictSince(const GuestMemory::RangeVersionParts& current, const GuestMemory::RangeStamp& stamp, std::uint64_t gpuPendingBefore, std::uint64_t texturePendingBefore, std::uint64_t ownPendingBefore) const;
     GuestMemory::ScopedProof scopedProof{};
     std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> shadowUnscoped{};
     std::uint64_t shadowGeneration = 0;

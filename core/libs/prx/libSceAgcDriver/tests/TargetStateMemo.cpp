@@ -201,6 +201,10 @@ bool memoServes() {
     return serves && !memoSwitchedOff();
 }
 
+bool memoScoped() {
+    return memoServes() && !RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemoC2);
+}
+
 bool memoCounted() {
     static const bool counted = std::getenv("APS5_PROFILE_TARGET_MEMO") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return counted;
@@ -269,9 +273,9 @@ void requireMoved(const ProofFields& before, const std::string& expected, const 
     Require(names == expected, what + " moved [" + names + "], expected [" + expected + "]");
 }
 
-void mustRepeat(AgcDriver::VulkanDevice& device, const ColorTarget& color, const std::string& what) {
+void mustRepeat(AgcDriver::VulkanDevice& device, const ColorTarget& color, const std::string& what, const DrawOptions& options = {}) {
     const auto before = lookups();
-    draw(device, color);
+    draw(device, color, options);
     Require(!LookupOutcomes::Profiled() || (lookups() != before) == memoResolves(), what);
 }
 
@@ -410,7 +414,8 @@ void pendingSerialOnly(AgcDriver::VulkanDevice& device) {
     const ProofFields before;
     StorageTexture::BumpPendingSerial();
     requireMoved(before, "pending", "a change of pending results");
-    mustLookUp(device, color, {}, "a draw after a change of pending results repeated its targets");
+    if (memoScoped()) mustRepeat(device, color, "a change of pending results elsewhere dropped a scoped color memo");
+    else mustLookUp(device, color, {}, "a draw after a change of pending results repeated its targets");
     expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "a change of pending results between repeated draws");
 }
 
@@ -484,7 +489,8 @@ void labelStoredBeforeHit(AgcDriver::VulkanDevice& device) {
     std::thread presenter([] { AgcDriverStoreGuestLabel_nid_postfix(reinterpret_cast<std::uint64_t*>(SourceStorage.data()), 1); });
     presenter.join();
     requireMoved(before, "proofs", "a label stored on another thread");
-    mustLookUp(device, color, {}, "a draw after another thread's label store repeated its targets");
+    if (memoScoped()) draw(device, color);
+    else mustLookUp(device, color, {}, "a draw after another thread's label store repeated its targets");
     mustRepeat(device, color, "a draw after the lookup that took another thread's label store did not repeat");
 }
 
@@ -781,6 +787,25 @@ void dccClear(AgcDriver::VulkanDevice& device) {
     mustLookUp(device, color, {}, "a draw after DCC keys were cleared repeated its targets");
 }
 
+void cmaskTargetStaysUncertified(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget(false, true);
+    reset(device, color);
+    bool repeated = false;
+    for (int repeat = 0; repeat < 64 && !repeated; ++repeat) {
+        const auto before = lookups();
+        draw(device, color);
+        repeated = lookups() == before;
+    }
+    std::cout << "a target with a CMASK " << (repeated ? "repeated" : "did not repeat") << " before the proof break\n";
+    if (!repeated) return;
+    AgcDriver::GuestMemory::BreakProofs();
+    const MemoEvents events;
+    mustLookUp(device, color, {}, "a proof break let a target with a CMASK repeat on a scoped certificate");
+    requireMemoEvent(events, TargetMemoEvent::ScopedUncertified, memoScoped() && memoCounted() ? 1u : 0u, "a proof break over a target with a CMASK");
+    requireMemoEvent(events, TargetMemoEvent::ScopedHit, 0u, "a proof break over a target with a CMASK");
+}
+
+
 void cmaskClearRecorded(AgcDriver::VulkanDevice& device) {
     auto color = colorTarget(false, true);
     auto* cmask = allocateWatched(65536);
@@ -1029,10 +1054,16 @@ void colorMemoProofBreak(AgcDriver::VulkanDevice& device) {
     requireMoved(before, "proofs", "an explicit proof break");
     depth.clearDepth = 0.625f;
     const MemoEvents events;
-    mustLookUp(device, color, {.scissor = Right, .depth = depth, .compare = VK_COMPARE_OP_ALWAYS}, "a proof break allowed color reuse while depth fell back");
-    requireMemoEvent(events, TargetMemoEvent::Proofs, memoServes() && memoCounted() ? 1u : 0u, "an explicit proof break");
-    requireMemoEvent(events, TargetMemoEvent::ProofsOrPendingOnly, memoServes() && memoCounted() ? 1u : 0u, "an explicit proof break");
-    requireMemoEvent(events, TargetMemoEvent::Hit, 0u, "an explicit proof break");
+    const DrawOptions options{.scissor = Right, .depth = depth, .compare = VK_COMPARE_OP_ALWAYS};
+    if (memoScoped()) mustRepeat(device, color, "a proof break outside the target dropped its scoped color memo", options);
+    else mustLookUp(device, color, options, "a proof break allowed color reuse while depth fell back");
+    const auto counted = memoServes() && memoCounted() ? 1u : 0u;
+    const auto scoped = memoScoped() && memoCounted() ? 1u : 0u;
+    requireMemoEvent(events, TargetMemoEvent::Proofs, counted, "an explicit proof break");
+    requireMemoEvent(events, TargetMemoEvent::ProofsOrPendingOnly, counted, "an explicit proof break");
+    requireMemoEvent(events, TargetMemoEvent::ScopedHit, scoped, "an explicit proof break");
+    requireMemoEvent(events, TargetMemoEvent::ScopedOwnPending, scoped, "an explicit proof break after the target's own pending results");
+    requireMemoEvent(events, TargetMemoEvent::Hit, scoped, "an explicit proof break");
     expect(device, color, [](std::uint32_t x) { return x < LeftWidth || x >= Width - LeftWidth ? Drawn : Old; }, "proof-break fallback");
 }
 
@@ -1437,6 +1468,8 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15>
 }};
 
 void scopedProofOracle(AgcDriver::VulkanDevice& device) {
+    const bool targetMemoC2WasOff = RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemoC2);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoTargetMemoC2, true);
     constexpr std::size_t Granule = AgcDriver::GuestMemory::RangeGranuleBytes;
     constexpr std::size_t WatchedBytes = 4 * Granule;
     auto* watched = allocateWatched(WatchedBytes + Granule);
@@ -1597,9 +1630,10 @@ void scopedProofOracle(AgcDriver::VulkanDevice& device) {
         device.WaitIdle();
     }
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != hitsBefore, "the oracle sequence never took a scoped proof");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoTargetMemoC2, targetMemoC2WasOff);
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 33> Scenarios{{
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 34> Scenarios{{
     {"repeated draws", repeatedDraws},
     {"CPU write", cpuWrite},
     {"driver store", driverStore},
@@ -1620,6 +1654,7 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 33>
     {"remap", remap},
     {"GPU write under an alias", gpuWriteUnderAlias},
     {"CMASK clear", cmaskClear},
+    {"CMASK target stays uncertified", cmaskTargetStaysUncertified},
     {"DCC clear", dccClear},
     {"HTILE clear", htileClear},
     {"depth plane stored between draws", depthPlaneStoredBetween},
@@ -1665,6 +1700,7 @@ int main(int argc, char** argv) {
             mutation.Add(OuterStorage.data(), OuterStorage.size(), true, true, true);
             mutation.Add(MultisampleStorage.data(), MultisampleStorage.size(), true, true, true);
         }
+        if (const char* mutant = std::getenv("APS5_TEST_TARGET_MEMO_C2_MUTANT")) SetTargetMemoC2MutantForTest(static_cast<TargetMemoC2Mutant>(std::strtoul(mutant, nullptr, 10)));
         AgcDriver::GuestMemory::MarkProofThread();
         AgcDriver::GuestMemory::BumpCollectEpoch();
         if (argc == 2 && std::string(argv[1]) == "--scoped-oracle") {

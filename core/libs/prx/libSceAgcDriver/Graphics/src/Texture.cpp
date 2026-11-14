@@ -2584,13 +2584,35 @@ void ReportScopedProofCounts() {
     AgcDriver::ProfilePrint_nid_no_patch("[scoped-proofs] (10 s, scoped proofs %s): range bumps calls/granules:%s; unscoped bumps:%s; full refreshes by shadow cert proved/unchanged/written:%s; unscoped moves seen by refreshes:%s; refused proofs by reason unchanged/written:%s\n", item, bumps.c_str(), unscoped.c_str(), refreshes.c_str(), movedBy.c_str(), refusals.c_str());
 }
 
+std::size_t StorageTexture::verdictSince(const GuestMemory::RangeVersionParts& current, const GuestMemory::RangeStamp& stamp, std::uint64_t gpuPendingBefore, std::uint64_t texturePendingBefore, std::uint64_t ownPendingBefore) const {
+    if (current.stamp == stamp) return ShadowHeld;
+    if (current.stamp.unscoped != stamp.unscoped) return ShadowUnscoped;
+    const auto gpuPending = current.gpuPending - gpuPendingBefore;
+    const auto texturePending = current.texturePending - texturePendingBefore;
+    if (current.stamp.sum - stamp.sum != gpuPending + texturePending) return ShadowMoved;
+    return texturePending == (ownPendingBumps.load(std::memory_order_relaxed) - ownPendingBefore) * ownStampDelta() ? ShadowOwnPending : ShadowOtherPending;
+}
+
 std::size_t StorageTexture::scopedVerdict(const GuestMemory::RangeVersionParts& current) const {
-    if (current.stamp == scopedProof.stamp) return ShadowHeld;
-    if (current.stamp.unscoped != scopedProof.stamp.unscoped) return ShadowUnscoped;
-    const auto gpuPending = current.gpuPending - certGpuPending;
-    const auto texturePending = current.texturePending - certTexturePending;
-    if (current.stamp.sum - scopedProof.stamp.sum != gpuPending + texturePending) return ShadowMoved;
-    return texturePending == (ownPendingBumps.load(std::memory_order_relaxed) - certOwnPending) * ownStampDelta() ? ShadowOwnPending : ShadowOtherPending;
+    return verdictSince(current, scopedProof.stamp, certGpuPending, certTexturePending, certOwnPending);
+}
+
+StorageTexture::TargetCertificate StorageTexture::TakeTargetCertificate() const {
+    TargetCertificate certificate;
+    certificate.ownPending = ownPendingBumps.load(std::memory_order_relaxed);
+    certificate.parts = GuestMemory::RangeVersionPartsOf(ownRanges());
+    return certificate;
+}
+
+StorageTexture::TargetVerdict StorageTexture::TargetVerdictSince(const TargetCertificate& certificate) const {
+    const auto& parts = certificate.parts;
+    switch (verdictSince(GuestMemory::RangeVersionPartsOf(ownRanges()), parts.stamp, parts.gpuPending, parts.texturePending, certificate.ownPending)) {
+        case ShadowHeld: return TargetVerdict::Held;
+        case ShadowOwnPending: return TargetVerdict::OwnPending;
+        case ShadowOtherPending: return TargetVerdict::OtherPending;
+        case ShadowUnscoped: return TargetVerdict::Unscoped;
+        default: return TargetVerdict::Moved;
+    }
 }
 
 void StorageTexture::classifyScopedShadow() {

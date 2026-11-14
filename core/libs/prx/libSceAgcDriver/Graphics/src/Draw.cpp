@@ -3395,6 +3395,8 @@ struct ColorMemo {
         std::weak_ptr<StorageTexture> resident;
         bool proxied = false;
         VkImageView view = VK_NULL_HANDLE;
+        StorageTexture::TargetCertificate certificate;
+        bool certified = false;
     };
     bool valid = false;
     TargetProof proof;
@@ -3429,7 +3431,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(TargetMemoEvent::Coun
     "lookup", "hit", "overlap cached", "overlap computed", "accept", "accept without depth", "depth hit", "avoided refresh lookups",
     "invalid", "thread changed", "descriptor", "resident gone", "resident evicted", "depth overlap", "metadata",
     "epoch", "proofs", "pending", "unwatch", "allocations", "surfaces", "released", "claims", "recorder", "device",
-    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked", "proofs or pending only"
+    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked", "proofs or pending only",
+    "scoped hit", "scoped own pending", "scoped other pending", "scoped moved", "scoped unscoped", "scoped uncertified"
 };
 
 std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count)>& targetMemoEvents() {
@@ -3466,6 +3469,23 @@ void reportTargetMemo() {
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s, all threads):%s\n", line.empty() ? " none" : line.c_str());
 }
 
+std::atomic<TargetMemoC2Mutant> targetMemoC2Mutant{TargetMemoC2Mutant::None};
+
+bool targetMemoScoped() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemoC2);
+}
+
+bool metadataOutsideImage(const ColorTarget& color, const StorageTexture& resident) {
+    return (color.dccAddress != 0 && color.dccAddress != resident.Descriptor().dccAddress) || color.chainDccAddress != 0 || color.cmaskAddress != 0;
+}
+
+bool proofsOrPendingOnly(const TargetProof& before, const TargetProof& after) {
+    auto rest = after;
+    rest.proofs = before.proofs;
+    rest.pending = before.pending;
+    return rest == before;
+}
+
 bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     if (before == after) return true;
     const auto note = [&](bool changed, TargetMemoEvent event) { if (changed) noteTargetMemo(event); };
@@ -3479,10 +3499,7 @@ bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
     note(before.claims != after.claims, TargetMemoEvent::Claims);
     note(before.recorder != after.recorder, TargetMemoEvent::Recorder);
     note(before.device != after.device, TargetMemoEvent::Device);
-    auto rest = after;
-    rest.proofs = before.proofs;
-    rest.pending = before.pending;
-    note(rest == before, TargetMemoEvent::ProofsOrPendingOnly);
+    note(proofsOrPendingOnly(before, after), TargetMemoEvent::ProofsOrPendingOnly);
     return false;
 }
 
@@ -3522,7 +3539,7 @@ bool metadataProved(const ColorTarget& color) {
     return proved;
 }
 
-void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
+void rememberTargets(const Context& context, const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
     ++targetMemoBuilds;
     noteTargetMemo(TargetMemoEvent::Build);
     auto& colors = ThreadTargetMemo().colors;
@@ -3537,12 +3554,52 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         colors.descriptors.assign(state.colors.begin(), state.colors.end());
         colors.attachments.resize(targets.size());
         for (std::size_t index = 0; index < targets.size(); ++index) colors.attachments[index] = {targets[index].resident, targets[index].proxied, views[index]};
+        if (targetMemoScoped()) {
+            for (std::size_t index = 0; index < targets.size(); ++index) {
+                auto& attachment = colors.attachments[index];
+                attachment.certificate = targets[index].resident->TakeTargetCertificate();
+                attachment.certified = !metadataOutsideImage(state.colors[index], *targets[index].resident) || targetMemoC2Mutant.load(std::memory_order_relaxed) == TargetMemoC2Mutant::CertifiesMetadata;
+            }
+            if (currentTargetProof(context) != proof) {
+                for (auto& attachment : colors.attachments) attachment.certified = false;
+            }
+        }
     }
     depth.valid = enabled && (!state.depth || state.depth->samples == 1u);
     if (depth.valid) {
         depth.proof = proof;
         depth.descriptor = state.depth;
     }
+}
+
+bool scopedColorsHold(const ColorMemo& memo, const TargetProof& proof) {
+    if (!targetMemoScoped() || !proofsOrPendingOnly(memo.proof, proof) || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+    const auto mutant = targetMemoC2Mutant.load(std::memory_order_relaxed);
+    bool ownPending = false;
+    for (const auto& attachment : memo.attachments) {
+        if (!attachment.certified) {
+            noteTargetMemo(TargetMemoEvent::ScopedUncertified);
+            return false;
+        }
+        const auto resident = attachment.resident.lock();
+        if (resident == nullptr) {
+            noteTargetMemo(TargetMemoEvent::ResidentGone);
+            return false;
+        }
+        auto verdict = resident->TargetVerdictSince(attachment.certificate);
+        if (mutant == TargetMemoC2Mutant::AcceptsOtherPending && verdict == StorageTexture::TargetVerdict::OtherPending) verdict = StorageTexture::TargetVerdict::OwnPending;
+        if (mutant == TargetMemoC2Mutant::IgnoresVerdict) verdict = StorageTexture::TargetVerdict::Held;
+        switch (verdict) {
+            case StorageTexture::TargetVerdict::Held: break;
+            case StorageTexture::TargetVerdict::OwnPending: ownPending = true; break;
+            case StorageTexture::TargetVerdict::OtherPending: noteTargetMemo(TargetMemoEvent::ScopedOtherPending); return false;
+            case StorageTexture::TargetVerdict::Unscoped: noteTargetMemo(TargetMemoEvent::ScopedUnscoped); return false;
+            case StorageTexture::TargetVerdict::Moved: noteTargetMemo(TargetMemoEvent::ScopedMoved); return false;
+        }
+    }
+    noteTargetMemo(TargetMemoEvent::ScopedHit);
+    if (ownPending) noteTargetMemo(TargetMemoEvent::ScopedOwnPending);
+    return true;
 }
 
 bool repeatColors(const Context& context, const State& state, const TargetProof& proof, std::vector<TargetBinding>& targets, std::vector<VkImageView>& views) {
@@ -3555,7 +3612,7 @@ bool repeatColors(const Context& context, const State& state, const TargetProof&
         noteTargetMemo(TargetMemoEvent::Invalid);
         return false;
     }
-    if (!colorProofMatches(memo.proof, proof)) return false;
+    if (!colorProofMatches(memo.proof, proof) && !scopedColorsHold(memo, proof)) return false;
     if (memo.descriptors != state.colors) {
         noteTargetMemo(TargetMemoEvent::Descriptor);
         return false;
@@ -3870,7 +3927,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const bool unchanged = retainedOwner && repeatedColors && ThreadTargetMemo().colors.valid &&
             ThreadTargetMemo().colors.proof == preparedProof && unchangedDepth;
         if (admissionProof == preparedProof) {
-            if (!unchanged) rememberTargets(state, targets, targetViews, preparedProof);
+            if (!unchanged) rememberTargets(context, state, targets, targetViews, preparedProof);
         } else {
             noteTargetMemo(TargetMemoEvent::Admission);
             ThreadTargetMemo().Invalidate();
@@ -4878,6 +4935,10 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop) {
 
 std::uint64_t TargetMemoEvents(TargetMemoEvent event) {
     return targetMemoEvents()[static_cast<std::size_t>(event)].Sum();
+}
+
+void SetTargetMemoC2MutantForTest(TargetMemoC2Mutant mutant) {
+    targetMemoC2Mutant.store(mutant, std::memory_order_relaxed);
 }
 
 const char* TargetMemoEventName(TargetMemoEvent event) {
