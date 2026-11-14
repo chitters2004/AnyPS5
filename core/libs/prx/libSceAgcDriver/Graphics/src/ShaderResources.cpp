@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
@@ -7005,8 +7006,15 @@ std::size_t ShaderResources::DrawUploadLimit() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved, bool movedOnly, const BdaResources* faultRecord) const {
+    RecordSplit::Lap lap;
+    RecordSplit::Count(RecordSplit::Event::BindingCalls);
     requireGuestBuffers(moved);
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) return {};
+    lap.To(RecordSplit::Span::SetsGuard);
+    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || (usesBda && !spaceReuse)) {
+        RecordSplit::Count(RecordSplit::Event::BindingEarlyOuts);
+        return {};
+    }
+    std::uint64_t inner = 0;
     prepareFaultSlot();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
@@ -7028,6 +7036,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto& item = allocations[index];
         const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         if (override != moved.end() && !override->words.empty()) {
+            const auto uploadStart = lap.Now();
             auto slice = recorder.DrawUpload(override->size);
             std::memcpy(slice.bytes, override->words.data(), override->size);
             for (const auto& patch : dataPatches) {
@@ -7035,6 +7044,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             selected.push_back(index);
             keep({0, std::move(slice.buffer), slice.offset, override->size});
+            if (lap.On()) {
+                inner += lap.Since(uploadStart, RecordSplit::Span::SetsUploads);
+                RecordSplit::Count(RecordSplit::Event::Uploads);
+                RecordSplit::Count(RecordSplit::Event::UploadBytes, override->size);
+            }
             continue;
         }
         std::uint64_t address = item.address;
@@ -7056,7 +7070,9 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamped = true;
         }
         VkDeviceSize offset = 0;
+        const auto snapshotStart = lap.Now();
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        auto snapshotEvent = buffer != nullptr ? RecordSplit::Event::SnapshotFast : RecordSplit::Event::SnapshotReused;
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
         if (verifySnapshots && buffer != nullptr) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
@@ -7070,6 +7086,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (buffer == nullptr) {
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
+                snapshotEvent = RecordSplit::Event::Uploads;
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
                 buffer = std::move(slice.buffer);
@@ -7078,6 +7095,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 const auto generation = GuestMemory::CollectWrites(begin, bytes);
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
                 if (buffer == nullptr) {
+                    snapshotEvent = RecordSplit::Event::SnapshotNew;
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
                     std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
@@ -7086,20 +7104,53 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
         }
+        if (lap.On()) {
+            const bool upload = snapshotEvent == RecordSplit::Event::Uploads;
+            inner += lap.Since(snapshotStart, upload ? RecordSplit::Span::SetsUploads : RecordSplit::Span::SetsSnapshots);
+            RecordSplit::Count(snapshotEvent);
+            if (upload) RecordSplit::Count(RecordSplit::Event::UploadBytes, bytes);
+        }
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
-    if (selected.empty() && !rebound) return {};
+    lap.To(RecordSplit::Span::SetsWalk, inner);
+    if (selected.empty() && !rebound) {
+        RecordSplit::Count(RecordSplit::Event::BindingEarlyOuts);
+        return {};
+    }
+    if (lap.On()) {
+        RecordSplit::Fingerprint bindingsPrint;
+        RecordSplit::Fingerprint rangesPrint;
+        bindingsPrint.Mix(this);
+        bindingsPrint.Mix(faultRecord);
+        rangesPrint.Mix(this);
+        rangesPrint.Mix(faultRecord);
+        for (std::size_t index = 0; index < selected.size(); ++index) {
+            const auto& snapshot = result->snapshots[index];
+            bindingsPrint.Mix(selected[index]);
+            bindingsPrint.Mix(snapshot.buffer.get());
+            bindingsPrint.Mix(snapshot.offset);
+            bindingsPrint.Mix(snapshot.bytes);
+            rangesPrint.Mix(selected[index]);
+            rangesPrint.Mix(snapshot.address);
+            rangesPrint.Mix(snapshot.bytes);
+        }
+        RecordSplit::NoteBindings(bindingsPrint.Value(), rangesPrint.Value());
+    }
     writeDrawSets(*result, selected, faultRecord);
+    lap.To(RecordSplit::Span::SetsWrite);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    lap.To(RecordSplit::Span::SetsKeeps);
     return result;
 }
 
 void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    RecordSplit::Lap lap;
+    RecordSplit::Count(RecordSplit::Event::SetsWritten);
     std::array<bool, 2> described{};
     thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
     auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
@@ -7115,6 +7166,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         else sizes.push_back({binding.layout.descriptorType, count});
     }
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+    lap.To(RecordSplit::Span::SetsRecount);
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result.cache = context.descriptorCache;
@@ -7128,6 +7180,7 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         result.fragmentLayout = fragment.layout;
         Require(result.fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
+    lap.To(RecordSplit::Span::SetsAllocate);
     thread_local std::vector<VkDescriptorBufferInfo>* buffersSlot = nullptr;
     auto& buffers = ShaderRecompiler::ThreadOwned(buffersSlot);
     buffers = descriptorBuffers;
@@ -7159,7 +7212,9 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
+    lap.To(RecordSplit::Span::SetsBuild);
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    lap.To(RecordSplit::Span::SetsUpdate);
 }
 
 ShaderResources::DrawUse::~DrawUse() {
@@ -7185,6 +7240,14 @@ void ShaderResources::CompleteDrawUse(const DrawUse& use) const {
     if (bda != nullptr) bda->CheckUse(use.record.get());
 }
 
+void ShaderResources::NoteGraphicsSets(VkCommandBuffer commands, VkPipelineLayout layout, VkDescriptorSet set, VkDescriptorSet fragmentSet) {
+    if (!RecordSplit::Enabled()) return;
+    const auto* recorder = Recorder::Active();
+    const auto stream = RecordSplit::Stream(commands, recorder != nullptr ? recorder->OpenSerial() : 0);
+    if (set != VK_NULL_HANDLE) RecordSplit::NoteSetBind(stream, layout, 0, set);
+    if (fragmentSet != VK_NULL_HANDLE) RecordSplit::NoteSetBind(stream, layout, 1, fragmentSet);
+}
+
 void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const {
     if (use == nullptr || use->bindings == nullptr) {
         Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout);
@@ -7193,6 +7256,7 @@ void ShaderResources::BindDrawUse(VkCommandBuffer commands, VkPipelineLayout lay
     requireGuestBuffers();
     const auto set = use->bindings->allocation.set;
     const auto fragmentSet = use->bindings->fragmentAllocation.set;
+    NoteGraphicsSets(commands, layout, set, fragmentSet);
     if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
     if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
 }
@@ -7230,6 +7294,7 @@ void ShaderResources::requireGuestBuffers(std::span<const MovedBuffer> moved) co
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     requireGuestBuffers();
     prepareFaultSlot();
+    if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) NoteGraphicsSets(commands, layout, _set, fragment.set);
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
 }

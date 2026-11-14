@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1006,6 +1007,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", RecordSplit::Describe(RecordSplit::Take(), profile.draws).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {
@@ -2304,6 +2306,11 @@ void CompactIndirectListRestart(const Context& context, const Pm4::DrawParameter
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
+std::uint64_t splitStream(const Recorder* recorder, VkCommandBuffer commands) {
+    if (recorder == nullptr) recorder = Recorder::Active();
+    return RecordSplit::Stream(commands, recorder != nullptr ? recorder->OpenSerial() : 0);
+}
+
 bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, const DrawTraceContext* trace, std::uint32_t& subdraw, std::optional<std::uint32_t> pieceFirstIndex = std::nullopt) {
     bool emitted = false;
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
@@ -2329,15 +2336,24 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
         emitted = true;
         return true;
     }
-    if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+    const auto stream = RecordSplit::Enabled() ? splitStream(context.recorder, commands) : 0;
+    if (!inputs.vertexHandles.empty()) {
+        RecordSplit::NoteVertexBind(stream, inputs.vertexHandles, inputs.vertexOffsets);
+        context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
+    }
     if (inputs.expandedIndexCount != 0u) {
+        RecordSplit::NoteIndexBind(stream, inputs.indexHandle, inputs.indexOffset, VK_INDEX_TYPE_UINT32);
         context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, VK_INDEX_TYPE_UINT32);
         CountVkDraw(VkDrawKind::Indexed);
         context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, inputs.expandedIndexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         emitted = true;
         return true;
     }
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    if (draw.indexed) {
+        const auto indexType = draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+        RecordSplit::NoteIndexBind(stream, inputs.indexHandle, inputs.indexOffset, indexType);
+        context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, indexType);
+    }
     if (args == nullptr) {
         if (draw.indexed) {
             CountVkDraw(VkDrawKind::Indexed);
@@ -2722,6 +2738,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
             std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
             stages |= VK_SHADER_STAGE_GEOMETRY_BIT;
         }
+        if (RecordSplit::Enabled()) RecordSplit::NotePush(splitStream(nullptr, commands), pipeline.Layout(), stages, block);
         pipeline.PushConstants(commands, stages, block);
         return;
     }
@@ -2731,6 +2748,7 @@ void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const
     if (state.tessellationCapture != nullptr) words = {static_cast<std::uint32_t>(capturedItems), static_cast<std::uint32_t>(capturedItems >> 32u), 0u, 0u, static_cast<std::uint32_t>(meshArguments), static_cast<std::uint32_t>(meshArguments >> 32u)};
     static_assert(ShaderRecompiler::MeshDrawPushOffsetBytes + ShaderRecompiler::MeshDrawPushBytes == PipelinePushSlotBytes);
     std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+    if (RecordSplit::Enabled()) RecordSplit::NotePush(splitStream(nullptr, commands), pipeline.Layout(), stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
     pipeline.PushConstants(commands, stages | VK_SHADER_STAGE_MESH_BIT_EXT, block);
 }
 
@@ -2824,6 +2842,8 @@ bool WriteOnlyPasses() {
 }
 
 void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+    RecordSplit::Lap lap;
+    RecordSplit::Count(RecordSplit::Event::Draws);
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -2855,6 +2875,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
+    lap.To(RecordSplit::Span::Flush);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
@@ -2879,7 +2900,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
+    lap.To(RecordSplit::Span::Access);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    lap.To(RecordSplit::Span::DrawSets);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -2910,10 +2933,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
+    if (lap.On()) {
+        RecordSplit::Count(RecordSplit::Event::ReadRanges, passReads.size());
+        RecordSplit::Count(RecordSplit::Event::WriteRanges, passWrites.size() + passWriteOnly.size());
+        RecordSplit::Count(RecordSplit::Event::StorageImages, passImages.size());
+    }
+    lap.To(RecordSplit::Span::PassAccess);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    lap.To(RecordSplit::Span::StartPass);
     if (record.spaceKeep != nullptr) *record.spaceKeep = reserveSpaceKeep(*recorder, resources);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
+    RecordSplit::Count(continued ? RecordSplit::Event::PassesContinued : RecordSplit::Event::PassesBegun);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     outcome.passBreak = start.reason;
@@ -2947,6 +2978,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    lap.To(RecordSplit::Span::PassSetup);
     if (continued) {
         record.pipeline->Continue(recording, state, record.masked);
     } else {
@@ -2988,10 +3020,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         record.pipeline->Begin(recording, *record.framebuffer, state.renderExtent, state, record.masked);
     }
+    lap.To(RecordSplit::Span::PassState);
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
         const auto set = drawBindings->allocation.set;
         const auto fragmentSet = drawBindings->fragmentAllocation.set;
+        ShaderResources::NoteGraphicsSets(commands, record.pipeline->Layout(), set, fragmentSet);
         if (set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
         if (fragmentSet != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragmentSet, 0, nullptr);
     } else {
@@ -2999,8 +3033,10 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) BindPixelFunctionLds(context, commands, record.pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, record.pipeline->Layout());
+    lap.To(RecordSplit::Span::Binds);
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, record.pushBytes, record.pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
+    lap.To(RecordSplit::Span::Push);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     static const bool timeEachDraw = std::getenv("APS5_PROFILE_GPU_DRAWS") != nullptr;
     auto eachDrawTiming = Recorder::NoTiming;
@@ -3025,6 +3061,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(recording, state, record.masked);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
+    lap.To(RecordSplit::Span::Commands);
     recorder->EndGpuTiming(eachDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (argumentSnapshot != nullptr) recorder->Keep(argumentSnapshot);
@@ -3055,7 +3092,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
+    lap.To(RecordSplit::Span::Tail);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    lap.To(RecordSplit::Span::Leave);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
@@ -3815,6 +3854,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     const auto& reorderPass = prepared.reorderPass;
     const auto& depthLocations = prepared.depthLocations;
     if (lean) {
+        RecordSplit::Lap assembling;
         RecordedDraw record;
         record.recorder = recorder;
         record.resources = resources;
@@ -3853,6 +3893,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         record.depthLocations = depthLocations;
         record.spaceKeep = &prepared.spaceKeep;
         record.masked = prepared.masked.has_value() ? &*prepared.masked : nullptr;
+        assembling.To(RecordSplit::Span::Assemble);
         recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, prepared.trace);
         // The recipe for the caller's draw-cache entry (design_cpu_final M8, rule R3 for draws):
         // only a template the resource cache serves under this content key (reusable: no lease,

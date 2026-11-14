@@ -254,6 +254,38 @@ void testWriteOnly() {
     Expect(hazards.Empty(), "cleared write-only stores");
 }
 
+void testAddedCounts() {
+    GuestRangeSet set;
+    Expect(set.Insert(0x1000, 0x2000), "a new range changes the set");
+    Expect(!set.Insert(0x1000, 0x2000), "the same range changes nothing");
+    Expect(!set.Insert(0x1400, 0x1800), "a covered range changes nothing");
+    Expect(set.Insert(0x2000, 0x2400), "an adjacent range extends the set");
+    Expect(set.Insert(0x0800, 0x1100), "an overlapping range extends the set");
+    Expect(!set.Insert(0x3000, 0x3000), "an empty range changes nothing");
+    PassHazards hazards;
+    hazards.BeginPass();
+    Use draw;
+    draw.reads = {{0x1000, 0x2000}, {0x4000, 0x5000}};
+    draw.writes = {{0x8000, 0x9000}};
+    draw.images = {{image(1), false}};
+    draw.attachments = {{image(2), true}};
+    auto added = hazards.Add(draw.View());
+    Expect(added.rangesOffered == 3 && added.rangesChanged == 3, "a first draw adds every range");
+    Expect(added.imagesOffered == 2 && added.imagesNew == 2, "a first draw adds every image");
+    Expect(hazards.RangeCount() == 3 && hazards.ImageCount() == 2, "the pass holds what the first draw added");
+    added = hazards.Add(draw.View());
+    Expect(added.rangesOffered == 3 && added.rangesChanged == 0, "a repeated draw changes no range");
+    Expect(added.imagesOffered == 2 && added.imagesNew == 0, "a repeated draw adds no image");
+    Use next;
+    next.reads = {{0x1800, 0x2800}};
+    next.attachments = {{image(2), true}, {VK_NULL_HANDLE, true}};
+    added = hazards.Add(next.View());
+    Expect(added.rangesOffered == 1 && added.rangesChanged == 1 && added.imagesOffered == 1 && added.imagesNew == 0, "a widened read changes its range, a null image is not offered");
+    Expect(hazards.RangeCount() == 3 && hazards.ImageCount() == 2, "a widened read merges into its range");
+    hazards.Clear();
+    Expect(hazards.RangeCount() == 0 && hazards.ImageCount() == 0, "cleared counts");
+}
+
 int main() {
     testRangeSet();
     testRanges();
@@ -261,6 +293,7 @@ int main() {
     testImages();
     testAttachments();
     testWriteOnly();
+    testAddedCounts();
     if (failures != 0) {
         std::fprintf(stderr, "%d pass hazard checks failed\n", failures);
         return 1;
