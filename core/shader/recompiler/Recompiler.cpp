@@ -2143,6 +2143,7 @@ void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
     const auto* tape = runtime.sizedReadLog ? Detail::SrtTape::For(plan) : nullptr;
+    ResourceMaterializer::NoteFastCapture(!runtime.sizedReadLog ? FastCaptureCount::ReadLogsSlowArm : tape != nullptr ? FastCaptureCount::ReadLogsSized : FastCaptureCount::ReadLogsUnsized);
     if (tape != nullptr) capture.userDataUse.reads.reserve(tape->Reads());
     if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);

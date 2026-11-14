@@ -121,6 +121,7 @@ struct SrtRuntime {
     bool fastCapture = false;
     bool sizedReadLog = false;
     bool batchedDescriptorReads = false;
+    bool countedFastCapture = true;
 };
 
 struct SrtForceSyncScope {

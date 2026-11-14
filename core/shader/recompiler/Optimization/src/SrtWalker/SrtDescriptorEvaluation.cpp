@@ -1,4 +1,5 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtTape.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -404,6 +405,7 @@ UnbatchedWalk walkUnbatched(const SrtTape& tape, const IrResourcePlan& program, 
     UnbatchedWalk walk;
     SrtRuntime unbatched = runtime;
     unbatched.batchedDescriptorReads = false;
+    unbatched.countedFastCapture = false;
     if (runtime.userDataUse != nullptr) {
         walk.use = *runtime.userDataUse;
         unbatched.userDataUse = &walk.use;
@@ -432,7 +434,9 @@ void verifyBatchedReads(const IrResourcePlan& program, const UnbatchedWalk& expe
 bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const std::uint32_t> sources, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, bool evaluateFlat, std::span<const std::uint8_t> cleanFlatSlots, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads) {
     const bool planInputs = evaluateFlat && sources.data() == program.materializationSources.data() && sources.size() == program.materializationSources.size() && cleanFlatSlots.data() == program.cleanFlatSlots.data() && cleanFlatSlots.size() == program.cleanFlatSlots.size();
     if (planInputs) {
-        if (const auto* tape = SrtTape::For(program); tape != nullptr) {
+        const auto* tape = SrtTape::For(program);
+        if (tape == nullptr) ResourceMaterializer::NoteFastCapture(FastCaptureCount::NoTape);
+        if (tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
             std::optional<SrtUserDataUse> useBefore;
@@ -440,6 +444,7 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
             std::optional<UnbatchedWalk> unbatched;
             if (SrtTape::BatchVerified() && runtime.batchedDescriptorReads) unbatched = walkUnbatched(*tape, program, runtime);
             const bool ran = tape->Run(program, runtime, results, flat, activeSources);
+            ResourceMaterializer::NoteFastCapture(ran ? FastCaptureCount::TapeRuns : FastCaptureCount::TapeRefused);
             if (unbatched) verifyBatchedReads(program, *unbatched, ran, runtime, results, flat, activeSources);
             if (ran) {
                 if (poison != nullptr) poison->clear();
