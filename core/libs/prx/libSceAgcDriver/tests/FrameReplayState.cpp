@@ -1007,7 +1007,9 @@ void testHostShaderPageGpuStore(const std::filesystem::path& directory) {
     constexpr std::size_t Page = AgcDriver::FrameRecorder::HostPageBytes;
     constexpr std::size_t CodeBytes = 256;
     constexpr std::uint32_t Stored = 0x600dcafeu;
-    auto* shader = reinterpret_cast<Shader*>(allocate(1u << 20));
+    auto* block = allocate(1u << 20);
+    auto* shader = reinterpret_cast<Shader*>(block);
+    auto* commands = reinterpret_cast<std::uint32_t*>(block + Page);
 #ifdef _WIN32
     auto* host = static_cast<std::byte*>(VirtualAlloc(nullptr, Page, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
 #else
@@ -1038,8 +1040,12 @@ void testHostShaderPageGpuStore(const std::filesystem::path& directory) {
     };
     store(17);
     recorder->RegisterShader(shader);
-    std::atomic_ref<std::uint32_t>(*label).store(Stored, std::memory_order_release);
-    AgcDriver::FrameRecorder::NoteGpuStore(address(label), std::as_bytes(std::span(label, 1)));
+    const std::array<std::uint32_t, 5> write{0xc0033700u, 0x00100200u, static_cast<std::uint32_t>(address(label)), static_cast<std::uint32_t>(address(label) >> 32u), Stored};
+    std::memcpy(commands, write.data(), sizeof(write));
+    Packet packet{commands, static_cast<std::uint32_t>(write.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&packet) == 0, "the label write was not submitted");
+    AgcDriverWaitIdle_nid_postfix();
+    check(std::atomic_ref<std::uint32_t>(*label).load(std::memory_order_acquire) == Stored, "the queue did not write the label");
     const auto expected = store(29);
     recorder->RegisterShader(shader);
     recorder->FrameBoundary();
