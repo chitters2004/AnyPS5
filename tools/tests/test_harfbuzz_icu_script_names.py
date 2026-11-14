@@ -23,7 +23,7 @@ def header_text(codes, reverse=False):
     return "\n".join(["typedef enum UScriptCode {"] + entries + ["} UScriptCode;", ""]).encode("ascii")
 
 
-class GeneratorOutputTests(unittest.TestCase):
+class GeneratorTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="icu script names ")
         self.addCleanup(temporary.cleanup)
@@ -47,6 +47,12 @@ class GeneratorOutputTests(unittest.TestCase):
         self.assertEqual(re.findall(r'"([A-Z]{4})"', text), [script_name(code) for code in codes])
         rows = [line for line in text.splitlines() if line.startswith('    "')]
         self.assertEqual([row.count('"') // 2 for row in rows], [10] * 19 + [3])
+
+    def test_a_header_with_another_checksum_is_refused_and_nothing_is_written(self):
+        with self.assertRaises(SystemExit) as refused:
+            self.generate(header_text(range(SCRIPT_COUNT)), checksum="0" * 64)
+        self.assertEqual(refused.exception.code, 2)
+        self.assertFalse((self.root / "IcuScriptNames.hpp").exists())
 
 
 if __name__ == "__main__":
