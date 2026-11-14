@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -85,8 +86,11 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
             recordQueuedLabelsBeforeRead(submission.queue);
             if (!indirectRecordsDraw(*drawParameters.indirect)) return DrawVerdict::Nothing;
         }
+        const auto colorWrites = metadata ? Graphics::PipelinedColorMetadataPassWrites(*metadata) : std::vector<std::pair<std::uint64_t, std::uint64_t>>{};
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        GuestMemory::RangedGpuHold gpuLock(Graphics::RangedGpuEntries() && (expand.has_value() || !colorWrites.empty()));
+        for (const auto& [begin, end] : colorWrites) GuestMemory::RangedGpuWrites(begin, end - begin);
+        if (expand) Graphics::DepthExpandPassWrites(*expand);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
         const std::shared_ptr<VulkanDevice> localDevice = device;
         recordLabelsForPacket(localDevice.get(), submission.queue);

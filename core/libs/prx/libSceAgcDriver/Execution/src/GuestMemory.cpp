@@ -3278,14 +3278,63 @@ bool GpuMutexType::tryEnter() {
     return HeldByThisThread() || mutex.try_lock();
 }
 
+namespace {
+
+struct RangedGpuEntry {
+    bool requested = false;
+    bool claimed = false;
+    bool active = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+};
+
+thread_local RangedGpuEntry rangedGpuEntry;
+
+}
+
+bool RequestRangedGpuEntry(bool ranged) {
+    auto& entry = rangedGpuEntry;
+    entry.requested = ranged && !proofThread && !GpuMutex().HeldByThisThread();
+    return entry.active;
+}
+
+bool ClaimRangedGpuEntry() {
+    auto& entry = rangedGpuEntry;
+    entry.requested = false;
+    return std::exchange(entry.claimed, false);
+}
+
+void ReleaseRangedGpuEntry(bool claimed, bool previous, std::size_t first) {
+    auto& entry = rangedGpuEntry;
+    if (!claimed) return;
+    for (std::size_t write = first; write < entry.writes.size(); ++write) BumpRangeVersions(entry.writes[write].first, entry.writes[write].second, RangeSource::NonDraw);
+    entry.writes.resize(first);
+    entry.active = previous;
+}
+
+std::size_t RangedGpuWriteCount() {
+    return rangedGpuEntry.writes.size();
+}
+
+void RangedGpuWrites(std::uint64_t address, std::uint64_t bytes) {
+    auto& entry = rangedGpuEntry;
+    if (!entry.active || bytes == 0) return;
+    BumpRangeVersions(address, bytes, RangeSource::NonDraw);
+    entry.writes.emplace_back(address, bytes);
+}
+
 void GpuMutexType::acquired(const void* caller) {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) {
             BreakProofs();
-            BumpUnscopedVersion(UnscopedSource::GpuMutex);
-            if (ScopedProofsProfiled()) countGpuMutexEntry(caller);
+            if (std::exchange(rangedGpuEntry.requested, false)) {
+                rangedGpuEntry.claimed = true;
+                rangedGpuEntry.active = true;
+            } else {
+                BumpUnscopedVersion(UnscopedSource::GpuMutex);
+                if (ScopedProofsProfiled()) countGpuMutexEntry(caller);
+            }
         }
     }
 }

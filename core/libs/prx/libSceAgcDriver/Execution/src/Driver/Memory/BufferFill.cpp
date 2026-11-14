@@ -9,6 +9,7 @@
 #include <algorithm>
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <bit>
 #include <cstdlib>
 #include <initializer_list>
@@ -351,7 +352,8 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
     if (bytes == 0) return;
     const auto store = [this, queueId, base, bytes, pattern, localDevice, memoryValueFill, noteMetadata] {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        GuestMemory::RangedGpuHold gpuLock(Graphics::RangedGpuEntries());
+        GuestMemory::RangedGpuWrites(base, bytes);
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto phaseStart = holdStart;
         const auto phase = [&](FillPhase which) {

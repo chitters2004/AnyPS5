@@ -3546,6 +3546,14 @@ bool DepthTargetOverlaps(const DepthTarget& target, std::uint64_t address, std::
 
 namespace {
 
+void depthTargetWrites(const DepthTarget& target) {
+    const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
+    const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    GuestMemory::RangedGpuWrites(target.address, planeBytes(d16 ? 2u : 4u));
+    if (target.stencilAddress != 0u) GuestMemory::RangedGpuWrites(target.stencilAddress, planeBytes(1u));
+    if (target.htileAddress != 0u) GuestMemory::RangedGpuWrites(target.htileAddress, HtileMetadataBytes(target.extent));
+}
+
 bool resident(std::uint64_t address, std::uint64_t bytes) {
     return GuestMemory::DescribeCommitted(address, static_cast<std::size_t>(bytes)).whole;
 }
@@ -4286,7 +4294,8 @@ std::optional<float> planeFillDepth(const DepthTarget& target, std::uint64_t add
 
 void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32_t pattern) {
     forgetCopiesInside(address, bytes);
-    std::lock_guard gpu(GuestMemory::GpuMutex());
+    GuestMemory::RangedGpuHold gpu(RangedGpuEntries());
+    GuestMemory::RangedGpuWrites(address, bytes);
     std::lock_guard lock(surfacesMutex());
     forgetHtileReads(address, bytes);
     for (const auto& surface : surfaces()) {
@@ -4386,10 +4395,11 @@ std::size_t DiscardFilledDepthPlanes(std::uint64_t address, std::size_t bytes, s
 }
 
 void NoteDepthRenderControl(const DepthRenderControl& draw) {
-    std::lock_guard gpu(GuestMemory::GpuMutex());
+    GuestMemory::RangedGpuHold gpu(RangedGpuEntries());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
         if (!surface->active->load(std::memory_order_acquire) || surface->target.samples == 1u || surface->target.samples != draw.samples || surface->target.address != draw.address) continue;
+        depthTargetWrites(surface->target);
         surface->renderControl = draw.control;
         const bool depthExpand = (draw.control & 0x40u) != 0u;
         const bool stencilExpand = (draw.control & 0x20u) != 0u;
@@ -4652,6 +4662,13 @@ void RunDepthExpandPass(const Context& context, const DepthExpandPass& pass) {
         }
     }
     if (!copied) expandsSkipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+void DepthExpandPassWrites(const DepthExpandPass& pass) {
+    const bool d16 = sixteenBitDepth(pass.source.format);
+    if (pass.destination != 0u) GuestMemory::RangedGpuWrites(pass.destination, DepthSliceBytes(pass.source.extent, d16 ? 2u : 4u));
+    if (pass.stencilDestination != 0u) GuestMemory::RangedGpuWrites(pass.stencilDestination, DepthSliceBytes(pass.source.extent, 1u));
+    depthTargetWrites(pass.source);
 }
 
 void StoreDepthExpandWrites(const Context& context) {

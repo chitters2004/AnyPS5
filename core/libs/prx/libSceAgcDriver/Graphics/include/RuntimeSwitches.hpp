@@ -21,6 +21,7 @@ enum class RuntimeSwitch : std::size_t {
     NoTargetMemo,
     NoTargetMemoOverlapCache,
     NoScopedProofs,
+    NoRangedGpuEntries,
     Count,
 };
 
@@ -31,6 +32,10 @@ bool Set(RuntimeSwitch id);
 void Assign(RuntimeSwitch id, bool set);
 std::optional<RuntimeSwitch> Find(std::string_view name);
 
+}
+
+inline bool RangedGpuEntries() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoRangedGpuEntries);
 }
 
 class AbSchedule {

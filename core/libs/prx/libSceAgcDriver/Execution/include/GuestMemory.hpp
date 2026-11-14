@@ -259,6 +259,29 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+bool RequestRangedGpuEntry(bool ranged);
+bool ClaimRangedGpuEntry();
+void ReleaseRangedGpuEntry(bool claimed, bool previous, std::size_t first);
+std::size_t RangedGpuWriteCount();
+void RangedGpuWrites(std::uint64_t address, std::uint64_t bytes);
+class RangedGpuHold {
+public:
+    [[gnu::always_inline]] explicit RangedGpuHold(bool ranged) : previous(RequestRangedGpuEntry(ranged)), first(RangedGpuWriteCount()) {
+        GpuMutex().lock();
+        claimed = ClaimRangedGpuEntry();
+    }
+    ~RangedGpuHold() {
+        ReleaseRangedGpuEntry(claimed, previous, first);
+        GpuMutex().unlock();
+    }
+    RangedGpuHold(const RangedGpuHold&) = delete;
+    RangedGpuHold& operator=(const RangedGpuHold&) = delete;
+
+private:
+    bool previous = false;
+    bool claimed = false;
+    std::size_t first = 0;
+};
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
