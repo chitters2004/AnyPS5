@@ -40,6 +40,7 @@ struct Record {
     std::uint64_t waitNs = 0;
     std::uint64_t committerNs = 0;
     std::uint32_t running = 0;
+    std::chrono::steady_clock::time_point started{};
     bool executed = false;
     bool quiet = false;
 };
@@ -57,6 +58,8 @@ struct State {
     std::uint64_t groups = 0;
     Totals total;
     Totals window;
+    std::uint64_t windowSubmissions = 0;
+    HeldFrames held;
     std::string detail;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
@@ -305,26 +308,38 @@ Totals analyse(std::vector<Record*>& records, std::string& detail) {
 }
 
 void closeFrames(State& shared, bool all) {
+    HeldFrames held;
+    const auto now = std::chrono::steady_clock::now();
     for (auto frame = shared.frames.begin(); frame != shared.frames.end();) {
         const auto index = frame->first;
         if (index >= shared.frame) break;
         if (!all && index + 2 > shared.frame) break;
         std::vector<Record*> records;
         bool finished = true;
-        bool running = false;
+        const Record* runner = nullptr;
         for (const auto serial : frame->second) {
             const auto found = shared.records.find(serial);
             if (found == shared.records.end()) continue;
             if (!found->second->executed) finished = false;
-            if (found->second->running != 0) running = true;
+            if (found->second->running != 0 && (runner == nullptr || found->second->started < runner->started)) runner = found->second.get();
             records.push_back(found->second.get());
         }
-        if (running || (!finished && index + AbandonFrames > shared.frame)) {
-            if (all) {
-                ++frame;
-                continue;
+        if (runner != nullptr || (!finished && index + AbandonFrames > shared.frame)) {
+            if (held.frames++ == 0) held.oldestAge = shared.frame - index;
+            if (runner != nullptr) {
+                ++held.running;
+                const auto ran = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - runner->started).count());
+                if (ran >= held.holderNs) {
+                    held.holderNs = ran;
+                    held.holderSerial = runner->serial;
+                    held.holderQueue = runner->queue;
+                    held.holderAge = shared.frame - index;
+                }
+            } else {
+                ++held.unexecuted;
             }
-            break;
+            ++frame;
+            continue;
         }
         if (!records.empty()) {
             const auto totals = analyse(records, shared.detail);
@@ -334,6 +349,7 @@ void closeFrames(State& shared, bool all) {
         for (const auto serial : frame->second) shared.records.erase(serial);
         frame = shared.frames.erase(frame);
     }
+    shared.held = held;
 }
 
 double perFrame(std::uint64_t value, std::uint64_t frames) {
@@ -342,9 +358,21 @@ double perFrame(std::uint64_t value, std::uint64_t frames) {
 
 void report(State& shared, bool now) {
     const auto time = std::chrono::steady_clock::now();
-    if ((!now && time - shared.reported < std::chrono::seconds(10)) || shared.window.frames == 0) return;
+    if (!now && time - shared.reported < std::chrono::seconds(10)) return;
+    if (shared.window.frames == 0 && shared.windowSubmissions == 0 && shared.held.frames == 0) return;
     const auto seconds = std::chrono::duration<double>(time - shared.reported).count();
     shared.reported = time;
+    const auto& h = shared.held;
+    if (h.frames != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] held at %.0f s: %llu frames not closed (oldest %llu frames back), %llu by a running buffer, %llu by unexecuted buffers; longest running buffer 0x%x#%llu, %.1f ms so far, submitted %llu frames back\n", seconds,
+            static_cast<unsigned long long>(h.frames), static_cast<unsigned long long>(h.oldestAge), static_cast<unsigned long long>(h.running), static_cast<unsigned long long>(h.unexecuted), h.holderQueue, static_cast<unsigned long long>(h.holderSerial),
+            static_cast<double>(h.holderNs) / 1e6, static_cast<unsigned long long>(h.holderAge));
+    }
+    if (shared.window.frames == 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] %.0f s, 0 frames closed, %llu buffers submitted\n", seconds, static_cast<unsigned long long>(shared.windowSubmissions));
+        shared.windowSubmissions = 0;
+        return;
+    }
     const auto& w = shared.window;
     const auto frames = w.frames;
     const auto work = w.workerNs + w.committerNs;
@@ -367,6 +395,7 @@ void report(State& shared, bool now) {
         perFrame(w.coveringBuffers, frames));
     AgcDriver::ProfilePrint_nid_no_patch("[guest-cbs] last frame (queue#serial tsubmit/builders draws dispatches worker+committer reads writes sharing):%s\n", shared.detail.c_str());
     shared.window = Totals{};
+    shared.windowSubmissions = 0;
 }
 
 }
@@ -416,8 +445,13 @@ void NoteSubmitted(std::uint64_t serial, std::uint32_t queue, const std::uint32_
         }
         shared.frames[shared.frame].push_back(serial);
         shared.records[serial] = std::move(record);
+        ++shared.windowSubmissions;
     }
-    if (flip || cpuFlip) ++shared.frame;
+    if (flip || cpuFlip) {
+        ++shared.frame;
+        closeFrames(shared, false);
+        report(shared, false);
+    }
 }
 
 void NoteFlip() {
@@ -425,6 +459,8 @@ void NoteFlip() {
     auto& shared = state();
     std::lock_guard lock(shared.mutex);
     ++shared.frame;
+    closeFrames(shared, false);
+    report(shared, false);
 }
 
 bool Recording() {
@@ -522,7 +558,7 @@ Execution::Execution(std::uint64_t serial) {
     const auto found = shared.records.find(serial);
     if (found == shared.records.end()) return;
     auto& record = *found->second;
-    ++record.running;
+    if (record.running++ == 0) record.started = std::chrono::steady_clock::now();
     record.executed = false;
     current() = &record;
     active = true;
@@ -542,6 +578,13 @@ Execution::~Execution() {
     record->executed = --record->running == 0;
     closeFrames(shared, false);
     report(shared, false);
+}
+
+HeldFrames Held() {
+    auto& shared = state();
+    std::lock_guard lock(shared.mutex);
+    closeFrames(shared, false);
+    return shared.held;
 }
 
 Totals Closed() {

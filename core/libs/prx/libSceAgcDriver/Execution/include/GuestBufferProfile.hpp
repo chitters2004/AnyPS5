@@ -81,7 +81,19 @@ struct Totals {
     std::uint64_t coveringBuffers = 0;
 };
 
+struct HeldFrames {
+    std::uint64_t frames = 0;
+    std::uint64_t oldestAge = 0;
+    std::uint64_t running = 0;
+    std::uint64_t unexecuted = 0;
+    std::uint64_t holderSerial = 0;
+    std::uint32_t holderQueue = 0;
+    std::uint64_t holderAge = 0;
+    std::uint64_t holderNs = 0;
+};
+
 Totals Closed();
+HeldFrames Held();
 void CloseFinished();
 
 }

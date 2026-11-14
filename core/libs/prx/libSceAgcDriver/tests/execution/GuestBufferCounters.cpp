@@ -15,6 +15,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -135,13 +136,47 @@ void ExpectStored(const std::uint32_t* target, const std::string& what) {
 
 }
 
-int main() {
+int HeldFrame() {
+    Profile::NoteSubmitted(1, 0, nullptr, 0, false, false);
+    std::atomic<bool> started{false};
+    std::atomic<bool> release{false};
+    std::thread holder([&] {
+        const Profile::Execution execution(1);
+        started.store(true);
+        while (!release.load()) std::this_thread::yield();
+    });
+    while (!started.load()) std::this_thread::yield();
+    constexpr std::uint64_t Frames = 40;
+    for (std::uint64_t frame = 0; frame < Frames; ++frame) {
+        const auto serial = frame + 2;
+        Profile::NoteSubmitted(serial, 0, nullptr, 0, true, false);
+        const Profile::Execution execution(serial);
+    }
+    const auto held = Profile::Held();
+    const auto steady = Profile::Closed();
+    release.store(true);
+    holder.join();
+    Profile::CloseFinished();
+    const auto all = Profile::Closed();
+    Expect(steady.frames, Frames - 2, "frames closed while an earlier frame's buffer still runs");
+    Expect(held.frames, 1, "frames held by the running buffer");
+    Expect(held.running, 1, "frames held by a running buffer");
+    Expect(held.unexecuted, 0, "frames held by unexecuted buffers");
+    Expect(held.holderSerial, 1, "the running buffer's serial");
+    Expect(held.oldestAge, Frames, "frames back to the held frame");
+    Expect(all.frames, Frames, "frames closed once the running buffer finished");
+    std::puts("guest buffer counters held frame tests passed");
+    return 0;
+}
+
+int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PROFILE_DRAW", "1");
 #else
     setenv("APS5_PROFILE_DRAW", "1", 1);
 #endif
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--held-frame") return HeldFrame();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
