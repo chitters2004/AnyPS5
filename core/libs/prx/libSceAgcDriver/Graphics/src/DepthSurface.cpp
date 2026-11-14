@@ -3532,7 +3532,9 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     std::uint64_t stencilCollected = 0;
     if (mirrorable(target)) depthCollected = surface->SyncFromMemory(mirrorResource(target));
     if (surface->StencilMirrorable()) stencilCollected = surface->SyncStencilFromMemory(stencilResource(target));
+    const auto writtenBeforeTake = surface->written;
     surface->TakeStencilStorage();
+    if (surface->written != writtenBeforeTake) stencilCollected = 0;
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
