@@ -277,7 +277,17 @@ void FrameRecorder::writeReferenceFrames() {
 }
 
 void FrameRecorder::record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders, const std::function<void()>& accept) {
-    std::lock_guard lock(mutex);
+    std::unique_lock lock(mutex);
+    if (accept && !prologueCall && state != State::Recording) {
+        unrecordedAccepts.fetch_add(1, std::memory_order_relaxed);
+        lock.unlock();
+        struct Accepted {
+            std::atomic<std::uint64_t>& count;
+            ~Accepted() { count.fetch_sub(1, std::memory_order_release); }
+        } accepted{unrecordedAccepts};
+        accept();
+        return;
+    }
     recordLocked(std::move(call), prologueCall, shaders);
     if (accept) accept();
 }
@@ -556,9 +566,9 @@ void FrameRecorder::stop(const char* reason) {
 void FrameRecorder::start() {
     ++startAttempts;
     auto& driver = DriverDetail::Driver::Get();
-    if (!driver.WaitIdleUnlessTitleWaitsFor(std::chrono::seconds(10))) {
+    if (unrecordedAccepts.load(std::memory_order_acquire) != 0 || !driver.WaitIdleUnlessTitleWaitsFor(std::chrono::seconds(10))) {
         if (startAttempts >= 600) {
-            std::fprintf(stderr, "[frame-capture] giving up: the driver was not idle at any of %llu frame boundaries\n", static_cast<unsigned long long>(startAttempts));
+            std::fprintf(stderr, "[frame-capture] giving up: the driver was not idle, or a guest call was still being accepted, at all of %llu frame boundaries\n", static_cast<unsigned long long>(startAttempts));
             state = State::Done;
         }
         return;
