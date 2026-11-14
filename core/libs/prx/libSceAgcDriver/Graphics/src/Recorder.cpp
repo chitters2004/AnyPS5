@@ -58,6 +58,16 @@
 
 namespace AgcDriver::Graphics {
 
+bool RecordSplit::Enabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+RecordSplit::Counters& RecordSplit::Shared() {
+    static Counters counters;
+    return counters;
+}
+
 namespace {
 
 Recorder* activeRecorder = nullptr;
