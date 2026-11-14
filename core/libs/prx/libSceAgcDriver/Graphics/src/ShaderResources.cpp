@@ -4479,6 +4479,35 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             noteEpochProof(true, false, false);
             return true;
         }
+        const bool scoped = epoch != 0 && LookupC2Scoped();
+        if (scoped && scopedRevalidate(epoch)) {
+            NoteLookupC2(LookupC2Count::ScopedHits);
+            if (LookupC2VerifyDue()) {
+                NoteLookupC2(LookupC2Count::Verified);
+                ProofReport full;
+                if (!revalidateFull(shaders, &full)) {
+                    NoteLookupC2(LookupC2Count::Disagreed);
+                    scopedProof.valid = false;
+                    provedEpoch = 0;
+                    if (report != nullptr) *report = full;
+                    return false;
+                }
+            }
+            if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None, false, false, true};
+            provedEpoch = epoch;
+            provedProof = proof;
+            provedPending = pending;
+            return true;
+        }
+        const bool stampAfter = LookupC2MutantForTest() == LookupC2Mutant::ScopedStampAfterProof;
+        GuestMemory::RangeStamp stamp;
+        std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> unscoped{};
+        if (scoped) {
+            buildProofRanges();
+            unscoped = GuestMemory::UnscopedVersionsByKind();
+            if (!stampAfter) stamp = GuestMemory::RangeVersionStamp(proofRanges);
+            NoteLookupC2(LookupC2Count::StampsTaken);
+        }
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
@@ -4488,9 +4517,87 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         } else {
             provedEpoch = 0;
         }
+        if (scoped) {
+            RunLookupC2ProofHook();
+            if (stampAfter) stamp = GuestMemory::RangeVersionStamp(proofRanges);
+            scopedProof = {stamp, epoch, ok && provedEpoch != 0};
+            scopedUnscoped = unscoped;
+            if (scopedProof.valid) NoteLookupC2(LookupC2Count::CertsStored);
+        }
         return ok;
     }
     return revalidateFull(shaders, report);
+}
+
+void ShaderResources::buildProofRanges() {
+    if (proofRangesBuilt) return;
+    proofRangesBuilt = true;
+    const auto add = [&](std::uint64_t address, std::uint64_t bytes) {
+        if (address != 0 && bytes != 0) proofRanges.emplace_back(address, address + bytes);
+    };
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin);
+    for (const auto& range : describedRanges) {
+        add(range.address, range.bytes);
+        if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& surface : validatedTextures) {
+        add(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        add(image->Descriptor().baseAddress, image->GuestBytes());
+        if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    std::sort(proofRanges.begin(), proofRanges.end());
+    std::size_t kept = 0;
+    for (const auto& range : proofRanges) {
+        if (kept != 0 && range.first <= proofRanges[kept - 1].second) proofRanges[kept - 1].second = std::max(proofRanges[kept - 1].second, range.second);
+        else proofRanges[kept++] = range;
+    }
+    proofRanges.resize(kept);
+}
+
+void ShaderResources::noteScopedMiss(bool collected) {
+    const auto now = GuestMemory::RangeVersionStamp(proofRanges);
+    if (now.unscoped == scopedProof.stamp.unscoped) {
+        NoteLookupC2(collected ? LookupC2Count::MissCollected : LookupC2Count::MissStamp);
+        return;
+    }
+    constexpr std::array<LookupC2Count, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> kinds{LookupC2Count::MissUnscopedNonDraw, LookupC2Count::MissUnscopedGpuMutex, LookupC2Count::MissUnscopedLabels, LookupC2Count::MissUnscopedBda};
+    const auto byKind = GuestMemory::UnscopedVersionsByKind();
+    for (std::size_t kind = 0; kind < byKind.size(); ++kind) {
+        if (byKind[kind] != scopedUnscoped[kind]) NoteLookupC2(kinds[kind]);
+    }
+}
+
+bool ShaderResources::scopedRevalidate(std::uint64_t epoch) {
+    if (!scopedProof.valid) {
+        NoteLookupC2(LookupC2Count::MissNoCert);
+        return false;
+    }
+    if (AnyPendingCpuWrites(context)) {
+        NoteLookupC2(LookupC2Count::MissCpuWriters);
+        return false;
+    }
+    const bool ignoreStamp = LookupC2MutantForTest() == LookupC2Mutant::ScopedIgnoresStamp;
+    if (!ignoreStamp && !GuestMemory::ScopedHolds(scopedProof, proofRanges)) {
+        noteScopedMiss(false);
+        scopedProof.valid = false;
+        return false;
+    }
+    if (scopedProof.epoch != epoch) {
+        if (LookupC2MutantForTest() != LookupC2Mutant::ScopedSkipsCollect) {
+            for (const auto& [begin, end] : proofRanges) static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)));
+        }
+        if (!ignoreStamp && !GuestMemory::ScopedHolds(scopedProof, proofRanges)) {
+            noteScopedMiss(true);
+            scopedProof.valid = false;
+            return false;
+        }
+        scopedProof.epoch = epoch;
+        NoteLookupC2(LookupC2Count::ScopedCollected);
+    }
+    return true;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {

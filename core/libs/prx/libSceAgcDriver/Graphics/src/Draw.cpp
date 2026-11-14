@@ -1435,8 +1435,8 @@ struct LookupSplitCounters {
     std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> ns;
     std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> calls;
     std::array<ProfileCounter, static_cast<std::size_t>(LookupOutcome::Count)> outcomes;
-    std::array<std::array<ProfileCounter, 4>, 2> proofPaths;
-    std::array<std::array<ProfileCounter, 4>, 2> proofPathNs;
+    std::array<std::array<ProfileCounter, 5>, 2> proofPaths;
+    std::array<std::array<ProfileCounter, 5>, 2> proofPathNs;
     std::array<std::array<ProfileCounter, 7>, 2> proofFailures;
 };
 
@@ -1470,8 +1470,8 @@ void noteLookupProof(bool recipe, bool proved, const ShaderResources::ProofRepor
     if (!LookupSplitProfiled()) return;
     auto& counters = lookupSplit();
     const std::size_t context = recipe ? 1u : 0u;
-    const std::size_t path = report.epoch ? 3u : static_cast<std::size_t>(report.path);
-    if (path < 4u) {
+    const std::size_t path = report.scoped ? 4u : report.epoch ? 3u : static_cast<std::size_t>(report.path);
+    if (path < 5u) {
         counters.proofPaths[context][path].Add();
         counters.proofPathNs[context][path].Add(lookupNs(from, to));
     }
@@ -1499,7 +1499,7 @@ void maybeReportLookupSplit() {
     }
     for (std::size_t index = 0; index < taken.outcomes.size(); ++index) taken.outcomes[index] = counters.outcomes[index].Take();
     for (std::size_t context = 0; context < 2u; ++context) {
-        for (std::size_t path = 0; path < 4u; ++path) {
+        for (std::size_t path = 0; path < 5u; ++path) {
             taken.proofPaths[context][path] = counters.proofPaths[context][path].Take();
             taken.proofPathNs[context][path] = counters.proofPathNs[context][path].Take();
         }
@@ -1507,7 +1507,7 @@ void maybeReportLookupSplit() {
     }
     constexpr std::array<const char*, static_cast<std::size_t>(LookupPiece::Count)> pieces{"key", "find", "space", "revalidate", "moved", "aliases", "template", "prove", "recipe moved", "recipe aliases", "depth note", "touch"};
     constexpr std::array<const char*, static_cast<std::size_t>(LookupOutcome::Count)> outcomes{"uncacheable", "absent", "space refused", "in use", "invalid", "moved refused", "template hit", "recipe template gone", "recipe proof refused", "recipe buffers", "recipe hit"};
-    constexpr std::array<const char*, 4> paths{"fast", "own refreshed", "full", "epoch"};
+    constexpr std::array<const char*, 5> paths{"fast", "own refreshed", "full", "epoch", "scoped"};
     constexpr std::array<const char*, 7> failures{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
     const auto full = taken.calls[static_cast<std::size_t>(LookupPiece::Key)];
     const auto recipe = taken.calls[static_cast<std::size_t>(LookupPiece::Template)];
@@ -1531,7 +1531,7 @@ void maybeReportLookupSplit() {
     }
     for (std::size_t context = 0; context < 2u; ++context) {
         text += context == 0u ? " revalidate paths:" : " prove paths:";
-        for (std::size_t path = 0; path < 4u; ++path) {
+        for (std::size_t path = 0; path < 5u; ++path) {
             if (taken.proofPaths[context][path] == 0u) continue;
             std::snprintf(line, sizeof(line), " %s %llu x %.0f ns,", paths[path], static_cast<unsigned long long>(taken.proofPaths[context][path]), static_cast<double>(taken.proofPathNs[context][path]) / static_cast<double>(taken.proofPaths[context][path]));
             text += line;
@@ -1648,8 +1648,8 @@ void maybeReportLookupC2() {
     LookupC2Counts taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = lookupC2().counts[index].Take();
     const auto at = [&](LookupC2Count count) { return static_cast<unsigned long long>(taken[static_cast<std::size_t>(count)]); };
-    AgcDriver::ProfilePrint_nid_no_patch("[lookup-c2] 10 s: %s; binding slots built %llu, moved-buffer calls on slots %llu, searches past the slots %llu; alias checks skipped %llu, run %llu; verified %llu, disagreements %llu\n",
-        RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2) ? "off (APS5_NO_LOOKUP_C2)" : "on", at(LookupC2Count::SlotsBuilt), at(LookupC2Count::SlotUses), at(LookupC2Count::SlotSearches), at(LookupC2Count::AliasSkips), at(LookupC2Count::AliasChecks), at(LookupC2Count::Verified), at(LookupC2Count::Disagreed));
+    AgcDriver::ProfilePrint_nid_no_patch("[lookup-c2] 10 s: %s, scoped proofs %s; binding slots built %llu, moved-buffer calls on slots %llu, searches past the slots %llu; alias checks skipped %llu, run %llu; scoped stamps taken %llu, certificates stored %llu, hits %llu (%llu after a collect), misses: no certificate %llu, cpu writers %llu, ranges moved %llu, moved by the collect %llu, unscoped non-draw %llu, gpu mutex %llu, labels %llu, bda %llu; verified %llu, disagreements %llu\n",
+        RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2) ? "off (APS5_NO_LOOKUP_C2)" : "on", LookupC2Scoped() ? "on" : "off", at(LookupC2Count::SlotsBuilt), at(LookupC2Count::SlotUses), at(LookupC2Count::SlotSearches), at(LookupC2Count::AliasSkips), at(LookupC2Count::AliasChecks), at(LookupC2Count::StampsTaken), at(LookupC2Count::CertsStored), at(LookupC2Count::ScopedHits), at(LookupC2Count::ScopedCollected), at(LookupC2Count::MissNoCert), at(LookupC2Count::MissCpuWriters), at(LookupC2Count::MissStamp), at(LookupC2Count::MissCollected), at(LookupC2Count::MissUnscopedNonDraw), at(LookupC2Count::MissUnscopedGpuMutex), at(LookupC2Count::MissUnscopedLabels), at(LookupC2Count::MissUnscopedBda), at(LookupC2Count::Verified), at(LookupC2Count::Disagreed));
 }
 
 }
@@ -1679,6 +1679,24 @@ LookupC2Mutant LookupC2MutantForTest() {
     return lookupC2Mutant.load(std::memory_order_relaxed);
 }
 
+bool LookupC2Scoped() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2);
+}
+
+namespace {
+
+std::atomic<void (*)()> lookupC2ProofHook{nullptr};
+
+}
+
+void SetLookupC2ProofHookForTest(void (*hook)()) {
+    lookupC2ProofHook.store(hook, std::memory_order_relaxed);
+}
+
+void RunLookupC2ProofHook() {
+    if (auto* hook = lookupC2ProofHook.load(std::memory_order_relaxed)) hook();
+}
+
 LookupSplitCounts LookupSplitTotals() {
     auto& counters = lookupSplit();
     LookupSplitCounts totals;
@@ -1688,7 +1706,7 @@ LookupSplitCounts LookupSplitTotals() {
     }
     for (std::size_t index = 0; index < totals.outcomes.size(); ++index) totals.outcomes[index] = counters.outcomes[index].Sum();
     for (std::size_t context = 0; context < 2u; ++context) {
-        for (std::size_t path = 0; path < 4u; ++path) {
+        for (std::size_t path = 0; path < 5u; ++path) {
             totals.proofPaths[context][path] = counters.proofPaths[context][path].Sum();
             totals.proofPathNs[context][path] = counters.proofPathNs[context][path].Sum();
         }

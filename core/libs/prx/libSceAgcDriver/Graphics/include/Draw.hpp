@@ -120,20 +120,23 @@ struct LookupSplitCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(LookupPiece::Count)> ns{};
     std::array<std::uint64_t, static_cast<std::size_t>(LookupPiece::Count)> calls{};
     std::array<std::uint64_t, static_cast<std::size_t>(LookupOutcome::Count)> outcomes{};
-    std::array<std::array<std::uint64_t, 4>, 2> proofPaths{};
-    std::array<std::array<std::uint64_t, 4>, 2> proofPathNs{};
+    std::array<std::array<std::uint64_t, 5>, 2> proofPaths{};
+    std::array<std::array<std::uint64_t, 5>, 2> proofPathNs{};
     std::array<std::array<std::uint64_t, 7>, 2> proofFailures{};
 };
 bool LookupSplitProfiled();
 LookupSplitCounts LookupSplitTotals();
-enum class LookupC2Count : std::size_t { SlotsBuilt, SlotUses, SlotSearches, AliasSkips, AliasChecks, Verified, Disagreed, Count };
+enum class LookupC2Count : std::size_t { SlotsBuilt, SlotUses, SlotSearches, AliasSkips, AliasChecks, Verified, Disagreed, StampsTaken, CertsStored, ScopedHits, ScopedCollected, MissNoCert, MissCpuWriters, MissStamp, MissCollected, MissUnscopedNonDraw, MissUnscopedGpuMutex, MissUnscopedLabels, MissUnscopedBda, Count };
 using LookupC2Counts = std::array<std::uint64_t, static_cast<std::size_t>(LookupC2Count::Count)>;
 void NoteLookupC2(LookupC2Count count);
 LookupC2Counts LookupC2Totals();
 bool LookupC2VerifyDue();
-enum class LookupC2Mutant : std::uint8_t { None, SlotOffByOne, AliasIgnoresWords };
+enum class LookupC2Mutant : std::uint8_t { None, SlotOffByOne, AliasIgnoresWords, ScopedIgnoresStamp, ScopedSkipsCollect, ScopedStampAfterProof };
 void SetLookupC2MutantForTest(LookupC2Mutant mutant);
 LookupC2Mutant LookupC2MutantForTest();
+bool LookupC2Scoped();
+void SetLookupC2ProofHookForTest(void (*hook)());
+void RunLookupC2ProofHook();
 struct DrawRecipeOutcome {
     bool recorded = false;
     DrawRecipeMiss miss = DrawRecipeMiss::None;

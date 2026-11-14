@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
@@ -365,6 +366,7 @@ public:
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
         bool epoch = false;
+        bool scoped = false;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
@@ -805,6 +807,13 @@ private:
     std::vector<Binding>::const_iterator keptBinding(std::uint32_t number, const BindingSlots* slots) const;
     std::uint64_t serial = NextSerial();
     static std::uint64_t NextSerial();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    bool proofRangesBuilt = false;
+    GuestMemory::ScopedProof scopedProof;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> scopedUnscoped{};
+    void buildProofRanges();
+    void noteScopedMiss(bool collected);
+    bool scopedRevalidate(std::uint64_t epoch);
     std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
     std::vector<VkDescriptorBindingFlags> fragmentBindingFlags;
     std::vector<std::uint32_t> refreshResourceKey;
