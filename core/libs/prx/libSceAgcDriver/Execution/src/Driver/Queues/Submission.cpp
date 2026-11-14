@@ -223,13 +223,13 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
         }
         reach(cursor, cursor + count);
         const auto opcode = (header >> 8u) & 0xffu;
-        if (opcode == 0x3fu && count == 14) {
+        if (opcode == Pm4::IndirectBufferOpcode && count == Pm4::ConditionalBufferWords) {
             const auto mode = guest[cursor + 1] & 3u;
             require(mode == 1u || mode == 2u, "invalid COND_INDIRECT_BUFFER mode");
             require(((guest[cursor + 1] >> 8u) & 7u) == 0u, "a COND_INDIRECT_BUFFER with a comparison is not implemented");
             require(!Pm4::Predicated(header), "a predicated COND_INDIRECT_BUFFER is not implemented");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 9] & 0xffffu) << 32u));
-            const std::size_t targetWords = guest[cursor + 10] & 0xfffffu;
+            const auto* target = reinterpret_cast<const std::uint32_t*>(Pm4::LinkAddress(guest[cursor + 8], guest[cursor + 9]));
+            const std::size_t targetWords = Pm4::LinkWords(guest[cursor + 10]);
             if (targetWords != 0) {
                 GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
                 const auto start = submission.commands.size();
@@ -243,11 +243,11 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
             cursor += count;
             continue;
         }
-        if (opcode == 0x3fu) {
-            require(count == 4, "invalid INDIRECT_BUFFER size");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 2] & 0xffffu) << 32u));
-            const std::size_t targetWords = guest[cursor + 3] & 0xfffffu;
-            const bool chain = (guest[cursor + 3] & (1u << 20u)) != 0;
+        if (opcode == Pm4::IndirectBufferOpcode) {
+            require(count == Pm4::IndirectBufferWords, "invalid INDIRECT_BUFFER size");
+            const auto* target = reinterpret_cast<const std::uint32_t*>(Pm4::LinkAddress(guest[cursor + 1], guest[cursor + 2]));
+            const std::size_t targetWords = Pm4::LinkWords(guest[cursor + 3]);
+            const bool chain = Pm4::LinkChains(guest[cursor + 3]);
             require(!chain || guarded.empty(), "a chained INDIRECT_BUFFER inside a conditional execution range is not implemented");
             GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
             if (Pm4::Predicated(header)) {
@@ -277,8 +277,8 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
             cursor += count;
             continue;
         }
-        if (opcode == 0x59u) {
-            require(count == 2, "a REWIND packet must be two dwords");
+        if (opcode == Pm4::RewindOpcode) {
+            require(count == Pm4::RewindWords, "a REWIND packet must be two dwords");
             require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
             submission.commands.push_back(header);
             submission.commands.push_back(std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(guest + cursor + 1)).load(std::memory_order_acquire));
@@ -287,7 +287,7 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
             submission.rewindWords = words - cursor;
             return true;
         }
-        if (opcode == 0x22u && count == 5) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(guest + cursor, count)), submission.commands.size());
+        if (opcode == Pm4::ConditionalExecOpcode && count == Pm4::ConditionalExecWords) guarded.emplace_back(cursor + count + Pm4::ConditionalWords(std::span(guest + cursor, count)), submission.commands.size());
         submission.commands.insert(submission.commands.end(), guest + cursor, guest + cursor + count);
         cursor += count;
     }

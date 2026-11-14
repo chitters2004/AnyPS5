@@ -173,6 +173,16 @@ inline bool CopyDataToRegister(std::span<const std::uint32_t> packet) { return (
 inline std::size_t CopyDataBytes(std::span<const std::uint32_t> packet) { return (packet[1] & 0x10000u) != 0 ? 8 : 4; }
 inline constexpr std::uint32_t RewindValid = 0x80000000u;
 inline constexpr std::uint32_t RewindOffloadEnable = 0x01000000u;
+inline constexpr std::uint32_t IndirectBufferOpcode = 0x3fu;
+inline constexpr std::uint32_t RewindOpcode = 0x59u;
+inline constexpr std::size_t IndirectBufferWords = 4;
+inline constexpr std::size_t ConditionalBufferWords = 14;
+inline constexpr std::size_t RewindWords = 2;
+inline constexpr std::uint32_t ConditionalExecOpcode = 0x22u;
+inline constexpr std::size_t ConditionalExecWords = 5;
+inline std::uintptr_t LinkAddress(std::uint32_t low, std::uint32_t high) { return static_cast<std::uintptr_t>(low & ~3u) | (static_cast<std::uintptr_t>(high & 0xffffu) << 32u); }
+inline std::size_t LinkWords(std::uint32_t control) { return control & 0xfffffu; }
+inline bool LinkChains(std::uint32_t control) { return (control & (1u << 20u)) != 0; }
 struct WaitFields {
     std::uint32_t function;
     std::uint64_t address;

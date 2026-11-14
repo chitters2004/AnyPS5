@@ -1,4 +1,5 @@
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CommandPublication.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "execution/VulkanTestDevice.hpp"
@@ -50,6 +51,11 @@ struct DriverTestAccess {
     }
     static bool FindWaitProducer(std::uint64_t address, std::size_t bytes, std::uint64_t& token) {
         return Driver::Get().findWaitProducer(address, bytes, token);
+    }
+    static std::vector<std::uint32_t> CopiedCommands(const std::uint32_t* guest, std::size_t words) {
+        Submission submission{};
+        Driver::copyCommands(submission, guest, words);
+        return submission.commands;
     }
     static std::uint64_t AwaitedAddress(std::uint32_t queue) {
         const auto& driver = Driver::Get();
@@ -139,6 +145,38 @@ void testThreadDimensionGroups() {
     check(ThreadDimensionGroups(64, 64) == 1 && ThreadDimensionGroups(65, 64) == 2, "a partial group still counts");
     check(ThreadDimensionGroups(0xffffffffu, 1) == 0xffffffffu, "one thread per group keeps the thread count");
     check(ThreadDimensionGroups(0xffffffffu, 64) == 0x4000000u, "a thread count near 2^32 wrapped before the division");
+}
+
+void testWalkMatchesCopy() {
+    using AgcDriver::DriverDetail::DriverTestAccess;
+    const auto address = [](const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer); };
+    const auto link = [&](std::uint32_t header, const std::vector<std::uint32_t>& target, std::uint32_t flags = 0) {
+        return std::vector<std::uint32_t>{header, static_cast<std::uint32_t>(address(target.data())), static_cast<std::uint32_t>(address(target.data()) >> 32u), static_cast<std::uint32_t>(target.size()) | flags};
+    };
+    const auto append = [](std::vector<std::uint32_t>& words, const std::vector<std::uint32_t>& more) { words.insert(words.end(), more.begin(), more.end()); };
+    const std::vector<std::uint32_t> nested{0xc0001000u, 7u, 0x80000000u};
+    const std::vector<std::uint32_t> skipped{0xc0001000u, 8u};
+    const std::vector<std::uint32_t> chained{0xc0001000u, 9u, 0xc0005900u, 0u, 0xc0001000u, 10u};
+    std::vector<std::uint32_t> root{0xc0001000u, 1u};
+    append(root, link(0xc0023f00u, nested));
+    append(root, link(0xc0023f01u, nested));
+    root.insert(root.end(), {0xc00c3f00u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(address(skipped.data())), static_cast<std::uint32_t>(address(skipped.data()) >> 32u), static_cast<std::uint32_t>(skipped.size()), 0u, 0u, 0u});
+    append(root, link(0xc0023f00u, chained, 1u << 20u));
+    root.insert(root.end(), {0xc0001000u, 2u});
+    std::vector<std::uint32_t> walked;
+    const auto reach = AgcDriver::CommandPublication::Walk(root.data(), root.size(), [](const void*, std::size_t) { return true; },
+                                                           [&](std::span<const std::uint32_t> packet) { walked.insert(walked.end(), packet.begin(), packet.end()); });
+    check(walked == DriverTestAccess::CopiedCommands(root.data(), root.size()), "the capture's command walk and the driver's command copy disagree on the packets a submission reaches");
+    check(reach.segments.size() == 4 && reach.tails.empty(), "the capture's command walk went past the COND_INDIRECT_BUFFER the driver ends the buffer at");
+
+    std::vector<std::uint32_t> guarded{0xc0001000u, 1u, 0xc0032200u, 0u, 0u, 0u, 14u};
+    guarded.insert(guarded.end(), {0xc00c3f00u, 1u, 0u, 0u, 0u, 0u, 0u, 0u, static_cast<std::uint32_t>(address(skipped.data())), static_cast<std::uint32_t>(address(skipped.data()) >> 32u), static_cast<std::uint32_t>(skipped.size()), 0u, 0u, 0u});
+    append(guarded, link(0xc0023f00u, chained, 1u << 20u));
+    walked.clear();
+    const auto guardedReach = AgcDriver::CommandPublication::Walk(guarded.data(), guarded.size(), [](const void*, std::size_t) { return true; },
+                                                                  [&](std::span<const std::uint32_t> packet) { walked.insert(walked.end(), packet.begin(), packet.end()); });
+    check(walked == DriverTestAccess::CopiedCommands(guarded.data(), guarded.size()), "the capture's command walk and the driver's command copy disagree inside a COND_EXEC range");
+    check(guardedReach.segments.size() == 3 && guardedReach.tails.size() == 1 && guardedReach.tails[0].word == address(chained.data() + 3), "the capture's command walk missed the chained buffer or the REWIND tail the driver stops at");
 }
 
 void testSelfReferencingIndirectBuffer() {
@@ -1239,6 +1277,12 @@ int main(int argc, char** argv) {
             testReadOnlyResummarize();
             LibcRunShutdown_nid_postfix();
             std::puts("Read-only resummarize submission passed");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--walk-matches-copy") {
+            testWalkMatchesCopy();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC command walk matches the driver's command copy");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--wait-producer-chain") {
