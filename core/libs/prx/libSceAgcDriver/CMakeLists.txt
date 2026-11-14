@@ -669,6 +669,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcDynamicCopySource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/DynamicCopy.comp)
+set(agcDynamicCopySpv ${agcTestShaderGeneratedRoot}/DynamicCopy.spv)
+set(agcDynamicCopyHeader ${agcTestShaderGeneratedRoot}/DynamicCopy_spv.h)
+add_custom_command(
+        OUTPUT "${agcDynamicCopyHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcDynamicCopySpv}" "${agcDynamicCopySource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcDynamicCopySpv} -DOUTPUT=${agcDynamicCopyHeader}
+        -DSYMBOL=DYNAMIC_COPY_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcDynamicCopySource}" glslang-standalone
+        VERBATIM
+)
+
 foreach(agcVertexRangeShader IN ITEMS VertexRange.vert VertexRangeProducer.frag)
     string(REPLACE "." "_" agcVertexRangeName "${agcVertexRangeShader}")
     string(TOUPPER "${agcVertexRangeName}_SPV" agcVertexRangeSymbol)

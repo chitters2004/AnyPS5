@@ -24,6 +24,10 @@ struct DrawSetCounters {
     ProfileCounter reboundDraws;
     ProfileCounter faultDraws;
     ProfileCounter uploadChunks;
+    ProfileCounter pooledChunks;
+    ProfileCounter persistentHits;
+    ProfileCounter persistentWrites;
+    ProfileCounter persistentFallbacks;
 };
 
 struct DrawSetCounts {
@@ -43,6 +47,10 @@ struct DrawSetCounts {
     std::uint64_t reboundDraws = 0;
     std::uint64_t faultDraws = 0;
     std::uint64_t uploadChunks = 0;
+    std::uint64_t pooledChunks = 0;
+    std::uint64_t persistentHits = 0;
+    std::uint64_t persistentWrites = 0;
+    std::uint64_t persistentFallbacks = 0;
 };
 
 bool DrawSetCountsProfiled();
