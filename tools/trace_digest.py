@@ -224,10 +224,9 @@ def load_stacks(path):
         if line.startswith("#") or not line.strip():
             continue
         frames, _, count = line.rpartition(" ")
-        try:
-            weight = int(count)
-        except ValueError as error:
-            raise ValueError(f"{path}:{number}: sample count must be a positive integer") from error
+        if not (count.isascii() and count.isdigit()):
+            raise ValueError(f"{path}:{number}: sample count must be a positive integer")
+        weight = int(count)
         if weight <= 0 or any(not frame.strip() for frame in frames.split(";")):
             raise ValueError(f"{path}:{number}: expected nonempty frames and a positive sample count")
         stacks.append((frames.split(";"), weight))
