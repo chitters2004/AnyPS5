@@ -1429,6 +1429,8 @@ const char* DrawRecipeMissName(DrawRecipeMiss miss) {
 
 namespace {
 
+void maybeReportLookupC2();
+
 struct LookupSplitCounters {
     std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> ns;
     std::array<ProfileCounter, static_cast<std::size_t>(LookupPiece::Count)> calls;
@@ -1479,6 +1481,7 @@ void noteLookupProof(bool recipe, bool proved, const ShaderResources::ProofRepor
 
 void maybeReportLookupSplit() {
     if (!LookupSplitProfiled()) return;
+    maybeReportLookupC2();
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
@@ -1549,6 +1552,131 @@ void maybeReportLookupSplit() {
 bool LookupSplitProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
     return profiled;
+}
+
+namespace {
+
+struct LookupC2Counters {
+    std::array<ProfileCounter, static_cast<std::size_t>(LookupC2Count::Count)> counts;
+};
+
+LookupC2Counters& lookupC2() {
+    static auto* counters = new LookupC2Counters();
+    return *counters;
+}
+
+std::uint64_t lookupC2VerifyPeriod() {
+    static const std::uint64_t period = [] {
+        const char* value = std::getenv("APS5_VERIFY_LOOKUP_C2");
+        if (value == nullptr) return std::uint64_t{0};
+        const auto parsed = std::strtoull(value, nullptr, 10);
+        return parsed == 0 ? std::uint64_t{1} : static_cast<std::uint64_t>(parsed);
+    }();
+    return period;
+}
+
+std::atomic<LookupC2Mutant> lookupC2Mutant{LookupC2Mutant::None};
+
+struct AliasMemo {
+    std::uint64_t resources = 0;
+    std::uint64_t targetAddress = 0;
+    std::uint64_t targetBytes = 0;
+    std::uint64_t indexAddress = 0;
+    std::uint64_t indexBytes = 0;
+    std::vector<std::uint32_t> inputs;
+};
+
+void gatherAliasInputs(std::span<const CompiledShader> shaders, std::vector<std::uint32_t>& inputs) {
+    inputs.clear();
+    for (const auto& shader : shaders) {
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            inputs.push_back(static_cast<std::uint32_t>(binding.guestDescriptor.size()));
+            inputs.insert(inputs.end(), binding.guestDescriptor.begin(), binding.guestDescriptor.end());
+            const auto elements = binding.guestDescriptor.size() / 4u;
+            for (std::size_t element = 0; element < elements; ++element) inputs.push_back(element >= binding.bufferWritten.size() || binding.bufferWritten[element] ? 1u : 0u);
+        }
+    }
+}
+
+void checkAliasesOnHit(const ShaderResources& resources, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2)) {
+        CheckBufferAliases(shaders, target, indexAddress, indexBytes);
+        return;
+    }
+    thread_local std::array<AliasMemo, 8> memos;
+    thread_local std::vector<std::uint32_t> inputs;
+    gatherAliasInputs(shaders, inputs);
+    auto& memo = memos[resources.Serial() % memos.size()];
+    const auto targetAddress = target.MemoryAddress();
+    const bool sameWords = memo.inputs == inputs || LookupC2MutantForTest() == LookupC2Mutant::AliasIgnoresWords;
+    if (memo.resources == resources.Serial() && memo.targetAddress == targetAddress && memo.targetBytes == target.bytes && memo.indexAddress == indexAddress && memo.indexBytes == indexBytes && sameWords) {
+        NoteLookupC2(LookupC2Count::AliasSkips);
+        if (LookupC2VerifyDue()) {
+            NoteLookupC2(LookupC2Count::Verified);
+            try {
+                CheckBufferAliases(shaders, target, indexAddress, indexBytes);
+            } catch (...) {
+                NoteLookupC2(LookupC2Count::Disagreed);
+                memo.resources = 0;
+                throw;
+            }
+        }
+        return;
+    }
+    memo.resources = 0;
+    CheckBufferAliases(shaders, target, indexAddress, indexBytes);
+    NoteLookupC2(LookupC2Count::AliasChecks);
+    memo.resources = resources.Serial();
+    memo.targetAddress = targetAddress;
+    memo.targetBytes = target.bytes;
+    memo.indexAddress = indexAddress;
+    memo.indexBytes = indexBytes;
+    memo.inputs = inputs;
+}
+
+void maybeReportLookupC2() {
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (due == 0) {
+        nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed)) return;
+    LookupC2Counts taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = lookupC2().counts[index].Take();
+    const auto at = [&](LookupC2Count count) { return static_cast<unsigned long long>(taken[static_cast<std::size_t>(count)]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[lookup-c2] 10 s: %s; binding slots built %llu, moved-buffer calls on slots %llu, searches past the slots %llu; alias checks skipped %llu, run %llu; verified %llu, disagreements %llu\n",
+        RuntimeSwitches::Set(RuntimeSwitch::NoLookupC2) ? "off (APS5_NO_LOOKUP_C2)" : "on", at(LookupC2Count::SlotsBuilt), at(LookupC2Count::SlotUses), at(LookupC2Count::SlotSearches), at(LookupC2Count::AliasSkips), at(LookupC2Count::AliasChecks), at(LookupC2Count::Verified), at(LookupC2Count::Disagreed));
+}
+
+}
+
+void NoteLookupC2(LookupC2Count count) {
+    if (LookupSplitProfiled() || lookupC2VerifyPeriod() != 0) lookupC2().counts[static_cast<std::size_t>(count)].Add();
+}
+
+LookupC2Counts LookupC2Totals() {
+    LookupC2Counts totals{};
+    for (std::size_t index = 0; index < totals.size(); ++index) totals[index] = lookupC2().counts[index].Sum();
+    return totals;
+}
+
+bool LookupC2VerifyDue() {
+    const auto period = lookupC2VerifyPeriod();
+    if (period == 0) return false;
+    thread_local std::uint64_t uses = 0;
+    return ++uses % period == 0;
+}
+
+void SetLookupC2MutantForTest(LookupC2Mutant mutant) {
+    lookupC2Mutant.store(mutant, std::memory_order_relaxed);
+}
+
+LookupC2Mutant LookupC2MutantForTest() {
+    return lookupC2Mutant.load(std::memory_order_relaxed);
 }
 
 LookupSplitCounts LookupSplitTotals() {
@@ -2387,7 +2515,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             }
             if (moved.has_value()) {
                 if (trimKey) {
-                    CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                    checkAliasesOnHit(*cached, shaders, state.color, draw.indexAddress, indexBytes);
                     split = chargeLookup(LookupPiece::Aliases, split);
                 }
                 noteLookup(LookupOutcome::TemplateHit);
@@ -4911,7 +5039,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         maybeReportLookupSplit();
         return miss(DrawRecipeMiss::Buffers);
     }
-    CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
+    checkAliasesOnHit(*resources, shaders, state.color, draw.indexAddress, inputs.indexBytes);
     split = chargeLookup(LookupPiece::RecipeAliases, split);
     if (recipe.hasDepth && writesDepthTarget(state)) {
         NoteDepthSurfaceWrite(context, *state.depth);
