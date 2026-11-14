@@ -359,7 +359,7 @@ public:
     // retile) moves it too.
     static void BumpPendingSerial();
     enum Refusal : std::size_t { RefusedNoProof, RefusedGeneration, RefusedUnlocked, RefusedCollect, RefusedKeys, RefusedStamped, RefusedPending, RefusalReasons };
-    void BumpOwnRanges(GuestMemory::RangeSource source, bool ownPending = false) const;
+    void BumpOwnRanges(GuestMemory::RangeSource source) const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

@@ -4874,14 +4874,14 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (dirty) {
         if (wasLent || newUnits) {
             BumpPendingSerial();
-            BumpOwnRanges(GuestMemory::RangeSource::TexturePending, !wasLent);
+            BumpOwnRanges(GuestMemory::RangeSource::TexturePending);
         }
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
     BumpPendingSerial();
-    BumpOwnRanges(GuestMemory::RangeSource::TexturePending, true);
+    BumpOwnRanges(GuestMemory::RangeSource::TexturePending);
 }
 
 void StorageTexture::reconcilePending() {
@@ -6325,8 +6325,8 @@ void StorageTexture::BumpPendingSerial() {
     HostThreadSlot<std::uint64_t, OwnPendingMovesSlot>::Set(OwnPendingMoves() + 1);
 }
 
-void StorageTexture::BumpOwnRanges(GuestMemory::RangeSource source, bool ownPending) const {
-    const bool counted = ownPending && source == GuestMemory::RangeSource::TexturePending && GuestMemory::GpuMutex().HeldByThisThread();
+void StorageTexture::BumpOwnRanges(GuestMemory::RangeSource source) const {
+    const bool counted = source == GuestMemory::RangeSource::TexturePending && GuestMemory::GpuMutex().HeldByThisThread();
     GuestMemory::BumpRangeVersions(descriptor.baseAddress, guestBytes, source);
     if (descriptor.dccAddress != 0) GuestMemory::BumpRangeVersions(descriptor.dccAddress, DccKeyBytes(guestBytes), source);
     if (counted) ownPendingBumps.fetch_add(1, std::memory_order_relaxed);
