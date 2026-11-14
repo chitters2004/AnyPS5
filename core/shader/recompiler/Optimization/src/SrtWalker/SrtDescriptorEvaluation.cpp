@@ -405,6 +405,7 @@ UnbatchedWalk walkUnbatched(const SrtTape& tape, const IrResourcePlan& program, 
     UnbatchedWalk walk;
     SrtRuntime unbatched = runtime;
     unbatched.batchedDescriptorReads = false;
+    unbatched.countedFastCapture = false;
     if (runtime.userDataUse != nullptr) {
         walk.use = *runtime.userDataUse;
         unbatched.userDataUse = &walk.use;

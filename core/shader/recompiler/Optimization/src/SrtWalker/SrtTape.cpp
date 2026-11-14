@@ -769,8 +769,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         DescriptorValue value;
         value.dwordCount = source.dwordCount;
         auto batch = Batch::Skipped;
-        if (active[sourceIndex] && !runtime.batchedDescriptorReads) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSlowArm);
-        else if (active[sourceIndex] && batchable[sourceIndex] == 0u) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesUnbatchable);
+        if (active[sourceIndex] && !runtime.batchedDescriptorReads) {
+            if (runtime.countedFastCapture) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSlowArm);
+        } else if (active[sourceIndex] && batchable[sourceIndex] == 0u) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesUnbatchable);
         else if (active[sourceIndex]) {
             frame.descriptorBytes = static_cast<std::size_t>(source.dwordCount) * sizeof(std::uint32_t);
             batch = readBatch(frame, sourceIndex, source.dwordCount, value);
