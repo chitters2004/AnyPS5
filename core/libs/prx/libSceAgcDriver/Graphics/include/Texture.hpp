@@ -271,8 +271,9 @@ inline constexpr std::size_t PendingBumpCount = static_cast<std::size_t>(Pending
 inline constexpr std::size_t EpochMoved = 1;
 inline constexpr std::size_t ProofMoved = 2;
 inline constexpr std::size_t PendingMoved = 4;
-inline constexpr std::size_t EpochExitOff = 8;
-inline constexpr std::size_t EpochExitCount = 9;
+inline constexpr std::size_t EpochExitGated = 8;
+inline constexpr std::size_t EpochExitNoEpoch = 9;
+inline constexpr std::size_t EpochExitCount = 10;
 enum class ProofCheck : std::uint8_t { Proved, NoProof, Version, Unheld, Collect, Keys, Unchanged, Overlap, Count };
 inline constexpr std::size_t ProofCheckCount = static_cast<std::size_t>(ProofCheck::Count);
 

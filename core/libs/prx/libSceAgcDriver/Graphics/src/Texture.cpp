@@ -2438,7 +2438,7 @@ TargetProofCounts& ThreadTargetProofCounts() {
 }
 
 const char* EpochExitName(std::size_t exit) {
-    static constexpr std::array<const char*, EpochExitCount> names{"hit", "epoch", "proof", "epoch+proof", "pending", "epoch+pending", "proof+pending", "epoch+proof+pending", "off"};
+    static constexpr std::array<const char*, EpochExitCount> names{"hit", "epoch", "proof", "epoch+proof", "pending", "epoch+pending", "proof+pending", "epoch+proof+pending", "gated", "no epoch"};
     return names[exit];
 }
 
@@ -2491,7 +2491,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool epochProofs = ShaderResources::EpochProofs();
     const auto epoch = epochProofs ? GuestMemory::CollectEpoch() : 0;
     if (profile) {
-        const auto moved = epoch == 0 ? EpochExitOff : (provedEpoch.load(std::memory_order_relaxed) != epoch ? EpochMoved : 0) | (provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? ProofMoved : 0) | (provedPending.load(std::memory_order_relaxed) != PendingSerial() ? PendingMoved : 0);
+        const auto moved = epoch == 0 ? (epochProofs ? EpochExitNoEpoch : EpochExitGated) : (provedEpoch.load(std::memory_order_relaxed) != epoch ? EpochMoved : 0) | (provedProof.load(std::memory_order_relaxed) != GuestMemory::ProofSerial() ? ProofMoved : 0) | (provedPending.load(std::memory_order_relaxed) != PendingSerial() ? PendingMoved : 0);
         ++ThreadTargetProofCounts().exits[moved];
     }
     if (epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial()) {

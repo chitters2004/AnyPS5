@@ -12836,6 +12836,10 @@ bool targetProofCountTests(const Device& device, Recorder& recorder) {
             return ThreadTargetProofCounts() - at;
         };
         static_cast<void>(repeat());
+        if (!DrawPipelineEnabled()) {
+            Require(exits(repeat(), EpochExitGated) == 1, "a repeat lookup without the draw pipeline did not count the epoch exit as gated");
+            return;
+        }
         const auto settled = repeat();
         Require(settled.repeatHits == 1 && exits(settled, 0) == 1, "a repeat lookup with nothing moved did not take the epoch exit");
         AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::NonDrawCommit);
@@ -12866,6 +12870,7 @@ bool targetProofCountTests(const Device& device, Recorder& recorder) {
         Require(total.proofCalls == checked, "the refreshProved calls do not match their outcomes");
         Require(exited == split.refreshes && checked == split.refreshes - exits(total, 0), "every refresh did not take one epoch exit outcome and every miss one re-proof outcome");
         Require(exits(total, 0) + total.checks[static_cast<std::size_t>(ProofCheck::Proved)] == split.refreshesProved, "the proved outcomes do not match the proved refreshes");
+        std::thread([&] { Require(exits(repeat(), EpochExitNoEpoch) == 1, "a repeat lookup on a thread without a collect epoch did not count the epoch exit as having no epoch"); }).join();
         ClearCachedTextures(context.device);
         const auto evicted = ThreadTargetProofCounts();
         Require(RepeatStorageSurface(context, resource, stored) == nullptr, "a repeat lookup served an evicted image");
