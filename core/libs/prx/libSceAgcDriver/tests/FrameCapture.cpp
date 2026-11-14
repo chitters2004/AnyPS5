@@ -1,10 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 #include <span>
 #include <string>
@@ -303,27 +305,51 @@ void testCollidingDeltas(const std::filesystem::path& directory) {
     for (std::size_t index = 0; index < deltas.size(); ++index) check(reader.Read(deltas[index]) == expected[index], "colliding delta " + std::to_string(index) + " does not read back");
 }
 
-void testMemoryFormatOne(const std::filesystem::path& source, const std::filesystem::path& directory) {
+void writeOlderMemory(const std::filesystem::path& source, const std::filesystem::path& directory, std::string_view magic) {
+    constexpr std::size_t HeaderBytes = 72;
+    constexpr std::size_t OlderHeaderBytes = 64;
     std::filesystem::remove_all(directory);
     std::filesystem::copy(source, directory, std::filesystem::copy_options::recursive);
-    {
-        std::fstream file(directory / FrameCaptureWriter::MemoryName, std::ios::binary | std::ios::in | std::ios::out);
-        file.write(FrameCaptureWriter::MemoryMagicV1.data(), static_cast<std::streamsize>(FrameCaptureWriter::MemoryMagicV1.size()));
-        check(file.good(), "cannot write the memory format 1 magic");
+    const auto path = directory / FrameCaptureWriter::MemoryName;
+    std::ifstream input(path, std::ios::binary);
+    const std::vector<char> bytes((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    input.close();
+    check(std::string_view(bytes.data(), FrameCaptureWriter::MemoryMagic.size()) == FrameCaptureWriter::MemoryMagic, "the source capture is not in the current memory format");
+    std::vector<char> older(magic.begin(), magic.end());
+    for (std::size_t at = FrameCaptureWriter::MemoryMagic.size(); at < bytes.size();) {
+        std::uint64_t stored = 0;
+        std::uint64_t shared = 0;
+        std::memcpy(&stored, bytes.data() + at + 48, sizeof(stored));
+        std::memcpy(&shared, bytes.data() + at + 56, sizeof(shared));
+        check(shared == 0, "the source capture shares payloads, which an older layout cannot reference");
+        older.insert(older.end(), bytes.begin() + static_cast<std::ptrdiff_t>(at), bytes.begin() + static_cast<std::ptrdiff_t>(at + OlderHeaderBytes));
+        older.insert(older.end(), bytes.begin() + static_cast<std::ptrdiff_t>(at + HeaderBytes), bytes.begin() + static_cast<std::ptrdiff_t>(at + HeaderBytes + stored));
+        at += HeaderBytes + stored;
     }
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(older.data(), static_cast<std::streamsize>(older.size()));
+    check(output.good(), "cannot write the older memory format");
+}
+
+void testOlderMemoryFormats(const std::filesystem::path& source, const std::filesystem::path& directory) {
     const FrameCaptureReader current(source);
-    const FrameCaptureReader older(directory);
-    check(older.Chunks().size() == current.Chunks().size(), "a memory format 1 capture reads a different number of chunks");
-    for (std::size_t index = 0; index < older.Chunks().size(); ++index) {
-        const auto& chunk = older.Chunks()[index];
-        check(chunk.kind == current.Chunks()[index].kind && chunk.address == current.Chunks()[index].address && chunk.offset == current.Chunks()[index].offset, "memory format 1 chunk " + std::to_string(index) + " does not read as written");
-        if (chunk.kind == FrameMemoryKind::Delta) check(older.Read(chunk) == current.Read(current.Chunks()[index]), "a memory format 1 delta does not read back");
+    for (const auto magic : {FrameCaptureWriter::MemoryMagicV1, FrameCaptureWriter::MemoryMagicV2}) {
+        const auto name = std::string(magic.substr(0, magic.size() - 1));
+        writeOlderMemory(source, directory, magic);
+        const FrameCaptureReader older(directory);
+        check(older.Chunks().size() == current.Chunks().size(), name + " capture reads a different number of chunks");
+        for (std::size_t index = 0; index < older.Chunks().size(); ++index) {
+            const auto& chunk = older.Chunks()[index];
+            const auto& written = current.Chunks()[index];
+            check(chunk.kind == written.kind && chunk.address == written.address && chunk.bytes == written.bytes && chunk.state.watch == 0, name + " chunk " + std::to_string(index) + " does not read as written");
+            if (chunk.kind == FrameMemoryKind::Delta) check(older.Read(chunk) == current.Read(written), name + " delta does not read back");
+        }
     }
 }
 
 void writeLastShared(const std::filesystem::path& directory, std::uint64_t value) {
     std::fstream file(directory / FrameCaptureWriter::MemoryName, std::ios::binary | std::ios::in | std::ios::out);
-    file.seekp(-static_cast<std::streamoff>(sizeof(value)), std::ios::end);
+    file.seekp(-2 * static_cast<std::streamoff>(sizeof(value)), std::ios::end);
     file.write(reinterpret_cast<const char*>(&value), sizeof(value));
     check(file.good(), "cannot rewrite the shared payload field");
 }
@@ -340,6 +366,38 @@ void testMalformedReference(const std::filesystem::path& source, const std::file
         std::filesystem::copy(source, directory, std::filesystem::copy_options::recursive);
         writeLastShared(directory, value);
         checkThrowsText([&] { FrameCaptureReader broken(directory); }, "frame capture: ", true, what + " is accepted");
+    }
+}
+
+void testRangeState(const std::filesystem::path& directory) {
+    using AgcDriver::FrameRangeState;
+    using AgcDriver::FrameRangeWatch;
+    const std::array<FrameRangeState, 3> states{{{FrameRangeWatch::Recorded | FrameRangeWatch::Watched, 0x7f00000000001234ull, 0x5678000}, {FrameRangeWatch::Recorded, 0, 0}, {}}};
+    {
+        FrameCaptureWriter writer(directory);
+        for (std::size_t index = 0; index < states.size(); ++index) writer.WriteRange(0x3000000000ull + index * 0x10000, 0x10000, FrameRangeKind::Section, 4, AgcDriver::FrameRangeAccess::Readable, states[index]);
+        writer.WriteDelta(5, 9, 0x3000000000ull, std::vector<std::byte>(16, std::byte{1}));
+        writer.Finish("{}");
+    }
+    {
+        const FrameCaptureReader reader(directory);
+        check(reader.Chunks().size() == states.size() + 1, "range state capture holds the wrong number of chunks");
+        for (std::size_t index = 0; index < states.size(); ++index) {
+            const auto& chunk = reader.Chunks()[index];
+            check(chunk.state == states[index] && chunk.group == 0 && chunk.completed == 0, "range state " + std::to_string(index) + " does not round-trip");
+        }
+        const auto& delta = reader.Chunks().back();
+        check(delta.group == 5 && delta.completed == 9 && delta.state == FrameRangeState{}, "a delta after ranges with state does not keep its group and serial");
+    }
+    const auto stateAt = static_cast<std::streamoff>(FrameCaptureWriter::MemoryMagic.size() + 64);
+    for (const std::uint64_t corrupt : {std::uint64_t{2}, std::uint64_t{4}, std::uint64_t{1} << 32}) {
+        {
+            std::fstream file(directory / FrameCaptureWriter::MemoryName, std::ios::binary | std::ios::in | std::ios::out);
+            file.seekp(stateAt);
+            file.write(reinterpret_cast<const char*>(&corrupt), sizeof(corrupt));
+            check(file.good(), "cannot write a corrupt range state");
+        }
+        checkThrows([&] { FrameCaptureReader reader(directory); }, "range state " + std::to_string(corrupt) + " does not throw");
     }
 }
 
@@ -506,10 +564,11 @@ int main(int argc, char** argv) {
     testOlderVersion(root / "capture", root / "version-one", "aps5-frame-calls 1\n", 1);
     testOlderVersion(root / "capture", root / "version-two", "aps5-frame-calls 2\n", 2);
     testCorrupt(root / "capture", root / "corrupt");
+    testRangeState(root / "range-state");
     testWriter(root / "writer");
     testSharedDeltas(root / "shared");
     testCollidingDeltas(root / "colliding");
-    testMemoryFormatOne(root / "capture", root / "memory-one");
+    testOlderMemoryFormats(root / "capture", root / "memory-older");
     testMalformedReference(root / "shared", root / "malformed");
     std::filesystem::remove_all(root);
     std::puts("frame capture tests passed");

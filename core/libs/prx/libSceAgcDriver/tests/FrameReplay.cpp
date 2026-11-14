@@ -17,6 +17,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libkernel/include/Api.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
@@ -186,6 +187,17 @@ void testCaptureAndReplay(const std::filesystem::path& tool, bool pipelines) {
     AgcDriverUnregisterVideoOutput_nid_postfix(Handle, output);
     output = std::make_shared<Output>();
     AgcDriverRegisterVideoOutput_nid_postfix(Handle, output);
+    const auto spare = allocate(4 * BlockBytes);
+    const auto unwatchedAt = at(spare.base) + BlockBytes;
+    AgcDriver::GuestMemory::Unwatch(unwatchedAt, 2 * BlockBytes);
+    check(!AgcDriver::GuestMemory::Watched(unwatchedAt, BlockBytes) && AgcDriver::GuestMemory::Watched(at(spare.base), BlockBytes), "the title-side unwatch did not take");
+    constexpr std::size_t ViewBytes = 2 * 65536;
+    std::int64_t physical = 0;
+    void* firstView = nullptr;
+    void* secondView = nullptr;
+    check(sceKernelAllocateDirectMemory(0, 0x10000000000ll, ViewBytes, 65536, 3, &physical) == 0, "cannot allocate direct memory");
+    check(sceKernelMapDirectMemory(&firstView, ViewBytes, 3, 0, physical, 65536) == 0 && sceKernelMapDirectMemory(&secondView, ViewBytes / 2, 3, 0, physical + ViewBytes / 2, 65536) == 0,
+          "cannot map direct memory twice");
 
     flip();
     std::memcpy(layout.source, first.data(), first.size());
@@ -225,6 +237,26 @@ void testCaptureAndReplay(const std::filesystem::path& tool, bool pipelines) {
     check(recorded(layout.base), "the guest block is not in the snapshot ranges");
     check(recorded(late.base), "the block committed during the capture is not in its ranges");
     check(reader.Header().find("\"late_ranges\":1") != std::string::npos, "the capture header does not count one range committed during the capture: " + reader.Header());
+    const auto stateAt = [&](std::uint64_t address) {
+        const auto found = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) { return chunk.kind == FrameMemoryKind::Range && chunk.address <= address && address < chunk.address + chunk.bytes; });
+        check(found != reader.Chunks().end(), "no captured range holds 0x" + std::to_string(address));
+        return *found;
+    };
+    const auto unwatched = stateAt(unwatchedAt);
+    check(unwatched.address == unwatchedAt && unwatched.bytes == 2 * BlockBytes && unwatched.state.watch == AgcDriver::FrameRangeWatch::Recorded,
+          "the range the title unwatched was not recorded as one unwatched range: " + std::to_string(unwatched.address - unwatchedAt) + " +" + std::to_string(unwatched.bytes) + " state " + std::to_string(unwatched.state.watch));
+    const auto sectionAt = [&](std::uint64_t address) {
+        const auto chunk = stateAt(address);
+        return std::pair{chunk.state.sectionKey, chunk.state.sectionOffset + (address - chunk.address)};
+    };
+    const auto firstSection = sectionAt(at(firstView) + ViewBytes / 2);
+    const auto secondSection = sectionAt(at(secondView));
+    check(firstSection.first != 0 && firstSection == secondSection,
+          "two views of one direct memory page were not recorded with the same section and offset: " + std::to_string(firstSection.first) + "+" + std::to_string(firstSection.second) + " and " +
+              std::to_string(secondSection.first) + "+" + std::to_string(secondSection.second));
+    for (const auto address : {at(spare.base), unwatchedAt + 2 * BlockBytes, at(layout.base)}) {
+        check(stateAt(address).state.watch == (AgcDriver::FrameRangeWatch::Recorded | AgcDriver::FrameRangeWatch::Watched), "a watched range was not recorded as watched");
+    }
 
     const auto firstDump = capture / "first dump.bin";
     const auto secondDump = capture / "second dump.bin";
@@ -243,7 +275,24 @@ void testCaptureAndReplay(const std::filesystem::path& tool, bool pipelines) {
         const auto json = readFile(output);
         return std::string(reinterpret_cast<const char*>(json.data()), json.size());
     };
-    replay("", capture / "replay output.json");
+    const auto kindsOutput = capture / "range kinds.json";
+    auto kindsCommand = "\"" + tool.string() + "\" \"" + capture.string() + "\" --range-kinds > \"" + kindsOutput.string() + "\"";
+#ifdef _WIN32
+    kindsCommand = "\"" + kindsCommand + "\"";
+#endif
+    check(std::system(kindsCommand.c_str()) == 0, "agc_frame_replay --range-kinds failed");
+    const auto kindsBytes = readFile(kindsOutput);
+    const std::string kinds(reinterpret_cast<const char*>(kindsBytes.data()), kindsBytes.size());
+    const auto plain = replay("", capture / "replay output.json");
+    const auto number = [&](const std::string& json, const std::string& key) {
+        const auto found = json.find("\"" + key + "\":");
+        check(found != std::string::npos, "the replay output has no " + key + ": " + json);
+        return std::strtod(json.c_str() + found + key.size() + 3, nullptr);
+    };
+    check(kinds.find("\"watch_state_recorded\":true") != std::string::npos && number(kinds, "multi_view\":{\"ranges") >= 2, "--range-kinds does not report the two views of one section: " + kinds);
+    check(number(plain, "unwatched_mib") >= 2.0 && number(plain, "watch_mismatch_mib") == 0.0, "the replay watch state does not match the captured one: " + plain);
+    const auto ownWatch = replay("--no-watch-state", capture / "own watch output.json");
+    check(number(ownWatch, "unwatched_mib") == 0.0, "--no-watch-state still unwatched captured ranges: " + ownWatch);
     if (pipelines) {
         check(std::getenv("APS5_HEADLESS_PIPELINE_CACHE") != nullptr, "the pipeline cache switch was not inherited");
         const auto warm = capture / "warm output.json";

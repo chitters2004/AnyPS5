@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
@@ -34,6 +35,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <tuple>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -54,6 +56,7 @@ using AgcDriver::FrameMemoryChunk;
 using AgcDriver::FrameMemoryKind;
 using AgcDriver::FrameRangeAccess;
 using AgcDriver::FrameRangeKind;
+using AgcDriver::FrameRangeWatch;
 using Clock = std::chrono::steady_clock;
 
 struct Dump {
@@ -78,6 +81,8 @@ struct Options {
     bool shaders = false;
     std::filesystem::path shaderCode;
     std::size_t submits = 0;
+    bool rangeKinds = false;
+    bool watchState = true;
     bool traceSerials = false;
     bool coldPipelines = false;
 };
@@ -220,6 +225,8 @@ std::pair<std::uint64_t, std::uint64_t> progress();
 struct Skipped {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t bytes = 0;
+    std::uint64_t unwatchedBytes = 0;
+    std::uint64_t watchMismatchBytes = 0;
 
     void Add(const FrameMemoryChunk& chunk) {
         ranges.emplace_back(chunk.address, chunk.address + chunk.bytes);
@@ -300,7 +307,7 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
     }
 }
 
-Skipped restoreMemory(const FrameCaptureReader& reader) {
+Skipped restoreMemory(const FrameCaptureReader& reader, bool watchState = true) {
     if (reader.Version() < 2) throw std::runtime_error("frame replay: calls format 1 does not record whether GPU writes had landed before each memory delta was read; record the capture again");
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -335,6 +342,27 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             commit(chunk);
             mutation.Add(pointer, bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
         }
+    }
+    const auto recorded = [&](std::size_t index) {
+        const auto& chunk = reader.Chunks()[index];
+        return watchState && chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && !owned[index] && (chunk.state.watch & FrameRangeWatch::Recorded) != 0 && !skipped.Overlaps(chunk);
+    };
+    for (std::size_t index = 0; index < reader.Chunks().size(); ++index) {
+        if (!recorded(index)) continue;
+        const auto& chunk = reader.Chunks()[index];
+        if ((chunk.state.watch & FrameRangeWatch::Watched) == 0) {
+            AgcDriverUnwatch_nid_postfix(chunk.address, chunk.bytes);
+            skipped.unwatchedBytes += chunk.bytes;
+            continue;
+        }
+#ifdef __linux__
+        if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes));
+#endif
+    }
+    for (std::size_t index = 0; index < reader.Chunks().size(); ++index) {
+        if (!recorded(index)) continue;
+        const auto& chunk = reader.Chunks()[index];
+        if (AgcDriverWatched_nid_postfix(chunk.address, chunk.bytes) != ((chunk.state.watch & FrameRangeWatch::Watched) != 0)) skipped.watchMismatchBytes += chunk.bytes;
     }
     restoreSnapshot(reader, skipped);
     return skipped;
@@ -886,6 +914,11 @@ int usage() {
                          "                      for each address\n"
                          "  --submits <n>       replays nothing; lists the first n submissions and flips of the captured frames with\n"
                          "                      their queue and serials, the packets of each and the fields of its waits and releases\n"
+                         "  --no-watch-state    keeps the replay's own write watch on every range instead of the watch state the title had\n"
+                         "  --range-kinds       replays nothing and maps no guest memory; prints one JSON line with the count and the\n"
+                         "                      bytes of the captured ranges of each memory kind, how many of those bytes are writable,\n"
+                         "                      GPU-visible, unwatched by the title and mapped from an identified section, and the\n"
+                         "                      ranges that map a section's bytes at more than one address\n"
                          "  --dump              writes guest memory to a file after the replay (hexadecimal or decimal)\n"
                          "  --frames <dir>      writes each recorded and replayed display buffer as reference-<n>.bmp and replay-<n>.bmp\n");
     return 2;
@@ -1203,6 +1236,73 @@ void describeSubmission(const FrameCall& call, CapturedMemory& memory) {
     std::printf("\n");
 }
 
+int listRangeKinds(const Options& options) {
+    const FrameCaptureReader reader(options.directory);
+    struct Totals {
+        std::uint64_t count = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t writable = 0;
+        std::uint64_t gpu = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t identified = 0;
+    };
+    constexpr std::array<std::pair<FrameRangeKind, const char*>, 6> kinds{{{FrameRangeKind::Watched, "watched"}, {FrameRangeKind::Unwatched, "unwatched"}, {FrameRangeKind::Section, "section"},
+                                                                        {FrameRangeKind::Alias, "alias"}, {FrameRangeKind::File, "file"}, {FrameRangeKind::Host, "host"}}};
+    std::array<Totals, kinds.size()> totals{};
+    Totals unknown;
+    bool recorded = false;
+    std::vector<const FrameMemoryChunk*> identified;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range) continue;
+        const auto found = std::find_if(kinds.begin(), kinds.end(), [&](const auto& kind) { return kind.first == chunk.rangeKind; });
+        auto& total = found != kinds.end() ? totals[static_cast<std::size_t>(found - kinds.begin())] : unknown;
+        ++total.count;
+        total.bytes += chunk.bytes;
+        if ((chunk.access & FrameRangeAccess::Writable) != 0) total.writable += chunk.bytes;
+        if ((chunk.access & FrameRangeAccess::Gpu) != 0) total.gpu += chunk.bytes;
+        if (chunk.state.watch == FrameRangeWatch::Recorded) total.unwatched += chunk.bytes;
+        recorded = recorded || chunk.state.watch != 0;
+        if (chunk.state.sectionKey == 0) continue;
+        total.identified += chunk.bytes;
+        identified.push_back(&chunk);
+    }
+    std::sort(identified.begin(), identified.end(), [](const auto* left, const auto* right) { return std::tie(left->state.sectionKey, left->state.sectionOffset) < std::tie(right->state.sectionKey, right->state.sectionOffset); });
+    std::vector<bool> shared(identified.size());
+    for (std::size_t first = 0; first < identified.size();) {
+        auto last = first + 1;
+        auto end = identified[first]->state.sectionOffset + identified[first]->bytes;
+        while (last < identified.size() && identified[last]->state.sectionKey == identified[first]->state.sectionKey && identified[last]->state.sectionOffset < end) {
+            end = std::max(end, identified[last]->state.sectionOffset + identified[last]->bytes);
+            ++last;
+        }
+        if (last - first > 1) std::fill(shared.begin() + static_cast<std::ptrdiff_t>(first), shared.begin() + static_cast<std::ptrdiff_t>(last), true);
+        first = last;
+    }
+    Totals multiView;
+    std::set<std::uint64_t> sections;
+    for (std::size_t index = 0; index < identified.size(); ++index) {
+        sections.insert(identified[index]->state.sectionKey);
+        if (!shared[index]) continue;
+        ++multiView.count;
+        multiView.bytes += identified[index]->bytes;
+        if ((identified[index]->access & FrameRangeAccess::Gpu) != 0) multiView.gpu += identified[index]->bytes;
+    }
+    const auto print = [](const char* name, const Totals& total) {
+        std::printf("\"%s\":{\"ranges\":%llu,\"bytes\":%llu,\"writable_bytes\":%llu,\"gpu_bytes\":%llu,\"unwatched_bytes\":%llu,\"identified_bytes\":%llu}", name, static_cast<unsigned long long>(total.count),
+                    static_cast<unsigned long long>(total.bytes), static_cast<unsigned long long>(total.writable), static_cast<unsigned long long>(total.gpu), static_cast<unsigned long long>(total.unwatched),
+                    static_cast<unsigned long long>(total.identified));
+    };
+    std::printf("{\"watch_state_recorded\":%s,", recorded ? "true" : "false");
+    for (std::size_t index = 0; index < kinds.size(); ++index) {
+        print(kinds[index].second, totals[index]);
+        std::printf(",");
+    }
+    print("unknown", unknown);
+    std::printf(",\"sections\":%zu,\"multi_view\":{\"ranges\":%llu,\"bytes\":%llu,\"gpu_bytes\":%llu}}\n", sections.size(), static_cast<unsigned long long>(multiView.count),
+                static_cast<unsigned long long>(multiView.bytes), static_cast<unsigned long long>(multiView.gpu));
+    return 0;
+}
+
 int listSubmits(const Options& options) {
     const FrameCaptureReader reader(options.directory);
     CapturedMemory memory(reader);
@@ -1251,7 +1351,7 @@ int run(const Options& options) {
     relaunchIfHostRegionBlocks(reader);
 #endif
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
-    auto skipped = restoreMemory(reader);
+    auto skipped = restoreMemory(reader, options.watchState);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
     replay.skipped = std::move(skipped);
@@ -1334,12 +1434,13 @@ int run(const Options& options) {
         frames += measured.frames;
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"unwatched_mib\":%.1f,\"watch_mismatch_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.parkRestores.load()), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
-                static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
+                static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), static_cast<double>(replay.skipped.unwatchedBytes) / (1024.0 * 1024.0),
+                static_cast<double>(replay.skipped.watchMismatchBytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
     std::fflush(stdout);
@@ -1379,7 +1480,9 @@ int main(int argc, char** argv) {
             const std::string_view value = argv[++index];
             const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), options.submits);
             if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
-        } else if (argument == "--trace-serials") options.traceSerials = true;
+        } else if (argument == "--range-kinds") options.rangeKinds = true;
+        else if (argument == "--no-watch-state") options.watchState = false;
+        else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
@@ -1389,9 +1492,9 @@ int main(int argc, char** argv) {
     if (options.directory.empty()) return usage();
     configureEnvironment(options);
     int code = 2;
-    const bool listing = options.shaders || options.submits != 0;
+    const bool listing = options.shaders || options.submits != 0 || options.rangeKinds;
     try {
-        code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
+        code = options.rangeKinds ? listRangeKinds(options) : options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
     }

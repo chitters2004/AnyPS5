@@ -179,6 +179,14 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
     *completed = done;
 }
 
+extern "C" void AgcDriverUnwatch_nid_postfix(std::uint64_t address, std::uint64_t bytes) {
+    AgcDriver::GuestMemory::Unwatch(address, static_cast<std::size_t>(bytes));
+}
+
+extern "C" bool AgcDriverWatched_nid_postfix(std::uint64_t address, std::uint64_t bytes) {
+    return AgcDriver::GuestMemory::Watched(address, static_cast<std::size_t>(bytes));
+}
+
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitSettledFor(std::chrono::milliseconds(milliseconds));
 }

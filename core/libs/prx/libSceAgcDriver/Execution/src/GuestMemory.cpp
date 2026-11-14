@@ -2476,6 +2476,31 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> UnwatchedSpans(std::uint64_t address, std::size_t bytes) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return spans;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return {{address, address + bytes}};
+    constexpr std::uint64_t page = 4096;
+    const auto visit = [&](const auto& self, std::uint64_t begin, std::uint64_t end) -> void {
+        if (tracker.covers(begin, static_cast<std::size_t>(end - begin))) return;
+        const auto firstPage = begin / page;
+        const auto lastPage = (end - 1) / page;
+        if (firstPage == lastPage) {
+            if (!spans.empty() && spans.back().second == begin) spans.back().second = end;
+            else spans.emplace_back(begin, end);
+            return;
+        }
+        const auto middle = (firstPage + (lastPage - firstPage + 1) / 2) * page;
+        self(self, begin, middle);
+        self(self, middle, end);
+    };
+    visit(visit, address, address + bytes);
+    return spans;
+}
+
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     Pages().initialize();
     auto* subscription = new WriteSubscription;
