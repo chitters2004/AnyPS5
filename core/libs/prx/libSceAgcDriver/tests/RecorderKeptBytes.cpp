@@ -2,6 +2,7 @@
 #include <new>
 #include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -365,7 +366,7 @@ void RepeatedReadsAnswerLikeEveryNote() {
     }
     const auto after = Recorder::ReadCounts();
     Expect(after.noted - before.noted == notedCalls, "the noted counter counted " + std::to_string(after.noted - before.noted) + " ranges, not every one of the " + std::to_string(notedCalls) + " noted");
-    const auto repeats = Recorder::FlipReadCheck() ? 0 : expectedRepeats;
+    const auto repeats = Recorder::FlipReadCheck() || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) ? 0 : expectedRepeats;
     Expect(after.repeated - before.repeated == repeats, "the batch skipped " + std::to_string(after.repeated - before.repeated) + " repeated reads, not the " + std::to_string(repeats) + " (range, kind) repeats it was given");
     std::size_t mismatches = 0;
     for (std::uint64_t offset = 0; offset < 0x900; offset += 0x10) {
@@ -399,6 +400,48 @@ void RepeatedReadsAnswerLikeEveryNote() {
     }
     recorder.Sync();
     Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
+}
+
+void DedupeSwitchFlipsMidBatch() {
+    if (Recorder::FlipReadCheck()) {
+        std::printf("APS5_FLIP_READ_CHECK keeps every note: the mid-batch switch flip check is skipped\n");
+        return;
+    }
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+    constexpr std::uint64_t base = 0x7f0000300000ull;
+    const auto repeated = [] { return Recorder::ReadCounts().repeated; };
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, false);
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    auto before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    Expect(repeated() == before + 1, "a repeated read with the dedupe on was not skipped");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, true);
+    before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    const auto list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{base + 0x400, base + 0x420}});
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    Expect(repeated() == before, "APS5_NO_EFFECTS_DEDUPE set at run time still skipped " + std::to_string(repeated() - before) + " repeated reads");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, false);
+    before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    Expect(repeated() == before + 2, "after the switch went back off, the batch skipped " + std::to_string(repeated() - before) + " repeated reads, not the 2 noted with the dedupe on");
+    const auto first = recorder.DescribePendingRead(base, 4);
+    const auto second = recorder.DescribePendingRead(base + 0x200, 4);
+    const auto listed = recorder.DescribePendingRead(base + 0x400, 4);
+    Expect(first.has_value() && first->open && first->kind == Kind::CopySource, "a read noted before the flips is no longer reported");
+    Expect(second.has_value() && second->open && second->kind == Kind::AddressBased && recorder.PendingLeaseSerial(base + 0x200, 4) == recorder.OpenSerial(), "a read noted while the dedupe was off is not reported");
+    Expect(listed.has_value() && listed->open && listed->kind == Kind::DispatchElement, "a list noted while the dedupe was off is not reported");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, environment);
+    recorder.Sync();
 }
 
 void ReadSurvivesFailedNote() {
@@ -521,6 +564,7 @@ int main(int argc, char** argv) {
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
         RepeatedReadsAnswerLikeEveryNote();
+        DedupeSwitchFlipsMidBatch();
         ReadSurvivesFailedNote();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
