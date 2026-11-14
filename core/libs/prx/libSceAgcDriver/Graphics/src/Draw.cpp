@@ -3469,7 +3469,7 @@ void reportTargetMemo() {
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s, all threads):%s\n", line.empty() ? " none" : line.c_str());
 }
 
-std::atomic<TargetMemoC2Mutant> targetMemoC2Mutant{TargetMemoC2Mutant::None};
+std::atomic<TargetMemoC2Mutant> targetMemoC2Mutant{TargetMemoC2Mutant::CertifiesMetadata};
 
 bool targetMemoScoped() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemoC2);
