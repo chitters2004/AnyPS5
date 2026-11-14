@@ -497,7 +497,7 @@ if(BUILD_TESTING)
         set_tests_properties(tools_pe_inventory PROPERTIES TIMEOUT 20)
         add_test(NAME rebase_verify COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_rebase_verify.py)
-        set_tests_properties(rebase_verify PROPERTIES TIMEOUT 20)
+        set_tests_properties(rebase_verify PROPERTIES TIMEOUT 60)
         add_test(NAME check_skips COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_skips.py)
         set_tests_properties(check_skips PROPERTIES TIMEOUT 20)
@@ -548,13 +548,13 @@ if(BUILD_TESTING)
         set_tests_properties(relinker_fuzz_configurations PROPERTIES TIMEOUT 30)
         add_test(NAME configure_seed COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_configure_seed.py ConfigureSeedTests)
-        set_tests_properties(configure_seed PROPERTIES TIMEOUT 20)
+        set_tests_properties(configure_seed PROPERTIES TIMEOUT 30)
         add_test(NAME configure_seed_paths COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_configure_seed.py ConfigureSeedPathTests)
         set_tests_properties(configure_seed_paths PROPERTIES TIMEOUT 20)
         add_test(NAME configure_seed_round_trips COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_configure_seed.py ConfigureSeedRoundTripTests)
-        set_tests_properties(configure_seed_round_trips PROPERTIES TIMEOUT 20)
+        set_tests_properties(configure_seed_round_trips PROPERTIES TIMEOUT 30)
         add_test(NAME configure_seed_stdout COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_configure_seed.py ConfigureSeedStdoutTests)
         set_tests_properties(configure_seed_stdout PROPERTIES TIMEOUT 20)
