@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/EffectRepeatScreen.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -8,6 +9,8 @@
 
 namespace {
 
+using AgcDriver::Graphics::EffectReadBucket;
+using AgcDriver::Graphics::EffectReadBuckets;
 using AgcDriver::Graphics::EffectReadPrint;
 using AgcDriver::Graphics::EffectRepeat;
 using AgcDriver::Graphics::EffectRepeatScreen;
@@ -47,6 +50,14 @@ void CheckRepeatsWithinOneBatch() {
     Require(screen.Note(&recorderB, 2, 8) == EffectRepeat::Unchanged, "a repeat on the other recorder is not unchanged");
 }
 
+void CheckReadBuckets() {
+    const std::vector<std::pair<std::size_t, std::size_t>> edges{{0, 0}, {1, 1}, {4, 1}, {5, 2}, {8, 2}, {9, 3}, {16, 3}, {17, 4}, {32, 4}, {33, 5}, {4096, 5}};
+    for (const auto& [reads, bucket] : edges) {
+        Require(EffectReadBucket(reads) == bucket, std::to_string(reads) + " own reads fall in bucket " + std::to_string(EffectReadBucket(reads)) + ", not " + std::to_string(bucket));
+    }
+    Require(EffectReadBuckets == 6, "the report names six own-read buckets");
+}
+
 void CheckFirstMarkAtZero() {
     EffectRepeatScreen screen;
     Require(screen.Note(nullptr, 0, 0) == EffectRepeat::First, "a first mark that matches the empty state repeats");
@@ -60,6 +71,7 @@ int main() {
         CheckPrintFollowsEveryInput();
         CheckRepeatsWithinOneBatch();
         CheckFirstMarkAtZero();
+        CheckReadBuckets();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

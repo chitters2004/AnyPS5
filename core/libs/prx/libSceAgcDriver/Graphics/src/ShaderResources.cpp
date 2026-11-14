@@ -3113,9 +3113,13 @@ std::uint64_t ShaderResources::InPlaceReadReuses() {
 }
 
 ProfileCounter effectSetsMarked, effectSetsUnchanged, effectSetsChanged;
+ProfileCounter effectOwnReads, effectListReads, effectUnchangedOwnReads;
+ProfileCounter effectUnchangedByOwnReads[EffectReadBuckets];
 
 ShaderResources::EffectScreenCounts ShaderResources::EffectScreen() {
-    return {effectSetsMarked.Sum(), effectSetsUnchanged.Sum(), effectSetsChanged.Sum()};
+    EffectScreenCounts counts{effectSetsMarked.Sum(), effectSetsUnchanged.Sum(), effectSetsChanged.Sum(), effectOwnReads.Sum(), effectListReads.Sum(), effectUnchangedOwnReads.Sum(), {}};
+    for (std::size_t bucket = 0; bucket < EffectReadBuckets; ++bucket) counts.unchangedByOwnReads[bucket] = effectUnchangedByOwnReads[bucket].Sum();
+    return counts;
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -7307,12 +7311,19 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
     static const bool screen = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    const auto screenReads = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, const void* list) {
+    const auto screenReads = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, const Recorder::ReadList* list) {
         if (!screen) return;
         effectSetsMarked.Add(1);
+        effectOwnReads.Add(reads.size());
+        if (list != nullptr) effectListReads.Add(list->size());
         const auto repeat = effectScreen.Note(&recorder, recorder.OpenSerial(), EffectReadPrint(reads, list, static_cast<std::uint32_t>(kind)));
-        if (repeat == EffectRepeat::Unchanged) effectSetsUnchanged.Add(1);
-        else if (repeat == EffectRepeat::Changed) effectSetsChanged.Add(1);
+        if (repeat == EffectRepeat::Unchanged) {
+            effectSetsUnchanged.Add(1);
+            effectUnchangedOwnReads.Add(reads.size());
+            effectUnchangedByOwnReads[EffectReadBucket(reads.size())].Add(1);
+        } else if (repeat == EffectRepeat::Changed) {
+            effectSetsChanged.Add(1);
+        }
     };
     if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
         if (auto split = guestMemory.SplitInPlaceReads()) {
@@ -7329,7 +7340,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
         auto reads = std::move(ownedReads);
         const auto capacity = reads.capacity();
-        const void* list = nullptr;
+        const Recorder::ReadList* list = nullptr;
         if (auto space = guestMemory.SplitInPlaceReads(reads)) {
             list = space.get();
             recorder.NotePendingReadList(std::move(space), kind);

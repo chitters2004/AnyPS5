@@ -4239,6 +4239,18 @@ bool effectScreenTests(const Device& device, Recorder& recorder) {
         Require(sets == (screened ? 7u : 0u), "the screen counted " + std::to_string(sets) + " effect sets for 7 marks");
         Require(unchanged == (screened ? 3u : 0u), "the screen counted " + std::to_string(unchanged) + " unchanged repeats, not the 3 within one batch");
         Require(changed == 0, "a resources object with fixed reads counted a changed repeat");
+        const auto own = after.ownReads - before.ownReads;
+        const auto repeatedOwn = after.unchangedOwnReads - before.unchangedOwnReads;
+        Require(own % 7 == 0 && repeatedOwn * 7 == own * 3, "the repeated sets' own reads (" + std::to_string(repeatedOwn) + ") are not 3 of 7 equal sets' (" + std::to_string(own) + ")");
+        Require(screened == (own != 0), screened ? "the screen counted no own reads for sets with reads" : "own reads were counted without APS5_PROFILE_DRAW");
+        Require(after.listReads == before.listReads, "a host-imported block without an address space counted read list reads");
+        std::uint64_t bucketed = 0;
+        for (std::size_t bucket = 0; bucket < after.unchangedByOwnReads.size(); ++bucket) {
+            const auto added = after.unchangedByOwnReads[bucket] - before.unchangedByOwnReads[bucket];
+            bucketed += added;
+            Require(added == 0 || bucket == EffectReadBucket(own / 7), "a repeated set fell outside its own-read bucket");
+        }
+        Require(bucketed == unchanged, "the own-read buckets hold " + std::to_string(bucketed) + " repeated sets, not " + std::to_string(unchanged));
     }
     {
         GuestAllocations::Mutation mutation;

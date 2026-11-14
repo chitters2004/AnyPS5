@@ -353,6 +353,8 @@ public:
     static std::uint64_t InPlaceReadReuses();
     struct EffectScreenCounts {
         std::uint64_t sets, unchanged, changed;
+        std::uint64_t ownReads, listReads, unchangedOwnReads;
+        std::array<std::uint64_t, EffectReadBuckets> unchangedByOwnReads;
     };
     static EffectScreenCounts EffectScreen();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }

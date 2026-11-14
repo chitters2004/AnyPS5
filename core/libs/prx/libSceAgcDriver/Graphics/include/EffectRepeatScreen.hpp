@@ -1,6 +1,8 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_EFFECTREPEATSCREEN_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_EFFECTREPEATSCREEN_HPP
 
+#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <span>
 #include <utility>
@@ -14,6 +16,15 @@ inline std::uint64_t EffectReadPrint(std::span<const std::pair<std::uint64_t, st
         print = (print ^ end) * 0x100000001b3ull;
     }
     return (print ^ reads.size()) * 0x100000001b3ull;
+}
+
+inline constexpr std::array<std::size_t, 5> EffectReadBucketEnds{1, 5, 9, 17, 33};
+inline constexpr std::size_t EffectReadBuckets = EffectReadBucketEnds.size() + 1;
+
+inline std::size_t EffectReadBucket(std::size_t ownReads) {
+    std::size_t bucket = 0;
+    while (bucket < EffectReadBucketEnds.size() && ownReads >= EffectReadBucketEnds[bucket]) ++bucket;
+    return bucket;
 }
 
 enum class EffectRepeat {
