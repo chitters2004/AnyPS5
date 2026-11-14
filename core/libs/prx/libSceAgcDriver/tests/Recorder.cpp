@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSetCounters.hpp"
@@ -5214,6 +5215,43 @@ int persistentDrawSetTests(const Device& device, Recorder& recorder) {
             }
             snapshots.Activate();
             if (!recycled) std::cout << "upload chunk handles were never recycled: the stale persistent set check did not run\n";
+        }
+        {
+            const SwitchScope persistent(RuntimeSwitch::NoPersistentDrawSets, false);
+            ShaderRecompiler::RecompileResult faulting;
+            faulting.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+            ShaderRecompiler::DescriptorBinding fault{};
+            fault.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            fault.role = ShaderRecompiler::DescriptorRole::FaultBuffer;
+            fault.binding = 5;
+            fault.count = 1;
+            faulting.bindings = {program.bindings.front(), fault};
+            const CompiledShader faultingShader{ShaderRecompiler::ShaderStage::Compute, &faulting, 0};
+            ShaderResources guarded(context, faultingShader);
+            const auto faultOf = [&](const DescriptorUpdates::Contents& call) { return call.buffers.at(std::pair{5u, 0u}); };
+            const auto overlaps = [](const VkDescriptorBufferInfo& left, const VkDescriptorBufferInfo& right) { return left.buffer == right.buffer && left.offset < right.offset + right.range && right.offset < left.offset + left.range; };
+            const auto draw = [&] {
+                const ShaderResources::MovedBuffer moved{0, 0, sizeof(first), first};
+                return guarded.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            };
+            auto held = draw();
+            Require(held != nullptr && held->persistent != nullptr, "a draw with a fault buffer did not get a persistent set");
+            const auto taken = faultOf(updates.calls.back());
+            const auto kept = held->persistent;
+            held.reset();
+            snapshots.Sync();
+            std::vector<std::unique_ptr<BdaResources>> pressure;
+            {
+                std::lock_guard gpu(GpuMutex());
+                BdaResources::NoteFinished(context.device, std::numeric_limits<std::uint64_t>::max() - 1u);
+                while (pressure.size() < 4096u && (pressure.empty() || !overlaps(pressure.back()->Fault(), taken))) pressure.push_back(std::make_unique<BdaResources>(context));
+                Require(overlaps(pressure.back()->Fault(), taken), "fault slot pressure did not reclaim the idle draw's slot");
+            }
+            const auto before = updates.calls.size();
+            const auto retaken = draw();
+            Require(retaken != nullptr && retaken->persistent != nullptr && retaken->persistent->key.front().buffer == kept->key.front().buffer, "the draw after a fault slot retake moved to another upload chunk");
+            Require(retaken->persistent != kept, "a draw after its fault slot was retaken reused the persistent set naming the old slot");
+            Require(updates.calls.size() > before && !overlaps(faultOf(updates.calls.back()), taken), "the persistent set written after a fault slot retake names the slot it gave back");
         }
         {
             const SwitchScope conventional(RuntimeSwitch::NoPersistentDrawSets, true);
