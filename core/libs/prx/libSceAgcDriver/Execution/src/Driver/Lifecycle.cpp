@@ -342,7 +342,7 @@ void Driver::ReleaseSettled() {
     if (!captureHold.load(std::memory_order_relaxed)) return;
     {
         std::lock_guard lock(mutex);
-        captureHold.store(false, std::memory_order_relaxed);
+        captureHold.store(false, std::memory_order_release);
     }
     changed.notify_all();
 }
