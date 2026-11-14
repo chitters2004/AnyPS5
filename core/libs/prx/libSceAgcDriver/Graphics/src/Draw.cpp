@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1010,6 +1011,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", line);
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] draws: %llu hits, %llu misses, %llu invalidated, %llu uncacheable; validation memo %llu hits / %llu misses (which key words the misses differ in: the miss churn line)\n", static_cast<unsigned long long>(profile.cacheHits), static_cast<unsigned long long>(profile.cacheMisses), static_cast<unsigned long long>(profile.cacheInvalidated), static_cast<unsigned long long>(profile.uncacheable), static_cast<unsigned long long>(profile.validateHits), static_cast<unsigned long long>(profile.validateMisses));
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", DrawSplit::Describe(DrawSplit::Take(), profile.draws).c_str());
     const auto address = AddressDrawReuseCounters();
     if (address != profile.addressSeen) {
         char reuse[512];
@@ -4029,7 +4031,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     APS5_LOG_CHARS_OUT_DEBUG("Creating Pipeline");
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
+    const auto maskStart = DrawSplit::Now();
     masked = maskedState(state, inputs.fragmentOutputs);
+    DrawSplit::Add(DrawSplit::Span::MaskedCopy, maskStart, DrawSplit::Now());
+    if (masked.has_value()) DrawSplit::Count(DrawSplit::Event::MaskedCopies);
     if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
@@ -4069,7 +4074,11 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         const bool repeated = pipeline != nullptr;
         if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
-        if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
+        if (memoized) {
+            DrawSplit::Scope remembering(DrawSplit::Span::RememberShape);
+            DrawSplit::Count(DrawSplit::Event::ShapeRemembers);
+            rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
+        }
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.

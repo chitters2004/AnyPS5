@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -891,6 +892,8 @@ VkPipelineLayout Pipeline::Layout() const {
 }
 
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<void>> owners, VkExtent2D extent, std::uint32_t layers) {
+    const DrawSplit::Scope acquiring(DrawSplit::Span::Framebuffer);
+    DrawSplit::Count(DrawSplit::Event::Framebuffers);
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     bool resident = true;
     for (const auto& owner : owners) resident = resident && owner != nullptr;
@@ -1460,7 +1463,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 
 std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint64_t hash, const std::weak_ptr<Pipeline>& expected) {
     auto& store = Pipelines();
+    const auto touchWait = DrawSplit::Now();
     std::lock_guard lock(store.mutex);
+    const auto touchHeld = DrawSplit::Now();
+    DrawSplit::Add(DrawSplit::Span::PipelineLockWait, touchWait, touchHeld);
+    DrawSplit::Count(DrawSplit::Event::PipelineTouches);
+    const DrawSplit::Scope holding(DrawSplit::Span::PipelineLockHold, touchHeld);
     reportPipelines(store);
     const auto found = store.index.find(hash);
     if (found == store.index.end()) return nullptr;

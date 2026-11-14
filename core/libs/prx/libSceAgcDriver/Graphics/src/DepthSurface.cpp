@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/DrawSplit.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -3528,6 +3529,8 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 }
 
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
+    DrawSplit::Scope viewing(DrawSplit::Span::DepthView);
+    DrawSplit::Count(DrawSplit::Event::DepthViews);
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
     if (target.stencilPartiallyResident) Require(resident(target.stencilAddress, planeBytes(1u)), "partially resident stencil (DB_STENCIL_INFO) with pages that are not mapped is unsupported");
@@ -3535,9 +3538,13 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    const auto gpuWait = DrawSplit::Now();
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    DrawSplit::Add(DrawSplit::Span::GpuMutexWait, gpuWait, DrawSplit::Now());
     settlePendingHtileClear(context, target.address);
+    const auto surfacesWait = DrawSplit::Now();
     std::unique_lock lock(surfacesMutex());
+    DrawSplit::Add(DrawSplit::Span::SurfacesLockWait, surfacesWait, DrawSplit::Now());
     const bool cleared = takeClearedHtile(target);
     DepthSurface* surface = nullptr;
     for (const auto& candidate : surfaces()) {
@@ -3605,13 +3612,20 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
-    if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
+    if (mirrorable(target)) {
+        DrawSplit::Count(DrawSplit::Event::DepthCollects);
+        surface->SyncFromMemory(mirrorResource(target));
+    }
+    if (surface->StencilMirrorable()) {
+        DrawSplit::Count(DrawSplit::Event::DepthCollects);
+        surface->SyncStencilFromMemory(stencilResource(target));
+    }
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
+    DrawSplit::Count(DrawSplit::Event::DepthCollects, target.stencilAddress != 0 ? 2u : 1u);
     surface->NoteMemory();
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
