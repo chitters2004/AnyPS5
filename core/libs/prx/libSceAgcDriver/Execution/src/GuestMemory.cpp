@@ -172,6 +172,33 @@ RangeVersionCounters& rangeVersionCounters() {
     return *counters;
 }
 
+struct GpuMutexEntries {
+    std::array<std::atomic<const void*>, 64> callers{};
+    std::array<std::atomic<std::uint64_t>, 64> entries{};
+    std::atomic<std::uint64_t> unlisted{0};
+};
+
+GpuMutexEntries& gpuMutexEntries() {
+    static auto* entries = new GpuMutexEntries;
+    return *entries;
+}
+
+void countGpuMutexEntry(const void* caller) {
+    auto& table = gpuMutexEntries();
+    for (std::size_t slot = 0; slot < table.callers.size(); ++slot) {
+        const auto* listed = table.callers[slot].load(std::memory_order_relaxed);
+        if (listed == nullptr) {
+            table.callers[slot].store(caller, std::memory_order_release);
+            listed = caller;
+        }
+        if (listed == caller) {
+            table.entries[slot].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+    table.unlisted.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::pair<std::uint64_t, std::uint64_t> granulesOf(std::uint64_t address, std::uint64_t bytes) {
     const auto first = address / RangeGranuleBytes;
     const auto last = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() / RangeGranuleBytes : (address + bytes - 1) / RangeGranuleBytes;
@@ -343,6 +370,19 @@ RangeVersionCounts TakeRangeVersionCounts() {
         counts.granules[source] = counters.granules[source].Take();
     }
     for (std::size_t source = 0; source < counts.unscoped.size(); ++source) counts.unscoped[source] = counters.unscoped[source].Take();
+    return counts;
+}
+
+std::vector<GpuMutexEntryCount> TakeGpuMutexEntryCounts() {
+    auto& table = gpuMutexEntries();
+    std::vector<GpuMutexEntryCount> counts;
+    for (std::size_t slot = 0; slot < table.callers.size(); ++slot) {
+        const auto* caller = table.callers[slot].load(std::memory_order_acquire);
+        if (caller == nullptr) break;
+        if (const auto entries = table.entries[slot].exchange(0, std::memory_order_relaxed); entries != 0) counts.push_back({ModuleOffset(caller), entries});
+    }
+    if (const auto unlisted = table.unlisted.exchange(0, std::memory_order_relaxed); unlisted != 0) counts.push_back({0, unlisted});
+    std::sort(counts.begin(), counts.end(), [](const GpuMutexEntryCount& a, const GpuMutexEntryCount& b) { return a.entries > b.entries; });
     return counts;
 }
 
@@ -3238,21 +3278,23 @@ bool GpuMutexType::tryEnter() {
     return HeldByThisThread() || mutex.try_lock();
 }
 
-void GpuMutexType::acquired() {
+void GpuMutexType::acquired(const void* caller) {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         if (!proofThread) {
             BreakProofs();
             BumpUnscopedVersion(UnscopedSource::GpuMutex);
+            if (ScopedProofsProfiled()) countGpuMutexEntry(caller);
         }
     }
 }
 
 bool GpuMutexType::try_lock() {
+    const void* caller = __builtin_return_address(0);
     if (!GpuLockProfiled()) {
         if (!tryEnter()) return false;
-        acquired();
+        acquired(caller);
         return true;
     }
     // The tag is consumed whether or not the try succeeds (a failed try must not name the next
@@ -3264,7 +3306,7 @@ bool GpuMutexType::try_lock() {
         ++stats.triesFailed;
         return false;
     }
-    acquired();
+    acquired(caller);
     if (depth == 1 && GpuHoldProfiled()) BeginHold(static_cast<std::size_t>(tagged == GpuLockSite::Other ? GpuLockSite::Try : tagged));
     return true;
 }
@@ -3313,6 +3355,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    const void* caller = __builtin_return_address(0);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {
@@ -3325,7 +3368,7 @@ void GpuMutexType::lock() {
                 trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, std::chrono::steady_clock::now());
             }
         }
-        acquired();
+        acquired(caller);
         return;
     }
     auto& stats = LockStats();
@@ -3340,7 +3383,7 @@ void GpuMutexType::lock() {
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
         LockSpinning(mutex, HandoffSpinWindow());
-        acquired();
+        acquired(caller);
         const auto now = std::chrono::steady_clock::now();
         if (auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr) trace->Add("GpuMutex.wait", GpuLockSiteNames[site], start, now);
         if (holders) {
@@ -3410,7 +3453,7 @@ void GpuMutexType::lock() {
         stats.lockedGpuWaitMs = 0;
         return;
     }
-    acquired();
+    acquired(caller);
     if (depth == 1 && GpuHoldProfiled()) BeginHold(site);
 }
 
