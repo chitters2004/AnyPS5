@@ -5872,7 +5872,7 @@ std::size_t RetainedSpaceCount() {
 namespace {
 
 bool epochMirrors() {
-    return DrawPipelineEnabled();
+    return ShaderResources::EpochProofs();
 }
 
 void noteEpochMirrors(bool reused, const GuestBufferMemory::AddressSpace& space) {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -9,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
@@ -4050,7 +4052,7 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 }
 
 bool ShaderResources::EpochProofs() {
-    return DrawPipelineEnabled();
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoEpochProofs) && DriverDetail::DrawPipeline::Depth() != 0;
 }
 
 namespace {
