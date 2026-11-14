@@ -3,11 +3,12 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,14 @@ public:
     static WindowsMappings& Get() {
         static auto* mappings = new WindowsMappings;
         return *mappings;
+    }
+
+    static void ProfileCollects() {
+        collectsProfiled.store(true, std::memory_order_relaxed);
+    }
+
+    static CollectCounts& ThreadCollectCounts() {
+        return HostThreadLocal<CollectCounts, CollectCounts>();
     }
 
 #ifdef APS5_COUNT_MAPPING_QUERIES
@@ -631,7 +640,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockForCollect();
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -931,9 +940,36 @@ private:
         return std::all_of(bytes.begin(), bytes.end(), [](std::uint64_t word) { return word == 0; });
     }
 
+    static std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point start) {
+        return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+
+    std::unique_lock<std::mutex> lockForCollect() {
+        if (!collectsProfiled.load(std::memory_order_relaxed)) return std::unique_lock(mutex);
+        auto& counts = ThreadCollectCounts();
+        ++counts.mappingLocks;
+        std::unique_lock lock(mutex, std::try_to_lock);
+        if (lock.owns_lock()) return lock;
+        const auto start = std::chrono::steady_clock::now();
+        lock.lock();
+        ++counts.mappingWaits;
+        counts.mappingWaitNs += nanosecondsSince(start);
+        return lock;
+    }
+
+    static UINT getWriteWatch(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
+        if (!collectsProfiled.load(std::memory_order_relaxed)) return GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        const auto start = std::chrono::steady_clock::now();
+        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        auto& counts = ThreadCollectCounts();
+        ++counts.watchCalls;
+        counts.watchNs += nanosecondsSince(start);
+        return result;
+    }
+
     UINT watchWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity, bool dropZero = false) {
         const auto capacity = *count;
-        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        const auto result = getWriteWatch(flags, address, bytes, pages, count, granularity);
         if (result != 0 || zeroPages.empty()) return result;
         const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{4095};
         const auto last = (reinterpret_cast<std::uintptr_t>(address) + bytes + 4095) & ~std::uintptr_t{4095};
@@ -1705,6 +1741,7 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
+    static inline std::atomic<bool> collectsProfiled{false};
     std::mutex mutex;
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;

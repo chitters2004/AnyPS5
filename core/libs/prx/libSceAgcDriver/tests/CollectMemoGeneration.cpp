@@ -250,6 +250,36 @@ void CheckStoreInNewEpochIsFound() {
     Require(Walked(address, Page, address), "a store in a new epoch was not found");
 }
 
+void CheckThreadCollectCounts() {
+    const auto block = Base + 40 * Block;
+    const auto address = block + 3 * Page + 100;
+    Require(CollectWritesUncached(block, Block) != 0, "the settling collect failed");
+    BumpCollectEpoch();
+    const auto before = ThreadCollectCounts();
+    Store(address);
+    Store(address + Page);
+    Require(CollectWrites(address, Page) != 0, "the counted collect failed");
+    Require(CollectWrites(address, Page) != 0, "the memoized collect failed");
+    const auto counted = ThreadCollectCounts() - before;
+    Require(counted.memoHits == 1, "the memo hit was not counted once");
+    Require(counted.walks == 1 && counted.requestedBytes == Page, "the walk was not counted with its requested bytes");
+    Require(counted.walkedPages == Block / Page, "the walk was not counted with the block it widened to");
+    Require(counted.stampedPages == 2, "the two written pages were not counted as stamped");
+    Require(counted.trackerLocks >= 1 && counted.trackerWaits <= counted.trackerLocks, "the tracker lock was not counted");
+#ifdef _WIN32
+    Require(counted.mappingLocks >= 1 && counted.watchCalls >= 1, "the mapping lock and the write watch call were not counted");
+#endif
+    const auto mine = ThreadCollectCounts();
+    std::thread other([&] {
+        BumpCollectEpoch();
+        Store(address);
+        Require(CollectWrites(address, Page) != 0, "the other thread's collect failed");
+    });
+    other.join();
+    const auto after = ThreadCollectCounts() - mine;
+    Require(after.walks == 0 && after.walkedPages == 0 && after.stampedPages == 0 && after.trackerLocks == 0 && after.mappingLocks == 0 && after.watchCalls == 0, "another thread's collect was counted on this thread");
+}
+
 void CheckInteriorCoverageAfterRingEviction() {
     BumpCollectEpoch();
     Require(CollectWrites(Base, 8 * Block) != 0, "the covering collection failed");
@@ -333,6 +363,7 @@ int main(int argc, char** argv) {
         if (argc == 2) {
             const std::string selected = argv[1];
             if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
+            else if (selected == "--counts") CheckThreadCollectCounts();
             else if (selected == "--unions") {
                 CheckAdjacentCoverage();
                 CheckOverlappingCoverage();

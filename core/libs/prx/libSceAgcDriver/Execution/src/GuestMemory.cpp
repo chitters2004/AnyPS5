@@ -546,8 +546,38 @@ void CountWriteCaller(const void* returnAddress) {
 }
 
 bool MemoryProfiled() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = [] {
+        const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+#ifdef _WIN32
+        if (profiled) GuestArena::GuestArenaProfileCollects_nid_no_patch();
+#endif
+        return profiled;
+    }();
     return profile;
+}
+
+CollectCounts& threadCollectCounts() {
+    struct Slot {};
+    return ThreadScratch<CollectCounts, Slot>();
+}
+
+class CollectSpan {
+public:
+    explicit CollectSpan(std::uint64_t CollectCounts::*field) : field(MemoryProfiled() ? field : nullptr), start(this->field != nullptr ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    ~CollectSpan() {
+        if (field != nullptr) threadCollectCounts().*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    }
+    CollectSpan(const CollectSpan&) = delete;
+    CollectSpan& operator=(const CollectSpan&) = delete;
+
+private:
+    std::uint64_t CollectCounts::*field;
+    std::chrono::steady_clock::time_point start;
+};
+
+void noteCollectMemoHit() {
+    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+    if (MemoryProfiled()) ++threadCollectCounts().memoHits;
 }
 
 class TimedAccess {
@@ -1739,14 +1769,17 @@ WriteTracker& Tracker() {
 class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
-        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (!profile) {
+        if (!MemoryProfiled()) {
             lock.lock();
             return;
         }
+        auto& counts = threadCollectCounts();
+        ++counts.trackerLocks;
         if (!lock.try_lock()) {
             trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            const CollectSpan waited(&CollectCounts::trackerWaitNs);
             lock.lock();
+            ++counts.trackerWaits;
         }
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
@@ -1927,6 +1960,10 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     auto& tracker = runs.tracker;
     if (end <= begin) return;
     ++runs.stamped;
+    if (MemoryProfiled()) threadCollectCounts().stampedPages += (end - begin + WritePageBytes - 1) / WritePageBytes;
+#ifndef _WIN32
+    const CollectSpan stamping(&CollectCounts::stampNs);
+#endif
     if (runs.window != nullptr) runs.windowRuns.emplace_back(begin, end);
     else {
         const auto generation = tracker.generation.load(std::memory_order_relaxed);
@@ -1973,7 +2010,11 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         auto cursor = first;
         while (cursor < stop) {
             std::size_t count = tracker.pages.size();
-            if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
+            {
+                const CollectSpan collecting(&CollectCounts::collectNs);
+                if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
+            }
+            const CollectSpan stamping(&CollectCounts::stampNs);
             for (std::size_t i = 0; i < count; ++i) {
                 const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
                 stampWrittenRun(&runs, page, page + WritePageBytes);
@@ -2008,6 +2049,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     ++tracker.generation;
+    if (MemoryProfiled()) threadCollectCounts().walkedPages += (stop - first + WritePageBytes - 1) / WritePageBytes;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
@@ -2045,7 +2087,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (epochCollectMapEnabled()) {
             const auto& map = epochCollectMap(epoch, unwatched, mapping);
             if (map.Covers(first, stop)) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
@@ -2054,7 +2096,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 return tracker.stable.load(std::memory_order_acquire);
             }
         }
@@ -2066,7 +2108,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && sharedCollectMemo()) {
         for (const auto& entry : tracker.memo) {
             if (entry.epoch == epoch && entry.unwatched == unwatchSerial.load(std::memory_order_relaxed) && entry.mapping == mapping && entry.begin <= cursor && stop <= entry.end) {
-                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                noteCollectMemoHit();
                 return tracker.generation;
             }
         }
@@ -2788,11 +2830,16 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     auto cursor = first;
     bool marked = false;
     StampRuns runs{tracker, StampKind::Cpu};
+    if (MemoryProfiled()) threadCollectCounts().walkedPages += (stop - first + WritePageBytes - 1) / WritePageBytes;
     while (cursor < stop) {
         std::size_t count = tracker.pages.size();
-        if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
+        {
+            const CollectSpan collecting(&CollectCounts::collectNs);
+            if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, true)) return false;
+        }
         if (count != 0 && !marked) ++tracker.generation;
         marked = marked || count != 0;
+        const CollectSpan stamping(&CollectCounts::stampNs);
         for (std::size_t i = 0; i < count; ++i) {
             const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
             tracker.stampHint(tracker.blockOf(page));
@@ -2825,7 +2872,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
-        collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        noteCollectMemoHit();
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
@@ -3239,9 +3286,21 @@ void NoteLockedGpuWait(double ms) {
     stats.lockedGpuWaitMs += ms;
 }
 
-std::uint64_t ThreadCollectedBytes() {
-    if (!MemoryProfiled()) return 0;
-    return CounterFor(CounterCollect).bytes.load(std::memory_order_relaxed);
+CollectCounts ThreadCollectCounts() {
+    if (!MemoryProfiled()) return {};
+    auto counts = threadCollectCounts();
+    const auto& collected = CounterFor(CounterCollect);
+    counts.walks = collected.calls.load(std::memory_order_relaxed);
+    counts.requestedBytes = collected.bytes.load(std::memory_order_relaxed);
+#ifdef _WIN32
+    const auto mapped = GuestArena::GuestArenaThreadCollectCounts_nid_no_patch();
+    counts.mappingLocks = mapped.mappingLocks;
+    counts.mappingWaits = mapped.mappingWaits;
+    counts.mappingWaitNs = mapped.mappingWaitNs;
+    counts.watchCalls = mapped.watchCalls;
+    counts.watchNs = mapped.watchNs;
+#endif
+    return counts;
 }
 
 std::uint32_t GpuLockThreadTag() {

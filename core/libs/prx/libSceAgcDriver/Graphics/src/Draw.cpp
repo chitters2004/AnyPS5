@@ -777,6 +777,7 @@ struct DrawOutcome {
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
     double lookupUs = 0;
+    GuestMemory::CollectCounts lookupCollects;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
@@ -842,6 +843,7 @@ struct DrawProfile {
     double slowLookupUs = 0;
     double slowLookupWaitUs = 0;
     double lookupWaitUs = 0;
+    GuestMemory::CollectCounts lookupCollects;
     // Resource cache outcomes: hits, misses (built and inserted when reusable), entries that failed
     // Revalidate, and draws that could not use the cache (synchronous, no variant id, or disabled).
     // Which key words the misses differ in is the cache's own "[rescache] miss churn" line
@@ -950,6 +952,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.partialLookups += outcome.partialLookups;
     profile.pagesWalked += outcome.pagesWalked;
     profile.lookupUs += outcome.lookupUs;
+    profile.lookupCollects += outcome.lookupCollects;
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
@@ -960,7 +963,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.lastReport = now;
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[4096];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over 10 s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun", static_cast<unsigned long long>(profile.draws), static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     bool listed = false;
@@ -984,7 +987,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
             n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu calls, us per call: guard %.2f, walk %.2f, snapshots %.2f, uploads %.2f, sets %.2f, keeps %.2f)", static_cast<unsigned long long>(split.calls), per(split.guardNanoseconds), per(split.walkNanoseconds), per(split.snapshotNanoseconds), per(split.uploadNanoseconds), per(split.setsNanoseconds), per(split.objectsNanoseconds));
         }
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
-        if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f, GPU waits %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, GPU waits %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, profile.slowLookupWaitUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.lookupWaitUs);
+        if (i == PhaseReadTarget && room()) {
+            const auto& collects = profile.lookupCollects;
+            const auto microseconds = [](std::uint64_t nanoseconds) { return static_cast<double>(nanoseconds) / 1000.0; };
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f, GPU waits %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us, GPU waits %.0f us; collects: memo hits %llu, walks %llu, requested %.0f KiB, watched %llu pages; tracker lock %llu of %llu waited %.0f us; mapping lock %llu of %llu waited %.0f us; GetWriteWatch %llu calls %.0f us; collect calls %.0f us; dirty pages %llu stamped in %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, profile.slowLookupWaitUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs, profile.lookupWaitUs, static_cast<unsigned long long>(collects.memoHits), static_cast<unsigned long long>(collects.walks), static_cast<double>(collects.requestedBytes) / 1024.0, static_cast<unsigned long long>(collects.walkedPages), static_cast<unsigned long long>(collects.trackerWaits), static_cast<unsigned long long>(collects.trackerLocks), microseconds(collects.trackerWaitNs), static_cast<unsigned long long>(collects.mappingWaits), static_cast<unsigned long long>(collects.mappingLocks), microseconds(collects.mappingWaitNs), static_cast<unsigned long long>(collects.watchCalls), microseconds(collects.watchNs), microseconds(collects.collectNs), static_cast<unsigned long long>(collects.stampedPages), microseconds(collects.stampNs));
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
@@ -1050,6 +1057,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.slowLookupUs = profile.slowLookupWaitUs = profile.lookupWaitUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
+    profile.lookupCollects = {};
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -2044,7 +2052,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 // the stored object instead.
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
-    const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    const auto collectedBefore = profile ? GuestMemory::ThreadCollectCounts() : GuestMemory::CollectCounts{};
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     std::shared_ptr<StorageTexture> resident;
     try {
@@ -2069,7 +2077,9 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             outcome.slowLookupWaitUs += waitedUs;
         }
         outcome.lookupUs += lookupUs;
-        outcome.pagesWalked += (GuestMemory::ThreadCollectedBytes() - walkedBefore) / 4096;
+        const auto collected = GuestMemory::ThreadCollectCounts() - collectedBefore;
+        outcome.pagesWalked += collected.requestedBytes / 4096;
+        outcome.lookupCollects += collected;
         const bool fullScissor = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height;
         ++(fullScissor ? outcome.fullScissorLookups : outcome.partialLookups);
     }

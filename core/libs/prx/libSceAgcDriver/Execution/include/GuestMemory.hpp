@@ -235,9 +235,63 @@ void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).
 void NoteLockedGpuWait(double ms);
-// Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
-// a caller reads the difference across a span of its own work.
-std::uint64_t ThreadCollectedBytes();
+struct CollectCounts {
+    std::uint64_t memoHits = 0;
+    std::uint64_t walks = 0;
+    std::uint64_t requestedBytes = 0;
+    std::uint64_t walkedPages = 0;
+    std::uint64_t trackerLocks = 0;
+    std::uint64_t trackerWaits = 0;
+    std::uint64_t trackerWaitNs = 0;
+    std::uint64_t mappingLocks = 0;
+    std::uint64_t mappingWaits = 0;
+    std::uint64_t mappingWaitNs = 0;
+    std::uint64_t watchCalls = 0;
+    std::uint64_t watchNs = 0;
+    std::uint64_t collectNs = 0;
+    std::uint64_t stampedPages = 0;
+    std::uint64_t stampNs = 0;
+
+    CollectCounts& operator+=(const CollectCounts& other) {
+        memoHits += other.memoHits;
+        walks += other.walks;
+        requestedBytes += other.requestedBytes;
+        walkedPages += other.walkedPages;
+        trackerLocks += other.trackerLocks;
+        trackerWaits += other.trackerWaits;
+        trackerWaitNs += other.trackerWaitNs;
+        mappingLocks += other.mappingLocks;
+        mappingWaits += other.mappingWaits;
+        mappingWaitNs += other.mappingWaitNs;
+        watchCalls += other.watchCalls;
+        watchNs += other.watchNs;
+        collectNs += other.collectNs;
+        stampedPages += other.stampedPages;
+        stampNs += other.stampNs;
+        return *this;
+    }
+
+    CollectCounts operator-(const CollectCounts& before) const {
+        CollectCounts delta;
+        delta.memoHits = memoHits - before.memoHits;
+        delta.walks = walks - before.walks;
+        delta.requestedBytes = requestedBytes - before.requestedBytes;
+        delta.walkedPages = walkedPages - before.walkedPages;
+        delta.trackerLocks = trackerLocks - before.trackerLocks;
+        delta.trackerWaits = trackerWaits - before.trackerWaits;
+        delta.trackerWaitNs = trackerWaitNs - before.trackerWaitNs;
+        delta.mappingLocks = mappingLocks - before.mappingLocks;
+        delta.mappingWaits = mappingWaits - before.mappingWaits;
+        delta.mappingWaitNs = mappingWaitNs - before.mappingWaitNs;
+        delta.watchCalls = watchCalls - before.watchCalls;
+        delta.watchNs = watchNs - before.watchNs;
+        delta.collectNs = collectNs - before.collectNs;
+        delta.stampedPages = stampedPages - before.stampedPages;
+        delta.stampNs = stampNs - before.stampNs;
+        return delta;
+    }
+};
+CollectCounts ThreadCollectCounts();
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);
