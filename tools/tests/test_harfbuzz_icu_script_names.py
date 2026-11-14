@@ -54,6 +54,13 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(refused.exception.code, 2)
         self.assertFalse((self.root / "IcuScriptNames.hpp").exists())
 
+    def test_a_header_missing_one_script_code_is_refused_and_nothing_is_written(self):
+        codes = [code for code in range(SCRIPT_COUNT) if code != 100]
+        with self.assertRaises(SystemExit) as refused:
+            self.generate(header_text(codes))
+        self.assertEqual(refused.exception.code, 2)
+        self.assertFalse((self.root / "IcuScriptNames.hpp").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
