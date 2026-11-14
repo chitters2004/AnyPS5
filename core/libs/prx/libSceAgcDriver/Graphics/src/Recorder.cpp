@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -2030,7 +2031,14 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
         open->passHazards.BeginPass();
         return {commands, false, true, reason};
     }
+    RecordSplit::Lap lap;
     const auto hazard = open->passHazards.Check(access, pass.key == key);
+    if (lap.On()) {
+        lap.To(RecordSplit::Span::HazardCheck);
+        RecordSplit::Count(RecordSplit::Event::HazardChecks);
+        RecordSplit::Count(RecordSplit::Event::HazardCheckRanges, open->passHazards.RangeCount());
+        RecordSplit::Count(RecordSplit::Event::HazardCheckImages, open->passHazards.ImageCount());
+    }
     if (hazard == PassHazard::None && pass.key == key) {
         PerformanceTrace::Amount("Graphics.RenderPass.Continued", 1);
         return {open->commands, true, false, PassBreak::Continued};
@@ -2055,7 +2063,16 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
-    open->passHazards.Add(access);
+    RecordSplit::Lap lap;
+    const auto added = open->passHazards.Add(access);
+    if (lap.On()) {
+        lap.To(RecordSplit::Span::HazardAdd);
+        RecordSplit::Count(RecordSplit::Event::HazardAdds);
+        RecordSplit::Count(RecordSplit::Event::HazardRangesOffered, added.rangesOffered);
+        RecordSplit::Count(RecordSplit::Event::HazardRangesChanged, added.rangesChanged);
+        RecordSplit::Count(RecordSplit::Event::HazardImagesOffered, added.imagesOffered);
+        RecordSplit::Count(RecordSplit::Event::HazardImagesNew, added.imagesNew);
+    }
 }
 
 void Recorder::SealPassWriteOnly() {

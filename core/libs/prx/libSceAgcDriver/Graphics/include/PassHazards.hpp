@@ -48,7 +48,7 @@ constexpr PassBreak PassBreakFor(PassHazard hazard) {
 
 class GuestRangeSet {
 public:
-    void Insert(std::uint64_t begin, std::uint64_t end);
+    bool Insert(std::uint64_t begin, std::uint64_t end);
     bool Overlaps(std::uint64_t begin, std::uint64_t end) const;
     bool Empty() const { return ranges.empty(); }
     std::size_t Size() const { return ranges.size(); }
@@ -61,8 +61,16 @@ private:
 
 class PassHazards {
 public:
+    struct Added {
+        std::size_t rangesOffered = 0;
+        std::size_t rangesChanged = 0;
+        std::size_t imagesOffered = 0;
+        std::size_t imagesNew = 0;
+    };
     PassHazard Check(const PassAccess& access, bool samePass) const;
-    void Add(const PassAccess& access);
+    Added Add(const PassAccess& access);
+    std::size_t RangeCount() const { return reads.Size() + writes.Size() + writeOnly.Size(); }
+    std::size_t ImageCount() const { return images.size() + attachments.size(); }
     void BeginPass() { ++pass; }
     void SealWriteOnly();
     void Clear();

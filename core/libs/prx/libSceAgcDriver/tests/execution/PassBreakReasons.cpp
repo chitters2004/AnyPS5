@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RecordSplit.hpp"
 #include "DepthFastClearHarness.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
@@ -124,6 +125,19 @@ void Draw(const Context& context, AgcDriver::VulkanDevice& device, const Shaders
     AgcDriver::Graphics::Draw(context, state, draw, shaders);
 }
 
+void ExpectContinuedSplit(const RecordSplit::Window& window) {
+    const auto event = [&](RecordSplit::Event which) { return window.events[static_cast<std::size_t>(which)]; };
+    const auto described = RecordSplit::Describe(window, 1);
+    Expect(event(RecordSplit::Event::Draws) == 1 && event(RecordSplit::Event::PassesContinued) == 1 && event(RecordSplit::Event::PassesBegun) == 0, "the record split did not count one continued draw: " + described);
+    Expect(event(RecordSplit::Event::HazardChecks) == 1 && event(RecordSplit::Event::HazardAdds) == 1, "the record split did not count one hazard check and one add: " + described);
+    Expect(event(RecordSplit::Event::HazardRangesChanged) == 0 && event(RecordSplit::Event::HazardImagesNew) == 0, "a repeated draw changed the pass hazards: " + described);
+    Expect(event(RecordSplit::Event::HazardImagesOffered) >= 1 && event(RecordSplit::Event::HazardCheckImages) >= 1, "the repeated draw's attachments were not offered: " + described);
+    std::uint64_t steps = 0;
+    for (std::size_t index = 0; index < RecordSplit::RecordSteps; ++index) steps += window.ns[index];
+    Expect(steps > 0, "the record split timed nothing: " + described);
+    Expect(described.rfind("[record-split]", 0) == 0, "the record split line has no tag: " + described);
+}
+
 }
 
 int main() {
@@ -162,9 +176,11 @@ int main() {
         after = Snapshot();
         ExpectBreak(before, after, PassBreak::NewBatch, "the first draw after a submit");
         before = after;
+        RecordSplit::Take();
         Draw(context, *device, shaders, ColorA, depthA);
         after = Snapshot();
         Expect(after.passes.passesContinued - before.passes.passesContinued == 1 && after.breaks == before.breaks, "a draw with the open pass's key and no hazard did not continue it: " + Describe(before, after));
+        ExpectContinuedSplit(RecordSplit::Take());
         recorder.Commands();
         before = Snapshot();
         Draw(context, *device, shaders, ColorA, depthA);

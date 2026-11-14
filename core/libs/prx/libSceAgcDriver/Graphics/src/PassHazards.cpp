@@ -3,8 +3,8 @@
 
 namespace AgcDriver::Graphics {
 
-void GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
-    if (begin >= end) return;
+bool GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
+    if (begin >= end) return false;
     auto first = std::lower_bound(ranges.begin(), ranges.end(), begin, [](const auto& range, std::uint64_t value) { return range.second < value; });
     auto last = first;
     while (last != ranges.end() && last->first <= end) {
@@ -14,10 +14,12 @@ void GuestRangeSet::Insert(std::uint64_t begin, std::uint64_t end) {
     }
     if (first == last) {
         ranges.insert(first, {begin, end});
-        return;
+        return true;
     }
+    if (last == first + 1 && first->first == begin && first->second == end) return false;
     *first = {begin, end};
     ranges.erase(first + 1, last);
+    return true;
 }
 
 bool GuestRangeSet::Overlaps(std::uint64_t begin, std::uint64_t end) const {
@@ -58,24 +60,36 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
     return PassHazard::None;
 }
 
-void PassHazards::Add(const PassAccess& access) {
-    for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
-    for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);
-    for (const auto& [begin, end] : access.writeOnly) writeOnly.Insert(begin, end);
+PassHazards::Added PassHazards::Add(const PassAccess& access) {
+    Added added;
+    const auto insert = [&](GuestRangeSet& set, GuestRangeList ranges) {
+        added.rangesOffered += ranges.size();
+        for (const auto& [begin, end] : ranges) added.rangesChanged += set.Insert(begin, end) ? 1 : 0;
+    };
+    insert(reads, access.reads);
+    insert(writes, access.writes);
+    insert(writeOnly, access.writeOnly);
     for (const auto& [image, written] : access.images) {
         if (image == VK_NULL_HANDLE) continue;
+        ++added.imagesOffered;
         const auto it = std::find_if(images.begin(), images.end(), [&](const auto& seen) { return seen.first == image; });
-        if (it == images.end()) images.emplace_back(image, written);
-        else it->second = it->second || written;
+        if (it == images.end()) {
+            images.emplace_back(image, written);
+            ++added.imagesNew;
+        } else it->second = it->second || written;
     }
     for (const auto& [image, written] : access.attachments) {
         if (image == VK_NULL_HANDLE) continue;
+        ++added.imagesOffered;
         const auto it = std::find_if(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image && seen.pass == pass; });
-        if (it == attachments.end()) attachments.push_back({image, written, pass});
-        else it->written = it->written || written;
+        if (it == attachments.end()) {
+            attachments.push_back({image, written, pass});
+            ++added.imagesNew;
+        } else it->written = it->written || written;
     }
     anyReads = anyReads || access.anyReads;
     anyWrites = anyWrites || access.anyWrites;
+    return added;
 }
 
 void PassHazards::SealWriteOnly() {
