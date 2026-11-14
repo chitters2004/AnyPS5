@@ -108,6 +108,12 @@ struct ScopedProof {
     bool valid = false;
 };
 bool ScopedHolds(const ScopedProof& proof, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+struct RangeVersionParts {
+    RangeStamp stamp;
+    std::uint64_t gpuPending = 0;
+    std::uint64_t texturePending = 0;
+};
+RangeVersionParts RangeVersionPartsOf(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 struct RangeVersionCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(RangeSource::Count)> calls{};
     std::array<std::uint64_t, static_cast<std::size_t>(RangeSource::Count)> granules{};

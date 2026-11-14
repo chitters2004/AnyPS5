@@ -1435,6 +1435,152 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 15>
     {"eviction", colorMemoResidentEviction}
 }};
 
+void scopedProofOracle(AgcDriver::VulkanDevice& device) {
+    constexpr std::size_t Granule = AgcDriver::GuestMemory::RangeGranuleBytes;
+    constexpr std::size_t WatchedBytes = 4 * Granule;
+    auto* watched = allocateWatched(WatchedBytes + Granule);
+    watched = reinterpret_cast<std::byte*>((address(watched) + Granule - 1) & ~std::uint64_t{Granule - 1});
+    auto plain = colorTarget();
+    plain.address = address(watched);
+    plain.surfaceAddress = plain.address;
+    auto targets = besideTargets();
+    targets.outer.address = address(watched) + Granule;
+    targets.outer.surfaceAddress = targets.outer.address;
+    targets.inner.address = targets.outer.address + PlaneBytes;
+    targets.inner.surfaceAddress = targets.inner.address;
+    const std::span<std::byte> elsewhere{watched + 2 * Granule, PlaneBytes};
+    const std::span<std::byte> besidePlain{watched + PlaneBytes, PlaneBytes};
+    const auto rewatch = [&] {
+#ifdef _WIN32
+        const std::pair<std::uint64_t, std::uint64_t> range{address(watched), address(watched) + WatchedBytes};
+        AgcDriver::GuestMemory::Rewatch(std::span(&range, 1));
+#else
+        GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(watched, WatchedBytes);
+#endif
+    };
+    const auto hitsBefore = StorageTexture::ScopedProofHits();
+    auto covered = colorTarget();
+    covered.address = address(watched) + 3 * Granule;
+    covered.surfaceAddress = covered.address;
+    auto grown = targets.outer;
+    grown.address = covered.address - PlaneBytes;
+    grown.surfaceAddress = grown.address;
+    const auto flushGrown = [&] {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        StorageTexture::FlushPending(grown.address, grown.bytes, nullptr, "test");
+        device.WaitIdle();
+    };
+    reset(device, covered);
+    rewatch();
+    draw(device, grown);
+    flushGrown();
+    const auto certify = [&] {
+        AgcDriver::GuestMemory::BreakProofs();
+        rewatch();
+        draw(device, covered);
+    };
+    for (int pass = 0; pass < 3; ++pass) certify();
+    const auto certified = StorageTexture::ScopedProofHits();
+    certify();
+    Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != certified, "a target drawn alone took no scoped proof");
+    const auto covering = StorageTexture::FindLive(grown.address, grown.bytes);
+    Require(covering != nullptr, "the covering image is not live");
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        covering->MarkDirty();
+    }
+    const auto beforeGrowth = StorageTexture::ScopedProofHits();
+    rewatch();
+    draw(device, covered);
+    Require(StorageTexture::ScopedProofHits() == beforeGrowth && StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof held after another image's results grew into the target");
+    flushGrown();
+    reset(device, plain);
+    reset(device, targets.inner);
+    reset(device, targets.outer);
+    const std::array<const ColorTarget*, 3> drawn{&plain, &targets.inner, &targets.outer};
+    std::uint64_t seed = 0x5c09edu;
+    const auto next = [&](std::uint64_t bound) {
+        seed = seed * 6364136223846793005u + 1442695040888963407u;
+        return (seed >> 33u) % bound;
+    };
+    const auto anyAddress = [&] {
+        const std::array<std::span<std::byte>, 4> spans{std::span<std::byte>{watched, PlaneBytes}, std::span<std::byte>{watched + Granule, 2 * PlaneBytes}, elsewhere, besidePlain};
+        const auto& span = spans[next(spans.size())];
+        return address(span.data()) + next(span.size() / 4) * 4;
+    };
+    for (int step = 0; step < 400; ++step) {
+        const auto event = next(13);
+        const std::uint32_t value = next(2) == 0 ? New : Old;
+        if (event == 0) {
+            std::memcpy(reinterpret_cast<void*>(anyAddress()), &value, 4);
+        } else if (event == 1) {
+            std::memcpy(reinterpret_cast<void*>(anyAddress()), &value, 4);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        } else if (event == 2) {
+            std::vector<std::byte> bytes(4);
+            std::memcpy(bytes.data(), &value, 4);
+            AgcDriver::GuestMemory::Write(anyAddress(), bytes);
+        } else if (event == 3) {
+            const auto at = anyAddress();
+            std::memcpy(reinterpret_cast<void*>(at), &value, 4);
+            AgcDriver::GuestMemory::MarkWritten(at, 4);
+        } else if (event == 4) {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            StorageTexture::FlushPending(drawn[next(drawn.size())]->address, PlaneBytes, nullptr, "test");
+            device.WaitIdle();
+        } else if (event == 5) {
+            AgcDriver::GuestMemory::BreakProofs();
+        } else if (event == 6) {
+            AgcDriver::GuestMemory::BumpUnscopedVersion(AgcDriver::GuestMemory::UnscopedSource::NonDraw);
+        } else if (event == 7) {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        } else if (event == 8) {
+            draw(device, targets.outer, {.scissor = Right});
+        } else if (event == 11) {
+            draw(device, targets.outer);
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                StorageTexture::FlushPending(targets.inner.address, PlaneBytes, nullptr, "test");
+                device.WaitIdle();
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                AgcDriver::GuestMemory::BreakProofs();
+                rewatch();
+                draw(device, targets.inner);
+            }
+            if (const auto outer = StorageTexture::FindPending(targets.outer.address, targets.outer.bytes)) {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                outer->MarkDirty();
+            }
+        } else if (event == 12) {
+            {
+                std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+                StorageTexture::FlushPending(targets.outer.address, targets.outer.bytes, nullptr, "test");
+                device.WaitIdle();
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                AgcDriver::GuestMemory::BreakProofs();
+                rewatch();
+                draw(device, targets.inner);
+            }
+            draw(device, targets.outer);
+        } else {
+            draw(device, *drawn[next(drawn.size())]);
+        }
+        for (const auto* target : drawn) {
+            rewatch();
+            draw(device, *target);
+        }
+        Require(StorageTexture::ScopedProofDisagreements() == 0, "a scoped proof hit where the full proof refused, after event " + std::to_string(event) + " at step " + std::to_string(step));
+    }
+    for (const auto* target : drawn) {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        StorageTexture::FlushPending(target->address, target->bytes, nullptr, "test");
+        device.WaitIdle();
+    }
+    Require(RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) || StorageTexture::ScopedProofHits() != hitsBefore, "the oracle sequence never took a scoped proof");
+}
+
 const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 33> Scenarios{{
     {"repeated draws", repeatedDraws},
     {"CPU write", cpuWrite},
@@ -1503,7 +1649,11 @@ int main(int argc, char** argv) {
         }
         AgcDriver::GuestMemory::MarkProofThread();
         AgcDriver::GuestMemory::BumpCollectEpoch();
-        if (argc == 3 && std::string(argv[1]) == "--r3") {
+        if (argc == 2 && std::string(argv[1]) == "--scoped-oracle") {
+            scopedProofOracle(*device);
+            std::cout << "refreshes proved " << StorageTexture::RefreshesProved() << "\n";
+            std::cout << "scoped proof oracle: " << StorageTexture::ScopedProofHits() << " scoped hits, " << StorageTexture::ScopedProofDisagreements() << " disagreements\n";
+        } else if (argc == 3 && std::string(argv[1]) == "--r3") {
             bool found = false;
             for (const auto& [name, scenario] : R3Scenarios) {
                 if (std::string(argv[2]) != name) continue;
