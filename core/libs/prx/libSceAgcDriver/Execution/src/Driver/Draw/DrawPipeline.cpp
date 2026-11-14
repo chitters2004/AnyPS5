@@ -27,6 +27,31 @@ namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
 
+bool scopedNonDraw(DrawPipeline::CommitKind kind) {
+    using Kind = DrawPipeline::CommitKind;
+    switch (kind) {
+    case Kind::SampleDump:
+    case Kind::DmaFill:
+    case Kind::DmaWrite:
+    case Kind::DmaCopy:
+    case Kind::Store:
+    case Kind::EndOfPipe:
+    case Kind::Seal:
+    case Kind::SubmitEnd:
+    case Kind::Completion:
+    case Kind::BufferFill:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void bumpNonDrawWrites(const std::vector<DrawPipeline::Range>& writes) {
+    for (const auto& [begin, end] : writes) {
+        if (end > begin) GuestMemory::BumpRangeVersions(begin, end - begin, GuestMemory::RangeSource::NonDraw);
+    }
+}
+
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
 
 std::atomic<unsigned> runningCommitters{0};
@@ -386,7 +411,7 @@ void DrawPipeline::enqueue(Item item) {
         wake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats && !Graphics::EpochProofCountsProfiled()) return;
+    if (!profile && !stats && !Graphics::EpochProofCountsProfiled() && !GuestMemory::ScopedProofsProfiled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     if (profile || stats) {
@@ -395,6 +420,7 @@ void DrawPipeline::enqueue(Item item) {
         lastReport = now;
     }
     Graphics::ReportEpochProofCounts();
+    if (GuestMemory::ScopedProofsProfiled()) Graphics::ReportScopedProofCounts();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -448,6 +474,8 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
+        const std::vector<Range>* writes = nullptr;
+        CommitKind kind = CommitKind::Other;
         bool isDraw = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
@@ -458,14 +486,21 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            writes = &items.front().writes;
+            kind = items.front().kind;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
         bool shutdown = false;
         try {
+            if (!isDraw) bumpNonDrawWrites(*writes);
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) {
+                GuestMemory::BreakProofs();
+                bumpNonDrawWrites(*writes);
+                if (!scopedNonDraw(kind)) GuestMemory::BumpUnscopedVersion(GuestMemory::UnscopedSource::NonDraw);
+            }
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

@@ -16,6 +16,7 @@ struct EpochProofCounters {
 EpochProofCounters& EpochProofCounts();
 bool EpochProofCountsProfiled();
 void ReportEpochProofCounts();
+void ReportScopedProofCounts();
 
 }
 

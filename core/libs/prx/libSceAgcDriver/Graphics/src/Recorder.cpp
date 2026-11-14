@@ -3905,8 +3905,22 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
     publishedWriteRanges = merged;
     published = merged;
+    const auto additionsOf = [&](const WriteRanges& current) {
+        if (extend) {
+            for (const auto& [begin, end] : additions) GuestMemory::BumpRangeVersions(begin, end - begin, GuestMemory::RangeSource::Pending);
+            return;
+        }
+        auto covering = previous != nullptr ? previous->begin() : WriteRanges::const_iterator{};
+        const auto stop = previous != nullptr ? previous->end() : WriteRanges::const_iterator{};
+        for (const auto& [begin, end] : current) {
+            while (covering != stop && covering->second < end) ++covering;
+            if (covering == stop || covering->first > begin) GuestMemory::BumpRangeVersions(begin, end - begin, GuestMemory::RangeSource::Pending);
+        }
+    };
+    const auto current = merged;
     pendingWrites.store(std::move(merged), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
+    additionsOf(*current);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
@@ -4381,6 +4395,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         ++batch.completionStoreCount;
         completionStores.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs();
+        GuestMemory::BumpRangeVersions(address, bytes.size(), GuestMemory::RangeSource::Labels);
     }
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
@@ -4397,7 +4412,8 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
     batch.completions.push_back(std::move(action));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs();
+    GuestMemory::BreakProofs();
+    GuestMemory::BumpUnscopedVersion(GuestMemory::UnscopedSource::Labels);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
@@ -4425,7 +4441,8 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             label.counted = true;
             ++batch.completionLabelCount;
             completionLabels.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs();
+            GuestMemory::BreakProofs();
+            GuestMemory::BumpRangeVersions(label.begin, label.end - label.begin, GuestMemory::RangeSource::Labels);
             completionLabelsCountedLate.fetch_add(1, std::memory_order_relaxed);
             ++batch.completionStoreCount;
             completionStores.fetch_add(1, std::memory_order_acq_rel);

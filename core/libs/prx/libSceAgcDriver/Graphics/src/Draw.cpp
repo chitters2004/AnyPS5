@@ -2595,6 +2595,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         });
         writers->push_back(resources);
         GuestMemory::BreakProofs();
+        for (const auto& [begin, end] : resources->GpuWrites()) GuestMemory::BumpRangeVersions(begin, end - begin, GuestMemory::RangeSource::CopiedWriters);
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
         else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });

@@ -2758,6 +2758,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
     BreakProofs();
+    BumpRangeVersions(address, bytes, RangeSource::Driver);
     const BreakWhenStored breakStored;
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -2826,6 +2827,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
     BreakProofs();
+    BumpRangeVersions(address, bytes, RangeSource::Driver);
     const BreakWhenStored breakStored;
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -3220,7 +3222,10 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) {
+            BreakProofs();
+            BumpUnscopedVersion(UnscopedSource::GpuMutex);
+        }
     }
 }
 

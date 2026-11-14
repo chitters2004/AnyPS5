@@ -463,12 +463,15 @@ void otherResultsGrowIntoTarget(AgcDriver::VulkanDevice& device) {
     armBesidePending(device, targets);
     const auto outer = StorageTexture::FindPending(targets.outer.address, OuterStorage.size());
     Require(outer != nullptr, "the outer image has no results pending beside the target");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> innerRange{{{targets.inner.address, targets.inner.address + 64}}};
+    const auto versions = AgcDriver::GuestMemory::RangeVersionStamp(innerRange);
     const ProofFields before;
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         outer->MarkDirty();
     }
     requireMoved(before, "pending", "another image's results growing into the target");
+    Require(AgcDriver::GuestMemory::RangeVersionStamp(innerRange).sum != versions.sum, "another image's results growing into the target left the target's granule versions");
     mustLookUp(device, targets.inner, {}, "a draw after another image's results grew into its target repeated its targets");
     flushBeside(device, targets);
 }

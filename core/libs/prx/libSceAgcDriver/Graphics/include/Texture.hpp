@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_TEXTURE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
@@ -357,6 +358,8 @@ public:
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
+    enum Refusal : std::size_t { RefusedNoProof, RefusedGeneration, RefusedUnlocked, RefusedCollect, RefusedKeys, RefusedStamped, RefusedPending, RefusalReasons };
+    void BumpOwnRanges(GuestMemory::RangeSource source) const;
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
@@ -553,6 +556,20 @@ public:
     bool AnyLayerPending() const;
 
 private:
+    std::array<std::pair<std::uint64_t, std::uint64_t>, 2> ownRanges() const;
+    GuestMemory::RangeStamp ownRangeStamp() const;
+    void classifyScopedShadow();
+    void noteScopedShadow(std::size_t outcome, const GuestMemory::RangeStamp& before, const std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)>& unscopedBefore, std::uint64_t ownBumpsBefore);
+    GuestMemory::RangeStamp shadowStamp{};
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::UnscopedSource::Count)> shadowUnscoped{};
+    std::uint64_t shadowGeneration = 0;
+    DccKeys shadowKeys = DccKeys::Uncompressed;
+    std::uint64_t shadowOwnBumps = 0;
+    mutable std::atomic<std::uint64_t> ownBumps{0};
+    std::uint64_t ownStampDelta() const;
+    std::size_t shadowCause = 0;
+    std::size_t refusal = RefusedNoProof;
+    bool shadowValid = false;
     std::atomic<std::uint64_t> provedEpoch{0};
     std::atomic<std::uint64_t> provedProof{0};
     std::atomic<std::uint64_t> provedPending{0};

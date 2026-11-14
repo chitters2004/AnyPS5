@@ -639,7 +639,7 @@ void CheckRangeVersions() {
     Require(GranuleBumps(RangeSource::Cpu) == granules, "one collect bumped a granule more than once or missed one");
     const auto marked = StampOf(Base + WatchedBytes - Block, Block);
     Require(MarkWritten(Base + WatchedBytes - Block, 16) != 0, "MarkWritten failed");
-    Require(StampOf(Base + WatchedBytes - Block, Block) != marked && GranuleBumps(RangeSource::Driver) == 1, "a driver store did not bump its granule once");
+    Require(StampOf(Base + WatchedBytes - Block, Block) != marked && GranuleBumps(RangeSource::Driver) == 2, "a driver store did not bump its granule once before and once after the store");
     const auto shared = StampOf(granule + 6 * RangeGranuleBytes, RangeGranuleBytes);
     constexpr int Threads = 4;
     constexpr int Bumps = 10000;
