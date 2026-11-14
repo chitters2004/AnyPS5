@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -187,6 +188,26 @@ AgcDriver::QueueState ExpandState(std::uint64_t source, std::uint64_t stencilSou
     return queue;
 }
 
+AgcDriver::QueueState ColorState(std::uint64_t address) {
+    AgcDriver::QueueState queue;
+    queue.userConfig[0x242] = 4;
+    const std::uint32_t extent = (Side << 16u) | Side;
+    queue.context = {
+        {0x0, 0}, {0x2d5, 0x2000}, {0x1b6, 0}, {0x1b8, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800}, {0x2dc, 0xaa00}, {0x2f8, 0}, {0x292, 2}, {0x293, 0},
+        {0x80, 0}, {0x8d, 0}, {0x83, 0xffff}, {0x8c, 0xa}, {0x2f9, 0x2d}, {0x313, 0x6000}, {0x30e, 0xffffffff}, {0x30f, 0xffffffff},
+        {0x206, 0x43f}, {0x204, 0x80000}, {0x205, 0x240}, {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0020}, {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
+        {0x31b, 0}, {0x31d, 0}, {0x3b0, ((Side - 1u) << 14u) | (Side - 1u)}, {0x3b8, 0x9000000}, {0x1e0, 0}, {0xc, 0}, {0xd, extent},
+        {0x81, 0x80000000}, {0x82, extent}, {0x90, 0x80000000}, {0x91, extent}, {0x94, 0x80000000}, {0x95, extent},
+        {0x318, static_cast<std::uint32_t>(address >> 8u)}, {0x390, static_cast<std::uint32_t>(address >> 40u)}, {0x323, 0}, {0x324, 0},
+        {0x113, std::bit_cast<std::uint32_t>(1.0f)}, {0x114, 0}, {0xb4, 0}, {0xb5, std::bit_cast<std::uint32_t>(1.0f)}, {0x3, 0},
+    };
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(Side / 2.0f);
+    queue.context[0x110] = std::bit_cast<std::uint32_t>(Side / 2.0f);
+    queue.context[0x111] = std::bit_cast<std::uint32_t>(-(Side / 2.0f));
+    queue.context[0x112] = std::bit_cast<std::uint32_t>(Side / 2.0f);
+    return queue;
+}
+
 void RenderControlTests(const std::shared_ptr<AgcDriver::VulkanDevice>& device, std::byte* blocks) {
     constexpr std::uint32_t Samples = 4u;
     const VkExtent2D extent{Side, Side / 4u};
@@ -243,6 +264,14 @@ int main() {
         const auto expandGranules = GranulesOf(destination, planeBytes) + GranulesOf(stencilDestination, stencilBytes) + GranulesOf(source, planeBytes) + GranulesOf(stencilSource, stencilBytes) + GranulesOf(htile, htileBytes);
         const auto queue = ExpandState(source, stencilSource, destination, stencilDestination, htile);
         RequireRanged("precheckDraw depth expand", expandGranules, [&] { Require(DriverTestAccess::Precheck(queue), "the DB expand draw was not run"); });
+        device->WaitIdle();
+        const auto colorQueue = ColorState(base);
+        const auto colorPass = AgcDriver::Graphics::DecodeColorMetadataPass(colorQueue);
+        Require(colorPass.has_value() && colorPass->mode == AgcDriver::Graphics::ColorMetadataPass::Mode::EliminateFastClear && colorPass->targets.size() == 1u, "the fast-clear eliminate did not decode");
+        std::uint64_t colorGranules = 0;
+        for (const auto& [begin, end] : AgcDriver::Graphics::PipelinedColorMetadataPassWrites(*colorPass)) colorGranules += GranulesOf(begin, end - begin);
+        Require(colorGranules >= 2u, "the fast-clear eliminate writes less than two granules");
+        RequireRanged("precheckDraw color metadata", colorGranules, [&] { Require(DriverTestAccess::Precheck(colorQueue), "the fast-clear eliminate draw was not run"); });
         device->WaitIdle();
         RenderControlTests(device, AllocateBlocks(8u * RangeGranuleBytes));
         DriverTestAccess::UseDevice(nullptr);
