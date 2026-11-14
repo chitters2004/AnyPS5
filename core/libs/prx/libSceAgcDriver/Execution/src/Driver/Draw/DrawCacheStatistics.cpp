@@ -1,9 +1,59 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+std::array<ProfileCounter, static_cast<std::size_t>(ShapeRefreshGate::Count)> shapeRefreshGates;
+std::array<ProfileCounter, static_cast<std::size_t>(ShapeRefreshStep::Count)> shapeRefreshSteps;
+
+}
+
+bool ShapeRefreshProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_SHAPE_REFRESH") != nullptr;
+    return profiled;
+}
+
+void NoteShapeRefresh(ShapeRefreshGate gate) {
+    if (ShapeRefreshProfiled()) shapeRefreshGates[static_cast<std::size_t>(gate)].Add();
+}
+
+void NoteShapeRefresh(ShapeRefreshStep step) {
+    if (ShapeRefreshProfiled()) shapeRefreshSteps[static_cast<std::size_t>(step)].Add();
+}
+
+ShapeRefreshCounts ShapeRefreshTotals() {
+    ShapeRefreshCounts counts;
+    for (std::size_t index = 0; index < counts.gates.size(); ++index) counts.gates[index] = shapeRefreshGates[index].Sum();
+    for (std::size_t index = 0; index < counts.steps.size(); ++index) counts.steps[index] = shapeRefreshSteps[index].Sum();
+    return counts;
+}
+
+void MaybeReportShapeRefresh() {
+    if (!ShapeRefreshProfiled()) return;
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (due == 0) {
+        nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !nextReport.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) return;
+    std::array<unsigned long long, static_cast<std::size_t>(ShapeRefreshGate::Count)> gates{};
+    std::array<unsigned long long, static_cast<std::size_t>(ShapeRefreshStep::Count)> steps{};
+    for (std::size_t index = 0; index < gates.size(); ++index) gates[index] = shapeRefreshGates[index].Take();
+    for (std::size_t index = 0; index < steps.size(); ++index) steps[index] = shapeRefreshSteps[index].Take();
+    const auto gate = [&](ShapeRefreshGate value) { return gates[static_cast<std::size_t>(value)]; };
+    const auto step = [&](ShapeRefreshStep value) { return steps[static_cast<std::size_t>(value)]; };
+    AgcDriver::ProfilePrint_nid_no_patch("[shape-refresh] 10 s: shapeNeedsEntry true %llu; false %llu = pipeline off %llu, no register key %llu, no shape %llu, data hits off %llu, indirect %llu, no data entry %llu, no compiled stage %llu, not seen twice %llu; true then: replaced the shape's entry %llu (previous entry erased %llu, none to erase %llu), admitted as a normal insert %llu, not cacheable %llu; later hits on refreshed entries: full %llu, data-only %llu\n",
+        gate(ShapeRefreshGate::Needed), gate(ShapeRefreshGate::Off) + gate(ShapeRefreshGate::NoRegisterKey) + gate(ShapeRefreshGate::NoShape) + gate(ShapeRefreshGate::DataHitsOff) + gate(ShapeRefreshGate::Indirect) + gate(ShapeRefreshGate::NoDataEntry) + gate(ShapeRefreshGate::NoCompiledStage) + gate(ShapeRefreshGate::NotSeenTwice),
+        gate(ShapeRefreshGate::Off), gate(ShapeRefreshGate::NoRegisterKey), gate(ShapeRefreshGate::NoShape), gate(ShapeRefreshGate::DataHitsOff), gate(ShapeRefreshGate::Indirect), gate(ShapeRefreshGate::NoDataEntry), gate(ShapeRefreshGate::NoCompiledStage), gate(ShapeRefreshGate::NotSeenTwice),
+        step(ShapeRefreshStep::Replaced), step(ShapeRefreshStep::PreviousErased), step(ShapeRefreshStep::NoPrevious), step(ShapeRefreshStep::AdmittedInstead), step(ShapeRefreshStep::NotCacheable), step(ShapeRefreshStep::HitOnRefreshed), step(ShapeRefreshStep::DataHitOnRefreshed));
+}
 
 bool Driver::traceDrawCache() {
     static const bool trace = std::getenv("APS5_TRACE_DRAW_CACHE") != nullptr;

@@ -439,6 +439,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (found != drawCache.end()) {
             entry = found->second;
             decode = entry->decode;
+            if (entry->shapeRefreshed) NoteShapeRefresh(ShapeRefreshStep::HitOnRefreshed);
         } else {
             ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
@@ -470,6 +471,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
                 }
                 if (dataEntry != nullptr) {
+                    if (dataEntry->shapeRefreshed) NoteShapeRefresh(ShapeRefreshStep::DataHitOnRefreshed);
                     ++drawEntryCounters.dataHits;
                     drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
                 }
@@ -1027,7 +1029,20 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         static std::array<std::atomic<std::uint64_t>, 4096> lastData{};
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
-    const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    const auto shapeGate = [&] {
+        if (!shapeRefresh) return ShapeRefreshGate::Off;
+        if (!registerKey) return ShapeRefreshGate::NoRegisterKey;
+        if (shapeKey == 0) return ShapeRefreshGate::NoShape;
+        if (!drawDataHits()) return ShapeRefreshGate::DataHitsOff;
+        if (drawParameters.indirect) return ShapeRefreshGate::Indirect;
+        if (dataEntry == nullptr) return ShapeRefreshGate::NoDataEntry;
+        if (dataStagesCompiled == 0) return ShapeRefreshGate::NoCompiledStage;
+        if (!refreshSeenTwice()) return ShapeRefreshGate::NotSeenTwice;
+        return ShapeRefreshGate::Needed;
+    }();
+    const bool shapeNeedsEntry = shapeGate == ShapeRefreshGate::Needed;
+    NoteShapeRefresh(shapeGate);
+    MaybeReportShapeRefresh();
     cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
     timing.Mark("shader_compile_and_link");
 

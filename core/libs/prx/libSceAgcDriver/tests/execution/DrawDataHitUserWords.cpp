@@ -181,12 +181,37 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
 
     const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
+    const bool counted = AgcDriver::DriverDetail::ShapeRefreshProfiled();
+    using Gate = AgcDriver::DriverDetail::ShapeRefreshGate;
+    using Step = AgcDriver::DriverDetail::ShapeRefreshStep;
     for (const std::uint32_t unread : {0x33u, 0x44u}) {
         commands.clear();
         PixelUserData(commands, second, unread);
         Append(commands, 0x2d, {3, 2});
         const auto last = counters;
+        const auto countsBefore = AgcDriver::DriverDetail::ShapeRefreshTotals();
         counters = Submit(std::move(commands));
+        const auto countsAfter = AgcDriver::DriverDetail::ShapeRefreshTotals();
+        const auto gate = [&](Gate value) { return countsAfter.gates[static_cast<std::size_t>(value)] - countsBefore.gates[static_cast<std::size_t>(value)]; };
+        const auto step = [&](Step value) { return countsAfter.steps[static_cast<std::size_t>(value)] - countsBefore.steps[static_cast<std::size_t>(value)]; };
+        std::uint64_t gates = 0;
+        for (std::size_t index = 0; index < countsAfter.gates.size(); ++index) gates += countsAfter.gates[index] - countsBefore.gates[index];
+        const auto describe = [&] {
+            std::string text = "gates";
+            for (std::size_t index = 0; index < countsAfter.gates.size(); ++index) text += " " + std::to_string(countsAfter.gates[index] - countsBefore.gates[index]);
+            text += ", steps";
+            for (std::size_t index = 0; index < countsAfter.steps.size(); ++index) text += " " + std::to_string(countsAfter.steps[index] - countsBefore.steps[index]);
+            return text;
+        };
+        if (!counted) {
+            Require(gates == 0 && countsAfter.steps == countsBefore.steps, "shape refresh counts moved without APS5_PROFILE_SHAPE_REFRESH: " + describe());
+        } else if (!refresh) {
+            Require(gates == 1 && gate(Gate::Off) == 1 && countsAfter.steps == countsBefore.steps, "shape refresh counts without APS5_DRAW_PIPELINE: " + describe());
+        } else if (unread == 0x33u) {
+            Require(gates == 1 && gate(Gate::Needed) == 1 && step(Step::Replaced) == 1 && step(Step::PreviousErased) + step(Step::NoPrevious) == 1 && step(Step::DataHitOnRefreshed) == 0, "shape refresh counts on the draw that refreshed the shape: " + describe());
+        } else {
+            Require(step(Step::DataHitOnRefreshed) == 1 && step(Step::Replaced) == 0, "shape refresh counts on the data-only hit served by the refreshed entry: " + describe());
+        }
         Require(counters.dataHits == last.dataHits + 1 && counters.inserts == last.inserts, "a draw at the moved pointer with a new unread word: " + Counts(counters));
         if (verify) continue;
         const auto compiled = counters.dataStagesCompiled - last.dataStagesCompiled;

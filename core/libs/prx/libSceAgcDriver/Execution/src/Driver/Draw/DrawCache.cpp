@@ -194,8 +194,10 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     auto& counters = drawEntryCounters;
     if (replaceShape && shape != 0) {
         ++counters.shapeUpdates;
+        bool erased = false;
         if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && shapeOf->second != key) {
             if (const auto previous = drawCache.find(shapeOf->second); previous != drawCache.end()) {
+                erased = true;
                 for (const auto& variants : previous->second->stages) {
                     for (const auto& variant : variants) accountDrawVariant(*variant, false);
                 }
@@ -204,6 +206,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
             }
             drawShapes.erase(shapeOf);
         }
+        NoteShapeRefresh(erased ? ShapeRefreshStep::PreviousErased : ShapeRefreshStep::NoPrevious);
     } else {
         ++counters.inserts;
     }
@@ -212,6 +215,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
     replacement->stages.resize(fresh.size());
     replacement->decode = std::move(decode);
     replacement->shape = shape;
+    replacement->shapeRefreshed = replaceShape && shape != 0;
     if (found != drawCache.end()) {
         if (found->second->stages.size() == fresh.size()) replacement->stages = found->second->stages;
         if (found->second->decode != nullptr) replacement->decode = found->second->decode;

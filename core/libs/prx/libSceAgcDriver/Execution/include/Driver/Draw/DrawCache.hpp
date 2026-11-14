@@ -80,6 +80,7 @@ struct DrawEntry {
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
     std::shared_ptr<DrawEntry> donor;
+    bool shapeRefreshed = false;
 };
 
 using DrawDataCandidates = std::vector<std::vector<std::pair<std::shared_ptr<DispatchVariant>, std::vector<ShaderRecompiler::MemoryRegion>>>>;
@@ -90,6 +91,20 @@ struct StageDataHit {
 };
 
 enum class DrawMiss : std::size_t { FrontDiffering, FragmentDiffering, OtherDiffering, QueuedStores, Layout, Gate, Stages, Count };
+
+enum class ShapeRefreshGate : std::uint8_t { Needed, Off, NoRegisterKey, NoShape, DataHitsOff, Indirect, NoDataEntry, NoCompiledStage, NotSeenTwice, Count };
+enum class ShapeRefreshStep : std::uint8_t { Replaced, AdmittedInstead, NotCacheable, PreviousErased, NoPrevious, HitOnRefreshed, DataHitOnRefreshed, Count };
+
+struct ShapeRefreshCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(ShapeRefreshGate::Count)> gates{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ShapeRefreshStep::Count)> steps{};
+};
+
+bool ShapeRefreshProfiled();
+void NoteShapeRefresh(ShapeRefreshGate gate);
+void NoteShapeRefresh(ShapeRefreshStep step);
+ShapeRefreshCounts ShapeRefreshTotals();
+void MaybeReportShapeRefresh();
 
 struct DrawEntryCounters {
     std::uint64_t lookups = 0, absent = 0, hits = 0, stageValidations = 0, stageEqual = 0, variantsCompared = 0, inserts = 0, shapeUpdates = 0, variantsInserted = 0, variantsEvicted = 0, present = 0, unstable = 0, touches = 0, verifyHits = 0, verifyMismatches = 0;
