@@ -120,14 +120,37 @@ void keepStorageTexture(Recorder& recorder, std::shared_ptr<StorageTexture> text
 // (recorded DCC clear, direct detile from the import, CPU) and written back by the reason of the
 // FlushPending that forced the write-back (the other callers name themselves: "refresh", "cache
 // eviction", "explicit"). `flushReason` is set by the caller around its writeBack calls.
-thread_local const char* flushReason = nullptr;
+struct FlushReasonSlot;
+
+const char* flushReason() {
+    return HostThreadSlot<const char*, FlushReasonSlot>::Get();
+}
+
+void setFlushReason(const char* reason) {
+    HostThreadSlot<const char*, FlushReasonSlot>::Set(reason);
+}
+
+const char* exchangeFlushReason(const char* reason) {
+    const auto previous = flushReason();
+    setFlushReason(reason);
+    return previous;
+}
 // Likewise what made an upload necessary: "first" (a new image), "keys" (the DCC keys changed),
 // "cpu" (a CPU store stamped a changed unit), "flushed" (another image's results were stored over
 // the surface by this refresh), "store" (a driver store: a fill, a copy, a label, an earlier
 // write-back), "untracked" (no write stamps for the surface: every refresh re-uploads), "alias"
 // (units taken from an alias image on the device); set by the constructor and Refresh around
 // upload() and borrowUnits().
-thread_local const char* uploadReason = "first";
+struct UploadReasonSlot;
+
+const char* uploadReason() {
+    const auto* reason = HostThreadSlot<const char*, UploadReasonSlot>::Get();
+    return reason != nullptr ? reason : "first";
+}
+
+void setUploadReason(const char* reason) {
+    HostThreadSlot<const char*, UploadReasonSlot>::Set(reason);
+}
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -226,7 +249,7 @@ void countStorageUpload(std::size_t path, std::uint64_t bytes) {
     std::lock_guard lock(traffic.mutex);
     ++traffic.uploads[path].first;
     traffic.uploads[path].second += bytes;
-    auto& reason = traffic.uploadReasons[uploadReason != nullptr ? uploadReason : "other"];
+    auto& reason = traffic.uploadReasons[uploadReason() != nullptr ? uploadReason() : "other"];
     ++reason.first;
     reason.second += bytes;
     reportStorageTraffic(traffic);
@@ -236,12 +259,12 @@ void countStorageWriteBack(std::uint64_t bytes, bool direct, bool drawn = false)
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
-    auto& totals = traffic.writeBacks[flushReason != nullptr ? flushReason : "other"];
+    auto& totals = traffic.writeBacks[flushReason() != nullptr ? flushReason() : "other"];
     ++totals.first;
     totals.second += bytes;
     if (direct) ++traffic.directWriteBacks;
     if (drawn) {
-        auto& stores = traffic.drawnStores[flushReason != nullptr ? flushReason : "other"];
+        auto& stores = traffic.drawnStores[flushReason() != nullptr ? flushReason() : "other"];
         ++stores.first;
         stores.second += bytes;
     }
@@ -1758,7 +1781,7 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
-    uploadReason = "first";
+    setUploadReason("first");
     texture->upload();
     texture->defaultMip = mipLevel;
     texture->view = texture->createView(mipLevel, false, texture->storageFormat);
@@ -2861,14 +2884,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         if (reports.fetch_add(1) < 8) std::fprintf(stderr, "[gpu] storage image 0x%llx: guest memory changed while GPU results were pending; keeping the CPU's blocks\n", static_cast<unsigned long long>(descriptor.baseAddress));
     }
     if (anyStored) {
-        const auto previous = std::exchange(flushReason, "refresh");
+        const auto previous = exchangeFlushReason("refresh");
         writeBackLayers(stored);
-        flushReason = previous;
+        setFlushReason(previous);
     } else if (dropped) {
         reconcilePending();
     }
     if (anyBorrowed) {
-        uploadReason = "alias";
+        setUploadReason("alias");
         borrowUnits(*alias, borrowed);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) {
@@ -2879,7 +2902,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         refreshGeneration();
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
-        uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        setUploadReason(keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store");
         upload(&changed);
     } else {
         uploadedKeys = keys;
@@ -2992,7 +3015,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
     static const bool trace = std::getenv("APS5_TRACE_DCC_KEYS") != nullptr;
     if (!trace || descriptor.dccAddress == 0) return;
     const auto packet = GuestMemory::CurrentPacket();
-    std::fprintf(stderr, "[dcc-keys] uncompressed store by %s (%s) for surface 0x%llx+0x%llx: keys 0x%llx+0x%llx (packet 0x%x queue 0x%x)\n", path, flushReason != nullptr ? flushReason : "?", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), static_cast<unsigned long long>(DccKeyCount(descriptor, guestBytes)), packet.opcode, packet.queue);
+    std::fprintf(stderr, "[dcc-keys] uncompressed store by %s (%s) for surface 0x%llx+0x%llx: keys 0x%llx+0x%llx (packet 0x%x queue 0x%x)\n", path, flushReason() != nullptr ? flushReason() : "?", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(descriptor.dccAddress), static_cast<unsigned long long>(DccKeyCount(descriptor, guestBytes)), packet.opcode, packet.queue);
 }
 
 }
@@ -3234,7 +3257,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
+    CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason(), layers != nullptr);
     const auto elementBytes = BytesPerElement(descriptor.format);
     const auto linearBytes = sliceLinearBytes * arrayLayers;
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
@@ -3845,7 +3868,7 @@ std::uint64_t StorageTexture::uploadWindows(std::span<const ImportSegment> segme
         pieces.emplace_back(source.begin, source.end);
         if (!source.shadow) allShadow = false;
     }
-    if (allShadow && !read.empty() && (std::strcmp(uploadReason, "flushed") == 0 || std::strcmp(uploadReason, "store") == 0)) uploadReason = "shadow";
+    if (allShadow && !read.empty() && (std::strcmp(uploadReason(), "flushed") == 0 || std::strcmp(uploadReason(), "store") == 0)) setUploadReason("shadow");
     auto windows = gather ? sliceWindows(runs) : sliceWindows(pieces);
     Require(!windows.empty(), "storage image upload selects no unit");
     std::shared_ptr<DeviceBuffer> gatherBuffer;
@@ -4903,9 +4926,9 @@ void StorageTexture::Flush(const char* reason) {
         BumpPendingSerial();
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
-    const auto previous = std::exchange(flushReason, reason);
+    const auto previous = exchangeFlushReason(reason);
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    flushReason = previous;
+    setFlushReason(previous);
 }
 
 void StorageTexture::appendStoredLayers(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
@@ -5192,7 +5215,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     std::exception_ptr failure;
-    const auto previousReason = std::exchange(flushReason, reason);
+    const auto previousReason = exchangeFlushReason(reason);
     for (const auto& texture : flush) {
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
@@ -5202,7 +5225,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             if (!failure) failure = std::current_exception();
         }
     }
-    flushReason = previousReason;
+    setFlushReason(previousReason);
     if (failure) std::rethrow_exception(failure);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
@@ -6512,9 +6535,9 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 
 void StorageTexture::WriteBack() {
     storeTrappedOverlaps("explicit");
-    const auto previous = std::exchange(flushReason, "explicit");
+    const auto previous = exchangeFlushReason("explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    flushReason = previous;
+    setFlushReason(previous);
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::FindLive(std::uint64_t address, std::uint64_t bytes) {
@@ -7147,7 +7170,7 @@ bool StorageTexture::cpuLeftUnchanged(std::uint32_t layer, std::uint64_t from, s
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
-    CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
+    CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason(), static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     struct Account {
@@ -7335,7 +7358,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({import, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
     else segments = importSegments();
-    if (flushReason != nullptr && std::strcmp(flushReason, "idle") == 0 && GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored))) segments.clear();
+    if (flushReason() != nullptr && std::strcmp(flushReason(), "idle") == 0 && GuestMemory::Watched(firstStored, static_cast<std::size_t>(lastStored - firstStored))) segments.clear();
     if (!segments.empty()) {
         Require(!unsavedOutsideWatch, unsavedCause);
         // Outside the write watch the stored bytes are what the next store compares with.

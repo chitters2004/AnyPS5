@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
@@ -239,23 +240,23 @@ private:
 
 class PerformanceContext {
 public:
-    explicit PerformanceContext(FrameTiming* frame) : previous(current) {
-        current = frame;
+    explicit PerformanceContext(FrameTiming* frame) : previous(Current()) {
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(frame);
     }
 
     PerformanceContext(const PerformanceContext&) = delete;
     PerformanceContext& operator=(const PerformanceContext&) = delete;
 
     ~PerformanceContext() {
-        current = previous;
+        HostThreadSlot<FrameTiming*, CurrentSlot>::Set(previous);
     }
 
     static FrameTiming* Current() {
-        return current;
+        return HostThreadSlot<FrameTiming*, CurrentSlot>::Get();
     }
 
 private:
-    inline static thread_local FrameTiming* current = nullptr;
+    struct CurrentSlot;
     FrameTiming* previous;
 };
 

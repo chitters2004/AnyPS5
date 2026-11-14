@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -237,15 +238,16 @@ TextureCache& Textures() {
     return cache;
 }
 
-thread_local unsigned sampledCacheHeld = 0;
-thread_local unsigned storageCacheHeld = 0;
-thread_local unsigned sampledCacheReclaimable = 0;
-thread_local unsigned storageCacheReclaimable = 0;
+struct SampledCacheHeld;
+struct StorageCacheHeld;
+struct SampledCacheReclaimable;
+struct StorageCacheReclaimable;
 
+template<typename TTag>
 struct CacheHold {
-    unsigned& depth;
-    explicit CacheHold(unsigned& depth) : depth(depth) { ++depth; }
-    ~CacheHold() { --depth; }
+    CacheHold() { HostThreadSlot<unsigned, TTag>::Set(Depth() + 1); }
+    ~CacheHold() { HostThreadSlot<unsigned, TTag>::Set(Depth() - 1); }
+    static unsigned Depth() { return HostThreadSlot<unsigned, TTag>::Get(); }
     CacheHold(const CacheHold&) = delete;
     CacheHold& operator=(const CacheHold&) = delete;
 };
@@ -576,37 +578,46 @@ struct LookupRecord {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> committed;
 };
 
-thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
 constexpr std::size_t LookupLogBound = 1024;
 constexpr std::size_t NoBuildLookups = std::numeric_limits<std::size_t>::max();
-thread_local std::size_t buildLookupsStart = NoBuildLookups;
-thread_local bool buildLookupsPastBound = false;
 std::atomic<std::uint64_t> lookupBuildsPastBound{0};
 
+struct LookupLog {
+    std::vector<LookupRecord> records;
+    std::size_t buildStart = NoBuildLookups;
+    bool pastBound = false;
+};
+
+LookupLog& threadLookupLog() {
+    struct Slot;
+    return ThreadScratch<LookupLog, Slot>();
+}
+
 std::vector<LookupRecord>& lookupLog() {
-    return ShaderRecompiler::ThreadOwned(lookupLogSlot);
+    return threadLookupLog().records;
 }
 
 void logLookup(const LookupRecord& record) {
-    auto& log = lookupLog();
+    auto& state = threadLookupLog();
+    auto& log = state.records;
     if (log.size() >= LookupLogBound) {
-        const auto dropped = std::min(LookupLogBound / 2, buildLookupsStart);
-        if (dropped < LookupLogBound / 2) buildLookupsPastBound = true;
+        const auto dropped = std::min(LookupLogBound / 2, state.buildStart);
+        if (dropped < LookupLogBound / 2) state.pastBound = true;
         log.erase(log.begin(), log.begin() + static_cast<std::ptrdiff_t>(dropped));
-        if (buildLookupsStart != NoBuildLookups) buildLookupsStart -= dropped;
+        if (state.buildStart != NoBuildLookups) state.buildStart -= dropped;
     }
     log.push_back(record);
 }
 
 class BuildLookups {
 public:
-    BuildLookups() : outermost(buildLookupsStart == NoBuildLookups) { buildLookupsStart = std::min(buildLookupsStart, lookupLog().size()); }
+    BuildLookups() : state(threadLookupLog()), outermost(state.buildStart == NoBuildLookups) { state.buildStart = std::min(state.buildStart, state.records.size()); }
     ~BuildLookups() {
         if (!outermost) return;
-        buildLookupsStart = NoBuildLookups;
-        if (buildLookupsPastBound) lookupBuildsPastBound.fetch_add(1, std::memory_order_relaxed);
-        buildLookupsPastBound = false;
-        auto& log = lookupLog();
+        state.buildStart = NoBuildLookups;
+        if (state.pastBound) lookupBuildsPastBound.fetch_add(1, std::memory_order_relaxed);
+        state.pastBound = false;
+        auto& log = state.records;
         if (log.size() > LookupLogBound) log.erase(log.begin(), log.end() - static_cast<std::ptrdiff_t>(LookupLogBound));
         if (log.capacity() > LookupLogBound + LookupLogBound / 2) log.shrink_to_fit();
     }
@@ -614,6 +625,7 @@ public:
     BuildLookups& operator=(const BuildLookups&) = delete;
 
 private:
+    LookupLog& state;
     bool outermost;
 };
 
@@ -1205,7 +1217,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(sampledCacheHeld);
+    const CacheHold<SampledCacheHeld> held;
     dropUncachedViews(cache);
     std::vector<std::byte> recycled;
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
@@ -1271,7 +1283,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     entry.surfaceBytes = bytes;
     entry.slabs = std::move(slabs);
     const auto createTexture = [&](auto&&... args) {
-        const CacheHold reclaimable(sampledCacheReclaimable);
+        const CacheHold<SampledCacheReclaimable> reclaimable;
         return std::make_shared<Texture>(context, std::forward<decltype(args)>(args)...);
     };
     if (source != nullptr) {
@@ -1544,7 +1556,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
     std::shared_ptr<StorageTexture> texture;
     {
         std::lock_guard lock(cache.mutex);
-        const CacheHold held(storageCacheHeld);
+        const CacheHold<StorageCacheHeld> held;
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
@@ -1571,7 +1583,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (flushed && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             std::shared_ptr<StorageTexture> created;
             {
-                const CacheHold reclaimable(storageCacheReclaimable);
+                const CacheHold<StorageCacheReclaimable> reclaimable;
                 created = StorageTexture::Create(context, *context.detiler, resource, mip);
             }
             created->AdoptHandOver(std::move(handOver));
@@ -1712,7 +1724,7 @@ void FlushCachedTextures(VkDevice device) {
     GuestMemory::AssertGpuLockHeld("FlushCachedTextures");
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(storageCacheHeld);
+    const CacheHold<StorageCacheHeld> held;
     for (const auto& entry : cache.entries) {
         if (entry.key.device == device) entry.texture->Flush();
     }
@@ -1729,7 +1741,7 @@ void ClearCachedTextures(VkDevice device) {
     auto& sampled = Textures();
     {
         std::lock_guard lock(sampled.mutex);
-        const CacheHold held(sampledCacheHeld);
+        const CacheHold<SampledCacheHeld> held;
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
@@ -1741,7 +1753,7 @@ void ClearCachedTextures(VkDevice device) {
     std::vector<std::shared_ptr<StorageTexture>> cleared;
     {
         std::lock_guard lock(storage.mutex);
-        const CacheHold held(storageCacheHeld);
+        const CacheHold<StorageCacheHeld> held;
         for (auto it = storage.entries.begin(); it != storage.entries.end();) {
             if (it->key.device != device) {
                 ++it;
@@ -1786,8 +1798,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     {
         auto& cache = Textures();
         std::unique_lock lock(cache.mutex, std::defer_lock);
-        const bool inherited = sampledCacheHeld != 0;
-        if ((inherited && (!newImage || sampledCacheReclaimable == 0)) || (!inherited && !lock.try_lock())) {
+        const bool inherited = CacheHold<SampledCacheHeld>::Depth() != 0;
+        if ((inherited && (!newImage || CacheHold<SampledCacheReclaimable>::Depth() == 0)) || (!inherited && !lock.try_lock())) {
             sampledSkipped = true;
         } else {
             for (auto it = cache.entries.end(); it != cache.entries.begin() && freed < bytes;) {
@@ -1805,8 +1817,8 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
     if (freed < bytes) {
         auto& cache = StorageTextures();
         std::unique_lock<GuestMemory::GpuMutexType> gpu(GuestMemory::GpuMutex(), std::defer_lock);
-        const bool inherited = storageCacheHeld != 0;
-        if ((inherited && (!newImage || storageCacheReclaimable == 0)) || !gpu.try_lock()) {
+        const bool inherited = CacheHold<StorageCacheHeld>::Depth() != 0;
+        if ((inherited && (!newImage || CacheHold<StorageCacheReclaimable>::Depth() == 0)) || !gpu.try_lock()) {
             storageSkipped = true;
         } else {
             try {
@@ -1909,7 +1921,7 @@ std::shared_ptr<StorageTexture> RepeatStorageSurface(const Context& context, con
     const auto resource = StorageSurface(context, viewed);
     auto& cache = StorageTextures();
     std::lock_guard lock(cache.mutex);
-    const CacheHold held(storageCacheHeld);
+    const CacheHold<StorageCacheHeld> held;
     if (resource.mipCount > AllocatedLevels(resource)) return nullptr;
     const auto it = findStorageByImage(cache, context.device, stored.get());
     if (it == cache.entries.end() || MetadataMoved(*it->texture, resource)) return nullptr;

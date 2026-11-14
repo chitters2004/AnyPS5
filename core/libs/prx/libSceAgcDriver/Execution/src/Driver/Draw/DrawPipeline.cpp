@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -52,8 +53,16 @@ struct ClearOnExit {
 }
 
 namespace {
-thread_local bool finisherThread = false;
-thread_local bool finisherProducer = false;
+struct FinisherThreadSlot;
+struct FinisherProducerSlot;
+
+bool finisherThread() {
+    return HostThreadSlot<bool, FinisherThreadSlot>::Get();
+}
+
+bool finisherProducer() {
+    return HostThreadSlot<bool, FinisherProducerSlot>::Get();
+}
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -86,7 +95,7 @@ bool DrawFinisher::Overlap() {
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -98,7 +107,7 @@ bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
 }
 
 DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value) {
-    if (!Busy() || !finisherProducer) return LabelLookup::NotHeld;
+    if (!Busy() || !finisherProducer()) return LabelLookup::NotHeld;
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto held = pending.rbegin(); held != pending.rend(); ++held) {
@@ -114,7 +123,7 @@ DrawFinisher::LabelLookup DrawFinisher::PendingLabel(std::uint64_t address, std:
 }
 
 bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     for (const auto& held : pending) {
         if (held.unknown) return true;
@@ -128,7 +137,7 @@ bool DrawFinisher::PendingOverlapsAny(std::span<const Range> ranges) {
 }
 
 bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
-    if (!Busy() || !finisherProducer) return false;
+    if (!Busy() || !finisherProducer()) return false;
     std::lock_guard lock(mutex);
     return std::any_of(pending.begin(), pending.end(), [&](const Pending& held) { return held.key == key || (shape != 0 && held.shape == shape); });
 }
@@ -174,7 +183,7 @@ std::string DrawFinisher::DrainText() {
 }
 
 bool DrawFinisher::OnFinisherThread() {
-    return finisherThread;
+    return finisherThread();
 }
 
 void DrawFinisher::Enqueue(Job job) {
@@ -182,7 +191,7 @@ void DrawFinisher::Enqueue(Job job) {
 }
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
-    finisherProducer = true;
+    HostThreadSlot<bool, FinisherProducerSlot>::Set(true);
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -198,7 +207,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!running) {
         running = true;
         thread = std::thread([this] {
-            finisherThread = true;
+            HostThreadSlot<bool, FinisherThreadSlot>::Set(true);
             run();
         });
     }
@@ -640,7 +649,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
 }
 
 bool DrawPipeline::Busy() const {
-    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap());
+    return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer() && DrawFinisher::Busy() && DrawFinisher::Overlap());
 }
 
 bool DrawPipeline::OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

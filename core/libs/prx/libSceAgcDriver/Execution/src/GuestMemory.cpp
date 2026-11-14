@@ -538,15 +538,19 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 }
 
 void CountReadCaller(const void* returnAddress) {
-    thread_local std::uint32_t sampled = 0;
+    struct Slot;
+    auto sampled = HostThreadSlot<std::uint32_t, Slot>::Get();
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).
     if ((sampled + 1) % 256 == 0) readSiteSamples[static_cast<std::size_t>(CurrentReadSite())].fetch_add(256, std::memory_order_relaxed);
     CountCaller(Profile().callers, sampled, 256, returnAddress);
+    HostThreadSlot<std::uint32_t, Slot>::Set(sampled);
 }
 
 void CountWriteCaller(const void* returnAddress) {
-    thread_local std::uint32_t sampled = 0;
+    struct Slot;
+    auto sampled = HostThreadSlot<std::uint32_t, Slot>::Get();
     CountCaller(Profile().writeCallers, sampled, 16, returnAddress);
+    HostThreadSlot<std::uint32_t, Slot>::Set(sampled);
 }
 
 bool MemoryProfiled() {
@@ -2268,7 +2272,7 @@ std::uint64_t CollectEpochBumps() {
 
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
-thread_local bool proofThread = false;
+struct ProofThreadSlot;
 }
 
 std::uint64_t ProofSerial() {
@@ -2280,7 +2284,7 @@ void BreakProofs() {
 }
 
 void MarkProofThread() {
-    proofThread = true;
+    HostThreadSlot<bool, ProofThreadSlot>::Set(true);
 }
 
 std::uint64_t CollectEpoch() {
@@ -2291,7 +2295,7 @@ namespace {
 
 std::atomic<void (*)(std::uint64_t, std::size_t)> unwatchHook{nullptr};
 
-thread_local bool unwatchWritesProven = true;
+struct UnwatchUnprovenSlot;
 std::atomic<int> importWalkFailureForTest{0};
 std::atomic<std::uint64_t> importWalkFailureSpanForTest{0};
 
@@ -2315,8 +2319,8 @@ void beforeUnwatch(std::uint64_t address, std::size_t bytes) {
 
 void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
     struct Unproven {
-        Unproven() { unwatchWritesProven = false; }
-        ~Unproven() { unwatchWritesProven = true; }
+        Unproven() { HostThreadSlot<bool, UnwatchUnprovenSlot>::Set(true); }
+        ~Unproven() { HostThreadSlot<bool, UnwatchUnprovenSlot>::Set(false); }
         Unproven(const Unproven&) = delete;
         Unproven& operator=(const Unproven&) = delete;
     } unproven;
@@ -2339,7 +2343,7 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 #endif
 }
 
-thread_local bool ownHostWrite = false;
+struct OwnHostWriteSlot;
 std::atomic<std::uint64_t> hostWritesInFlight{0};
 std::atomic<bool> hostWritesStopped{false};
 
@@ -2353,8 +2357,8 @@ public:
 
 class OwnHostWrite {
 public:
-    OwnHostWrite() : outer(std::exchange(ownHostWrite, true)) {}
-    ~OwnHostWrite() { ownHostWrite = outer; }
+    OwnHostWrite() : outer(HostThreadSlot<bool, OwnHostWriteSlot>::Get()) { HostThreadSlot<bool, OwnHostWriteSlot>::Set(true); }
+    ~OwnHostWrite() { HostThreadSlot<bool, OwnHostWriteSlot>::Set(outer); }
     OwnHostWrite(const OwnHostWrite&) = delete;
     OwnHostWrite& operator=(const OwnHostWrite&) = delete;
 
@@ -2369,7 +2373,7 @@ void SetUnwatchHook(void (*hook)(std::uint64_t, std::size_t)) {
 }
 
 bool UnwatchWritesProven() {
-    return unwatchWritesProven;
+    return !HostThreadSlot<bool, UnwatchUnprovenSlot>::Get();
 }
 
 void SetImportWalkFailureForTest(int walk, std::uint64_t span) {
@@ -2834,7 +2838,10 @@ std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes) {
 #ifdef _WIN32
 namespace {
 
-thread_local ThreadCollectMemo threadHintMemo;
+ThreadCollectMemo& threadHintMemo() {
+    struct Slot;
+    return ThreadScratch<ThreadCollectMemo, Slot>();
+}
 
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     auto cursor = first;
@@ -2873,7 +2880,8 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     if (!tracker.watched || !tracker.hinted(first, stop)) return 0;
     const auto unwatched = unwatchSerial.load(std::memory_order_relaxed);
     const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const bool memoized = collectMemoEnabled() && std::any_of(threadHintMemo.entries.begin(), threadHintMemo.entries.end(), [&](const WriteTracker::Memo& entry) {
+    auto& memo = threadHintMemo();
+    const bool memoized = collectMemoEnabled() && std::any_of(memo.entries.begin(), memo.entries.end(), [&](const WriteTracker::Memo& entry) {
         return entry.epoch == epoch && entry.unwatched == unwatched && entry.mapping == mapping && entry.begin <= first && stop <= entry.end;
     });
     if (memoized) {
@@ -2881,7 +2889,7 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
     } else {
         const TimedAccess timed(CounterCollect, bytes);
         if (!walkHints(tracker, first, stop)) return 0;
-        if (collectMemoEnabled()) threadHintMemo.entries[threadHintMemo.next++ % threadHintMemo.entries.size()] = {first, stop, epoch, unwatched, mapping};
+        if (collectMemoEnabled()) memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, unwatched, mapping};
     }
     return tracker.newestHint(first, stop);
 #else
@@ -2995,8 +3003,9 @@ std::size_t HolderColumnFor(std::uint32_t tag) {
     return 0;
 }
 
+struct GpuLockTagSlot;
+
 struct GpuLockStats {
-    std::uint32_t tag = 0xffffffffu;
     std::uint64_t acquisitions = 0;
     std::uint64_t waits = 0;
     double waitedMs = 0;
@@ -3055,7 +3064,7 @@ void EndHold() {
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
     stats.siteMaxHeldMs[stats.holdSite] = std::max(stats.siteMaxHeldMs[stats.holdSite], heldMs);
-    if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(stats.tag));
+    if (stats.holderColumn < 0) stats.holderColumn = static_cast<int>(HolderColumnFor(GpuLockThreadTag()));
     Holders().heldNs[static_cast<std::size_t>(stats.holderColumn)][stats.holdSite].fetch_add(static_cast<std::uint64_t>(heldNs), std::memory_order_relaxed);
 }
 
@@ -3105,7 +3114,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!HostThreadSlot<bool, ProofThreadSlot>::Get()) BreakProofs();
     }
 }
 
@@ -3252,8 +3261,8 @@ void GpuMutexType::lock() {
         char counts[160];
         std::snprintf(counts, sizeof(counts), "; lock() %llu / try %llu / try failed %llu; locked GPU waits %llu / %.0f ms", static_cast<unsigned long long>(stats.acquisitions), static_cast<unsigned long long>(stats.tries), static_cast<unsigned long long>(stats.triesFailed), static_cast<unsigned long long>(stats.lockedGpuWaits), stats.lockedGpuWaitMs);
         holds += counts;
-        if (stats.tag == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
-        else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.tag, stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        if (GpuLockThreadTag() == 0xffffffffu) AgcDriver::ProfilePrint_nid_no_patch("[lock] %s waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", stats.holderColumn == PresenterColumn ? "presenter" : "untagged thread", stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
+        else AgcDriver::ProfilePrint_nid_no_patch("[lock] queue 0x%x waited %.0f ms for the GPU mutex in %llu of %llu acquisitions (%.0f s); by site (acquisitions/waits, waited):%s%s\n", GpuLockThreadTag(), stats.waitedMs, static_cast<unsigned long long>(stats.waits), static_cast<unsigned long long>(stats.acquisitions), interval, sites.c_str(), holds.c_str());
         stats.waitedMs = 0;
         stats.waits = 0;
         stats.acquisitions = 0;
@@ -3297,7 +3306,7 @@ std::uint64_t ThreadCollectedBytes() {
 }
 
 std::uint32_t GpuLockThreadTag() {
-    return LockStats().tag;
+    return ~HostThreadSlot<std::uint32_t, GpuLockTagSlot>::Get();
 }
 
 GpuMutexType& GpuMutex() {
@@ -3311,7 +3320,7 @@ GpuMutexType& GpuMutex() {
 }
 
 void TagGpuLockThread(std::uint32_t queue) {
-    LockStats().tag = queue;
+    HostThreadSlot<std::uint32_t, GpuLockTagSlot>::Set(~queue);
 }
 
 unsigned long long CodeOffset(const void* address) {
@@ -3445,7 +3454,7 @@ std::string HostWriteReport() {
 }
 
 void PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
-    if (ownHostWrite || bytes == 0) return;
+    if (HostThreadSlot<bool, OwnHostWriteSlot>::Get() || bytes == 0) return;
     if (GpuMutex().HeldByThisThread()) noteLockedHostWrite(address, bytes);
     const HostWriteInFlight inFlight;
     if (hostWritesStopped.load(std::memory_order_seq_cst)) return;
