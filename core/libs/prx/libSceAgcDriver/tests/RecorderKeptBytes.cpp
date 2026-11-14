@@ -1,4 +1,8 @@
+#include <limits>
+#include <new>
+#include <stdexcept>
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <array>
@@ -6,13 +10,43 @@
 #include <cstdio>
 #include <exception>
 #include <map>
+#include <optional>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <thread>
 #include <vector>
 
 using namespace AgcDriver::Graphics;
+
+namespace {
+
+thread_local int failAllocationIn = -1;
+std::atomic<std::uint64_t> injectedFailures{0};
+
+}
+
+void* operator new(std::size_t bytes) {
+    if (failAllocationIn >= 0 && failAllocationIn-- == 0) {
+        injectedFailures.fetch_add(1, std::memory_order_relaxed);
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes != 0 ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* memory) noexcept {
+    std::free(memory);
+}
+
+void operator delete(void* memory, std::size_t) noexcept {
+    std::free(memory);
+}
 
 namespace {
 
@@ -238,6 +272,212 @@ void SharedOwnerCountsOncePerBatch() {
     recorder.Sync();
 }
 
+using Kind = Recorder::ReadKind;
+
+struct NotedRead {
+    std::uint64_t begin;
+    std::uint64_t end;
+    Kind kind;
+    std::shared_ptr<const Recorder::ReadList> list;
+};
+
+std::optional<Kind> FirstNotedReader(const std::vector<NotedRead>& notes, std::uint64_t address, std::uint64_t end, std::optional<Kind> only = std::nullopt) {
+    for (const auto& note : notes) {
+        if (only.has_value() && note.kind != *only) continue;
+        if (note.list == nullptr) {
+            if (address < note.end && note.begin < end) return note.kind;
+            continue;
+        }
+        for (const auto& [begin, finish] : *note.list) {
+            if (address < finish && begin < end) return note.kind;
+        }
+    }
+    return std::nullopt;
+}
+
+struct ReadSequence {
+    std::uint32_t state = 0x2545f491u;
+    std::uint32_t Next() {
+        state = state * 1664525u + 1013904223u;
+        return state >> 8u;
+    }
+};
+
+void RepeatedReadsAnswerLikeEveryNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000100000ull;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 6> ranges{{{0x000, 0x100}, {0x080, 0x200}, {0x000, 0x100}, {0x300, 0x340}, {0x100, 0x180}, {0x1c0, 0x400}}};
+    const std::array<Kind, 3> kinds{Kind::DispatchElement, Kind::AddressBased, Kind::CopySource};
+    ReadSequence random;
+    std::vector<NotedRead> notes;
+    std::vector<std::shared_ptr<const Recorder::ReadList>> lists;
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, Kind>> seen;
+    std::uint64_t expectedRepeats = 0;
+    const auto remember = [&](std::uint64_t begin, std::uint64_t end, Kind kind) {
+        notes.push_back({begin, end, kind, nullptr});
+        if (std::find(seen.begin(), seen.end(), std::make_tuple(begin, end, kind)) != seen.end()) ++expectedRepeats;
+        else seen.emplace_back(begin, end, kind);
+    };
+    const auto pick = [&] {
+        const auto& range = ranges[random.Next() % ranges.size()];
+        return std::make_tuple(base + range.first, base + range.second, kinds[random.Next() % kinds.size()]);
+    };
+    const auto before = Recorder::ReadCounts();
+    std::uint64_t notedCalls = 0;
+    for (int operation = 0; operation < 600; ++operation) {
+        const auto choice = random.Next() % 10;
+        if (choice < 7) {
+            const auto [begin, end, kind] = pick();
+            recorder.NotePendingRead(begin, static_cast<std::size_t>(end - begin), kind);
+            remember(begin, end, kind);
+            ++notedCalls;
+        } else if (choice < 9) {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> span;
+            const auto count = 1 + random.Next() % 3;
+            for (std::uint32_t index = 0; index < count; ++index) {
+                const auto [begin, end, ignored] = pick();
+                static_cast<void>(ignored);
+                span.emplace_back(begin, end);
+            }
+            span.emplace_back(base + 0x500, base + 0x500);
+            recorder.NotePendingReads(span, kind);
+            for (const auto& [begin, end] : span) {
+                if (end > begin) remember(begin, end, kind);
+            }
+            notedCalls += span.size();
+        } else {
+            const auto kind = kinds[random.Next() % kinds.size()];
+            std::shared_ptr<const Recorder::ReadList> list;
+            if (!lists.empty() && random.Next() % 2 == 0) {
+                list = lists[random.Next() % lists.size()];
+            } else {
+                const auto start = base + 0x40 * (random.Next() % 16);
+                list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{start, start + 0x20}, {start + 0x400, start + 0x440}});
+                lists.push_back(list);
+            }
+            recorder.NotePendingReadList(list, kind);
+            const bool listed = std::any_of(notes.begin(), notes.end(), [&](const NotedRead& note) { return note.list == list && note.kind == kind; });
+            if (!listed) notes.push_back({0, 0, kind, list});
+            notedCalls += 2;
+        }
+    }
+    const auto after = Recorder::ReadCounts();
+    Expect(after.noted - before.noted == notedCalls, "the noted counter counted " + std::to_string(after.noted - before.noted) + " ranges, not every one of the " + std::to_string(notedCalls) + " noted");
+    const auto repeats = Recorder::FlipReadCheck() || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) ? 0 : expectedRepeats;
+    Expect(after.repeated - before.repeated == repeats, "the batch skipped " + std::to_string(after.repeated - before.repeated) + " repeated reads, not the " + std::to_string(repeats) + " (range, kind) repeats it was given");
+    std::size_t mismatches = 0;
+    for (std::uint64_t offset = 0; offset < 0x900; offset += 0x10) {
+        for (const std::uint64_t bytes : {1ull, 0x20ull, 0x90ull, 0x300ull}) {
+            const auto address = base + offset;
+            const auto expected = FirstNotedReader(notes, address, address + bytes);
+            const auto described = recorder.DescribePendingRead(address, static_cast<std::size_t>(bytes));
+            const bool leased = FirstNotedReader(notes, address, address + bytes, Kind::AddressBased).has_value();
+            if (recorder.PendingReadOverlaps(address, static_cast<std::size_t>(bytes)) != expected.has_value()) ++mismatches;
+            if (described.has_value() != expected.has_value() || (described.has_value() && (described->kind != *expected || !described->open))) ++mismatches;
+            if (recorder.PendingLeaseSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+            if (recorder.PendingWriterSerial(address, static_cast<std::size_t>(bytes)) != (leased ? recorder.OpenSerial() : 0)) ++mismatches;
+        }
+    }
+    Expect(mismatches == 0, std::to_string(mismatches) + " read queries answered differently from the reader every noted read names");
+    recorder.Submit();
+    const auto submitted = recorder.Submissions();
+    const auto repeatedBefore = Recorder::ReadCounts().repeated;
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    Expect(Recorder::ReadCounts().repeated == repeatedBefore, "a range the submitted batch noted was skipped as a repeat in the next batch");
+    const auto next = recorder.DescribePendingRead(base, 4);
+    Expect(next.has_value() && next->open && next->kind == Kind::CopySource && next->serial == submitted + 1, "the next batch does not report the read it noted again");
+    recorder.NotePendingRead(base, 0x100, Kind::AddressBased);
+    Expect(recorder.PendingLeaseSerial(base, 4) == recorder.OpenSerial(), "the next batch dropped a range noted again with another reader kind");
+    Expect(!lists.empty(), "the read sequence noted no list: the list checks prove nothing");
+    if (!lists.empty()) {
+        const auto& list = lists.front();
+        recorder.NotePendingReadList(list, Kind::DispatchElement);
+        const auto listed = recorder.DescribePendingRead(list->back().first, 4);
+        Expect(listed.has_value() && listed->open && listed->kind == Kind::DispatchElement && listed->serial == submitted + 1, "the next batch does not report a list the submitted batch had noted");
+    }
+    recorder.Sync();
+    Expect(recorder.Idle() && !recorder.PendingReadOverlaps(base, 0x1000, false), "repeated reads outlived their batch");
+}
+
+void DedupeSwitchFlipsMidBatch() {
+    if (Recorder::FlipReadCheck()) {
+        std::printf("APS5_FLIP_READ_CHECK keeps every note: the mid-batch switch flip check is skipped\n");
+        return;
+    }
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+    constexpr std::uint64_t base = 0x7f0000300000ull;
+    const auto repeated = [] { return Recorder::ReadCounts().repeated; };
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, false);
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    auto before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    Expect(repeated() == before + 1, "a repeated read with the dedupe on was not skipped");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, true);
+    before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    const auto list = std::make_shared<Recorder::ReadList>(Recorder::ReadList{{base + 0x400, base + 0x420}});
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    Expect(repeated() == before, "APS5_NO_EFFECTS_DEDUPE set at run time still skipped " + std::to_string(repeated() - before) + " repeated reads");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, false);
+    before = repeated();
+    recorder.NotePendingRead(base, 0x100, Kind::CopySource);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingRead(base + 0x200, 0x40, Kind::AddressBased);
+    recorder.NotePendingReadList(list, Kind::DispatchElement);
+    Expect(repeated() == before + 2, "after the switch went back off, the batch skipped " + std::to_string(repeated() - before) + " repeated reads, not the 2 noted with the dedupe on");
+    const auto first = recorder.DescribePendingRead(base, 4);
+    const auto second = recorder.DescribePendingRead(base + 0x200, 4);
+    const auto listed = recorder.DescribePendingRead(base + 0x400, 4);
+    Expect(first.has_value() && first->open && first->kind == Kind::CopySource, "a read noted before the flips is no longer reported");
+    Expect(second.has_value() && second->open && second->kind == Kind::AddressBased && recorder.PendingLeaseSerial(base + 0x200, 4) == recorder.OpenSerial(), "a read noted while the dedupe was off is not reported");
+    Expect(listed.has_value() && listed->open && listed->kind == Kind::DispatchElement, "a list noted while the dedupe was off is not reported");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, environment);
+    recorder.Sync();
+}
+
+void ReadSurvivesFailedNote() {
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    constexpr std::uint64_t base = 0x7f0000200000ull;
+    for (std::uint64_t index = 0; index < 8; ++index) recorder.NotePendingRead(base + index * 0x100, 0x10, Kind::CopySource);
+    const auto injected = injectedFailures.load(std::memory_order_relaxed);
+    bool threw = false;
+    failAllocationIn = 0;
+    try {
+        recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    failAllocationIn = -1;
+    if (injectedFailures.load(std::memory_order_relaxed) == injected) {
+        std::printf("allocation failure not injected into the driver: the failed read note check is skipped\n");
+        recorder.Sync();
+        return;
+    }
+    Expect(threw, "the injected allocation failure did not reach the read note");
+    recorder.NotePendingRead(base + 0x800, 0x10, Kind::CopySource);
+    Expect(recorder.PendingReadOverlaps(base + 0x800, 4), "a read whose first note failed to allocate was lost when noted again");
+    recorder.Sync();
+}
+
+template<typename Condition>
+bool EventuallyTrue(Condition&& condition) {
+    for (int attempt = 0; attempt < 5000 && !condition(); ++attempt) {
+        for (const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1); std::chrono::steady_clock::now() < until;) std::this_thread::yield();
+    }
+    return condition();
+}
+
 void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleResult = VK_ERROR_DEVICE_LOST) {
     mock = MockDevice{};
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -302,13 +542,82 @@ void FailedSubmission(VkResult endResult, VkResult submitResult, VkResult idleRe
 
 }
 
-int main() {
+int AssertsWithOpenBatch() {
+    mock = MockDevice{};
+    Recorder recorder(mockContext());
+    {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        recorder.Keep(std::make_shared<int>(0));
+    }
+    std::signal(SIGABRT, [](int) { std::_Exit(0); });
+    recorder.NotePendingRead(0x10000, 16, Recorder::ReadKind::CopySource);
+    std::fprintf(stderr, "FAIL: a read noted without the GPU mutex into an open batch did not assert under APS5_ASSERT_GPU_LOCK\n");
+    std::_Exit(1);
+}
+
+int NoteReadBench(int argc, char** argv) {
+    const std::size_t notes = argc > 2 ? std::strtoull(argv[2], nullptr, 10) : 4096;
+    const int rounds = argc > 3 ? std::atoi(argv[3]) : 9;
+    if (notes == 0 || rounds <= 0) {
+        std::fprintf(stderr, "usage: --note-read-bench [notes per batch] [rounds]\n");
+        return 2;
+    }
+    const std::size_t queries = std::max<std::size_t>(notes / 4, 1);
+    mock = MockDevice{};
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    Recorder recorder(mockContext());
+    const bool environment = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+    const bool flipped = Recorder::FlipReadCheck();
+    constexpr std::uint64_t base = 0x7f0000400000ull;
+    constexpr std::uint64_t stride = 0x100;
+    const auto median = [](std::vector<double> values) {
+        std::sort(values.begin(), values.end());
+        return values[values.size() / 2];
+    };
+    for (const std::size_t repeatPercent : {0u, 50u, 90u, 99u}) {
+        const std::size_t distinct = std::max<std::size_t>(notes * (100 - repeatPercent) / 100, 1);
+        std::array<std::vector<double>, 2> noteNs;
+        std::array<std::vector<double>, 2> queryNs;
+        for (int round = 0; round < rounds; ++round) {
+            for (const int arm : {0, 1}) {
+                RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, arm == 1);
+                const auto repeatedBefore = Recorder::ReadCounts().repeated;
+                const auto noteStart = std::chrono::steady_clock::now();
+                for (std::size_t index = 0; index < notes; ++index) recorder.NotePendingRead(base + (index % distinct) * stride, stride / 2, Kind::CopySource);
+                const auto noteEnd = std::chrono::steady_clock::now();
+                const auto repeated = Recorder::ReadCounts().repeated - repeatedBefore;
+                const std::uint64_t expected = arm == 0 && !flipped ? notes - distinct : 0;
+                Expect(repeated == expected, "the bench skipped " + std::to_string(repeated) + " notes, not " + std::to_string(expected));
+                std::size_t hits = 0;
+                const auto queryStart = std::chrono::steady_clock::now();
+                for (std::size_t query = 0; query < queries; ++query) hits += recorder.PendingReadOverlaps(base + (query % distinct) * stride + stride / 2, stride / 4) ? 1 : 0;
+                const auto queryEnd = std::chrono::steady_clock::now();
+                Expect(hits == 0, "a query between the noted ranges overlapped one");
+                recorder.Submit();
+                for (auto& [fence, signaled] : mock.signaled) signaled = true;
+                recorder.Reap();
+                noteNs[arm].push_back(std::chrono::duration<double, std::nano>(noteEnd - noteStart).count() / static_cast<double>(notes));
+                queryNs[arm].push_back(std::chrono::duration<double, std::nano>(queryEnd - queryStart).count() / static_cast<double>(queries));
+            }
+        }
+        std::printf("note-read bench: %zu notes per batch, %zu%% repeats, %zu queries, median of %d: dedupe on %.1f ns/note %.1f ns/query; off %.1f ns/note %.1f ns/query\n", notes, repeatPercent, queries, rounds, median(noteNs[0]), median(queryNs[0]), median(noteNs[1]), median(queryNs[1]));
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoEffectsDedupe, environment);
+    return failures == 0 ? 0 : 1;
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--assert-open-batch") return AssertsWithOpenBatch();
+    if (argc >= 2 && std::string_view(argv[1]) == "--note-read-bench") return NoteReadBench(argc, argv);
     try {
         OpenBatchUnderBudget();
         InFlightWithinTwiceTheBudget();
         SyncedWithinTwiceTheBudget();
         CountFollowsEveryPath();
         SharedOwnerCountsOncePerBatch();
+        RepeatedReadsAnswerLikeEveryNote();
+        DedupeSwitchFlipsMidBatch();
+        ReadSurvivesFailedNote();
         FailedSubmission(VK_ERROR_OUT_OF_HOST_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_ERROR_OUT_OF_DEVICE_MEMORY, VK_SUCCESS);
         FailedSubmission(VK_SUCCESS, VK_ERROR_OUT_OF_HOST_MEMORY);

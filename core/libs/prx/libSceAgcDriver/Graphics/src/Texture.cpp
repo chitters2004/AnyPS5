@@ -1,11 +1,13 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -4743,12 +4745,17 @@ namespace {
 struct WriteRecords {
     std::mutex mutex;
     std::unordered_map<std::uint64_t, StorageTexture::WriteRecord> byAddress;
-    std::uint64_t serial = 0;
+    std::array<std::atomic<std::uint64_t>, 256> stripes{};
+    std::atomic<std::uint64_t> clears{0};
 };
 
 WriteRecords& LayoutWrites() {
     static WriteRecords records;
     return records;
+}
+
+std::atomic<std::uint64_t>& LayoutStripe(WriteRecords& records, std::uint64_t address) {
+    return records.stripes[static_cast<std::size_t>(address >> 16u) % records.stripes.size()];
 }
 
 }
@@ -4764,6 +4771,8 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
+ProfileCounter layoutStoresSkipped;
+ProfileCounter pendingSinceLoopsSkipped;
 }
 
 void StorageTexture::NoteFlip() {
@@ -4774,13 +4783,36 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
     return occasionalLabelStores.load(std::memory_order_relaxed);
 }
 
+std::uint64_t StorageTexture::LayoutStoreSkips() {
+    return layoutStoresSkipped.Sum();
+}
+
+std::uint64_t StorageTexture::PendingSinceSkips() {
+    return pendingSinceLoopsSkipped.Sum();
+}
+
+void StorageTexture::ClearLayoutWritesForTest() {
+    auto& records = LayoutWrites();
+    std::lock_guard lock(records.mutex);
+    records.byAddress.clear();
+    records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+}
+
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
-    {
-        auto& records = LayoutWrites();
+    if (auto& records = LayoutWrites(); layoutStripeSerial == 0 || RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) || LayoutStripe(records, descriptor.baseAddress).load(std::memory_order_acquire) != layoutStripeSerial || records.clears.load(std::memory_order_acquire) != layoutClears) {
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            records.clears.store(records.clears.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+        }
+        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format};
+        auto& stripe = LayoutStripe(records, descriptor.baseAddress);
+        layoutStripeSerial = stripe.load(std::memory_order_relaxed) + 1;
+        stripe.store(layoutStripeSerial, std::memory_order_release);
+        layoutClears = records.clears.load(std::memory_order_relaxed);
+    } else {
+        layoutStoresSkipped.Add(1);
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
@@ -4838,7 +4870,22 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         layerPending.SetRange(first, count, true);
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
-    StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        pendingSinceFirst = pendingSinceEnd = 0;
+        StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+    } else if (pendingSince == pendingSinceHeld && first >= pendingSinceFirst && first + count <= pendingSinceEnd) {
+        pendingSinceLoopsSkipped.Add(1);
+    } else {
+        const bool everyUnit = StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+        if (everyUnit && pendingSince == pendingSinceHeld && first <= pendingSinceEnd && pendingSinceFirst <= first + count) {
+            pendingSinceFirst = std::min(pendingSinceFirst, first);
+            pendingSinceEnd = std::max(pendingSinceEnd, first + count);
+        } else if (everyUnit) {
+            pendingSinceHeld = pendingSince;
+            pendingSinceFirst = first;
+            pendingSinceEnd = first + count;
+        }
+    }
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.

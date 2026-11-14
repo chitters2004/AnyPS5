@@ -30,6 +30,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_LOOKUP_C2",
     "APS5_NO_PERSISTENT_DRAW_SETS",
     "APS5_NO_DRAW_UPLOAD_POOL",
+    "APS5_NO_FAST_CAPTURE",
+    "APS5_NO_DEPTH_COLLECT_REUSE",
+    "APS5_NO_EFFECTS_DEDUPE",
 };
 
 struct SwitchValues {
@@ -49,6 +52,9 @@ struct SwitchValues {
             std::getenv("APS5_NO_LOOKUP_C2") != nullptr,
             std::getenv("APS5_NO_PERSISTENT_DRAW_SETS") != nullptr,
             std::getenv("APS5_NO_DRAW_UPLOAD_POOL") != nullptr,
+            std::getenv("APS5_NO_FAST_CAPTURE") != nullptr,
+            std::getenv("APS5_NO_DEPTH_COLLECT_REUSE") != nullptr,
+            std::getenv("APS5_NO_EFFECTS_DEDUPE") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

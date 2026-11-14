@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -3096,6 +3097,7 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 std::atomic<std::uint64_t> depthGuardRefusals{0};
+ProfileCounter inPlaceReadReuses;
 thread_local bool indexProof = false;
 
 }
@@ -3155,6 +3157,20 @@ void ShaderResources::noteReusable() {
 
 std::uint64_t ShaderResources::DepthGuardRefusals() {
     return depthGuardRefusals.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ShaderResources::InPlaceReadReuses() {
+    return inPlaceReadReuses.Sum();
+}
+
+ProfileCounter effectSetsMarked, effectSetsUnchanged, effectSetsChanged;
+ProfileCounter effectOwnReads, effectListReads, effectUnchangedOwnReads;
+ProfileCounter effectUnchangedByOwnReads[EffectReadBuckets];
+
+ShaderResources::EffectScreenCounts ShaderResources::EffectScreen() {
+    EffectScreenCounts counts{effectSetsMarked.Sum(), effectSetsUnchanged.Sum(), effectSetsChanged.Sum(), effectOwnReads.Sum(), effectListReads.Sum(), effectUnchangedOwnReads.Sum(), {}};
+    for (std::size_t bucket = 0; bucket < EffectReadBuckets; ++bucket) counts.unchangedByOwnReads[bucket] = effectUnchangedByOwnReads[bucket].Sum();
+    return counts;
 }
 
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
@@ -7705,11 +7721,47 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // one of them (the copy HLE) must not land before the recorded work read it.
     static const bool readOnlyLeaseSkip = std::getenv("APS5_NO_READ_ONLY_LEASE_SKIP") == nullptr;
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : readOnlyLeaseSkip && usesBda && bdaReadOnly ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
-    if (auto split = guestMemory.SplitInPlaceReads()) {
-        recorder.NotePendingReadList(std::move(split->space), kind);
-        recorder.NotePendingReads(split->own, kind);
+    static const bool screen = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto screenReads = [&](std::span<const std::pair<std::uint64_t, std::uint64_t>> reads, const Recorder::ReadList* list) {
+        if (!screen) return;
+        effectSetsMarked.Add(1);
+        effectOwnReads.Add(reads.size());
+        if (list != nullptr) effectListReads.Add(list->size());
+        const auto repeat = effectScreen.Note(&recorder, recorder.OpenSerial(), EffectReadPrint(reads, list, static_cast<std::uint32_t>(kind)));
+        if (repeat == EffectRepeat::Unchanged) {
+            effectSetsUnchanged.Add(1);
+            effectUnchangedOwnReads.Add(reads.size());
+            effectUnchangedByOwnReads[EffectReadBucket(reads.size())].Add(1);
+        } else if (repeat == EffectRepeat::Changed) {
+            effectSetsChanged.Add(1);
+        }
+    };
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        if (auto split = guestMemory.SplitInPlaceReads()) {
+            screenReads(split->own, split->space.get());
+            recorder.NotePendingReadList(std::move(split->space), kind);
+            recorder.NotePendingReads(split->own, kind);
+        } else {
+            const auto reads = guestMemory.InPlaceReads();
+            screenReads(reads, nullptr);
+            recorder.NotePendingReads(reads, kind);
+        }
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* inPlaceReadsSlot = nullptr;
+        auto& ownedReads = ShaderRecompiler::ThreadOwned(inPlaceReadsSlot);
+        auto reads = std::move(ownedReads);
+        const auto capacity = reads.capacity();
+        const Recorder::ReadList* list = nullptr;
+        if (auto space = guestMemory.SplitInPlaceReads(reads)) {
+            list = space.get();
+            recorder.NotePendingReadList(std::move(space), kind);
+        } else {
+            guestMemory.InPlaceReads(reads);
+        }
+        if (capacity != 0 && reads.capacity() == capacity) inPlaceReadReuses.Add(1);
+        screenReads(reads, list);
+        recorder.NotePendingReads(reads, kind);
+        ownedReads = std::move(reads);
     }
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;

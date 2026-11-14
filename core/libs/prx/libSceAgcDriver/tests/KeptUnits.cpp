@@ -65,6 +65,10 @@ void Compare(const Kept& kept, const UnitLayout& layout, const std::vector<std::
     for (std::size_t unit = 0; unit < expected.size(); ++unit) {
         Require(expected[unit] == actual[unit], Describe(layout, first, count, label) + ": unit " + std::to_string(unit) + " differs from the per-unit answer");
     }
+    bool everyUnit = true;
+    for (std::uint32_t unit = first; unit < first + count; ++unit) everyUnit = everyUnit && expected[unit] == Stamp;
+    std::vector<std::uint64_t> stamps(generations.size(), Untouched);
+    Require(StampUnkeptUnits(kept, layout, generations, stamps, first, count, Stamp) == everyUnit, Describe(layout, first, count, label) + ": the walk's answer does not say whether it stamped every requested unit");
 }
 
 constexpr std::uint64_t Block = 65536;

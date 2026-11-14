@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EffectRepeatScreen.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -360,6 +361,13 @@ public:
     const std::vector<std::uint64_t>& MultisampleSources() const { return multisampleSources; }
     static bool NeverReusable(std::span<const CompiledShader> shaders);
     static std::uint64_t DepthGuardRefusals();
+    static std::uint64_t InPlaceReadReuses();
+    struct EffectScreenCounts {
+        std::uint64_t sets, unchanged, changed;
+        std::uint64_t ownReads, listReads, unchangedOwnReads;
+        std::array<std::uint64_t, EffectReadBuckets> unchangedByOwnReads;
+    };
+    static EffectScreenCounts EffectScreen();
     const std::vector<std::shared_ptr<Texture>>& SampledTextures() const { return textures; }
     static std::size_t LookupLogCapacity();
     bool ChecksFaults() const { return bda != nullptr; }
@@ -695,6 +703,7 @@ private:
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::shared_ptr<ShaderResources> afterRunSelf;
+    EffectRepeatScreen effectScreen;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     std::vector<BdaResources::SrtGuardFaults> srtGuardFaults;

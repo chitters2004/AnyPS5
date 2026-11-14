@@ -16,10 +16,13 @@ public:
     static const SrtTape* For(const IrResourcePlan& plan);
     static bool Enabled();
     static bool Verified();
+    static bool BatchVerified();
+    static std::uint64_t BatchedReads();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
 
     std::size_t Nodes() const { return nodes.size(); }
+    std::size_t Reads() const { return reads; }
 
 private:
     friend class SrtTapeCompiler;
@@ -45,6 +48,9 @@ private:
         const IrValue* source = nullptr;
     };
     struct Frame;
+    enum class Batch : std::uint8_t { Skipped, Read, Failed };
+    bool operands(Frame& frame, const Node& node, std::array<std::uint64_t, 5>& operand, std::int32_t& origin) const;
+    Batch readBatch(Frame& frame, std::uint32_t sourceIndex, std::uint32_t count, DescriptorValue& value) const;
     bool evaluate(Frame& frame, std::uint32_t index, std::uint64_t& result) const;
     bool compute(Frame& frame, const Node& node, std::uint64_t& result) const;
 
@@ -52,6 +58,8 @@ private:
     std::vector<std::array<std::uint32_t, 8>> sourceDwords;
     std::vector<std::uint32_t> flatRoots;
     std::vector<std::uint32_t> conditionRoots;
+    std::vector<std::uint8_t> batchable;
+    std::size_t reads = 0;
 };
 
 }

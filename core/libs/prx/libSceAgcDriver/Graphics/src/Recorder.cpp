@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
@@ -609,7 +610,7 @@ bool KeyStoresEach() {
 std::atomic<std::uint64_t> queuedLabelsNoted{0}, queuedLabelsOverRecorded{0}, queuedLabelHits{0}, queuedLabelHookRecords{0}, queuedLabelHookInCompletion{0};
 // Read-tracking counters (Recorder::ReadCounts), relaxed: they are only reported.
 constexpr std::size_t ReadKinds = static_cast<std::size_t>(Recorder::ReadKind::Count);
-ProfileCounter readsNoted, readQueries, readStaleIgnored;
+ProfileCounter readsNoted, readQueries, readStaleIgnored, readsRepeated;
 ProfileCounter readHits[ReadKinds];
 
 bool ReadTrackingEnabled() {
@@ -1347,7 +1348,7 @@ struct Recorder::ProgressWatcher {
     }
 };
 
-Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)) {
+Recorder::Recorder(const Context& context, bool timelineSemaphores) : context(context), id(nextRecorderId.fetch_add(1)), assertGpuLock(GuestMemory::GpuLockAssertsEnabled()) {
     {
         std::lock_guard lock(liveRecordersMutex);
         liveRecorders.push_back(id);
@@ -2149,7 +2150,7 @@ void Recorder::recordKeyStores(bool forWriter) {
     if (forWriter) keyStoreRunsForWriter.fetch_add(1, std::memory_order_relaxed);
 }
 
-void Recorder::ensureOpen() {
+void Recorder::beginBatch() {
     GuestMemory::AssertGpuLockHeld("Recorder::Commands");
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
@@ -2180,6 +2181,13 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         open = std::move(batch);
+        notedReadKeys.Reset();
+        notedReadLists.Reset();
+        if (++batchEpoch == 0) {
+            notedReadKeys.Clear();
+            notedReadLists.Clear();
+            ++batchEpoch;
+        }
         open->predictedSerial = submissions + 1;
         try {
             if (open->queue == 0) WriteCheckpointSerial(context, open->commands, open->predictedSerial, open->queue);
@@ -4095,22 +4103,46 @@ bool Recorder::ReadTracking() {
     return ReadTrackingEnabled();
 }
 
+namespace {
+
+bool DedupeReads() {
+    return !Recorder::FlipReadCheck() && !RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe);
+}
+
+}
+
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
-    open->reads.push_back({address, address + bytes, kind});
+    if (!noteRead(address, address + bytes, kind, DedupeReads())) readsRepeated.Add(1);
     readsNoted.Add(1);
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
+    const bool dedupe = DedupeReads();
+    std::uint64_t repeated = 0;
     for (const auto& [begin, end] : ranges) {
         CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%llu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), static_cast<int>(kind));
-        if (end > begin) open->reads.push_back({begin, end, kind});
+        if (end > begin && !noteRead(begin, end, kind, dedupe)) ++repeated;
     }
     readsNoted.Add(ranges.size());
+    if (repeated != 0) readsRepeated.Add(repeated);
+}
+
+bool Recorder::noteRead(std::uint64_t begin, std::uint64_t end, ReadKind kind, bool dedupe) {
+    if (!dedupe) {
+        open->reads.push_back({begin, end, kind});
+        return true;
+    }
+    const ReadKey key{begin, end, kind};
+    const auto probe = notedReadKeys.Find(key, batchEpoch);
+    if (probe.found) return false;
+    open->reads.push_back({begin, end, kind});
+    notedReadKeys.Place(probe, key, batchEpoch);
+    return true;
 }
 
 bool Recorder::ValidReadList(const ReadList& ranges) {
@@ -4129,10 +4161,16 @@ void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadK
     }
     ensureOpen();
     readsNoted.Add(ranges->size());
-    for (const auto& note : open->readLists) {
-        if (note.ranges == ranges && note.kind == kind) return;
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe)) {
+        for (const auto& note : open->readLists) {
+            if (note.ranges == ranges && note.kind == kind) return;
+        }
+        open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+        return;
     }
+    const ReadListKey key{ranges.get(), kind};
     open->readLists.push_back({std::move(ranges), open->reads.size(), kind});
+    if (!notedReadLists.Insert(key, batchEpoch)) open->readLists.pop_back();
 }
 
 std::optional<Recorder::ReadKind> Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only) {
@@ -4207,7 +4245,7 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
 }
 
 Recorder::ReadStatistics Recorder::ReadCounts() {
-    ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}};
+    ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}, readsRepeated.Sum()};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].Sum();
     return counts;
 }
@@ -5067,6 +5105,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us; command buffers freed at batch release %llu, fences kept for reuse %llu\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs, static_cast<unsigned long long>(commandBuffersFreed.load()), static_cast<unsigned long long>(fencesKept.load()));
                     const auto reads = Recorder::ReadCounts();
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu, address-based read-only %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.hits[7]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] repeated batch effects skipped: %llu reads already noted, %llu layout stores, %llu pending-since loops, %llu in-place read lists filled without allocating\n", static_cast<unsigned long long>(reads.repeated), static_cast<unsigned long long>(StorageTexture::LayoutStoreSkips()), static_cast<unsigned long long>(StorageTexture::PendingSinceSkips()), static_cast<unsigned long long>(ShaderResources::InPlaceReadReuses()));
+                    const auto screen = ShaderResources::EffectScreen();
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] effect sets: %llu marked, %llu repeated in their batch with the same reads, %llu repeated with other reads; %llu reads noted\n", static_cast<unsigned long long>(screen.sets), static_cast<unsigned long long>(screen.unchanged), static_cast<unsigned long long>(screen.changed), static_cast<unsigned long long>(reads.noted));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] effect set reads: %llu own, %llu in read lists; repeated sets: %llu own reads, sets by own reads 0 %llu, 1-4 %llu, 5-8 %llu, 9-16 %llu, 17-32 %llu, 33+ %llu\n", static_cast<unsigned long long>(screen.ownReads), static_cast<unsigned long long>(screen.listReads), static_cast<unsigned long long>(screen.unchangedOwnReads), static_cast<unsigned long long>(screen.unchangedByOwnReads[0]), static_cast<unsigned long long>(screen.unchangedByOwnReads[1]), static_cast<unsigned long long>(screen.unchangedByOwnReads[2]), static_cast<unsigned long long>(screen.unchangedByOwnReads[3]), static_cast<unsigned long long>(screen.unchangedByOwnReads[4]), static_cast<unsigned long long>(screen.unchangedByOwnReads[5]));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};

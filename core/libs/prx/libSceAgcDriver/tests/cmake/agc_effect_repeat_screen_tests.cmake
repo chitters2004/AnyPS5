@@ -1,0 +1,11 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_effect_repeat_screen_tests tests/EffectRepeatScreen.cpp)
+    target_include_directories(agc_effect_repeat_screen_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_effect_repeat_screen_tests PRIVATE libc)
+    add_test(NAME agc_effect_repeat_screen COMMAND agc_effect_repeat_screen_tests)
+    set_tests_properties(agc_effect_repeat_screen PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_effect_repeat_screen PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

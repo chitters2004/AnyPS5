@@ -24,6 +24,9 @@ enum class RuntimeSwitch : std::size_t {
     NoLookupC2,
     NoPersistentDrawSets,
     NoDrawUploadPool,
+    NoFastCapture,
+    NoDepthCollectReuse,
+    NoEffectsDedupe,
     Count,
 };
 

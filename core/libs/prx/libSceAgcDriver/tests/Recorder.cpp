@@ -4196,6 +4196,91 @@ void viewPastLastMipTests(const Device& device, Recorder& recorder) {
     Require(texel(*past, 3) == 0x77777777u, "the level past the last mip was not read from its addrlib tail slot");
 }
 
+bool effectScreenTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: the effect set screen is not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the effect screen block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the effect screen block refused: the screen is not tested\n";
+        return false;
+    }
+    const auto program = [&](std::uint64_t element) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, 1024, 0x31000000u};
+        binding.bufferWritten = {false};
+        result.bindings.push_back(binding);
+        return result;
+    };
+    const auto programA = program(address + 4096);
+    const auto programB = program(address + 8192);
+    const bool screened = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    {
+        ShaderResources first(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &programA, 0});
+        ShaderResources second(context, CompiledShader{ShaderRecompiler::ShaderStage::Compute, &programB, 0});
+        const auto before = ShaderResources::EffectScreen();
+        first.MarkGpuWrites(recorder);
+        first.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        first.MarkGpuWrites(recorder);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        first.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        second.MarkGpuWrites(recorder);
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        const auto after = ShaderResources::EffectScreen();
+        const auto sets = after.sets - before.sets;
+        const auto unchanged = after.unchanged - before.unchanged;
+        const auto changed = after.changed - before.changed;
+        Require(sets == (screened ? 7u : 0u), "the screen counted " + std::to_string(sets) + " effect sets for 7 marks");
+        Require(unchanged == (screened ? 3u : 0u), "the screen counted " + std::to_string(unchanged) + " unchanged repeats, not the 3 within one batch");
+        Require(changed == 0, "a resources object with fixed reads counted a changed repeat");
+        const auto own = after.ownReads - before.ownReads;
+        const auto repeatedOwn = after.unchangedOwnReads - before.unchangedOwnReads;
+        Require(own % 7 == 0 && repeatedOwn * 7 == own * 3, "the repeated sets' own reads (" + std::to_string(repeatedOwn) + ") are not 3 of 7 equal sets' (" + std::to_string(own) + ")");
+        Require(screened == (own != 0), screened ? "the screen counted no own reads for sets with reads" : "own reads were counted without APS5_PROFILE_DRAW");
+        Require(after.listReads == before.listReads, "a host-imported block without an address space counted read list reads");
+        std::uint64_t bucketed = 0;
+        for (std::size_t bucket = 0; bucket < after.unchangedByOwnReads.size(); ++bucket) {
+            const auto added = after.unchangedByOwnReads[bucket] - before.unchangedByOwnReads[bucket];
+            bucketed += added;
+            Require(added == 0 || bucket == EffectReadBucket(own / 7), "a repeated set fell outside its own-read bucket");
+        }
+        Require(bucketed == unchanged, "the own-read buckets hold " + std::to_string(bucketed) + " repeated sets, not " + std::to_string(unchanged));
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    std::cout << (screened ? "effect set screen: ok\n" : "effect set screen: off without APS5_PROFILE_DRAW, nothing counted\n");
+    return true;
+}
+
 void resourceReadTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -14607,6 +14692,159 @@ void sliceDirtyTests(const Device& device, Recorder& recorder) {
     std::cout << "slice dirty marking: ok\n";
 }
 
+void markRepeatTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    constexpr std::uint32_t side = 128;
+    constexpr std::uint32_t slices = 4;
+    constexpr std::size_t sliceBytes = 65536;
+    constexpr std::size_t bytes = slices * sliceBytes;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: repeated mark effects not tested\n";
+        return;
+    }
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        std::size_t bytes;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+            ReleaseWatched(block, bytes);
+        }
+    } unregister{base, block, address, bytes};
+    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.hostImportAlignment = 0;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.depthOrLastArray = slices - 1;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.dimension = TextureDimension::k2DArray;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    auto flat = resource;
+    flat.dimension = TextureDimension::k2D;
+    flat.depthOrLastArray = 0;
+    const auto geometry = DescribeSurface(resource);
+    Require(geometry.imageLayers == slices && geometry.guestBytes == bytes, "the repeated mark image does not hold four 64 KiB slices");
+    {
+        auto image = StorageTexture::Create(context, detiler, resource, 0);
+        auto alias = StorageTexture::Create(context, detiler, flat, 0);
+        const auto units = image->TrackedUnits();
+        Require(units == slices, "the repeated mark image tracks " + std::to_string(units) + " units, not one per slice");
+        static_cast<void>(recorder.Commands());
+        recorder.Keep(image);
+        recorder.Keep(alias);
+        const auto lastDimension = [&] {
+            const auto record = StorageTexture::LastWrite(address);
+            Require(record.has_value(), "no layout write is recorded at the images' address");
+            Require(record->width == side && record->tileMode == TextureTileMode::kLinear && record->format == 56, "the recorded layout write lost the images' shape");
+            return record->dimension;
+        };
+        std::atomic<bool> reading{true};
+        std::atomic<std::uint64_t> foreignRecords{0};
+        std::thread reader([&] {
+            while (reading.load(std::memory_order_acquire)) {
+                const auto record = StorageTexture::LastWrite(address);
+                if (record.has_value() && (record->width != side || (record->dimension != TextureDimension::k2DArray && record->dimension != TextureDimension::k2D))) foreignRecords.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+        struct StopReader {
+            std::atomic<bool>& reading;
+            std::thread& reader;
+            ~StopReader() {
+                reading.store(false, std::memory_order_release);
+                reader.join();
+            }
+        } stopReader{reading, reader};
+        image->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write is not the recorded layout");
+        const std::uint64_t dedupe = RuntimeSwitches::Set(RuntimeSwitch::NoEffectsDedupe) ? 0 : 1;
+        const auto layoutSkips = StorageTexture::LayoutStoreSkips();
+        image->MarkSliceDirty(1);
+        Require(lastDimension() == TextureDimension::k2DArray, "a repeated write of the array image changed the recorded layout");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + dedupe, dedupe != 0 ? "a repeated write of the array image stored its layout again" : "APS5_NO_EFFECTS_DEDUPE still skipped a layout store");
+        alias->MarkDirty();
+        Require(lastDimension() == TextureDimension::k2D, "the alias's write after the array image's is not the recorded layout");
+        image->MarkSliceDirty(2);
+        Require(lastDimension() == TextureDimension::k2DArray, "the array image's write after the alias's left the alias's layout recorded");
+        Require(StorageTexture::LayoutStoreSkips() == layoutSkips + dedupe, "a write after another image's was skipped as a repeat");
+        auto neighborResource = flat;
+        neighborResource.baseAddress = address + sliceBytes;
+        auto neighbor = StorageTexture::Create(context, detiler, neighborResource, 0);
+        recorder.Keep(neighbor);
+        neighbor->MarkDirty();
+        const auto alternating = StorageTexture::LayoutStoreSkips();
+        image->MarkSliceDirty(3);
+        neighbor->MarkDirty();
+        image->MarkSliceDirty(0);
+        Require(StorageTexture::LayoutStoreSkips() == alternating + 3 * dedupe, "alternating writes of images at different addresses stored their layouts again");
+        Require(lastDimension() == TextureDimension::k2DArray, "a neighbouring image's write changed the array image's recorded layout");
+        const auto neighborRecord = StorageTexture::LastWrite(address + sliceBytes);
+        Require(neighborRecord.has_value() && neighborRecord->dimension == TextureDimension::k2D, "the neighbouring image's layout is not recorded at its address");
+        StorageTexture::ClearLayoutWritesForTest();
+        Require(!StorageTexture::LastWrite(address).has_value(), "the cleared layout table still holds the array image's layout");
+        image->MarkSliceDirty(1);
+        Require(lastDimension() == TextureDimension::k2DArray, "a write after the layout table was cleared did not record its layout again");
+        Require(foreignRecords.load(std::memory_order_relaxed) == 0, "a concurrent reader saw a layout no image at the address wrote");
+        std::vector<std::uint64_t> expected(units);
+        for (std::uint32_t unit = 0; unit < units; ++unit) expected[unit] = image->PendingSinceForTest(unit);
+        const auto mark = [&](std::uint32_t first, std::uint32_t count, bool advance, const std::string& what) {
+            if (advance) AgcDriver::GuestMemory::AdvanceTrackerGenerationForTest(AgcDriver::GuestMemory::TrackerGeneration() + 100);
+            const auto before = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto skips = StorageTexture::PendingSinceSkips();
+            image->MarkSliceDirty(first, count);
+            const auto after = AgcDriver::GuestMemory::TrackerGeneration();
+            const auto since = image->PendingSinceForTest(first);
+            Require(since >= before && since <= after, what + ": the marked unit's pending-since generation " + std::to_string(since) + " is not the generation of its mark");
+            for (std::uint32_t unit = first; unit < first + count; ++unit) expected[unit] = since;
+            for (std::uint32_t unit = 0; unit < units; ++unit) {
+                Require(image->PendingSinceForTest(unit) == expected[unit], what + ": unit " + std::to_string(unit) + " holds pending-since generation " + std::to_string(image->PendingSinceForTest(unit)) + ", not " + std::to_string(expected[unit]));
+            }
+            return StorageTexture::PendingSinceSkips() - skips;
+        };
+        mark(0, units, true, "a whole mark at a new generation");
+        const auto held = expected[1];
+        const bool heldBefore = AgcDriver::GuestMemory::TrackerGeneration() == held;
+        const auto repeatSkips = mark(1, 2, false, "a repeated mark inside the whole mark");
+        Require(heldBefore && AgcDriver::GuestMemory::TrackerGeneration() == held, "the tracker generation moved under a repeated mark: the skip is not exercised");
+        Require(repeatSkips == dedupe, dedupe != 0 ? "a repeated mark at the same generation walked its units again" : "APS5_NO_EFFECTS_DEDUPE still skipped a pending-since walk");
+        mark(2, 1, true, "a one-unit mark at a new generation");
+        const auto outsideSkips = mark(0, 1, false, "a mark of a unit outside the newest mark at the same generation");
+        mark(1, 1, false, "a mark between the two newest marks");
+        mark(0, 3, false, "a mark covering the joined marks");
+        mark(3, 1, false, "a mark of the last unit");
+        mark(0, units, true, "a whole mark at a later generation");
+        Require(outsideSkips == 0, "a mark of a unit no mark at its generation covered was skipped");
+        image->WriteBack();
+        alias->WriteBack();
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    }
+    recorder.Sync();
+    std::cout << "repeated mark effects: ok\n";
+}
+
 void atomicViewTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     TextureDetiler detiler(context);
@@ -16921,6 +17159,13 @@ int main(int argc, char** argv) {
             sliceDirtyTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--effect-screen-only") {
+            return effectScreenTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--mark-repeat-only") {
+            markRepeatTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resident-present-only") {
             RunResidentPresentTests(device.GetContext());
             return 0;
@@ -17239,6 +17484,7 @@ int main(int argc, char** argv) {
         drawInputInPlaceTests(device, recorder);
         RunResidentPresentTests(device.GetContext());
         sliceDirtyTests(device, recorder);
+        markRepeatTests(device, recorder);
         storeRunTests(device, recorder);
         queuedWriteGroupTests();
         remappedImportTests(device);
