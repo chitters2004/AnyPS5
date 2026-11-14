@@ -12,6 +12,9 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_dcc_keys_rewrite_after_epoch_proof_committer COMMAND agc_driver_dcc_keys_first_write_tests --rewrite-after-epoch-proof)
     set_tests_properties(agc_driver_dcc_keys_rewrite_after_epoch_proof_committer PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_resident_refresh_counts COMMAND agc_driver_dcc_keys_first_write_tests --resident-refresh-counts)
+    set_tests_properties(agc_driver_resident_refresh_counts PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1;APS5_PROFILE_RESIDENT_REFRESH=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     foreach(gate IN ITEMS "committer|on" "finisher|on|APS5_DRAW_PIPELINE=1" "inline|off|APS5_PIPELINED_DRAWS=0" "finisher_inline|off|APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=0" "locked_prepare|off|APS5_LOCKED_DRAW_PREPARE=1" "switched_off|off|APS5_NO_EPOCH_PROOFS=1" "finisher_switched_off|off|APS5_DRAW_PIPELINE=1;APS5_NO_EPOCH_PROOFS=1")
         string(REPLACE "|" ";" fields "${gate}")
         list(GET fields 0 name)
@@ -30,7 +33,7 @@ if(BUILD_TESTING)
         endif()
     endforeach()
     if(WIN32)
-        set_tests_properties(agc_driver_dcc_keys_rewrite_after_memo agc_driver_dcc_keys_rewrite_after_refresh_proof agc_driver_dcc_keys_rewrite_after_epoch_proof agc_driver_dcc_keys_rewrite_after_epoch_proof_committer agc_driver_dcc_keys_partial_rewrite_keeps_store agc_driver_dcc_keys_write_beside_keys_keeps_store agc_driver_dcc_keys_rewrite_to_register_clear PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_dcc_keys_rewrite_after_memo agc_driver_dcc_keys_rewrite_after_refresh_proof agc_driver_dcc_keys_rewrite_after_epoch_proof agc_driver_dcc_keys_rewrite_after_epoch_proof_committer agc_driver_dcc_keys_partial_rewrite_keeps_store agc_driver_dcc_keys_write_beside_keys_keeps_store agc_driver_dcc_keys_rewrite_to_register_clear agc_driver_resident_refresh_counts PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

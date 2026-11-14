@@ -2513,13 +2513,20 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         EpochProofCounts().storageReuses.Add();
+        if (ResidentRefreshProfiled()) ResidentRefreshCounts().exits.Add();
         return true;
     }
     const auto proofBefore = GuestMemory::ProofSerial();
     const auto pendingBefore = PendingSerial();
+    const bool counted = ResidentRefreshProfiled();
+    thread_local std::uint32_t fullRefreshes = 0;
+    const bool sampled = counted && (fullRefreshes++ & 63u) == 0u;
+    const auto sampleStart = sampled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
-    if (refreshProved()) {
+    const auto outcome = refreshProved();
+    if (counted) noteResidentRefresh(outcome, sampled ? std::chrono::steady_clock::now() - sampleStart : std::chrono::steady_clock::duration{});
+    if (outcome == RefreshOutcome::Proved) {
         layerBehind.clear();
         if (epoch != 0) {
             provedEpoch.store(epoch, std::memory_order_relaxed);
@@ -2920,27 +2927,62 @@ bool StorageTexture::otherPendingOverlaps() const {
     return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
-bool StorageTexture::refreshProved() {
-    if (refreshProof.generation == 0) return false;
-    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
+void StorageTexture::noteResidentRefresh(RefreshOutcome outcome, std::chrono::steady_clock::duration sample) {
+    auto& counts = ResidentRefreshCounts();
+    (outcome == RefreshOutcome::Proved ? counts.proved : outcome == RefreshOutcome::Written ? counts.written : counts.refused).Add();
+    if (sample != std::chrono::steady_clock::duration{}) {
+        counts.sampledNs.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(sample).count()));
+        counts.samples.Add();
+    }
+    const auto breaks = ProofBreakCounts();
+    for (std::size_t kind = 0; kind < ProofBreakKinds; ++kind) {
+        if (breaks[kind] == provedBreaks[kind]) continue;
+        counts.brokeBefore[kind].Add();
+        if (outcome == RefreshOutcome::Proved) counts.brokeBeforeProved[kind].Add();
+    }
+    if (outcome == RefreshOutcome::Proved) provedBreaks = breaks;
+}
+
+StorageTexture::RefreshOutcome StorageTexture::refreshProved() {
+    if (refreshProof.generation == 0) return RefreshOutcome::Refused;
+    if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return RefreshOutcome::Refused;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    const bool counted = ResidentRefreshProfiled();
+    const auto walkedBefore = counted ? GuestMemory::ThreadWalkedBytes() : 0;
+    struct Collected {
+        bool counted;
+        std::uint64_t walkedBefore;
+        std::size_t collects = 0;
+        std::uint64_t bytes = 0;
+        ~Collected() {
+            if (!counted || collects == 0) return;
+            auto& counts = ResidentRefreshCounts();
+            counts.collects.Add(collects);
+            counts.collectBytes.Add(bytes);
+            counts.walkedBytes.Add(GuestMemory::ThreadWalkedBytes() - walkedBefore);
+        }
+    } collected{counted, walkedBefore};
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
-    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;
+    ++collected.collects;
+    collected.bytes += bytes;
+    if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return RefreshOutcome::Refused;
     queries[used++] = {descriptor.baseAddress, bytes, generation};
     if (descriptor.dccAddress != 0) {
         const auto keyCount = static_cast<std::size_t>(guestBytes / 256);
-        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return false;
-        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return false;
+        if (keyCount == 0 || keyProof.generation != refreshProof.keyGeneration || keyProof.keys != uploadedKeys || !PendingKeyProofHolds(descriptor, guestBytes, keyProof)) return RefreshOutcome::Refused;
+        ++collected.collects;
+        collected.bytes += keyCount;
+        if (GuestMemory::CollectWrites(descriptor.dccAddress, keyCount) == 0) return RefreshOutcome::Refused;
         queries[used++] = {descriptor.dccAddress, keyCount, keyProof.generation};
     }
-    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return false;
+    if (!GuestMemory::UnchangedSinceAll(std::span(queries.data(), used))) return RefreshOutcome::Written;
     const auto serial = PendingSerial();
     if (serial != refreshProof.pendingSerial) {
-        if (otherPendingOverlaps()) return false;
+        if (otherPendingOverlaps()) return RefreshOutcome::Refused;
         refreshProof.pendingSerial = serial;
     }
-    return true;
+    return RefreshOutcome::Proved;
 }
 
 void StorageTexture::takeRefreshProof(bool aliased) {

@@ -37,6 +37,7 @@ void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     GuestMemory::BumpCollectEpoch();
     if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
     ++(epochBumps().*counter);
+    if (counter == &EpochBumps::submissions && ResidentRefreshProfiled()) ResidentRefreshCounts().submissions.Add();
 }
 
 void Driver::bumpWaitEpoch(std::uint64_t address, std::size_t bytes) {

@@ -386,7 +386,7 @@ void DrawPipeline::enqueue(Item item) {
         wake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats && !Graphics::EpochProofCountsProfiled()) return;
+    if (!profile && !stats && !Graphics::EpochProofCountsProfiled() && !ResidentRefreshProfiled()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     if (profile || stats) {
@@ -394,7 +394,8 @@ void DrawPipeline::enqueue(Item item) {
     } else {
         lastReport = now;
     }
-    Graphics::ReportEpochProofCounts();
+    if (profile || stats || Graphics::EpochProofCountsProfiled()) Graphics::ReportEpochProofCounts();
+    if (ResidentRefreshProfiled()) ReportResidentRefreshCounts();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -465,7 +466,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) GuestMemory::BreakProofs(ProofBreak::NonDraw);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

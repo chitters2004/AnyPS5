@@ -532,6 +532,60 @@ int RunEpochProofGate(AgcDriver::VulkanDevice& device, std::uint8_t* block, bool
     return 0;
 }
 
+struct ResidentRefreshSeen {
+    std::uint64_t exits = 0, proved = 0, written = 0, refused = 0, collects = 0, bytes = 0, walked = 0, epochs = 0, nonDraw = 0, nonDrawProved = 0;
+    static ResidentRefreshSeen Now() {
+        auto& counts = AgcDriver::ResidentRefreshCounts();
+        const auto kind = static_cast<std::size_t>(AgcDriver::ProofBreak::NonDraw);
+        return {counts.exits.Sum(), counts.proved.Sum(), counts.written.Sum(), counts.refused.Sum(), counts.collects.Sum(), counts.collectBytes.Sum(), counts.walkedBytes.Sum(), counts.epochs.Sum(), counts.brokeBefore[kind].Sum(), counts.brokeBeforeProved[kind].Sum()};
+    }
+    ResidentRefreshSeen operator-(const ResidentRefreshSeen& before) const {
+        return {exits - before.exits, proved - before.proved, written - before.written, refused - before.refused, collects - before.collects, bytes - before.bytes, walked - before.walked, epochs - before.epochs, nonDraw - before.nonDraw, nonDrawProved - before.nonDrawProved};
+    }
+};
+
+int RunResidentRefreshCounts(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    auto* texels = block;
+    auto* keys = block + KeysOffset;
+    std::memset(texels, 0x55, SurfaceBytes);
+    std::memset(keys, 0xff, KeyBytes);
+    Require(AgcDriver::Graphics::ShaderResources::EpochProofs() && AgcDriver::ResidentRefreshProfiled(), "resident refresh counts: needs epoch proofs and APS5_PROFILE_RESIDENT_REFRESH");
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(texels, keys));
+    const auto context = device.graphicsContext();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto image = AgcDriver::Graphics::CachedStorageSurface(context, resource);
+    if (!AgcDriver::GuestMemory::Watched(AddressOf(texels), SurfaceBytes)) {
+        std::puts("resident refresh counts: the surface is not write-watched after the upload: skipped");
+        return VulkanTestSkipped;
+    }
+    for (int lookup = 0; lookup < 2; ++lookup) Require(AgcDriver::Graphics::CachedStorageSurface(context, resource) == image, "resident refresh counts: a repeated lookup made another image");
+    const auto lookUp = [&](const char* what) {
+        const auto before = ResidentRefreshSeen::Now();
+        Require(AgcDriver::Graphics::CachedStorageSurface(context, resource) == image, std::string("resident refresh counts: ") + what + " made another image");
+        return ResidentRefreshSeen::Now() - before;
+    };
+    const auto exit = lookUp("a lookup in the proving epoch");
+    Require(exit.exits == 1 && exit.proved + exit.written + exit.refused == 0 && exit.collects == 0, "resident refresh counts: a lookup in the proving epoch was not counted as one epoch exit");
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::ProofBreak::NonDraw);
+    const auto epochBefore = ResidentRefreshSeen::Now();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require((ResidentRefreshSeen::Now() - epochBefore).epochs == 1, "resident refresh counts: a collect epoch bump was not counted once");
+    const auto clean = lookUp("the lookup after a non-draw break");
+    Require(clean.exits == 0 && clean.proved == 1 && clean.written == 0 && clean.refused == 0, "resident refresh counts: an unwritten surface after a non-draw break was not counted as one proved full refresh");
+    Require(clean.nonDraw == 1 && clean.nonDrawProved == 1, "resident refresh counts: the non-draw break before the proof was not counted as recoverable");
+    Require(clean.collects >= 1 && clean.bytes >= SurfaceBytes && clean.walked > 0, "resident refresh counts: the full refresh's collect was not counted with its bytes and walk");
+    const auto again = lookUp("a lookup after the re-proof");
+    Require(again.exits == 1 && again.proved == 0, "resident refresh counts: the re-proof did not restore the epoch exit");
+    std::memset(texels, 0x66, 256);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto dirty = lookUp("the lookup after a CPU write");
+    Require(dirty.proved == 0 && dirty.written == 1 && dirty.refused == 0, "resident refresh counts: a CPU write into the surface was not counted as written");
+    Require(dirty.nonDraw == 0, "resident refresh counts: a break before the previous proof was counted again");
+    std::puts("resident refresh counts: exit, proved, written and break kinds counted");
+    return 0;
+}
+
 void RunSingleKeys(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     auto* texels = block;
     auto* keys = block + KeysOffset;
@@ -1068,6 +1122,14 @@ int main(int argc, char** argv) {
             }
             watched.emplace(true);
             return RunEpochProofGate(*device, watched->Data(), std::string_view(argv[2]) == "on");
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-refresh-counts") {
+            if (!AgcDriver::GuestMemory::WriteWatched()) {
+                std::puts("resident refresh counts: no write watching: skipped");
+                return VulkanTestSkipped;
+            }
+            watched.emplace(true);
+            return RunResidentRefreshCounts(*device, watched->Data());
         }
         if (argc == 2) {
             const auto mode = std::find_if(KeyWriteModes.begin(), KeyWriteModes.end(), [&](const KeyWriteMode& entry) { return entry.name == argv[1]; });

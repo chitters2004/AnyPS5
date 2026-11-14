@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ResidentRefreshCounters.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -322,6 +323,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 }
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+thread_local std::uint64_t threadWalkedBytes = 0;
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -2045,6 +2047,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
     ++tracker.generation;
+    threadWalkedBytes += stop - first;
     observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
@@ -2243,6 +2246,7 @@ void BumpCollectEpoch() {
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    if (ResidentRefreshProfiled()) ResidentRefreshCounts().epochs.Add();
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -2258,6 +2262,10 @@ void AdoptLatestCollectEpoch() {
     if (latest > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(latest);
 }
 
+std::uint64_t ThreadWalkedBytes() {
+    return threadWalkedBytes;
+}
+
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
@@ -2271,8 +2279,14 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+static std::array<std::atomic<std::uint64_t>, ProofBreakKinds>& proofBreakKinds() {
+    static std::array<std::atomic<std::uint64_t>, ProofBreakKinds> kinds{};
+    return kinds;
+}
+
+void BreakProofs(ProofBreak kind) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    if (ResidentRefreshProfiled()) proofBreakKinds()[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 void MarkProofThread() {
@@ -2640,7 +2654,7 @@ void SetOwnStoreCompare(bool compare) {
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, const std::function<std::pair<std::uint64_t, std::uint64_t>(std::span<std::byte>)>& store, bool complete = true) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(ProofBreak::OwnStores);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -2707,7 +2721,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    BreakProofs();
+    BreakProofs(ProofBreak::MarkedWrites);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
     if (order != nullptr) *order = 0;
@@ -3101,7 +3115,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(ProofBreak::GpuMutex);
     }
 }
 
@@ -3687,7 +3701,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::WriteBacks);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3752,7 +3766,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::WriteBacks);
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());
@@ -3811,6 +3825,47 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
         else std::memcpy(destination, source.data(), source.size());
         if (!image.empty()) std::memcpy(image.data(), source.data(), source.size());
     });
+}
+
+}
+
+namespace AgcDriver {
+
+ResidentRefreshCounters& ResidentRefreshCounts() {
+    static ResidentRefreshCounters counters;
+    return counters;
+}
+
+bool ResidentRefreshProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_RESIDENT_REFRESH") != nullptr;
+    return profiled;
+}
+
+ProofBreakSerials ProofBreakCounts() {
+    ProofBreakSerials counts{};
+    for (std::size_t kind = 0; kind < ProofBreakKinds; ++kind) counts[kind] = GuestMemory::proofBreakKinds()[kind].load(std::memory_order_relaxed);
+    return counts;
+}
+
+void ReportResidentRefreshCounts() {
+    static constexpr std::array<const char*, ProofBreakKinds> names{"non-draw", "draw writes", "copied writers", "labels", "own stores", "marked writes", "write-backs", "gpu mutex"};
+    auto& counts = ResidentRefreshCounts();
+    const auto samples = counts.samples.Take();
+    const auto sampledNs = counts.sampledNs.Take();
+    const auto proved = counts.proved.Take();
+    const auto written = counts.written.Take();
+    const auto refused = counts.refused.Take();
+    std::string breaks;
+    for (std::size_t kind = 0; kind < ProofBreakKinds; ++kind) {
+        const auto broke = counts.brokeBefore[kind].Take();
+        const auto clean = counts.brokeBeforeProved[kind].Take();
+        breaks += std::string(kind == 0 ? " " : ", ") + names[kind] + " " + std::to_string(broke) + "/" + std::to_string(clean);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[resident-refresh] (10 s): submissions %llu, collect epochs %llu; resident refreshes: epoch exits %llu, full %llu (proved %llu, written %llu, refused %llu); resident collects %llu over %.1f MiB, walked %.1f MiB; full refresh %.0f ns mean over %llu samples; breaks since the last proof (full/proved):%s\n",
+        static_cast<unsigned long long>(counts.submissions.Take()), static_cast<unsigned long long>(counts.epochs.Take()), static_cast<unsigned long long>(counts.exits.Take()),
+        static_cast<unsigned long long>(proved + written + refused), static_cast<unsigned long long>(proved), static_cast<unsigned long long>(written), static_cast<unsigned long long>(refused),
+        static_cast<unsigned long long>(counts.collects.Take()), counts.collectBytes.Take() / 1048576.0, counts.walkedBytes.Take() / 1048576.0,
+        samples != 0 ? static_cast<double>(sampledNs) / static_cast<double>(samples) : 0.0, static_cast<unsigned long long>(samples), breaks.c_str());
 }
 
 }
