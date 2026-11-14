@@ -49,6 +49,9 @@ bool MaterializeProfiled() {
     return profile;
 }
 
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastCaptureCount::Count)> fastCaptureCounts{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastCaptureCount::Count)> fastCaptureTaken{};
+
 struct DecodedImage {
     IrTextureNumericClass numericClass = IrTextureNumericClass::Unsupported;
     RdnaImageDimension dimension = RdnaImageDimension::Unknown;
@@ -1775,7 +1778,9 @@ bool disabledBufferAccesses(const IrResourcePlan& plan, std::uint32_t index, con
 }
 
 bool memoryAccessedBuffer(const IrResourcePlan& plan, std::uint32_t buffer, bool planFacts) {
-    if (planFacts && plan.memoryAccessedBuffers.size() == plan.info.buffers.size()) return plan.memoryAccessedBuffers[buffer] != 0u;
+    const bool fresh = plan.memoryAccessedBuffers.size() == plan.info.buffers.size();
+    ResourceMaterializer::NoteFastCapture(!planFacts ? FastCaptureCount::BufferFlagsSlowArm : fresh ? FastCaptureCount::BufferFlagsFromPlan : FastCaptureCount::BufferFlagsStale);
+    if (planFacts && fresh) return plan.memoryAccessedBuffers[buffer] != 0u;
     return std::any_of(plan.memoryInfo.begin(), plan.memoryInfo.end(), [buffer](const MemoryInfo& memory) { return memory.kind == ResourceKind::Buffer && memory.resource == buffer; });
 }
 
@@ -2968,6 +2973,20 @@ std::uint64_t ResourceMaterializer::EvaluateNanoseconds() {
 
 std::uint64_t ResourceMaterializer::MaterializeNanoseconds() {
     return materializeNanoseconds.load(std::memory_order_relaxed);
+}
+
+void ResourceMaterializer::NoteFastCapture(FastCaptureCount count) {
+    if (MaterializeProfiled()) fastCaptureCounts[static_cast<std::size_t>(count)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t ResourceMaterializer::FastCaptureTotal(FastCaptureCount count) {
+    return fastCaptureCounts[static_cast<std::size_t>(count)].load(std::memory_order_relaxed);
+}
+
+std::uint64_t ResourceMaterializer::TakeFastCapture(FastCaptureCount count) {
+    const auto index = static_cast<std::size_t>(count);
+    const auto total = fastCaptureCounts[index].load(std::memory_order_relaxed);
+    return total - fastCaptureTaken[index].exchange(total, std::memory_order_relaxed);
 }
 
 }

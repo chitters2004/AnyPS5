@@ -1,4 +1,5 @@
 #include "Optimization/SrtWalker/SrtTape.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
@@ -412,10 +413,18 @@ SrtTape::Batch SrtTape::readBatch(Frame& frame, std::uint32_t sourceIndex, std::
     const auto& runtime = frame.runtime;
     const auto& roots = sourceDwords[sourceIndex];
     const auto& first = nodes[roots[0]];
-    if (runtime.readSpan == nullptr || runtime.readMemory == nullptr || (first.clean && runtime.readSpecializationMemory != runtime.readMemory)) return Batch::Skipped;
-    if (runtime.readTrace != nullptr && runtime.readTrace->leaf != nullptr) return Batch::Skipped;
+    if (runtime.readSpan == nullptr || runtime.readMemory == nullptr || (first.clean && runtime.readSpecializationMemory != runtime.readMemory)) {
+        ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSkippedReader);
+        return Batch::Skipped;
+    }
+    if (runtime.readTrace != nullptr && runtime.readTrace->leaf != nullptr) {
+        ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSkippedLeaf);
+        return Batch::Skipped;
+    }
     for (std::uint32_t dword = 0; dword < count; ++dword) {
-        if (frame.states[roots[dword]] != 0u) return Batch::Skipped;
+        if (frame.states[roots[dword]] == 0u) continue;
+        ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSkippedEvaluated);
+        return Batch::Skipped;
     }
     std::array<std::uint64_t, 5> operand{};
     std::int32_t origin = -1;
@@ -452,6 +461,7 @@ SrtTape::Batch SrtTape::readBatch(Frame& frame, std::uint32_t sourceIndex, std::
         frame.values[roots[dword]] = value.dwords[dword];
     }
     batchedReads.fetch_add(1, std::memory_order_relaxed);
+    ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesBatched);
     return Batch::Read;
 }
 
@@ -759,11 +769,16 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         DescriptorValue value;
         value.dwordCount = source.dwordCount;
         auto batch = Batch::Skipped;
-        if (active[sourceIndex] && runtime.batchedDescriptorReads && batchable[sourceIndex] != 0u) {
+        if (active[sourceIndex] && !runtime.batchedDescriptorReads) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesSlowArm);
+        else if (active[sourceIndex] && batchable[sourceIndex] == 0u) ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesUnbatchable);
+        else if (active[sourceIndex]) {
             frame.descriptorBytes = static_cast<std::size_t>(source.dwordCount) * sizeof(std::uint32_t);
             batch = readBatch(frame, sourceIndex, source.dwordCount, value);
             frame.descriptorBytes = 0u;
-            if (batch == Batch::Failed) return refuse();
+            if (batch == Batch::Failed) {
+                ResourceMaterializer::NoteFastCapture(FastCaptureCount::SourcesBatchFailed);
+                return refuse();
+            }
         }
         if (active[sourceIndex] && batch == Batch::Skipped) {
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {

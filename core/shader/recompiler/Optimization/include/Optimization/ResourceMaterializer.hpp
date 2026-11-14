@@ -71,6 +71,26 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+enum class FastCaptureCount : std::uint8_t {
+    TapeRuns,
+    TapeRefused,
+    NoTape,
+    SourcesBatched,
+    SourcesSlowArm,
+    SourcesUnbatchable,
+    SourcesSkippedReader,
+    SourcesSkippedLeaf,
+    SourcesSkippedEvaluated,
+    SourcesBatchFailed,
+    ReadLogsSized,
+    ReadLogsUnsized,
+    ReadLogsSlowArm,
+    BufferFlagsFromPlan,
+    BufferFlagsStale,
+    BufferFlagsSlowArm,
+    Count
+};
+
 class ResourceMaterializer {
 public:
     static std::uint32_t EmulatedCompareState(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t index);
@@ -91,6 +111,9 @@ public:
     static ImageTableReuseCounts TableReuse();
     static std::uint64_t EvaluateNanoseconds();
     static std::uint64_t MaterializeNanoseconds();
+    static void NoteFastCapture(FastCaptureCount count);
+    static std::uint64_t FastCaptureTotal(FastCaptureCount count);
+    static std::uint64_t TakeFastCapture(FastCaptureCount count);
 };
 
 }
