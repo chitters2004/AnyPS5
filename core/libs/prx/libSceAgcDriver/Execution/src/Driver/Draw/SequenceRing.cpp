@@ -42,6 +42,7 @@ SequenceRing::SequenceRing(Options configured) : options(std::move(configured)) 
     if (options.preparers == 0) throw std::invalid_argument("a sequence ring needs at least one preparer");
     if (options.pause == nullptr) options.pause = &yieldPause;
     slots.resize(std::bit_ceil(options.capacity));
+    options.resume = std::clamp<std::size_t>(options.resume == 0 ? slots.size() / 2 : options.resume, 1, slots.size());
     mask = slots.size() - 1;
     if (options.preparers > 1) {
         visitFrom = std::make_unique<std::atomic<std::uint64_t>[]>(options.preparers);
@@ -125,7 +126,7 @@ std::uint64_t SequenceRing::Push(Work work, Held held, bool holdsGpuLock, std::u
     if (index - prepared.load(std::memory_order_acquire) >= slots.size()) {
         if (holdsGpuLock) throw std::runtime_error("sequence ring full while the producer holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        waitPrepared(index - slots.size() + 1);
+        waitRoom(index - slots.size() + options.resume);
         fullWaits.fetch_add(1, std::memory_order_relaxed);
         fullWaitNs.fetch_add(nanosSince(start), std::memory_order_relaxed);
     }
@@ -182,6 +183,18 @@ void SequenceRing::waitPrepared(std::uint64_t count) {
     }
 }
 
+void SequenceRing::waitRoom(std::uint64_t count) {
+    if (spinFor(options.spin, options.pause, [&] { return prepared.load(std::memory_order_acquire) >= count; })) return;
+    roomTarget.store(count, std::memory_order_seq_cst);
+    for (;;) {
+        const auto value = prepared.load(std::memory_order_seq_cst);
+        if (value >= count) break;
+        prepared.wait(value, std::memory_order_acquire);
+        roomWakes.fetch_add(1, std::memory_order_relaxed);
+    }
+    roomTarget.store(0, std::memory_order_relaxed);
+}
+
 void SequenceRing::waitTurn(std::uint64_t index) {
     if (prepared.load(std::memory_order_acquire) == index) return;
     const auto start = options.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -232,6 +245,7 @@ SequenceRing::Counters SequenceRing::TakeCounters() {
     counters.bypassed = bypassed.exchange(0, std::memory_order_relaxed);
     counters.fullWaits = fullWaits.exchange(0, std::memory_order_relaxed);
     counters.fullWaitNs = fullWaitNs.exchange(0, std::memory_order_relaxed);
+    counters.roomWakes = roomWakes.exchange(0, std::memory_order_relaxed);
     counters.preparerSleeps = preparerSleeps.exchange(0, std::memory_order_relaxed);
     counters.idleNs = idleNs.exchange(0, std::memory_order_relaxed);
     const auto totals = CurrentTotals();
@@ -323,7 +337,8 @@ void SequenceRing::finishItem(std::uint64_t index) {
     }
     preparedSequence.store(sequence, std::memory_order_release);
     prepared.store(index + 1, std::memory_order_seq_cst);
-    if (preparedWaiters.load(std::memory_order_seq_cst) != 0) prepared.notify_all();
+    const auto room = roomTarget.load(std::memory_order_seq_cst);
+    if (preparedWaiters.load(std::memory_order_seq_cst) != 0 || (room != 0 && index + 1 >= room)) prepared.notify_all();
 }
 
 bool SequenceRing::claimable() const {
