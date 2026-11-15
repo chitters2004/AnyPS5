@@ -791,7 +791,19 @@ void epochVerifyWorkTests(Context context) {
     program.bindings.push_back(std::move(binding));
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
     Require(resources->Reusable() && resources->StorageImages().size() == 1, "the storage image template is not reusable");
+    const bool tracked = AgcDriver::GuestMemory::Watched(address, SurfaceBytes);
+#ifndef _WIN32
+    Require(tracked, "the storage image's host import left its memory unwatched under APS5_WRITE_WATCH_IMPORTS=watch");
+#endif
     ShaderResources::ProofReport report{};
     Require(resources->Revalidate(shader, &report), "the storage image template did not prove current through the full proof");
     bool settled = false;
@@ -801,18 +813,25 @@ void epochVerifyWorkTests(Context context) {
         settled = EpochProofCounts().resourceProofs.Sum() == proofs;
     }
     Require(settled, "an unchanged storage image template in the same collect epoch never took the epoch exit");
-    const auto image = CachedStorageSurface(context, DecodeTextureResource(words));
-    Require(image != nullptr && image->Refresh(), "the set's storage image did not refresh in the collect epoch");
-    const auto reusedBefore = EpochProofCounts().storageReuses.Sum();
-    Require(image->Refresh() && EpochProofCounts().storageReuses.Sum() != reusedBefore, "the set's storage image did not take its epoch proof");
+    if (tracked) {
+        const auto image = CachedStorageSurface(context, DecodeTextureResource(words));
+        Require(image != nullptr && image->Refresh(), "the set's storage image did not refresh in the collect epoch");
+        const auto reusedBefore = EpochProofCounts().storageReuses.Sum();
+        Require(image->Refresh() && EpochProofCounts().storageReuses.Sum() != reusedBefore, "the set's storage image did not take its epoch proof");
+        std::puts("the set's storage image took its own epoch proof before the held store");
+    } else {
+        std::puts("the set's storage image cannot take its own epoch proof: its host import left the memory unwatched on this device (direct host imports use comparisons)");
+    }
     const std::vector<std::byte> fill(SurfaceBytes, std::byte{0x21});
-    AgcDriver::GuestMemory::HoldProofBreaksForTest(true);
-    AgcDriver::GuestMemory::Write(address, fill, 4);
-    AgcDriver::GuestMemory::HoldProofBreaksForTest(false);
+    {
+        struct Held {
+            Held() { AgcDriver::GuestMemory::HoldProofBreaksForTest(true); }
+            ~Held() { AgcDriver::GuestMemory::HoldProofBreaksForTest(false); }
+        } held;
+        AgcDriver::GuestMemory::Write(address, fill, 4);
+    }
     const auto proofs = EpochProofCounts().resourceProofs.Sum();
     Require(resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs, "a storage image template whose guest store held its proof break did not take the epoch exit");
-    resources.reset();
-    ClearCachedTextures(context.device);
     std::puts("epoch exit over a storage image stored to with its proof break held: taken");
 }
 
