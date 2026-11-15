@@ -48,6 +48,7 @@ struct Mode {
     bool active = false;
     bool shared = false;
     bool changed = false;
+    bool snapshots = false;
 };
 
 class GuestBlock {
@@ -240,7 +241,7 @@ void LiveShadowBytes(AgcDriver::VulkanDevice& device, const Mode& mode) {
         return;
     }
     Require(shared >= Programs - 1, "shared staging shadows: six builds of one region shared its shadow " + std::to_string(shared) + " times, expected 5 or 6");
-    if (!mode.changed) Require(afterAll == afterFirst, "shared staging shadows: live shadow bytes went from " + std::to_string(afterFirst) + " to " + std::to_string(afterAll) + " over six builds of one region");
+    if (!mode.snapshots) Require(afterAll == afterFirst, "shared staging shadows: live shadow bytes went from " + std::to_string(afterFirst) + " to " + std::to_string(afterAll) + " over six builds of one region");
 }
 
 void FillBetween(AgcDriver::VulkanDevice& device, const Mode& mode) {
@@ -312,7 +313,7 @@ void FullDeviceMemory(AgcDriver::VulkanDevice& device, const Mode& mode) {
     const auto refusals = AgcDriver::Graphics::StagingShadowsRefused() - refused;
     device.WaitIdle();
     Expect(block.Words(), Lanes, 3, "a second build while device memory reports full");
-    if (mode.shared && !mode.changed) {
+    if (mode.shared && !mode.snapshots) {
         Require(refusals == 0, "shared staging shadows: a build of a region with a live shadow was refused " + std::to_string(refusals) + " shadows by a full device heap");
         ExpectCounts(mode, counts.Since(), 1, 1, "a second build while device memory reports full");
     } else if (!mode.shared) {
@@ -364,6 +365,7 @@ int main(int argc, char** argv) {
         Mode mode;
         mode.changed = run == "--changed";
         mode.shared = run != "--private";
+        mode.snapshots = mode.changed || (run == "--off" && std::getenv("APS5_NO_MERGED_COPY_BACK") == nullptr);
         SetEnvironment("APS5_WRITTEN_SHADOW_MIN_KIB", "0");
         SetEnvironment(mode.changed ? "APS5_CHANGED_COPY_BACK" : "APS5_NO_CHANGED_COPY_BACK", "1");
         if (run == "--off") SetEnvironment("APS5_NO_STAGING_HANDOVER", "1");
