@@ -1026,7 +1026,7 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen() {
-        if (open == nullptr || assertGpuLock) beginBatch();
+        if (open == nullptr || assertGpuLock || Latched()) beginBatch();
     }
     void beginBatch();
     void flushDeferredDispatch();
