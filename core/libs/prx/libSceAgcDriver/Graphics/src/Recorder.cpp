@@ -1761,6 +1761,10 @@ Recorder* Recorder::Active() {
     return activeRecorder;
 }
 
+void Recorder::RefuseWhenPoisoned() {
+    if (activeRecorder != nullptr) activeRecorder->RethrowLatched();
+}
+
 void Recorder::Activate() {
     activeRecorder = this;
     {
@@ -5412,13 +5416,15 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             } catch (...) {
                 LatchFailure(std::current_exception());
             }
-            frontiers.Mark(batch->serial, BatchState::Failed);
-            removeLabels(*batch);
-            runDiscards(*batch);
-            release(*batch);
-            cancelSuffix();
-            RethrowLatched();
         }
+    }
+    if (Latched()) {
+        frontiers.Mark(batch->serial, BatchState::Failed);
+        removeLabels(*batch);
+        runDiscards(*batch);
+        release(*batch);
+        cancelSuffix();
+        RethrowLatched();
     }
     frontiers.Mark(batch->serial, BatchState::Completed);
     readGpuTiming(*batch);
