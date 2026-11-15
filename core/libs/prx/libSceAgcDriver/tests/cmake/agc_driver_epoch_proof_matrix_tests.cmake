@@ -7,8 +7,8 @@ if(BUILD_TESTING)
         "committer|"
         "finisher|APS5_DRAW_PIPELINE=1,APS5_PIPELINED_DRAWS=32")
     set(epochProofDispatches
-        "dispatch_inline|"
-        "dispatch_pipelined|APS5_PIPELINE_DISPATCH=1")
+        "dispatch_pipelined|"
+        "dispatch_inline|APS5_NO_PIPELINE_DISPATCH=1")
     set(epochProofModes
         "off|APS5_NO_EPOCH_PROOFS=1"
         "on|"
