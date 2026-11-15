@@ -3585,6 +3585,7 @@ struct ColorMemo {
     std::vector<ColorTarget> descriptors;
     std::vector<Attachment> attachments;
     std::optional<DepthFootprint> clearOfDepth;
+    std::optional<TargetProof> recorded;
 };
 
 struct DepthMemo {
@@ -3613,7 +3614,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(TargetMemoEvent::Coun
     "lookup", "hit", "overlap cached", "overlap computed", "accept", "accept without depth", "depth hit", "avoided refresh lookups",
     "invalid", "thread changed", "descriptor", "resident gone", "resident evicted", "depth overlap", "metadata",
     "epoch", "proofs", "pending", "unwatch", "allocations", "surfaces", "released", "claims", "recorder", "device",
-    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked"
+    "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked",
+    "pending own recording", "pending other"
 };
 
 std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count)>& targetMemoEvents() {
@@ -3650,12 +3652,16 @@ void reportTargetMemo() {
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s, all threads):%s\n", line.empty() ? " none" : line.c_str());
 }
 
-bool colorProofMatches(const TargetProof& before, const TargetProof& after) {
+bool colorProofMatches(const TargetProof& before, const TargetProof& after, const std::optional<TargetProof>* recorded = nullptr) {
     if (before == after) return true;
     const auto note = [&](bool changed, TargetMemoEvent event) { if (changed) noteTargetMemo(event); };
     note(before.epoch != after.epoch, TargetMemoEvent::Epoch);
     note(before.proofs != after.proofs, TargetMemoEvent::Proofs);
     note(before.pending != after.pending, TargetMemoEvent::Pending);
+    if (recorded != nullptr && before.pending != after.pending) {
+        const bool ownRecording = recorded->has_value() && **recorded == after;
+        noteTargetMemo(ownRecording ? TargetMemoEvent::PendingOwnRecording : TargetMemoEvent::PendingOther);
+    }
     note(before.unwatch != after.unwatch, TargetMemoEvent::Unwatch);
     note(before.allocations != after.allocations, TargetMemoEvent::Allocations);
     note(before.surfaces != after.surfaces, TargetMemoEvent::Surfaces);
@@ -3702,6 +3708,31 @@ bool metadataProved(const ColorTarget& color) {
     return proved;
 }
 
+struct RememberedStamp {
+    bool armed = false;
+    TargetProof proof;
+    std::uint64_t ownPending = 0;
+};
+
+struct RememberedStampStorage {};
+
+RememberedStamp& rememberedStamp() {
+    return HostThreadLocal<RememberedStamp, RememberedStampStorage>();
+}
+
+void noteTargetMemoRecorded(const Context& context) {
+    auto& stamp = rememberedStamp();
+    if (!stamp.armed) return;
+    stamp.armed = false;
+    auto& colors = ThreadTargetMemo().colors;
+    if (!colors.valid || colors.proof != stamp.proof) return;
+    const auto after = currentTargetProof(context);
+    auto pendingOnly = after;
+    pendingOnly.pending = stamp.proof.pending;
+    const auto moved = after.pending - stamp.proof.pending;
+    if (moved != 0 && pendingOnly == stamp.proof && moved == StorageTexture::OwnPendingMoves() - stamp.ownPending) colors.recorded = after;
+}
+
 void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
     ++targetMemoBuilds;
     noteTargetMemo(TargetMemoEvent::Build);
@@ -3711,7 +3742,9 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
     colors.valid = enabled && !targets.empty() && std::ranges::all_of(targets, [&](const TargetBinding& binding) {
         return binding.resident != nullptr && binding.resident->Cached() && !binding.multisampled && binding.color.fmaskAddress == 0 && !colorOverlapsDepth(state, binding) && metadataProved(binding.color);
     });
+    colors.recorded.reset();
     if (colors.valid) {
+        if (targetMemoProfiled) rememberedStamp() = {true, proof, StorageTexture::OwnPendingMoves()};
         colors.proof = proof;
         colors.clearOfDepth = depthFootprint(state.depth);
         colors.descriptors.assign(state.colors.begin(), state.colors.end());
@@ -3735,7 +3768,7 @@ bool repeatColors(const Context& context, const State& state, const TargetProof&
         noteTargetMemo(TargetMemoEvent::Invalid);
         return false;
     }
-    if (!colorProofMatches(memo.proof, proof)) return false;
+    if (!colorProofMatches(memo.proof, proof, targetMemoProfiled ? &memo.recorded : nullptr)) return false;
     if (memo.descriptors != state.colors) {
         noteTargetMemo(TargetMemoEvent::Descriptor);
         return false;
@@ -4826,7 +4859,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         }
     } heldSpace{prepared};
     try {
+        if (targetMemoProfiled) rememberedStamp().armed = false;
         if (prepareDraw(context, state, draw, shaders, snapshots, prepared)) recordPreparedDraw(context, state, draw, shaders, prepared);
+        if (targetMemoProfiled) noteTargetMemoRecorded(context);
     } catch (...) {
         ThreadTargetMemo().Invalidate();
         keepHeldSpace(prepared);

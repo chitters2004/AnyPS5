@@ -1609,7 +1609,35 @@ void memoOrder(AgcDriver::VulkanDevice& device) {
     expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "repeats served by either memo");
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 17> R3Scenarios{{
+void requirePendingSplit(AgcDriver::VulkanDevice& device, const ColorTarget& color, std::uint64_t own, std::uint64_t other, const std::string& what) {
+    const MemoEvents events;
+    draw(device, color);
+    requireMemoEvent(events, TargetMemoEvent::Pending, own + other, what);
+    requireMemoEvent(events, TargetMemoEvent::PendingOwnRecording, own, what);
+    requireMemoEvent(events, TargetMemoEvent::PendingOther, other, what);
+}
+
+void pendingSplit(AgcDriver::VulkanDevice& device) {
+    Require(memoCounted() && memoServes(), "the pending split test needs the target memo serving under APS5_PROFILE_DRAW");
+    const auto color = colorTarget();
+    reset(device, color);
+    const ProofFields flushed;
+    draw(device, color);
+    requireMoved(flushed, "pending", "the first draw after a flush");
+    requirePendingSplit(device, color, 1, 0, "the draw after the first draw since a flush");
+    requirePendingSplit(device, color, 0, 0, "a repeat after the memo was admitted again");
+    StorageTexture::BumpPendingSerial();
+    requirePendingSplit(device, color, 0, 1, "a draw after pending results changed between draws");
+    reset(device, color);
+    draw(device, color);
+    StorageTexture::BumpPendingSerial();
+    requirePendingSplit(device, color, 0, 1, "a draw after the first draw since a flush and a change of pending results");
+    std::cout << "pending split: own recording and other counted apart\n";
+    expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "draws around pending moves");
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 18> R3Scenarios{{
+    {"pending-split", pendingSplit},
     {"memo-order", memoOrder},
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},
