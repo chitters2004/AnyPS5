@@ -27,6 +27,7 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainReason::Count)> DrainNames{"packet", "flush", "labels", "capture", "indirect", "submission"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainSite::Count)> DrainSiteNames{"untagged", "dispatch.ahead", "dispatch.off", "dispatch.indirect", "dispatch.labels", "dispatch.copy", "dispatch.miss", "dispatch.verify", "dispatch.reads", "dispatch.recipe", "dispatch.writes", "dispatch.not_plain", "dispatch.late", "dispatch.gate", "fill.inputs", "precheck.metadata", "precheck.expand", "precheck.depth_control", "group_ahead", "packet", "custom", "predication", "indirect"};
 
 bool scopedNonDraw(DrawPipeline::CommitKind kind) {
     using Kind = DrawPipeline::CommitKind;
@@ -437,15 +438,35 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         drainText += item;
     }
     drainText += "; packet drains by opcode:";
-    for (int shown = 0; shown < 5; ++shown) {
+    for (int shown = 0; shown < 8; ++shown) {
         const auto top = std::max_element(drainOpcodes.begin(), drainOpcodes.begin() + 0x100);
         if (*top == 0) break;
-        char item[32];
-        std::snprintf(item, sizeof(item), " 0x%02x x%llu", static_cast<unsigned>(top - drainOpcodes.begin()), static_cast<unsigned long long>(*top));
+        const auto opcode = static_cast<std::size_t>(top - drainOpcodes.begin());
+        char item[48];
+        std::snprintf(item, sizeof(item), " 0x%02zx x%llu (%.1f ms)", opcode, static_cast<unsigned long long>(*top), static_cast<double>(drainOpcodeWaitNs[opcode]) / 1e6);
         drainText += item;
         *top = 0;
     }
+    drainText += "; drains by site:";
+    for (std::size_t site = 0; site < drainSites.size(); ++site) {
+        if (drainSites[site] == 0) continue;
+        char item[64];
+        std::snprintf(item, sizeof(item), " %s x%llu (%.1f ms)", DrainSiteNames[site], static_cast<unsigned long long>(drainSites[site]), static_cast<double>(drainSiteWaitNs[site]) / 1e6);
+        drainText += item;
+    }
+    drainText += "; custom packet drains by operation:";
+    for (std::size_t custom = 0; custom < drainCustoms.size(); ++custom) {
+        if (drainCustoms[custom] == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " 0x%02zx x%llu (%.1f ms)", custom, static_cast<unsigned long long>(drainCustoms[custom]), static_cast<double>(drainCustomWaitNs[custom]) / 1e6);
+        drainText += item;
+    }
     drainOpcodes = {};
+    drainOpcodeWaitNs = {};
+    drainSites = {};
+    drainSiteWaitNs = {};
+    drainCustoms = {};
+    drainCustomWaitNs = {};
     const auto perCommit = commits == 0 ? 0.0 : static_cast<double>(commitNs) / 1e3 / static_cast<double>(commits);
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
@@ -557,7 +578,7 @@ void DrawPipeline::ReleaseRetired() {
     std::swap(done, retired);
 }
 
-void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
+void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode, DrainSite site, std::uint32_t custom) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
@@ -572,8 +593,16 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     --idleWaiters;
     const auto index = static_cast<std::size_t>(reason);
     ++drains[index];
+    const auto waited = elapsedNs(start);
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
-    drainWaitNs[index] += elapsedNs(start);
+    drainOpcodeWaitNs[std::min<std::uint32_t>(opcode, 0x100)] += waited;
+    ++drainSites[static_cast<std::size_t>(site)];
+    drainSiteWaitNs[static_cast<std::size_t>(site)] += waited;
+    if (site == DrainSite::Custom) {
+        ++drainCustoms[custom & 0x3fu];
+        drainCustomWaitNs[custom & 0x3fu] += waited;
+    }
+    drainWaitNs[index] += waited;
     rethrowFailure();
 }
 

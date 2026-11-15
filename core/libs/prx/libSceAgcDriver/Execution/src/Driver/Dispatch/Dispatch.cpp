@@ -161,7 +161,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (resolvedAhead().empty()) gateOpened() = true;
             return;
         }
-        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Active() && !pipelineCandidate) {
+            using Site = DrawPipeline::DrainSite;
+            const auto site = fromAhead ? Site::DispatchAhead : !DispatchItemsEnabled() ? Site::DispatchOff : indirectArguments != 0 ? Site::DispatchIndirect : !deferredLabels().labels.empty() ? Site::DispatchLabels : Site::DispatchCopy;
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, site);
+        }
         if (const auto htile = Graphics::HtileDepthClearAddress(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads); htile != 0) {
             const auto threads = (packet[4] & 0x20u) != 0 ? static_cast<std::uint64_t>(packet[1]) : static_cast<std::uint64_t>(packet[1]) * compute.numThreads[0];
             const auto nativeBytes = Graphics::HtileDepthClearBytes_nid_no_patch(std::span(snapshot.code).subspan(codeOffset), userData, compute, packet, indirectArguments);
@@ -327,6 +331,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
+        auto readsSite = DrawPipeline::DrainSite::DispatchReads;
         {
             std::lock_guard cacheLock(dispatchCacheMutex);
             if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
@@ -338,13 +343,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             lateItem = true;
         } else if (!entryFound || noDispatchCache || stampValidate()) {
             NoteItemFallback(ItemFallback::Miss);
+            readsSite = DrawPipeline::DrainSite::DispatchMiss;
         } else if (verifyDataHits()) {
             NoteItemFallback(ItemFallback::Verify);
+            readsSite = DrawPipeline::DrainSite::DispatchVerify;
         } else {
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
-        if (!readsClear && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, readsSite);
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -370,10 +377,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     if (readsClear) {
+        auto recipeSite = DrawPipeline::DrainSite::DispatchRecipe;
         if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded;
+            recipeSite = DrawPipeline::DrainSite::DispatchWrites;
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         } else if (queueMisses && cached && keepVariant != nullptr) {
             recipeLess = true;
@@ -382,7 +391,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         } else {
             NoteItemFallback(ItemFallback::NoRecipe);
         }
-        if (!pipelined && !recipeLess && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!pipelined && !recipeLess && !lateItem && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, recipeSite);
     }
     std::uint64_t forgetAtCapture = 0;
     if (cached) {
@@ -540,7 +549,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pipelined = false;
         itemWrites.clear();
         itemNotPlain.fetch_add(1, std::memory_order_relaxed);
-        if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, DrawPipeline::DrainSite::DispatchNotPlain);
     }
     if (lateItem || recipeLess) {
         bool queued = plain;
@@ -557,7 +566,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (!bounded) NoteItemFallback(ItemFallback::Writes);
         }
         if (pipelined) (lateItem ? itemMisses : itemRecipeLess).fetch_add(1, std::memory_order_relaxed);
-        else if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        else if (DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15, DrawPipeline::DrainSite::DispatchLate);
     }
     if (pipelined) {
         runCaptureCheckHook();

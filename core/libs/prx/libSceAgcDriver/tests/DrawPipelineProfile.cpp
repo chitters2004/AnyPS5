@@ -80,6 +80,17 @@ std::size_t Count(std::string_view text, std::string_view value) {
     return count;
 }
 
+void DrainWhileBusy(AgcDriver::DriverDetail::DrawPipeline& pipeline, std::uint32_t opcode, AgcDriver::DriverDetail::DrawPipeline::DrainSite site, std::uint32_t custom) {
+    std::binary_semaphore held{0};
+    pipeline.Enqueue([&] { held.acquire(); }, {}, 0, {}, {}, true);
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        held.release();
+    });
+    pipeline.Drain(AgcDriver::DriverDetail::DrawPipeline::DrainReason::Packet, opcode, site, custom);
+    releaser.join();
+}
+
 void TestReport() {
     using AgcDriver::DriverDetail::DrawPipeline;
     auto& pipeline = DrawPipeline::Queue0();
@@ -89,6 +100,9 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
+        DrainWhileBusy(pipeline, 0x10, DrawPipeline::DrainSite::Custom, 0x17);
+        DrainWhileBusy(pipeline, 0x15, DrawPipeline::DrainSite::DispatchMiss, 0);
+        DrainWhileBusy(pipeline, 0x15, DrawPipeline::DrainSite::DispatchMiss, 0);
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
@@ -107,7 +121,11 @@ void TestReport() {
     Check(Count(report, " stores held") == 1, "pipeline held-store counters were printed more than once");
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
-    Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    Check(report.find("packet drains by opcode: 0x15 x2 (") != std::string::npos, "pipeline opcode counters were lost");
+    Check(report.find(" 0x10 x1 (") != std::string::npos, "pipeline custom packet drain was not counted by opcode");
+    Check(report.find("; drains by site: dispatch.miss x2 (") != std::string::npos, "pipeline drain sites were not counted");
+    Check(report.find(" custom x1 (") != std::string::npos, "pipeline custom drain site was not counted");
+    Check(report.find("; custom packet drains by operation: 0x17 x1 (") != std::string::npos, "pipeline custom packet operations were not counted");
 }
 
 }
