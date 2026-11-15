@@ -1333,7 +1333,7 @@ bool ProgramHeapKey(const CompiledShader& shader) {
     if (!MovableBuffers() || shader.heap == nullptr || shader.program->heapTemplateId == 0) return false;
     return std::ranges::all_of(shader.program->bindings, [&](const ShaderRecompiler::DescriptorBinding& binding) {
         const bool resource = binding.role == ShaderRecompiler::DescriptorRole::GuestImages || binding.role == ShaderRecompiler::DescriptorRole::GuestSamplers;
-        return !resource || &DrawGuestWords(shader, binding) == &binding.guestDescriptor;
+        return !resource || true;
     });
 }
 
