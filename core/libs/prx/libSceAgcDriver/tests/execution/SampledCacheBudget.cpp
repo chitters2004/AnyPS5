@@ -754,6 +754,44 @@ void epochReuseTests(Context context) {
     std::puts("resource proof reuse and invalidation passed");
 }
 
+void epochVerifyWorkTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the verify-work fixture needs epoch proofs on");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(1, false);
+    binding.imageSamplers.assign(1, 0u);
+    const auto words = Descriptor(surface.Address());
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    Require(resources->Reusable() && resources->StorageImages().size() == 1, "the storage image template is not reusable");
+    ShaderResources::ProofReport report{};
+    Require(resources->Revalidate(shader, &report), "the storage image template did not prove current through the full proof");
+    Require(resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None, "an unchanged storage image template in the same collect epoch did not take the epoch exit");
+    const std::vector<std::byte> fill(SurfaceBytes, std::byte{0x21});
+    AgcDriver::GuestMemory::HoldProofBreaksForTest(true);
+    AgcDriver::GuestMemory::Write(surface.Address(), fill, 4);
+    AgcDriver::GuestMemory::HoldProofBreaksForTest(false);
+    Require(resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None, "a storage image template whose guest store held its proof break did not take the epoch exit");
+    resources.reset();
+    ClearCachedTextures(context.device);
+    std::puts("epoch exit over a storage image stored to with its proof break held: taken");
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1673,6 +1711,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochReuseTests(context);
             std::puts("resource cache epoch reuse tests passed");
+            return 0;
+        }
+        if (mode == "resource-epoch-verify-work") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            epochVerifyWorkTests(context);
+            std::puts("resource cache epoch verify work tests passed");
             return 0;
         }
         if (mode == "resource-lookup-changed") {

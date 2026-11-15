@@ -3433,7 +3433,7 @@ struct RevalidateProfile {
     // checked against the full walk.
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FastFail::Count)> fullByReason{};
     std::atomic<std::uint64_t> ownRefreshed{0};
-    std::atomic<std::uint64_t> ownStorageRefreshes{0};
+    std::atomic<std::uint64_t> ownStorageUploades{0};
     std::atomic<std::uint64_t> ownViewRefreshes{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(OwnRefreshFallback::Count)> ownFallbacks{};
     std::atomic<std::uint64_t> ownSourceViews{0};
@@ -3509,7 +3509,7 @@ void countOwnRefreshFallback(OwnRefreshFallback reason) {
 
 void countOwnRefresh(bool storage) {
     TextureCounts().ownRefreshes.fetch_add(1, std::memory_order_relaxed);
-    if (BuildProfiled()) (storage ? Revalidations().ownStorageRefreshes : Revalidations().ownViewRefreshes).fetch_add(1, std::memory_order_relaxed);
+    if (BuildProfiled()) (storage ? Revalidations().ownStorageUploades : Revalidations().ownViewRefreshes).fetch_add(1, std::memory_order_relaxed);
 }
 
 // APS5_NO_OWN_IMAGE_REFRESH=1: a Pending failure of the fast proof takes the full walk, as before
@@ -3571,7 +3571,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         for (const auto& surface : profile.refusedSurfaces) refusedBytes += surface.second;
         profile.refusedSurfaces.clear();
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageUploades.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
@@ -4112,6 +4112,7 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->CompletionLabelIn(address, bytes))) {
         Recorder::CountSync(4);
         recorder->SyncThrough(address, bytes);
+        ProofWorkTrace::Note(ProofWork::CpuWriteSync);
         return true;
     }
     return false;
@@ -4129,6 +4130,32 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 
 bool ShaderResources::EpochProofs() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoEpochProofs) && DriverDetail::DrawPipeline::Depth() != 0;
+}
+
+namespace {
+thread_local ProofWorkTrace* proofWorkTrace = nullptr;
+}
+
+ProofWorkTrace::ProofWorkTrace() : previous(proofWorkTrace) {
+    proofWorkTrace = this;
+}
+
+ProofWorkTrace::~ProofWorkTrace() {
+    proofWorkTrace = previous;
+}
+
+bool ProofWorkTrace::Active() {
+    return proofWorkTrace != nullptr;
+}
+
+void ProofWorkTrace::Note(ProofWork work) {
+    if (proofWorkTrace != nullptr) ++proofWorkTrace->counts[static_cast<std::size_t>(work)];
+}
+
+std::uint64_t ProofWorkTrace::Total() const {
+    std::uint64_t total = 0;
+    for (const auto count : counts) total += count;
+    return total;
 }
 
 EpochProofCounters& EpochProofCounts() {
@@ -4222,7 +4249,9 @@ struct ExitVerification {
     std::atomic<std::uint64_t> failures{0};
     std::atomic<std::uint64_t> stores{0};
     std::atomic<std::uint64_t> concurrent{0};
+    std::atomic<std::uint64_t> worked{0};
     std::atomic<std::uint64_t> reported{0};
+    std::atomic<std::uint64_t> workReported{0};
     std::atomic<std::uint64_t> misses{0};
     std::array<std::atomic<std::uint64_t>, ExitInputs.size()> moved{};
     std::array<std::atomic<std::uint64_t>, ExitInputs.size()> alone{};
@@ -4254,16 +4283,17 @@ void printExitVerification() {
         alone += alone.empty() ? "" : ", ";
         alone += std::string(ExitInputs[input]) + " " + std::to_string(verification.alone[input].load(std::memory_order_relaxed));
     }
-    std::fprintf(stderr, "[epoch-proofs] verify: %llu reused resource proofs checked, %llu failed, %llu where the full proof stored to guest memory, %llu where only other threads broke proofs meanwhile; %llu proved builds missed the exit, by input moved: %s; moved alone: %s\n", static_cast<unsigned long long>(verification.checks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.failures.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.stores.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.concurrent.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.misses.load(std::memory_order_relaxed)), moved.c_str(), alone.c_str());
+    std::fprintf(stderr, "[epoch-proofs] verify: %llu reused resource proofs checked, %llu failed, %llu where the full proof stored to guest memory, %llu where only other threads broke proofs meanwhile, %llu where the full proof did work the exit skipped; %llu proved builds missed the exit, by input moved: %s; moved alone: %s\n", static_cast<unsigned long long>(verification.checks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.failures.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.stores.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.concurrent.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.worked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(verification.misses.load(std::memory_order_relaxed)), moved.c_str(), alone.c_str());
 }
 
-void noteEpochProof(bool reused, bool verified, bool failed, bool stored = false, bool concurrent = false) {
+void noteEpochProof(bool reused, bool verified, bool failed, bool stored = false, bool concurrent = false, bool worked = false) {
     (reused ? EpochProofCounts().resourceReuses : EpochProofCounts().resourceProofs).Add();
     if (!verified) return;
     auto& verification = exitVerification();
     if (failed) verification.failures.fetch_add(1, std::memory_order_relaxed);
     if (stored) verification.stores.fetch_add(1, std::memory_order_relaxed);
     if (concurrent) verification.concurrent.fetch_add(1, std::memory_order_relaxed);
+    if (worked) verification.worked.fetch_add(1, std::memory_order_relaxed);
     if (reportDue(verification.checks.fetch_add(1, std::memory_order_relaxed) + 1u)) printExitVerification();
 }
 
@@ -4701,6 +4731,19 @@ void ShaderResources::reportVerifiedStore(std::uint64_t exitSerial, std::uint64_
     std::fprintf(stderr, "[epoch-proofs] verify: the full proof behind a reused proof broke proofs %llu times (the serial moved %llu times since the exit, %llu before the full proof started): %s\n", static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(endSerial - exitSerial), static_cast<unsigned long long>(startSerial - exitSerial), breaks.c_str());
 }
 
+void ShaderResources::reportVerifiedWork(const ProofWorkTrace& work) const {
+    auto& verification = exitVerification();
+    if (verification.workReported.fetch_add(1, std::memory_order_relaxed) >= 64u) return;
+    std::string images;
+    for (const auto& image : storageTextures) {
+        if (image == nullptr) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s0x%llx+0x%llx", images.empty() ? "" : ", ", static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<unsigned long long>(image->GuestBytes()));
+        images += text;
+    }
+    std::fprintf(stderr, "[epoch-proofs] verify: the full proof behind a reused proof did work the exit skipped: %llu CPU write syncs, %llu storage image uploads (the set's storage images: %s; %zu sampled textures)\n", static_cast<unsigned long long>(work.Count(ProofWork::CpuWriteSync)), static_cast<unsigned long long>(work.Count(ProofWork::StorageUpload)), images.empty() ? "none" : images.c_str(), textures.size());
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
@@ -4716,11 +4759,14 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (verifyingExits()) {
                 const auto startSerial = GuestMemory::ProofSerial();
                 GuestMemory::ProofBreakTrace trace;
+                ProofWorkTrace work;
                 const bool ok = revalidateFull(shaders, report);
                 const auto endSerial = GuestMemory::ProofSerial();
                 const bool stored = trace.Count() != 0;
+                const bool worked = work.Total() != 0;
                 if (stored) reportVerifiedStore(stamp.proof, startSerial, endSerial, trace);
-                noteEpochProof(true, true, !ok, stored, !stored && endSerial != stamp.proof);
+                if (worked) reportVerifiedWork(work);
+                noteEpochProof(true, true, !ok, stored, !stored && endSerial != stamp.proof, worked);
                 return ok;
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
