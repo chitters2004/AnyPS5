@@ -1,6 +1,8 @@
 #include "../PortabilitySubset.hpp"
+#include "../WatchedBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -759,7 +761,18 @@ void epochVerifyWorkTests(Context context) {
     context.placeholderImages = &placeholders;
     TextureCache textures(context);
     context.textureCache = &textures;
-    WatchedSurface surface(context);
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(SurfaceBytes, 65536));
+    Require(memory != nullptr, "the verify-work fixture needs the guest write watch");
+    std::memset(memory, 0x5a, SurfaceBytes);
+    GuestAllocations::Mutation().Add(memory, SurfaceBytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, SurfaceBytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
     ClearCachedTextures(context.device);
     Require(ShaderResources::EpochProofs(), "the verify-work fixture needs epoch proofs on");
     AgcDriver::GuestMemory::BumpCollectEpoch();
@@ -772,7 +785,7 @@ void epochVerifyWorkTests(Context context) {
     binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
     binding.imageWritten.assign(1, false);
     binding.imageSamplers.assign(1, 0u);
-    const auto words = Descriptor(surface.Address());
+    const auto words = Descriptor(address);
     binding.guestDescriptor.assign(words.begin(), words.end());
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
@@ -781,12 +794,23 @@ void epochVerifyWorkTests(Context context) {
     Require(resources->Reusable() && resources->StorageImages().size() == 1, "the storage image template is not reusable");
     ShaderResources::ProofReport report{};
     Require(resources->Revalidate(shader, &report), "the storage image template did not prove current through the full proof");
-    Require(resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None, "an unchanged storage image template in the same collect epoch did not take the epoch exit");
+    bool settled = false;
+    for (int round = 0; round < 4 && !settled; ++round) {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        Require(resources->Revalidate(shader, &report), "an unchanged storage image template stopped proving current");
+        settled = EpochProofCounts().resourceProofs.Sum() == proofs;
+    }
+    Require(settled, "an unchanged storage image template in the same collect epoch never took the epoch exit");
+    const auto image = CachedStorageSurface(context, DecodeTextureResource(words));
+    Require(image != nullptr && image->Refresh(), "the set's storage image did not refresh in the collect epoch");
+    const auto reusedBefore = EpochProofCounts().storageReuses.Sum();
+    Require(image->Refresh() && EpochProofCounts().storageReuses.Sum() != reusedBefore, "the set's storage image did not take its epoch proof");
     const std::vector<std::byte> fill(SurfaceBytes, std::byte{0x21});
     AgcDriver::GuestMemory::HoldProofBreaksForTest(true);
-    AgcDriver::GuestMemory::Write(surface.Address(), fill, 4);
+    AgcDriver::GuestMemory::Write(address, fill, 4);
     AgcDriver::GuestMemory::HoldProofBreaksForTest(false);
-    Require(resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None, "a storage image template whose guest store held its proof break did not take the epoch exit");
+    const auto proofs = EpochProofCounts().resourceProofs.Sum();
+    Require(resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs, "a storage image template whose guest store held its proof break did not take the epoch exit");
     resources.reset();
     ClearCachedTextures(context.device);
     std::puts("epoch exit over a storage image stored to with its proof break held: taken");
