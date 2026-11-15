@@ -556,7 +556,8 @@ void LargeInput(AgcDriver::VulkanDevice& device, const Settings& settings) {
         const auto started = std::chrono::steady_clock::now();
         for (std::uint32_t use = 0; use < Dispatches; ++use) {
             AgcDriver::GuestMemory::BumpCollectEpoch();
-            Require(AgcDriver::GuestMemory::CollectWrites(source.Address(), InputBytes) != 0, "input twins: a 2 MiB input is not write-watched");
+            const auto collected = AgcDriver::GuestMemory::CollectWrites(source.Address(), InputBytes);
+            Require(!settings.twins || collected != 0, "input twins: a 2 MiB input is not write-watched");
         }
         walk = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count() / Dispatches;
     }
