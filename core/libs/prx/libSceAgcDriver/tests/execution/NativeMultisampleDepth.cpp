@@ -1833,10 +1833,6 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                                 try { AgcDriverShutdown_nid_postfix(); } catch (...) {}
                             }
                         } shutdownDriver;
-                        gpuLock.unlock();
-                        AgcDriverWaitForPipelineJournal_nid_postfix();
-                        AgcDriverWaitIdle_nid_postfix();
-                        gpuLock.lock();
                         const auto armedClears = ArmedHtileDepthClearCount();
                         const auto discardedClears = DiscardedHtileDepthClearCount();
                         Recorder::FailNextSubmitsForTest(1u);
