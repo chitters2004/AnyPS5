@@ -2033,6 +2033,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     APS5_LOG_CHARS_OUT_DEBUG("Index validation OK");
     timing.Mark("index_upload");
+    if (ShaderReadsCounted() && inputs.indexHandle != VK_NULL_HANDLE) {
+        const bool owned = inputs.indices != nullptr && inputs.indexHandle == inputs.indices->Handle();
+        const auto bytes = draw.indexed ? indexBytes : owned && inputs.indices->Mapped() ? inputs.indices->Bytes().size() : 0;
+        CountShaderRead(ShaderReadUse::Draw, ShaderReadPath::Index, owned ? BufferReadMemory(*inputs.indices) : ShaderReadMemory::Import, bytes);
+    }
     const auto& attributes = shaders.front().program->vertexAttributes;
     inputs.vertexOffsets.assign(attributes.size(), 0);
     inputs.vertexHandles.reserve(attributes.size());
@@ -2102,9 +2107,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
+            if (ShaderReadsCounted()) CountShaderRead(ShaderReadUse::Draw, ShaderReadPath::Vertex, ShaderReadMemory::Import, bytes);
             continue;
         }
         if (auto copied = GpuCopiedDrawInput(context, begin, bytes, rangeFrom[range])) {
+            if (ShaderReadsCounted()) CountShaderRead(ShaderReadUse::Draw, ShaderReadPath::Vertex, BufferReadMemory(*copied), bytes);
             rangeHandles.push_back(copied->Handle());
             rangeOffsets.push_back(0);
             inputs.vertexBuffers.push_back(std::move(copied));
@@ -2112,6 +2119,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, rangeFrom[range]);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
+        if (ShaderReadsCounted()) CountShaderRead(ShaderReadUse::Draw, ShaderReadPath::Vertex, BufferReadMemory(*copy.buffer), bytes);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -2121,6 +2129,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
+        if (ShaderReadsCounted()) CountShaderRead(ShaderReadUse::Draw, ShaderReadPath::Vertex, BufferReadMemory(*copy.buffer), bytes);
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }

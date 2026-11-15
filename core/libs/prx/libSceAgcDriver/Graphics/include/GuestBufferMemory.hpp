@@ -246,6 +246,15 @@ InputTwinCounts InputTwinCounters();
 const char* InputTwinMissName(InputTwinMiss miss);
 bool InputTwinsEnabled(const Context& context);
 std::uint64_t InputTwinLimit();
+enum class ShaderReadUse : std::uint8_t { Draw, Dispatch, Count };
+enum class ShaderReadPath : std::uint8_t { Descriptor, Address, Vertex, Index, Count };
+enum class ShaderReadMemory : std::uint8_t { Import, Device, Host, Count };
+bool ShaderReadsCounted();
+void CountShaderRead(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory, std::uint64_t bytes);
+void CountDrawSnapshotRead(std::uint64_t bytes);
+ShaderReadMemory BufferReadMemory(const Buffer& buffer);
+bool TraceCopyBacks();
+void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 void SetInputTwinLimitForTests(std::uint64_t bytes);
 void OutdateInputTwins(VkDevice device, std::uint64_t begin, std::uint64_t end);
 void OutdateInputTwins(VkDevice device);
@@ -432,6 +441,7 @@ public:
     // recorded work) and copies the regions a descriptor may write, so the window between that copy
     // and the recorder's pending-write note stays closed.
     void Upload(bool addressable);
+    void CountReads(ShaderReadUse use) const;
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
@@ -657,6 +667,7 @@ private:
     bool copyBackDeferral = false;
     bool keptCopyBacks = false;
     bool inputTwinsAllowed = false;
+    bool addressedUpload = false;
     std::uint64_t handoverToken = 0;
     bool addressStaging = true;
     bool adjustedRegions = false;
