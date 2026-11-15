@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1484,6 +1485,12 @@ void reportHeapStatistics() {
                  printed(heapDraws), printed(plainDraws), printed(heapDispatches), printed(plainDispatches), printed(heapBindsSeen),
                  printed(commandBuffers), binds.c_str(), excluded.c_str(), stageReasons.c_str(), printed(copies), printed(copiedMiB),
                  printed(spansWritten), printed(spansKept), printed(pushedKeeps), printed(spansExpired), printed(userRewrites[0]), printed(userRewrites[1]), printed(userRewrites[2]), printed(poolMiB), printed(totals.poolBlocksHeld), printed(totals.poolBlockBytes >> 20u), printed(poolMade), printed(poolRecycled), printed(poolFreed), printed(totals.poolBatchPeakBytes >> 10u), printed(totals.spanPeakBytes >> 10u), printed(imageEncodes), printed(imageCopies), printed(totals.imageSlotsHeld), BindlessHeap::ImageSlotCapacity(), printed(slotsEvicted), printed(evictionWaits), printed(samplersEvicted), printed(slotPressureSubmits), printed(templates.entries), printed(templates.bytes >> 20u), printed(templates.evicted));
+    static std::uint64_t lastKeysBuilt = 0;
+    const auto keysBuiltTotal = DrawContentKeysBuilt();
+    const auto keysBuilt = windowDelta(keysBuiltTotal, lastKeysBuilt);
+    lastKeysBuilt = keysBuiltTotal;
+    std::fprintf(stderr, "[gpu-heap] draw keys (10 s): %llu stage content keys built over %llu heap draws (%s)\n", printed(keysBuilt), printed(heapDraws),
+                 RuntimeSwitches::Set(RuntimeSwitch::NoProgramHeapKeys) ? "per-record memo" : "program memo");
 }
 
 void forgetHeapBinding(VkCommandBuffer commands) {
