@@ -1,7 +1,7 @@
 add_test_executable(agc_commit_shape_tests EXCLUDE_FROM_ALL tests/CommitShape.cpp Graphics/src/CommitShape.cpp)
 target_include_directories(agc_commit_shape_tests PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(agc_commit_shape_tests PROPERTIES CXX_EXTENSIONS OFF)
-configure_windows_unwind(agc_commit_shape_tests)
+configure_host_test_executable(agc_commit_shape_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_commit_shape_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_commit_shape COMMAND agc_commit_shape_tests)
