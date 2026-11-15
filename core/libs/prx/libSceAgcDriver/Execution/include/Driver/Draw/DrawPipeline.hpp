@@ -49,6 +49,12 @@ public:
     void Stop();
     void ReleaseRetired();
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
+    struct HandoffCounts {
+        std::uint64_t committerWakes = 0;
+        std::uint64_t fullWaits = 0;
+        std::uint64_t producerWakes = 0;
+    };
+    static HandoffCounts Handoffs();
     static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const;
     std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
@@ -114,6 +120,9 @@ private:
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drainWaitNs{};
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::array<std::atomic<std::uint64_t>, 257> drainRequests{};
+    std::atomic<std::uint64_t> committerWakes{0};
+    std::atomic<std::uint64_t> fullWaits{0};
+    std::atomic<std::uint64_t> producerWakes{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrainReason::Count)> reasonRequests{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindCommits{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
