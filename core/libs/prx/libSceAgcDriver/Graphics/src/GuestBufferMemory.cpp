@@ -6134,8 +6134,17 @@ bool changedCopyBacks(const Context& context) {
     return !disabled && context.changedCopyBacks && (context.pushDescriptors || context.bufferDeviceAddress);
 }
 
+bool mergedCopyBacks(const Context& context) {
+    static const bool disabled = std::getenv("APS5_NO_MERGED_COPY_BACK") != nullptr;
+    return !disabled && !changedCopyBacks(context) && (context.pushDescriptors || context.bufferDeviceAddress);
+}
+
+bool copyInSnapshots(const Context& context) {
+    return changedCopyBacks(context) || mergedCopyBacks(context);
+}
+
 bool addressedChangedCopyBacks(const Context& context) {
-    return changedCopyBacks(context) && !context.pushDescriptors;
+    return copyInSnapshots(context) && !context.pushDescriptors;
 }
 
 VkBufferUsageFlags gpuCopyUsage(const Context& context, bool addressable) {
@@ -7109,7 +7118,7 @@ bool GuestBufferMemory::StagingDecisionsCurrent() const {
 std::uint64_t GuestBufferMemory::StagedBytes() const {
     std::uint64_t bytes = 0;
     for (const auto& region : regions) {
-        if (region.gpuCopy && region.deviceLocal && region.twin == nullptr) bytes += (region.end - region.begin) * (changedCopyBacks(context) ? 2u : 1u);
+        if (region.gpuCopy && region.deviceLocal && region.twin == nullptr) bytes += (region.end - region.begin) * (copyInSnapshots(context) ? 2u : 1u);
     }
     return bytes;
 }
@@ -7306,7 +7315,7 @@ void GuestBufferMemory::StagedShadows(std::vector<std::pair<const void*, std::ui
         if (!region.gpuCopy || !region.deviceLocal || region.twin != nullptr) continue;
         const auto bytes = region.end - region.begin;
         shadows.emplace_back(region.buffer != nullptr ? static_cast<const void*>(region.buffer.get()) : static_cast<const void*>(&region), bytes);
-        if (changedCopyBacks(context)) shadows.emplace_back(region.shadowCopy != nullptr ? static_cast<const void*>(region.shadowCopy.get()) : static_cast<const void*>(&region.shadowCopy), bytes);
+        if (copyInSnapshots(context)) shadows.emplace_back(region.shadowCopy != nullptr ? static_cast<const void*>(region.shadowCopy.get()) : static_cast<const void*>(&region.shadowCopy), bytes);
     }
 }
 
@@ -8053,9 +8062,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     bool allUntouched = handoverToken != 0;
     for (std::size_t index = 0; allUntouched && index < copies.size(); ++index) allUntouched = untouched(index);
     if (allUntouched) {
-        for (auto* region : copies) {
+        for (std::size_t index = 0; index < copies.size(); ++index) {
+            auto* region = copies[index];
             region->snapshot.clear();
-            region->shadowCopy = nullptr;
+            region->shadowCopy = mergedCopyBacks(context) ? claimFor(index)->snapshot : nullptr;
+            if (region->shadowCopy != nullptr) recorder->Keep(region->shadowCopy);
             traceStaged(region->begin, region->end, region->atomic);
             Recorder::CountForwardedCopyIns(1, 0, region->end - region->begin);
             if (profile) {
@@ -8187,12 +8198,22 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     std::vector<Region*> shadowed;
-    for (auto* region : copies) {
+    const bool merged = mergedCopyBacks(context);
+    for (std::size_t index = 0; index < copies.size(); ++index) {
+        auto* region = copies[index];
         const auto bytes = static_cast<std::size_t>(region->end - region->begin);
         const bool addressed = addressedChangedCopyBacks(context);
-        if (!changedCopyBacks(context) || (addressed && region->buffer->DeviceAddress() == 0) || !WritesOverlap(region->begin, bytes)) {
+        if (!copyInSnapshots(context) || (addressed && region->buffer->DeviceAddress() == 0) || !WritesOverlap(region->begin, bytes)) {
             region->shadowCopy = nullptr;
             continue;
+        }
+        if (merged) {
+            if (const auto* claim = claimFor(index); claim != nullptr) {
+                region->shadowCopy = claim->snapshot;
+                if (region->shadowCopy != nullptr) recorder->Keep(region->shadowCopy);
+                continue;
+            }
+            region->shadowCopy = nullptr;
         }
         if (region->shadowCopy == nullptr) region->shadowCopy = stagingBuffer(context, bytes, gpuCopyUsage(context, addressed));
         if (region->shadowCopy == nullptr || (addressed && region->shadowCopy->DeviceAddress() == 0)) {
@@ -8261,9 +8282,10 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
-        if (defers && region.deviceLocal && region.shadowCopy == nullptr && region.buffer != nullptr) {
+        const bool mergeBack = mergedCopyBacks(context);
+        if (defers && region.deviceLocal && (region.shadowCopy == nullptr || mergeBack) && region.buffer != nullptr) {
             auto written = writtenWithin(region.begin, region.end);
-            if (!written.empty()) recorder.DeferCopyBack({region.begin, region.end, region.copySource, region.copySourceBase, region.buffer, std::move(written), 0});
+            if (!written.empty()) recorder.DeferCopyBack({region.begin, region.end, region.copySource, region.copySourceBase, region.buffer, std::move(written), 0, mergeBack ? region.shadowCopy : nullptr, region.copySourceAddress, addressedChangedCopyBacks(context)});
             region.copiedBack = true;
             continue;
         }
@@ -8276,7 +8298,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 commands = recorder.Commands(&covered);
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
                 // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+                constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
                 if (!Recorder::ElideCovered(Recorder::CommandClass::StagingOut, leading, covered)) {
                     RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
                     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
@@ -8299,8 +8321,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 }
                 const auto dwords = static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u);
                 const auto recordChanged = [&] {
-                    if (addressed) return recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), dwords, counter != nullptr ? counter->DeviceAddress() : 0);
-                    return recorder.RecordBoundChangedCopy(commands, {region.buffer->Handle(), alignedFrom - region.begin}, {region.shadowCopy->Handle(), alignedFrom - region.begin}, {region.copySource, alignedFrom - region.copySourceBase}, dwords, counter != nullptr ? counter->Handle() : VK_NULL_HANDLE);
+                    if (addressed) return recorder.RecordChangedCopy(commands, region.buffer->DeviceAddress() + (alignedFrom - region.begin), region.shadowCopy->DeviceAddress() + (alignedFrom - region.begin), region.copySourceAddress + (alignedFrom - region.copySourceBase), dwords, counter != nullptr ? counter->DeviceAddress() : 0, mergeBack);
+                    return recorder.RecordBoundChangedCopy(commands, {region.buffer->Handle(), alignedFrom - region.begin}, {region.shadowCopy->Handle(), alignedFrom - region.begin}, {region.copySource, alignedFrom - region.copySourceBase}, dwords, counter != nullptr ? counter->Handle() : VK_NULL_HANDLE, mergeBack);
                 };
                 if (alignedFrom < alignedTo && recordChanged()) {
                     if (counter != nullptr) {
@@ -8311,6 +8333,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                             static const bool alwaysCopy = std::getenv("APS5_CHANGED_COPY_ALWAYS") != nullptr;
                             if (diverged != 0) std::fprintf(stderr, "[copy-back] 0x%llx+0x%llx (region 0x%llx+0x%llx): %u dwords where the shader and the CPU changed the same bytes; %s\n", static_cast<unsigned long long>(alignedFrom), static_cast<unsigned long long>(alignedTo - alignedFrom), static_cast<unsigned long long>(regionBegin), static_cast<unsigned long long>(regionEnd - regionBegin), diverged, alwaysCopy ? "the shader's bytes were stored (APS5_CHANGED_COPY_ALWAYS)" : "the CPU's bytes were kept");
                         });
+                    }
+                    if (mergeBack) {
+                        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                        CopyBuffer(context, commands, region.buffer->Handle(), alignedFrom - region.begin, region.copySource, alignedFrom - region.copySourceBase, alignedTo - alignedFrom);
                     }
                     if (from < alignedFrom) {
                         CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);

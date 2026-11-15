@@ -1,7 +1,7 @@
 #version 450
 
 layout(local_size_x = 64) in;
-layout(set = 0, binding = 0, std430) readonly buffer Result { uint words[]; } result;
+layout(set = 0, binding = 0, std430) buffer Result { uint words[]; } result;
 layout(set = 0, binding = 1, std430) readonly buffer Snapshot { uint words[]; } snapshot;
 layout(set = 0, binding = 2, std430) buffer Target { uint words[]; } target;
 layout(set = 0, binding = 3, std430) buffer Counter { uint words[]; } counter;
@@ -10,7 +10,7 @@ layout(push_constant) uniform Parameters {
     uint snapshotBase;
     uint targetBase;
     uint count;
-    uint always;
+    uint mode;
     uint counting;
 } parameters;
 
@@ -29,7 +29,12 @@ void main() {
     uint held = target.words[parameters.targetBase + index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);
-    uint stored = parameters.always != 0u ? 0xffffffffu : changed & ~kept;
-    if (stored != 0u) target.words[parameters.targetBase + index] = (held & ~stored) | (value & stored);
+    uint stored = (parameters.mode & 1u) != 0u ? 0xffffffffu : changed & ~kept;
+    if ((parameters.mode & 2u) != 0u) {
+        uint merged = (held & ~stored) | (value & stored);
+        if (merged != value) result.words[parameters.resultBase + index] = merged;
+    } else if (stored != 0u) {
+        target.words[parameters.targetBase + index] = (held & ~stored) | (value & stored);
+    }
     if (parameters.counting != 0u && (changed & kept) != 0u) atomicAdd(counter.words[0], 1u);
 }

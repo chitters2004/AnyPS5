@@ -193,6 +193,9 @@ public:
         std::shared_ptr<Buffer> shadow;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         std::uint64_t taker = 0;
+        std::shared_ptr<Buffer> snapshot;
+        VkDeviceAddress targetAddress = 0;
+        bool addressed = false;
     };
     struct StagedClaim {
         std::uint64_t begin = 0;
@@ -202,6 +205,7 @@ public:
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         std::shared_ptr<Buffer> shadow;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> forwarded;
+        std::shared_ptr<Buffer> snapshot;
     };
     struct HandoverStatistics {
         std::uint64_t taken, skipped, redirected, forwardedBytes, elided, elidedBytes, landed, landedBytes;
@@ -435,12 +439,12 @@ public:
     void CountSamples();
     bool CountingSamples() const { return countingSamples; }
     bool RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules);
-    bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0);
+    bool RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter = 0, bool merge = false);
     struct BoundWords {
         VkBuffer buffer = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
     };
-    bool RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords result, BoundWords snapshot, BoundWords target, std::uint32_t dwords, VkBuffer counter = VK_NULL_HANDLE);
+    bool RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords result, BoundWords snapshot, BoundWords target, std::uint32_t dwords, VkBuffer counter = VK_NULL_HANDLE, bool merge = false);
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
     void NoteSampledDraw(VkCommandBuffer commands);
@@ -1039,6 +1043,7 @@ private:
     void ensureOpen();
     void flushDeferredDispatch();
     void flushCopyBacks(LandingSite site, const CopyBackReach* reach = nullptr);
+    bool mergeCopyBack(VkCommandBuffer commands, const StagedCopyBack& entry, std::uint64_t begin, std::uint64_t end);
     VkCommandBuffer openCommands(VkAccessFlags* coveredAccess);
     static bool landsFor(const StagedCopyBack& held, const CopyBackReach* reach);
     bool runConflict(std::span<const RunAccess> accesses) const;

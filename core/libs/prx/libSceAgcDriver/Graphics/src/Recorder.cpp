@@ -1940,9 +1940,20 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     if (open->renderPass.open) endOpenRenderPass(PassBreak::Command);
     const auto commands = open->commands;
     const auto timing = BeginGpuTiming(CommandClass::StagingOut);
-    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    const bool merging = std::any_of(landing.begin(), landing.end(), [](const StagedCopyBack& entry) { return entry.snapshot != nullptr; });
+    const BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | (merging ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | (merging ? VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT : 0u)};
     if (!ElideCovered(CommandClass::StagingOut, leading, open->coveredAccess)) {
         recordBarrier(commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+        CountBarriers(CommandClass::StagingOut);
+    }
+    GuestRanges unmerged;
+    if (merging) {
+        for (const auto& entry : landing) {
+            for (const auto& [begin, end] : entry.written) {
+                if (entry.snapshot == nullptr || !mergeCopyBack(commands, entry, begin, end)) unmerged.emplace_back(begin, end);
+            }
+        }
+        recordBarrier(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         CountBarriers(CommandClass::StagingOut);
     }
     const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
@@ -1954,6 +1965,7 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
         for (const auto& [begin, end] : entry.written) {
             regions.push_back({begin - entry.begin, begin - entry.targetBase, end - begin});
             landed.emplace_back(begin, end);
+            if (!merging) unmerged.emplace_back(begin, end);
             bytes += end - begin;
         }
         copy(commands, entry.shadow->Handle(), entry.target, static_cast<std::uint32_t>(regions.size()), regions.data());
@@ -1964,10 +1976,23 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     CountBarriers(CommandClass::StagingOut);
     open->coveredAccess = copiedAccess;
     EndGpuTiming(timing, bytes);
-    NoteWholeCopyBacks(*this, landed);
+    NoteWholeCopyBacks(*this, unmerged);
     handoverLanded.fetch_add(landing.size(), std::memory_order_relaxed);
     handoverLandedBytes.fetch_add(bytes, std::memory_order_relaxed);
     handoverLandedAt[static_cast<std::size_t>(site)].fetch_add(landing.size(), std::memory_order_relaxed);
+}
+
+bool Recorder::mergeCopyBack(VkCommandBuffer commands, const StagedCopyBack& entry, std::uint64_t begin, std::uint64_t end) {
+    if (entry.begin % 4u != 0 || entry.targetBase % 4u != 0) return false;
+    const auto alignedFrom = (begin + 3u) & ~std::uint64_t{3};
+    const auto alignedTo = end & ~std::uint64_t{3};
+    if (alignedFrom >= alignedTo) return false;
+    const auto dwords = static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u);
+    const bool merged = entry.addressed ? entry.targetAddress != 0 && RecordChangedCopy(commands, entry.shadow->DeviceAddress() + (alignedFrom - entry.begin), entry.snapshot->DeviceAddress() + (alignedFrom - entry.begin), entry.targetAddress + (alignedFrom - entry.targetBase), dwords, 0, true) : RecordBoundChangedCopy(commands, {entry.shadow->Handle(), alignedFrom - entry.begin}, {entry.snapshot->Handle(), alignedFrom - entry.begin}, {entry.target, alignedFrom - entry.targetBase}, dwords, VK_NULL_HANDLE, true);
+    if (!merged) return false;
+    Keep(entry.snapshot);
+    if (begin < alignedFrom || alignedTo < end) return false;
+    return true;
 }
 
 bool Recorder::PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const {
@@ -2009,6 +2034,7 @@ std::uint64_t Recorder::ClaimCopyBacks(std::span<StagedClaim> claims) {
         found->taker = token;
         claim.shadow = found->shadow;
         claim.forwarded = found->written;
+        claim.snapshot = found->snapshot;
     }
     if (token != 0) handoversTaken.fetch_add(1, std::memory_order_relaxed);
     return token;
@@ -3387,7 +3413,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
-bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter) {
+bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress snapshot, VkDeviceAddress target, std::uint32_t dwords, VkDeviceAddress counter, bool merge) {
     constexpr std::uint32_t PushBytes = 40;
     constexpr std::uint32_t GroupSize = 64;
     if (changedCopyState == 0) {
@@ -3429,8 +3455,8 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
             VkDeviceAddress target;
             VkDeviceAddress counter;
             std::uint32_t count;
-            std::uint32_t always;
-        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, count, alwaysCopy ? 1u : 0u};
+            std::uint32_t mode;
+        } parameters{result + VkDeviceAddress{done} * 4u, snapshot + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, count, (alwaysCopy ? 1u : 0u) | (merge ? 2u : 0u)};
         static_assert(sizeof(parameters) == PushBytes);
         function(cmdPushConstants, "vkCmdPushConstants")(commands, changedCopyLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (count + GroupSize - 1) / GroupSize, 1, 1);
@@ -3439,14 +3465,14 @@ bool Recorder::RecordChangedCopy(VkCommandBuffer commands, VkDeviceAddress resul
     return true;
 }
 
-bool Recorder::RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords result, BoundWords snapshot, BoundWords target, std::uint32_t dwords, VkBuffer counter) {
+bool Recorder::RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords result, BoundWords snapshot, BoundWords target, std::uint32_t dwords, VkBuffer counter, bool merge) {
     constexpr std::uint32_t GroupSize = 64;
     struct Parameters {
         std::uint32_t resultBase;
         std::uint32_t snapshotBase;
         std::uint32_t targetBase;
         std::uint32_t count;
-        std::uint32_t always;
+        std::uint32_t mode;
         std::uint32_t counting;
     };
     if (!context.pushDescriptors) return false;
@@ -3515,7 +3541,7 @@ bool Recorder::RecordBoundChangedCopy(VkCommandBuffer commands, BoundWords resul
             writes[binding].pBufferInfo = &infos[binding];
         }
         cmdPushChangedCopySet(commands, VK_PIPELINE_BIND_POINT_COMPUTE, boundChangedCopyLayout, 0, static_cast<std::uint32_t>(writes.size()), writes.data());
-        const Parameters parameters{bases[0], bases[1], bases[2], count, alwaysCopy ? 1u : 0u, counter != VK_NULL_HANDLE ? 1u : 0u};
+        const Parameters parameters{bases[0], bases[1], bases[2], count, (alwaysCopy ? 1u : 0u) | (merge ? 2u : 0u), counter != VK_NULL_HANDLE ? 1u : 0u};
         function(cmdPushConstants, "vkCmdPushConstants")(commands, boundChangedCopyLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(parameters), &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (count + GroupSize - 1) / GroupSize, 1, 1);
         done += count;

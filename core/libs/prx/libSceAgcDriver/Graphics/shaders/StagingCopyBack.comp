@@ -10,7 +10,7 @@ layout(push_constant) uniform Parameters {
     Words target;
     Words counter;
     uint count;
-    uint always;
+    uint mode;
 } parameters;
 
 uint differingBytes(uint difference) {
@@ -28,7 +28,12 @@ void main() {
     uint held = parameters.target.words[index];
     uint changed = differingBytes(value ^ before);
     uint kept = differingBytes(held ^ before);
-    uint stored = parameters.always != 0u ? 0xffffffffu : changed & ~kept;
-    if (stored != 0u) parameters.target.words[index] = (held & ~stored) | (value & stored);
+    uint stored = (parameters.mode & 1u) != 0u ? 0xffffffffu : changed & ~kept;
+    if ((parameters.mode & 2u) != 0u) {
+        uint merged = (held & ~stored) | (value & stored);
+        if (merged != value) parameters.result.words[index] = merged;
+    } else if (stored != 0u) {
+        parameters.target.words[index] = (held & ~stored) | (value & stored);
+    }
     if (uint64_t(parameters.counter) != 0ul && (changed & kept) != 0u) atomicAdd(parameters.counter.words[0], 1u);
 }
