@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
@@ -478,6 +479,11 @@ int main(int argc, char** argv) {
             RecordsKeepThePacketsFragmentWord(libraries);
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
+        }
+        if (std::getenv("APS5_RING_COMMITTER_PREPARE") != nullptr && std::getenv("APS5_DRAW_PIPELINE") != nullptr) {
+            const auto plans = AgcDriver::Graphics::TakePlannedDrawCounts();
+            Require(plans.planned != 0 && plans.used != 0, "with APS5_RING_COMMITTER_PREPARE no pipelined draw took a preparer's plan (" + std::to_string(plans.planned) + " planned, " + std::to_string(plans.used) + " taken, " + std::to_string(plans.missing) + " not ready)");
+            std::cout << "committer prepare: " << plans.planned << " planned, " << plans.used << " taken, " << plans.missing << " not ready, " << plans.otherDevice << " for another device\n";
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

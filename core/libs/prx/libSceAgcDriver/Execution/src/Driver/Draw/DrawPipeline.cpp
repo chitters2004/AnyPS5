@@ -645,6 +645,59 @@ void DrawPipeline::NoteDrawKey(std::uint64_t key, std::uint64_t shape) {
     previousShape = shape;
 }
 
+void DrawPipeline::EnqueuePrepared(CommitKind kind, Commit commit, Commit prepare, std::vector<Range> writes, std::vector<Range> reads) {
+    Item item{std::move(commit), std::move(writes), 0, {}, std::move(reads), true, false, kind};
+    item.prepare = std::move(prepare);
+    enqueue(std::move(item));
+}
+
+bool DrawPipeline::CommitterPrepare() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RingCommitterPrepare);
+}
+
+DrawPipeline::RingReads::~RingReads() {
+    if (token != 0) pipeline.releaseRingReads(token);
+}
+
+void DrawPipeline::holdRingReads(Item& item) {
+    auto hold = std::make_shared<RingReads>(*this);
+    {
+        std::lock_guard lock(ringReadsMutex);
+        hold->token = ++ringReadTokens;
+        ringHeldReads.emplace_back(hold->token, std::move(item.reads));
+    }
+    item.reads.clear();
+    item.ringReads = std::move(hold);
+}
+
+void DrawPipeline::restoreRingReads(Item& item) {
+    if (item.ringReads == nullptr) return;
+    const auto token = std::exchange(item.ringReads->token, 0);
+    item.ringReads.reset();
+    if (token == 0) return;
+    std::lock_guard lock(ringReadsMutex);
+    const auto found = std::find_if(ringHeldReads.begin(), ringHeldReads.end(), [token](const auto& held) { return held.first == token; });
+    if (found == ringHeldReads.end()) throw std::logic_error("a ring item's held reads were released before the committer admitted it");
+    item.reads = std::move(found->second);
+    ringHeldReads.erase(found);
+}
+
+void DrawPipeline::releaseRingReads(std::uint64_t token) {
+    std::lock_guard lock(ringReadsMutex);
+    const auto found = std::find_if(ringHeldReads.begin(), ringHeldReads.end(), [token](const auto& held) { return held.first == token; });
+    if (found != ringHeldReads.end()) ringHeldReads.erase(found);
+}
+
+void DrawPipeline::runPrepare(Item& item) {
+    auto prepare = std::exchange(item.prepare, nullptr);
+    if (!prepare) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    prepare();
+    prepareRuns.fetch_add(1, std::memory_order_relaxed);
+    if (profile) prepareRunNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+}
+
 void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes) {
     const auto end = address + bytes.size();
     enqueue({std::move(commit), {{address, end}}, address, std::move(bytes), {}, false, true, CommitKind::Store});
@@ -658,22 +711,33 @@ void DrawPipeline::enqueue(Item item) {
     }
     auto& finisher = DrawFinisher::Get();
     if (DrawFinisher::OnFinisherThread()) {
+        runPrepare(item);
         item.sequence = SequenceRing::Running();
         if (DrawFinisher::Buffered() && !preparerDirect()) {
             preparerOutbox().push_back(std::move(item));
             return;
         }
     } else if (Active()) {
-        if (!item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
-        if (DrawFinisher::Busy()) {
+        const bool ringReads = CommitterPrepare();
+        if (!ringReads) item.prepare = nullptr;
+        if (!ringReads && !item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
+        if (item.prepare || DrawFinisher::Busy()) {
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            const auto pushStart = profile && item.prepare ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool prepared = static_cast<bool>(item.prepare);
             DrawFinisher::Pending held;
             held.unknown = false;
             held.store = item.store;
             held.writes = item.writes;
             held.labelAddress = item.labelAddress;
             held.labelBytes = item.labelBytes;
-            const auto tag = static_cast<std::uint8_t>(1 + static_cast<std::size_t>(item.kind));
+            const auto tag = prepared ? CommitterPrepareTag : static_cast<std::uint8_t>(1 + static_cast<std::size_t>(item.kind));
+            if (ringReads && !item.reads.empty()) {
+                holdRingReads(item);
+                ringReadPushes.fetch_add(1, std::memory_order_relaxed);
+            }
             finisher.Enqueue([this, item = std::move(item)]() mutable {
+                runPrepare(item);
                 item.sequence = SequenceRing::Running();
                 if (DrawFinisher::Buffered() && !preparerDirect()) {
                     preparerOutbox().push_back(std::move(item));
@@ -681,6 +745,10 @@ void DrawPipeline::enqueue(Item item) {
                 }
                 admit(std::move(item));
             }, std::move(held), tag);
+            if (prepared) {
+                preparedPushes.fetch_add(1, std::memory_order_relaxed);
+                if (profile) preparedPushNs.fetch_add(elapsedNs(pushStart), std::memory_order_relaxed);
+            }
             return;
         }
         item.sequence = finisher.Bypass();
@@ -701,6 +769,7 @@ void DrawPipeline::admit(Item item) {
     if (profile) lockWaitNs += elapsedNs(lockStart);
     rethrowFailure();
     if (closing) {
+        restoreRingReads(item);
         lock.unlock();
         item.commit();
         return;
@@ -722,6 +791,7 @@ void DrawPipeline::admit(Item item) {
     }
     depthSum += items.size();
     ++enqueued;
+    restoreRingReads(item);
     heldReadRanges.fetch_add(item.reads.size(), std::memory_order_relaxed);
     countWrites(item.writes, true);
     items.push_back(std::move(item));
@@ -788,10 +858,22 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
             const auto& residency = ring.residency[tag];
             if (residency.items == 0) continue;
             char item[96];
-            std::snprintf(item, sizeof(item), " %s %llu (%.1f us, longest %.1f us)", tag == 0 ? "prepare" : tag - 1 < KindNames.size() ? KindNames[tag - 1] : "other", static_cast<unsigned long long>(residency.items), static_cast<double>(residency.totalNs) / 1e3 / static_cast<double>(residency.items), static_cast<double>(residency.longestNs) / 1e3);
+            std::snprintf(item, sizeof(item), " %s %llu (%.1f us, longest %.1f us)", tag == 0 ? "prepare" : tag == CommitterPrepareTag ? "committer prepare" : tag - 1 < KindNames.size() ? KindNames[tag - 1] : "other", static_cast<unsigned long long>(residency.items), static_cast<double>(residency.totalNs) / 1e3 / static_cast<double>(residency.items), static_cast<double>(residency.longestNs) / 1e3);
             residencyText += item;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[sequence] ring (10 s): %llu sequences issued in total, %llu items went straight to the committer, %llu waits for room (%.1f ms), %llu preparer sleeps; %zu preparers, %llu items published by another preparer, %llu turn waits (%.1f ms); committed through sequence %llu; time from push to prepared by kind:%s\n", static_cast<unsigned long long>(ring.pushed), static_cast<unsigned long long>(ring.bypassed), static_cast<unsigned long long>(ring.fullWaits), static_cast<double>(ring.fullWaitNs) / 1e6, static_cast<unsigned long long>(ring.preparerSleeps), DrawFinisher::Preparers(), static_cast<unsigned long long>(ring.publishedForOthers), static_cast<unsigned long long>(ring.turnWaits), static_cast<double>(ring.turnWaitNs) / 1e6, static_cast<unsigned long long>(CommittedSequence()), residencyText.c_str());
+    }
+    {
+        const auto plans = Graphics::TakePlannedDrawCounts();
+        const auto pushes = preparedPushes.exchange(0, std::memory_order_relaxed);
+        const auto pushNs = preparedPushNs.exchange(0, std::memory_order_relaxed);
+        const auto readPushes = ringReadPushes.exchange(0, std::memory_order_relaxed);
+        const auto runs = prepareRuns.exchange(0, std::memory_order_relaxed);
+        const auto runNs = prepareRunNs.exchange(0, std::memory_order_relaxed);
+        const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count); };
+        if (pushes != 0 || runs != 0 || plans.used != 0 || plans.missing != 0) {
+            AgcDriver::ProfilePrint_nid_no_patch("[committer-prepare] (10 s): %llu draws pushed for a preparer plan (%.2f us per push), %llu pushes holding their reads; preparer: %llu prepares (%.2f us each, %.2f us of it planning), %llu plans refused; committer: %llu plans taken (%.2f us of planning each moved off), %llu not ready, %llu for another device, %llu planned inline (%.2f us each)\n", static_cast<unsigned long long>(pushes), per(pushNs, pushes), static_cast<unsigned long long>(readPushes), static_cast<unsigned long long>(runs), per(runNs, runs), per(plans.planNs, plans.planned), static_cast<unsigned long long>(plans.failed), static_cast<unsigned long long>(plans.used), per(plans.usedPlanNs, plans.used), static_cast<unsigned long long>(plans.missing), static_cast<unsigned long long>(plans.otherDevice), static_cast<unsigned long long>(plans.inlinePlans), per(plans.inlinePlanNs, plans.inlinePlans));
+        }
     }
     {
         struct Finisher {
@@ -952,6 +1034,14 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     heldReadQueries.fetch_add(1, std::memory_order_relaxed);
     for (const auto& item : pipeline.items) {
         for (const auto& [begin, limit] : item.reads) {
+            if (address >= limit || begin >= end) continue;
+            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    }
+    std::lock_guard ringLock(pipeline.ringReadsMutex);
+    for (const auto& [token, reads] : pipeline.ringHeldReads) {
+        for (const auto& [begin, limit] : reads) {
             if (address >= limit || begin >= end) continue;
             heldReadHits.fetch_add(1, std::memory_order_relaxed);
             return true;
