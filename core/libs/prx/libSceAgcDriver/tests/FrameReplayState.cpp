@@ -740,6 +740,72 @@ private:
     const std::uint32_t* label;
 };
 
+class ArgumentOutput final : public AgcDriver::IVideoOutput {
+public:
+    explicit ArgumentOutput(Frames& frames) : frames(frames) {}
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override {
+        std::lock_guard lock(mutex);
+        arguments.push_back(info.argument);
+        return std::make_shared<ReplayFlip>(frames);
+    }
+    void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+    std::vector<std::int64_t> Arguments() {
+        std::lock_guard lock(mutex);
+        return arguments;
+    }
+
+private:
+    Frames& frames;
+    std::mutex mutex;
+    std::vector<std::int64_t> arguments;
+};
+
+void testSubmitReadsOrdered(const std::filesystem::path& directory) {
+    auto* bytes = allocate(FrameCaptureWriter::BlockBytes);
+    auto* gate = reinterpret_cast<std::uint32_t*>(bytes);
+    auto* wait = reinterpret_cast<std::uint32_t*>(bytes + 256);
+    auto* flip = reinterpret_cast<std::uint32_t*>(bytes + 512);
+    const std::array<std::uint32_t, 7> waitWords{(3u << 30u) | (5u << 16u) | (0x3cu << 8u), 0x13u, static_cast<std::uint32_t>(address(gate)), static_cast<std::uint32_t>(address(gate) >> 32u), 1u, 0xffffffffu, 0x10u};
+    std::ranges::copy(waitWords, wait);
+    const std::array<std::uint32_t, AgcDriver::FlipPacketWords> flipWords{AgcDriver::FlipPacketHeader, 7, 0xffffffffu, 1, 1, 0};
+    std::ranges::copy(flipWords, flip);
+    const std::uint32_t restored = 2;
+    FrameCaptureWriter writer(directory);
+    writer.WriteDelta(1, 0, address(flip + 4), std::as_bytes(std::span(&restored, 1)));
+    writer.Finish("{}");
+    const FrameCaptureReader reader(directory);
+    Options options;
+    options.release = false;
+    options.paceTimeout = std::chrono::milliseconds(300);
+    Replay replay{options, reader};
+    replay.recording = true;
+    collectGroups(replay);
+    auto output = std::make_shared<ArgumentOutput>(replay.frames);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, output);
+    const Packet parked{wait, static_cast<std::uint32_t>(waitWords.size()), 0, {}};
+    check(sceAgcDriverSubmitDcb(&parked) == 0, "the parked submission failed");
+    FrameCall submit;
+    submit.kind = FrameCallKind::Submit;
+    submit.thread = 1;
+    submit.address = address(flip);
+    submit.size = flipWords.size();
+    submit.accepted = 1;
+    submit.completed = 1;
+    std::thread opener([&] {
+        const auto deadline = Clock::now() + std::chrono::seconds(10);
+        while (output->Arguments().empty() && Clock::now() < deadline) std::this_thread::yield();
+        AgcDriver::GuestStore::Store(gate, std::uint32_t{1});
+    });
+    const std::array calls{submit, memoryCall(1, 2)};
+    replay.runWindow(calls);
+    opener.join();
+    AgcDriverWaitIdle_nid_postfix();
+    check(replay.paceTimeouts.load() == 1, "the submission was not paced behind the parked submission");
+    check(output->Arguments() == std::vector<std::int64_t>{1}, "a later memory delta was restored while an earlier submission still read its commands");
+    check(flip[4] == restored, "the later memory delta was not restored");
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, output);
+}
+
 void testTraceWindow(const std::filesystem::path& directory) {
     const char* traceDirectory = std::getenv("APS5_TRACE_DIR");
     check(traceDirectory != nullptr && AgcDriver::PerformanceTrace::Configured(), "the trace window test runs without APS5_TRACE_DIR and APS5_TRACE_FRAMES");
@@ -784,6 +850,7 @@ void testBlockingSubmission(const std::filesystem::path& directory) {
     options.pace = false;
     options.release = false;
     Replay replay{options, reader};
+    replay.observed.emplace_back(address(label), sizeof(*label));
     collectGroups(replay);
     auto output = std::make_shared<WaitingOutput>(replay.frames, label);
     AgcDriverRegisterVideoOutput_nid_postfix(7, output);
@@ -1128,6 +1195,7 @@ int main(int argc, char** argv) {
         else if (mode == "tokens") testEopTokens();
         else if (mode == "reservations" || mode == "reservation_failure") testRepeatedReservations(directory, mode == "reservation_failure");
         else if (mode == "blocking") testBlockingSubmission(directory);
+        else if (mode == "submit_reads_ordered") testSubmitReadsOrdered(directory);
         else if (mode == "environment") testColdPipelines();
         else if (mode == "shader" || mode == "shader_host") testShaderCode(directory, mode == "shader_host");
         else throw std::runtime_error("unknown test");

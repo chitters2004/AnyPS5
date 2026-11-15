@@ -41,6 +41,7 @@ extern "C" bool AgcDriverSettled_nid_postfix();
 extern "C" void AgcDriverEnablePollPause_nid_postfix();
 extern "C" void AgcDriverPausePolls_nid_postfix();
 extern "C" void AgcDriverResumePolls_nid_postfix();
+extern "C" void AgcDriverSetSubmitReadHook_nid_postfix(void (*hook)(void*), void* context);
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity);
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();

@@ -29,6 +29,14 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
+struct SubmitReadHook {
+    void (*hook)(void*) = nullptr;
+    void* context = nullptr;
+};
+
+thread_local SubmitReadHook submitReadHook;
+std::atomic<bool> submitReadHooks{false};
+
 void noteIndirectSegment(Submission& submission, std::size_t start, const std::uint32_t* target, std::size_t words) {
     if (submission.commands.size() - start != words || !std::equal(submission.commands.begin() + static_cast<std::ptrdiff_t>(start), submission.commands.end(), target)) return;
     submission.indirectSegments.push_back({start, target, words});
@@ -749,6 +757,11 @@ void Driver::executeRewindTail(const Submission& stalled) {
     execute(tail);
 }
 
+void Driver::SetSubmitReadHook(void (*hook)(void*), void* context) {
+    if (hook != nullptr) submitReadHooks.store(true, std::memory_order_relaxed);
+    submitReadHook = {hook, context};
+}
+
 void Driver::SubmitFlip(const FlipInfo& info) {
     const auto argument = static_cast<std::uint64_t>(info.argument);
     std::array<std::uint32_t, FlipPacketWords> words{FlipPacketHeader, info.handle, static_cast<std::uint32_t>(info.index), info.mode, static_cast<std::uint32_t>(argument), static_cast<std::uint32_t>(argument >> 32u)};
@@ -783,6 +796,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
     validate(submission, descriptor.addr);
     readRegisterLists(submission);
+    if (submitReadHooks.load(std::memory_order_relaxed) && submitReadHook.hook != nullptr) submitReadHook.hook(submitReadHook.context);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(submission);
     const bool holdsWork = holdFlipBehindWorker(submission, cpuFlip);

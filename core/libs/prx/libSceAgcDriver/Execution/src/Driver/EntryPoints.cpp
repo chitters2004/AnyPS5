@@ -207,6 +207,10 @@ extern "C" void AgcDriverResumePolls_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().ResumePolls();
 }
 
+extern "C" void AgcDriverSetSubmitReadHook_nid_postfix(void (*hook)(void*), void* context) {
+    AgcDriver::DriverDetail::Driver::SetSubmitReadHook(hook, context);
+}
+
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
     auto* const recorder = AgcDriver::FrameRecorder::Active();
     if (recorder == nullptr) {

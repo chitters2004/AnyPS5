@@ -12,6 +12,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -342,6 +343,7 @@ struct Replay {
         return true;
     }();
     Frames& frames = *new Frames;
+    std::vector<std::pair<std::uint64_t, std::size_t>> observed;
     std::map<std::uint32_t, std::shared_ptr<ReplayOutput>> outputs;
     std::mutex memoryMutex;
     std::map<std::uint64_t, std::vector<const FrameMemoryChunk*>> groups;
@@ -594,13 +596,20 @@ struct Replay {
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         std::vector<std::uint64_t> parked;
+        std::vector<std::pair<std::uint64_t, std::size_t>> live = observed;
         for (std::size_t slot = 0; slot < count; ++slot) {
             if (rewindWait(awaited[slot])) parked.push_back(awaited[slot].address);
+            else if (awaited[slot].bytes != 0) live.emplace_back(awaited[slot].address, awaited[slot].bytes);
         }
+        std::erase_if(live, [&](const auto& word) {
+            return !AgcDriver::GuestStore::IsLabel(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(word.first)), word.second) || std::ranges::any_of(held, [&](const auto& wait) { return wait.address == word.first; });
+        });
+        std::vector<StagedWord> labels;
         std::vector<std::pair<std::uint32_t*, std::uint32_t>> controls;
         for (const auto* chunk : found->second) {
             if (skipped.Overlaps(*chunk)) continue;
             auto bytes = reader.Read(*chunk);
+            std::vector<std::pair<std::size_t, std::size_t>> kept;
             auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
             AgcDriverPrepareCommandWrite_nid_no_patch(chunk->address, static_cast<std::size_t>(chunk->bytes));
             for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
@@ -612,17 +621,30 @@ struct Replay {
                 const bool rewind = (header >> 30u) == 3u && ((header >> 8u) & 0xffu) == 0x59u;
                 if (!rewind && std::find(parked.begin(), parked.end(), chunk->address + at) == parked.end()) continue;
                 if (!again) controls.emplace_back(reinterpret_cast<std::uint32_t*>(target + at), value);
-                std::memcpy(bytes.data() + at, target + at, sizeof(value));
+                kept.emplace_back(at, sizeof(value));
             }
             for (const auto& wait : held) {
                 if (wait.address < chunk->address || wait.address + wait.bytes > chunk->address + bytes.size()) continue;
                 const auto offset = static_cast<std::size_t>(wait.address - chunk->address);
                 staged.push_back({wait.address, {bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.begin() + static_cast<std::ptrdiff_t>(offset + wait.bytes)}});
-                std::memcpy(bytes.data() + offset, target + offset, wait.bytes);
+                kept.emplace_back(offset, wait.bytes);
             }
-            std::memcpy(target, bytes.data(), bytes.size());
+            for (const auto& [word, size] : live) {
+                if (word < chunk->address || word + size > chunk->address + bytes.size() || std::ranges::any_of(labels, [&](const auto& label) { return label.address == word; })) continue;
+                const auto offset = static_cast<std::size_t>(word - chunk->address);
+                labels.push_back({word, {bytes.begin() + static_cast<std::ptrdiff_t>(offset), bytes.begin() + static_cast<std::ptrdiff_t>(offset + size)}});
+                kept.emplace_back(offset, size);
+            }
+            std::ranges::sort(kept);
+            std::size_t copied = 0;
+            for (const auto& [offset, size] : kept) {
+                if (offset > copied) std::memcpy(target + copied, bytes.data() + copied, offset - copied);
+                copied = std::max(copied, offset + size);
+            }
+            if (copied < bytes.size()) std::memcpy(target + copied, bytes.data() + copied, bytes.size() - copied);
             deltaBytes += chunk->bytes;
         }
+        for (const auto& label : labels) AgcDriver::GuestStore::StoreLabel(reinterpret_cast<void*>(static_cast<std::uintptr_t>(label.address)), label.value);
         for (const auto& [control, value] : controls) std::atomic_ref<std::uint32_t>(*control).store(value, std::memory_order_release);
         return staged;
     }
@@ -729,6 +751,15 @@ struct Replay {
         }
     }
 
+    struct SubmitReads {
+        explicit SubmitReads(std::function<void()>* advance) {
+            if (advance != nullptr) AgcDriverSetSubmitReadHook_nid_postfix([](void* context) { (*static_cast<std::function<void()>*>(context))(); }, advance);
+        }
+        ~SubmitReads() { AgcDriverSetSubmitReadHook_nid_postfix(nullptr, nullptr); }
+        SubmitReads(const SubmitReads&) = delete;
+        SubmitReads& operator=(const SubmitReads&) = delete;
+    };
+
     void runWindow(std::span<const FrameCall> calls) {
         std::map<std::uint64_t, std::vector<std::size_t>> byThread;
         for (std::size_t index = 0; index < calls.size(); ++index) byThread[calls[index].thread].push_back(index);
@@ -765,7 +796,8 @@ struct Replay {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
                     if (failure != nullptr) return;
-                    const auto advance = [&] {
+                    std::function<void()> advance = [&] {
+                        if (!lock.owns_lock()) return;
                         ++started;
                         sequenced.store(started);
                         lock.unlock();
@@ -773,10 +805,12 @@ struct Replay {
                     };
                     const auto kind = calls[index].kind;
                     const bool ordered = kind == FrameCallKind::Memory || kind == FrameCallKind::RegisterVideoOutput || kind == FrameCallKind::UnregisterVideoOutput;
-                    if (!ordered) advance();
+                    const bool readsFirst = kind == FrameCallKind::Submit;
+                    if (!ordered && !readsFirst) advance();
                     try {
+                        const SubmitReads reads{readsFirst ? &advance : nullptr};
                         execute(calls[index]);
-                        if (ordered) advance();
+                        advance();
                     } catch (...) {
                         if (!lock.owns_lock()) lock.lock();
                         if (failure == nullptr) failure = std::current_exception();

@@ -89,6 +89,7 @@ public:
     void EnablePollPause();
     void PausePolls();
     void ResumePolls();
+    static void SetSubmitReadHook(void (*hook)(void*), void* context);
     std::uint64_t GuardedProbes() const;
     void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
     void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output);
