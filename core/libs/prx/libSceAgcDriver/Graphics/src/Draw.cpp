@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexPlanScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -2267,12 +2268,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.maxIndex += draw.firstVertex;
         inputs.minIndex += draw.firstVertex;
     }
-    std::vector<VertexFetch> fetches;
-    std::vector<std::size_t> fetchValid;
+    const VertexPlanLease planLease;
+    auto& fetches = planLease->fetches;
+    auto& fetchValid = planLease->fetchValid;
+    auto& fetchOf = planLease->fetchOf;
+    auto& zeroed = planLease->zeroed;
     fetches.reserve(attributes.size());
     fetchValid.reserve(attributes.size());
-    std::vector<std::size_t> fetchOf(attributes.size(), 0);
-    std::vector<std::shared_ptr<Buffer>> zeroed(attributes.size());
+    fetchOf.assign(attributes.size(), 0);
+    zeroed.resize(attributes.size());
     const auto& layout = inputs.VertexLayout();
     for (std::size_t i = 0; i < attributes.size(); ++i) {
         const auto& attribute = attributes[i];
@@ -2297,11 +2301,13 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         fetchValid.push_back(args == nullptr && stride != 0 ? static_cast<std::size_t>(std::min(recordBytes, static_cast<std::uint64_t>(bytes))) : bytes);
     }
     const auto soloFetches = SoloZeroPaddedFetchIndices(fetches, fetchValid);
-    std::vector<bool> isSolo(fetches.size(), false);
+    auto& isSolo = planLease->isSolo;
+    auto& plannedFetches = planLease->plannedFetches;
+    auto& plannedOf = planLease->plannedOf;
+    isSolo.assign(fetches.size(), false);
     for (const auto f : soloFetches) isSolo[f] = true;
-    std::vector<VertexFetch> plannedFetches;
     plannedFetches.reserve(fetches.size());
-    std::vector<std::size_t> plannedOf(fetches.size(), 0);
+    plannedOf.assign(fetches.size(), 0);
     for (std::size_t f = 0; f < fetches.size(); ++f) {
         if (isSolo[f]) continue;
         plannedOf[f] = plannedFetches.size();
@@ -2309,8 +2315,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     const auto plan = PlanVertexCopies(plannedFetches);
     const auto rangeFrom = args == nullptr && !state.stages.mesh ? VertexCopyStarts(plan, plannedFetches, inputs.minIndex, draw.firstInstance) : std::vector<std::size_t>(plan.copies.size(), 0);
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
+    auto& rangeHandles = planLease->rangeHandles;
+    auto& rangeOffsets = planLease->rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -2872,7 +2878,9 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
-    auto kept = std::make_shared<Kept>();
+    std::shared_ptr<Kept> kept;
+    const auto unwindGuard = recorder.UnwindGuard();
+    kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
     kept->framebuffer = std::move(framebuffer);
@@ -3264,6 +3272,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     VkDeviceSize argumentOffset = 0;
     bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
+    std::vector<std::shared_ptr<void>> reorderKept;
+    std::optional<Recorder::EncodingWindow> encoding(std::in_place, *recorder);
+    const auto unwindGuard = recorder->UnwindGuard();
     if (continued) {
         record.pipeline->Continue(recording, state, record.masked);
     } else {
@@ -3297,9 +3308,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
         // layout, which a lean draw renders in: no transitions.
         if (!record.reordered.empty()) {
-            std::vector<std::shared_ptr<void>> kept;
-            RecordSampleOrder(context, recording, record.reorderPass, record.reordered, true, kept);
-            for (auto& object : kept) recorder->Keep(std::move(object));
+            RecordSampleOrder(context, recording, record.reorderPass, record.reordered, true, reorderKept);
+            for (auto& object : reorderKept) recorder->Keep(std::move(object));
         }
         for (const auto& write : record.staged) RecordStagedClear(context, commands, *write.temporary);
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
@@ -3339,6 +3349,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(recording, state, record.masked);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset, trace, subdraw);
     }
+    encoding.reset();
     recorder->EndGpuTiming(eachDrawTiming);
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (argumentSnapshot != nullptr) recorder->Keep(argumentSnapshot);
@@ -5236,6 +5247,15 @@ std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const Stat
 
 std::uint64_t AddressDrawReuseVerifications() {
     return addressDrawReuseVerifications().load(std::memory_order_relaxed);
+}
+
+VertexPlanScratchState ThreadVertexPlanScratch() {
+    const auto& scratch = VertexPlanLease::Resting();
+    VertexPlanScratchState state;
+    state.busy = VertexPlanLease::Busy();
+    state.resting = scratch.fetches.size() + scratch.fetchValid.size() + scratch.fetchOf.size() + scratch.zeroed.size() + scratch.isSolo.size() + scratch.plannedFetches.size() + scratch.plannedOf.size() + scratch.rangeHandles.size() + scratch.rangeOffsets.size();
+    state.capacity = scratch.fetches.capacity() + scratch.fetchValid.capacity() + scratch.fetchOf.capacity() + scratch.zeroed.capacity() + scratch.isSolo.capacity() + scratch.plannedFetches.capacity() + scratch.plannedOf.capacity() + scratch.rangeHandles.capacity() + scratch.rangeOffsets.capacity();
+    return state;
 }
 
 bool DrawPipelineEnabled() {

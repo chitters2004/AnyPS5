@@ -34,6 +34,9 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_DEPTH_COLLECT_REUSE",
     "APS5_NO_EFFECTS_DEDUPE",
     "APS5_NO_PIPELINE_DISPATCH",
+    "APS5_NO_RECORD_ENCODER",
+    "APS5_NO_ADAPTIVE_ENCODER",
+    "APS5_QUIESCED_SEGMENTS",
 };
 
 struct SwitchValues {
@@ -57,6 +60,9 @@ struct SwitchValues {
             std::getenv("APS5_NO_DEPTH_COLLECT_REUSE") != nullptr,
             std::getenv("APS5_NO_EFFECTS_DEDUPE") != nullptr,
             std::getenv("APS5_NO_PIPELINE_DISPATCH") != nullptr,
+            std::getenv("APS5_NO_RECORD_ENCODER") != nullptr,
+            std::getenv("APS5_NO_ADAPTIVE_ENCODER") != nullptr,
+            std::getenv("APS5_QUIESCED_SEGMENTS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

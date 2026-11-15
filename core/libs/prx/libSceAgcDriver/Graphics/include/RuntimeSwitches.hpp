@@ -28,6 +28,9 @@ enum class RuntimeSwitch : std::size_t {
     NoDepthCollectReuse,
     NoEffectsDedupe,
     NoPipelineDispatch,
+    NoRecordEncoder,
+    NoAdaptiveEncoder,
+    QuiescedSegments,
     Count,
 };
 
