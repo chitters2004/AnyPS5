@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PipelineLinkOptimization.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
@@ -112,6 +113,7 @@ struct TestConfigurationError : std::runtime_error {
 
 using namespace AgcDriver::Graphics;
 using AgcDriver::GuestMemory::GpuMutex;
+using AgcDriver::CommitShapeProfiled;
 
 bool collectMappingHistoryTests() {
     constexpr std::size_t bytes = 131072;
@@ -1603,6 +1605,9 @@ void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
 void writeSettledTests(const Device& device, Recorder& recorder) {
     Require(recorder.PendingWriteSettled(0x50000, 0x100), "an unwritten range is not settled");
     recorder.NotePendingWrite(0x50000, 0x100);
+    const auto hitsBefore = Recorder::ThreadDependencyHits();
+    Require(recorder.PendingWriteOverlaps(0x50000, 0x100) && !recorder.PendingWriteOverlaps(0x50100, 0x100), "an open batch's write does not overlap exactly its range");
+    Require(Recorder::ThreadDependencyHits() - hitsBefore == (CommitShapeProfiled() ? 1u : 0u), "the dependency hits did not count exactly the overlapping query under APS5_PROFILE_COMMIT_SHAPE and nothing without it");
     Require(recorder.PendingWriteOverlaps(0x50000, 0x100) && !recorder.PendingWriteSettled(0x50000, 0x100) && recorder.PendingWriteSettled(0x50100, 0x100), "an open batch's write counts as settled");
     recorder.Submit();
     device.WaitQueue();

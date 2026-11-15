@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
@@ -154,6 +155,13 @@ AgcDriver::Mutex threadSyncsMutex;
 // This thread's fence and timeline waits in total (Recorder::ThreadWaitedMs): a caller times a span
 // of its own work and reads the difference to learn how much of it was waiting for the GPU.
 struct ThreadWaitedSlot {};
+
+struct ThreadDependencySlot {};
+
+bool countDependency() {
+    if (CommitShapeProfiled()) HostThreadSlot<std::uint64_t, ThreadDependencySlot>::Set(HostThreadSlot<std::uint64_t, ThreadDependencySlot>::Get() + 1);
+    return true;
+}
 
 void CountThreadSync(int source, double ms) {
     HostThreadSlot<double, ThreadWaitedSlot>::Set(HostThreadSlot<double, ThreadWaitedSlot>::Get() + ms);
@@ -2000,6 +2008,10 @@ double Recorder::ThreadWaitedMs() {
     return HostThreadSlot<double, ThreadWaitedSlot>::Get();
 }
 
+std::uint64_t Recorder::ThreadDependencyHits() {
+    return HostThreadSlot<std::uint64_t, ThreadDependencySlot>::Get();
+}
+
 std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
@@ -2411,7 +2423,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
 bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const {
     if (open == nullptr || bytes == 0) return false;
     const auto end = address + bytes;
-    return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; });
+    return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return address < store.End() && store.address < end; }) && countDependency();
 }
 
 bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const {
@@ -3970,9 +3982,9 @@ bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) co
     if (bytes == 0) return false;
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
-    if (open != nullptr && overlaps(*open, address, end)) return true;
+    if (open != nullptr && overlaps(*open, address, end)) return countDependency();
     for (const auto& batch : inFlight) {
-        if (overlaps(*batch, address, end)) return true;
+        if (overlaps(*batch, address, end)) return countDependency();
     }
     return false;
 }
@@ -4347,12 +4359,12 @@ bool Recorder::PendingLabelIn(std::uint64_t address, std::size_t bytes) const {
     std::lock_guard tableLock(labelTableMutex);
     if (bytes == 0) return false;
     const auto end = address + bytes;
-    if (const auto first = labels.lower_bound(address); first != labels.end() && first->first < end) return true;
-    if (wideLabelInLocked(address, bytes)) return true;
+    if (const auto first = labels.lower_bound(address); first != labels.end() && first->first < end) return countDependency();
+    if (wideLabelInLocked(address, bytes)) return countDependency();
     // A queued label of another queue is unordered against the caller on hardware (nothing that
     // queue recorded could have satisfied a wait yet); it is still reported, since the table mutex
     // is held anyway and a caller deciding a CPU store wants the conservative answer.
-    if (const auto first = queuedLabels.lower_bound(address); first != queuedLabels.end() && first->first < end) return true;
+    if (const auto first = queuedLabels.lower_bound(address); first != queuedLabels.end() && first->first < end) return countDependency();
     return false;
 }
 
