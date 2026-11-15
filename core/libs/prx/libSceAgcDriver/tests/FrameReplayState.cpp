@@ -128,11 +128,12 @@ void testSharedPage(const std::filesystem::path& directory) {
 void testHostNeighbors(const std::filesystem::path& directory) {
 #ifdef __linux__
     const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
-    void* mapped = mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    check(mapped != MAP_FAILED, "host allocation failed");
+    constexpr std::size_t Reserved = std::size_t{64} << 20;
+    void* mapped = mmap(nullptr, Reserved, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    check(mapped != MAP_FAILED, "host reservation failed");
     auto* occupied = static_cast<std::byte*>(mapped);
+    check(mprotect(occupied, page, PROT_READ | PROT_WRITE) == 0, "host page commit failed");
     auto* available = occupied + page;
-    check(munmap(available, page) == 0, "host page release failed");
     std::uintptr_t base = 0;
     std::size_t arenaSize = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &arenaSize);
@@ -141,6 +142,7 @@ void testHostNeighbors(const std::filesystem::path& directory) {
     writer.WriteRange(address(available), page, FrameRangeKind::Host, ReadWrite, FrameRangeAccess::Readable | FrameRangeAccess::Writable | FrameRangeAccess::Gpu);
     writer.Finish("{\"arena_base\":" + std::to_string(base) + "}");
     const FrameCaptureReader reader(directory);
+    check(munmap(available, Reserved - page) == 0, "host page release failed");
     const auto skipped = restoreMemory(reader);
     check(skipped.bytes == page, "an occupied CPU host range was not the only range skipped");
 #else
