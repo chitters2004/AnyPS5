@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1433,27 +1434,54 @@ namespace {
 // DrawWithRecipe.
 struct DrawTimer {
     bool profile;
+    bool timed;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    CommitStamps stamps{};
+    std::uint64_t dependenciesBefore = 0;
+    explicit DrawTimer(bool profile) : profile(profile), timed(profile || CommitShapeProfiled()), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
-        if (!profile) return;
+        if (!timed) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
     }
     void charge(DrawPhase which, std::chrono::steady_clock::time_point start) {
-        if (!profile) return;
+        if (!timed) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - start).count();
         phaseStart += now - start;
     }
 };
 
+static_assert(KindCount == CommitShape::Kinds && PhaseCount == CommitShape::Phases);
+
+void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
+    static auto* const shape = new CommitShape();
+    shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps);
+    static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
+    auto due = nextReport.load(std::memory_order_relaxed);
+    if (due == 0) {
+        nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(shape->Take(), DrawKindNames, DrawPhaseNames).c_str());
+}
+
+void startCommitShape(DrawTimer& timer) {
+    if (!CommitShapeProfiled()) return;
+    timer.stamps = {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), Recorder::PublishGeneration()};
+    timer.dependenciesBefore = Recorder::ThreadDependencyHits();
+}
+
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
+    if (CommitShapeProfiled()) noteCommitShape(timer, outcome);
     if (!timer.profile) return;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
@@ -1742,7 +1770,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     ValidateDepthBounds(context, state);
     ValidateSampleMask(context, state, shaders);
     timer.phase(PhaseValidate);
-    const auto layoutStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto layoutStart = timer.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& attributes = shaders.front().program->vertexAttributes;
     if (recipe != nullptr) {
         plan.vertexInput = recipe->vertexInput;
@@ -1757,7 +1785,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     plan.candidate = recipe == nullptr && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
-        const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto keyStart = timer.timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (earlyKey != nullptr && KeyForDevice(*earlyKey, context.device)) {
             plan.contentKey = *earlyKey;
             static const bool verify = std::getenv("APS5_VERIFY_EARLY_DRAW_KEY") != nullptr;
@@ -3569,6 +3597,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& timer = prepared.timer;
     timer = DrawTimer(profile);
+    startCommitShape(timer);
     // APS5_TRACE_DRAWS (together with APS5_PROFILE_DRAW; alone it only enables Driver.cpp's own
     // [draw] lines) additionally prints one line per draw with its phases and, for synchronous
     // draws, their inputs: per-draw string building at ~1400 draws per 10 s is itself a cost the
@@ -4516,6 +4545,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DrawTimer timer(profile);
+    startCommitShape(timer);
     DrawRecipeOutcome result;
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
