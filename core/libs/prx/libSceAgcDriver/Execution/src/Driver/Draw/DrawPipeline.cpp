@@ -655,6 +655,10 @@ bool DrawPipeline::CommitterPrepare() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RingCommitterPrepare);
 }
 
+DrawPipeline::CommitterPrepareRoutes DrawPipeline::PrepareRoutes() const {
+    return {handedOffPreparesTotal.load(std::memory_order_relaxed), preparedPushesTotal.load(std::memory_order_relaxed)};
+}
+
 DrawPipeline::RingReads::~RingReads() {
     if (token != 0) pipeline.releaseRingReads(token);
 }
@@ -691,7 +695,7 @@ void DrawPipeline::releaseRingReads(std::uint64_t token) {
 void DrawPipeline::runPrepare(Item& item) {
     auto prepare = std::exchange(item.prepare, nullptr);
     if (!prepare) return;
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const bool profile = pipelineStats();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     prepare();
     prepareRuns.fetch_add(1, std::memory_order_relaxed);
@@ -711,6 +715,10 @@ void DrawPipeline::enqueue(Item item) {
     }
     auto& finisher = DrawFinisher::Get();
     if (DrawFinisher::OnFinisherThread()) {
+        if (item.prepare) {
+            handedOffPrepares.fetch_add(1, std::memory_order_relaxed);
+            handedOffPreparesTotal.fetch_add(1, std::memory_order_relaxed);
+        }
         runPrepare(item);
         item.sequence = SequenceRing::Running();
         if (DrawFinisher::Buffered() && !preparerDirect()) {
@@ -722,7 +730,7 @@ void DrawPipeline::enqueue(Item item) {
         if (!ringReads) item.prepare = nullptr;
         if (!ringReads && !item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
         if (item.prepare || DrawFinisher::Busy()) {
-            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            const bool profile = pipelineStats();
             const auto pushStart = profile && item.prepare ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool prepared = static_cast<bool>(item.prepare);
             DrawFinisher::Pending held;
@@ -747,6 +755,7 @@ void DrawPipeline::enqueue(Item item) {
             }, std::move(held), tag);
             if (prepared) {
                 preparedPushes.fetch_add(1, std::memory_order_relaxed);
+                preparedPushesTotal.fetch_add(1, std::memory_order_relaxed);
                 if (profile) preparedPushNs.fetch_add(elapsedNs(pushStart), std::memory_order_relaxed);
             }
             return;
@@ -870,9 +879,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         const auto readPushes = ringReadPushes.exchange(0, std::memory_order_relaxed);
         const auto runs = prepareRuns.exchange(0, std::memory_order_relaxed);
         const auto runNs = prepareRunNs.exchange(0, std::memory_order_relaxed);
+        const auto handedOff = handedOffPrepares.exchange(0, std::memory_order_relaxed);
         const auto per = [](std::uint64_t ns, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(count); };
         if (pushes != 0 || runs != 0 || plans.used != 0 || plans.missing != 0) {
-            AgcDriver::ProfilePrint_nid_no_patch("[committer-prepare] (10 s): %llu draws pushed for a preparer plan (%.2f us per push), %llu pushes holding their reads; preparer: %llu prepares (%.2f us each, %.2f us of it planning), %llu plans refused; committer: %llu plans taken (%.2f us of planning each moved off), %llu not ready, %llu for another device, %llu planned inline (%.2f us each)\n", static_cast<unsigned long long>(pushes), per(pushNs, pushes), static_cast<unsigned long long>(readPushes), static_cast<unsigned long long>(runs), per(runNs, runs), per(plans.planNs, plans.planned), static_cast<unsigned long long>(plans.failed), static_cast<unsigned long long>(plans.used), per(plans.usedPlanNs, plans.used), static_cast<unsigned long long>(plans.missing), static_cast<unsigned long long>(plans.otherDevice), static_cast<unsigned long long>(plans.inlinePlans), per(plans.inlinePlanNs, plans.inlinePlans));
+            AgcDriver::ProfilePrint_nid_no_patch("[committer-prepare] (10 s): %llu draws planned on the finisher they were handed off to, %llu draws pushed for a preparer plan (%.2f us per push), %llu pushes holding their reads; preparer: %llu prepares (%.2f us each, %.2f us of it planning), %llu plans refused; committer: %llu plans taken (%.2f us of planning each moved off), %llu not ready, %llu for another device, %llu planned inline (%.2f us each)\n", static_cast<unsigned long long>(handedOff), static_cast<unsigned long long>(pushes), per(pushNs, pushes), static_cast<unsigned long long>(readPushes), static_cast<unsigned long long>(runs), per(runNs, runs), per(plans.planNs, plans.planned), static_cast<unsigned long long>(plans.failed), static_cast<unsigned long long>(plans.used), per(plans.usedPlanNs, plans.used), static_cast<unsigned long long>(plans.missing), static_cast<unsigned long long>(plans.otherDevice), static_cast<unsigned long long>(plans.inlinePlans), per(plans.inlinePlanNs, plans.inlinePlans));
         }
     }
     {

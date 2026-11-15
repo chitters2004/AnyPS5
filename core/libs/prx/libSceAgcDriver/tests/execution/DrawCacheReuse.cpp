@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
@@ -483,7 +484,10 @@ int main(int argc, char** argv) {
         if (std::getenv("APS5_RING_COMMITTER_PREPARE") != nullptr && std::getenv("APS5_DRAW_PIPELINE") != nullptr) {
             const auto plans = AgcDriver::Graphics::TakePlannedDrawCounts();
             Require(plans.planned != 0 && plans.used != 0, "with APS5_RING_COMMITTER_PREPARE no pipelined draw took a preparer's plan (" + std::to_string(plans.planned) + " planned, " + std::to_string(plans.used) + " taken, " + std::to_string(plans.missing) + " not ready)");
-            std::cout << "committer prepare: " << plans.planned << " planned, " << plans.used << " taken, " << plans.missing << " not ready, " << plans.otherDevice << " for another device\n";
+            const auto routes = AgcDriver::DriverDetail::DrawPipeline::Queue0().PrepareRoutes();
+            std::cout << "committer prepare: " << plans.planned << " planned, " << plans.used << " taken, " << plans.missing << " not ready, " << plans.otherDevice << " for another device; " << routes.handedOff << " planned on the finisher, " << routes.pushed << " pushed into the ring\n";
+            if (std::getenv("APS5_PROFILE_DRAW") != nullptr) Require(routes.pushed != 0 && routes.handedOff == 0, "with APS5_PROFILE_DRAW draws are not handed off, so every preparer plan must come from a ring push (" + std::to_string(routes.handedOff) + " on the finisher, " + std::to_string(routes.pushed) + " pushed)");
+            else Require(routes.handedOff != 0, "with the finisher hand-off on no draw was planned on the finisher it was handed off to (" + std::to_string(routes.pushed) + " pushed)");
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

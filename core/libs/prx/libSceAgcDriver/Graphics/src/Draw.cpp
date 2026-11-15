@@ -1743,7 +1743,7 @@ PlannedDrawCounters& plannedDrawCounters() {
 }
 
 bool profilePlans() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     return profile;
 }
 

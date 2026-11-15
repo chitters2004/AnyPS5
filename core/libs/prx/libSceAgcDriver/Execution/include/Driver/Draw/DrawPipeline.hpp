@@ -49,6 +49,11 @@ public:
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
     void EnqueuePrepared(CommitKind kind, Commit commit, Commit prepare, std::vector<Range> writes, std::vector<Range> reads);
     static bool CommitterPrepare();
+    struct CommitterPrepareRoutes {
+        std::uint64_t handedOff = 0;
+        std::uint64_t pushed = 0;
+    };
+    CommitterPrepareRoutes PrepareRoutes() const;
     static constexpr std::uint8_t CommitterPrepareTag = 1 + static_cast<std::uint8_t>(CommitKind::Count);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
@@ -127,6 +132,9 @@ private:
     std::atomic<std::uint64_t> prepareRuns{0};
     std::atomic<std::uint64_t> prepareRunNs{0};
     std::atomic<std::uint64_t> preparedPushNs{0};
+    std::atomic<std::uint64_t> handedOffPrepares{0};
+    std::atomic<std::uint64_t> handedOffPreparesTotal{0};
+    std::atomic<std::uint64_t> preparedPushesTotal{0};
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
     std::exception_ptr failure;
