@@ -6759,6 +6759,197 @@ std::uint64_t InputTwinLimit() {
     return inputTwinLimit();
 }
 
+namespace {
+
+constexpr std::size_t ReadUses = static_cast<std::size_t>(ShaderReadUse::Count);
+constexpr std::size_t ReadPaths = static_cast<std::size_t>(ShaderReadPath::Count);
+constexpr std::size_t ReadMemories = static_cast<std::size_t>(ShaderReadMemory::Count);
+constexpr std::array<const char*, ReadUses> ReadUseNames{"draw", "dispatch"};
+constexpr std::array<const char*, ReadPaths> ReadPathNames{"descriptor", "address", "vertex", "index"};
+constexpr std::array<const char*, ReadMemories> ReadMemoryNames{"import", "device", "host"};
+
+enum class InPlaceReason : std::uint8_t { Written, DrawBuild, TwinsOff, Address, Lease, Sparse, ReadOnlyMapping, NoGpuCopies, Small, Large, Candidate, Count };
+constexpr std::size_t InPlaceReasons = static_cast<std::size_t>(InPlaceReason::Count);
+constexpr std::array<const char*, InPlaceReasons> InPlaceReasonNames{"written by the build", "draw build", "twins off on this device", "address-based", "leased", "sparse", "read-only mapping", "GPU copies off", "below the twin minimum", "above a quarter of the twin bound", "twin candidate"};
+
+struct ReadTally {
+    std::atomic<std::uint64_t> bytes{0};
+    std::atomic<std::uint64_t> bindings{0};
+};
+
+constexpr std::size_t ReadTallies = ReadUses * ReadPaths * ReadMemories + ReadUses * InPlaceReasons + 4;
+constexpr std::size_t SnapshotTally = ReadUses * ReadPaths * ReadMemories + ReadUses * InPlaceReasons;
+constexpr std::size_t WholeCopyBackTally = SnapshotTally + 1;
+constexpr std::size_t CpuStoredTally = SnapshotTally + 2;
+constexpr std::size_t UntrackedCopyBackTally = SnapshotTally + 3;
+
+struct ShaderReadCounters {
+    std::array<ReadTally, ReadTallies> tallies{};
+    std::atomic<std::int64_t> lastReport{0};
+    std::mutex reportMutex;
+    std::array<std::pair<std::uint64_t, std::uint64_t>, ReadTallies> seen{};
+    std::uint64_t seenFrames = 0;
+};
+
+ShaderReadCounters& ReadCounters() {
+    static ShaderReadCounters counters;
+    return counters;
+}
+
+std::size_t readTally(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory) {
+    return (static_cast<std::size_t>(use) * ReadPaths + static_cast<std::size_t>(path)) * ReadMemories + static_cast<std::size_t>(memory);
+}
+
+std::size_t inPlaceTally(ShaderReadUse use, InPlaceReason reason) {
+    return ReadUses * ReadPaths * ReadMemories + static_cast<std::size_t>(use) * InPlaceReasons + static_cast<std::size_t>(reason);
+}
+
+void addTally(std::size_t index, std::uint64_t bytes) {
+    auto& tally = ReadCounters().tallies[index];
+    tally.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    tally.bindings.fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportShaderReads() {
+    auto& counters = ReadCounters();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    std::lock_guard lock(counters.reportMutex);
+    std::array<std::pair<std::uint64_t, std::uint64_t>, ReadTallies> delta{};
+    for (std::size_t index = 0; index < ReadTallies; ++index) {
+        const std::pair<std::uint64_t, std::uint64_t> now{counters.tallies[index].bytes.load(std::memory_order_relaxed), counters.tallies[index].bindings.load(std::memory_order_relaxed)};
+        delta[index] = {now.first - counters.seen[index].first, now.second - counters.seen[index].second};
+        counters.seen[index] = now;
+    }
+    const auto frames = inputTwinFrames.load(std::memory_order_relaxed);
+    const auto framesSeen = frames - std::exchange(counters.seenFrames, frames);
+    const double per = static_cast<double>(std::max<std::uint64_t>(framesSeen, 1));
+    const auto entry = [&](const char* name, const std::pair<std::uint64_t, std::uint64_t>& value) {
+        char text[96];
+        std::snprintf(text, sizeof(text), "%s %.2f MiB/%.0f", name, static_cast<double>(value.first) / 1048576.0 / per, static_cast<double>(value.second) / per);
+        return std::string(text);
+    };
+    std::string reads;
+    for (std::size_t use = 0; use < ReadUses; ++use) {
+        for (std::size_t path = 0; path < ReadPaths; ++path) {
+            std::string memories;
+            for (std::size_t memory = 0; memory < ReadMemories; ++memory) {
+                const auto& value = delta[readTally(static_cast<ShaderReadUse>(use), static_cast<ShaderReadPath>(path), static_cast<ShaderReadMemory>(memory))];
+                if (value.second == 0) continue;
+                memories += (memories.empty() ? "" : ", ") + entry(ReadMemoryNames[memory], value);
+            }
+            if (memories.empty()) continue;
+            reads += std::string(reads.empty() ? "" : "; ") + ReadUseNames[use] + " " + ReadPathNames[path] + ": " + memories;
+        }
+    }
+    if (delta[SnapshotTally].second != 0) reads += "; " + entry("draw import reads rebound to host snapshots", delta[SnapshotTally]);
+    AgcDriver::ProfilePrint_nid_no_patch("[reads] guest bytes bound per frame by use, path and memory, MiB/bindings (10 s, %llu frames): %s\n", static_cast<unsigned long long>(framesSeen), reads.empty() ? "none" : reads.c_str());
+    std::string inPlace;
+    for (std::size_t use = 0; use < ReadUses; ++use) {
+        std::string reasons;
+        for (std::size_t reason = 0; reason < InPlaceReasons; ++reason) {
+            const auto& value = delta[inPlaceTally(static_cast<ShaderReadUse>(use), static_cast<InPlaceReason>(reason))];
+            if (value.second == 0) continue;
+            reasons += (reasons.empty() ? "" : ", ") + entry(InPlaceReasonNames[reason], value);
+        }
+        if (!reasons.empty()) inPlace += std::string(inPlace.empty() ? "" : "; ") + ReadUseNames[use] + ": " + reasons;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[reads] import ranges bound in place per frame by why no input twin serves them, MiB/bindings (10 s): %s\n", inPlace.empty() ? "none" : inPlace.c_str());
+    if (!TraceCopyBacks()) return;
+    const auto& whole = delta[WholeCopyBackTally];
+    const auto& stored = delta[CpuStoredTally];
+    const auto& untracked = delta[UntrackedCopyBackTally];
+    AgcDriver::ProfilePrint_nid_no_patch("[copy-back] whole-range copy-backs (10 s): %llu ranges, %.2f MiB; the CPU stored into %llu of them (%.2f MiB) between the copy-back's recording and its batch's completion, an upper bound on stores it rolled back; %llu untracked (%.2f MiB)\n", static_cast<unsigned long long>(whole.second), static_cast<double>(whole.first) / 1048576.0, static_cast<unsigned long long>(stored.second), static_cast<double>(stored.first) / 1048576.0, static_cast<unsigned long long>(untracked.second), static_cast<double>(untracked.first) / 1048576.0);
+}
+
+}
+
+bool ShaderReadsCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PROFILE_GPU") != nullptr;
+    return counted;
+}
+
+void CountShaderRead(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory, std::uint64_t bytes) {
+    addTally(readTally(use, path, memory), bytes);
+    reportShaderReads();
+}
+
+void CountDrawSnapshotRead(std::uint64_t bytes) {
+    addTally(SnapshotTally, bytes);
+}
+
+ShaderReadMemory BufferReadMemory(const Buffer& buffer) {
+    return buffer.Mapped() ? ShaderReadMemory::Host : ShaderReadMemory::Device;
+}
+
+bool TraceCopyBacks() {
+    static const bool trace = std::getenv("APS5_TRACE_COPY_BACK") != nullptr;
+    return trace;
+}
+
+void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (!TraceCopyBacks() || ranges.empty()) return;
+    std::vector<std::array<std::uint64_t, 3>> watched;
+    watched.reserve(ranges.size());
+    for (const auto& [begin, end] : ranges) {
+        if (begin >= end) continue;
+        watched.push_back({begin, end - begin, GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin))});
+    }
+    recorder.OnComplete([watched = std::move(watched)] {
+        for (const auto& [begin, bytes, generation] : watched) {
+            addTally(WholeCopyBackTally, bytes);
+            if (generation == 0) {
+                addTally(UntrackedCopyBackTally, bytes);
+                continue;
+            }
+            if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)) == 0 || !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), generation)) addTally(CpuStoredTally, bytes);
+        }
+        if (ShaderReadsCounted()) reportShaderReads();
+    });
+}
+
+void GuestBufferMemory::CountReads(ShaderReadUse use) const {
+    if (!ShaderReadsCounted() || !uploaded || committed) return;
+    const auto memoryOf = [](const Region& region) -> std::optional<ShaderReadMemory> {
+        if (region.direct != nullptr) return ShaderReadMemory::Import;
+        if (region.mirror != nullptr) {
+            if (region.mirror->resident != nullptr) return ShaderReadMemory::Device;
+            if (region.mirror->buffer != nullptr) return BufferReadMemory(*region.mirror->buffer);
+            return std::nullopt;
+        }
+        if (region.buffer != nullptr) return BufferReadMemory(*region.buffer);
+        return std::nullopt;
+    };
+    const auto reasonOf = [&](const Region& region, std::uint64_t bytes, bool addressed) {
+        if (region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return InPlaceReason::Written;
+        if (!inputTwinsAllowed) return InPlaceReason::DrawBuild;
+        if (!InputTwinsEnabled(context)) return InPlaceReason::TwinsOff;
+        if (addressed) return InPlaceReason::Address;
+        if (HoldsLease()) return InPlaceReason::Lease;
+        if (region.sparse) return InPlaceReason::Sparse;
+        if (!region.writable) return InPlaceReason::ReadOnlyMapping;
+        if (!gpuCopiesEnabled()) return InPlaceReason::NoGpuCopies;
+        if (bytes < inputTwinMin()) return InPlaceReason::Small;
+        if (bytes > inputTwinLimit() / 4u) return InPlaceReason::Large;
+        return InPlaceReason::Candidate;
+    };
+    const auto count = [&](const Region& region, ShaderReadPath path) {
+        const auto end = region.direct != nullptr ? inPlaceEnd(region) : region.end;
+        const auto memory = memoryOf(region);
+        if (!memory || end <= region.begin) return;
+        const auto bytes = end - region.begin;
+        addTally(readTally(use, path, *memory), bytes);
+        if (*memory == ShaderReadMemory::Import) addTally(inPlaceTally(use, reasonOf(region, bytes, path == ShaderReadPath::Address)), bytes);
+    };
+    if (space != nullptr) {
+        for (const auto& region : space->base) count(region, ShaderReadPath::Address);
+    }
+    const auto path = addressedUpload ? ShaderReadPath::Address : ShaderReadPath::Descriptor;
+    for (const auto& region : regions) count(region, path);
+    reportShaderReads();
+}
+
 void SetInputTwinLimitForTests(std::uint64_t bytes) {
     twinLimitForTests.store(bytes, std::memory_order_relaxed);
 }
@@ -7199,6 +7390,7 @@ void GuestBufferMemory::resolveOverlays() {
 void GuestBufferMemory::UploadPrepare(bool addressable) {
     Require(!prepared && !uploaded, "guest memory was already uploaded");
     prepared = true;
+    addressedUpload = addressable;
     resolveOverlays();
     servedInsideBase.clear();
     std::vector<std::uint32_t> order(regions.size());
@@ -8038,6 +8230,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> wholeRanges;
     if (!writes.empty()) {
         auto sorted = writes;
         std::sort(sorted.begin(), sorted.end());
@@ -8119,13 +8312,22 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                             if (diverged != 0) std::fprintf(stderr, "[copy-back] 0x%llx+0x%llx (region 0x%llx+0x%llx): %u dwords where the shader and the CPU changed the same bytes; %s\n", static_cast<unsigned long long>(alignedFrom), static_cast<unsigned long long>(alignedTo - alignedFrom), static_cast<unsigned long long>(regionBegin), static_cast<unsigned long long>(regionEnd - regionBegin), diverged, alwaysCopy ? "the shader's bytes were stored (APS5_CHANGED_COPY_ALWAYS)" : "the CPU's bytes were kept");
                         });
                     }
-                    if (from < alignedFrom) CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
-                    if (alignedTo < to) CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
+                    if (from < alignedFrom) {
+                        CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
+                        wholeRanges.emplace_back(from, alignedFrom);
+                    }
+                    if (alignedTo < to) {
+                        CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
+                        wholeRanges.emplace_back(alignedTo, to);
+                    }
                     whole = wholeEnd;
                     recorder.Keep(region.shadowCopy);
                 }
             }
-            if (whole < wholeEnd) CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
+            if (whole < wholeEnd) {
+                CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
+                wholeRanges.emplace_back(whole, wholeEnd);
+            }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
             if (profile) {
@@ -8149,6 +8351,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
+    NoteWholeCopyBacks(recorder, wholeRanges);
 }
 
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {

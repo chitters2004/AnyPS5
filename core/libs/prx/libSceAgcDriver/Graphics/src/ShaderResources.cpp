@@ -2026,6 +2026,7 @@ bool BindsGuestRangesOnly(const CompiledShader& compute) {
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) : context(context), guestMemory(context), dispatchThreads(dispatchThreads), htileClear(htileClear), deferredCompute(compute), deferredSnapshots(snapshots) {
     Require(compute.stage == ShaderRecompiler::ShaderStage::Compute, "compute resources require a compute shader");
+    dispatchBuild = true;
     // Every use of a compute build is a recorded dispatch that calls MarkGpuWrites, which staged
     // buffers need (a synchronous draw's use would not).
     guestMemory.AllowDeviceStaging();
@@ -7433,6 +7434,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
         totalSnapshotBytes += bytes;
+        if (override == moved.end() && ShaderReadsCounted()) CountDrawSnapshotRead(bytes);
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
@@ -7589,6 +7591,7 @@ bool SkipWriteBack() {
 }
 
 void ShaderResources::WriteBack() {
+    guestMemory.CountReads(ShaderReadUse::Draw);
     std::exception_ptr unaligned;
     try {
         WriteBackBuffers();
@@ -7607,6 +7610,7 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+    guestMemory.CountReads(dispatchBuild ? ShaderReadUse::Dispatch : ShaderReadUse::Draw);
     if (bda != nullptr && recorder.Device() == context.device) bda->NoteUse(recorder.OpenSerial());
     // The ranges this use reads in place through their host imports (read-only and written elements
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
