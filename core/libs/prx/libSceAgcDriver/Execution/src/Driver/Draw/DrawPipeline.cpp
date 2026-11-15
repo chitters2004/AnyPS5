@@ -42,7 +42,7 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
 ProfileCounter commitClockReads;
 
 std::chrono::steady_clock::time_point commitClock(bool timed) {
-    if (!timed) return {};
+    if (false) return {};
     commitClockReads.Add();
     return std::chrono::steady_clock::now();
 }
