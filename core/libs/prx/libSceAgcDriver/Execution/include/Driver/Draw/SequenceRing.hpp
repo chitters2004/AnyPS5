@@ -42,6 +42,7 @@ public:
         std::size_t preparers = 1;
         bool (*single)() = nullptr;
         std::function<Publish()> outbox;
+        std::size_t resume = 0;
     };
     class Cancelled : public std::runtime_error {
     public:
@@ -58,6 +59,7 @@ public:
         std::uint64_t bypassed = 0;
         std::uint64_t fullWaits = 0;
         std::uint64_t fullWaitNs = 0;
+        std::uint64_t roomWakes = 0;
         std::uint64_t preparerSleeps = 0;
         std::uint64_t worked = 0;
         std::uint64_t busyCpuNs = 0;
@@ -145,6 +147,7 @@ private:
     void claimProducer();
     void run(std::size_t preparer);
     void waitPrepared(std::uint64_t count);
+    void waitRoom(std::uint64_t count);
     void waitTurn(std::uint64_t index);
     void publishReady();
     void finishItem(std::uint64_t index);
@@ -164,6 +167,7 @@ private:
     alignas(64) std::atomic<std::uint32_t> preparerSleepers{0};
     std::atomic<std::uint32_t> wakeSignal{0};
     std::atomic<std::uint32_t> preparedWaiters{0};
+    std::atomic<std::uint64_t> roomTarget{0};
     std::atomic<bool> failed{false};
     std::atomic<std::uint64_t> cancelBelow{0};
     std::atomic<bool> stopping{false};
@@ -180,6 +184,7 @@ private:
     std::atomic<std::uint64_t> bypassed{0};
     std::atomic<std::uint64_t> fullWaits{0};
     std::atomic<std::uint64_t> fullWaitNs{0};
+    std::atomic<std::uint64_t> roomWakes{0};
     std::atomic<std::uint64_t> preparerSleeps{0};
     std::atomic<std::uint64_t> worked{0};
     std::atomic<std::uint64_t> busyCpuNs{0};

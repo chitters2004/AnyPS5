@@ -160,6 +160,54 @@ void FullRingBlocksTheProducer() {
     Require(ring.TakeCounters().fullWaits != 0, "the full waits were not counted");
 }
 
+void FullRingResumesAtItsWatermark(std::size_t resume, std::size_t free) {
+    constexpr std::size_t capacity = 8;
+    auto options = Small(capacity);
+    options.resume = resume;
+    SequenceRing ring(std::move(options));
+    std::atomic<std::size_t> allowed{0};
+    std::atomic<bool> open{false};
+    std::atomic<std::size_t> pushes{0};
+    std::exception_ptr producerError;
+    std::thread producer([&] {
+        try {
+            for (std::size_t i = 0; i <= capacity; ++i) {
+                ring.Push([&, i] {
+                    while (!open.load(std::memory_order_acquire) && allowed.load(std::memory_order_acquire) <= i) std::this_thread::yield();
+                }, {});
+                pushes.fetch_add(1);
+            }
+            ring.Drain();
+        } catch (...) {
+            producerError = std::current_exception();
+        }
+    });
+    struct JoinOnExit {
+        std::thread& thread;
+        std::atomic<bool>& open;
+        ~JoinOnExit() {
+            open.store(true, std::memory_order_release);
+            if (thread.joinable()) thread.join();
+        }
+    } joiner{producer, open};
+    WaitUntil([&] { return pushes.load() == capacity; }, "the ring to fill");
+    ring.TakeCounters();
+    for (std::size_t step = 1; step < free; ++step) {
+        allowed.store(step, std::memory_order_release);
+        WaitUntil([&] { return ring.Waiting() == capacity - step; }, "an item to be prepared");
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        Require(pushes.load() == capacity, "with resume " + std::to_string(resume) + " the producer pushed again after " + std::to_string(step) + " of " + std::to_string(free) + " slots were freed");
+    }
+    allowed.store(free, std::memory_order_release);
+    WaitUntil([&] { return pushes.load() == capacity + 1; }, "the producer to resume at its watermark");
+    const auto counters = ring.TakeCounters();
+    Require(counters.fullWaits == 1, "the producer did not wait for room exactly once");
+    Require(counters.roomWakes >= 1 && counters.roomWakes < std::max<std::size_t>(free, 2), "with resume " + std::to_string(resume) + " the parked producer woke " + std::to_string(counters.roomWakes) + " times while " + std::to_string(free) + " slots were freed");
+    open.store(true, std::memory_order_release);
+    producer.join();
+    if (producerError != nullptr) std::rethrow_exception(producerError);
+}
+
 void FullRingRefusesTheGpuLockHolder() {
     std::atomic<bool> open{false};
     SequenceRing ring(Small(2));
@@ -729,6 +777,9 @@ int main(int argc, char** argv) {
         ItemsRunInSequenceOrder(std::chrono::microseconds(50));
         MixedItemsKeepTheirOrder();
         FullRingBlocksTheProducer();
+        FullRingResumesAtItsWatermark(0, 4);
+        FullRingResumesAtItsWatermark(1, 1);
+        FullRingResumesAtItsWatermark(6, 6);
         FullRingRefusesTheGpuLockHolder();
         FailureSkipsLaterItemsUntilRethrown();
         TeardownRunsWaitingItems();
