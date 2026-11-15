@@ -607,7 +607,10 @@ jobs:
             python3 - <<'PY' > build/targets.txt
           import glob, os, re, subprocess, sys
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
-          known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
+          # CMake target names are the phony entries without a path; a basename match against every output let a copied
+          # script (test_trace_digest.py) through as a "target" that ninja does not know.
+          listing = subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout
+          known = {t for t, _, rule in (l.rpartition(": ") for l in listing.splitlines()) if rule.strip() == "phony" and "/" not in t}
           names = set()
           for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
               for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
@@ -990,7 +993,10 @@ jobs:
             python - <<'PY' > build/targets.txt
           import glob, os, re, subprocess
           selected = {n.strip() for n in re.findall(r"^\s*Test\s+#\d+: (.*)$", open("build/selected.txt", errors="replace").read(), re.M)}
-          known = {os.path.basename(t) for t in subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout.replace(":", " ").split()}
+          # CMake target names are the phony entries without a path; a basename match against every output let a copied
+          # script (test_trace_digest.py) through as a "target" that ninja does not know.
+          listing = subprocess.run(["ninja", "-C", "build", "-t", "targets", "all"], capture_output=True, text=True, check=True).stdout
+          known = {t for t, _, rule in (l.rpartition(": ") for l in listing.splitlines()) if rule.strip() == "phony" and "/" not in t}
           names = set()
           for path in glob.glob("build/**/CTestTestfile.cmake", recursive=True):
               for line in (re.sub(r'^(\s*(?:add_test|set_tests_properties)\()"((?:[^"\\]|\\.)*)"', r"\1[=[\2]=]", l) for l in open(path, encoding="utf-8", errors="replace")):  # newer CMake quotes the test name instead of bracketing it
