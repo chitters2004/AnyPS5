@@ -456,11 +456,12 @@ void verifyResultRoundTrip() {
     require(decoded.variantId == 0 && !decoded.cacheHit, "the per-process fields were stored");
     auto memoized = result;
     memoized.drawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(std::vector<std::uint32_t>{1u, 2u, 3u}));
+    memoized.heapDrawKeyMemo.words.store(std::make_shared<const std::vector<std::uint32_t>>(std::vector<std::uint32_t>{4u, 5u}));
     std::vector<std::byte> memoizedBytes;
     ShaderDiskCache::EncodeResult(memoized, memoizedBytes);
     require(memoizedBytes == bytes, "the draw key memo was stored");
     RecompileResult memoizedDecoded;
-    require(ShaderDiskCache::DecodeResult(memoizedBytes, memoizedDecoded) && !memoizedDecoded.drawKeyMemo.words.load(), "a decoded result has a draw key memo");
+    require(ShaderDiskCache::DecodeResult(memoizedBytes, memoizedDecoded) && !memoizedDecoded.drawKeyMemo.words.load() && !memoizedDecoded.heapDrawKeyMemo.words.load(), "a decoded result has a draw key memo");
     for (std::size_t size = 0; size < bytes.size(); size += size < 256 ? 1 : 97) {
         RecompileResult partial;
         require(!ShaderDiskCache::DecodeResult(std::span(bytes).first(size), partial), "a result truncated to " + std::to_string(size) + " bytes decodes");

@@ -1016,6 +1016,7 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     std::uint64_t heapTemplateId = 0;
     std::vector<std::uint32_t> heapUserWords;
     ResultKeyMemo drawKeyMemo;
+    ResultKeyMemo heapDrawKeyMemo;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
