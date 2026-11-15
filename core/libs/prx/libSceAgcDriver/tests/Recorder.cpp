@@ -17431,6 +17431,11 @@ int main(int argc, char** argv) {
             drawSnapshotEpochTests(device);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--write-settled-only") {
+            writeSettledTests(device, recorder);
+            std::cout << "write settled tests passed\n";
+            return 0;
+        }
 
         if (argc == 2 && (std::string_view(argv[1]) == "--vertex-target-range-copied" || std::string_view(argv[1]) == "--vertex-target-range-imported")) {
             return vertexTargetRangeTests(device, recorder, std::string_view(argv[1]) == "--vertex-target-range-imported") ? 0 : 77;
