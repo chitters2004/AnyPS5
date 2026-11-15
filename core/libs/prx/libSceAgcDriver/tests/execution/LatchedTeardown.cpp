@@ -91,15 +91,17 @@ private:
     std::uint8_t* block = nullptr;
 };
 
-bool SeedShadowUnit(AgcDriver::VulkanDevice& device, std::uint64_t unit) {
+const char* SeedShadowUnit(AgcDriver::VulkanDevice& device, std::uint64_t unit) {
     using namespace AgcDriver::Graphics;
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
     auto* recorder = Recorder::Active();
     const auto* import = HostImportFor(context, unit, ShadowUnitBytes);
-    if (recorder == nullptr || import == nullptr) return false;
+    if (recorder == nullptr) return "no recorder is active";
+    if (import == nullptr) return "no host import covers the guest block";
+    if (!AgcDriver::GuestMemory::Watched(unit, ShadowUnitBytes)) return "the guest block's host import is compared, not write-watched, so it has no shadow unit";
     auto destination = ShadowDestinationFor(context, *import, unit, unit + ShadowUnitBytes);
-    if (!destination.has_value()) return false;
+    if (!destination.has_value()) return "the write-watched host import got no shadow slab for the guest block";
     auto pattern = std::make_shared<Buffer>(context, ShadowUnitBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     auto* words = reinterpret_cast<std::uint32_t*>(pattern->Bytes().data());
     std::fill(words, words + ShadowUnitBytes / 4u, Stored);
@@ -113,7 +115,7 @@ bool SeedShadowUnit(AgcDriver::VulkanDevice& device, std::uint64_t unit) {
     recorder->MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     const ShadowedRange range{unit, unit + ShadowUnitBytes, destination->slab};
     MarkShadowed(*import, std::span(&range, 1), AgcDriver::GuestMemory::TrackerGeneration());
-    return true;
+    return nullptr;
 }
 
 bool Shadowed(std::uint64_t unit) {
@@ -140,8 +142,8 @@ int main() {
         auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto unit = guest.Address() + ShadowUnitBytes;
-        if (!SeedShadowUnit(*device, unit)) {
-            std::puts("no watched host import or shadow slab for the guest block: latched teardown not tested");
+        if (const auto* unseeded = SeedShadowUnit(*device, unit)) {
+            std::printf("%s: latched teardown not tested\n", unseeded);
             return VulkanTestSkipped;
         }
         device->WaitIdle();
