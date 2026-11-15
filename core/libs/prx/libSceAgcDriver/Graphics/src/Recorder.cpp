@@ -2258,7 +2258,8 @@ void Recorder::beginBatch() {
             notedReadLists.Clear();
             ++batchEpoch;
         }
-        open->predictedSerial = submissions + 1;
+        open->predictedSerial = frontiers.Reserve();
+        Require(open->predictedSerial == submissions + 1, "Recorder::ensureOpen reserved a serial ahead of the submitted ones");
         try {
             if (open->queue == 0) WriteCheckpointSerial(context, live(), open->predictedSerial, open->queue);
             else WriteCheckpointSentinel(context, live());
@@ -4782,6 +4783,7 @@ void Recorder::Submit() {
         batch->recording.Finish();
     }
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands.Get(BatchCommands::Use::Lifetime)), "vkEndCommandBuffer recorder");
+    frontiers.Mark(batch->predictedSerial, BatchState::Recorded);
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
@@ -4832,6 +4834,8 @@ void Recorder::Submit() {
     if (batch->guestWork) LibcRunReportMilestone_nid_no_patch(2);
     batch->submitted = true;
     batch->serial = ++submissions;
+    Require(batch->serial == batch->predictedSerial, "Recorder::Submit submitted a batch out of its reserved order");
+    frontiers.Mark(batch->serial, BatchState::Submitted);
     batch->submittedAt = std::chrono::steady_clock::now();
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {
@@ -5331,10 +5335,12 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             Check(idle, "vkDeviceWaitIdle after recorder fence failure");
         }
         if (result != VK_SUCCESS) {
+            frontiers.Mark(batch->serial, BatchState::Failed);
             release(*batch);
             Check(result, "vkWaitForFences recorder");
         }
     }
+    frontiers.Mark(batch->serial, BatchState::Completed);
     readGpuTiming(*batch);
     readSamples(*batch);
     if (batch->serial != 0) {
@@ -5414,6 +5420,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     if (encoder != nullptr) encoder->Quiesce();
+    if (batch->predictedSerial != 0 && batch->predictedSerial == frontiers.Newest() && !batch->submitted) frontiers.Retract(batch->predictedSerial);
     std::erase_if(pendingSamples, [&](const SampleSegment& sample) { return sample.batch == batch->sampleBatch; });
     std::erase_if(batch->foldedSamples, [&](const SampleSegment& sample) { return sample.batch == batch->sampleBatch; });
     if (pendingSamples.size() + batch->foldedSamples.size() <= pendingSamples.capacity()) {
