@@ -632,8 +632,10 @@ jobs:
                 select_targets
                 if [ "$no_tests" != 1 ]; then cmake --build build --target $(cat build/targets.txt) libs || rc=$?; fi
               else
-                cmake --build build || rc=$?
-                if [ $rc -eq 0 ]; then cmake --build build --target libs || rc=$?; fi
+                # A warm keeps going past a file that is broken on main, so everything else still reaches the ccache.
+                keep=(); [ "$KIND" = warm ] && keep=(-- -k 0)
+                cmake --build build "${keep[@]}" || rc=$?
+                if [ $rc -eq 0 ] || [ "$KIND" = warm ]; then cmake --build build --target libs "${keep[@]}" || rc=$?; fi
               fi ;;
             asan|tsan)
               cmake --build build -- -k 0 || rc=$?
