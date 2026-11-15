@@ -47,6 +47,9 @@ public:
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void EnqueueStore(Commit commit, std::uint64_t address, std::vector<std::byte> bytes);
+    void EnqueuePrepared(CommitKind kind, Commit commit, Commit prepare, std::vector<Range> writes, std::vector<Range> reads);
+    static bool CommitterPrepare();
+    static constexpr std::uint8_t CommitterPrepareTag = 1 + static_cast<std::uint8_t>(CommitKind::Count);
     static void NoteDrawKey(std::uint64_t key, std::uint64_t shape);
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     void Stop();
@@ -77,6 +80,14 @@ public:
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
 private:
+    struct RingReads {
+        DrawPipeline& pipeline;
+        std::uint64_t token = 0;
+        explicit RingReads(DrawPipeline& pipeline) : pipeline(pipeline) {}
+        RingReads(const RingReads&) = delete;
+        RingReads& operator=(const RingReads&) = delete;
+        ~RingReads();
+    };
     struct Item {
         Commit commit;
         std::vector<Range> writes;
@@ -87,6 +98,8 @@ private:
         bool store = false;
         CommitKind kind = CommitKind::Other;
         std::uint64_t sequence = 0;
+        Commit prepare;
+        std::shared_ptr<RingReads> ringReads;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -97,11 +110,23 @@ private:
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
+    void holdRingReads(Item& item);
+    void restoreRingReads(Item& item);
+    void releaseRingReads(std::uint64_t token);
+    void runPrepare(Item& item);
 
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    std::mutex ringReadsMutex;
+    std::deque<std::pair<std::uint64_t, std::vector<Range>>> ringHeldReads;
+    std::uint64_t ringReadTokens = 0;
+    std::atomic<std::uint64_t> preparedPushes{0};
+    std::atomic<std::uint64_t> ringReadPushes{0};
+    std::atomic<std::uint64_t> prepareRuns{0};
+    std::atomic<std::uint64_t> prepareRunNs{0};
+    std::atomic<std::uint64_t> preparedPushNs{0};
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
     std::exception_ptr failure;

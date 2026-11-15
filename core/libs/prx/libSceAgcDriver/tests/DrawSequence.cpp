@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -149,8 +151,17 @@ void ForwardsDoNotWaitForEarlierDraws() {
     Require(!pipeline.Overlaps(Base + 0x5008, 4) && pipeline.StoredBytes(Base + 0x80, 4, {}) == DrawPipeline::QueuedWrite::None, "committed items stayed visible");
 }
 
+struct CommitterPrepareSwitch {
+    bool previous;
+    explicit CommitterPrepareSwitch(bool set) : previous(AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::RingCommitterPrepare)) {
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::RingCommitterPrepare, set);
+    }
+    ~CommitterPrepareSwitch() { AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::RingCommitterPrepare, previous); }
+};
+
 void ReadsDoNotWaitInTheRing() {
     if (!DrawFinisher::Sequenced()) return;
+    const CommitterPrepareSwitch prepareSwitch(false);
     Log log;
     Gate gate;
     gate.Close();
@@ -351,6 +362,142 @@ void AbWindowReportsTheSettledPhase() {
     Require(log.committed == log.expected, "draws around the A/B window committed out of order");
 }
 
+struct PreparedDraw {
+    std::atomic<bool> prepared{false};
+    std::atomic<bool> preparedBeforeCommit{false};
+    std::thread::id preparer;
+};
+
+void EnqueuePrepared(Log& log, int index, PreparedDraw& draw, std::vector<DrawPipeline::Range> reads = {}) {
+    log.expected.emplace_back(Kind::Draw, index);
+    DrawPipeline::Queue0().EnqueuePrepared(Kind::Draw, [&log, index, &draw] {
+        draw.preparedBeforeCommit.store(draw.prepared.load(std::memory_order_acquire), std::memory_order_release);
+        log.Commit(Kind::Draw, index);
+    }, [&draw] {
+        draw.preparer = std::this_thread::get_id();
+        draw.prepared.store(true, std::memory_order_release);
+    }, {{Base + 0x1000, Base + 0x2000}}, std::move(reads));
+}
+
+void PreparedDrawsArePreparedOnTheRing() {
+    if (!DrawFinisher::Sequenced()) return;
+    for (const bool on : {true, false}) {
+        const CommitterPrepareSwitch prepareSwitch(on);
+        static_cast<void>(DrawFinisher::Get().Ring().TakeCounters());
+        const auto issuedBefore = DrawFinisher::Get().Ring().Issued();
+        Log log;
+        PreparedDraw first;
+        PreparedDraw second;
+        EnqueuePrepared(log, 0, first);
+        Forward(log, Kind::EndOfPipe, 1, Base + 0x40, Bytes(7));
+        EnqueuePrepared(log, 2, second);
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        const auto counters = DrawFinisher::Get().Ring().TakeCounters();
+        const auto issued = DrawFinisher::Get().Ring().Issued() - issuedBefore;
+        const auto ringed = issued - counters.bypassed;
+        Require(log.committed == log.expected, std::string("prepared draws and a label committed out of issue order with the committer prepare switch ") + (on ? "on" : "off"));
+        if (on) {
+            Require(first.prepared.load() && second.prepared.load(), "a draw pushed for a preparer plan was not prepared");
+            Require(first.preparedBeforeCommit.load() && second.preparedBeforeCommit.load(), "a prepared draw was committed before its preparation ran");
+            Require(first.preparer != std::this_thread::get_id() && second.preparer != std::this_thread::get_id(), "a prepared draw was prepared on the worker instead of a ring preparer");
+            Require(issued == 3 && ringed >= 2, "a draw with a preparation went straight to the committer with the switch on (" + std::to_string(ringed) + " pushed, " + std::to_string(counters.bypassed) + " bypassed)");
+            if (std::getenv("APS5_PIPELINE_STATS") != nullptr) Require(counters.residency[DrawPipeline::CommitterPrepareTag].items == 2, "the prepared draws' residency was not counted under the committer prepare tag");
+        } else {
+            Require(!first.prepared.load() && !second.prepared.load(), "a draw ran its preparation with the committer prepare switch off");
+            Require(issued == 3 && ringed == 0, "with the switch off, items on an idle ring did not go straight to the committer (" + std::to_string(ringed) + " pushed, " + std::to_string(counters.bypassed) + " bypassed)");
+        }
+    }
+}
+
+void QueuedReadsInTheRingAreHeld() {
+    if (!DrawFinisher::Sequenced()) return;
+    const CommitterPrepareSwitch prepareSwitch(true);
+    Log log;
+    Gate gate;
+    gate.Close();
+    Draw(log, 0, &gate);
+    PreparedDraw prepared;
+    EnqueuePrepared(log, 1, prepared, {{Base + 0x7000, Base + 0x7100}});
+    log.expected.emplace_back(Kind::Draw, 2);
+    DrawPipeline::Queue0().Enqueue(Kind::Draw, [&log] { log.Commit(Kind::Draw, 2); }, {}, 0, {}, {{Base + 0x8000, Base + 0x8100}}, true);
+    Require(DrawFinisher::Busy() && DrawFinisher::Get().Ring().Waiting() >= 3, "a reading item waited for a held draw with the committer prepare switch on instead of taking its place in the ring");
+    Require(DrawPipeline::HeldReads(Base + 0x7040, 4), "the reads of a prepared draw waiting in the ring are not held");
+    Require(DrawPipeline::HeldReads(Base + 0x80f0, 0x20), "the reads of an unprepared draw waiting in the ring are not held");
+    Require(!DrawPipeline::HeldReads(Base + 0x7100, 0x100), "a range past the ring items' reads is held");
+    gate.Open();
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    Require(log.committed == log.expected, "reading items behind a held draw committed out of order");
+    Require(prepared.preparedBeforeCommit.load(), "a prepared draw behind a held draw was committed before its preparation");
+    Require(!DrawPipeline::HeldReads(Base + 0x7040, 4) && !DrawPipeline::HeldReads(Base + 0x80f0, 0x20), "committed items' reads stayed held");
+}
+
+void CancelledRingItemsReleaseTheirReads() {
+    if (!DrawFinisher::Sequenced()) return;
+    const CommitterPrepareSwitch prepareSwitch(true);
+    Log log;
+    Gate gate;
+    gate.Close();
+    DrawFinisher::Get().Enqueue([&gate] {
+        gate.Pass();
+        throw std::runtime_error("older preparation failed");
+    }, {});
+    PreparedDraw prepared;
+    EnqueuePrepared(log, 0, prepared, {{Base + 0x7000, Base + 0x7100}});
+    Require(DrawPipeline::HeldReads(Base + 0x7040, 4), "the reads of a prepared draw behind a held preparation are not held");
+    gate.Open();
+    bool thrown = false;
+    try {
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    } catch (const std::runtime_error& error) {
+        thrown = std::string(error.what()) == "older preparation failed";
+    }
+    Require(thrown, "the older preparation's failure was not rethrown");
+    WaitUntil([] { return !DrawFinisher::Busy(); }, "the cancelled items to leave the ring");
+    Require(log.committed.empty(), "a draw behind a failed preparation was committed");
+    Require(!DrawPipeline::HeldReads(Base + 0x7040, 4), "a cancelled prepared draw's reads stayed held");
+    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+}
+
+void Spin(std::chrono::nanoseconds duration) {
+    const auto until = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < until) {
+    }
+}
+
+void BenchCommitterPrepare(std::size_t count, std::chrono::nanoseconds worker, std::chrono::nanoseconds committer) {
+    Require(DrawFinisher::Sequenced(), "the committer prepare bench needs the sequence ring");
+    for (const bool on : {false, true, false, true}) {
+        const CommitterPrepareSwitch prepareSwitch(on);
+        static_cast<void>(DrawFinisher::Get().Ring().TakeCounters());
+        const auto issuedBefore = DrawFinisher::Get().Ring().Issued();
+        std::atomic<std::size_t> committed{0};
+        std::atomic<std::size_t> prepared{0};
+        std::atomic<std::uint64_t> latencyNs{0};
+        std::uint64_t enqueueNs = 0;
+        std::uint64_t slowest = 0;
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t index = 0; index < count; ++index) {
+            Spin(worker);
+            const auto pushed = std::chrono::steady_clock::now();
+            DrawPipeline::Queue0().EnqueuePrepared(Kind::Draw, [&committed, &latencyNs, pushed, committer] {
+                latencyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pushed).count()), std::memory_order_relaxed);
+                Spin(committer);
+                committed.fetch_add(1, std::memory_order_relaxed);
+            }, [&prepared] { prepared.fetch_add(1, std::memory_order_relaxed); }, {{Base + 0x1000, Base + 0x2000}}, {{Base + 0x3000, Base + 0x3100}});
+            const auto call = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - pushed).count());
+            enqueueNs += call;
+            slowest = std::max(slowest, call);
+        }
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+        const auto done = std::chrono::steady_clock::now();
+        const auto counters = DrawFinisher::Get().Ring().TakeCounters();
+        const auto ringed = DrawFinisher::Get().Ring().Issued() - issuedBefore - counters.bypassed;
+        Require(committed.load() == count && prepared.load() == (on ? count : 0), "the committer prepare bench lost items");
+        const auto items = static_cast<double>(count);
+        std::cout << "committer prepare " << (on ? "on " : "off") << ": " << count << " items, enqueue " << static_cast<double>(enqueueNs) / items << " ns/item (slowest " << slowest << " ns), push to commit " << static_cast<double>(latencyNs.load()) / items << " ns/item, total " << static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(done - start).count()) / items << " ns/item, " << ringed << " through the ring, preparer busy " << (counters.worked == 0 ? 0.0 : static_cast<double>(counters.busyWallNs) / static_cast<double>(counters.worked)) << " ns/item, " << counters.fullWaits << " waits for room\n";
+    }
+}
+
 void FailedPrepareReachesTheWorker() {
     Log log;
     DrawFinisher::Get().Enqueue([] { throw std::runtime_error("prepare failed"); }, {});
@@ -385,14 +532,22 @@ void DriverThreadsAreNamed() {
 #endif
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
         if (DrawPipeline::Depth() == 0) return 77;
         if (!DrawFinisher::Overlap()) throw std::runtime_error("the draw finisher is disabled; set APS5_DRAW_PIPELINE");
         DrawPipeline::Active() = true;
+        if (argc > 1) {
+            Require(argc == 5 && std::string(argv[1]) == "--bench-committer-prepare", "usage: [--bench-committer-prepare <items> <worker ns per item> <committer ns per item>]");
+            BenchCommitterPrepare(std::stoul(argv[2]), std::chrono::nanoseconds(std::stoul(argv[3])), std::chrono::nanoseconds(std::stoul(argv[4])));
+            return 0;
+        }
         MixedItemsCommitInIssueOrder();
         ForwardsDoNotWaitForEarlierDraws();
         ReadsDoNotWaitInTheRing();
+        PreparedDrawsArePreparedOnTheRing();
+        QueuedReadsInTheRingAreHeld();
+        CancelledRingItemsReleaseTheirReads();
         FailedPrepareReachesTheWorker();
         IdleDrainRethrowsAFailedPreparation();
         ResidencyIsCountedByKind();

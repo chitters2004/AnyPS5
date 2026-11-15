@@ -1770,6 +1770,116 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     return plan;
 }
 
+}
+
+struct PlannedDraw {
+    VkDevice device = VK_NULL_HANDLE;
+    DrawPlan plan;
+    bool validateMemoized = false;
+    bool validateHit = false;
+    std::uint64_t planNs = 0;
+};
+
+namespace {
+
+struct PlannedDrawCounters {
+    alignas(64) std::atomic<std::uint64_t> planned{0};
+    std::atomic<std::uint64_t> failed{0};
+    std::atomic<std::uint64_t> planNs{0};
+    alignas(64) std::atomic<std::uint64_t> used{0};
+    std::atomic<std::uint64_t> otherDevice{0};
+    std::atomic<std::uint64_t> missing{0};
+    std::atomic<std::uint64_t> usedPlanNs{0};
+    std::atomic<std::uint64_t> inlinePlans{0};
+    std::atomic<std::uint64_t> inlinePlanNs{0};
+};
+
+PlannedDrawCounters& plannedDrawCounters() {
+    static PlannedDrawCounters counters;
+    return counters;
+}
+
+bool profilePlans() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::uint64_t nsSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+DrawPlan takePlan(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::shared_ptr<PlannedDraw>* planned, const std::vector<std::uint32_t>* earlyKey, DrawOutcome& outcome, DrawTimer& timer) {
+    auto& counters = plannedDrawCounters();
+    if (planned != nullptr) {
+        auto taken = std::exchange(*planned, nullptr);
+        if (taken == nullptr) {
+            counters.missing.fetch_add(1, std::memory_order_relaxed);
+        } else if (taken->device != context.device) {
+            counters.otherDevice.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            counters.used.fetch_add(1, std::memory_order_relaxed);
+            counters.usedPlanNs.fetch_add(taken->planNs, std::memory_order_relaxed);
+            outcome.validateMemoized = taken->validateMemoized;
+            outcome.validateHit = taken->validateHit;
+            return std::move(taken->plan);
+        }
+    }
+    if (!profilePlans()) return planDraw(context, state, draw, shaders, nullptr, outcome, timer, earlyKey);
+    const auto start = std::chrono::steady_clock::now();
+    auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, earlyKey);
+    counters.inlinePlans.fetch_add(1, std::memory_order_relaxed);
+    counters.inlinePlanNs.fetch_add(nsSince(start), std::memory_order_relaxed);
+    return plan;
+}
+
+}
+
+std::shared_ptr<PlannedDraw> PlanDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    auto& counters = plannedDrawCounters();
+    const bool profile = profilePlans();
+    const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto planned = std::make_shared<PlannedDraw>();
+    DrawOutcome outcome;
+    DrawTimer timer(false);
+    try {
+        planned->plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer);
+    } catch (const std::exception&) {
+        counters.failed.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    planned->device = context.device;
+    planned->validateMemoized = outcome.validateMemoized;
+    planned->validateHit = outcome.validateHit;
+    if (profile) {
+        planned->planNs = nsSince(start);
+        counters.planNs.fetch_add(planned->planNs, std::memory_order_relaxed);
+    }
+    counters.planned.fetch_add(1, std::memory_order_relaxed);
+    return planned;
+}
+
+void SetPlannedDrawDeviceForTest(PlannedDraw& planned, VkDevice device) {
+    planned.device = device;
+}
+
+PlannedDrawCounts TakePlannedDrawCounts() {
+    auto& counters = plannedDrawCounters();
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_relaxed); };
+    PlannedDrawCounts counts;
+    counts.planned = take(counters.planned);
+    counts.failed = take(counters.failed);
+    counts.used = take(counters.used);
+    counts.otherDevice = take(counters.otherDevice);
+    counts.missing = take(counters.missing);
+    counts.planNs = take(counters.planNs);
+    counts.usedPlanNs = take(counters.usedPlanNs);
+    counts.inlinePlans = take(counters.inlinePlans);
+    counts.inlinePlanNs = take(counters.inlinePlanNs);
+    return counts;
+}
+
+namespace {
+
 bool VerifyDrawPlan() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLAN") != nullptr;
     return verify;
@@ -3241,6 +3351,7 @@ struct PreparedDraw {
     SampleOrderPass reorderPass;
     std::optional<DepthSampleLocations> depthLocations;
     std::shared_ptr<std::shared_ptr<const void>> spaceKeep;
+    std::shared_ptr<PlannedDraw>* planned = nullptr;
 };
 
 void keepHeldSpace(PreparedDraw& prepared) {
@@ -3583,7 +3694,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& ownWaitedMs = prepared.ownWaitedMs;
     const auto report = [&](const char* suffix) { reportDrawEnd(state, timer, built, outcome, waitedBefore, ownWaitedMs, suffix); };
     auto& inputs = prepared.inputs;
-    const auto plan = planDraw(context, state, draw, shaders, nullptr, outcome, timer, prepared.contentKey);
+    const auto plan = takePlan(context, state, draw, shaders, prepared.planned, prepared.contentKey, outcome, timer);
     if (plan.nothing) return false;
     inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
     if (inputs.nothing) {
@@ -4455,7 +4566,7 @@ std::vector<std::uint32_t> DrawResourceContentKey(const Context& context, const 
     return DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
 }
 
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey, std::shared_ptr<PlannedDraw>* planned) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
@@ -4490,6 +4601,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     prepared.shape = shape;
     prepared.contentKey = contentKey;
     prepared.passAttachments = PassAttachmentMemoEnabled();
+    prepared.planned = planned;
     const struct HeldSpace {
         PreparedDraw& prepared;
         ~HeldSpace() {
