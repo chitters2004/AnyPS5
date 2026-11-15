@@ -111,7 +111,7 @@ jobs:
 
   mark-stack:
     needs: [check-stack, warm-stack]
-    if: ${{ needs.warm-stack.result == 'success' }}
+    if: ${{ needs.warm-stack.result == 'success' || needs.warm-stack.result == 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -123,9 +123,11 @@ jobs:
           path: marker
           key: warm-stack-done-${{ needs.check-stack.outputs.sha }}
 
+  # A warm builds with -k 0, so a failed one still cached everything that compiles: mark it done for this sha too,
+  # or a file broken on main makes every scheduled run rebuild the same commit.
   mark:
     needs: [check, warm]
-    if: ${{ needs.warm.result == 'success' }}
+    if: ${{ needs.warm.result == 'success' || needs.warm.result == 'failure' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
