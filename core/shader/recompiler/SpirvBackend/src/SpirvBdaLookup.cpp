@@ -41,19 +41,26 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranch, outerBody);
     EmitLabel(state, outerBody);
     std::vector<std::uint32_t> exits{spv::OpPhi, resultType, state.module.AllocateId()};
-    const auto leave = [&](std::uint32_t value) {
+    const bool lean = recordFaults && !LeanBdaPathsDisabled();
+    std::vector<std::uint32_t> reasons{spv::OpPhi, u32, lean ? state.module.AllocateId() : 0u};
+    const auto leaveWith = [&](std::uint32_t value, std::uint32_t reason) {
         exits.push_back(value);
         exits.push_back(state.currentLabel);
+        if (lean) {
+            reasons.push_back(reason);
+            reasons.push_back(state.currentLabel);
+        }
         state.module.AddFunction(spv::OpBranch, outerMerge);
     };
+    const auto leave = [&](std::uint32_t value) { leaveWith(value, lean ? constant(0u) : 0u); };
     const auto leaveIf = [&](std::uint32_t condition, std::uint32_t reason) {
         const auto failed = state.module.AllocateId();
         const auto next = state.module.AllocateId();
         state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
         state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
         EmitLabel(state, failed);
-        if (recordFaults) RecordBdaFaultReason(state, address, bytes, instruction, reason);
-        leave(zero);
+        if (recordFaults && !lean) RecordBdaFaultReason(state, address, bytes, instruction, reason);
+        leaveWith(zero, lean ? reason : 0u);
         EmitLabel(state, next);
     };
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) { leaveIf(condition, recordFaults ? constant(static_cast<std::uint32_t>(reason)) : 0u); };
@@ -139,6 +146,10 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranch, outer);
     EmitLabel(state, outerMerge);
     state.module.AddFunction(exits);
+    if (lean) {
+        state.module.AddFunction(reasons);
+        EmitIfCondition(state, binary(spv::OpINotEqual, boolean, reasons[2], constant(0u)), [&] { RecordBdaFaultReason(state, address, bytes, instruction, reasons[2]); });
+    }
     state.module.AddFunction(spv::OpReturnValue, exits[2]);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;

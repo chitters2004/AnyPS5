@@ -207,6 +207,25 @@ std::uint32_t CallSites(const std::vector<std::uint32_t>& spirv, const char* nam
     return calls;
 }
 
+std::uint32_t CallSitesIn(const std::vector<std::uint32_t>& spirv, const char* callee, const char* caller) {
+    std::uint32_t target = 0;
+    std::uint32_t from = 0;
+    for (std::size_t at = 5; at < spirv.size() && (spirv[at] >> 16u) != 0u; at += spirv[at] >> 16u) {
+        if ((spirv[at] & 0xffffu) != spv::OpName) continue;
+        const auto* name = reinterpret_cast<const char*>(&spirv[at + 2u]);
+        if (std::strcmp(name, callee) == 0) target = spirv[at + 1u];
+        if (std::strcmp(name, caller) == 0) from = spirv[at + 1u];
+    }
+    std::uint32_t function = 0;
+    std::uint32_t calls = 0;
+    for (std::size_t at = 5; at < spirv.size() && (spirv[at] >> 16u) != 0u; at += spirv[at] >> 16u) {
+        const auto opcode = spirv[at] & 0xffffu;
+        if (opcode == spv::OpFunction) function = spirv[at + 2u];
+        if (opcode == spv::OpFunctionCall && target != 0u && from != 0u && function == from && spirv[at + 3u] == target) ++calls;
+    }
+    return calls;
+}
+
 std::pair<std::uint32_t, std::uint32_t> LoopsKeptRolled(const std::vector<std::uint32_t>& spirv, const char* name) {
     std::uint32_t target = 0;
     for (std::size_t at = 5; at < spirv.size() && (spirv[at] >> 16u) != 0u; at += spirv[at] >> 16u) {
@@ -311,6 +330,19 @@ void RunBdaContractTests() {
     AgcDriver::Graphics::Require(ordered({}) && ordered({{0x1000, 0x2000, 1, 1, 0}, {0x2000, 0x2000, 1, 1, 0}, {0x2000, 0x3000, 1, 1, 0}, {0x4000, 0x5000, 1, 1, 0}}), "ascending BDA ranges were refused");
     AgcDriver::Graphics::Require(ordered({{0x1000, 0x3000, 1, 1, 0}, {0x2f00, 0x3100, 1, 1, 0}}), "BDA ranges ascending by begin and overlapping were refused");
     AgcDriver::Graphics::Require(!ordered({{0x4000, 0x5000, 1, 1, 0}, {0x1000, 0x2000, 1, 1, 0}}), "unsorted BDA ranges were accepted");
+    const std::array<std::uint32_t, 4> stores{1u, 2u, 3u, 4u};
+    const bool lean = !LeanBdaPathsDisabled();
+    for (std::uint32_t dwords = 2; dwords <= 4; ++dwords) {
+        const auto shader = MakeBdaDwordWriteTestShader(0x7fff12340001ULL, dwords, stores.data());
+        const auto text = std::to_string(dwords) + "-dword BDA write";
+        for (const auto* lookup : {"get_bda_pointer", "get_bda_write_pointer"}) {
+            const auto records = CallSitesIn(shader, "record_bda_fault", lookup);
+            AgcDriver::Graphics::Require(lean ? records == 1u : records > 1u, "a " + text + " records faults at " + std::to_string(records) + " sites in " + lookup + (lean ? ", not once at its exit" : ", not at each failed check under APS5_NO_LEAN_BDA_PATHS"));
+        }
+        const auto lookups = CallSites(shader, "get_bda_write_pointer");
+        const auto notes = CallSites(shader, "note_bda_write");
+        AgcDriver::Graphics::Require(lookups == (lean ? 2u : 1u + dwords) && notes == (lean ? 4u : 3u + dwords), "a " + text + " has " + std::to_string(lookups) + " write lookups and " + std::to_string(notes) + " written-page notes" + (lean ? ", not one store body in its fallback loop" : ", not one fallback store per dword under APS5_NO_LEAN_BDA_PATHS"));
+    }
     for (const std::uint32_t bits : {8u, 16u, 32u}) {
         const auto shader = MakeBdaWriteTestShader(0x7fff1235fffdULL, 0xa1b2c3d4u, bits, false);
         const auto lookups = CallSites(shader, "get_bda_write_pointer");

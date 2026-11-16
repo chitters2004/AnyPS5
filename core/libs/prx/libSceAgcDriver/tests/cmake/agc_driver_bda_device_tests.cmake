@@ -29,6 +29,13 @@ endif()
 
 if(BUILD_TESTING)
     agc_add_default_test(agc_driver_bda_device_tests)
+    add_test(NAME agc_driver_bda_device_no_lean_paths COMMAND agc_driver_bda_device_tests)
+    set_tests_properties(agc_driver_bda_device_no_lean_paths PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_LEAN_BDA_PATHS=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_bda_device_no_lean_paths PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_bda_device_selection_cpu COMMAND agc_driver_bda_device_tests --device-selection-cpu)
     set_tests_properties(agc_driver_bda_device_selection_cpu PROPERTIES
             ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")

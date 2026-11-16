@@ -148,7 +148,7 @@ static void RunWrittenRangeDecodeTests() {
     Require(!decode(), "more claims than slots were accepted");
 }
 
-static void RunBdaDwordWriteTests(const Context& context) {
+void RunBdaDwordWriteExecutionTests(const Context& context) {
     RunWrittenRangeDecodeTests();
     namespace Abi = ShaderRecompiler::BdaAbi;
     constexpr std::uint64_t guest = 0x7fff12340f80ULL;
@@ -226,6 +226,7 @@ static void RunBdaDwordWriteTests(const Context& context) {
     write(guest + 41, 4, 16, static_cast<Abi::FaultReason>(0));
     write(guest + firstBytes - 8, 4, 16, static_cast<Abi::FaultReason>(0));
     write(guest + firstBytes + 12, 4, 4, Abi::FaultReason::Permission);
+    write(guest + firstBytes + 8, 4, 8, Abi::FaultReason::Permission);
     write(guest + 0x7c, 2, 8, static_cast<Abi::FaultReason>(0), 64);
 }
 
@@ -543,7 +544,6 @@ void RunBdaExecutionTests(const Context& context) {
     sequence({Abi::FaultReason::Unaligned, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unaligned, 0);
     sequence({Abi::FaultReason::Unaligned, Abi::FaultReason::Unmapped}, Abi::FaultReason::Unaligned, 1);
     sequence({Abi::FaultReason::Unmapped, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unmapped, 1);
-    RunBdaDwordWriteTests(context);
     RunBdaAnchorTests(context);
 }
 

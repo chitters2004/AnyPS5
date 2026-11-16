@@ -362,6 +362,11 @@ bool BdaByteReadsForced() {
     return forced;
 }
 
+bool LeanBdaPathsDisabled() {
+    static const bool disabled = std::getenv("APS5_NO_LEAN_BDA_PATHS") != nullptr;
+    return disabled;
+}
+
 std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords) {
     const auto all = (1u << dwords) - 1u;
     if (dwords == 1u) return all;
@@ -765,7 +770,37 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
         addresses[dword] = AddBdaImmediate(ctx, inst, address, static_cast<std::int32_t>(offset + dword * 4u));
     }
     const auto storeDwords = [&] {
-        for (std::uint32_t dword = 0; dword < dwords; ++dword) EmitBdaStore(ctx, inst, addresses[dword], values[dword], 32u);
+        if (LeanBdaPathsDisabled()) {
+            for (std::uint32_t dword = 0; dword < dwords; ++dword) EmitBdaStore(ctx, inst, addresses[dword], values[dword], 32u);
+            return;
+        }
+        const auto entry = state.currentLabel;
+        const auto header = state.module.AllocateId();
+        const auto body = state.module.AllocateId();
+        const auto continuation = state.module.AllocateId();
+        const auto loopMerge = state.module.AllocateId();
+        const auto index = state.module.AllocateId();
+        const auto next = state.module.AllocateId();
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, header);
+        state.module.AddFunction(spv::OpPhi, u32, index, ConstantU32(state, 0u), entry, next, continuation);
+        const auto more = Binary(state, spv::OpULessThan, boolean, index, ConstantU32(state, dwords));
+        state.module.AddFunction(spv::OpLoopMerge, loopMerge, continuation, spv::LoopControlDontUnrollMask);
+        state.module.AddFunction(spv::OpBranchConditional, more, body, loopMerge);
+        EmitLabel(state, body);
+        auto chosenAddress = addresses[0];
+        auto chosenValue = values[0];
+        for (std::uint32_t dword = 1; dword < dwords; ++dword) {
+            const auto is = Binary(state, spv::OpIEqual, boolean, index, ConstantU32(state, dword));
+            chosenAddress = Select(state, u64, is, addresses[dword], chosenAddress);
+            chosenValue = Select(state, u32, is, values[dword], chosenValue);
+        }
+        EmitBdaStore(ctx, inst, chosenAddress, chosenValue, 32u);
+        state.module.AddFunction(spv::OpBranch, continuation);
+        EmitLabel(state, continuation);
+        state.module.AddFunction(spv::OpIAdd, u32, next, index, ConstantU32(state, 1u));
+        state.module.AddFunction(spv::OpBranch, header);
+        EmitLabel(state, loopMerge);
     };
     if (state.bdaWriteProbeFunction == 0) {
         storeDwords();
