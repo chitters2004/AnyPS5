@@ -7539,7 +7539,6 @@ void ShaderResources::prepareFaultSlot() const {
     const auto* recorder = Recorder::Active();
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
     if (!bda->TakeFaultSlot(context)) return;
-    drawSetCache->Clear();
     std::vector<VkWriteDescriptorSet> writes;
     writes.reserve(faultDescriptors.size());
     for (const auto& fault : faultDescriptors) {
