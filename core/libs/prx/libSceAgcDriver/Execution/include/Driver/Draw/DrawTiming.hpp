@@ -33,7 +33,7 @@ struct ThreadPhaseTotals {
     static constexpr std::size_t Threads = static_cast<std::size_t>(PhaseThread::Count);
     static constexpr std::size_t Groups = static_cast<std::size_t>(PhaseGroup::Count);
     std::array<std::array<std::uint64_t, Groups>, Threads> groupNs{};
-    std::array<std::uint64_t, Threads> drawNs{}, draws{};
+    std::array<std::uint64_t, Threads> lapNs{}, drawNs{}, draws{};
     std::uint64_t busyNs = 0, submissions = 0, windowNs = 0;
 };
 
