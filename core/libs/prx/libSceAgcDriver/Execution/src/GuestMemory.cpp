@@ -2986,8 +2986,13 @@ void noteBreak(ProofBreakSite site) {
 }
 }
 
+bool ScopedProofBreaks() {
+    static const bool scoped = std::getenv("APS5_NO_SCOPED_PROOFS") == nullptr;
+    return scoped;
+}
+
 bool ProofBreaksLogged() {
-    static const bool logged = ProofBreaksCounted();
+    static const bool logged = ProofBreaksCounted() || ScopedProofBreaks();
     return logged;
 }
 

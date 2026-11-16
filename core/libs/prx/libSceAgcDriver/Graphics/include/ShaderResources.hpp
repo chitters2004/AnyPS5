@@ -858,6 +858,7 @@ private:
     bool flushUnscoped = true;
     std::uint64_t planesClean = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    bool provedRanges = false;
     void recordFlushRanges();
     void recordProofRanges();
     bool stalePlanesRead();

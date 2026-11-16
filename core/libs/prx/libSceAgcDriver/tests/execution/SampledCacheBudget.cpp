@@ -779,7 +779,10 @@ void epochProofLogTests(Context context) {
     } release{resources, context.device};
     Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the proof-log template is not reusable");
     ShaderResources::ProofReport report{};
-    const auto exitTaken = [&] { return resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None; };
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
     const auto settle = [&](const char* label) {
         for (int round = 0; round < 3; ++round) {
             if (exitTaken()) return;
@@ -809,6 +812,8 @@ void epochProofLogTests(Context context) {
     Require(!nearPacket, "a packet break over the set's surface let the exit through");
     Require(!unrangedPacket, "a packet break without declared writes let the exit through");
     Require(!distantStore, "a driver store, which the log does not scope, let the exit through");
+    if (AgcDriver::GuestMemory::ScopedProofBreaks()) Require(distantWritten && distantPacket, "a break outside the set kept it from the exit with scoped proofs on");
+    else Require(!distantWritten && !distantPacket, "a break outside the set let the exit through with scoped proofs off");
     std::fprintf(stderr, "proof log: outside breaks kept the exit: marked written %s, packet %s\n", distantWritten ? "yes" : "no", distantPacket ? "yes" : "no");
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
 }
