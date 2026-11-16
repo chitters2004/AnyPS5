@@ -3104,7 +3104,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
+        const auto inFlight = recorder.InFlightBatches();
+        recorder.Reap();
+        LabelPhases::CountLabelReap(inFlight, recorder.InFlightBatches());
+    }
     LabelPhases::Mark(LabelPhases::Phase::Reap);
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;

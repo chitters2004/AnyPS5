@@ -11,6 +11,7 @@
 #include <windows.h>
 #endif
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <numeric>
 #include <span>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -97,19 +99,29 @@ int main() {
             std::printf("skipped, the device does not import guest memory\n");
             return VulkanTestSkipped;
         }
+        device->SubmitRecorded(false);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::memcmp(labels.bytes + 4096, pattern.data(), sizeof(pattern)) != 0) {
+            Require(std::chrono::steady_clock::now() < deadline, "label phases: the submitted fill never landed");
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        const std::uint32_t opening = 0x5a5a0000u;
+        Require(device->WriteLabelOnGpu(labels.Address(), std::as_bytes(std::span(&opening, 1)), 100, 0, false) == 0, "label phases: the label opening a batch behind the finished one was not stored on the GPU");
         Require(CommitShaped(*device, labels.Address() + 4, 0x5a5a0001u, 1) == 0, "label phases: the label was not stored on the GPU");
         Require(Store(*device, labels.Address() + 8, 0x5a5a0002u, 2) == 0, "label phases: the unframed label was not stored on the GPU");
         Phases::CountReapTry(Phases::ReapTry::Failed, 3000);
         Phases::CountReapTry(Phases::ReapTry::Reaped, 5000000);
         const auto totals = Phases::Take();
         RequireSplit(totals, 1);
+        Require(totals.labelReaps == 1 && totals.labelReapsWithWork == 1 && totals.labelReapRetired == 1 && totals.labelReapInFlight == 1, ("label phases: the in-label reap over one finished batch counted " + std::to_string(totals.labelReaps) + " reaps, " + std::to_string(totals.labelReapsWithWork) + " with work, " + std::to_string(totals.labelReapRetired) + " retired of " + std::to_string(totals.labelReapInFlight) + " in flight").c_str());
         const auto line = Phases::Line(totals);
-        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos && line.find("; pre detail: drawn-linear ") != std::string::npos && line.find(" readback ") != std::string::npos;
+        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos && line.find("; pre detail: drawn-linear ") != std::string::npos && line.find(" readback ") != std::string::npos && line.find("; in-label reaps: 1, 1 retired a batch (1 batches), 1 batches in flight before them") != std::string::npos;
         Require(shaped, ("label phases: unexpected report line: " + line).c_str());
         Require(Phases::Take().labels == 0, "label phases: a taken window was counted again");
         Phases::SetEnabled(false);
         Require(CommitShaped(*device, labels.Address() + 12, 0x5a5a0003u, 3) == 0, "label phases: the disabled label was not stored on the GPU");
         const auto disabled = Phases::Take();
+        Require(disabled.labelReaps == 0, "label phases: an in-label reap was counted while disabled");
         Require(disabled.preCalls[0] == 0 && disabled.preCalls[1] == 0, "label phases: pre detail was timed while disabled");
         Require(disabled.labels == 0 && disabled.holdNs == 0 && std::accumulate(disabled.counts.begin(), disabled.counts.end(), std::uint64_t{0}) == 0, "label phases: a label was timed while disabled");
         device->SubmitRecorded(true);

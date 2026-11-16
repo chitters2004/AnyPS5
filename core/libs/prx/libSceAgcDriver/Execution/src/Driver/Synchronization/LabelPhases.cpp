@@ -26,6 +26,10 @@ struct Counters {
     ProfileCounter drawnStored;
     ProfileCounter readbackScanned;
     ProfileCounter readbackFlushed;
+    ProfileCounter labelReaps;
+    ProfileCounter labelReapsWithWork;
+    ProfileCounter labelReapRetired;
+    ProfileCounter labelReapInFlight;
 };
 
 Counters& Shared() {
@@ -106,6 +110,15 @@ void CountReadback(std::uint64_t scanned, std::uint64_t flushed) {
     Shared().readbackFlushed.Add(flushed);
 }
 
+void CountLabelReap(std::uint64_t inFlightBefore, std::uint64_t inFlightAfter) {
+    if (!open.active) return;
+    const auto retired = inFlightBefore > inFlightAfter ? inFlightBefore - inFlightAfter : 0;
+    Shared().labelReaps.Add();
+    if (retired != 0) Shared().labelReapsWithWork.Add();
+    Shared().labelReapRetired.Add(retired);
+    Shared().labelReapInFlight.Add(inFlightBefore);
+}
+
 PreTimer::PreTimer(PreSlot slot) : slot(slot), on(open.active) {
     if (on) started = SteadyNs();
 }
@@ -137,6 +150,10 @@ Totals Take() {
     totals.drawnStored = shared.drawnStored.Take();
     totals.readbackScanned = shared.readbackScanned.Take();
     totals.readbackFlushed = shared.readbackFlushed.Take();
+    totals.labelReaps = shared.labelReaps.Take();
+    totals.labelReapsWithWork = shared.labelReapsWithWork.Take();
+    totals.labelReapRetired = shared.labelReapRetired.Take();
+    totals.labelReapInFlight = shared.labelReapInFlight.Take();
     return totals;
 }
 
@@ -155,6 +172,8 @@ std::string Line(const Totals& totals) {
     const auto drawn = static_cast<std::size_t>(PreSlot::DrawnLinear);
     const auto readback = static_cast<std::size_t>(PreSlot::Readback);
     std::snprintf(part.data(), part.size(), "; pre detail: drawn-linear %.2f us/label (%llu calls, %llu stored), readback %.2f us/label (%llu calls, %llu textures scanned, %llu flushed)", static_cast<double>(totals.preNs[drawn]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[drawn]), static_cast<unsigned long long>(totals.drawnStored), static_cast<double>(totals.preNs[readback]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[readback]), static_cast<unsigned long long>(totals.readbackScanned), static_cast<unsigned long long>(totals.readbackFlushed));
+    line += part.data();
+    std::snprintf(part.data(), part.size(), "; in-label reaps: %llu, %llu retired a batch (%llu batches), %llu batches in flight before them", static_cast<unsigned long long>(totals.labelReaps), static_cast<unsigned long long>(totals.labelReapsWithWork), static_cast<unsigned long long>(totals.labelReapRetired), static_cast<unsigned long long>(totals.labelReapInFlight));
     line += part.data();
     std::snprintf(part.data(), part.size(), "; boundary reap tries: %llu reaped (%.2f ms), %llu failed (%.2f ms)\n", static_cast<unsigned long long>(totals.reapTries[reaped]), static_cast<double>(totals.reapTryNs[reaped]) / 1e6, static_cast<unsigned long long>(totals.reapTries[failed]), static_cast<double>(totals.reapTryNs[failed]) / 1e6);
     line += part.data();
