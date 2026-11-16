@@ -13,6 +13,7 @@
 #include <cstring>
 #include <iterator>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <span>
 
@@ -210,17 +211,51 @@ std::size_t dropEveryOther(TMap& map) {
 
 }
 
-bool Driver::MergeDrawRelocation(DrawRelocation& shape, const DrawEntry& entry) {
-    const auto& programs = entry.decode->programs;
-    bool changed = false;
-    const auto ban = [&](std::uint32_t reg) {
-        if (const auto held = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; }); held != shape.words.end()) {
-            shape.words.erase(held);
-            changed = true;
+namespace {
+
+class RelocationEdit {
+public:
+    explicit RelocationEdit(const DrawRelocation& base) : view(&base) {}
+    const DrawRelocation& Shape() const { return *view; }
+    DrawRelocation& Edit() {
+        if (copy == nullptr) {
+            copy = std::make_shared<DrawRelocation>(*view);
+            view = copy.get();
         }
-        if (std::find(shape.banned.begin(), shape.banned.end(), reg) != shape.banned.end()) return;
-        shape.banned.push_back(reg);
-        changed = true;
+        return *copy;
+    }
+    std::shared_ptr<DrawRelocation> Take() { return std::move(copy); }
+
+private:
+    const DrawRelocation* view;
+    std::shared_ptr<DrawRelocation> copy;
+};
+
+const DrawRelocation& EmptyRelocation() {
+    static const DrawRelocation empty;
+    return empty;
+}
+
+std::ptrdiff_t HeldWord(const DrawRelocation& shape, std::uint32_t reg) {
+    const auto held = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
+    return held == shape.words.end() ? -1 : held - shape.words.begin();
+}
+
+bool Banned(const DrawRelocation& shape, std::uint32_t reg) {
+    return std::find(shape.banned.begin(), shape.banned.end(), reg) != shape.banned.end();
+}
+
+}
+
+std::shared_ptr<const DrawRelocation> Driver::MergeDrawRelocation(const std::shared_ptr<const DrawRelocation>& shape, const DrawEntry& entry) {
+    const auto& programs = entry.decode->programs;
+    RelocationEdit edit(shape != nullptr ? *shape : EmptyRelocation());
+    const auto ban = [&](std::uint32_t reg) {
+        if (const auto held = HeldWord(edit.Shape(), reg); held >= 0) {
+            auto& words = edit.Edit().words;
+            words.erase(words.begin() + held);
+        }
+        if (!Banned(edit.Shape(), reg)) edit.Edit().banned.push_back(reg);
     };
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (entry.stages[i].empty()) continue;
@@ -234,7 +269,7 @@ bool Driver::MergeDrawRelocation(DrawRelocation& shape, const DrawEntry& entry) 
                 ban(reg);
                 continue;
             }
-            if (std::find(shape.banned.begin(), shape.banned.end(), reg) != shape.banned.end()) continue;
+            if (Banned(edit.Shape(), reg)) continue;
             RelocatableUserWord word{reg, {}, value};
             for (const auto& [callee, length] : variant.calleeReads) {
                 if (callee != index) continue;
@@ -248,27 +283,26 @@ bool Driver::MergeDrawRelocation(DrawRelocation& shape, const DrawEntry& entry) 
             }
             std::sort(word.reads.begin(), word.reads.end());
             word.reads.erase(std::unique(word.reads.begin(), word.reads.end()), word.reads.end());
-            const auto held = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& kept) { return kept.reg == reg; });
-            if (held == shape.words.end()) {
-                shape.words.push_back(std::move(word));
-                changed = true;
+            const auto held = HeldWord(edit.Shape(), reg);
+            if (held < 0) {
+                edit.Edit().words.push_back(std::move(word));
                 continue;
             }
-            if (held->value != word.value || held->high != word.high) {
+            const auto& kept = edit.Shape().words[static_cast<std::size_t>(held)];
+            if (kept.value != word.value || kept.high != word.high) {
                 ban(reg);
                 continue;
             }
+            if (std::includes(kept.reads.begin(), kept.reads.end(), word.reads.begin(), word.reads.end())) continue;
             std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
-            std::set_union(held->reads.begin(), held->reads.end(), word.reads.begin(), word.reads.end(), std::back_inserter(reads));
-            if (reads.size() == held->reads.size()) continue;
-            held->reads = std::move(reads);
-            changed = true;
+            std::set_union(kept.reads.begin(), kept.reads.end(), word.reads.begin(), word.reads.end(), std::back_inserter(reads));
+            edit.Edit().words[static_cast<std::size_t>(held)].reads = std::move(reads);
         }
     }
-    if (changed) {
-        std::sort(shape.words.begin(), shape.words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
-        std::sort(shape.banned.begin(), shape.banned.end());
-    }
+    auto changed = edit.Take();
+    if (changed == nullptr) return shape != nullptr ? shape : std::make_shared<const DrawRelocation>();
+    std::sort(changed->words.begin(), changed->words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
+    std::sort(changed->banned.begin(), changed->banned.end());
     return changed;
 }
 
@@ -279,9 +313,14 @@ void Driver::learnDrawRelocation(std::uint64_t key, const DrawRelocationSource& 
     const auto& entry = *inserted->second;
     if (entry.stages.size() != entry.decode->programs.size()) return;
     const auto known = drawRelocations.find(source.identity);
-    auto shape = std::make_shared<DrawRelocation>();
-    if (known != drawRelocations.end()) *shape = *known->second;
-    if (MergeDrawRelocation(*shape, entry) || known == drawRelocations.end()) drawRelocations[source.identity] = std::move(shape);
+    const auto current = known != drawRelocations.end() ? known->second : nullptr;
+    auto merged = MergeDrawRelocation(current, entry);
+    if (merged == current) {
+        ++drawRelocationCounters.learnedUnchanged;
+    } else {
+        ++drawRelocationCounters.learnedChanged;
+        drawRelocations.insert_or_assign(source.identity, std::move(merged));
+    }
     if (source.alias == 0) return;
     if (drawAliases.size() >= MaxAliases) drawRelocationCounters.evicted += dropEveryOther(drawAliases);
     drawAliases[source.alias] = key;
@@ -399,7 +438,7 @@ void Driver::patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::
 
 void Driver::reportDrawRelocation() {
     auto& counters = drawRelocationCounters;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; %zu shader sets learned, %zu aliases held (%llu dropped at the limit)\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), drawRelocations.size(), drawAliases.size(), static_cast<unsigned long long>(counters.evicted));
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-relocate] %llu alias lookups: %llu donors with moved user words, %llu refusals, %llu hits through a relocated entry; %zu shader sets learned (%llu inserts changed a learned set, %llu left it unchanged), %zu aliases held (%llu dropped at the limit)\n", static_cast<unsigned long long>(counters.lookups), static_cast<unsigned long long>(counters.donors), static_cast<unsigned long long>(counters.refused), static_cast<unsigned long long>(counters.hits), drawRelocations.size(), static_cast<unsigned long long>(counters.learnedChanged), static_cast<unsigned long long>(counters.learnedUnchanged), drawAliases.size(), static_cast<unsigned long long>(counters.evicted));
     counters = {};
 }
 
