@@ -142,6 +142,14 @@ void DrawFinisher::NoteDrain(DrainSite site, bool drained) {
 }
 
 namespace {
+std::atomic<std::uint64_t> afterMissSame{0}, afterMissOther{0};
+}
+
+void DrawFinisher::NoteAfterRelocationMiss(bool sameIdentity) {
+    (sameIdentity ? afterMissSame : afterMissOther).fetch_add(1, std::memory_order_relaxed);
+}
+
+namespace {
 std::array<std::atomic<std::uint64_t>, 257> drainedOpcodes{}, drainedBeside{};
 }
 
@@ -151,13 +159,16 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "relocation (same identity)", "relocation (other identity)"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
-        char item[96];
+        char item[64];
         std::snprintf(item, sizeof(item), " %s %llu/%llu", names[i], static_cast<unsigned long long>(finisherDrains[i].exchange(0)), static_cast<unsigned long long>(finisherSkips[i].exchange(0)));
         text += item;
     }
+    char afterMiss[128];
+    std::snprintf(afterMiss, sizeof(afterMiss), "; draws after a relocation miss (learned by the finisher, not waited for): same identity %llu, other identity %llu", static_cast<unsigned long long>(afterMissSame.exchange(0)), static_cast<unsigned long long>(afterMissOther.exchange(0)));
+    text += afterMiss;
     text += "; drained by opcode (of them beside commits):";
     for (int shown = 0; shown < 6; ++shown) {
         std::size_t top = 0;
