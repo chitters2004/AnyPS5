@@ -309,7 +309,7 @@ bool Driver::refreshIndirectSegment(Submission& submission, std::size_t index) {
     }();
     if (!pipelineWrites && !finisherWrites && !recordedWrites) return false;
     if (pipelineWrites) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x3f);
-    if (finisherWrites) DrawFinisher::Get().Drain();
+    if (finisherWrites) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Submission);
     std::vector<std::uint32_t> words(segment.words);
     GuestMemory::Read(address, std::as_writable_bytes(std::span(words)), alignof(std::uint32_t));
     const auto end = segment.start + segment.words;
@@ -345,7 +345,7 @@ bool Driver::refreshIndirectSegment(Submission& submission, std::size_t index) {
         }
     }
     if (DrawPipeline::Active() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x3f);
-    if (DrawFinisher::Busy()) DrawFinisher::Get().Drain();
+    if (DrawFinisher::Busy()) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Submission);
     const auto delta = static_cast<std::ptrdiff_t>(expanded.commands.size()) - static_cast<std::ptrdiff_t>(segment.words);
     const auto moved = [&](std::size_t cursor) { return cursor >= end ? static_cast<std::size_t>(static_cast<std::ptrdiff_t>(cursor) + delta) : cursor; };
     auto& commands = submission.commands;
