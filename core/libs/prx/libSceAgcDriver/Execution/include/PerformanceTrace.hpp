@@ -905,6 +905,7 @@ public:
     }
 
     static void BindThread(const char* name, std::size_t capacity = TraceThread::DefaultCapacity);
+    static const char* BoundName();
     static void Present(std::uint32_t width, std::uint32_t height, const VulkanDevice* device);
 
     static void GpuRange(const char* name, double beginNs, double endNs, std::uint64_t batch = 0) {
@@ -958,6 +959,7 @@ private:
     inline static std::atomic<std::uint64_t> presentCount{0};
     static thread_local TraceThread* local;
     static thread_local const char* localName;
+    static thread_local const char* boundName;
     static std::atomic<TraceThread* (*)()> binder;
     inline static std::mutex gpuMutex;
     inline static std::vector<TraceGpuRange> gpuRanges;
