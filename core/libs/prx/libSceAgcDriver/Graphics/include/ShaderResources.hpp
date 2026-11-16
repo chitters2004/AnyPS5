@@ -220,6 +220,13 @@ public:
     std::span<const VkDescriptorBindingFlags> LayoutBindingFlags() const { return layoutBindingFlags; }
     VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
     bool SplitSets() const { return splitSets; }
+    struct DrawSetCounts {
+        std::uint64_t prepared = 0;
+        std::uint64_t indexed = 0;
+        std::uint64_t setsWritten = 0;
+        std::uint64_t poolCountsBuilt = 0;
+    };
+    static DrawSetCounts DrawSetTotals();
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
@@ -752,7 +759,16 @@ private:
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    struct DrawPoolCounts {
+        std::mutex mutex;
+        bool built = false;
+        std::vector<std::size_t> variableBindings;
+        std::vector<std::uint32_t> variableCounts;
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<bool, 2> described{};
+    };
+    std::shared_ptr<DrawPoolCounts> drawPoolCounts = std::make_shared<DrawPoolCounts>();
+    void countDrawPools(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;

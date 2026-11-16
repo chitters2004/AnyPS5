@@ -5374,6 +5374,100 @@ void drawDescriptorWriteTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+ShaderRecompiler::RecompileResult flattenedSrtProgram(std::uint32_t elements) {
+    ShaderRecompiler::RecompileResult program;
+    for (std::uint32_t element = 0; element < elements; ++element) {
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2u + element;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        program.bindings.push_back(data);
+    }
+    return program;
+}
+
+void drawSetIndexTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    Recorder snapshots(context);
+    snapshots.Activate();
+    const auto program = flattenedSrtProgram(4);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    using Words = std::array<std::uint32_t, 16>;
+    Words first{}, second{}, repeated{};
+    first.fill(11u);
+    second.fill(22u);
+    repeated.fill(33u);
+    const std::array<ShaderResources::MovedBuffer, 3> moved{{{2, 0, sizeof(Words), first}, {0, 0, sizeof(Words), second}, {2, 0, sizeof(Words), repeated}}};
+    const auto prepare = [&](bool scan, std::uint64_t poolBuilds) {
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetIndex, scan);
+        const auto before = ShaderResources::DrawSetTotals();
+        const auto draw = resources.PrepareDrawBindings(snapshots, moved);
+        const auto after = ShaderResources::DrawSetTotals();
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetIndex, false);
+        Require(draw != nullptr && draw->snapshots.size() == 2u, "moved shader data did not make one snapshot for each moved allocation");
+        Require(after.prepared - before.prepared == 1u && after.setsWritten - before.setsWritten == 1u, "a prepared draw was not counted once");
+        Require(after.indexed - before.indexed == (scan ? 0u : 1u), "the draw set index counter disagrees with the switch");
+        Require(after.poolCountsBuilt - before.poolCountsBuilt == poolBuilds, "the template's pool sizes were not counted exactly when expected");
+        std::vector<Words> seen;
+        for (const auto& snapshot : draw->snapshots) {
+            Require(snapshot.buffer != nullptr && snapshot.bytes == sizeof(Words), "a moved allocation was not uploaded whole");
+            Words words{};
+            std::memcpy(words.data(), snapshot.buffer->Bytes().data() + snapshot.offset, sizeof(Words));
+            seen.push_back(words);
+        }
+        return seen;
+    };
+    const auto scanned = prepare(true, 0u);
+    Require(scanned == std::vector<Words>{second, first}, "the scanning lookup did not take the first override of each allocation");
+    Require(prepare(false, 1u) == scanned, "the indexed lookup chose different overrides than the scan");
+    for (int draw = 0; draw < 3; ++draw) Require(prepare(false, 0u) == scanned, "the indexed lookup changed its choice on an unchanged template");
+    snapshots.Sync();
+    recorder.Activate();
+}
+
+int drawSetIndexBench(const Device& device, Recorder& recorder, std::uint32_t elements) {
+    auto context = device.GetContext();
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    Recorder snapshots(context);
+    snapshots.Activate();
+    const auto program = flattenedSrtProgram(elements);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, shader);
+    std::vector<std::array<std::uint32_t, 16>> words(elements);
+    std::vector<ShaderResources::MovedBuffer> moved;
+    for (std::uint32_t element = 0; element < elements; ++element) {
+        words[element].fill(element);
+        moved.push_back({element, 0, sizeof(words[element]), words[element]});
+    }
+    constexpr std::size_t Draws = 20000;
+    constexpr std::size_t Batch = 1000;
+    const auto run = [&](bool scan) {
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetIndex, scan);
+        std::chrono::nanoseconds spent{0};
+        for (std::size_t done = 0; done < Draws; done += Batch) {
+            const auto start = std::chrono::steady_clock::now();
+            for (std::size_t draw = 0; draw < Batch; ++draw) Require(resources.PrepareDrawBindings(snapshots, moved) != nullptr, "a benchmark draw made no bindings");
+            spent += std::chrono::steady_clock::now() - start;
+            snapshots.Sync();
+            snapshots.FlushDeferredReleases();
+        }
+        RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetIndex, false);
+        return static_cast<double>(spent.count()) / static_cast<double>(Draws);
+    };
+    run(false);
+    run(true);
+    const std::array<double, 4> arms{run(true), run(false), run(false), run(true)};
+    std::printf("draw set index bench: %u elements, scan %.1f ns/draw, indexed %.1f ns/draw (ABBA %.1f %.1f %.1f %.1f)\n", elements, (arms[0] + arms[3]) / 2.0, (arms[1] + arms[2]) / 2.0, arms[0], arms[1], arms[2], arms[3]);
+    recorder.Activate();
+    return 0;
+}
+
 void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
     using ShaderRecompiler::DescriptorKind;
@@ -17693,10 +17787,12 @@ int main(int argc, char** argv) {
             fmaskDecompressMsaaTests(device, recorder);
             return 0;
         }
+        if ((argc == 2 || argc == 3) && std::string_view(argv[1]) == "--benchmark-draw-set-index") return drawSetIndexBench(device, recorder, argc == 3 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 4u);
         if (argc == 2 && std::string_view(argv[1]) == "--draw-descriptors-only") {
             drawDescriptorWriteTests(device, recorder);
             drawSnapshotTableSetTests(device, recorder);
             imageTableFirstLayerRevalidateTests(device, recorder);
+            drawSetIndexTests(device, recorder);
             std::cout << "Draw descriptor writes and snapshot overrides passed\n";
             return 0;
         }
@@ -17779,6 +17875,7 @@ int main(int argc, char** argv) {
         drawDescriptorWriteTests(device, recorder);
         drawSnapshotTableSetTests(device, recorder);
         imageTableFirstLayerRevalidateTests(device, recorder);
+        drawSetIndexTests(device, recorder);
         drawSnapshotCapTests(device, recorder);
         drawSnapshotEvictionTests(device);
         paddedVertexSnapshotTests(device);

@@ -55,6 +55,39 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+struct DrawSetCounters {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> indexed{0};
+    std::atomic<std::uint64_t> setsWritten{0};
+    std::atomic<std::uint64_t> poolCountsBuilt{0};
+};
+
+DrawSetCounters drawSetCounters;
+
+void ReportDrawSets() {
+    static std::mutex reportMutex;
+    static std::chrono::steady_clock::time_point lastReport{};
+    static ShaderResources::DrawSetCounts last{};
+    std::unique_lock lock(reportMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (lastReport == std::chrono::steady_clock::time_point{}) {
+        lastReport = now;
+        last = ShaderResources::DrawSetTotals();
+        return;
+    }
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto totals = ShaderResources::DrawSetTotals();
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    std::fprintf(stderr, "[draw-sets] (10 s): %llu prepared (%llu indexed), %llu sets written, %llu pool counts built%s\n", delta(totals.prepared, last.prepared), delta(totals.indexed, last.indexed), delta(totals.setsWritten, last.setsWritten), delta(totals.poolCountsBuilt, last.poolCountsBuilt), RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex) ? ", index off" : "");
+    last = totals;
+    lastReport = now;
+}
+
+}
+
+namespace {
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -7143,11 +7176,30 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         return entry.inPlace != VK_NULL_HANDLE && element.pushByte < 0 && element.dataAllocation == static_cast<std::int64_t>(data);
     };
     const bool inPlaceData = std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE && allocations[entry.allocation].pushByte < 0; });
+    const bool indexed = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex);
+    constexpr auto Unmoved = std::numeric_limits<std::uint32_t>::max();
+    thread_local std::vector<std::uint32_t>* overrideSlot = nullptr;
+    auto& overrideOf = ShaderRecompiler::ThreadOwned(overrideSlot);
+    thread_local std::vector<std::uint8_t>* toldSlot = nullptr;
+    auto& toldIn = ShaderRecompiler::ThreadOwned(toldSlot);
+    if (indexed) {
+        overrideOf.assign(allocations.size(), Unmoved);
+        toldIn.assign(allocations.size(), 0);
+        for (std::size_t entry = 0; entry < moved.size(); ++entry) {
+            const auto& movedEntry = moved[entry];
+            if (movedEntry.allocation >= allocations.size()) continue;
+            if (overrideOf[movedEntry.allocation] == Unmoved) overrideOf[movedEntry.allocation] = static_cast<std::uint32_t>(entry);
+            const auto& element = allocations[movedEntry.allocation];
+            if (movedEntry.inPlace != VK_NULL_HANDLE && element.pushByte < 0 && element.dataAllocation >= 0 && static_cast<std::size_t>(element.dataAllocation) < allocations.size()) toldIn[static_cast<std::size_t>(element.dataAllocation)] = 1;
+        }
+    }
+    if (const auto prepared = drawSetCounters.prepared.fetch_add(1, std::memory_order_relaxed) + 1; (prepared & 4095u) == 0) ReportDrawSets();
+    if (indexed) drawSetCounters.indexed.fetch_add(1, std::memory_order_relaxed);
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto override = indexed ? (overrideOf[index] == Unmoved ? moved.end() : moved.begin() + overrideOf[index]) : std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const bool words = override != moved.end() && !override->words.empty();
-        const bool offsets = inPlaceData && !item.guest && item.buffer != nullptr && std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return toldInData(entry, index); });
+        const bool offsets = inPlaceData && !item.guest && item.buffer != nullptr && (indexed ? toldIn[index] != 0 : std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return toldInData(entry, index); }));
         if (words || (offsets && override == moved.end())) {
             const auto size = words ? override->size : item.size;
             auto slice = recorder.DrawUpload(size);
@@ -7244,11 +7296,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
-    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+void ShaderResources::countDrawPools(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const {
+    described = {};
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -7261,6 +7310,44 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         else sizes.push_back({binding.layout.descriptorType, count});
     }
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+}
+
+ShaderResources::DrawSetCounts ShaderResources::DrawSetTotals() {
+    return {drawSetCounters.prepared.load(std::memory_order_relaxed), drawSetCounters.indexed.load(std::memory_order_relaxed), drawSetCounters.setsWritten.load(std::memory_order_relaxed), drawSetCounters.poolCountsBuilt.load(std::memory_order_relaxed)};
+}
+
+void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    std::array<bool, 2> described{};
+    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
+    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex)) {
+        countDrawPools(counts, described);
+    } else {
+        auto& memo = *drawPoolCounts;
+        std::lock_guard lock(memo.mutex);
+        const auto current = [&] {
+            for (std::size_t index = 0; index < memo.variableBindings.size(); ++index) {
+                if (std::max(1u, static_cast<std::uint32_t>(bindings[memo.variableBindings[index]].imageAllocations.size())) != memo.variableCounts[index]) return false;
+            }
+            return true;
+        };
+        if (!memo.built || !current()) {
+            countDrawPools(memo.sizes, memo.described);
+            memo.variableBindings.clear();
+            memo.variableCounts.clear();
+            for (std::size_t index = 0; index < bindings.size(); ++index) {
+                if ((bindings[index].flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) == 0) continue;
+                memo.variableBindings.push_back(index);
+                memo.variableCounts.push_back(std::max(1u, static_cast<std::uint32_t>(bindings[index].imageAllocations.size())));
+            }
+            memo.built = true;
+            drawSetCounters.poolCountsBuilt.fetch_add(1, std::memory_order_relaxed);
+        }
+        counts = memo.sizes;
+        described = memo.described;
+    }
+    drawSetCounters.setsWritten.fetch_add(1, std::memory_order_relaxed);
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result.cache = context.descriptorCache;
