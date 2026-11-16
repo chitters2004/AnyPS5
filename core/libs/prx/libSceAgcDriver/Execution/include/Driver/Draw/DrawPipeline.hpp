@@ -207,6 +207,7 @@ public:
     void AwaitTurn();
     bool OlderUnpublished();
     static bool Busy() { return Sequenced() ? !Get().Ring().Idle() : outstanding.load(std::memory_order_acquire) != 0; }
+    static std::size_t Outstanding() { return Sequenced() ? Get().Ring().Waiting() : outstanding.load(std::memory_order_acquire); }
     bool Producing();
     SequenceRing& Ring();
     void Enqueue(Job job);

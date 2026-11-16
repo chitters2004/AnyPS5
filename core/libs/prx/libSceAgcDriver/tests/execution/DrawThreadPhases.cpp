@@ -1,10 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -12,6 +15,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -112,6 +116,57 @@ std::uint64_t DrawNs(const ThreadPhaseTotals& totals, PhaseThread thread) {
     return totals.drawNs[static_cast<std::size_t>(thread)];
 }
 
+std::uint64_t LapNs(const ThreadPhaseTotals& totals, PhaseThread thread) {
+    return totals.lapNs[static_cast<std::size_t>(thread)];
+}
+
+std::vector<std::uint32_t> Draws(std::uint64_t count, float base) {
+    auto commands = Setup();
+    for (std::uint64_t index = 0; index < count; ++index) {
+        Append(commands, 0x69, {0x10f, std::bit_cast<std::uint32_t>(base + static_cast<float>(index))});
+        Append(commands, 0x2d, {3, 2});
+    }
+    return commands;
+}
+
+void QueuedJobsKeepTheirOwnTimes() {
+    using AgcDriver::DriverDetail::DrawFinisher;
+    using AgcDriver::DriverDetail::ThreadPhases;
+    constexpr std::uint64_t Queued = 4;
+    constexpr auto Hold = std::chrono::milliseconds(200);
+    static_cast<void>(ThreadPhases::Take());
+    std::atomic<bool> locked{false};
+    std::atomic<bool> filled{false};
+    std::atomic<std::int64_t> heldNs{0};
+    std::thread holder([&] {
+        std::lock_guard gpuLock(AgcDriver::GuestMemory::GpuMutex());
+        const auto start = std::chrono::steady_clock::now();
+        locked.store(true);
+        const auto deadline = start + std::chrono::seconds(10);
+        while (DrawFinisher::Outstanding() < Queued && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        filled.store(DrawFinisher::Outstanding() >= Queued);
+        std::this_thread::sleep_for(Hold);
+        heldNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    });
+    while (!locked.load()) std::this_thread::yield();
+    auto commands = Draws(Queued, 96.0f);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    const bool submitted = sceAgcDriverSubmitDcb(&packet) == 0;
+    holder.join();
+    Require(submitted, "the queued draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    DrawFinisher::Get().Drain();
+    const auto totals = ThreadPhases::Take();
+    const auto text = ThreadPhases::Text(totals);
+    std::cout << text << '\n';
+    const auto held = static_cast<std::uint64_t>(heldNs.load());
+    Require(filled.load(), "the worker did not queue " + std::to_string(Queued) + " draw jobs while the finisher waited for the GPU lock: " + text);
+    Require(Draws(totals, PhaseThread::Finisher) == Queued, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " of " + std::to_string(Queued) + " queued jobs: " + text);
+    Require(DrawNs(totals, PhaseThread::Finisher) < 2 * held, "the finisher's job times include the time the jobs behind the first one waited in the queue (" + std::to_string(held) + " ns held): " + text);
+    Require(Grouped(totals, PhaseThread::Finisher) <= LapNs(totals, PhaseThread::Finisher), "the finisher's phase groups exceed all of its phase laps: " + text);
+    Require(LapNs(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase laps for queued jobs sum past their job times, so a lap started before its job did: " + text);
+}
+
 }
 
 int main() {
@@ -132,11 +187,7 @@ int main() {
         PixelConstant[0] = 0.25f;
         static_cast<void>(ThreadPhases::Take());
         constexpr std::uint64_t Count = 16;
-        auto commands = Setup();
-        for (std::uint64_t index = 0; index < Count; ++index) {
-            Append(commands, 0x69, {0x10f, std::bit_cast<std::uint32_t>(32.0f + static_cast<float>(index))});
-            Append(commands, 0x2d, {3, 2});
-        }
+        auto commands = Draws(Count, 32.0f);
         Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
         AgcDriverWaitIdle_nid_postfix();
@@ -145,7 +196,7 @@ int main() {
         const auto text = ThreadPhases::Text(totals);
         std::cout << text << '\n';
         if (!timed) {
-            Require(totals.submissions == 0 && Draws(totals, PhaseThread::Worker) == 0 && Draws(totals, PhaseThread::Finisher) == 0 && totals.busyNs == 0, "draw thread phases were counted without APS5_DRAW_THREAD_TIMES, APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: " + text);
+            Require(totals.submissions == 0 && LapNs(totals, PhaseThread::Worker) == 0 && LapNs(totals, PhaseThread::Finisher) == 0 && Draws(totals, PhaseThread::Worker) == 0 && Draws(totals, PhaseThread::Finisher) == 0 && totals.busyNs == 0, "draw thread phases were counted without APS5_DRAW_THREAD_TIMES, APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: " + text);
             AgcDriverShutdown_nid_postfix();
             std::cout << "draw thread phases stay off without their gate\n";
             return 0;
@@ -155,18 +206,19 @@ int main() {
         Require(Draws(totals, PhaseThread::Worker) == Count, "the worker timed " + std::to_string(Draws(totals, PhaseThread::Worker)) + " draws, expected " + std::to_string(Count) + ": " + text);
         Require(Draws(totals, PhaseThread::Other) == 0 && Grouped(totals, PhaseThread::Other) == 0, "draws on queue 0 were counted on another queue: " + text);
         Require(DrawNs(totals, PhaseThread::Worker) <= totals.busyNs, "the worker's draws took longer than its submissions: " + text);
-        Require(Grouped(totals, PhaseThread::Worker) <= DrawNs(totals, PhaseThread::Worker), "the worker's phase groups exceed its draw time: " + text);
+        Require(Grouped(totals, PhaseThread::Worker) <= LapNs(totals, PhaseThread::Worker) && LapNs(totals, PhaseThread::Worker) <= DrawNs(totals, PhaseThread::Worker), "the worker's phase laps exceed its draw time: " + text);
         Require(Group(totals, PhaseThread::Worker, PhaseGroup::Prepare) > 0, "the worker's decode and prepare were not timed: " + text);
         if (finisher) {
             Require(Draws(totals, PhaseThread::Finisher) >= 1 && Draws(totals, PhaseThread::Finisher) <= Count, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " jobs for " + std::to_string(Count) + " draws: " + text);
-            Require(Grouped(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase groups exceed its job time: " + text);
+            Require(Grouped(totals, PhaseThread::Finisher) <= LapNs(totals, PhaseThread::Finisher) && LapNs(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase laps exceed its job time: " + text);
             Require(Group(totals, PhaseThread::Finisher, PhaseGroup::Handoff) + Group(totals, PhaseThread::Finisher, PhaseGroup::Graphics) > 0, "the finisher's commit hand-off and Graphics::Draw were not timed: " + text);
+            if (DrawFinisher::Preparers() == 1) QueuedJobsKeepTheirOwnTimes();
         } else {
             Require(Draws(totals, PhaseThread::Finisher) == 0 && Grouped(totals, PhaseThread::Finisher) == 0, "finisher time was counted with no finisher: " + text);
             Require(Group(totals, PhaseThread::Worker, PhaseGroup::Handoff) + Group(totals, PhaseThread::Worker, PhaseGroup::Graphics) > 0, "the worker's commit hand-off and Graphics::Draw were not timed: " + text);
         }
         AgcDriverShutdown_nid_postfix();
-        std::cout << "draw thread phases accounted " << (finisher ? "across the worker and the finisher" : "on the worker") << "\n";
+        std::cout << "draw thread phases accounted " << (finisher ? "across the worker and the finisher, queued jobs included" : "on the worker") << "\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
