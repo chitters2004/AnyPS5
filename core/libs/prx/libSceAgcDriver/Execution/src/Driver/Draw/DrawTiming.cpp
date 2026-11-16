@@ -47,7 +47,7 @@ namespace {
 
 thread_local PhaseThread phaseRole = PhaseThread::Other;
 std::array<std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Groups>, ThreadPhaseTotals::Threads> phaseGroupNs{};
-std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Threads> phaseDrawNs{}, phaseDraws{};
+std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Threads> phaseLapNs{}, phaseDrawNs{}, phaseDraws{};
 std::atomic<std::uint64_t> phaseBusyNs{0}, phaseSubmissions{0};
 std::atomic<std::int64_t> phaseWindowStart{std::chrono::steady_clock::now().time_since_epoch().count()};
 
@@ -91,6 +91,7 @@ ThreadPhases::Role::~Role() {
 }
 
 void ThreadPhases::AddPhase(DrawDriverPhase which, std::uint64_t ns) {
+    phaseLapNs[static_cast<std::size_t>(phaseRole)].fetch_add(ns, std::memory_order_relaxed);
     const auto group = groupOf(which);
     if (group == ThreadPhaseTotals::Groups) return;
     phaseGroupNs[static_cast<std::size_t>(phaseRole)][group].fetch_add(ns, std::memory_order_relaxed);
@@ -116,6 +117,7 @@ ThreadPhaseTotals ThreadPhases::Take() {
     totals.windowNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::duration(now - phaseWindowStart.exchange(now, std::memory_order_relaxed))).count());
     for (std::size_t thread = 0; thread < ThreadPhaseTotals::Threads; ++thread) {
         for (std::size_t group = 0; group < ThreadPhaseTotals::Groups; ++group) totals.groupNs[thread][group] = phaseGroupNs[thread][group].exchange(0, std::memory_order_relaxed);
+        totals.lapNs[thread] = phaseLapNs[thread].exchange(0, std::memory_order_relaxed);
         totals.drawNs[thread] = phaseDrawNs[thread].exchange(0, std::memory_order_relaxed);
         totals.draws[thread] = phaseDraws[thread].exchange(0, std::memory_order_relaxed);
     }
@@ -131,8 +133,8 @@ std::string ThreadPhases::Text(const ThreadPhaseTotals& totals) {
         const auto index = static_cast<std::size_t>(thread);
         const auto& groups = totals.groupNs[index];
         const auto grouped = groups[0] + groups[1] + groups[2] + groups[3];
-        char text[224];
-        std::snprintf(text, sizeof(text), "%llu %s in %.1f ms (prepare %.1f, lookup %.1f, lock and commit hand-off %.1f, Graphics::Draw %.1f, rest %.1f)", static_cast<unsigned long long>(totals.draws[index]), noun, ms(totals.drawNs[index]), ms(groups[0]), ms(groups[1]), ms(groups[2]), ms(groups[3]), signedMs(totals.drawNs[index], grouped));
+        char text[288];
+        std::snprintf(text, sizeof(text), "%llu %s in %.1f ms (prepare %.1f, lookup %.1f, lock and commit hand-off %.1f, Graphics::Draw %.1f, other phases %.1f, untimed %.1f)", static_cast<unsigned long long>(totals.draws[index]), noun, ms(totals.drawNs[index]), ms(groups[0]), ms(groups[1]), ms(groups[2]), ms(groups[3]), signedMs(totals.lapNs[index], grouped), signedMs(totals.drawNs[index], totals.lapNs[index]));
         return std::string(text);
     };
     const auto worker = static_cast<std::size_t>(PhaseThread::Worker);
