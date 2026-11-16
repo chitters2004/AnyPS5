@@ -413,8 +413,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
-            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
+            if (drawRelocationPending.key != 0) {
+                const bool drain = DrawFinisher::Busy();
+                if (drain) DrawFinisher::Get().Drain();
+                if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(drawRelocationPending.identity == drawIdentity ? DrawFinisher::DrainSite::RelocationSame : DrawFinisher::DrainSite::RelocationOther, drain);
+            }
             std::lock_guard cacheLock(drawCacheMutex);
             learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
