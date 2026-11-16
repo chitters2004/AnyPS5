@@ -202,6 +202,11 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    if (jobs.size() >= depth && ThreadPhases::Enabled()) {
+        const auto start = std::chrono::steady_clock::now();
+        idle.wait(lock, [&] { return jobs.size() < depth; });
+        ThreadPhases::AddFinisherRoomWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+    }
     idle.wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));

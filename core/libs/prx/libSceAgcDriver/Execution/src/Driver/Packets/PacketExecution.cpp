@@ -299,7 +299,19 @@ void Driver::execute(Submission& submission) {
     } settleFinisher{submission.queue == 0};
     std::size_t nextSegment = 0;
     auto* const executingPacket = workerPacket();
+    const bool timedPackets = outermostSubmission;
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+        struct PacketClock {
+            bool timed;
+            std::size_t bucket;
+            std::uint64_t excludedNs;
+            std::chrono::steady_clock::time_point start;
+            ~PacketClock() {
+                if (!timed) return;
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                ThreadPhases::AddPacket(bucket, ns > excludedNs ? ns - excludedNs : 0);
+            }
+        } packetClock{timedPackets, ThreadPhaseTotals::NoPacket, 0, timedPackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         while (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) {
@@ -315,6 +327,7 @@ void Driver::execute(Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        packetClock.bucket = opcode;
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
@@ -322,7 +335,11 @@ void Driver::execute(Submission& submission) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
             const bool beside = DrawFinisher::Overlap() && opcode != 0x15 && (queuesLabel || heldLabelWait || keepsDrawPipeline(packet, header, opcode));
-            if (!beside) DrawFinisher::Get().Drain();
+            if (!beside) {
+                const auto drainStart = timedPackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                DrawFinisher::Get().Drain();
+                if (timedPackets) ThreadPhases::AddPacketDrain(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drainStart).count()));
+            }
             if (DrawFinisher::Overlap()) {
                 DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, !beside);
                 if (!beside) DrawFinisher::NoteDrainedOpcode(header == FlipPacketHeader ? 0xffu : opcode, keepsDrawPipeline(packet, header, opcode));
@@ -560,7 +577,11 @@ void Driver::execute(Submission& submission) {
                     std::string rejected;
                     const auto drawStart = ThreadPhases::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const auto verdict = draw(queue, packet, submission, cursor, rejected);
-                    if (ThreadPhases::Enabled()) ThreadPhases::AddDraw(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drawStart).count()));
+                    if (ThreadPhases::Enabled()) {
+                        const auto drawNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drawStart).count());
+                        ThreadPhases::AddDraw(drawNs);
+                        packetClock.excludedNs += drawNs;
+                    }
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
@@ -649,7 +670,9 @@ void Driver::execute(Submission& submission) {
     if (submission.queue == 0) {
         const bool traced = BoundaryTrace::Enabled();
         if (traced) BoundaryTrace::Note(BoundaryEvent::DrainBegin, static_cast<std::uint32_t>(DrawFinisher::Outstanding()), static_cast<std::uint32_t>(DrawPipeline::Queue0().Outstanding()));
+        const auto endDrainStart = timedPackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         DrawFinisher::Get().Drain();
+        if (timedPackets) ThreadPhases::AddEndDrain(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - endDrainStart).count()));
         if (traced) BoundaryTrace::Note(BoundaryEvent::DrainEnd);
     }
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());

@@ -34,8 +34,12 @@ struct ThreadPhaseTotals {
     static constexpr std::size_t Threads = static_cast<std::size_t>(PhaseThread::Count);
     static constexpr std::size_t Groups = static_cast<std::size_t>(PhaseGroup::Count);
     std::array<std::array<std::uint64_t, Groups>, Threads> groupNs{};
+    static constexpr std::size_t PacketBuckets = 257;
+    static constexpr std::size_t NoPacket = 256;
     std::array<std::uint64_t, Threads> lapNs{}, drawNs{}, draws{};
     std::uint64_t busyNs = 0, submissions = 0, windowNs = 0;
+    std::array<std::uint64_t, PacketBuckets> packetNs{}, packets{};
+    std::uint64_t packetDrains = 0, packetDrainNs = 0, endDrains = 0, endDrainNs = 0, roomWaits = 0, roomWaitNs = 0;
 };
 
 enum class BoundaryEvent : std::uint8_t { DrainBegin, DrainEnd, CommitBegin, CommitEnd, RoomWaitBegin, RoomWaitEnd };
@@ -76,8 +80,13 @@ public:
     static void AddPhase(DrawDriverPhase which, std::uint64_t ns);
     static void AddDraw(std::uint64_t ns);
     static void AddSubmission(std::uint64_t ns);
+    static void AddPacket(std::size_t bucket, std::uint64_t ns);
+    static void AddPacketDrain(std::uint64_t ns);
+    static void AddEndDrain(std::uint64_t ns);
+    static void AddFinisherRoomWait(std::uint64_t ns);
     static ThreadPhaseTotals Take();
     static std::string Text(const ThreadPhaseTotals& totals);
+    static std::string PacketText(const ThreadPhaseTotals& totals);
 
     class Role {
     public:

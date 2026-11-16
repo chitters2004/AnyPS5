@@ -52,6 +52,8 @@ thread_local PhaseThread phaseRole = PhaseThread::Other;
 std::array<std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Groups>, ThreadPhaseTotals::Threads> phaseGroupNs{};
 std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Threads> phaseLapNs{}, phaseDrawNs{}, phaseDraws{};
 std::atomic<std::uint64_t> phaseBusyNs{0}, phaseSubmissions{0};
+std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::PacketBuckets> phasePacketNs{}, phasePackets{};
+std::atomic<std::uint64_t> phasePacketDrains{0}, phasePacketDrainNs{0}, phaseEndDrains{0}, phaseEndDrainNs{0}, phaseRoomWaits{0}, phaseRoomWaitNs{0};
 std::atomic<std::int64_t> phaseWindowStart{std::chrono::steady_clock::now().time_since_epoch().count()};
 
 std::size_t groupOf(DrawDriverPhase which) {
@@ -115,6 +117,27 @@ void ThreadPhases::AddSubmission(std::uint64_t ns) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", BoundaryTrace::Text(BoundaryTrace::Take()).c_str());
 }
 
+void ThreadPhases::AddPacket(std::size_t bucket, std::uint64_t ns) {
+    const auto index = std::min(bucket, ThreadPhaseTotals::NoPacket);
+    phasePacketNs[index].fetch_add(ns, std::memory_order_relaxed);
+    phasePackets[index].fetch_add(1, std::memory_order_relaxed);
+}
+
+void ThreadPhases::AddPacketDrain(std::uint64_t ns) {
+    phasePacketDrainNs.fetch_add(ns, std::memory_order_relaxed);
+    phasePacketDrains.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ThreadPhases::AddEndDrain(std::uint64_t ns) {
+    phaseEndDrainNs.fetch_add(ns, std::memory_order_relaxed);
+    phaseEndDrains.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ThreadPhases::AddFinisherRoomWait(std::uint64_t ns) {
+    phaseRoomWaitNs.fetch_add(ns, std::memory_order_relaxed);
+    phaseRoomWaits.fetch_add(1, std::memory_order_relaxed);
+}
+
 ThreadPhaseTotals ThreadPhases::Take() {
     ThreadPhaseTotals totals;
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -127,7 +150,39 @@ ThreadPhaseTotals ThreadPhases::Take() {
     }
     totals.busyNs = phaseBusyNs.exchange(0, std::memory_order_relaxed);
     totals.submissions = phaseSubmissions.exchange(0, std::memory_order_relaxed);
+    for (std::size_t bucket = 0; bucket < ThreadPhaseTotals::PacketBuckets; ++bucket) {
+        totals.packetNs[bucket] = phasePacketNs[bucket].exchange(0, std::memory_order_relaxed);
+        totals.packets[bucket] = phasePackets[bucket].exchange(0, std::memory_order_relaxed);
+    }
+    totals.packetDrains = phasePacketDrains.exchange(0, std::memory_order_relaxed);
+    totals.packetDrainNs = phasePacketDrainNs.exchange(0, std::memory_order_relaxed);
+    totals.endDrains = phaseEndDrains.exchange(0, std::memory_order_relaxed);
+    totals.endDrainNs = phaseEndDrainNs.exchange(0, std::memory_order_relaxed);
+    totals.roomWaits = phaseRoomWaits.exchange(0, std::memory_order_relaxed);
+    totals.roomWaitNs = phaseRoomWaitNs.exchange(0, std::memory_order_relaxed);
     return totals;
+}
+
+std::string ThreadPhases::PacketText(const ThreadPhaseTotals& totals) {
+    constexpr std::size_t Shown = 8;
+    std::array<std::size_t, ThreadPhaseTotals::PacketBuckets> order{};
+    for (std::size_t bucket = 0; bucket < order.size(); ++bucket) order[bucket] = bucket;
+    std::ranges::stable_sort(order, [&](std::size_t left, std::size_t right) { return totals.packetNs[left] > totals.packetNs[right]; });
+    std::uint64_t timedNs = 0;
+    for (const auto ns : totals.packetNs) timedNs += ns;
+    const auto worker = static_cast<std::size_t>(PhaseThread::Worker);
+    const auto otherNs = static_cast<double>(totals.busyNs) - static_cast<double>(totals.drawNs[worker]);
+    std::string text = " (queue 0 packets outside the draw call, by opcode:";
+    for (std::size_t rank = 0; rank < Shown && totals.packetNs[order[rank]] != 0; ++rank) {
+        const auto bucket = order[rank];
+        char item[64];
+        if (bucket == ThreadPhaseTotals::NoPacket) std::snprintf(item, sizeof(item), " filler x%llu %.1f ms", static_cast<unsigned long long>(totals.packets[bucket]), static_cast<double>(totals.packetNs[bucket]) / 1e6);
+        else std::snprintf(item, sizeof(item), " 0x%02zx x%llu %.1f ms", bucket, static_cast<unsigned long long>(totals.packets[bucket]), static_cast<double>(totals.packetNs[bucket]) / 1e6);
+        text += item;
+    }
+    char tail[256];
+    std::snprintf(tail, sizeof(tail), "; finisher drains before packets %llu, %.1f ms; outside the packet loop %.1f ms, of which the end-of-submission finisher drain %llu, %.1f ms)", static_cast<unsigned long long>(totals.packetDrains), static_cast<double>(totals.packetDrainNs) / 1e6, (otherNs - static_cast<double>(timedNs)) / 1e6, static_cast<unsigned long long>(totals.endDrains), static_cast<double>(totals.endDrainNs) / 1e6);
+    return text + tail;
 }
 
 std::string ThreadPhases::Text(const ThreadPhaseTotals& totals) {
@@ -146,7 +201,9 @@ std::string ThreadPhases::Text(const ThreadPhaseTotals& totals) {
     std::snprintf(head, sizeof(head), "[draw-threads] (%.1f s): queue 0 worker busy %.1f ms in %llu submissions, idle %.1f ms; ", static_cast<double>(totals.windowNs) / 1e9, ms(totals.busyNs), static_cast<unsigned long long>(totals.submissions), signedMs(totals.windowNs, totals.busyNs));
     char packets[64];
     std::snprintf(packets, sizeof(packets), ", other packets %.1f ms", signedMs(totals.busyNs, totals.drawNs[worker]));
-    return head + draws(PhaseThread::Worker, "draws") + packets + "; finisher " + draws(PhaseThread::Finisher, "jobs") + "; other queues " + draws(PhaseThread::Other, "draws");
+    char waits[128];
+    std::snprintf(waits, sizeof(waits), "; finisher room waits %llu, %.1f ms (in the waiting thread's draws)", static_cast<unsigned long long>(totals.roomWaits), ms(totals.roomWaitNs));
+    return head + draws(PhaseThread::Worker, "draws") + packets + PacketText(totals) + waits + "; finisher " + draws(PhaseThread::Finisher, "jobs") + "; other queues " + draws(PhaseThread::Other, "draws");
 }
 
 

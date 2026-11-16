@@ -156,6 +156,8 @@ void QueuedJobsKeepTheirOwnTimes() {
     const auto text = ThreadPhases::Text(totals);
     std::cout << text << '\n';
     Require(filled.load(), "the worker did not queue " + std::to_string(Queued) + " draw jobs behind a held finisher job: " + text);
+    Require(totals.endDrains == 1 && totals.endDrainNs >= static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Hold).count() / 2), "the submission's end drain behind the " + std::to_string(Hold.count()) + " ms held finisher job was not timed as one end-of-submission drain: " + text);
+    Require(totals.endDrainNs <= totals.busyNs - DrawNs(totals, PhaseThread::Worker), "the end-of-submission drain is longer than the worker's time outside draws: " + text);
     Require(Draws(totals, PhaseThread::Finisher) == Queued, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " of " + std::to_string(Queued) + " queued jobs: " + text);
     Require(DrawNs(totals, PhaseThread::Finisher) < static_cast<std::uint64_t>(heldNs.load()), "the finisher's job times include the " + std::to_string(heldNs.load()) + " ns they waited in the queue: " + text);
     Require(Grouped(totals, PhaseThread::Finisher) <= LapNs(totals, PhaseThread::Finisher), "the finisher's phase groups exceed all of its phase laps: " + text);
@@ -300,6 +302,55 @@ void LiveDrainsReachTheTrace(bool pipelined) {
     Require(totals.dropped == 0, "the boundary trace dropped events: " + text);
 }
 
+void FullFinisherTimesTheRoomWait() {
+    using AgcDriver::DriverDetail::DrawFinisher;
+    using AgcDriver::DriverDetail::ThreadPhases;
+    constexpr std::uint64_t Depth = 16;
+    constexpr auto Hold = std::chrono::milliseconds(100);
+    static_cast<void>(ThreadPhases::Take());
+    std::atomic<bool> filled{false};
+    DrawFinisher::Pending blocker;
+    blocker.unknown = false;
+    DrawFinisher::Get().Enqueue([&] {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (DrawFinisher::Outstanding() < Depth && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        filled.store(DrawFinisher::Outstanding() >= Depth);
+        std::this_thread::sleep_for(Hold);
+    }, std::move(blocker));
+    auto commands = Draws(Depth + 4, 128.0f);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the submission behind a full finisher failed");
+    AgcDriverWaitIdle_nid_postfix();
+    DrawFinisher::Get().Drain();
+    const auto totals = ThreadPhases::Take();
+    const auto text = ThreadPhases::Text(totals);
+    std::cout << text << '\n';
+    Require(filled.load(), "the worker did not fill the finisher behind a held job: " + text);
+    Require(totals.roomWaits >= 1, "the worker waited for room in a full finisher but no room wait was counted: " + text);
+    Require(totals.roomWaitNs >= static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Hold).count() / 2), "the finisher room wait is shorter than half the " + std::to_string(Hold.count()) + " ms hold that caused it: " + text);
+    Require(totals.roomWaitNs <= DrawNs(totals, PhaseThread::Worker), "the finisher room wait is longer than the worker's draws that contain it: " + text);
+}
+
+std::uint64_t Opcodes(const std::vector<std::uint32_t>& commands, std::uint32_t opcode) {
+    std::uint64_t found = 0;
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += ((commands[cursor] >> 16u) & 0x3fffu) + 2u) {
+        if (((commands[cursor] >> 8u) & 0xffu) == opcode) ++found;
+    }
+    return found;
+}
+
+void PacketsSplitByOpcode(const ThreadPhaseTotals& totals, const std::vector<std::uint32_t>& commands, const std::string& text) {
+    std::uint64_t timedNs = 0;
+    for (const auto ns : totals.packetNs) timedNs += ns;
+    for (const std::uint32_t opcode : {0x69u, 0x76u, 0x79u, 0x2du}) {
+        Require(totals.packets[opcode] == Opcodes(commands, opcode), "opcode 0x" + std::to_string(opcode) + " was timed " + std::to_string(totals.packets[opcode]) + " times for " + std::to_string(Opcodes(commands, opcode)) + " packets: " + text);
+    }
+    Require(totals.packetNs[0x69] > 0, "the context register packets took no time: " + text);
+    Require(totals.packetNs[0x2d] < DrawNs(totals, PhaseThread::Worker), "the draw packets' own time outside the draw call is not below the draw calls' time, so the draw call was counted in the packet's bucket: " + text);
+    Require(timedNs + DrawNs(totals, PhaseThread::Worker) <= totals.busyNs, "the per-opcode packet times and the draws add up past the worker's busy time, so a draw call was counted twice: " + text);
+    Require(text.find("by opcode: 0x") != std::string::npos, "the [draw-threads] line does not list packets by opcode: " + text);
+}
+
 int main() {
     try {
         FoldSeparatesStarvationFromSaturation();
@@ -330,6 +381,9 @@ int main() {
         if (!timed) {
             const auto boundaries = AgcDriver::DriverDetail::BoundaryTrace::Take();
             Require(boundaries.drains == 0 && boundaries.commits == 0, "boundary events were traced without their gate: " + BoundaryText(boundaries));
+            std::uint64_t packetsTimed = 0;
+            for (const auto count : totals.packets) packetsTimed += count;
+            Require(packetsTimed == 0 && totals.packetDrains == 0 && totals.endDrains == 0 && totals.roomWaits == 0, "packet or finisher room wait times were counted without their gate: " + text);
             Require(totals.submissions == 0 && LapNs(totals, PhaseThread::Worker) == 0 && LapNs(totals, PhaseThread::Finisher) == 0 && Draws(totals, PhaseThread::Worker) == 0 && Draws(totals, PhaseThread::Finisher) == 0 && totals.busyNs == 0, "draw thread phases were counted without APS5_DRAW_THREAD_TIMES, APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: " + text);
             AgcDriverShutdown_nid_postfix();
             std::cout << "draw thread phases stay off without their gate\n";
@@ -342,11 +396,13 @@ int main() {
         Require(DrawNs(totals, PhaseThread::Worker) <= totals.busyNs, "the worker's draws took longer than its submissions: " + text);
         Require(Grouped(totals, PhaseThread::Worker) <= LapNs(totals, PhaseThread::Worker) && LapNs(totals, PhaseThread::Worker) <= DrawNs(totals, PhaseThread::Worker), "the worker's phase laps exceed its draw time: " + text);
         Require(Group(totals, PhaseThread::Worker, PhaseGroup::Prepare) > 0, "the worker's decode and prepare were not timed: " + text);
+        PacketsSplitByOpcode(totals, commands, text);
         if (finisher) {
             Require(Draws(totals, PhaseThread::Finisher) >= 1 && Draws(totals, PhaseThread::Finisher) <= Count, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " jobs for " + std::to_string(Count) + " draws: " + text);
             Require(Grouped(totals, PhaseThread::Finisher) <= LapNs(totals, PhaseThread::Finisher) && LapNs(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase laps exceed its job time: " + text);
             Require(Group(totals, PhaseThread::Finisher, PhaseGroup::Handoff) + Group(totals, PhaseThread::Finisher, PhaseGroup::Graphics) > 0, "the finisher's commit hand-off and Graphics::Draw were not timed: " + text);
             QueuedJobsKeepTheirOwnTimes();
+            FullFinisherTimesTheRoomWait();
         } else {
             Require(Draws(totals, PhaseThread::Finisher) == 0 && Grouped(totals, PhaseThread::Finisher) == 0, "finisher time was counted with no finisher: " + text);
             Require(Group(totals, PhaseThread::Worker, PhaseGroup::Handoff) + Group(totals, PhaseThread::Worker, PhaseGroup::Graphics) > 0, "the worker's commit hand-off and Graphics::Draw were not timed: " + text);
