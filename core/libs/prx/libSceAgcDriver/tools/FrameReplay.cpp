@@ -502,6 +502,7 @@ struct Replay {
                 paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
                 if (!settled && options.strict) throw std::runtime_error("frame replay: the replay did not settle before memory delta " + std::to_string(call.ordinal));
                 parkedAsCaptured = !pacing || !settled || call.values.size() < 2 || atCapturedPark(call);
+                { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] memory call %llu group %llu captured %llu/%llu parked %zu; replay %llu/%llu settled %d asCaptured %d blocked%s\n", (unsigned long long)call.ordinal, (unsigned long long)call.values.at(0), (unsigned long long)call.accepted, (unsigned long long)call.completed, call.values.size() > 1 ? (size_t)call.values.at(1) : 0, (unsigned long long)a, (unsigned long long)c, settled, parkedAsCaptured, describeBlocked().c_str()); }
                 staged = restoreGroup(call.values.at(0), false, heldWaits());
             }
             releaseStaged(staged);
@@ -533,15 +534,17 @@ struct Replay {
     void restoreAtCapturedPark(const FrameCall& call) {
         const auto began = Clock::now();
         const auto deadline = began + options.busyTimeout;
+        { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] waiting for captured park: replay %llu/%llu blocked%s\n", (unsigned long long)a, (unsigned long long)c, describeBlocked().c_str()); }
         while (Clock::now() < deadline) {
             if (atCapturedPark(call) && AgcDriverHoldSettled_nid_postfix(0)) {
                 const SettledHold hold{true};
                 if (!atCapturedPark(call)) continue;
                 restoreGroup(call.values.at(0), true);
                 ++parkRestores;
+                { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] re-restored at park after %lld us: replay %llu/%llu blocked%s\n", (long long)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - began).count(), (unsigned long long)a, (unsigned long long)c, describeBlocked().c_str()); }
                 break;
             }
-            if (AgcDriverSettled_nid_postfix() && !atCapturedPark(call)) break;
+            if (AgcDriverSettled_nid_postfix() && !atCapturedPark(call)) { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] gave up re-restore: replay %llu/%llu blocked%s\n", (unsigned long long)a, (unsigned long long)c, describeBlocked().c_str()); break; }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();

@@ -517,6 +517,9 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     call.ordinal = ++ordinal;
     call.accepted = accepted;
     call.completed = completed;
+    std::fprintf(stderr, "[dbg] capture delta group %llu at %llu/%llu parked %zu:", (unsigned long long)group, (unsigned long long)accepted, (unsigned long long)completed, parked.size());
+    for (const auto address : parked) std::fprintf(stderr, " 0x%llx", (unsigned long long)address);
+    std::fprintf(stderr, "\n");
     call.values = {group, parked.size()};
     call.values.insert(call.values.end(), parked.begin(), parked.end());
     writer->WriteCall(call);
