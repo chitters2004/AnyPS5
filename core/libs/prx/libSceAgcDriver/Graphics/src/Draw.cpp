@@ -784,6 +784,7 @@ struct DrawOutcome {
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
     std::size_t buildReason = BuildReasonCount;
+    ProofLeadNote proofLead;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
     // lookups' flushes, the build's texture lookups): nested in the draw's GpuMutex hold, so they
     // are the part of the hold that is waiting rather than working. The draw's own syncs (a
@@ -1466,7 +1467,7 @@ CommitShape& drawCommitShape() {
 
 void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     auto* const shape = &drawCommitShape();
-    shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps, PerformanceCounters::ThreadPipelines() - timer.pipelinesBefore, outcome.buildReason);
+    shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps, PerformanceCounters::ThreadPipelines() - timer.pipelinesBefore, outcome.buildReason, outcome.proofLead);
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
@@ -1479,10 +1480,21 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     const auto report = shape->Take();
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(report, DrawKindNames, DrawPhaseNames).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofLeadLine(report).c_str());
+}
+
+std::atomic<std::uint64_t> profiledCommits{0};
+
+struct ProofLeadTag;
+using ProofLeadSlot = HostThreadSlot<const ProofLeadStamp*, ProofLeadTag>;
+
+std::array<std::uint64_t, 3> proofSerials() {
+    return {GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), RetiredImportSerial()};
 }
 
 void startCommitShape(DrawTimer& timer) {
     if (!CommitShapeProfiled()) return;
+    profiledCommits.fetch_add(1, std::memory_order_relaxed);
     timer.stamps = {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), Recorder::PublishGeneration()};
     timer.dependenciesBefore = Recorder::ThreadDependencyHits();
     timer.pipelinesBefore = PerformanceCounters::ThreadPipelines();
@@ -2291,7 +2303,31 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                 }
             }
-            const bool valid = spaceHeld && cached->Revalidate(shaders);
+            const bool leadProfiled = CommitShapeProfiled();
+            ShaderResources::ProofReport proofReport{};
+            proofReport.traceEffects = leadProfiled;
+            if (leadProfiled) {
+                auto& lead = outcome.proofLead;
+                lead.looked = true;
+                if (const auto* stamp = ProofLeadSlot::Get(); stamp != nullptr) {
+                    const auto commits = profiledCommits.load(std::memory_order_relaxed);
+                    lead.stamped = true;
+                    lead.lead = commits > stamp->commits ? commits - stamp->commits - 1 : 0;
+                    lead.survived = proofSerials() == stamp->serials;
+                    lead.epochAdvanced = stamp->epochTokens->load(std::memory_order_relaxed) != stamp->epochToken;
+                }
+            }
+            const auto revalidateStart = leadProfiled && spaceHeld ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const bool valid = spaceHeld && cached->Revalidate(shaders, leadProfiled ? &proofReport : nullptr);
+            if (leadProfiled && spaceHeld) {
+                outcome.proofLead.revalidateUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - revalidateStart).count();
+                outcome.proofLead.ending = !proofReport.walked ? (valid ? EndingEpoch : EndingRefused) : proofReport.path == ShaderResources::ProofPath::Full ? EndingFull : EndingFast;
+            }
+            if (leadProfiled) {
+                outcome.proofLead.walked = proofReport.walked;
+                outcome.proofLead.lookups = proofReport.lookups;
+                outcome.proofLead.effects = proofReport.effects;
+            }
             if (counted && spaceHeld && !valid) reuse = AddressDrawReuse::Revalidation;
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
@@ -2305,6 +2341,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
+                outcome.proofLead.served = true;
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
                 buildReason = inUse ? BuildInUse : BuildNotReusable;
@@ -4814,6 +4851,19 @@ FragmentOutputLookups ThreadFragmentOutputLookups() {
 
 CommitShape::Report TakeDrawCommitShape() {
     return drawCommitShape().Take();
+}
+
+std::optional<ProofLeadStamp> StampProofLead(std::uint64_t epochToken, const std::atomic<std::uint64_t>& epochTokens) {
+    if (!CommitShapeProfiled()) return std::nullopt;
+    return ProofLeadStamp{proofSerials(), epochToken, &epochTokens, profiledCommits.load(std::memory_order_relaxed)};
+}
+
+ProofLeadScope::ProofLeadScope(const ProofLeadStamp* stamp) : previous(ProofLeadSlot::Get()) {
+    ProofLeadSlot::Set(stamp);
+}
+
+ProofLeadScope::~ProofLeadScope() {
+    ProofLeadSlot::Set(previous);
 }
 
 VkDrawCounts TakeVkDrawCounts() {

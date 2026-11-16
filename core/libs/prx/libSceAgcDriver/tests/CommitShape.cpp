@@ -133,6 +133,33 @@ void BuildsSumPerReasonAndPipelinesPerKind() {
 
 }
 
+void ProofLeadSplitsSurvivalPurityAndLead() {
+    CommitShape shape;
+    using Lead = AgcDriver::ProofLeadNote;
+    const auto note = [&](const Lead& lead) { shape.Note(1, NoPhases, 0, {}, 0, AgcDriver::BuildReasonCount, lead); };
+    note({.looked = true, .stamped = true, .lead = 0, .survived = true, .walked = true, .lookups = true, .served = true, .effects = 0});
+    note({.looked = true, .stamped = true, .lead = 3, .survived = false, .epochAdvanced = true, .walked = true, .lookups = false, .served = true, .effects = 1u << AgcDriver::EffectUpload});
+    note({.looked = true, .stamped = true, .lead = 40, .survived = true, .walked = true, .lookups = false, .served = true, .effects = (1u << AgcDriver::EffectStaging) | (1u << AgcDriver::EffectUpload)});
+    note({.looked = true, .stamped = false, .walked = true, .served = true, .effects = 0});
+    note({.looked = true, .stamped = true, .lead = 8, .survived = true, .walked = true, .served = false, .ending = AgcDriver::EndingFull, .revalidateUs = 30.0});
+    note({.looked = true, .stamped = true, .lead = 9, .survived = true, .walked = false, .served = true, .ending = AgcDriver::EndingEpoch, .revalidateUs = 2.0});
+    note({.looked = false, .ending = AgcDriver::EndingFast, .revalidateUs = 100.0});
+    note({});
+    const auto report = shape.Take();
+    Require(report.leadLooked == 6 && report.leadStamped == 5 && report.leadSurvived == 4 && report.leadEpochAdvanced == 1, "the lookups, stamps and survivals were miscounted");
+    Require(report.leadBuckets[0] == 1 && report.leadBuckets[1] == 1 && report.leadBuckets[2] == 1 && report.leadBuckets[3] == 1 && report.leadBuckets[4] == 0 && report.leadBuckets[5] == 1, "the leads fell in the wrong buckets");
+    Require(report.walked == 5 && report.walkedLookups == 1 && report.walkedServed == 4 && report.servedStamped == 3, "the walks were miscounted");
+    Require(report.servedSurvived == 2 && report.servedPure == 2 && report.servedPureSurvived == 1, "the served walks' survival and purity were miscounted");
+    Require(report.servedEffects[AgcDriver::EffectUpload] == 2 && report.servedEffects[AgcDriver::EffectStaging] == 1 && report.servedEffects[AgcDriver::EffectDepthPlanes] == 0, "the effects were miscounted");
+    const auto line = CommitShape::ProofLeadLine(report);
+    Require(line.find("[proof-lead] 10 s: 6 template lookups, 5 stamped at prepare (83.3%), proof, pending and retired serials unchanged since prepare 80.0%, epoch token advanced since prepare 20.0%;") == 0, "the line does not start with the lookups: " + line);
+    Require(line.find("lead in draws 0: 20.0%, 1-4: 20.0%, 5-8: 20.0%, 9-16: 20.0%, 17-32: 0.0%, >32: 20.0%;") != std::string::npos, "the lead distribution is wrong: " + line);
+    Require(line.find("full walks 5 (1 with lookups), served 4 (3 stamped): serials unchanged since prepare 66.7% of stamped, pure 50.0%, pure and unchanged 33.3% of stamped;") != std::string::npos, "the served walks are wrong: " + line);
+    Require(line.find(" upload 50.0%, pending flush 0.0%, staging 25.0%,") != std::string::npos, "the effects are wrong: " + line);
+    Require(report.endings[AgcDriver::EndingFull] == 1 && report.endings[AgcDriver::EndingEpoch] == 1 && report.endings[AgcDriver::EndingFast] == 0, "the revalidate endings were miscounted");
+    Require(line.find("; revalidate epoch exit 1 x 2.00 us (6.2% of the time), fast-ending 0 x 0.00 us (0.0% of the time), full-walk-ending 1 x 30.00 us (93.8% of the time), refused before the walk 0 x 0.00 us (0.0% of the time)") != std::string::npos, "the revalidate split is wrong: " + line);
+}
+
 int main() {
     try {
         UnchangedStampsSurviveEveryDistance();
@@ -141,6 +168,7 @@ int main() {
         PhasesAndDependenciesSumPerKind();
         TakeResetsCountsButKeepsHistory();
         BuildsSumPerReasonAndPipelinesPerKind();
+        ProofLeadSplitsSurvivalPurityAndLead();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "commit shape: %s\n", error.what());
         return 1;

@@ -19,6 +19,26 @@ enum BuildReason : std::size_t { BuildUncacheable, BuildNewKey, BuildReturnedKey
 
 inline constexpr std::array<const char*, BuildReasonCount> BuildReasonNames{"uncacheable", "new key", "evicted key returned", "space changed", "invalidated", "in use", "not reusable"};
 
+enum WalkEffect : std::size_t { EffectDepthPlanes, EffectCpuWrites, EffectMultisample, EffectOwnRefresh, EffectUpload, EffectPendingFlush, EffectStaging, EffectSubscribe, WalkEffectCount };
+
+inline constexpr std::array<const char*, WalkEffectCount> WalkEffectNames{"depth planes", "CPU writes", "multisample claim", "own refresh", "upload", "pending flush", "staging", "subscribe"};
+
+enum ProofEnding : std::size_t { EndingEpoch, EndingFast, EndingFull, EndingRefused, ProofEndingCount };
+inline constexpr std::array<const char*, ProofEndingCount> ProofEndingNames{"epoch exit", "fast-ending", "full-walk-ending", "refused before the walk"};
+struct ProofLeadNote {
+    bool looked = false;
+    bool stamped = false;
+    std::uint64_t lead = 0;
+    bool survived = false;
+    bool epochAdvanced = false;
+    bool walked = false;
+    bool lookups = false;
+    bool served = false;
+    std::uint32_t effects = 0;
+    std::size_t ending = ProofEndingCount;
+    double revalidateUs = 0;
+};
+
 bool CommitShapeProfiled();
 
 class CommitShape {
@@ -43,13 +63,20 @@ public:
         std::array<std::array<double, Phases>, BuildReasonCount> reasonPhaseUs{};
         std::array<std::uint64_t, BuildReasonCount> reasonPipelines{};
         std::array<std::uint64_t, BuildReasonCount> reasonPipelineDraws{};
+        static constexpr std::array<std::uint64_t, 5> LeadBounds{0, 4, 8, 16, 32};
+        std::uint64_t leadLooked = 0, leadStamped = 0, leadSurvived = 0, leadEpochAdvanced = 0, walked = 0, walkedLookups = 0, walkedServed = 0, servedStamped = 0, servedSurvived = 0, servedPure = 0, servedPureSurvived = 0;
+        std::array<std::uint64_t, LeadBounds.size() + 1> leadBuckets{};
+        std::array<std::uint64_t, WalkEffectCount> servedEffects{};
+        std::array<std::uint64_t, ProofEndingCount> endings{};
+        std::array<double, ProofEndingCount> endingUs{};
     };
 
-    void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines = 0, std::size_t buildReason = BuildReasonCount);
+    void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines = 0, std::size_t buildReason = BuildReasonCount, const ProofLeadNote& lead = {});
     Report Take();
 
     static std::string Line(const Report& report, std::span<const char* const, Kinds> kindNames, std::span<const char* const, Phases> phaseNames);
     static std::string BuildLine(const Report& report, std::span<const char* const, Kinds> kindNames, std::size_t resourcesPhase, std::size_t pipelinePhase);
+    static std::string ProofLeadLine(const Report& report);
 
 private:
     Mutex mutex;

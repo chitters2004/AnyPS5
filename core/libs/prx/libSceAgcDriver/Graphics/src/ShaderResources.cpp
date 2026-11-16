@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -4500,28 +4501,36 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
-    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+    const bool traceEffects = report != nullptr && report->traceEffects;
+    if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other, false, traceEffects, true};
+    const auto effect = [&](WalkEffect which) {
+        if (traceEffects) report->effects |= 1u << static_cast<std::uint32_t>(which);
+    };
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool cpuWriters = !GuestMemory::WriteIndexEnabled() || AnyPendingCpuWrites(context);
+    const auto completeCpuWrites = [&](std::uint64_t address, std::size_t bytes) {
+        if (CompletePendingCpuWrites(context, address, bytes)) effect(EffectCpuWrites);
+    };
     for (const auto& region : directRegions) {
-        static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
-        if (cpuWriters) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
+        if (!FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)).empty()) effect(EffectDepthPlanes);
+        if (cpuWriters) completeCpuWrites(region.begin, static_cast<std::size_t>(region.end - region.begin));
     }
     for (const auto& range : describedRanges) {
         if (!range.imageTable) {
+            if (range.storedWords) effect(EffectMultisample);
             if (range.storedWords) claimStoredMultisampleMemory(context, DecodeTextureResource(*range.storedWords), range.bytes, range.storedMip);
             RequireNoMultisampleColorTarget(range.address, static_cast<std::size_t>(range.bytes), "a cached image access");
         }
         if (!cpuWriters) continue;
-        CompletePendingCpuWrites(context, range.address, static_cast<std::size_t>(range.bytes));
-        if (range.dccAddress != 0) CompletePendingCpuWrites(context, range.dccAddress, DccKeyBytes(range.bytes));
+        completeCpuWrites(range.address, static_cast<std::size_t>(range.bytes));
+        if (range.dccAddress != 0) completeCpuWrites(range.dccAddress, DccKeyBytes(range.bytes));
     }
     for (const auto& image : storageTextures) {
         if (!cpuWriters) break;
-        CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
-        if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        completeCpuWrites(image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
+        if (image->Descriptor().dccAddress != 0) completeCpuWrites(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
@@ -4645,7 +4654,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (GuestMemory::WriteIndexEnabled() && !noFast && EpochRevalidate()) {
         if (indexRevalidate(shaders, serialBefore) != IndexOutcome::Fallback) indexProved = true;
         else {
-            if (writeSubscription == nullptr) subscribeIndex(shaders);
+            if (writeSubscription == nullptr) {
+                effect(EffectSubscribe);
+                subscribeIndex(shaders);
+            }
             if (writeSubscription != nullptr) indexBaseline = GuestMemory::SubscriptionGeneration(*writeSubscription);
         }
     }
@@ -4660,6 +4672,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         auto fallback = OwnRefreshFallback::Count;
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
+            effect(EffectOwnRefresh);
             refreshed = overlapping;
             fallback = refreshOwnObjects(shaders, refreshed);
         }
@@ -4682,7 +4695,18 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (!fast) {
         countFullWalk(reason);
         const auto walkStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct WalkVersionsTag {};
+        auto& walkVersions = ThreadScratch<std::vector<std::pair<const StorageTexture*, std::uint64_t>>, WalkVersionsTag>();
+        walkVersions.clear();
+        if (traceEffects) {
+            report->lookups = true;
+            for (const auto& surface : validatedTextures) {
+                if (surface.source != nullptr) walkVersions.emplace_back(surface.source, surface.source->Version());
+            }
+            for (const auto& image : storageTextures) walkVersions.emplace_back(image.get(), image->Version());
+        }
         const bool walked = fullWalk();
+        if (traceEffects && std::any_of(walkVersions.begin(), walkVersions.end(), [](const auto& entry) { return entry.first->Version() != entry.second; })) effect(EffectUpload);
         countFullWalkTime(reason, walkStart);
         if (!walked) {
             const auto failure = [&] {
@@ -4749,7 +4773,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
-                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                if (region.overlaps || AnyShadowedOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+                    effect(EffectPendingFlush);
+                    StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
+                }
             }
         }
         if (importsReconcilable ? HostImportsReconciledUnchanged(context, importsProof) : HostImportsUnchanged(context, importsProof)) {
@@ -4759,6 +4786,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             importsProof = HostImportsIdentity(context);
         }
     } else {
+        if (!directRegions.empty() || !guestMemory.Writes().empty()) effect(EffectPendingFlush);
         for (const auto& region : directRegions) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, "imported buffer region");
         for (const auto& [begin, end] : guestMemory.Writes()) StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, "written buffer range");
         if (!serialLoop()) return finish(fast, false, ProofFailure::Imports);
@@ -4768,6 +4796,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
     if (!guestMemory.StagingDecisionsCurrent()) return finish(fast, false, ProofFailure::Changed);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        if (guestMemory.HasStagedCopies()) effect(EffectStaging);
         try {
             guestMemory.RecordStagingCopies(*recorder);
         } catch (const std::exception& error) {

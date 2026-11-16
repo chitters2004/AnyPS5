@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -504,6 +505,19 @@ void BuildsKeptTheirReason(std::uint64_t pipelinesBefore) {
     for (const auto count : report.kindPipelines) created += count;
     Require(created != 0 && created <= pipelines, "the draws noted " + std::to_string(created) + " pipelines created where the device created " + std::to_string(pipelines) + ": " + line);
     const auto returned = report.reasonBuilds[AgcDriver::BuildReturnedKey];
+    const auto lead = AgcDriver::CommitShape::ProofLeadLine(report);
+    std::cout << lead << '\n';
+    Require(report.leadLooked != 0, "no template lookup was noted: " + lead);
+    Require(report.leadStamped <= report.leadLooked && report.leadSurvived <= report.leadStamped && report.walked <= report.leadLooked, "the lookups do not bound the stamps and walks: " + lead);
+    Require(report.walkedServed <= report.walked && report.servedStamped <= report.walkedServed && report.servedPure <= report.walkedServed && report.servedPureSurvived <= report.servedSurvived, "the served walks are not a subset of the walks: " + lead);
+    std::uint64_t bucketed = 0;
+    for (const auto count : report.leadBuckets) bucketed += count;
+    Require(bucketed == report.leadStamped, "the lead buckets do not add up to the stamps: " + lead);
+    std::uint64_t ended = 0;
+    for (const auto count : report.endings) ended += count;
+    Require(ended != 0 && ended <= report.leadLooked && report.endings[AgcDriver::EndingFast] + report.endings[AgcDriver::EndingFull] == report.walked, "the revalidate endings do not match the lookups and walks: " + lead);
+    if (AgcDriver::DriverDetail::DrawFinisher::Enabled() && AgcDriver::DriverDetail::DrawFinisher::Overlap()) Require(report.leadStamped != 0 && report.servedStamped != 0, "no queued template lookup carried the stamp of its prepare: " + lead);
+    else Require(report.leadStamped == 0, "an inline template lookup was stamped: " + lead);
     if (evicting) Require(returned != 0, "with one resource cache entry no build was for an evicted key that came back: " + line);
     else Require(returned == 0, "with room in the resource cache a build was counted for an evicted key: " + line);
 }

@@ -370,6 +370,10 @@ public:
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
         bool audited = false;
+        bool traceEffects = false;
+        bool walked = false;
+        bool lookups = false;
+        std::uint32_t effects = 0;
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();

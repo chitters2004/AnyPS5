@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -23,6 +24,24 @@ struct VkDrawCounts {
 };
 VkDrawCounts TakeVkDrawCounts();
 CommitShape::Report TakeDrawCommitShape();
+
+struct ProofLeadStamp {
+    std::array<std::uint64_t, 3> serials{};
+    std::uint64_t epochToken = 0;
+    const std::atomic<std::uint64_t>* epochTokens = nullptr;
+    std::uint64_t commits = 0;
+};
+std::optional<ProofLeadStamp> StampProofLead(std::uint64_t epochToken, const std::atomic<std::uint64_t>& epochTokens);
+class ProofLeadScope {
+public:
+    explicit ProofLeadScope(const ProofLeadStamp* stamp);
+    ~ProofLeadScope();
+    ProofLeadScope(const ProofLeadScope&) = delete;
+    ProofLeadScope& operator=(const ProofLeadScope&) = delete;
+
+private:
+    const ProofLeadStamp* previous;
+};
 
 struct HostImport;
 

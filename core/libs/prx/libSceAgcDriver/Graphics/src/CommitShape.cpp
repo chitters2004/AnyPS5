@@ -11,9 +11,40 @@ bool CommitShapeProfiled() {
     return profiled;
 }
 
-void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines, std::size_t buildReason) {
+void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines, std::size_t buildReason, const ProofLeadNote& lead) {
     std::lock_guard lock(mutex);
     ++counts.draws;
+    if (lead.looked) {
+        ++counts.leadLooked;
+        if (lead.ending < ProofEndingCount) {
+            ++counts.endings[lead.ending];
+            counts.endingUs[lead.ending] += lead.revalidateUs;
+        }
+        if (lead.stamped) {
+            ++counts.leadStamped;
+            std::size_t bucket = 0;
+            while (bucket < Report::LeadBounds.size() && lead.lead > Report::LeadBounds[bucket]) ++bucket;
+            ++counts.leadBuckets[bucket];
+            if (lead.survived) ++counts.leadSurvived;
+            if (lead.epochAdvanced) ++counts.leadEpochAdvanced;
+        }
+        if (lead.walked) {
+            ++counts.walked;
+            if (lead.lookups) ++counts.walkedLookups;
+            if (lead.served) {
+                ++counts.walkedServed;
+                const bool pure = lead.effects == 0;
+                const bool survived = lead.stamped && lead.survived;
+                if (lead.stamped) ++counts.servedStamped;
+                if (survived) ++counts.servedSurvived;
+                if (pure) ++counts.servedPure;
+                if (pure && survived) ++counts.servedPureSurvived;
+                for (std::size_t effect = 0; effect < WalkEffectCount; ++effect) {
+                    if ((lead.effects >> effect) & 1u) ++counts.servedEffects[effect];
+                }
+            }
+        }
+    }
     if (kind < Kinds) {
         ++counts.kindDraws[kind];
         for (std::size_t phase = 0; phase < Phases; ++phase) counts.kindPhaseUs[kind][phase] += phaseUs[phase];
@@ -120,6 +151,35 @@ std::string CommitShape::BuildLine(const Report& report, std::span<const char* c
     text += " pipelines created by kind:";
     for (std::size_t kind = 0; kind < Kinds; ++kind) {
         std::snprintf(item, sizeof(item), " %s %llu in %llu of %llu draws%s", kindNames[kind], static_cast<unsigned long long>(report.kindPipelines[kind]), static_cast<unsigned long long>(report.kindPipelineDraws[kind]), static_cast<unsigned long long>(report.kindDraws[kind]), kind + 1 < Kinds ? "," : "");
+        text += item;
+    }
+    return text;
+}
+
+std::string CommitShape::ProofLeadLine(const Report& report) {
+    const auto share = [](std::uint64_t part, std::uint64_t whole) { return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0; };
+    std::string text;
+    char item[256];
+    std::snprintf(item, sizeof(item), "[proof-lead] 10 s: %llu template lookups, %llu stamped at prepare (%.1f%%), proof, pending and retired serials unchanged since prepare %.1f%%, epoch token advanced since prepare %.1f%%; lead in draws", static_cast<unsigned long long>(report.leadLooked), static_cast<unsigned long long>(report.leadStamped), share(report.leadStamped, report.leadLooked), share(report.leadSurvived, report.leadStamped), share(report.leadEpochAdvanced, report.leadStamped));
+    text += item;
+    for (std::size_t bucket = 0; bucket < report.leadBuckets.size(); ++bucket) {
+        if (bucket == 0) std::snprintf(item, sizeof(item), " 0: %.1f%%", share(report.leadBuckets[bucket], report.leadStamped));
+        else if (bucket < Report::LeadBounds.size()) std::snprintf(item, sizeof(item), ", %llu-%llu: %.1f%%", static_cast<unsigned long long>(Report::LeadBounds[bucket - 1] + 1), static_cast<unsigned long long>(Report::LeadBounds[bucket]), share(report.leadBuckets[bucket], report.leadStamped));
+        else std::snprintf(item, sizeof(item), ", >%llu: %.1f%%", static_cast<unsigned long long>(Report::LeadBounds.back()), share(report.leadBuckets[bucket], report.leadStamped));
+        text += item;
+    }
+    std::snprintf(item, sizeof(item), "; full walks %llu (%llu with lookups), served %llu (%llu stamped): serials unchanged since prepare %.1f%% of stamped, pure %.1f%%, pure and unchanged %.1f%% of stamped; effects", static_cast<unsigned long long>(report.walked), static_cast<unsigned long long>(report.walkedLookups), static_cast<unsigned long long>(report.walkedServed), static_cast<unsigned long long>(report.servedStamped), share(report.servedSurvived, report.servedStamped), share(report.servedPure, report.walkedServed), share(report.servedPureSurvived, report.servedStamped));
+    text += item;
+    for (std::size_t effect = 0; effect < WalkEffectCount; ++effect) {
+        std::snprintf(item, sizeof(item), " %s %.1f%%%s", WalkEffectNames[effect], share(report.servedEffects[effect], report.walkedServed), effect + 1 < WalkEffectCount ? "," : "");
+        text += item;
+    }
+    text += "; revalidate";
+    double totalUs = 0;
+    for (const auto us : report.endingUs) totalUs += us;
+    for (std::size_t ending = 0; ending < ProofEndingCount; ++ending) {
+        const auto count = report.endings[ending];
+        std::snprintf(item, sizeof(item), " %s %llu x %.2f us (%.1f%% of the time)%s", ProofEndingNames[ending], static_cast<unsigned long long>(count), count != 0 ? report.endingUs[ending] / static_cast<double>(count) : 0.0, totalUs > 0 ? 100.0 * report.endingUs[ending] / totalUs : 0.0, ending + 1 < ProofEndingCount ? "," : "");
         text += item;
     }
     return text;
