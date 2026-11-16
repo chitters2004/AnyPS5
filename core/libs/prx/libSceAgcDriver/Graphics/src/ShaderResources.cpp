@@ -3446,6 +3446,7 @@ struct RevalidateProfile {
     std::atomic<std::uint64_t> refusedStorage{0};
     std::atomic<std::uint64_t> refusedUncommitted{0};
     std::atomic<std::uint64_t> refusedUnwatched{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ExclusionSource::Count) + 1> refusedUnwatchedBySource{};
     std::atomic<std::uint64_t> refusedOther{0};
     std::mutex refusedMutex;
     std::unordered_map<std::uint64_t, std::uint64_t> refusedSurfaces;
@@ -3499,6 +3500,13 @@ void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes)
     const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes);
     const bool watched = accessible && GuestMemory::Watched(address, bytes);
     (!accessible ? profile.refusedUncommitted : !watched ? profile.refusedUnwatched : profile.refusedOther).fetch_add(1, std::memory_order_relaxed);
+    if (accessible && !watched) {
+        const auto mask = GuestMemory::UnwatchedSources(address, bytes);
+        if (mask == 0) profile.refusedUnwatchedBySource.back().fetch_add(1, std::memory_order_relaxed);
+        for (std::size_t source = 0; source + 1 < profile.refusedUnwatchedBySource.size(); ++source) {
+            if ((mask & (std::uint32_t{1} << source)) != 0) profile.refusedUnwatchedBySource[source].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     std::lock_guard lock(profile.refusedMutex);
     if (profile.refusedSurfaces.size() < RefusedSurfaceLimit || profile.refusedSurfaces.contains(address)) profile.refusedSurfaces[address] = bytes;
 }
@@ -3572,6 +3580,12 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         profile.refusedSurfaces.clear();
     }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
+    std::string refusedSources;
+    for (std::size_t source = 0; source < profile.refusedUnwatchedBySource.size(); ++source) {
+        const auto count = profile.refusedUnwatchedBySource[source].exchange(0, std::memory_order_relaxed);
+        refusedSources += " " + std::string(source + 1 < profile.refusedUnwatchedBySource.size() ? GuestMemory::ExclusionSourceName(static_cast<GuestMemory::ExclusionSource>(source)) : "never-excluded") + " " + std::to_string(count);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[rescache] collect refusals over unwatched surfaces by exclusion source (10 s):%s\n", refusedSources.c_str());
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();

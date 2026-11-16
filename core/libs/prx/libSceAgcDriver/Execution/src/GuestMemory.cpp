@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -41,6 +42,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <string_view>
 #include <tuple>
 #include <unordered_map>
 #include <utility>
@@ -537,6 +539,67 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 #endif
 }
 
+std::array<ProfileCounter, static_cast<std::size_t>(ExclusionSource::Count)> unwatchedBytes;
+std::atomic<bool> exclusionSourcesDroppedForTest{false};
+
+struct CompareSite {
+    std::atomic<std::uint64_t> key{0};
+    std::atomic<const char*> file{nullptr};
+    std::atomic<std::uint32_t> line{0};
+    ProfileCounter calls;
+    ProfileCounter bytes;
+};
+constexpr std::size_t CompareSiteSlots = 48;
+std::array<CompareSite, CompareSiteSlots> compareSites;
+ProfileCounter compareSitesOverflow;
+
+void CountCompareSite(const std::source_location& site, std::size_t bytes) {
+    const auto key = (static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(site.file_name())) << 16u) ^ site.line() ^ 1u;
+    for (auto& slot : compareSites) {
+        auto held = slot.key.load(std::memory_order_acquire);
+        if (held == 0 && slot.key.compare_exchange_strong(held, key, std::memory_order_acq_rel)) {
+            slot.file.store(site.file_name(), std::memory_order_relaxed);
+            slot.line.store(site.line(), std::memory_order_release);
+            held = key;
+        }
+        if (held != key) continue;
+        slot.calls.Add();
+        slot.bytes.Add(bytes);
+        return;
+    }
+    compareSitesOverflow.Add(bytes);
+}
+
+std::uint64_t CompareSiteBytesForTest(std::uint32_t line) {
+    std::uint64_t bytes = 0;
+    for (const auto& slot : compareSites) {
+        if (slot.key.load(std::memory_order_acquire) != 0 && slot.line.load(std::memory_order_acquire) == line) bytes += slot.bytes.Sum();
+    }
+    return bytes;
+}
+
+std::string CompareSitesText() {
+    std::vector<std::tuple<std::uint64_t, std::uint64_t, const char*, std::uint32_t>> taken;
+    for (auto& slot : compareSites) {
+        if (slot.key.load(std::memory_order_acquire) == 0) continue;
+        const auto calls = slot.calls.Take();
+        const auto bytes = slot.bytes.Take();
+        if (calls != 0) taken.emplace_back(bytes, calls, slot.file.load(std::memory_order_relaxed), slot.line.load(std::memory_order_acquire));
+    }
+    std::sort(taken.rbegin(), taken.rend());
+    std::string text;
+    for (std::size_t i = 0; i < taken.size() && i < 12; ++i) {
+        const auto& [bytes, calls, file, line] = taken[i];
+        std::string_view name = file != nullptr ? file : "?";
+        if (const auto slash = name.find_last_of("/\\"); slash != std::string_view::npos) name.remove_prefix(slash + 1);
+        char entry[160];
+        std::snprintf(entry, sizeof(entry), " %.*s:%u %.1f MiB %llu calls", static_cast<int>(name.size()), name.data(), line, bytes / 1048576.0, static_cast<unsigned long long>(calls));
+        text += entry;
+    }
+    if (const auto overflow = compareSitesOverflow.Take(); overflow != 0) text += " other " + std::to_string(overflow / 1048576) + " MiB";
+    return text.empty() ? std::string(" none") : text;
+}
+
 void CountReadCaller(const void* returnAddress) {
     thread_local std::uint32_t sampled = 0;
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).
@@ -589,6 +652,8 @@ public:
             const auto count = readSiteSamples[site].load(std::memory_order_relaxed);
             if (count != 0) AgcDriver::ProfilePrint_nid_no_patch(" %s=%llu", ReadSiteName(static_cast<ReadSite>(site)), static_cast<unsigned long long>(count));
         }
+        AgcDriver::ProfilePrint_nid_no_patch(" | compares by site (10 s):%s | unwatched by source (10 s):", CompareSitesText().c_str());
+        for (std::size_t source = 0; source < unwatchedBytes.size(); ++source) AgcDriver::ProfilePrint_nid_no_patch(" %s %.1f MiB", ExclusionSourceName(static_cast<ExclusionSource>(source)), unwatchedBytes[source].Take() / 1048576.0);
         AgcDriver::ProfilePrint_nid_no_patch("\n");
     }
 private:
@@ -1355,6 +1420,7 @@ struct WriteTracker {
 #endif
     };
     std::vector<std::unique_ptr<Leaf>> leaves;
+    UnwatchSources unwatchSources;
 #ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
@@ -1910,6 +1976,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
     tracker.coverage.Restore(address, bytes, generation);
+    tracker.unwatchSources.Erase(address, address + bytes);
     ++tracker.generation;
     tracker.noteCpuStore(address, address + bytes, tracker.generation);
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
@@ -2325,8 +2392,12 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
     beforeUnwatch(address, bytes);
 }
 
-void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, ExclusionSource source) {
     if (!tracker.watched) return;
+    if (bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && !exclusionSourcesDroppedForTest.load(std::memory_order_relaxed)) {
+        tracker.unwatchSources.Assign(address, address + bytes, static_cast<std::uint8_t>(source));
+        unwatchedBytes[static_cast<std::size_t>(source)].Add(bytes);
+    }
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {
@@ -2394,7 +2465,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    unwatchLocked(tracker, address, bytes);
+    unwatchLocked(tracker, address, bytes, ExclusionSource::Explicit);
 }
 
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -2410,6 +2481,7 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         if (tracker.coverage.Covers(begin, bytes)) continue;
         GuestArena::GuestArenaCompareWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), bytes);
         if (!walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
+        tracker.unwatchSources.Erase(begin, end);
         ++tracker.generation;
         tracker.noteCpuStore(begin, end, tracker.generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
@@ -2459,8 +2531,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
         if (!runImport()) return false;
         bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
-        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
-        unwatchLocked(tracker, address, bytes);
+        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), ExclusionSource::ComparedImport);
+        unwatchLocked(tracker, address, bytes, ExclusionSource::ComparedImport);
         return true;
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
@@ -2513,10 +2585,10 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     leave(leaving);
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
-        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
+        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom), ExclusionSource::ImportWalk);
         unwatchedFrom = end;
     }
-    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
+    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom), ExclusionSource::ImportWalk);
     return true;
 }
 
@@ -2587,6 +2659,24 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
+}
+
+void SetExclusionSourcesDroppedForTest(bool dropped) {
+    exclusionSourcesDroppedForTest.store(dropped, std::memory_order_relaxed);
+}
+
+const char* ExclusionSourceName(ExclusionSource source) {
+    constexpr std::array<const char*, static_cast<std::size_t>(ExclusionSource::Count)> names{"compared-import", "import-walk", "collect-failed", "explicit"};
+    const auto index = static_cast<std::size_t>(source);
+    return index < names.size() ? names[index] : "invalid";
+}
+
+std::uint32_t UnwatchedSources(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    auto& tracker = Tracker();
+    auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return tracker.unwatchSources.Mask(address, address + bytes);
 }
 
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -2800,7 +2890,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
                 beforeUnwatchUnproven(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             }
             ++tracker.generation;
-            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst), ExclusionSource::CollectFailed);
             tracker.noteUnstampedStore(address, address + bytes);
             if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
             return 0;
@@ -3677,14 +3767,15 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
-bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
+bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site) {
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
-    return EqualsCommittedUnsynced(address, bytes);
+    return EqualsCommittedUnsynced(address, bytes, site);
 }
 
-bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
+bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes, std::source_location site) {
     if (bytes.empty()) return true;
+    if (MemoryProfiled()) CountCompareSite(site, bytes.size());
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return equalsCommittedBytes(address, bytes.data(), bytes.size());
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {

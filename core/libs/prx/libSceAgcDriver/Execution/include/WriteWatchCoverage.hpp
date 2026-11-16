@@ -7,9 +7,52 @@
 #include <cstdint>
 #include <vector>
 #include <limits>
+#include <map>
 #include <unordered_map>
 
 namespace AgcDriver::GuestMemory {
+
+class UnwatchSources {
+public:
+    void Assign(std::uint64_t begin, std::uint64_t end, std::uint8_t source) {
+        if (end <= begin) return;
+        Erase(begin, end);
+        ranges.emplace(begin, Range{end, source});
+    }
+
+    void Erase(std::uint64_t begin, std::uint64_t end) {
+        if (end <= begin) return;
+        auto it = ranges.lower_bound(begin);
+        if (it != ranges.begin() && std::prev(it)->second.end > begin) --it;
+        while (it != ranges.end() && it->first < end) {
+            const auto [first, range] = *it;
+            it = ranges.erase(it);
+            if (first < begin) ranges.emplace(first, Range{begin, range.source});
+            if (range.end > end) {
+                ranges.emplace(end, Range{range.end, range.source});
+                break;
+            }
+        }
+    }
+
+    std::uint32_t Mask(std::uint64_t begin, std::uint64_t end) const {
+        std::uint32_t mask = 0;
+        if (end <= begin) return mask;
+        auto it = ranges.lower_bound(begin);
+        if (it != ranges.begin() && std::prev(it)->second.end > begin) --it;
+        for (; it != ranges.end() && it->first < end; ++it) mask |= std::uint32_t{1} << it->second.source;
+        return mask;
+    }
+
+    std::size_t Ranges() const { return ranges.size(); }
+
+private:
+    struct Range {
+        std::uint64_t end;
+        std::uint8_t source;
+    };
+    std::map<std::uint64_t, Range> ranges;
+};
 
 class WriteWatchCoverage {
 public:
