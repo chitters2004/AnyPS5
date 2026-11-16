@@ -265,6 +265,7 @@ struct LiveImages {
 
 std::atomic<void (*)()> publishHookForTest{nullptr};
 std::atomic<void (*)(std::uint64_t, std::size_t)> pendingHookForTest{nullptr};
+std::atomic<void (*)(std::uint64_t, std::size_t)> flushingHookForTest{nullptr};
 
 LiveImages& Live() {
     static LiveImages live;
@@ -5125,6 +5126,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             BumpPendingSerial();
         }
     } unregister{flush};
+    if (const auto hook = flushingHookForTest.load(std::memory_order_acquire)) hook(address, bytes);
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
@@ -5263,6 +5265,10 @@ void StorageTexture::SetPublishHookForTest(void (*hook)()) {
 
 void StorageTexture::SetPendingHookForTest(void (*hook)(std::uint64_t address, std::size_t bytes)) {
     pendingHookForTest.store(hook, std::memory_order_release);
+}
+
+void StorageTexture::SetFlushingHookForTest(void (*hook)(std::uint64_t address, std::size_t bytes)) {
+    flushingHookForTest.store(hook, std::memory_order_release);
 }
 
 bool StorageTexture::UnwatchHookLocksGpu(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
