@@ -62,6 +62,36 @@
 #include <iterator>
 #endif
 #endif
+#include <chrono>
+#include <cstdarg>
+
+namespace {
+const auto timingStart = std::chrono::steady_clock::now();
+auto timingLast = timingStart;
+
+void timingPrefix() {
+    const auto now = std::chrono::steady_clock::now();
+    std::printf("[%9.3f +%8.3f] ", std::chrono::duration<double>(now - timingStart).count(), std::chrono::duration<double>(now - timingLast).count());
+    timingLast = now;
+}
+
+int timedPrintf(const char* format, ...) {
+    timingPrefix();
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = std::vprintf(format, arguments);
+    va_end(arguments);
+    std::fflush(stdout);
+    return written;
+}
+
+int timedPuts(const char* text) {
+    timingPrefix();
+    const int written = std::puts(text);
+    std::fflush(stdout);
+    return written;
+}
+}
 
 namespace AgcDriver {
 
@@ -129,7 +159,7 @@ public:
             VkPhysicalDeviceProperties selectedProperties{};
             function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &selectedProperties);
             context.limits = selectedProperties.limits;
-            std::printf("Selected GPU name=%s vendor=0x%x device=0x%x driver=%u\n", selectedProperties.deviceName, selectedProperties.vendorID, selectedProperties.deviceID, selectedProperties.driverVersion);
+            timedPrintf("Selected GPU name=%s vendor=0x%x device=0x%x driver=%u\n", selectedProperties.deviceName, selectedProperties.vendorID, selectedProperties.deviceID, selectedProperties.driverVersion);
             const auto queues = function<PFN_vkGetPhysicalDeviceQueueFamilyProperties>("vkGetPhysicalDeviceQueueFamilyProperties");
             queues(context.physical, &count, nullptr);
             std::vector<VkQueueFamilyProperties> families(count);
@@ -1469,7 +1499,7 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
             Require(std::equal(excluded[index].begin(), excluded[index].end(), reinterpret_cast<const std::byte*>(addresses[index] + begin)), "native D32S8 publication wrote an unmapped or remapped hole");
         }
     }
-    std::printf("Native D32S8 publication samples=%u write=%u depthOnly=%u unmap=%u clear=%u checked\n", samples, static_cast<std::uint32_t>(write), depthOnly, static_cast<std::uint32_t>(unmap), static_cast<std::uint32_t>(clear));
+    timedPrintf("Native D32S8 publication samples=%u write=%u depthOnly=%u unmap=%u clear=%u checked\n", samples, static_cast<std::uint32_t>(write), depthOnly, static_cast<std::uint32_t>(unmap), static_cast<std::uint32_t>(clear));
 }
 
 std::array<std::uint32_t, 8> StencilSampleWords(const DepthTarget& target) {
@@ -1573,7 +1603,7 @@ void CheckDrawFeedback() {
     AgcDriver::GuestMemory::Read(tested.address + depthBytes - 1u, probe);
     Require(probe[0] == guestByte(depthBytes - 1u), "a guest read after a depth-test-only draw did not return its guest bytes");
     Require(!DepthSurfaceAt(tested.address), "a guest read left a native depth surface only depth-tested resident");
-    std::puts("Native depth feedback refused through the draw resource path; a written surface refused and a depth-tested one retired on guest read");
+    timedPuts("Native depth feedback refused through the draw resource path; a written surface refused and a depth-tested one retired on guest read");
 }
 
 void CheckDepthAttachmentAlias() {
@@ -1606,7 +1636,7 @@ void CheckDepthAttachmentAlias() {
     Require(secondView != VK_NULL_HANDLE && secondView != firstView, "an aliased depth attachment reused the previous layout's view");
     Require(DepthSurfaceView(context, second) == secondView, "an unchanged native depth attachment was not reused");
     for (std::size_t offset = 0u; offset < bytes; ++offset) Require(memory.Data()[offset] == std::byte{0x3c}, "retiring an unwritten attachment alias changed guest bytes");
-    std::puts("native depth attachment alias changes layout while retaining held GPU views");
+    timedPuts("native depth attachment alias changes layout while retaining held GPU views");
 }
 
 void CheckStorageAliasRetirement() {
@@ -1648,7 +1678,7 @@ void CheckStorageAliasRetirement() {
     Require(CachedStorageSurface(context, alias) != nullptr, "overlapping cached storage alias was not returned");
     Require(!DepthSurfaceAt(depth.address), "a cached storage view kept a native depth owner inside its range");
     for (std::size_t offset = 0u; offset < prefix + bytes; ++offset) Require(memory.Data()[offset] == std::byte{0x3c}, "retiring unwritten native depth changed guest bytes");
-    std::puts("cached storage span retires only intersecting native depth owners");
+    timedPuts("cached storage span retires only intersecting native depth owners");
 }
 
 enum class ClearFault { None, PartialStore, CpuWrite, DepthWrite, BadMetadata, UnprovenDispatch, PendingWrite, Overlap, PossibleStore, CompletedPossibleStore, DriverDispatch, ImportWindowWrite, FillDuringClear, DriverBufferDispatch, SupersededClear };
@@ -1857,14 +1887,14 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                         if (!AgcDriver::GuestMemory::Watched(target.htileAddress, metadataBytes)) {
                             Require(PrepareImportWatch(driverContext) == ImportWatch::Unwatch,
                                     "the HTILE metadata range lost write-watch coverage on a device whose host imports stay watched");
-                            std::puts("skipped native HTILE write-coverage assertion: the write tracker does not cover the imported metadata range; the production depth-sampling path may still decline this clear");
+                            timedPuts("skipped native HTILE write-coverage assertion: the write tracker does not cover the imported metadata range; the production depth-sampling path may still decline this clear");
                             TargetRefuses([&] { Require(DepthSurfaceHolds(context, DecodeTextureResource(words), texture.get()), "native depth owner was not retained"); },
                                           "native multisample depth clear requires tracked HTILE generations");
                             return;
                         } else {
                             const bool storedAll = AgcDriver::GuestMemory::StoredAllSince_nid_no_patch(target.htileAddress, metadataBytes, generation);
                             Require(storedAll, "driver idle returned before recording the completed HTILE dispatch");
-                            std::puts("Native HTILE tracked dispatch completed");
+                            timedPuts("Native HTILE tracked dispatch completed");
                         }
                     } else {
                         const auto nativeBytes = fault == ClearFault::UnprovenDispatch ? 0u : static_cast<std::size_t>(metadataBytes);
@@ -1963,7 +1993,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
                 batch.SubmitAndWait();
                 check(false, 0.0f);
             }
-            std::printf("Native depth completed %s format=%d samples=%u depthOnly=%u value=%u cycles=3\n", source == ClearSource::QueuedFill ? "queued metadata fill" : filling ? "metadata fill" : "clear", format, fragments, depthOnly, one);
+            timedPrintf("Native depth completed %s format=%d samples=%u depthOnly=%u value=%u cycles=3\n", source == ClearSource::QueuedFill ? "queued metadata fill" : filling ? "metadata fill" : "clear", format, fragments, depthOnly, one);
         }
     }
     Require(std::all_of(memory.Data(), memory.Data() + bytes, [](auto value) { return value == std::byte{0xa5}; }), "native depth sampling silently published guest memory");
@@ -2012,7 +2042,7 @@ void CheckDepthTarget(Context context, VkFormat format, std::uint32_t fragments,
     TargetRefuses([&] { DepthSurfaceHolds(context, resource, texture.get()); }, "guest writes");
     texture.reset();
     arrayTexture.reset();
-    std::printf("Native depth format=%u samples=%u clear=%u iterate256=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one, iterate256);
+    timedPrintf("Native depth format=%u samples=%u clear=%u iterate256=%u: imported, rasterized twice, sampled and refused conflicts\n", static_cast<std::uint32_t>(format), fragments, one, iterate256);
 }
 
 void CheckUnwrittenGuestAccess(Context context, VkFormat format, std::uint32_t fragments) {
@@ -2066,7 +2096,7 @@ void CheckUnwrittenGuestAccess(Context context, VkFormat format, std::uint32_t f
     Require(resident(), "a refused guest access retired a written native depth surface");
     for (std::size_t offset = 0u; offset < bytes; ++offset) Require(memory.Data()[offset] == guestByte(offset), "retiring an unwritten native depth surface changed its guest bytes");
     Require(std::all_of(metadata.Data(), metadata.Data() + metadataBytes, [](std::byte value) { return value == std::byte{0}; }), "retiring an unwritten native depth surface changed its HTILE");
-    std::printf("Native depth format=%u samples=%u: guest access retired the unwritten surface and refused the written one\n", static_cast<std::uint32_t>(format), fragments);
+    timedPrintf("Native depth format=%u samples=%u: guest access retired the unwritten surface and refused the written one\n", static_cast<std::uint32_t>(format), fragments);
 }
 
 enum class BufferWrite { DepthPlane, Htile };
@@ -2109,11 +2139,11 @@ void CheckBufferWrite(Context context, VkFormat format, std::uint32_t fragments,
 
 void CheckBufferWrites(Context context, VkFormat format, std::uint32_t fragments) {
     if (context.hostImportAlignment == 0u) {
-        std::printf("skipped native depth buffer writes: the device lacks VK_EXT_external_memory_host, VK_KHR_buffer_device_address or the bufferDeviceAddress feature\n");
+        timedPrintf("skipped native depth buffer writes: the device lacks VK_EXT_external_memory_host, VK_KHR_buffer_device_address or the bufferDeviceAddress feature\n");
         return;
     }
     for (const auto write : {BufferWrite::DepthPlane, BufferWrite::Htile}) CheckBufferWrite(context, format, fragments, write);
-    std::printf("Native depth format=%u samples=%u: a GPU buffer write over the depth or HTILE released the unwritten surface\n", static_cast<std::uint32_t>(format), fragments);
+    timedPrintf("Native depth format=%u samples=%u: a GPU buffer write over the depth or HTILE released the unwritten surface\n", static_cast<std::uint32_t>(format), fragments);
 }
 
 void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments) {
@@ -2143,7 +2173,7 @@ void CheckHtileRouting(Context context, VkFormat format, std::uint32_t fragments
     alias.address = single.Address();
     Require(DepthSurfaceView(context, alias) != VK_NULL_HANDLE, "a single-sample bind could not retire an unwritten native HTILE owner");
     Require(untouched(), "a single-sample bind over a native owner's HTILE stored expanded words into it");
-    std::printf("Native depth format=%u samples=%u: binds over the owner's HTILE left its words alone\n", static_cast<std::uint32_t>(format), fragments);
+    timedPrintf("Native depth format=%u samples=%u: binds over the owner's HTILE left its words alone\n", static_cast<std::uint32_t>(format), fragments);
 }
 
 enum class StencilFault { None, DepthWord, StencilWord, PartialStencil, MixedDepth, UnwatchedStencil, StencilWrite, StencilQueued, FillPartial, FillDepthWord, FillStencilWord, FillPartialStore, FillCpuWrite, FillStencilWrite, FillOverlap, MaskClear };
@@ -2249,7 +2279,7 @@ void CheckStencilTarget(Context context, std::uint32_t fragments, bool one, bool
     }
     Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [](auto value) { return value == std::byte{0xa5}; }), "native depth-stencil sampling silently published the stencil plane");
     texture.reset();
-    std::printf("Native depth-stencil samples=%u clear=%u fill=%u: imported, stencil-tested, sampled%s\n", fragments, one, filling, filling ? " and refilled three times" : "");
+    timedPrintf("Native depth-stencil samples=%u clear=%u fill=%u: imported, stencil-tested, sampled%s\n", fragments, one, filling, filling ? " and refilled three times" : "");
 }
 
 enum class PlaneFault { None, StencilByte, StencilWrite, UnwatchedStencil, HtileWord, PartialStencilFill, StencilFillPattern, StencilFillUnstored, StencilFillCpuWrite, StencilFillStoredFirst, StencilSameValueStore, StencilOtherValueStore };
@@ -2379,7 +2409,7 @@ void CheckSeparateStencilTarget(Context context, std::uint32_t fragments, bool o
     else Require(std::equal(imported.begin(), imported.end(), stencil.Data()), "native depth sampling with a separate stencil plane changed the guest stencil plane");
     bare.reset();
     texture.reset();
-    std::printf("Native depth with a separate stencil plane samples=%u clear=%u fill=%u pipeAligned=%u: imported, stencil-tested and sampled with and without HTILE; other metadata and XOR refused\n", fragments, one, static_cast<std::uint32_t>(fill), pipeAligned);
+    timedPrintf("Native depth with a separate stencil plane samples=%u clear=%u fill=%u pipeAligned=%u: imported, stencil-tested and sampled with and without HTILE; other metadata and XOR refused\n", fragments, one, static_cast<std::uint32_t>(fill), pipeAligned);
 }
 
 enum class GhostFill { Stored, QueuedAfterNote, QueuedBeforeNote, QueuedNotedTwice };
@@ -2461,7 +2491,7 @@ void CheckGhostSequence(Context context, std::uint32_t fragments, GhostFill path
     sample(&hit, 0.25f, 0.25f);
     Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [](auto value) { return value == std::byte{0}; }), "native depth sampling after the stencil plane fill changed the guest stencil plane");
     texture.reset();
-    std::printf("Native depth after HTILE and stencil plane fills samples=%u path=%u: imported, sampled the cleared depth and stencil-tested the filled stencil\n", fragments, static_cast<std::uint32_t>(path));
+    timedPrintf("Native depth after HTILE and stencil plane fills samples=%u path=%u: imported, sampled the cleared depth and stencil-tested the filled stencil\n", fragments, static_cast<std::uint32_t>(path));
 }
 
 enum class AliasCase { Cleared, DrawnAfterClear, OtherFormat, OtherSamples, Drawn };
@@ -2550,7 +2580,7 @@ void CheckAliasedStencil(Context context, std::uint32_t fragments, AliasCase whi
             read(std::nullopt);
             Require(untouched(), "native depth over an unproven aliased stencil plane read or wrote the guest stencil plane");
             texture.reset();
-            std::printf("Native depth over a stencil plane aliased by a colour target samples=%u case=%u: imported with the plane unproven, depth sampled, a stencil-tested bind and a stencil plane sample refused\n", fragments, static_cast<std::uint32_t>(which));
+            timedPrintf("Native depth over a stencil plane aliased by a colour target samples=%u case=%u: imported with the plane unproven, depth sampled, a stencil-tested bind and a stencil plane sample refused\n", fragments, static_cast<std::uint32_t>(which));
             return;
         }
         absorb(cleared);
@@ -2568,7 +2598,7 @@ void CheckAliasedStencil(Context context, std::uint32_t fragments, AliasCase whi
     TargetRefuses([&] { CachedSampledTexture(context, words); }, "native multisample stencil plane aliases a multisampled colour target whose samples are only on the host");
     Require(untouched(), "native depth over an aliased stencil plane read or wrote the guest stencil plane");
     texture.reset();
-    std::printf("Native depth over a stencil plane aliased by an R8 colour target samples=%u case=%u: %s, refilled from its fill, refused once the colour target drew\n", fragments, static_cast<std::uint32_t>(which), which == AliasCase::Cleared ? "imported from the colour target's clear" : "imported unproven and proven by a whole-plane fill the colour target absorbed");
+    timedPrintf("Native depth over a stencil plane aliased by an R8 colour target samples=%u case=%u: %s, refilled from its fill, refused once the colour target drew\n", fragments, static_cast<std::uint32_t>(which), which == AliasCase::Cleared ? "imported from the colour target's clear" : "imported unproven and proven by a whole-plane fill the colour target absorbed");
 }
 
 void CheckStencilView(Context context, std::uint32_t fragments) {
@@ -2656,7 +2686,7 @@ void CheckStencilView(Context context, std::uint32_t fragments) {
     Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [](auto value) { return value == std::byte{0}; }), "sampling the native stencil view read or wrote the guest stencil plane");
     stencilTexture.reset();
     depth.reset();
-    std::printf("Native D32S8 stencil view samples=%u: per-pixel, per-sample stencil and depth read in one dispatch through an R8_UINT and a D32 2D MSAA T#, twice after raster writes; other stencil descriptors refused\n", fragments);
+    timedPrintf("Native D32S8 stencil view samples=%u: per-pixel, per-sample stencil and depth read in one dispatch through an R8_UINT and a D32 2D MSAA T#, twice after raster writes; other stencil descriptors refused\n", fragments);
 }
 
 enum class DepthAliasCase { Mismatched, Matching, Partial, UnprovenWord, OtherClearWord, OtherSamples, DrawnAfterImport, NewTargetAfterImport, Unchanged, DrawnBeforeImport, StencilWord, AliasedStencilPlane, SameFillAfterImport, OtherFillAfterImport, PartialFillAfterImport, DrawnThenSameFill, HtileWordThenSameFill, NegativeZeroFill, NanFill, FillShortOfAlias, PartialThenSameFill, OtherThenSameFill, DoubleSameFill, TripleSameFill, SameOtherSameFill, SamePartialSameFill, SameDrawSameFill, UnknownThenPartialFill };
@@ -2817,7 +2847,7 @@ void CheckAliasedDepth(Context context, std::uint32_t fragments, const AliasedDe
     Require(std::all_of(stencil.Data(), stencil.Data() + stencilBytes, [](auto value) { return value == std::byte{0}; }), "native depth over an aliased depth plane changed the guest stencil plane");
     texture.reset();
     const char* after = which == DepthAliasCase::Unchanged ? ", sampled again unchanged" : which == DepthAliasCase::DrawnAfterImport ? ", refused once the colour target drew" : which == DepthAliasCase::NewTargetAfterImport ? ", refused once a second colour target covered the plane" : which == DepthAliasCase::SameFillAfterImport ? ", sampled again after a whole fill of the colour target's clear value" : which == DepthAliasCase::OtherFillAfterImport ? ", refused once the colour target took a whole fill of another value" : which == DepthAliasCase::PartialFillAfterImport ? ", refused once half the colour target took a fill of its clear value" : which == DepthAliasCase::DrawnThenSameFill ? ", refused once the colour target drew and took a whole fill of its clear value" : which == DepthAliasCase::HtileWordThenSameFill ? ", refused once a guest write changed an HTILE word before a whole fill of the colour target's clear value" : which == DepthAliasCase::NegativeZeroFill ? ", refused once the colour target cleared to 0.0 took a whole fill of -0.0" : which == DepthAliasCase::NanFill ? ", refused once the colour target took a whole fill of a NaN" : which == DepthAliasCase::FillShortOfAlias ? ", refused once the colour target took a fill of its clear value over its footprint but not its whole guarded range" : which == DepthAliasCase::PartialThenSameFill ? ", refused once the colour target took a fill of half its range and then a whole fill of its clear value" : which == DepthAliasCase::OtherThenSameFill ? ", refused once the colour target took a whole fill of another value and then one of its clear value" : which == DepthAliasCase::DoubleSameFill ? ", sampled again after two whole fills of the colour target's clear value" : which == DepthAliasCase::TripleSameFill ? ", sampled again after three whole fills of the colour target's clear value" : which == DepthAliasCase::SameOtherSameFill ? ", refused once whole fills of its clear value, another value and its clear value followed" : which == DepthAliasCase::SamePartialSameFill ? ", refused once a whole fill of its clear value, a fill of half its range and a whole fill of its clear value followed" : which == DepthAliasCase::SameDrawSameFill ? ", refused once a whole fill of its clear value, a draw and a whole fill of its clear value followed" : which == DepthAliasCase::UnknownThenPartialFill ? ", imported while a fill of half the colour target left it unknown, refused once it took a second such fill" : "";
-    std::printf("Native depth over a depth plane aliased by an R32F colour target holding %g samples=%u clear=%u htile=%u word=0x%08x case=%u: imported with every HTILE word proving the clear, read DB_DEPTH_CLEAR in every sample%s\n", aliasValue, fragments, one, static_cast<std::uint32_t>(htile.layout), proving, static_cast<std::uint32_t>(which), after);
+    timedPrintf("Native depth over a depth plane aliased by an R32F colour target holding %g samples=%u clear=%u htile=%u word=0x%08x case=%u: imported with every HTILE word proving the clear, read DB_DEPTH_CLEAR in every sample%s\n", aliasValue, fragments, one, static_cast<std::uint32_t>(htile.layout), proving, static_cast<std::uint32_t>(which), after);
 }
 
 void CheckExpandGate(Context context, std::uint32_t fragments, bool stencilPlane) {
@@ -2908,7 +2938,7 @@ void CheckExpandGate(Context context, std::uint32_t fragments, bool stencilPlane
     refused();
     bare.reset();
     texture.reset();
-    std::printf("Native depth in-place expand gate samples=%u stencil=%u: sampled without metadata only after an expand draw, refused again after an HTILE fill, a clear draw and %s\n", fragments, stencilPlane, stencilPlane ? "a stencil plane fill" : "an HTILE mask clear");
+    timedPrintf("Native depth in-place expand gate samples=%u stencil=%u: sampled without metadata only after an expand draw, refused again after an HTILE fill, a clear draw and %s\n", fragments, stencilPlane, stencilPlane ? "a stencil plane fill" : "an HTILE mask clear");
 }
 
 void CheckEligibility(Context context) {
@@ -3063,7 +3093,7 @@ void CheckEligibility(Context context) {
         }
     }
     texture.reset();
-    std::puts("Native depth eligibility, guest writes, queued writes, metadata transitions and held views checked");
+    timedPuts("Native depth eligibility, guest writes, queued writes, metadata transitions and held views checked");
 }
 
 void CheckInitialOwner(Context context, VkFormat format, std::uint32_t samples, bool one, bool depthOnly) {
@@ -3246,7 +3276,7 @@ void CheckRetirement(Context context, VkFormat format, std::uint32_t samples, st
         for (std::uint32_t i = 0u; i < count; ++i) {
             std::array<float, 4> value{};
             std::memcpy(value.data(), output.Bytes().data() + (i + 1u) * 16u, 16u);
-            if (value != std::array<float, 4>{expected, 0.0f, 0.0f, 1.0f}) std::printf("Retirement sample format=%d samples=%u mode=%u index=%u expected=%g actual=(%g,%g,%g,%g)\n", format, samples, mode, i, expected, value[0], value[1], value[2], value[3]);
+            if (value != std::array<float, 4>{expected, 0.0f, 0.0f, 1.0f}) timedPrintf("Retirement sample format=%d samples=%u mode=%u index=%u expected=%g actual=(%g,%g,%g,%g)\n", format, samples, mode, i, expected, value[0], value[1], value[2], value[3]);
             Require(value == std::array<float, 4>{expected, 0.0f, 0.0f, 1.0f}, "retired or remapped depth image lost its exact contents");
         }
         Require(std::all_of(output.Bytes().begin(), output.Bytes().begin() + 16u, [](std::byte value) { return value == std::byte{0xa5}; }) && std::all_of(output.Bytes().end() - 16u, output.Bytes().end(), [](std::byte value) { return value == std::byte{0xa5}; }), "retirement fetch wrote beyond its output");
@@ -3373,21 +3403,21 @@ void CheckDriverPathTarget(const Context& context, Recorder& recorder, std::uint
     if (fill == DriverFill::Partial) {
         target.Fill(target.HtileBytes() / 2u);
         TargetRefuses([&] { target.Sampled(); }, "native multisample depth metadata fill transition is not implemented");
-        std::printf("Native depth on the driver's device samples=%u clear=%u: a DMA_DATA fill over half its HTILE refused\n", fragments, one);
+        timedPrintf("Native depth on the driver's device samples=%u clear=%u: a DMA_DATA fill over half its HTILE refused\n", fragments, one);
         return;
     }
     if (fill == DriverFill::Queued) {
         target.Fill(DriverMetadataSpan);
         Require(AgcDriver::DriverDetail::dmaFills.load() == fillsBefore + 1u, "a DMA_DATA fill of 128 KiB from the HTILE was not queued as a buffer fill");
         target.Sample(std::nullopt, std::nullopt, "a queued DMA_DATA fill of 128 KiB from the HTILE through the driver");
-        std::printf("Native depth on the driver's device samples=%u clear=%u: cleared by a queued DMA_DATA fill of 128 KiB from its HTILE through the driver and sampled\n", fragments, one);
+        timedPrintf("Native depth on the driver's device samples=%u clear=%u: cleared by a queued DMA_DATA fill of 128 KiB from its HTILE through the driver and sampled\n", fragments, one);
         return;
     }
     target.Fill(target.HtileBytes());
     Require(AgcDriver::DriverDetail::dmaFills.load() == fillsBefore, "a whole-HTILE DMA_DATA fill of 64 KiB or less was stored as a queued buffer fill");
     target.Sample(std::nullopt, std::nullopt, "a whole-HTILE DMA_DATA fill through the driver");
     target.Sample(0.125f, 0.125f, "native depth drawn after a DMA_DATA clear through the driver");
-    std::printf("Native depth on the driver's device samples=%u clear=%u %ux%u: drawn, cleared by a DMA_DATA fill of its HTILE through the driver and sampled\n", fragments, one, size.width, size.height);
+    timedPrintf("Native depth on the driver's device samples=%u clear=%u %ux%u: drawn, cleared by a DMA_DATA fill of its HTILE through the driver and sampled\n", fragments, one, size.width, size.height);
 }
 
 int CheckDriverPath(bool queued) {
@@ -3407,7 +3437,7 @@ int CheckDriverPath(bool queued) {
         Require(recorder != nullptr && recorder->Device() == context.device, "the driver's device did not activate its recorder");
 #ifdef _WIN32
         if (queued && PrepareImportWatch(context) == ImportWatch::Unwatch) {
-            std::printf("skipped, host imports are compared here, not write-watched, and a queued fill's HTILE proof needs a write-watched import\n");
+            timedPrintf("skipped, host imports are compared here, not write-watched, and a queued fill's HTILE proof needs a write-watched import\n");
             return VulkanTestSkipped;
         }
 #else
@@ -3423,7 +3453,7 @@ int CheckDriverPath(bool queued) {
         }
         if (!queued) CheckDriverPathTarget(context, *recorder, 4u, false, DriverFill::Partial);
         AgcDriverWaitIdle_nid_postfix();
-        std::printf("Native depth on the driver's device cases checked=%u unavailable=%u\n", checked, unavailable);
+        timedPrintf("Native depth on the driver's device cases checked=%u unavailable=%u\n", checked, unavailable);
         return 0;
     }();
     device.reset();
@@ -3521,7 +3551,7 @@ void CheckUniformPlanesWithoutHtile(Context context, std::uint32_t samples) {
         TargetRefuses([&] { lookup(); }, "guest writes");
         clear();
     }
-    std::printf("Native D32S8 without HTILE, samples=%u: uniform planes imported and sampled, other planes refused\n", samples);
+    timedPrintf("Native D32S8 without HTILE, samples=%u: uniform planes imported and sampled, other planes refused\n", samples);
 }
 
 void CheckUnevenPlaneWithoutHtile(Context context, std::uint32_t samples) {
@@ -3617,14 +3647,14 @@ void CheckUnevenPlaneWithoutHtile(Context context, std::uint32_t samples) {
     store(linear);
     if (!draws && !copies) {
         TargetRefuses([&] { lookup(); }, "requires multisampled storage image writes without format");
-        std::printf("Native D32 without stencil or HTILE, samples=%u: uniform plane cleared, plane outside [0, 1] %s, uneven plane refused without the import features\n", samples, outsideResult.c_str());
+        timedPrintf("Native D32 without stencil or HTILE, samples=%u: uniform plane cleared, plane outside [0, 1] %s, uneven plane refused without the import features\n", samples, outsideResult.c_str());
         return;
     }
     requireSamples(linear, "an uneven D32 plane without stencil or HTILE");
     memory.Data()[0] = std::byte{0x3f};
     TargetRefuses([&] { lookup(); }, "guest writes");
     clear();
-    std::printf("Native D32 without stencil or HTILE, samples=%u: uniform plane cleared, plane outside [0, 1] %s, uneven plane imported sample by sample, later guest writes refused\n", samples, outsideResult.c_str());
+    timedPrintf("Native D32 without stencil or HTILE, samples=%u: uniform plane cleared, plane outside [0, 1] %s, uneven plane imported sample by sample, later guest writes refused\n", samples, outsideResult.c_str());
 }
 
 enum class UniformPublication { Read, Pages, StencilRace, PlaneStore };
@@ -3705,7 +3735,7 @@ void CheckUniformPlanePublication(Context context, std::uint32_t samples, Unifor
         Require(stored && stencil.Data()[stencilSample] == std::byte{0x7e} && DepthSurfaceAt(target.address), "a CPU store to the stencil plane of a D32S8 owner without HTILE was overwritten or its owner retired");
         if (betweenPlanes) Require(std::equal(expected[0].begin(), expected[0].end(), memory.Data()), "the depth plane of a D32S8 owner without HTILE was not committed before its stencil plane");
     }
-    std::printf("Native D32S8 without HTILE publication samples=%u mode=%u checked\n", samples, static_cast<std::uint32_t>(mode));
+    timedPrintf("Native D32S8 without HTILE publication samples=%u mode=%u checked\n", samples, static_cast<std::uint32_t>(mode));
 }
 
 enum class BarePublication { Uniform, Uneven, Pages };
@@ -3774,7 +3804,7 @@ void CheckBarePlanePublication(Context context, std::uint32_t samples, BarePubli
         AgcDriver::GuestMemory::Read(target.address + depthBytes - 1u, probe);
         published("its samples after a second draw");
     }
-    std::printf("Native D32 without stencil or HTILE publication samples=%u mode=%u checked\n", samples, static_cast<std::uint32_t>(mode));
+    timedPrintf("Native D32 without stencil or HTILE publication samples=%u mode=%u checked\n", samples, static_cast<std::uint32_t>(mode));
 }
 
 void CheckSmallerExtent(Context context, std::uint32_t samples) {
@@ -3835,7 +3865,7 @@ void CheckSmallerExtent(Context context, std::uint32_t samples) {
         Require(sampled == base + static_cast<float>(sample + 1u) / 16.0f, "a draw at the smaller extent did not land in, or did not stay within, its owner's samples at " + std::to_string(x) + "," + std::to_string(y) + " sample " + std::to_string(sample));
     }
     texture.reset();
-    std::printf("Native depth smaller extent samples=%u: attached to its owner and drawn within it\n", samples);
+    timedPrintf("Native depth smaller extent samples=%u: attached to its owner and drawn within it\n", samples);
 }
 
 enum class CoveredOwner { SameExtent, OtherIdentity, Uncovered };
@@ -3906,7 +3936,7 @@ void CheckCoveredOwner(Context context, std::uint32_t samples, CoveredOwner mode
         second->Run(recorder.Commands(), 0.5f);
         recorder.Sync();
         Require(StorageTexture::AnyPendingOverlaps(written), "storage results over part of an owner's plane were dropped when the owner was drawn again");
-        std::printf("Native depth covered owner samples=%u: storage results over part of a plane keep the owner\n", samples);
+        timedPrintf("Native depth covered owner samples=%u: storage results over part of a plane keep the owner\n", samples);
         return;
     }
     auto bound = target;
@@ -3936,7 +3966,7 @@ void CheckCoveredOwner(Context context, std::uint32_t samples, CoveredOwner mode
     for (std::size_t offset = 0u; offset < bytes; ++offset) {
         if (memory.Data()[offset] != expected[offset]) Require(false, "a native depth target drawn over stored storage results did not publish its samples over them at byte " + std::to_string(offset) + (offset < depthBytes ? " of the depth plane" : " of the stencil plane"));
     }
-    std::printf("Native depth covered owner samples=%u mode=%u: storage results under the next attachment, its samples published over them\n", samples, static_cast<std::uint32_t>(mode));
+    timedPrintf("Native depth covered owner samples=%u mode=%u: storage results under the next attachment, its samples published over them\n", samples, static_cast<std::uint32_t>(mode));
 }
 
 enum class OverwrittenPlanes { NextDraw, SampledFirst, GuestAccess, Partial, OtherValue, GuestWrite, PendingStorage };
@@ -4021,7 +4051,7 @@ void CheckOverwrittenPlanes(Context context, std::uint32_t samples, OverwrittenP
         Require(DepthSurfaceView(context, target) == view, "a refused owner over uneven planes was not reused by its next draw");
         TargetRefuses([&] { lookup(); }, "native multisample depth plane without HTILE does not hold one depth value in [0, 1]");
         if (mode == OverwrittenPlanes::PendingStorage) Require(!StorageTexture::AnyPendingOverlaps(written) && std::all_of(memory.Data(), memory.Data() + depthBytes, [](std::byte value) { return value == std::byte{0x3c}; }), "storage results recorded over the planes before the proof were not stored to them");
-        std::printf("Native depth overwritten planes samples=%u mode=%u: the import stays refused\n", samples, static_cast<std::uint32_t>(mode));
+        timedPrintf("Native depth overwritten planes samples=%u mode=%u: the import stays refused\n", samples, static_cast<std::uint32_t>(mode));
         return;
     }
     if (mode == OverwrittenPlanes::NextDraw) {
@@ -4038,7 +4068,7 @@ void CheckOverwrittenPlanes(Context context, std::uint32_t samples, OverwrittenP
             const auto* guest = plane == 0u ? memory.Data() : stencil.Data();
             Require(std::equal(expected[plane].begin(), expected[plane].end(), guest), std::string("a guest access over an overwritten owner did not publish its samples over the ") + (plane == 0u ? "depth plane" : "stencil plane"));
         }
-        std::printf("Native depth overwritten planes samples=%u mode=%u: imported and published by a guest access after its first draw\n", samples, static_cast<std::uint32_t>(mode));
+        timedPrintf("Native depth overwritten planes samples=%u mode=%u: imported and published by a guest access after its first draw\n", samples, static_cast<std::uint32_t>(mode));
         return;
     }
     texture = lookup();
@@ -4072,7 +4102,7 @@ void CheckOverwrittenPlanes(Context context, std::uint32_t samples, OverwrittenP
             if (guest[offset] != expected[plane][offset]) Require(false, std::string("an overwritten owner did not publish its samples over its uneven guest bytes, keeping the padding, at byte ") + std::to_string(offset) + (plane == 0u ? " of the depth plane" : " of the stencil plane"));
         }
     }
-    std::printf("Native depth overwritten planes samples=%u mode=%u: imported after its first draw wrote every sample, sampled and published\n", samples, static_cast<std::uint32_t>(mode));
+    timedPrintf("Native depth overwritten planes samples=%u mode=%u: imported after its first draw wrote every sample, sampled and published\n", samples, static_cast<std::uint32_t>(mode));
 }
 
 void CheckOverwriteOverStorage(Context context, std::uint32_t samples, bool overwrites) {
@@ -4140,7 +4170,7 @@ void CheckOverwriteOverStorage(Context context, std::uint32_t samples, bool over
         NoteDepthSurfaceWrite(context, target);
         second->Run(recorder.Commands(), 0.5f);
         TargetRefuses([&] { AgcDriver::GuestMemory::Read(target.stencilAddress, probe); }, "native multisample depth publication over pending storage image writes is not implemented");
-        std::printf("Native depth published owner under storage results samples=%u: a draw that does not prove an overwrite still refuses its publication\n", samples);
+        timedPrintf("Native depth published owner under storage results samples=%u: a draw that does not prove an overwrite still refuses its publication\n", samples);
         return;
     }
     const auto fresh = DepthSurfaceViewWithStencilWriteIntent(context, target, true, true, true, reference);
@@ -4171,7 +4201,7 @@ void CheckOverwriteOverStorage(Context context, std::uint32_t samples, bool over
     }
     texture.reset();
     AgcDriver::GuestMemory::Read(target.stencilAddress, probe);
-    std::printf("Native depth published owner under storage results samples=%u: an overwriting draw started a new owner over the stored results\n", samples);
+    timedPrintf("Native depth published owner under storage results samples=%u: an overwriting draw started a new owner over the stored results\n", samples);
 }
 
 void CheckSingleSampleView(Context context, std::uint32_t samples) {
@@ -4233,7 +4263,7 @@ void CheckSingleSampleView(Context context, std::uint32_t samples) {
     Require(texture != nullptr && texture->View() != VK_NULL_HANDLE, "a multisampled view over a published owner was not sampled from the owner");
     draw(0.5f);
     TargetRefuses([&] { colorLookup(); }, "native multisample depth sampled identity or format mismatch");
-    std::printf("Native depth single-sample view samples=%u: guest memory before the first draw and after the publication, refused while host-written\n", samples);
+    timedPrintf("Native depth single-sample view samples=%u: guest memory before the first draw and after the publication, refused while host-written\n", samples);
 }
 
 void CheckPendingUnitsBeyondPlanes(Context context, std::uint32_t samples) {
@@ -4307,7 +4337,7 @@ void CheckPendingUnitsBeyondPlanes(Context context, std::uint32_t samples) {
         }
     }
     Require(StorageTexture::AnyPendingOverlaps(past), "the storage units past the planes were stored by the owner's publication");
-    std::printf("Native depth owner next to pending storage units samples=%u: published while the units past its planes stay pending\n", samples);
+    timedPrintf("Native depth owner next to pending storage units samples=%u: published while the units past its planes stay pending\n", samples);
 }
 
 void CheckUniformPlaneAliasedDepth(Context context, std::uint32_t samples) {
@@ -4376,7 +4406,7 @@ void CheckUniformPlaneAliasedDepth(Context context, std::uint32_t samples) {
     fill(0.0f, std::bit_cast<std::uint32_t>(2.0f));
     Require(DepthSurfaceView(context, target) != VK_NULL_HANDLE, "a refused aliased uniform depth plane has no attachment view");
     TargetRefuses([&] { CachedSampledTexture(context, words); }, depthAliasRefusal);
-    std::printf("Native D32S8 without HTILE, samples=%u: uniform depth aliased by an R32F colour target took its clear and refused an out-of-range one\n", samples);
+    timedPrintf("Native D32S8 without HTILE, samples=%u: uniform depth aliased by an R32F colour target took its clear and refused an out-of-range one\n", samples);
 }
 
 
@@ -4461,7 +4491,7 @@ void CheckHtileAliasedDepth(Context context, std::uint32_t samples) {
     NoteDepthMetadataFill(target.stencilAddress, stencilBytes, 0x33333333u);
     AgcDriver::GuestMemory::StoreOwnBytes(target.stencilAddress, stencilBytes, [&] { std::memset(stencil.Data(), 0x33, stencilBytes); });
     sample(0.0f, false);
-    std::printf("Native D32S8 with HTILE, samples=%u: a depth plane aliased by an R32F colour target took a matching clear, read DB_DEPTH_CLEAR under a different fill, kept a depth alias separate from a stored stencil fill and refused an unstored one\n", samples);
+    timedPrintf("Native D32S8 with HTILE, samples=%u: a depth plane aliased by an R32F colour target took a matching clear, read DB_DEPTH_CLEAR under a different fill, kept a depth alias separate from a stored stencil fill and refused an unstored one\n", samples);
 }
 
 
@@ -4578,7 +4608,7 @@ void CheckStoredRepeatFill(Context context, std::uint32_t samples) {
     QueueTargetWordFill(context, recorder, stencil.Address(), stencilBytes, 0u);
     NoteDepthMetadataFill(stencil.Address(), stencilBytes, 0u);
     sample(0.0f);
-    std::printf("Native D32S8 with HTILE, samples=%u: a stored whole-HTILE fill was accepted, an unstored or partially stored one was refused, a stored refill after a draw was accepted, a superseding fill was applied and repeated recorded HTILE and stencil fills were consumed before a sync\n", samples);
+    timedPrintf("Native D32S8 with HTILE, samples=%u: a stored whole-HTILE fill was accepted, an unstored or partially stored one was refused, a stored refill after a draw was accepted, a superseding fill was applied and repeated recorded HTILE and stencil fills were consumed before a sync\n", samples);
 }
 
 void CheckElidedFillOverArmedClear(Context context, std::uint32_t samples) {
@@ -4618,7 +4648,7 @@ void CheckElidedFillOverArmedClear(Context context, std::uint32_t samples) {
     CompleteHtileDepthClear(target.htileAddress, metadataBytes);
     NoteDepthMetadataFill(target.htileAddress, metadataBytes, pattern);
     TargetRefuses([&] { CachedSampledTexture(context, words); }, "external GPU writes over native multisample depth are not implemented");
-    std::printf("Native D32 with HTILE, samples=%u: a recorded fill superseded an armed clear dispatch while an elided fill kept its pending-write refusal\n", samples);
+    timedPrintf("Native D32 with HTILE, samples=%u: a recorded fill superseded an armed clear dispatch while an elided fill kept its pending-write refusal\n", samples);
 }
 
 
@@ -4633,7 +4663,7 @@ int main(int argc, char** argv) {
         try { device = std::make_unique<Device>(); }
         catch (const std::exception& error) {
             if (std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr) throw;
-            std::printf("skipped, no usable Vulkan device: %s\n", error.what());
+            timedPrintf("skipped, no usable Vulkan device: %s\n", error.what());
             return VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--initial-owner") {
@@ -4650,7 +4680,7 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            std::printf("Native depth initial owner cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth initial owner cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked == 0u ? VulkanTestSkipped : 0;
         }
         const auto context = device->GetContext();
@@ -4708,17 +4738,17 @@ int main(int argc, char** argv) {
                      std::pair{ClearFault::PendingWrite, "external GPU writes"},
                      std::pair{ClearFault::Overlap, "native multisample depth clear has not been recorded"}}) {
                 TargetRefuses([&] { CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, fault, ClearSource::HtileDispatch, lock); }, expected);
-                std::printf("Native depth clear fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth clear fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::FillDuringClear, ClearSource::HtileDispatch, lock);
-            std::puts("Native depth clear superseded by a metadata fill before arming was accepted");
+            timedPuts("Native depth clear superseded by a metadata fill before arming was accepted");
             for (const auto& [fault, expected] : std::array{
                      std::pair{ClearFault::CpuWrite, "CPU writes raced"},
                      std::pair{ClearFault::DepthWrite, "guest writes"},
                      std::pair{ClearFault::BadMetadata, "does not prove its clear value"},
                      std::pair{ClearFault::PendingWrite, "external GPU writes"}}) {
                 TargetRefuses([&] { CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, fault, ClearSource::QueuedFill, lock); }, expected);
-                std::printf("Native depth queued fill fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth queued fill fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             return 0;
         }
@@ -4747,7 +4777,7 @@ int main(int argc, char** argv) {
                 if (uneven) CheckBarePlanePublication(publishing, samples, BarePublication::Uneven);
             }
             CheckBarePlanePublication(publishing, 4u, BarePublication::Pages);
-            if (!uneven) std::printf("Native D32 without stencil or HTILE publication of uneven planes not checked: the device lacks the import features\n");
+            if (!uneven) timedPrintf("Native D32 without stencil or HTILE publication of uneven planes not checked: the device lacks the import features\n");
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--covered-owner") {
@@ -4833,7 +4863,7 @@ int main(int argc, char** argv) {
                 if (DepthSupported(context, VK_FORMAT_D32_SFLOAT, samples)) CheckElidedFillOverArmedClear(context, samples);
                 ++checked;
             }
-            std::printf("Native depth stored repeated HTILE fill cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth stored repeated HTILE fill cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked != 0u ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--uniform-planes") {
@@ -4843,7 +4873,7 @@ int main(int argc, char** argv) {
                 CheckUniformPlanesWithoutHtile(context, samples);
                 ++checked;
             }
-            std::printf("Native depth uniform-plane cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth uniform-plane cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked != 0u ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--uneven-plane") {
@@ -4858,7 +4888,7 @@ int main(int argc, char** argv) {
                 CheckUnevenPlaneWithoutHtile(importing, samples);
                 ++checked;
             }
-            std::printf("Native depth uneven-plane cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth uneven-plane cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked != 0u ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--htile-plane-alias") {
@@ -4870,7 +4900,7 @@ int main(int argc, char** argv) {
                 CheckHtileAliasedDepth(context, samples);
                 ++checked;
             }
-            std::printf("Native depth HTILE-plane alias cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth HTILE-plane alias cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked != 0u ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--uniform-plane-alias") {
@@ -4882,7 +4912,7 @@ int main(int argc, char** argv) {
                 CheckUniformPlaneAliasedDepth(context, samples);
                 ++checked;
             }
-            std::printf("Native depth uniform-plane alias cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth uniform-plane alias cases checked=%u unavailable=%u\n", checked, unavailable);
             return checked != 0u ? 0 : VulkanTestSkipped;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--clears") {
@@ -4905,7 +4935,7 @@ int main(int argc, char** argv) {
             ++checked;
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DriverDispatch, ClearSource::HtileDispatch, lock);
             ++checked;
-            std::printf("Native depth completed clear cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth completed clear cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--stencil") {
@@ -4934,11 +4964,11 @@ int main(int argc, char** argv) {
                      std::tuple{StencilFault::FillStencilWrite, true, "guest writes over native multisample depth"},
                      std::tuple{StencilFault::MaskClear, true, "HTILE mask clear of a stencil surface"}}) {
                 TargetRefuses([&] { CheckStencilTarget(context, 4u, false, filling, fault); }, expected);
-                std::printf("Native depth-stencil fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth-stencil fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             CheckStencilTarget(context, 4u, false, true, StencilFault::FillOverlap);
-            std::puts("Native depth-stencil superseding repeated HTILE fill was accepted");
-            std::printf("Native depth-stencil cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPuts("Native depth-stencil superseding repeated HTILE fill was accepted");
+            timedPrintf("Native depth-stencil cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--separate-stencil") {
@@ -4958,7 +4988,7 @@ int main(int argc, char** argv) {
                      std::pair{PlaneFault::StencilWrite, "guest writes over native multisample depth"},
                      std::pair{PlaneFault::UnwatchedStencil, "watched accessible guest memory"}}) {
                 TargetRefuses([&] { CheckSeparateStencilTarget(context, 4u, false, PlaneFill::None, fault); }, expected);
-                std::printf("Native depth with a separate stencil plane fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth with a separate stencil plane fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!supported(samples)) { unavailable += 1u; continue; }
@@ -4966,11 +4996,11 @@ int main(int argc, char** argv) {
                 ++checked;
             }
             TargetRefuses([&] { CheckSeparateStencilTarget(context, 4u, true, PlaneFill::None, PlaneFault::StencilOtherValueStore); }, "guest writes raced native multisample depth import");
-            std::printf("Native depth with a separate stencil plane stored the clear value again during import: imported; stored another value: refused\n");
+            timedPrintf("Native depth with a separate stencil plane stored the clear value again during import: imported; stored another value: refused\n");
             for (const auto& [fault, expected] : std::array{
                      std::pair{PlaneFault::HtileWord, "native multisample depth HTILE that is not pipe-aligned holds more than one word"}}) {
                 TargetRefuses([&] { CheckSeparateStencilTarget(context, 4u, false, PlaneFill::None, fault, false); }, expected);
-                std::printf("Native depth with a separate stencil plane fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth with a separate stencil plane fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             for (const auto& [fault, expected] : std::array{
                      std::pair{PlaneFault::PartialStencilFill, "native multisample stencil plane partial fill transition is not implemented"},
@@ -4978,33 +5008,33 @@ int main(int argc, char** argv) {
                      std::pair{PlaneFault::StencilFillUnstored, "native multisample stencil plane fill has no complete tracked store"},
                      std::pair{PlaneFault::StencilFillCpuWrite, "CPU writes raced native multisample stencil plane fill"}}) {
                 TargetRefuses([&] { CheckSeparateStencilTarget(context, 4u, true, PlaneFill::Stencil, fault, false); }, expected);
-                std::printf("Native depth with a separate stencil plane fill fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
+                timedPrintf("Native depth with a separate stencil plane fill fault=%u refused: %s\n", static_cast<std::uint32_t>(fault), expected);
             }
             CheckSeparateStencilTarget(context, 4u, true, PlaneFill::Stencil, PlaneFault::StencilFillStoredFirst, false);
-            std::puts("Native depth with a separate stencil plane accepted a fill stored before its note");
+            timedPuts("Native depth with a separate stencil plane accepted a fill stored before its note");
             for (const auto samples : {2u, 4u, 8u}) {
                 if (!supported(samples)) { unavailable += 4u; continue; }
                 for (const auto path : {GhostFill::Stored, GhostFill::QueuedAfterNote, GhostFill::QueuedBeforeNote, GhostFill::QueuedNotedTwice}) { CheckGhostSequence(context, samples, path); ++checked; }
             }
             for (const auto fault : {GhostFault::LaterStencilWrite, GhostFault::OtherHtileWord, GhostFault::PartialHtileFill}) {
                 TargetRefuses([&] { CheckGhostSequence(context, 4u, GhostFill::QueuedAfterNote, fault); }, "external GPU writes over native multisample depth are not implemented");
-                std::printf("Native depth after HTILE and stencil plane fills fault=%u refused: external GPU writes over native multisample depth are not implemented\n", static_cast<std::uint32_t>(fault));
+                timedPrintf("Native depth after HTILE and stencil plane fills fault=%u refused: external GPU writes over native multisample depth are not implemented\n", static_cast<std::uint32_t>(fault));
             }
             for (const auto path : {GhostFill::Stored, GhostFill::QueuedAfterNote}) {
                 CheckGhostSequence(context, 4u, path, GhostFault::UnwrittenReach);
-                std::printf("Native depth after HTILE and stencil plane fills path=%u waited for a pending raw-pointer reach over the target that stored nothing there and sampled it\n", static_cast<std::uint32_t>(path));
+                timedPrintf("Native depth after HTILE and stencil plane fills path=%u waited for a pending raw-pointer reach over the target that stored nothing there and sampled it\n", static_cast<std::uint32_t>(path));
             }
             TargetRefuses([&] { CheckGhostSequence(context, 4u, GhostFill::Stored, GhostFault::WrittenReach); }, "external GPU writes over native multisample depth are not implemented");
-            std::puts("Native depth after HTILE and stencil plane fills refused a pending raw-pointer reach whose use stored into the depth plane: external GPU writes over native multisample depth are not implemented");
+            timedPuts("Native depth after HTILE and stencil plane fills refused a pending raw-pointer reach whose use stored into the depth plane: external GPU writes over native multisample depth are not implemented");
             for (const auto path : {GhostFill::Stored, GhostFill::QueuedNotedTwice}) {
                 CheckGhostSequence(context, 4u, path, GhostFault::RepeatedStencilNote);
-                std::printf("Native depth after HTILE and stencil plane fills path=%u superseded a stencil plane fill noted twice without a write between\n", static_cast<std::uint32_t>(path));
+                timedPrintf("Native depth after HTILE and stencil plane fills path=%u superseded a stencil plane fill noted twice without a write between\n", static_cast<std::uint32_t>(path));
             }
             for (const auto path : {GhostFill::Stored, GhostFill::QueuedAfterNote}) {
                 TargetRefuses([&] { CheckGhostSequence(context, 4u, path, GhostFault::CreationRefused); }, "native multisample depth HTILE that is not pipe-aligned holds more than one word");
-                std::printf("Native depth after HTILE and stencil plane fills path=%u kept its creation refusal: native multisample depth HTILE that is not pipe-aligned holds more than one word\n", static_cast<std::uint32_t>(path));
+                timedPrintf("Native depth after HTILE and stencil plane fills path=%u kept its creation refusal: native multisample depth HTILE that is not pipe-aligned holds more than one word\n", static_cast<std::uint32_t>(path));
             }
-            std::printf("Native depth with a separate stencil plane cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth with a separate stencil plane cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--aliased-stencil") {
@@ -5021,18 +5051,18 @@ int main(int argc, char** argv) {
                 }
                 CheckAliasedStencil(context, samples, AliasCase::OtherFormat, 0u, false);
                 TargetRefuses([&] { CheckAliasedStencil(context, samples, AliasCase::OtherFormat); }, refusal);
-                std::printf("Native depth with an aliased stencil plane samples=%u case=%u refused the whole-plane fill its colour target cannot confirm: %s\n", samples, static_cast<std::uint32_t>(AliasCase::OtherFormat), refusal.data());
+                timedPrintf("Native depth with an aliased stencil plane samples=%u case=%u refused the whole-plane fill its colour target cannot confirm: %s\n", samples, static_cast<std::uint32_t>(AliasCase::OtherFormat), refusal.data());
                 checked += 2u;
                 for (const auto colorSamples : {2u, 4u, 8u}) {
                     if (colorSamples == samples) continue;
                     if ((context.limits.framebufferColorSampleCounts & colorSamples) == 0u) { unavailable += 2u; continue; }
                     CheckAliasedStencil(context, samples, AliasCase::OtherSamples, colorSamples, false);
                     TargetRefuses([&] { CheckAliasedStencil(context, samples, AliasCase::OtherSamples, colorSamples); }, refusal);
-                    std::printf("Native depth with an aliased stencil plane samples=%u colour samples=%u refused the whole-plane fill its colour target cannot confirm: %s\n", samples, colorSamples, refusal.data());
+                    timedPrintf("Native depth with an aliased stencil plane samples=%u colour samples=%u refused the whole-plane fill its colour target cannot confirm: %s\n", samples, colorSamples, refusal.data());
                     checked += 2u;
                 }
             }
-            std::printf("Native depth with an aliased stencil plane cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth with an aliased stencil plane cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--stencil-view") {
@@ -5044,7 +5074,7 @@ int main(int argc, char** argv) {
                 CheckStencilView(context, samples);
                 ++checked;
             }
-            std::printf("Native D32S8 stencil view cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native D32S8 stencil view cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 3 && std::string_view(argv[1]) == "--aliased-depth") {
@@ -5062,13 +5092,13 @@ int main(int argc, char** argv) {
                     for (const auto which : {DepthAliasCase::Mismatched, DepthAliasCase::Matching, DepthAliasCase::Partial, DepthAliasCase::Unchanged, DepthAliasCase::DrawnBeforeImport, DepthAliasCase::DrawnAfterImport, DepthAliasCase::NewTargetAfterImport, DepthAliasCase::SameFillAfterImport, DepthAliasCase::OtherFillAfterImport, DepthAliasCase::PartialFillAfterImport, DepthAliasCase::DrawnThenSameFill, DepthAliasCase::HtileWordThenSameFill, DepthAliasCase::NegativeZeroFill, DepthAliasCase::NanFill, DepthAliasCase::FillShortOfAlias, DepthAliasCase::PartialThenSameFill, DepthAliasCase::OtherThenSameFill, DepthAliasCase::DoubleSameFill, DepthAliasCase::TripleSameFill, DepthAliasCase::SameOtherSameFill, DepthAliasCase::SamePartialSameFill, DepthAliasCase::SameDrawSameFill, DepthAliasCase::UnknownThenPartialFill}) { CheckAliasedDepth(context, samples, htile, which); ++checked; }
                     for (const auto which : {DepthAliasCase::UnprovenWord, DepthAliasCase::OtherClearWord}) {
                         TargetRefuses([&] { CheckAliasedDepth(context, samples, htile, which); }, unprovenHtileRefusal);
-                        std::printf("Native depth with an aliased depth plane samples=%u clear=%u htile=%u word=0x%08x case=%u refused: %s\n", samples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, static_cast<std::uint32_t>(which), unprovenHtileRefusal.data());
+                        timedPrintf("Native depth with an aliased depth plane samples=%u clear=%u htile=%u word=0x%08x case=%u refused: %s\n", samples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, static_cast<std::uint32_t>(which), unprovenHtileRefusal.data());
                         ++checked;
                     }
                     if (stencilInHtile) {
                         for (const auto& [which, refusal] : {std::pair{DepthAliasCase::StencilWord, unprovenStencilHtileRefusal}, std::pair{DepthAliasCase::AliasedStencilPlane, stencilAliasRefusal}}) {
                             TargetRefuses([&] { CheckAliasedDepth(context, samples, htile, which); }, refusal);
-                            std::printf("Native depth with an aliased depth plane samples=%u clear=%u htile=%u word=0x%08x case=%u refused: %s\n", samples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, static_cast<std::uint32_t>(which), refusal.data());
+                            timedPrintf("Native depth with an aliased depth plane samples=%u clear=%u htile=%u word=0x%08x case=%u refused: %s\n", samples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, static_cast<std::uint32_t>(which), refusal.data());
                             ++checked;
                         }
                     }
@@ -5076,12 +5106,12 @@ int main(int argc, char** argv) {
                         if (colorSamples == samples) continue;
                         if ((context.limits.framebufferColorSampleCounts & colorSamples) == 0u) { ++unavailable; continue; }
                         TargetRefuses([&] { CheckAliasedDepth(context, samples, htile, DepthAliasCase::OtherSamples, colorSamples); }, depthAliasRefusal);
-                        std::printf("Native depth with an aliased depth plane samples=%u colour samples=%u clear=%u htile=%u word=0x%08x refused: %s\n", samples, colorSamples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, depthAliasRefusal.data());
+                        timedPrintf("Native depth with an aliased depth plane samples=%u colour samples=%u clear=%u htile=%u word=0x%08x refused: %s\n", samples, colorSamples, htile.one, static_cast<std::uint32_t>(htile.layout), htile.word, depthAliasRefusal.data());
                         ++checked;
                     }
                 }
             }
-            std::printf("Native depth with an aliased depth plane, %s HTILE, cases checked=%u unavailable=%u\n", argv[2], checked, unavailable);
+            timedPrintf("Native depth with an aliased depth plane, %s HTILE, cases checked=%u unavailable=%u\n", argv[2], checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--expand-gate") {
@@ -5095,12 +5125,12 @@ int main(int argc, char** argv) {
                     ++checked;
                 }
             }
-            std::printf("Native depth in-place expand gate cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth in-place expand gate cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--buffer-clear") {
             CheckDepthTarget(context, VK_FORMAT_D32_SFLOAT, 4u, false, true, false, ClearFault::DriverBufferDispatch, ClearSource::HtileDispatch, lock);
-            std::puts("Native depth clear by the buffer HTILE mask kernel through PM4 checked");
+            timedPuts("Native depth clear by the buffer HTILE mask kernel through PM4 checked");
             return 0;
         }
         Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--retirement"), "invalid native depth fixture arguments");
@@ -5112,7 +5142,7 @@ int main(int argc, char** argv) {
                     for (std::uint32_t mode = 0u; mode < 4u; ++mode) { CheckRetirement(context, format, samples, mode); ++checked; }
                 }
             }
-            std::printf("Native depth retirement cases checked=%u unavailable=%u\n", checked, unavailable);
+            timedPrintf("Native depth retirement cases checked=%u unavailable=%u\n", checked, unavailable);
             return 0;
         }
         std::uint32_t checked = 0u, unavailable = 0u;
@@ -5136,7 +5166,7 @@ int main(int argc, char** argv) {
             }
         }
         CheckEligibility(context);
-        std::printf("Native multisampled depth cases checked=%u unavailable=%u\n", checked, unavailable);
+        timedPrintf("Native multisampled depth cases checked=%u unavailable=%u\n", checked, unavailable);
         return 0;
     } catch (const std::exception& error) { std::fprintf(stderr, "%s\n", error.what()); return 1; }
 }
