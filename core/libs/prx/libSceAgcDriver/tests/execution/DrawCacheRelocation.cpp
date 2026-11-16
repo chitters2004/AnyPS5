@@ -55,6 +55,11 @@ struct DriverTestAccess {
         const auto found = driver.drawAliases.find(alias);
         return found == driver.drawAliases.end() ? 0 : found->second;
     }
+    static AgcDriver::DriverDetail::DrawRelocationCounters RelocationCounters() {
+        auto& driver = Driver::Get();
+        std::lock_guard lock(driver.drawCacheMutex);
+        return driver.drawRelocationCounters;
+    }
 };
 
 }
@@ -417,14 +422,14 @@ void LearningIgnoresInsertOrder() {
     std::array<std::size_t, 3> order{0, 1, 2};
     std::string first;
     do {
-        DrawRelocation shape;
+        std::shared_ptr<const DrawRelocation> shape;
         for (const auto index : order) {
             DrawEntry entry;
             entry.decode = inputs[index].decode;
             entry.stages = {{inputs[index].variant}};
-            AgcDriver::DriverDetail::Driver::MergeDrawRelocation(shape, entry);
+            shape = AgcDriver::DriverDetail::Driver::MergeDrawRelocation(shape, entry);
         }
-        const auto text = ShapeText(shape);
+        const auto text = ShapeText(*shape);
         if (first.empty()) first = text;
         Require(text == first, "learning in insert order " + std::to_string(order[0]) + std::to_string(order[1]) + std::to_string(order[2]) + " gave '" + text + "', the first order gave '" + first + "'");
     } while (std::next_permutation(order.begin(), order.end()));
@@ -449,12 +454,49 @@ void LearningTakesEachJobsOwnKey() {
     const auto forwardShape = DriverTestAccess::Learned(Forward), backwardShape = DriverTestAccess::Learned(Backward), single = DriverTestAccess::Learned(Single);
     Require(forwardShape != nullptr && backwardShape != nullptr && single != nullptr, "an inserted job's identity learned no relocation");
     Require(ShapeText(*forwardShape) == ShapeText(*backwardShape), "inserts of the same three jobs in two orders learned '" + ShapeText(*forwardShape) + "' and '" + ShapeText(*backwardShape) + "'");
-    DrawRelocation alone;
     DrawEntry entry;
     entry.decode = inputs[1].decode;
     entry.stages = {{inputs[1].variant}};
-    AgcDriver::DriverDetail::Driver::MergeDrawRelocation(alone, entry);
-    Require(ShapeText(*single) == ShapeText(alone), "a job learned '" + ShapeText(*single) + "', not its own entry's '" + ShapeText(alone) + "'");
+    const auto alone = AgcDriver::DriverDetail::Driver::MergeDrawRelocation(nullptr, entry);
+    Require(ShapeText(*single) == ShapeText(*alone), "a job learned '" + ShapeText(*single) + "', not its own entry's '" + ShapeText(*alone) + "'");
+}
+
+void FillLearningEntry(DrawEntry& entry, const LearningInput& input, bool compiled) {
+    entry.decode = input.decode;
+    entry.stages.assign(input.decode->programs.size(), {});
+    if (compiled) entry.stages.front().push_back(input.variant);
+}
+
+void UnchangedLearningKeepsTheShape() {
+    using AgcDriver::DriverDetail::Driver;
+    using AgcDriver::DriverDetail::DriverTestAccess;
+    const auto inputs = LearningInputs();
+    DrawEntry entry0, entry1, bare;
+    FillLearningEntry(entry0, inputs[0], true);
+    FillLearningEntry(entry1, inputs[1], true);
+    FillLearningEntry(bare, inputs[0], false);
+    const auto first = Driver::MergeDrawRelocation(nullptr, entry0);
+    Require(first != nullptr, "learning a first entry gave no shape");
+    const auto firstText = ShapeText(*first);
+    Require(Driver::MergeDrawRelocation(first, entry0) == first, "learning the same entry again copied a shape it left unchanged");
+    const auto second = Driver::MergeDrawRelocation(first, entry1);
+    Require(second != first, "learning an entry with other reads did not make a new shape");
+    Require(ShapeText(*first) == firstText, "learning into a published shape changed it to '" + ShapeText(*first) + "', it was '" + firstText + "'");
+    Require(Driver::MergeDrawRelocation(second, entry1) == second && Driver::MergeDrawRelocation(second, entry0) == second, "learning entries already in a shape copied it");
+    const auto empty = Driver::MergeDrawRelocation(nullptr, bare);
+    Require(empty != nullptr && empty->words.empty() && empty->banned.empty(), "an entry with no compiled stage did not learn an empty shape for a new identity");
+
+    constexpr std::uint64_t Identity = 0x54000;
+    const auto before = DriverTestAccess::RelocationCounters();
+    DriverTestAccess::Insert(0xa400, inputs[0].variant, inputs[0].decode, {0xb400, Identity});
+    const auto learned = DriverTestAccess::Learned(Identity);
+    DriverTestAccess::Insert(0xa401, inputs[0].variant, inputs[0].decode, {0xb401, Identity});
+    Require(learned != nullptr && DriverTestAccess::Learned(Identity) == learned, "a second insert of the same job replaced its identity's learned shape");
+    DriverTestAccess::Insert(0xa402, inputs[1].variant, inputs[1].decode, {0xb402, Identity});
+    const auto widened = DriverTestAccess::Learned(Identity);
+    Require(widened != learned && ShapeText(*learned) == firstText, "an insert with other reads did not publish a new shape, or changed the published one");
+    const auto after = DriverTestAccess::RelocationCounters();
+    Require(after.learnedChanged - before.learnedChanged == 2 && after.learnedUnchanged - before.learnedUnchanged == 1, "three inserts counted " + std::to_string(after.learnedChanged - before.learnedChanged) + " changed and " + std::to_string(after.learnedUnchanged - before.learnedUnchanged) + " unchanged learnings, expected 2 and 1");
 }
 
 void SplitRunsNameTheirSharedWords() {
@@ -617,6 +659,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string(argv[1]) == "--learning") {
             LearningIgnoresInsertOrder();
             LearningTakesEachJobsOwnKey();
+            UnchangedLearningKeepsTheShape();
             std::cout << "Relocation learning took each job's own key in any insert order\n";
             return 0;
         }
