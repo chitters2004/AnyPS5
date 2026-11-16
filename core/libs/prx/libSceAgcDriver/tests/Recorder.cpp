@@ -12616,6 +12616,46 @@ void discardActionTests(const Device& device) {
     std::cout << "Recorder discard action tests passed\n";
 }
 
+void writeCompleteDiscardTests(const Device& device) {
+    auto context = device.GetContext();
+    Recorder recorder(context);
+    const auto base = Recorder::PendingWriteBackCompletions();
+    constexpr std::uint64_t address = 0x7a0000;
+    constexpr std::size_t bytes = 0x100;
+    int completed = 0;
+    int discarded = 0;
+    const auto watch = [&] { recorder.OnWriteComplete(address, bytes, [&] { ++completed; }, [&] { ++discarded; }); };
+    CoverPass cover(context);
+    cover.Draw(recorder);
+    recorder.NotePendingWrite(address, bytes);
+    watch();
+    Require(completed == 0 && Recorder::PendingWriteBackCompletions() == base + 1, "a write-complete action ran before the batch holding its write");
+    Recorder::FailNextSubmitsForTest(1);
+    bool failed = false;
+    try {
+        recorder.Submit();
+    } catch (const std::runtime_error& error) {
+        failed = std::string(error.what()) == "vkQueueSubmit recorder: injected failure";
+    }
+    Recorder::FailNextSubmitsForTest(0);
+    Require(failed, "a batch holding a watched write was submitted past an injected failure");
+    recorder.Sync();
+    Require(discarded == 1 && completed == 0, "a discarded batch ran " + std::to_string(discarded) + " discard and " + std::to_string(completed) + " completion actions of a write it never made");
+    Require(Recorder::PendingWriteBackCompletions() == base, "a discarded batch left its write-complete action counted as pending");
+    CoverPass next(context);
+    next.Draw(recorder);
+    recorder.NotePendingWrite(address, bytes);
+    watch();
+    recorder.Submit();
+    watch();
+    recorder.Sync();
+    Require(completed == 2 && discarded == 1, "a completed batch ran " + std::to_string(completed) + " of its 2 write-complete actions and " + std::to_string(discarded - 1) + " discard actions");
+    Require(Recorder::PendingWriteBackCompletions() == base, "a completed batch left its write-complete actions counted as pending");
+    watch();
+    Require(completed == 3 && discarded == 1, "a write-complete action with no batch holding its write did not run at once");
+    std::cout << "Recorder write-complete discard tests passed\n";
+}
+
 void uncountedPassTests(const Device& device) {
     auto context = device.GetContext();
     context.bufferDeviceAddress = false;
@@ -17546,6 +17586,7 @@ int main(int argc, char** argv) {
         shadowedKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         discardActionTests(device);
+        writeCompleteDiscardTests(device);
         discardedSampleTests(device);
         copiedDirectOrderingTests(device, recorder);
         copiedWriteBackTests(device, recorder);

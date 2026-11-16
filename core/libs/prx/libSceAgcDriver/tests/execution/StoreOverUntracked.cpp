@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -278,7 +279,7 @@ struct Case {
     std::size_t access;
 };
 
-enum class Outcome { Kept, Lost, Missed };
+enum class Outcome { Kept, Lost, Missed, NotRun };
 
 // The surface is outside the write watch from the start. Its first results are stored, which
 // leaves their bytes saved for the next store to compare with; the CPU writes another block, then
@@ -389,6 +390,54 @@ Outcome RunStoredThenLeftWatch(const char* name, bool cpuWrites, bool landed) {
     if (lost == 0) return Outcome::Kept;
     std::fprintf(stderr, "[store over untracked] %s: of 0x%zx bytes the CPU wrote while the results were pending, %zu were lost\n", name, Page, lost);
     return Outcome::Lost;
+}
+
+Outcome RunDiscardedRebase() {
+    Surface surface(true, 0, 16 * Block);
+    struct WaitForWork {
+        ~WaitForWork() {
+            AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(0u);
+            try {
+                AgcDriverWaitIdle_nid_postfix();
+            } catch (...) {
+            }
+        }
+    } waitForWork;
+    const auto address = surface.Address();
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) return Outcome::NotRun;
+    std::unique_lock hold(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+    Store(surface.Texels());
+    if (!HoldPending(hold, surface, Stored)) return Outcome::Missed;
+    StorageTexture::FlushAllPending("store over untracked fixture");
+    const auto image = StorageTexture::FindLive(address, SurfaceBytes);
+    Require(image != nullptr, "discarded rebase: the surface has no storage image");
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes) || image->GuestSnapshotValid()) return Outcome::NotRun;
+    const auto before = StorageTexture::RebaseCounts();
+    AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
+    if (!image->RebasePending()) return Outcome::Missed;
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    Require(recorder != nullptr, "discarded rebase: the device has no active recorder");
+    AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(1u);
+    std::string thrown = "nothing";
+    try {
+        recorder->Sync();
+    } catch (const std::exception& error) {
+        thrown = error.what();
+    }
+    AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(0u);
+    const auto settled = StorageTexture::RebaseCounts();
+    if (settled.completed != before.completed) return Outcome::Missed;
+    Require(thrown.find("injected failure") != std::string::npos, "discarded rebase: the batch holding the store was not failed ('" + thrown + "')");
+    Require(!image->RebasePending(), "discarded rebase: the rebase still waits on a store whose batch was discarded");
+    Require(settled.discarded == before.discarded + 1u, "discarded rebase: the discarded batch did not drop its rebase");
+    image->MarkDirty();
+    try {
+        StorageTexture::FlushAllPending("store over untracked fixture");
+    } catch (const std::exception&) {
+    }
+    const auto after = StorageTexture::RebaseCounts();
+    Require(after.syncs == before.syncs, "discarded rebase: a rebase whose batch was discarded fell back to a full sync");
+    return Outcome::Kept;
 }
 
 Outcome Run(const Case& test) {
@@ -524,7 +573,7 @@ Outcome Run(const Case& test) {
 
 int main(int argc, char** argv) {
     try {
-        Require(argc == 1 || (argc == 2 && std::string_view(argv[1]) == "--pending-identity"), "store over untracked: unknown test argument");
+        Require(argc == 1 || (argc == 2 && (std::string_view(argv[1]) == "--pending-identity" || std::string_view(argv[1]) == "--discarded-rebase")), "store over untracked: unknown test argument");
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
@@ -532,6 +581,17 @@ int main(int argc, char** argv) {
         struct ShutdownGuard {
             ~ShutdownGuard() { try { AgcDriverShutdown_nid_postfix(); } catch (...) {} }
         } shutdown;
+        if (argc == 2 && std::string_view(argv[1]) == "--discarded-rebase") {
+            auto outcome = Outcome::Missed;
+            for (std::uint32_t attempt = 0; attempt < 256u && outcome == Outcome::Missed; ++attempt) outcome = RunDiscardedRebase();
+            if (outcome == Outcome::NotRun) {
+                std::puts("discarded rebase: not run, the store did not stay in write-watched memory on this device");
+                return VulkanTestSkipped;
+            }
+            Require(outcome != Outcome::Missed, "discarded rebase: no rebase ever waited on a store in a batch that could be discarded");
+            std::puts("discarded rebase tests passed");
+            return 0;
+        }
         if (argc == 2) {
             PendingIdentity();
             AgcDriverShutdown_nid_postfix();

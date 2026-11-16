@@ -3928,7 +3928,7 @@ void Recorder::FailNextDiscardRegistrationsForTest(unsigned count) {
     injectedDiscardRegistrationFailures.store(count, std::memory_order_relaxed);
 }
 
-void Recorder::OnWriteComplete(std::uint64_t address, std::size_t bytes, std::function<void()> action) {
+void Recorder::OnWriteComplete(std::uint64_t address, std::size_t bytes, std::function<void()> action, std::function<void()> discarded) {
     const auto end = address + bytes;
     Batch* holder = open != nullptr && overlaps(*open, address, end) ? open.get() : nullptr;
     for (auto batch = inFlight.rbegin(); holder == nullptr && batch != inFlight.rend(); ++batch) {
@@ -3937,6 +3937,11 @@ void Recorder::OnWriteComplete(std::uint64_t address, std::size_t bytes, std::fu
     if (holder == nullptr) {
         action();
         return;
+    }
+    holder->completions.reserve(holder->completions.size() + 1u);
+    if (discarded) {
+        holder->discards.reserve(holder->discards.size() + 1u);
+        holder->discards.push_back(std::move(discarded));
     }
     holder->completions.push_back(std::move(action));
     ++holder->writeBackCompletionCount;

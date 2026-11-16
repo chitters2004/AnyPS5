@@ -261,7 +261,7 @@ public:
     void OnComplete(std::function<void()> action);
     void OnDiscard(std::function<void()> action);
     void ChangeUndoneOnDiscard(const std::function<void()>& change, std::function<void()> undo);
-    void OnWriteComplete(std::uint64_t address, std::size_t bytes, std::function<void()> action);
+    void OnWriteComplete(std::uint64_t address, std::size_t bytes, std::function<void()> action, std::function<void()> discarded = {});
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);

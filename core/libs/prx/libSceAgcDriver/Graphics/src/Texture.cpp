@@ -135,6 +135,7 @@ thread_local const char* uploadReason = "first";
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0}, slabRetiles{0}, paddingSeedCopies{0}, linearImportRetiles{0};
+std::atomic<std::uint64_t> rebaseTickets{0}, rebasesCompleted{0}, rebasesDiscarded{0}, rebaseSyncs{0};
 std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0}, clearHandOvers{0}, creationHandOvers{0}, handedOverSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
@@ -214,6 +215,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, handed over at %llu clear-key refreshes and %llu image creations (%llu units superseded), dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, held for a queued draw read %llu, evicted stale %llu; refreshes proved %llu, %llu of them over pending driver key stores (cumulative); drawn linear targets: stores by reason (count/MiB):%s, pending %zu images / %.1f MiB, oldest %.1f ms\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(clearHandOvers), take(creationHandOvers), take(handedOverSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(queuedReadHeld), take(staleEvicted), static_cast<unsigned long long>(refreshesProved.load(std::memory_order_relaxed)), static_cast<unsigned long long>(refreshesProvedPendingKeys.load(std::memory_order_relaxed)), drawnLine.c_str(), drawn.images, drawn.bytes / 1048576.0, drawn.oldestMs);
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] rebases since start: %llu registered on a store, %llu applied when it completed, %llu dropped when its batch was discarded; %llu awaits fell back to a full sync\n", static_cast<unsigned long long>(rebaseTickets.load(std::memory_order_relaxed)), static_cast<unsigned long long>(rebasesCompleted.load(std::memory_order_relaxed)), static_cast<unsigned long long>(rebasesDiscarded.load(std::memory_order_relaxed)), static_cast<unsigned long long>(rebaseSyncs.load(std::memory_order_relaxed)));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.drawnStores.clear();
@@ -3141,9 +3143,17 @@ void StorageTexture::rebaseBeforeUnwatch(std::uint64_t address, std::size_t byte
         if (storing) {
             const auto ticket = ++lastRebaseTicket;
             rebaseTicket[unit] = ticket;
-            recorder->OnWriteComplete(begin, unitBytes, [texture = weak_from_this(), ticket, unit] {
-                if (auto alive = texture.lock()) alive->applyRebase(ticket, unit);
-            });
+            try {
+                recorder->OnWriteComplete(begin, unitBytes, [texture = weak_from_this(), ticket, unit] {
+                    if (auto alive = texture.lock()) alive->applyRebase(ticket, unit);
+                }, [texture = weak_from_this(), ticket, unit] {
+                    if (auto alive = texture.lock()) alive->dropRebase(ticket, unit);
+                });
+            } catch (...) {
+                if (rebaseTicket[unit] == ticket) rebaseTicket[unit] = 0;
+                throw;
+            }
+            rebaseTickets.fetch_add(1, std::memory_order_relaxed);
             due = true;
             continue;
         }
@@ -3156,7 +3166,23 @@ void StorageTexture::rebaseBeforeUnwatch(std::uint64_t address, std::size_t byte
 void StorageTexture::applyRebase(std::uint64_t ticket, std::uint32_t unit) {
     if (rebaseTicket[unit] != ticket) return;
     rebaseTicket[unit] = 0;
+    rebasesCompleted.fetch_add(1, std::memory_order_relaxed);
     if (generationBaseline.size() == guestBytes) readBaseline(unit);
+}
+
+void StorageTexture::dropRebase(std::uint64_t ticket, std::uint32_t unit) {
+    if (rebaseTicket[unit] != ticket) return;
+    rebaseTicket[unit] = 0;
+    rebasesDiscarded.fetch_add(1, std::memory_order_relaxed);
+    anyBaselineDue.store(true, std::memory_order_relaxed);
+}
+
+StorageTexture::RebaseStatistics StorageTexture::RebaseCounts() {
+    return {rebaseTickets.load(std::memory_order_relaxed), rebasesCompleted.load(std::memory_order_relaxed), rebasesDiscarded.load(std::memory_order_relaxed), rebaseSyncs.load(std::memory_order_relaxed)};
+}
+
+bool StorageTexture::RebasePending() const {
+    return std::any_of(rebaseTicket.begin(), rebaseTicket.end(), [](std::uint64_t ticket) { return ticket != 0; });
 }
 
 void StorageTexture::awaitRebase(std::uint32_t unit) {
@@ -3165,7 +3191,9 @@ void StorageTexture::awaitRebase(std::uint32_t unit) {
     if (recorder == nullptr) recorder = context.recorder;
     Require(recorder != nullptr, "a storage image's baseline is due after a store in flight without a recorder");
     recorder->SyncThrough(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)));
-    if (rebaseTicket[unit] != 0) recorder->Sync();
+    if (rebaseTicket[unit] == 0) return;
+    rebaseSyncs.fetch_add(1, std::memory_order_relaxed);
+    recorder->Sync();
 }
 
 void StorageTexture::forgetUnwatchHash(std::uint32_t first, std::uint32_t count) {

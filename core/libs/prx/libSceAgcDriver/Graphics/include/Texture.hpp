@@ -517,6 +517,14 @@ public:
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
     DccKeys UploadedKeys() const { return uploadedKeys; }
     DccKeys FilledKeys() const { return filledKeys; }
+    struct RebaseStatistics {
+        std::uint64_t tickets;
+        std::uint64_t completed;
+        std::uint64_t discarded;
+        std::uint64_t syncs;
+    };
+    static RebaseStatistics RebaseCounts();
+    bool RebasePending() const;
     bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
     DccKeyProof& KeyProof() const { return keyProof; }
     DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
@@ -578,6 +586,7 @@ private:
     void forgetUnwatchHash(std::uint32_t first, std::uint32_t count);
     void rebaseBeforeUnwatch(std::uint64_t address, std::size_t bytes, bool proven);
     void applyRebase(std::uint64_t ticket, std::uint32_t unit);
+    void dropRebase(std::uint64_t ticket, std::uint32_t unit);
     void readBaseline(std::uint32_t unit);
     void awaitRebase(std::uint32_t unit);
     bool originalHolds(std::uint64_t address, std::size_t bytes) const;
