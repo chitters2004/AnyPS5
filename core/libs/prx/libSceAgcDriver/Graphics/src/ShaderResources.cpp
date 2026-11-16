@@ -7389,7 +7389,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::DrawSetCache::Fi
                 const auto& held = cached->snapshots[at];
                 if (current.uploaded != held.uploaded || current.bytes != held.bytes) return false;
                 if (current.uploaded) continue;
-                if (current.buffer != held.buffer || current.handle != held.handle || current.offset != held.offset || current.address != held.address) return false;
+                
             }
             return true;
         }();
