@@ -116,6 +116,10 @@ private:
     bool stopped = false;
     bool closing = false;
     std::uint64_t wakes = 0;
+    std::uint64_t wakesUnlocked = 0;
+    std::uint64_t fullWaits = 0;
+    std::uint64_t waiterWakes = 0;
+    std::uint64_t waiterWakesUnlocked = 0;
     std::uint64_t lockWaitNs = 0;
     std::thread thread;
     std::uint64_t commits = 0;

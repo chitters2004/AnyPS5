@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -153,6 +154,16 @@ int main() {
     ProducerResumesAtTheLowWatermark();
     if (DrawPipeline::Depth() >= DrawPipeline::ResumeDepth() + 2) EveryProducerResumes();
     DrainReturnsAtEmptyBehindAWaitingProducer();
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    const auto halfDepth = DrawPipeline::ResumeDepth();
+    Switches::Assign(RuntimeSwitch::DrawPipelineLockedWakes, true);
+    Require(DrawPipeline::ResumeDepth() + 1 == DrawPipeline::Depth(), "APS5_DRAW_PIPELINE_LOCKED_WAKES did not restore the resume after one retire");
+    ProducerResumesAtTheLowWatermark();
+    if (DrawPipeline::Depth() >= DrawPipeline::ResumeDepth() + 2) EveryProducerResumes();
+    DrainReturnsAtEmptyBehindAWaitingProducer();
+    Switches::Assign(RuntimeSwitch::DrawPipelineLockedWakes, false);
+    Require(DrawPipeline::ResumeDepth() == halfDepth, "clearing APS5_DRAW_PIPELINE_LOCKED_WAKES did not restore the half-depth resume");
     std::cout << "draw pipeline producer wake tests passed\n";
     return 0;
 }

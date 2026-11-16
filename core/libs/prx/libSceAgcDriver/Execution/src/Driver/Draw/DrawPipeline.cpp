@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -286,7 +287,16 @@ std::size_t DrawPipeline::Depth() {
     return depth;
 }
 
+namespace {
+
+bool LockedWakes() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DrawPipelineLockedWakes);
+}
+
+}
+
 std::size_t DrawPipeline::ResumeDepth() {
+    if (LockedWakes()) return Depth() == 0 ? 0 : Depth() - 1;
     return Depth() / 2;
 }
 
@@ -376,6 +386,7 @@ void DrawPipeline::enqueue(Item item) {
         const auto start = std::chrono::steady_clock::now();
         while (items.size() >= Depth()) {
             ++producersWaiting;
+            ++fullWaits;
             producerWaits.fetch_add(1, std::memory_order_release);
             idle.wait(lock);
         }
@@ -396,9 +407,12 @@ void DrawPipeline::enqueue(Item item) {
         runningCommitters.fetch_add(1, std::memory_order_acq_rel);
     }
     const bool wakeCommitter = committerWaiting;
+    const bool lockedWake = LockedWakes();
     if (wakeCommitter) {
         ++wakes;
+        if (!lockedWake) ++wakesUnlocked;
         committerWakes.fetch_add(1, std::memory_order_relaxed);
+        if (lockedWake) wake.notify_one();
     }
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (profile || stats) {
@@ -406,7 +420,7 @@ void DrawPipeline::enqueue(Item item) {
         if (now - lastReport >= std::chrono::seconds(10)) report(now);
     }
     lock.unlock();
-    if (wakeCommitter) wake.notify_one();
+    if (wakeCommitter && !lockedWake) wake.notify_one();
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -434,7 +448,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.Sum()), static_cast<unsigned long long>(heldReadHits.Take()), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes (%llu signalled after unlock); %llu full-queue waits, %llu waiter wakes (%llu signalled after unlock);%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), static_cast<unsigned long long>(wakesUnlocked), static_cast<unsigned long long>(fullWaits), static_cast<unsigned long long>(waiterWakes), static_cast<unsigned long long>(waiterWakesUnlocked), reads, drainText.c_str());
     std::string kindText;
     for (std::size_t i = 0; i < kindCommits.size(); ++i) {
         const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
@@ -447,7 +461,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()));
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = wakesUnlocked = fullWaits = waiterWakes = waiterWakesUnlocked = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -506,15 +520,17 @@ void DrawPipeline::run() {
         if (fatal != nullptr && failure == nullptr) failure = fatal;
         outstanding.fetch_sub(1, std::memory_order_release);
         const bool wakeWaiters = (producersWaiting != 0 && items.size() <= ResumeDepth()) || (drainersWaiting != 0 && items.empty());
+        const bool lockedWake = LockedWakes();
         if (wakeWaiters) {
             producersWaiting = 0;
             drainersWaiting = 0;
+            ++waiterWakes;
+            if (!lockedWake) ++waiterWakesUnlocked;
+            producerWakes.fetch_add(1, std::memory_order_relaxed);
+            if (lockedWake) idle.notify_all();
         }
         lock.unlock();
-        if (wakeWaiters) {
-            producerWakes.fetch_add(1, std::memory_order_relaxed);
-            idle.notify_all();
-        }
+        if (wakeWaiters && !lockedWake) idle.notify_all();
     }
     runningCommitters.fetch_sub(1, std::memory_order_acq_rel);
 }
