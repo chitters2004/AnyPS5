@@ -824,6 +824,52 @@ void epochProofLogTests(Context context) {
     Require(restored == scoped, "restoring APS5_NO_SCOPED_PROOFS did not restore the scoped exit");
 }
 
+void concurrentProofLogTests() {
+    using Site = AgcDriver::GuestMemory::ProofBreakSite;
+    constexpr std::uint64_t Watched = 0x7000000000ull;
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> set{{{Watched, Watched + 65536u}}};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> breakers;
+    for (unsigned thread = 0; thread < 4; ++thread) {
+        breakers.emplace_back([&, thread] {
+            std::uint64_t round = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto outside = Watched + (std::uint64_t{1} << 30u) + (round % 64u) * 4096u;
+                if (thread == 0) AgcDriver::GuestMemory::BreakProofs(Site::Written, Watched + (round % 16u) * 4096u, 4096u);
+                else if (thread == 1) {
+                    const std::array<std::pair<std::uint64_t, std::uint64_t>, 6> writes{{{outside, outside + 64u}, {outside + 128u, outside + 192u}, {outside + 256u, outside + 320u}, {outside + 384u, outside + 448u}, {outside + 512u, outside + 576u}, {Watched + 8192u, Watched + 8256u}}};
+                    AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, writes);
+                } else {
+                    const std::array<std::pair<std::uint64_t, std::uint64_t>, 4> writes{{{outside, outside + 64u}, {outside + 128u, outside + 192u}, {outside + 256u, outside + 320u}, {Watched + 65472u + thread, Watched + 65536u}}};
+                    AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, writes);
+                }
+                ++round;
+            }
+        });
+    }
+    std::uint64_t checks = 0;
+    std::uint64_t clears = 0;
+    std::uint64_t falseClears = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < until) {
+        const auto stamp = AgcDriver::GuestMemory::ProofSerial();
+        while (AgcDriver::GuestMemory::ProofSerial() < stamp + 64u) std::this_thread::yield();
+        const auto window = AgcDriver::GuestMemory::ProofBreaksSince(stamp, set);
+        ++checks;
+        if (window.complete && window.clear) ++clears;
+        if (window.complete && window.clear && window.breaks != 0) ++falseClears;
+    }
+    stop.store(true);
+    for (auto& thread : breakers) thread.join();
+    const auto quiet = AgcDriver::GuestMemory::ProofSerial();
+    AgcDriver::GuestMemory::BreakProofs(Site::Written, Watched + (std::uint64_t{1} << 31u), 4096u);
+    const auto after = AgcDriver::GuestMemory::ProofBreaksSince(quiet, set);
+    std::fprintf(stderr, "proof log under 4 breaking threads: %llu windows checked, %llu cleared, %llu cleared over a window with breaks into the set\n", static_cast<unsigned long long>(checks), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(falseClears));
+    Require(checks != 0, "the concurrent proof log check never ran");
+    Require(falseClears == 0, "the proof log cleared a window holding breaks into the set");
+    Require(after.complete && after.clear, "the proof log did not clear a quiet window with one outside break");
+}
+
 void epochVerifyWorkTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1738,6 +1784,11 @@ int main(int argc, char** argv) {
 #else
             setenv("APS5_PROFILE_DRAW", "1", 1);
 #endif
+        }
+        if (mode == "proof-log-concurrent") {
+            concurrentProofLogTests();
+            std::puts("proof log concurrent tests passed");
+            return 0;
         }
         if (mode == "device-selection-cpu") {
             deviceSelectionTests();
