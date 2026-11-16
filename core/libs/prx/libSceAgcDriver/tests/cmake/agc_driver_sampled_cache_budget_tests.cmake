@@ -43,6 +43,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_resource_cache_epoch_verify_work PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_resource_cache_epoch_gpu_label COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-gpu-label)
+    set_tests_properties(agc_driver_resource_cache_epoch_gpu_label PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "gpu label: a label stored on the GPU over a sampled view of a storage image kept the exit: submit end no, completion no\n.*gpu label: a label stored on the GPU outside the set kept the exit: yes\n.*resource cache epoch GPU label tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    if(WIN32)
+        set_tests_properties(agc_driver_resource_cache_epoch_gpu_label PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_proof_log_concurrent COMMAND agc_driver_sampled_cache_budget_tests proof-log-concurrent)
     set_tests_properties(agc_driver_proof_log_concurrent PROPERTIES TIMEOUT 30
         PASS_REGULAR_EXPRESSION "proof log under 4 breaking threads: [1-9][0-9]* windows checked, [0-9]+ cleared, 0 cleared over a window with breaks into the set.*proof log concurrent tests passed"

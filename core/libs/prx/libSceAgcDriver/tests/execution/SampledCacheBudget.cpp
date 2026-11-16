@@ -979,6 +979,100 @@ void epochVerifyWorkTests(Context context) {
     std::puts("epoch exit over a storage image stored to with its proof break held: taken");
 }
 
+bool epochGpuLabelTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(SurfaceBytes, 65536));
+    Require(memory != nullptr, "the GPU label fixture needs the guest write watch");
+    std::memset(memory, 0x5a, SurfaceBytes);
+    GuestAllocations::Mutation().Add(memory, SurfaceBytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, SurfaceBytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the GPU label fixture needs epoch proofs on");
+    const auto* import = HostImportFor(context, address, SurfaceBytes);
+    if (import == nullptr) {
+        std::puts("skipped, the surface has no host import for the GPU to store a label into");
+        return false;
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto storage = CachedStorageSurface(context, DecodeTextureResource(Descriptor(address)));
+    Require(storage != nullptr, "the surface has no storage image");
+    const auto program = SampledProgram(address);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the GPU label template is not reusable");
+    Require(resources->SampledTextures().front()->ViewsStorageImage(), "the sampled texture over the storage image's memory is not a view of it");
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 4; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("an unchanged sampled view of a storage image did not take the epoch exit");
+    using Pipeline = AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = Pipeline::Queue0();
+    const auto commitItem = [&](Pipeline::CommitKind kind, Pipeline::Commit commit) {
+        std::exception_ptr failure;
+        std::thread committer([&] {
+            try {
+                pipeline.Enqueue(kind, std::move(commit), {});
+                pipeline.Drain(Pipeline::DrainReason::Submission);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        committer.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+    };
+    Recorder recorder(context);
+    const auto labelAt = [&](Pipeline::CommitKind kind, std::uint32_t value, std::uint64_t offset) {
+        const auto labelAddress = address + offset;
+        const auto bytes = std::as_bytes(std::span(&value, 1));
+        commitItem(kind, [&] {
+            recorder.RecordStore(import->buffer, HostImportOffset(*import, labelAddress), bytes, labelAddress);
+            recorder.AfterCompletions(labelAddress, bytes, value, 0, true);
+        });
+        const bool taken = exitTaken();
+        recorder.Sync();
+        std::uint32_t landed = 0;
+        std::memcpy(&landed, memory + offset, sizeof(landed));
+        Require(landed == value, "the label the GPU stored did not land in the surface's memory");
+        settle("the sampled view did not take the exit again after the label landed");
+        return taken;
+    };
+    const bool submitEnd = labelAt(Pipeline::CommitKind::SubmitEnd, 0x13572468u, 256u);
+    const bool completion = labelAt(Pipeline::CommitKind::Completion, 0x2468ace0u, 512u);
+    std::fprintf(stderr, "gpu label: a label stored on the GPU over a sampled view of a storage image kept the exit: submit end %s, completion %s\n", submitEnd ? "yes" : "no", completion ? "yes" : "no");
+    Require(!submitEnd && !completion, "a label the GPU stores over a sampled view of a storage image let the exit through");
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::GpuLabel, address + SurfaceBytes + (std::uint64_t{64} << 20u), 4u);
+    const bool distant = exitTaken();
+    std::fprintf(stderr, "gpu label: a label stored on the GPU outside the set kept the exit: %s\n", distant ? "yes" : "no");
+    Require(distant == !RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs), "a label stored on the GPU outside the set did not keep the exit exactly when scoped proofs are on");
+    return true;
+}
+
 bool lookupChangedTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1915,6 +2009,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochVerifyWorkTests(context);
             std::puts("resource cache epoch verify work tests passed");
+            return 0;
+        }
+        if (mode == "resource-epoch-gpu-label") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!epochGpuLabelTests(context)) return VulkanTestSkipped;
+            std::puts("resource cache epoch GPU label tests passed");
             return 0;
         }
         if (mode == "resource-lookup-changed") {
