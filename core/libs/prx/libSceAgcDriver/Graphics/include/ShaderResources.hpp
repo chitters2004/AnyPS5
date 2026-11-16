@@ -818,7 +818,9 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> flushRanges;
     bool flushUnscoped = true;
     std::uint64_t planesClean = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
     void recordFlushRanges();
+    void recordProofRanges();
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;

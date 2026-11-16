@@ -7929,6 +7929,14 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     }
 }
 
+void GuestBufferMemory::BoundRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    if (space != nullptr) {
+        for (const auto& region : space->base) out.emplace_back(region.begin, region.end);
+    }
+    for (const auto& region : regions) out.emplace_back(region.begin, std::max(region.end, region.bufferEnd));
+    out.insert(out.end(), writes.begin(), writes.end());
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     InPlaceReads(result);

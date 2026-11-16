@@ -2328,11 +2328,115 @@ ProofBreakCounts TakeProofBreakCounts() {
     return counts;
 }
 
+namespace {
+struct LoggedBreak {
+    std::uint64_t serial = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    ProofBreakSite site = ProofBreakSite::Other;
+    bool ranged = false;
+};
+
+constexpr std::size_t LoggedBreakSlots = 4096;
+constexpr std::size_t LoggedBreakWalk = 1024;
+constexpr std::size_t LoggedRangesPerBreak = 8;
+
+struct ProofBreakLog {
+    AgcDriver::Mutex mutex;
+    std::array<LoggedBreak, LoggedBreakSlots> slots{};
+    std::uint64_t written = 0;
+    void put(const LoggedBreak& entry) {
+        slots[static_cast<std::size_t>(written % LoggedBreakSlots)] = entry;
+        ++written;
+    }
+};
+
+ProofBreakLog& proofBreakLog() {
+    static ProofBreakLog log;
+    return log;
+}
+
+void countBreak(ProofBreakSite site) {
+    if (ProofBreaksCounted()) proofBreakCounters().sites[static_cast<std::size_t>(site)].Add();
+}
+}
+
+bool ProofBreaksLogged() {
+    static const bool logged = ProofBreaksCounted();
+    return logged;
+}
+
+bool ProofBreakScoped(ProofBreakSite site) {
+    return site == ProofBreakSite::Written || site == ProofBreakSite::Packet;
+}
+
 void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes) {
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
-    proofSerial.fetch_add(1, std::memory_order_acq_rel);
-    if (ProofBreaksCounted()) proofBreakCounters().sites[static_cast<std::size_t>(site)].Add();
+    if (!ProofBreaksLogged()) proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    else {
+        auto& log = proofBreakLog();
+        const std::lock_guard lock(log.mutex);
+        const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+        const bool ranged = ProofBreakScoped(site) && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address;
+        log.put({serial, address, ranged ? address + bytes : 0, site, ranged});
+    }
+    countBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, address, bytes});
+}
+
+void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    if (ranges.size() == 1 && ranges.front().second > ranges.front().first) return BreakProofs(site, ranges.front().first, ranges.front().second - ranges.front().first);
+    if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
+    const bool ranged = ProofBreakScoped(site) && !ranges.empty() && ranges.size() <= LoggedRangesPerBreak && std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; });
+    if (!ProofBreaksLogged()) proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    else {
+        auto& log = proofBreakLog();
+        const std::lock_guard lock(log.mutex);
+        const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (!ranged) log.put({serial, 0, 0, site, false});
+        else for (const auto& [begin, end] : ranges) log.put({serial, begin, end, site, true});
+    }
+    countBreak(site);
+    if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, ranges.empty() ? 0 : ranges.front().first, ranges.empty() ? 0 : ranges.front().second - ranges.front().first});
+}
+
+ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    ProofBreakWindow window;
+    if (!ProofBreaksLogged()) return window;
+    auto& log = proofBreakLog();
+    const std::lock_guard lock(log.mutex);
+    const auto current = proofSerial.load(std::memory_order_acquire);
+    if (current == serial) {
+        window.complete = window.clear = true;
+        return window;
+    }
+    if (current < serial) return window;
+    window.breaks = current - serial;
+    const auto available = std::min<std::uint64_t>(log.written, LoggedBreakSlots);
+    bool reached = log.written <= LoggedBreakSlots;
+    for (std::uint64_t walked = 0; walked < available; ++walked) {
+        if (walked >= LoggedBreakWalk) return window;
+        const auto& entry = log.slots[static_cast<std::size_t>((log.written - 1 - walked) % LoggedBreakSlots)];
+        if (entry.serial <= serial) {
+            reached = true;
+            break;
+        }
+        if (!entry.ranged) {
+            window.complete = true;
+            window.unranged = true;
+            window.blocker = entry.site;
+            return window;
+        }
+        const bool overlaps = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return entry.begin < range.second && range.first < entry.end; });
+        if (overlaps) {
+            window.complete = true;
+            window.blocker = entry.site;
+            return window;
+        }
+    }
+    if (!reached) return window;
+    window.complete = window.clear = true;
+    return window;
 }
 
 ProofBreakTrace::ProofBreakTrace() : previous(proofBreakTrace) {
