@@ -162,6 +162,18 @@ void QueuedJobsKeepTheirOwnTimes() {
 }
 
 
+void Add(AgcDriver::DriverDetail::ThreadPhaseTotals& totals, const AgcDriver::DriverDetail::ThreadPhaseTotals& more) {
+    for (std::size_t thread = 0; thread < totals.groupNs.size(); ++thread) {
+        for (std::size_t group = 0; group < totals.groupNs[thread].size(); ++group) totals.groupNs[thread][group] += more.groupNs[thread][group];
+        totals.lapNs[thread] += more.lapNs[thread];
+        totals.drawNs[thread] += more.drawNs[thread];
+        totals.draws[thread] += more.draws[thread];
+    }
+    totals.busyNs += more.busyNs;
+    totals.submissions += more.submissions;
+    totals.windowNs += more.windowNs;
+}
+
 void RewindTailsCountOnce() {
     using AgcDriver::DriverDetail::ThreadPhases;
     constexpr std::size_t Tails = 12;
@@ -183,9 +195,18 @@ void RewindTailsCountOnce() {
         std::atomic_ref<std::uint32_t>(gate).store(1);
     }
     AgcDriverWaitIdle_nid_postfix();
-    const auto totals = ThreadPhases::Take();
-    const auto text = ThreadPhases::Text(totals);
+    auto totals = ThreadPhases::Take();
+    auto text = ThreadPhases::Text(totals);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (totals.submissions == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        Add(totals, ThreadPhases::Take());
+        text = ThreadPhases::Text(totals);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto after = ThreadPhases::Take();
     std::cout << text << '\n';
+    Require(after.submissions == 0, "a nested rewind tail was timed as a submission after the outer submission ended: " + ThreadPhases::Text(after));
     Require(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last rewind tail did not run");
     Require(totals.submissions == 1, "one submission with " + std::to_string(Tails) + " nested rewind tails was timed " + std::to_string(totals.submissions) + " times: " + text);
     Require(totals.busyNs <= totals.windowNs, "the worker's busy time counts nested rewind tails more than once: " + text);
