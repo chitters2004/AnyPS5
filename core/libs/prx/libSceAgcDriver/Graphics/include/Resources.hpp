@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include <cstdint>
 #include <span>
 
 namespace AgcDriver::Graphics {
@@ -112,6 +113,13 @@ private:
     bool pending = false;
     bool submitted = false;
 };
+
+struct CommandBatchStalls {
+    std::uint64_t waits = 0;
+    std::uint64_t slices = 0;
+};
+
+CommandBatchStalls CommandBatchWaitStalls();
 
 }
 
