@@ -86,12 +86,21 @@ std::array<std::uint32_t, 4> Image(const void* texels) {
     return {static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (Format32Float << 20u) | (((TexelWidth - 1u) & 3u) << 30u), ((TexelWidth - 1u) >> 2u) | ((TexelHeight - 1u) << 14u) | (1u << 31u), 0xfacu | (Type2D << 28u)};
 }
 
+bool SharedGuestMemory = false;
+
 class GuestBlocks {
 public:
     explicit GuestBlocks(std::size_t bytes) : bytes(bytes) {
 #ifdef _WIN32
         base = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
-        if (base != nullptr) GuestArena::GuestArenaCommit_nid_postfix(base, bytes, PAGE_READWRITE, bytes);
+        if (base != nullptr && SharedGuestMemory) {
+            const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(static_cast<std::uint64_t>(bytes) >> 32u), static_cast<DWORD>(bytes), nullptr);
+            Require(section != nullptr, "certified proofs: cannot create a section for shared guest memory");
+            GuestArena::GuestArenaMap_nid_postfix(base, bytes, section, 0, PAGE_READWRITE);
+            CloseHandle(section);
+        } else if (base != nullptr) {
+            GuestArena::GuestArenaCommit_nid_postfix(base, bytes, PAGE_READWRITE, bytes);
+        }
 #else
         void* mapped = mmap(nullptr, bytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
@@ -1038,9 +1047,22 @@ int main(int argc, char** argv) {
             return VulkanTestSkipped;
         }
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
-        GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
-        Target = &target;
-        if (!SceneWatched(*device)) {
+        auto target = std::make_unique<GuestBlocks>((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
+        Target = target.get();
+        bool watched = SceneWatched(*device);
+#ifdef _WIN32
+        if (!watched) {
+            std::puts("certified proofs: private guest memory is compared on this device (no second queue to settle its host imports on); running every case on shared guest memory, whose import aliases keep the write watch");
+            device->WaitIdle();
+            Scenes.clear();
+            target.reset();
+            SharedGuestMemory = true;
+            target = std::make_unique<GuestBlocks>((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
+            Target = target.get();
+            watched = SceneWatched(*device);
+        }
+#endif
+        if (!watched) {
             std::puts("skipped, the scene's tables or texels are host imports this platform compares instead of watching");
             return VulkanTestSkipped;
         }
@@ -1052,7 +1074,8 @@ int main(int argc, char** argv) {
         }
         device->WaitIdle();
         Scenes.clear();
-        std::puts("certified proofs tests passed");
+        target.reset();
+        std::puts(SharedGuestMemory ? "certified proofs tests passed on shared guest memory" : "certified proofs tests passed");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
