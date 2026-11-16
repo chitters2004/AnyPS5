@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <list>
 #include <string>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -35,6 +36,37 @@ struct ThreadPhaseTotals {
     std::array<std::array<std::uint64_t, Groups>, Threads> groupNs{};
     std::array<std::uint64_t, Threads> lapNs{}, drawNs{}, draws{};
     std::uint64_t busyNs = 0, submissions = 0, windowNs = 0;
+};
+
+enum class BoundaryEvent : std::uint8_t { DrainBegin, DrainEnd, CommitBegin, CommitEnd, RoomWaitBegin, RoomWaitEnd };
+
+struct BoundaryRecord {
+    std::int64_t ns = 0;
+    BoundaryEvent event = BoundaryEvent::DrainBegin;
+    std::uint32_t finisherJobs = 0, committerItems = 0;
+};
+
+struct BoundaryTotals {
+    std::uint64_t windowNs = 0, drains = 0, drainNs = 0, commits = 0, busyNs = 0, idleNs = 0, idleInDrainNs = 0, idleAfterDrainNs = 0, busyInDrainNs = 0, roomWaitNs = 0, roomWaitInDrainNs = 0;
+    std::uint64_t emptyAtDrain = 0, heldAtDrain = 0, finisherJobsAtDrain = 0, starved = 0, saturated = 0, other = 0, dropped = 0;
+    std::array<std::uint64_t, 4> drainLengths{};
+};
+
+struct BoundaryState {
+    std::int64_t cursor = 0;
+    bool started = false, committerBusy = false, draining = false, afterDrain = false;
+    std::uint32_t roomWaiters = 0;
+    std::int64_t drainStart = 0;
+    std::uint64_t drainIdleNs = 0, drainBusyNs = 0, drainRoomWaitNs = 0;
+};
+
+class BoundaryTrace {
+public:
+    static bool Enabled();
+    static void Note(BoundaryEvent event, std::uint32_t finisherJobs = 0, std::uint32_t committerItems = 0);
+    static BoundaryTotals Take();
+    static void Fold(std::vector<BoundaryRecord>& records, std::int64_t until, BoundaryState& state, BoundaryTotals& totals);
+    static std::string Text(const BoundaryTotals& totals);
 };
 
 class ThreadPhases {

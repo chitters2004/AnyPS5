@@ -646,7 +646,12 @@ void Driver::execute(Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().Drain();
+    if (submission.queue == 0) {
+        const bool traced = BoundaryTrace::Enabled();
+        if (traced) BoundaryTrace::Note(BoundaryEvent::DrainBegin, static_cast<std::uint32_t>(DrawFinisher::Outstanding()), static_cast<std::uint32_t>(DrawPipeline::Queue0().Outstanding()));
+        DrawFinisher::Get().Drain();
+        if (traced) BoundaryTrace::Note(BoundaryEvent::DrainEnd);
+    }
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

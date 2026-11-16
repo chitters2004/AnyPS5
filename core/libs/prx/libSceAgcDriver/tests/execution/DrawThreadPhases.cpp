@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
@@ -214,8 +215,94 @@ void RewindTailsCountOnce() {
 
 }
 
+std::string BoundaryText(const AgcDriver::DriverDetail::BoundaryTotals& totals) {
+    return AgcDriver::DriverDetail::BoundaryTrace::Text(totals);
+}
+
+void FoldSeparatesStarvationFromSaturation() {
+    using AgcDriver::DriverDetail::BoundaryEvent;
+    using AgcDriver::DriverDetail::BoundaryRecord;
+    using AgcDriver::DriverDetail::BoundaryState;
+    using AgcDriver::DriverDetail::BoundaryTotals;
+    using AgcDriver::DriverDetail::BoundaryTrace;
+    constexpr std::int64_t Ms = 1000000;
+    const std::vector<BoundaryRecord> timeline{
+        {0, BoundaryEvent::DrainBegin, 3, 1},
+        {0, BoundaryEvent::CommitBegin},
+        {1 * Ms, BoundaryEvent::CommitEnd},
+        {10 * Ms, BoundaryEvent::DrainEnd},
+        {12 * Ms, BoundaryEvent::CommitBegin},
+        {13 * Ms, BoundaryEvent::CommitEnd},
+        {20 * Ms, BoundaryEvent::CommitBegin},
+        {21 * Ms, BoundaryEvent::DrainBegin, 1, 0},
+        {22 * Ms, BoundaryEvent::RoomWaitBegin},
+        {29 * Ms, BoundaryEvent::RoomWaitEnd},
+        {30 * Ms, BoundaryEvent::DrainEnd},
+        {31 * Ms, BoundaryEvent::CommitEnd},
+        {40 * Ms, BoundaryEvent::CommitBegin},
+        {40 * Ms, BoundaryEvent::DrainBegin, 0, 2},
+        {42 * Ms, BoundaryEvent::CommitEnd},
+        {44 * Ms, BoundaryEvent::DrainEnd},
+    };
+    BoundaryState whole;
+    BoundaryTotals totals;
+    auto records = timeline;
+    std::reverse(records.begin(), records.end());
+    BoundaryTrace::Fold(records, 50 * Ms, whole, totals);
+    const auto text = BoundaryText(totals);
+    std::cout << text << '\n';
+    Require(totals.drains == 3 && totals.drainNs == static_cast<std::uint64_t>(10 * Ms + 9 * Ms + 4 * Ms), "the fold counted " + std::to_string(totals.drains) + " drains: " + text);
+    Require(totals.starved == 1 && totals.saturated == 1 && totals.other == 1, "the fold did not find one starved, one saturated and one other boundary: " + text);
+    Require(totals.idleInDrainNs == static_cast<std::uint64_t>(9 * Ms + 2 * Ms) && totals.idleAfterDrainNs == static_cast<std::uint64_t>(2 * Ms + 6 * Ms), "the fold put the wrong committer idle in and after drains: " + text);
+    Require(totals.busyInDrainNs == static_cast<std::uint64_t>(1 * Ms + 9 * Ms + 2 * Ms) && totals.busyNs == static_cast<std::uint64_t>(1 * Ms + 1 * Ms + 11 * Ms + 2 * Ms), "the fold put the wrong committer busy time in drains: " + text);
+    Require(totals.busyNs + totals.idleNs == static_cast<std::uint64_t>(50 * Ms), "the committer's busy and idle time do not cover the folded span: " + text);
+    Require(totals.idleNs - totals.idleInDrainNs - totals.idleAfterDrainNs == static_cast<std::uint64_t>(7 * Ms + 9 * Ms), "the fold put the wrong committer idle outside drains: " + text);
+    Require(totals.roomWaitNs == static_cast<std::uint64_t>(7 * Ms) && totals.roomWaitInDrainNs == static_cast<std::uint64_t>(7 * Ms), "the fold put the wrong room waits in drains: " + text);
+    Require(totals.heldAtDrain == 2 && totals.emptyAtDrain == 1 && totals.finisherJobsAtDrain == 4, "the fold counted the wrong queue state at drain starts: " + text);
+    Require(totals.drainLengths[2] == 1 && totals.drainLengths[3] == 2, "the fold did not put the 4 ms drain under 5 ms and the 9 and 10 ms drains at 5 ms or more: " + text);
+
+    BoundaryState split;
+    BoundaryTotals first, second;
+    std::vector<BoundaryRecord> early(timeline.begin(), timeline.begin() + 9), late(timeline.begin() + 9, timeline.end());
+    BoundaryTrace::Fold(early, 25 * Ms, split, first);
+    BoundaryTrace::Fold(late, 50 * Ms, split, second);
+    Require(first.busyNs + second.busyNs == totals.busyNs && first.idleNs + second.idleNs == totals.idleNs && first.idleInDrainNs + second.idleInDrainNs == totals.idleInDrainNs && first.idleAfterDrainNs + second.idleAfterDrainNs == totals.idleAfterDrainNs && first.busyInDrainNs + second.busyInDrainNs == totals.busyInDrainNs && first.roomWaitInDrainNs + second.roomWaitInDrainNs == totals.roomWaitInDrainNs, "a drain split across two windows folded differently: " + BoundaryText(first) + " then " + BoundaryText(second));
+    Require(first.drains + second.drains == 3 && second.saturated == 1, "a drain that started in one window and ended in the next was not counted once, as saturated: " + BoundaryText(first) + " then " + BoundaryText(second));
+}
+
+void AddBoundaries(AgcDriver::DriverDetail::BoundaryTotals& totals, const AgcDriver::DriverDetail::BoundaryTotals& more) {
+    totals.windowNs += more.windowNs;
+    totals.drains += more.drains;
+    totals.commits += more.commits;
+    totals.busyNs += more.busyNs;
+    totals.idleNs += more.idleNs;
+    totals.dropped += more.dropped;
+}
+
+void LiveDrainsReachTheTrace(bool pipelined) {
+    using AgcDriver::DriverDetail::BoundaryTrace;
+    static_cast<void>(BoundaryTrace::Take());
+    auto commands = Draws(8, 24.0f);
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the boundary trace submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    auto totals = BoundaryTrace::Take();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (totals.drains == 0 && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        AddBoundaries(totals, BoundaryTrace::Take());
+    }
+    const auto text = BoundaryText(totals);
+    std::cout << text << '\n';
+    Require(totals.drains >= 1, "a queue 0 submission's finisher drain did not reach the boundary trace: " + text);
+    Require(!pipelined || totals.commits >= 8, "the committer's items did not reach the boundary trace: " + text);
+    Require(totals.busyNs + totals.idleNs == totals.windowNs, "the committer's busy and idle time do not cover the window: " + text);
+    Require(totals.dropped == 0, "the boundary trace dropped events: " + text);
+}
+
 int main() {
     try {
+        FoldSeparatesStarvationFromSaturation();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -241,6 +328,8 @@ int main() {
         const auto text = ThreadPhases::Text(totals);
         std::cout << text << '\n';
         if (!timed) {
+            const auto boundaries = AgcDriver::DriverDetail::BoundaryTrace::Take();
+            Require(boundaries.drains == 0 && boundaries.commits == 0, "boundary events were traced without their gate: " + BoundaryText(boundaries));
             Require(totals.submissions == 0 && LapNs(totals, PhaseThread::Worker) == 0 && LapNs(totals, PhaseThread::Finisher) == 0 && Draws(totals, PhaseThread::Worker) == 0 && Draws(totals, PhaseThread::Finisher) == 0 && totals.busyNs == 0, "draw thread phases were counted without APS5_DRAW_THREAD_TIMES, APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: " + text);
             AgcDriverShutdown_nid_postfix();
             std::cout << "draw thread phases stay off without their gate\n";
@@ -263,6 +352,7 @@ int main() {
             Require(Group(totals, PhaseThread::Worker, PhaseGroup::Handoff) + Group(totals, PhaseThread::Worker, PhaseGroup::Graphics) > 0, "the worker's commit hand-off and Graphics::Draw were not timed: " + text);
         }
         RewindTailsCountOnce();
+        LiveDrainsReachTheTrace(AgcDriver::DriverDetail::DrawPipeline::Active());
         AgcDriverShutdown_nid_postfix();
         std::cout << "draw thread phases accounted " << (finisher ? "across the worker and the finisher, queued jobs included" : "on the worker") << "\n";
         return 0;

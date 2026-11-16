@@ -372,7 +372,9 @@ void DrawPipeline::enqueue(Item item) {
         const auto start = std::chrono::steady_clock::now();
         resumeAt = Depth() - 1;
         ++idleWaiters;
+        BoundaryTrace::Note(BoundaryEvent::RoomWaitBegin);
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
+        BoundaryTrace::Note(BoundaryEvent::RoomWaitEnd);
         --idleWaiters;
         resumeAt = 0;
         fullWaitNs += elapsedNs(start);
@@ -450,6 +452,7 @@ void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
     ReserveCommitterCore();
     StartCommitterSampler();
+    const bool traced = BoundaryTrace::Enabled();
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -463,6 +466,7 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
         }
+        if (traced) BoundaryTrace::Note(BoundaryEvent::CommitBegin);
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
@@ -480,6 +484,7 @@ void DrawPipeline::run() {
             fatal = std::current_exception();
         }
         const auto spent = elapsedNs(start);
+        if (traced) BoundaryTrace::Note(BoundaryEvent::CommitEnd);
         if (fatal != nullptr && !stopped) {
             stopped = true;
             if (!shutdown) Driver::Get().ReportFailure(fatal);
