@@ -4,10 +4,12 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <functional>
 #include <iostream>
@@ -1072,10 +1074,78 @@ void CheckWriteIndex() {
 }
 }
 
+double BumpNanoseconds(std::uint64_t firstBlock, unsigned threads, std::uint64_t iterations, bool stamped = true) {
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> workers;
+    std::vector<double> nanoseconds(threads, 0.0);
+    for (unsigned t = 0; t < threads; ++t) {
+        workers.emplace_back([&, t] {
+            const auto address = Base + (firstBlock + t) * Block + 64;
+            ready.fetch_add(1);
+            while (!go.load()) std::this_thread::yield();
+            const auto start = std::chrono::steady_clock::now();
+            if (stamped) {
+                for (std::uint64_t i = 0; i < iterations; ++i) static_cast<void>(MarkWritten(address, 4));
+            } else {
+                for (std::uint64_t i = 0; i < iterations; ++i) BumpWrites(address, 4, WriteBumpSource::Mirror);
+            }
+            nanoseconds[t] = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / static_cast<double>(iterations);
+        });
+    }
+    while (ready.load() != threads) std::this_thread::yield();
+    go.store(true);
+    for (auto& worker : workers) worker.join();
+    double total = 0.0;
+    for (const auto value : nanoseconds) total += value;
+    return total / threads;
+}
+
+void CheckBumpCost() {
+    SetWriteIndexCountingForTest(true);
+    ResetWriteIndexCounts();
+    for (int i = 0; i < 1000; ++i) static_cast<void>(MarkWritten(Base + 300 * Block, 4));
+    Require(WriteIndexCounted().calls == 0, "write bumps did index work with nothing subscribed: " + std::to_string(WriteIndexCounted().calls) + " calls counted");
+    std::vector<std::shared_ptr<WriteSubscription>> subscriptions;
+    for (std::uint64_t t = 0; t < 4; ++t) subscriptions.push_back(Subscribe(Base + (300 + t) * Block, 1, WriteChangeAll, false));
+    const auto certificate = CertifySubscription(*subscriptions[0], 0);
+    Require(CertificateHolds(*subscriptions[0], certificate, 0), "a fresh certificate did not hold");
+    Require(WriteIndexCounted().bumps == 0, "a counted-block subscription registered handles");
+    static_cast<void>(MarkWritten(Base + 300 * Block + 64, 4));
+    Require(WriteIndexCounted().calls == 1, "a bump of a subscribed block was not counted once");
+    Require(WriteIndexCounted().bumps == 0, "a counted-block subscription was bumped through a handle");
+    Require(!CertificateHolds(*subscriptions[0], certificate, 0), "a bump that touched no handle left the certificate holding, so block counters are not its invalidation");
+    constexpr std::uint64_t Iterations = 200000;
+    struct Case {
+        const char* name;
+        std::uint64_t firstBlock;
+    };
+    const std::array<Case, 3> cases{{{"subscribed block", 300}, {"unsubscribed block in a subscribed leaf", 400}, {"block in an empty leaf", 5000}}};
+    subscriptions.clear();
+    SetWriteIndexCountingForTest(false);
+    for (const unsigned threads : {1u, 4u}) std::printf("[bump-bench] nothing subscribed, %u thread%s: %.1f ns/call (driver write stamp alone)\n", threads, threads == 1 ? " " : "s", BumpNanoseconds(300, threads, Iterations));
+    for (std::uint64_t t = 0; t < 4; ++t) subscriptions.push_back(Subscribe(Base + (300 + t) * Block, 1, WriteChangeAll, false));
+    for (const bool counting : {false, true}) {
+        SetWriteIndexCountingForTest(counting);
+        for (const unsigned threads : {1u, 4u}) {
+            for (const auto& entry : cases) {
+                const auto ns = BumpNanoseconds(entry.firstBlock, threads, Iterations);
+                std::printf("[bump-bench] counting %s, %u thread%s, %s: %.1f ns/call\n", counting ? "on " : "off", threads, threads == 1 ? " " : "s", entry.name, ns);
+            }
+        }
+    }
+    for (const bool counting : {false, true}) {
+        SetWriteIndexCountingForTest(counting);
+        for (const unsigned threads : {1u, 4u}) std::printf("[bump-bench] bump alone (no write stamp), counting %s, %u thread%s, subscribed block: %.1f ns/call\n", counting ? "on " : "off", threads, threads == 1 ? " " : "s", BumpNanoseconds(300, threads, Iterations, false));
+    }
+    SetWriteIndexCountingForTest(false);
+    std::cout << "write bump cost checks passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
-        const bool writeIndexOnly = argc == 2 && std::string(argv[1]) == "--write-index";
+        const bool writeIndexOnly = argc == 2 && (std::string(argv[1]) == "--write-index" || std::string(argv[1]) == "--bump-cost");
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
@@ -1092,6 +1162,7 @@ int main(int argc, char** argv) {
         if (argc == 2) {
             const std::string selected = argv[1];
             if (selected == "--write-index") CheckWriteIndex();
+            else if (selected == "--bump-cost") CheckBumpCost();
             else if (selected == "--interior") CheckInteriorCoverageAfterRingEviction();
             else if (selected == "--unions") {
                 CheckAdjacentCoverage();
