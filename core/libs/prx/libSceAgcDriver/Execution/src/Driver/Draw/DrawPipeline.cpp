@@ -1145,8 +1145,8 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     static const bool unordered = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") != nullptr;
     if (bytes == 0 || unordered) return false;
     if (HoldForOlderReads()) {
-        heldReadQueries.fetch_add(1, std::memory_order_relaxed);
-        heldReadHits.fetch_add(1, std::memory_order_relaxed);
+        heldReadQueries.Add();
+        heldReadHits.Add();
         return true;
     }
     const auto end = address + bytes;
@@ -1164,7 +1164,7 @@ bool DrawPipeline::HeldReads(std::uint64_t address, std::size_t bytes) {
     for (const auto& [token, reads] : pipeline.ringHeldReads) {
         for (const auto& [begin, limit] : reads) {
             if (address >= limit || begin >= end) continue;
-            heldReadHits.fetch_add(1, std::memory_order_relaxed);
+            heldReadHits.Add();
             return true;
         }
     }
