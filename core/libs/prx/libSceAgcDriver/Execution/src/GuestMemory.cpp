@@ -2986,24 +2986,13 @@ void noteBreak(ProofBreakSite site) {
 }
 }
 
-bool ScopedProofBreaks() {
-    static const bool scoped = std::getenv("APS5_NO_SCOPED_PROOFS") == nullptr;
-    return scoped;
-}
-
-bool ProofBreaksLogged() {
-    static const bool logged = ProofBreaksCounted() || ScopedProofBreaks();
-    return logged;
-}
-
 bool ProofBreakScoped(ProofBreakSite site) {
     return site == ProofBreakSite::Written || site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered;
 }
 
 void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes) {
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
-    if (!ProofBreaksLogged()) proofSerial.fetch_add(1, std::memory_order_acq_rel);
-    else {
+    {
         auto& log = proofBreakLog();
         const std::lock_guard lock(log.mutex);
         const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -3018,8 +3007,7 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
     if (ranges.size() == 1 && ranges.front().second > ranges.front().first) return BreakProofs(site, ranges.front().first, ranges.front().second - ranges.front().first);
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
     const bool ranged = ProofBreakScoped(site) && !ranges.empty() && ranges.size() <= LoggedRangesPerBreak && std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; });
-    if (!ProofBreaksLogged()) proofSerial.fetch_add(1, std::memory_order_acq_rel);
-    else {
+    {
         auto& log = proofBreakLog();
         const std::lock_guard lock(log.mutex);
         const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -3032,7 +3020,6 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
 
 ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     ProofBreakWindow window;
-    if (!ProofBreaksLogged()) return window;
     auto& log = proofBreakLog();
     const std::lock_guard lock(log.mutex);
     const auto current = proofSerial.load(std::memory_order_acquire);

@@ -764,7 +764,6 @@ void epochProofLogTests(Context context) {
     WatchedSurface surface(context);
     ClearCachedTextures(context.device);
     Require(ShaderResources::EpochProofs(), "the proof-log fixture needs epoch proofs on");
-    Require(AgcDriver::GuestMemory::ProofBreaksLogged(), "the proof-log fixture needs the proof break log");
     AgcDriver::GuestMemory::BumpCollectEpoch();
     const auto program = SampledProgram(surface.Address());
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
@@ -812,10 +811,17 @@ void epochProofLogTests(Context context) {
     Require(!nearPacket, "a packet break over the set's surface let the exit through");
     Require(!unrangedPacket, "a packet break without declared writes let the exit through");
     Require(!distantStore, "a driver store, which the log does not scope, let the exit through");
-    if (AgcDriver::GuestMemory::ScopedProofBreaks()) Require(distantWritten && distantPacket, "a break outside the set kept it from the exit with scoped proofs on");
+    const bool scoped = !RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs);
+    if (scoped) Require(distantWritten && distantPacket, "a break outside the set kept it from the exit with scoped proofs on");
     else Require(!distantWritten && !distantPacket, "a break outside the set let the exit through with scoped proofs off");
     std::fprintf(stderr, "proof log: outside breaks kept the exit: marked written %s, packet %s\n", distantWritten ? "yes" : "no", distantPacket ? "yes" : "no");
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+    RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, scoped);
+    const bool flipped = check("a marked-written break outside the set with the switch flipped", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, distant, 4096u); });
+    RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, !scoped);
+    Require(flipped != scoped, "flipping APS5_NO_SCOPED_PROOFS at run time did not flip the scoped exit");
+    const bool restored = check("a marked-written break outside the set with the switch restored", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, distant, 4096u); });
+    Require(restored == scoped, "restoring APS5_NO_SCOPED_PROOFS did not restore the scoped exit");
 }
 
 void epochVerifyWorkTests(Context context) {

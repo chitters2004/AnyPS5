@@ -28,6 +28,7 @@ enum class RuntimeSwitch : std::size_t {
     NoCoveredCommits,
     NoWriteOwners,
     WholePendingBumps,
+    NoScopedProofs,
     Count,
 };
 
