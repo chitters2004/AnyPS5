@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -87,6 +88,7 @@ private:
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
+    static void breakPacketProofs(CommitKind kind, const std::vector<Range>& writes, GuestMemory::ProofBreakSite site);
 
     std::mutex mutex;
     std::condition_variable wake;

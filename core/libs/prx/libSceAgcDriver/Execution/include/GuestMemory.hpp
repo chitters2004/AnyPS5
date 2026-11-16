@@ -254,8 +254,9 @@ void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t addr
 bool ProofBreakVoidsCertificates(ProofBreakSite site);
 std::uint64_t CertificateBreakSerial();
 void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint8_t detail = 0);
+void BreakProofsWithoutWrites(ProofBreakSite site, std::uint8_t detail = 0);
 inline constexpr std::size_t ProofBreakDetails = 16;
-enum class PacketWrites : std::uint8_t { Declared, None, Empty, Count };
+enum class PacketWrites : std::uint8_t { Declared, None, Empty, Writeless, Count };
 bool ProofBreakCensusEnabled();
 std::array<std::array<std::uint64_t, static_cast<std::size_t>(PacketWrites::Count)>, ProofBreakDetails> TakePacketBreakCounts();
 struct ProofBreakCensus {

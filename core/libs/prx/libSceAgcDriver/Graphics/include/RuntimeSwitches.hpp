@@ -29,6 +29,7 @@ enum class RuntimeSwitch : std::size_t {
     NoWriteOwners,
     WholePendingBumps,
     NoScopedProofs,
+    NoWritelessPacketScope,
     Count,
 };
 
