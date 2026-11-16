@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "Optimization/SrtWalker.hpp"
@@ -216,6 +217,37 @@ void RelocatingDrawsKeepTheirDonor(bool libraries) {
     Require(relocated.evictions - start.evictions >= 2, mode + ": draws of another vertex shader evicted " + std::to_string(relocated.evictions - start.evictions) + " entries, expected at least 2 (run with APS5_DRAW_CACHE_ENTRIES=2)");
 }
 
+std::pair<unsigned long long, unsigned long long> DrainCounts(const std::string& text, const std::string& site) {
+    const auto at = text.find(" " + site + " ");
+    Require(at != std::string::npos, "the finisher drain report has no '" + site + "' entry:" + text);
+    unsigned long long drained = 0, skipped = 0;
+    Require(std::sscanf(text.c_str() + at + site.size() + 2, "%llu/%llu", &drained, &skipped) == 2, "the finisher drain report's '" + site + "' entry has no counts:" + text);
+    return {drained, skipped};
+}
+
+void RelocationDrainsNameTheirIdentity(bool libraries) {
+    using AgcDriver::DriverDetail::DrawFinisher;
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    Registered(SecondVertexHeader, SecondVertexCode.data(), sizeof(SecondVertexCode), 2);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    alignas(16) static std::array<std::array<float, 4>, 3> same{};
+    for (auto& entry : same) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    alignas(16) static std::array<float, 4> second{0.5f, 0.0f, 0.0f, 0.0f};
+    static_cast<void>(DrawFinisher::DrainText());
+    auto commands = DrawFrom({same[0].data(), same[1].data(), same[2].data()});
+    const auto other = DrawFrom({second.data()}, SecondVertexCode.data());
+    commands.insert(commands.end(), other.begin(), other.end());
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+    AgcDriverWaitIdle_nid_postfix();
+    const auto text = DrawFinisher::DrainText();
+    const auto [sameDrained, sameSkipped] = DrainCounts(text, "relocation (same identity)");
+    const auto [otherDrained, otherSkipped] = DrainCounts(text, "relocation (other identity)");
+    Require(sameDrained + sameSkipped == 2, mode + ": " + std::to_string(sameDrained + sameSkipped) + " draws after a miss of their own shaders were counted at the relocation drain, expected 2:" + text);
+    Require(otherDrained + otherSkipped == 1, mode + ": " + std::to_string(otherDrained + otherSkipped) + " draws after a miss of other shaders were counted at the relocation drain, expected 1:" + text);
+}
+
 void SplitRunsNameTheirSharedWords() {
     alignas(16) static std::array<std::uint32_t, 4> data{1u, 2u, 3u, 4u};
     auto table = std::make_shared<ShaderRecompiler::SrtGuestWords>();
@@ -369,7 +401,8 @@ int main(int argc, char** argv) {
     try {
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
         const bool kept = argc == 2 && std::string(argv[1]) == "--kept";
-        if (!evicted && !kept) SplitRunsNameTheirSharedWords();
+        const bool drains = argc == 2 && std::string(argv[1]) == "--drains";
+        if (!evicted && !kept && !drains) SplitRunsNameTheirSharedWords();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -381,6 +414,13 @@ int main(int argc, char** argv) {
             EvictedEntriesServeNoRelocation(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "An evicted draw served no relocation " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (drains) {
+            if (!AgcDriver::DriverDetail::DrawFinisher::Enabled() || !AgcDriver::DriverDetail::DrawFinisher::Overlap()) return VulkanTestSkipped;
+            RelocationDrainsNameTheirIdentity(libraries);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "Relocation drains named their identity " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
         }
         if (kept) {

@@ -64,7 +64,7 @@ struct WaitTally {
 std::atomic<std::uint64_t> finisherSpinNs{0};
 WaitTally finisherSleepWaits;
 std::array<WaitTally, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> finisherDrainWaits;
-constexpr std::array<const char*, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> WaitSiteNames{"reloc", "lookup", "reads", "kept", "packet", "pipeline", "submission", "other"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> WaitSiteNames{"reloc same", "reloc other", "lookup", "reads", "kept", "packet", "pipeline", "submission", "other"};
 WaitTally producerSettles;
 WaitTally producerRoom;
 WaitTally finisherCommitterRoom;
@@ -335,10 +335,10 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "end"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "end", "relocation (same identity)", "relocation (other identity)"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
-        char item[64];
+        char item[96];
         std::snprintf(item, sizeof(item), " %s %llu/%llu", names[i], static_cast<unsigned long long>(finisherDrains[i].exchange(0)), static_cast<unsigned long long>(finisherSkips[i].exchange(0)));
         text += item;
     }
