@@ -23,7 +23,7 @@ enum class RuntimeSwitch : std::size_t {
     NoExtendedFastProofs,
     TableSnapshot,
     NoDrawRelocation,
-    FinisherPrepare,
+    NoFinisherPrepare,
     Count,
 };
 
