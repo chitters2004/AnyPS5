@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <algorithm>
 #include <atomic>
@@ -59,6 +60,7 @@ std::atomic<std::uint32_t> currentPage{0};
 std::atomic<std::uint64_t> gpuTotal{0};
 std::atomic<std::uint64_t> driverTotal{0};
 std::atomic<std::uint64_t> pipelineTotal{0};
+struct ThreadPipelinesSlot {};
 std::atomic<OverlayDriverCounters (*)()> driverCounters{nullptr};
 
 struct PacketCounterRegistry {
@@ -176,6 +178,7 @@ void PerformanceCounters::AddDriverNanoseconds(std::uint64_t nanoseconds) {
 
 void PerformanceCounters::CountPipeline() {
     pipelineTotal.fetch_add(1, std::memory_order_relaxed);
+    HostThreadSlot<std::uint64_t, ThreadPipelinesSlot>::Set(HostThreadSlot<std::uint64_t, ThreadPipelinesSlot>::Get() + 1u);
 }
 
 std::uint64_t PerformanceCounters::GpuNanoseconds() {
@@ -188,6 +191,10 @@ std::uint64_t PerformanceCounters::DriverNanoseconds() {
 
 std::uint64_t PerformanceCounters::Pipelines() {
     return pipelineTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t PerformanceCounters::ThreadPipelines() {
+    return HostThreadSlot<std::uint64_t, ThreadPipelinesSlot>::Get();
 }
 
 PacketCounters& PacketCounters::ThisThread() {

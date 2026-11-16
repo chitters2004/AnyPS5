@@ -47,6 +47,7 @@ public:
     static std::uint64_t GpuNanoseconds();
     static std::uint64_t DriverNanoseconds();
     static std::uint64_t Pipelines();
+    static std::uint64_t ThreadPipelines();
     static bool GpuEnabled();
     static bool DriverEnabled();
 };

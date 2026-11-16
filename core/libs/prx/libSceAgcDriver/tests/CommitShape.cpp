@@ -107,6 +107,30 @@ void TakeResetsCountsButKeepsHistory() {
     Require(report.compared[DistanceIndex(1)] == 1 && report.compared[DistanceIndex(2)] == 1 && report.compared[DistanceIndex(4)] == 0, "a draw after Take did not compare against the draws before it");
 }
 
+void BuildsSumPerReasonAndPipelinesPerKind() {
+    CommitShape shape;
+    std::array<double, CommitShape::Phases> phases{};
+    phases[6] = 100.0;
+    phases[7] = 300.0;
+    shape.Note(2, phases, 0, {}, 1, AgcDriver::BuildReturnedKey);
+    shape.Note(2, phases, 0, {}, 0, AgcDriver::BuildReturnedKey);
+    shape.Note(3, phases, 0, {}, 2, AgcDriver::BuildNewKey);
+    shape.Note(1, phases, 0, {}, 1);
+    shape.Note(1, phases, 0, {});
+    const auto report = shape.Take();
+    Require(report.reasonBuilds[AgcDriver::BuildReturnedKey] == 2 && report.reasonBuilds[AgcDriver::BuildNewKey] == 1, "builds were counted under the wrong reason");
+    Require(report.reasonBuilds[AgcDriver::BuildUncacheable] == 0 && report.reasonBuilds[AgcDriver::BuildInvalidated] == 0, "a draw without a build reason was counted as a build");
+    Require(report.reasonPhaseUs[AgcDriver::BuildReturnedKey][7] == 600.0 && report.reasonPhaseUs[AgcDriver::BuildNewKey][6] == 100.0, "phase time was not summed per build reason");
+    Require(report.reasonPipelines[AgcDriver::BuildReturnedKey] == 1 && report.reasonPipelineDraws[AgcDriver::BuildReturnedKey] == 1 && report.reasonPipelines[AgcDriver::BuildNewKey] == 2 && report.reasonPipelineDraws[AgcDriver::BuildNewKey] == 1, "pipelines created were not counted per build reason");
+    Require(report.kindPipelines[1] == 1 && report.kindPipelineDraws[1] == 1 && report.kindPipelines[2] == 1 && report.kindPipelines[3] == 2, "pipelines created were not counted per kind");
+    const auto line = CommitShape::BuildLine(report, KindNames, 6, 7);
+    Require(line.find("[draw-builds] 10 s: 3 builds;") == 0, "the build line does not start with the build count: " + line);
+    Require(line.find(" new key 1 x 400.00 us (resources 100.00, pipeline 300.00), 2 pipelines created in 1;") != std::string::npos, "the new-key builds are missing from the line: " + line);
+    Require(line.find(" evicted key returned 2 x 400.00 us (resources 100.00, pipeline 300.00), 1 pipelines created in 1;") != std::string::npos, "the returned-key builds are missing from the line: " + line);
+    Require(line.find("uncacheable") == std::string::npos, "a reason without builds is in the line: " + line);
+    Require(line.find("template hit 1 in 1 of 2 draws") != std::string::npos, "the template hits' pipelines are missing from the line: " + line);
+}
+
 }
 
 int main() {
@@ -116,6 +140,7 @@ int main() {
         DistanceSixteenReachesTheOldestHeldDraw();
         PhasesAndDependenciesSumPerKind();
         TakeResetsCountsButKeepsHistory();
+        BuildsSumPerReasonAndPipelinesPerKind();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "commit shape: %s\n", error.what());
         return 1;

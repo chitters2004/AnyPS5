@@ -15,6 +15,10 @@ enum CommitStamp : std::size_t { StampEpoch, StampProofs, StampPending, StampUnw
 
 using CommitStamps = std::array<std::uint64_t, StampCount>;
 
+enum BuildReason : std::size_t { BuildUncacheable, BuildNewKey, BuildReturnedKey, BuildSpaceChanged, BuildInvalidated, BuildInUse, BuildNotReusable, BuildReasonCount };
+
+inline constexpr std::array<const char*, BuildReasonCount> BuildReasonNames{"uncacheable", "new key", "evicted key returned", "space changed", "invalidated", "in use", "not reusable"};
+
 bool CommitShapeProfiled();
 
 class CommitShape {
@@ -33,12 +37,19 @@ public:
         std::array<std::uint64_t, Distances.size()> compared{};
         std::array<std::uint64_t, Distances.size()> survived{};
         std::array<std::array<std::uint64_t, StampCount>, Distances.size()> moved{};
+        std::array<std::uint64_t, Kinds> kindPipelines{};
+        std::array<std::uint64_t, Kinds> kindPipelineDraws{};
+        std::array<std::uint64_t, BuildReasonCount> reasonBuilds{};
+        std::array<std::array<double, Phases>, BuildReasonCount> reasonPhaseUs{};
+        std::array<std::uint64_t, BuildReasonCount> reasonPipelines{};
+        std::array<std::uint64_t, BuildReasonCount> reasonPipelineDraws{};
     };
 
-    void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps);
+    void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines = 0, std::size_t buildReason = BuildReasonCount);
     Report Take();
 
     static std::string Line(const Report& report, std::span<const char* const, Kinds> kindNames, std::span<const char* const, Phases> phaseNames);
+    static std::string BuildLine(const Report& report, std::span<const char* const, Kinds> kindNames, std::size_t resourcesPhase, std::size_t pipelinePhase);
 
 private:
     Mutex mutex;

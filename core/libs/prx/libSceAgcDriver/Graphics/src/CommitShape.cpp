@@ -11,12 +11,20 @@ bool CommitShapeProfiled() {
     return profiled;
 }
 
-void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps) {
+void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines, std::size_t buildReason) {
     std::lock_guard lock(mutex);
     ++counts.draws;
     if (kind < Kinds) {
         ++counts.kindDraws[kind];
         for (std::size_t phase = 0; phase < Phases; ++phase) counts.kindPhaseUs[kind][phase] += phaseUs[phase];
+        counts.kindPipelines[kind] += pipelines;
+        if (pipelines != 0) ++counts.kindPipelineDraws[kind];
+    }
+    if (buildReason < BuildReasonCount) {
+        ++counts.reasonBuilds[buildReason];
+        for (std::size_t phase = 0; phase < Phases; ++phase) counts.reasonPhaseUs[buildReason][phase] += phaseUs[phase];
+        counts.reasonPipelines[buildReason] += pipelines;
+        if (pipelines != 0) ++counts.reasonPipelineDraws[buildReason];
     }
     if (dependencies != 0) {
         ++counts.dependentDraws;
@@ -89,6 +97,30 @@ std::string CommitShape::Line(const Report& report, std::span<const char* const,
             text += item;
         }
         text += index + 1 < Distances.size() ? "," : "";
+    }
+    return text;
+}
+
+std::string CommitShape::BuildLine(const Report& report, std::span<const char* const, Kinds> kindNames, std::size_t resourcesPhase, std::size_t pipelinePhase) {
+    std::string text;
+    char item[256];
+    std::uint64_t builds = 0;
+    for (const auto count : report.reasonBuilds) builds += count;
+    std::snprintf(item, sizeof(item), "[draw-builds] 10 s: %llu builds;", static_cast<unsigned long long>(builds));
+    text += item;
+    for (std::size_t reason = 0; reason < BuildReasonCount; ++reason) {
+        const auto count = report.reasonBuilds[reason];
+        if (count == 0) continue;
+        double drawUs = 0;
+        for (const auto us : report.reasonPhaseUs[reason]) drawUs += us;
+        const auto per = static_cast<double>(count);
+        std::snprintf(item, sizeof(item), " %s %llu x %.2f us (resources %.2f, pipeline %.2f), %llu pipelines created in %llu;", BuildReasonNames[reason], static_cast<unsigned long long>(count), drawUs / per, report.reasonPhaseUs[reason][resourcesPhase] / per, report.reasonPhaseUs[reason][pipelinePhase] / per, static_cast<unsigned long long>(report.reasonPipelines[reason]), static_cast<unsigned long long>(report.reasonPipelineDraws[reason]));
+        text += item;
+    }
+    text += " pipelines created by kind:";
+    for (std::size_t kind = 0; kind < Kinds; ++kind) {
+        std::snprintf(item, sizeof(item), " %s %llu in %llu of %llu draws%s", kindNames[kind], static_cast<unsigned long long>(report.kindPipelines[kind]), static_cast<unsigned long long>(report.kindPipelineDraws[kind]), static_cast<unsigned long long>(report.kindDraws[kind]), kind + 1 < Kinds ? "," : "");
+        text += item;
     }
     return text;
 }

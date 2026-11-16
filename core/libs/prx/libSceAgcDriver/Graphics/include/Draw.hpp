@@ -4,6 +4,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -21,6 +22,7 @@ struct VkDrawCounts {
     std::uint64_t mesh = 0;
 };
 VkDrawCounts TakeVkDrawCounts();
+CommitShape::Report TakeDrawCommitShape();
 
 struct HostImport;
 

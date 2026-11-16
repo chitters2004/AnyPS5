@@ -859,7 +859,7 @@ private:
 class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
-    std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, bool* evictedBefore = nullptr);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -889,7 +889,7 @@ private:
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
-    void noteReturn(const Key& key);
+    bool noteReturn(const Key& key);
     void noteUse(const Key& key);
     void removeImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted);
     struct KeyHash {

@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -782,6 +783,7 @@ struct DrawOutcome {
     double lookupUs = 0;
     // How the draw's resources came about (DrawKind), for the per-kind averages.
     std::size_t kind = 0;
+    std::size_t buildReason = BuildReasonCount;
     // The flush hook's fence waits made inside this draw (index and vertex reads, the target
     // lookups' flushes, the build's texture lookups): nested in the draw's GpuMutex hold, so they
     // are the part of the hold that is waiting rather than working. The draw's own syncs (a
@@ -1439,6 +1441,7 @@ struct DrawTimer {
     std::array<double, PhaseCount> us{};
     CommitStamps stamps{};
     std::uint64_t dependenciesBefore = 0;
+    std::uint64_t pipelinesBefore = 0;
     explicit DrawTimer(bool profile) : profile(profile), timed(profile || CommitShapeProfiled()), phaseStart(std::chrono::steady_clock::now()) {}
     void phase(DrawPhase which) {
         if (!timed) return;
@@ -1456,9 +1459,14 @@ struct DrawTimer {
 
 static_assert(KindCount == CommitShape::Kinds && PhaseCount == CommitShape::Phases);
 
-void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
+CommitShape& drawCommitShape() {
     static auto* const shape = new CommitShape();
-    shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps);
+    return *shape;
+}
+
+void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
+    auto* const shape = &drawCommitShape();
+    shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps, PerformanceCounters::ThreadPipelines() - timer.pipelinesBefore, outcome.buildReason);
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
@@ -1468,13 +1476,16 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
         return;
     }
     if (now < due || !nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed)) return;
-    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(shape->Take(), DrawKindNames, DrawPhaseNames).c_str());
+    const auto report = shape->Take();
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(report, DrawKindNames, DrawPhaseNames).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
 }
 
 void startCommitShape(DrawTimer& timer) {
     if (!CommitShapeProfiled()) return;
     timer.stamps = {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), Recorder::PublishGeneration()};
     timer.dependenciesBefore = Recorder::ThreadDependencyHits();
+    timer.pipelinesBefore = PerformanceCounters::ThreadPipelines();
 }
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.
@@ -2242,9 +2253,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     std::optional<AddressDrawReuse> reuse;
     if (address == AddressStages::Storing) reuse = AddressDrawReuse::NotReadOnly;
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
+    auto buildReason = BuildUncacheable;
     if (resolved.cacheable) {
         resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        bool evictedBefore = false;
+        auto cached = SharedResourceCache().Find(resolved.contentKey, &evictedBefore);
+        buildReason = evictedBefore ? BuildReturnedKey : BuildNewKey;
+        if (cached != nullptr) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();
@@ -2292,10 +2307,12 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 countCache(&DrawProfile::cacheHits);
                 if (counted) reuse = AddressDrawReuse::Reused;
             } else if (valid || inUse) {
+                buildReason = inUse ? BuildInUse : BuildNotReusable;
                 if (valid && cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 if (valid && counted) reuse = patched ? AddressDrawReuse::PatchedData : AddressDrawReuse::MovedBuffer;
                 countCache(&DrawProfile::cacheMisses);
             } else {
+                buildReason = spaceHeld ? BuildInvalidated : BuildSpaceChanged;
                 if (cached->SpaceReuse()) static_cast<void>(cached->ReleaseSpace());
                 SharedResourceCache().Remove(resolved.contentKey);
                 countCache(&DrawProfile::cacheInvalidated);
@@ -2310,6 +2327,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
+        outcome.buildReason = buildReason;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);
         if (address == AddressStages::ReadOnly && !reuse.has_value()) reuse = resolved.resources->SpaceReuse() ? AddressDrawReuse::Built : AddressDrawReuse::NotSpaceOnly;
     }
@@ -4793,6 +4811,10 @@ FragmentOutputLookups ThreadFragmentOutputLookups() {
     return ThreadScratch<LastFragmentOutputs, LastFragmentOutputsTag>().lookups;
 }
 
+
+CommitShape::Report TakeDrawCommitShape() {
+    return drawCommitShape().Take();
+}
 
 VkDrawCounts TakeVkDrawCounts() {
     VkDrawCounts counts;

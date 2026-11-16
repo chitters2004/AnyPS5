@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
@@ -486,6 +488,26 @@ void FullVertexPushDataLeavesRoomForTheFragment(bool libraries) {
 
 }
 
+void BuildsKeptTheirReason(std::uint64_t pipelinesBefore) {
+    const char* entries = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
+    const bool evicting = entries != nullptr && std::string_view(entries) == "1";
+    const auto pipelines = AgcDriver::PerformanceCounters::Pipelines() - pipelinesBefore;
+    const auto report = AgcDriver::Graphics::TakeDrawCommitShape();
+    const auto line = AgcDriver::CommitShape::BuildLine(report, std::array<const char*, AgcDriver::CommitShape::Kinds>{"recipe hit", "template hit", "build", "BDA"}, 6, 7);
+    std::cout << line << '\n';
+    std::uint64_t reasons = 0;
+    for (const auto count : report.reasonBuilds) reasons += count;
+    const auto builds = report.kindDraws[2] + report.kindDraws[3];
+    Require(builds != 0 && reasons == builds, std::to_string(builds) + " builds were noted with " + std::to_string(reasons) + " reasons: " + line);
+    Require(report.reasonBuilds[AgcDriver::BuildNewKey] != 0, "no build was for a new key: " + line);
+    std::uint64_t created = 0;
+    for (const auto count : report.kindPipelines) created += count;
+    Require(created != 0 && created <= pipelines, "the draws noted " + std::to_string(created) + " pipelines created where the device created " + std::to_string(pipelines) + ": " + line);
+    const auto returned = report.reasonBuilds[AgcDriver::BuildReturnedKey];
+    if (evicting) Require(returned != 0, "with one resource cache entry no build was for an evicted key that came back: " + line);
+    else Require(returned == 0, "with room in the resource cache a build was counted for an evicted key: " + line);
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_NO_GPU_UNFOLDED_INDIRECT", "1");
@@ -506,6 +528,10 @@ int main(int argc, char** argv) {
             return 0;
         }
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
+        const bool buildReasons = argc == 2 && std::string_view(argv[1]) == "--build-reasons";
+        Require(!buildReasons || AgcDriver::CommitShapeProfiled(), "--build-reasons needs APS5_PROFILE_COMMIT_SHAPE");
+        static_cast<void>(AgcDriver::Graphics::TakeDrawCommitShape());
+        const auto pipelinesBefore = AgcDriver::PerformanceCounters::Pipelines();
         if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
         } else {
@@ -518,6 +544,7 @@ int main(int argc, char** argv) {
             FullVertexPushDataLeavesRoomForTheFragment(libraries);
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
+            if (buildReasons) BuildsKeptTheirReason(pipelinesBefore);
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

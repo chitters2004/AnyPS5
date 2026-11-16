@@ -4913,12 +4913,13 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 
 }
 
-std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
+std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key, bool* evictedBefore) {
     resourceCacheFinds.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(mutex);
     const auto found = index.find(key);
     if (found == index.end()) {
-        noteReturn(key);
+        const bool returned = noteReturn(key);
+        if (evictedBefore != nullptr) *evictedBefore = returned;
         noteMiss(key);
         return nullptr;
     }
@@ -4928,7 +4929,6 @@ std::shared_ptr<ShaderResources> ResourceCache::Find(const Key& key) {
 }
 
 void ResourceCache::noteEvicted(const Key& key) {
-    if (fixedCapacity) return;
     const auto hash = KeyHash{}(key);
     if (const auto found = evictedKeys.find(hash); found != evictedKeys.end()) evictedOrder.erase(found->second);
     evictedOrder.push_front(hash);
@@ -4937,6 +4937,7 @@ void ResourceCache::noteEvicted(const Key& key) {
         evictedKeys.erase(evictedOrder.back());
         evictedOrder.pop_back();
     }
+    if (fixedCapacity) return;
     if (++evictionsSinceCheck < capacity / 4u) return;
     const bool churning = returnsSinceCheck * 2u > evictionsSinceCheck;
     evictionsSinceCheck = 0;
@@ -4968,13 +4969,13 @@ void ResourceCache::noteUse(const Key& key) {
     std::fprintf(stderr, "[rescache] capacity %zu -> %zu entries: %zu keys served the last %zu uses\n", previous, capacity, used, uses);
 }
 
-void ResourceCache::noteReturn(const Key& key) {
-    if (fixedCapacity) return;
+bool ResourceCache::noteReturn(const Key& key) {
     const auto found = evictedKeys.find(KeyHash{}(key));
-    if (found == evictedKeys.end()) return;
+    if (found == evictedKeys.end()) return false;
     evictedOrder.erase(found->second);
     evictedKeys.erase(found);
-    ++returnsSinceCheck;
+    if (!fixedCapacity) ++returnsSinceCheck;
+    return true;
 }
 
 namespace {
