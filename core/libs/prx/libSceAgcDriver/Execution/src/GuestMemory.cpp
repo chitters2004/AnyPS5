@@ -2290,6 +2290,7 @@ const char* ProofBreakSiteName(ProofBreakSite site) {
         case ProofBreakSite::WrittenBack: return "written back";
         case ProofBreakSite::KeptDraw: return "kept writing draw";
         case ProofBreakSite::ResourceWriteBack: return "resource write-back";
+        case ProofBreakSite::GpuLabel: return "label stored on the GPU";
         case ProofBreakSite::Other: break;
     }
     return "other";
@@ -2415,7 +2416,7 @@ std::array<std::array<std::uint64_t, static_cast<std::size_t>(PacketWrites::Coun
 }
 
 bool ProofBreakScoped(ProofBreakSite site) {
-    return site == ProofBreakSite::Written || site == ProofBreakSite::Packet;
+    return site == ProofBreakSite::Written || site == ProofBreakSite::Packet || site == ProofBreakSite::GpuLabel;
 }
 
 void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes) {

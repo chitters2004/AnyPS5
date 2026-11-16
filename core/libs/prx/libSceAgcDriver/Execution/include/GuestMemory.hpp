@@ -155,9 +155,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-enum class ProofBreakSite : std::uint8_t { Other, DriverStore, Written, GpuMutex, WriteBack, WriteBackIfHeld, Packet, CompletionStore, RecordedWork, WrittenBack, KeptDraw, ResourceWriteBack };
+enum class ProofBreakSite : std::uint8_t { Other, DriverStore, Written, GpuMutex, WriteBack, WriteBackIfHeld, Packet, CompletionStore, RecordedWork, WrittenBack, KeptDraw, ResourceWriteBack, GpuLabel };
 const char* ProofBreakSiteName(ProofBreakSite site);
-inline constexpr std::size_t ProofBreakSiteCount = static_cast<std::size_t>(ProofBreakSite::ResourceWriteBack) + 1;
+inline constexpr std::size_t ProofBreakSiteCount = static_cast<std::size_t>(ProofBreakSite::GpuLabel) + 1;
 struct ProofBreakCounts {
     std::array<std::uint64_t, ProofBreakSiteCount> sites{};
     std::uint64_t emptyWriteBacks = 0;

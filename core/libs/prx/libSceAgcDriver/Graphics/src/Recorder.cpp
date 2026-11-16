@@ -4552,6 +4552,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     const bool behindCompletion = !(storedOnGpu && !always && !CountAllCompletionLabels());
     if (!behindCompletion) {
         batch.completionLabelRanges.push_back({address, address + bytes.size(), false});
+        GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::GpuLabel, address, bytes.size());
     } else {
         ++batch.completionLabelCount;
         completionLabels.fetch_add(1, std::memory_order_acq_rel);
