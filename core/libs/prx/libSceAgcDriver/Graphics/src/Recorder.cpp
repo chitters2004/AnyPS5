@@ -1964,7 +1964,7 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     CountBarriers(CommandClass::StagingOut);
     open->coveredAccess = copiedAccess;
     EndGpuTiming(timing, bytes);
-    NoteWholeCopyBacks(*this, landed);
+    NoteWholeCopyBacks(*this, landed, static_cast<std::uint8_t>(site));
     handoverLanded.fetch_add(landing.size(), std::memory_order_relaxed);
     handoverLandedBytes.fetch_add(bytes, std::memory_order_relaxed);
     handoverLandedAt[static_cast<std::size_t>(site)].fetch_add(landing.size(), std::memory_order_relaxed);
