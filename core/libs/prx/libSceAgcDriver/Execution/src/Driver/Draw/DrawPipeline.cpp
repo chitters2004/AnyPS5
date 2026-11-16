@@ -448,6 +448,7 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
+        const std::vector<Range>* writes = nullptr;
         bool isDraw = false;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
@@ -458,6 +459,7 @@ void DrawPipeline::run() {
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
+            writes = &items.front().writes;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -465,7 +467,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::Packet);
+            if (!isDraw) GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::Packet, *writes);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

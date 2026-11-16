@@ -4183,6 +4183,25 @@ struct ExitMisses {
     std::array<ProfileCounter, StampAges> stored;
     std::array<ProfileCounter, StampAges> missed;
     std::array<ProfileCounter, StampAges> proofAlone;
+    std::array<ProfileCounter, 32> combos;
+    std::array<ProfileCounter, 4> onlyScoped;
+    std::array<ProfileCounter, 4> withLog;
+    ProfileCounter logChecked;
+    ProfileCounter logClears;
+    ProfileCounter logClearsAlone;
+    ProfileCounter logIncomplete;
+    ProfileCounter logUnscopedSet;
+    std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> overlapBlocks;
+    std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> unrangedBlocks;
+};
+
+constexpr std::array<const char*, 5> ComboInputs{"epoch", "proof", "pending", "releases", "other"};
+constexpr std::array<std::size_t, 4> ScopedInputs{0, 2, 3, 1};
+
+struct ProofLogCheck {
+    bool checked = false;
+    bool unscopedSet = false;
+    GuestMemory::ProofBreakWindow window;
 };
 
 bool exitMissesCounted() {
@@ -4220,6 +4239,40 @@ void reportExitMisses() {
         sites += std::string(GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site))) + " " + std::to_string(breaks.sites[site]);
     }
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks));
+    std::string combos;
+    for (std::size_t mask = 1; mask < misses.combos.size(); ++mask) {
+        const auto count = misses.combos[mask].Take();
+        if (count == 0) continue;
+        std::string name;
+        for (std::size_t input = 0; input < ComboInputs.size(); ++input) {
+            if ((mask >> input) & 1u) name += (name.empty() ? "" : "+") + std::string(ComboInputs[input]);
+        }
+        combos += (combos.empty() ? "" : ", ") + name + " " + std::to_string(count);
+    }
+    std::string only;
+    std::string withLog;
+    for (std::size_t scoped = 0; scoped < ScopedInputs.size(); ++scoped) {
+        only += (only.empty() ? "" : ", ") + std::string(ExitInputs[ScopedInputs[scoped]]) + " " + std::to_string(misses.onlyScoped[scoped].Take());
+        const auto logged = misses.withLog[scoped].Take();
+        if (ScopedInputs[scoped] != 1) withLog += (withLog.empty() ? "" : ", ") + std::string(ExitInputs[ScopedInputs[scoped]]) + " " + std::to_string(logged);
+    }
+    const auto blockSites = [](std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount>& counters) {
+        std::string text;
+        for (std::size_t site = 0; site < counters.size(); ++site) {
+            const auto count = counters[site].Take();
+            if (count != 0) text += (text.empty() ? "" : ", ") + std::string(GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site))) + " " + std::to_string(count);
+        }
+        return text.empty() ? std::string("none") : text;
+    };
+    const auto checked = misses.logChecked.Take();
+    const auto clears = misses.logClears.Take();
+    const auto clearsAlone = misses.logClearsAlone.Take();
+    const auto incomplete = misses.logIncomplete.Take();
+    const auto unscopedSet = misses.logUnscopedSet.Take();
+    const auto overlapping = blockSites(misses.overlapBlocks);
+    const auto unranged = blockSites(misses.unrangedBlocks);
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits by the inputs that moved: %s; would hit if only that input were scoped: %s; with the proof scoped by the break log and only that input too: %s\n", combos.empty() ? "none" : combos.c_str(), only.c_str(), withLog.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
 }
 
 ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, const ShaderResources::ExitStamp& end, std::uint64_t flushBreaks, std::uint64_t ownBreaks) {
@@ -4297,12 +4350,39 @@ void noteEpochProof(bool reused, bool verified, bool failed, bool stored = false
     if (reportDue(verification.checks.fetch_add(1, std::memory_order_relaxed) + 1u)) printExitVerification();
 }
 
-void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResources::ExitStamp& current, bool stalePlanes, bool copies, ShaderResources::StampAge age) {
+void noteProofLog(const std::array<bool, ExitInputs.size()>& moved, const ProofLogCheck& log) {
+    auto& misses = exitMisses();
+    std::size_t mask = 0;
+    for (std::size_t input = 0; input < moved.size(); ++input) {
+        if (!moved[input]) continue;
+        mask |= input == 0 ? 1u : input == 1 ? 2u : input == 2 ? 4u : input == 3 ? 8u : 16u;
+    }
+    misses.combos[mask].Add();
+    const bool logClears = log.checked && !log.unscopedSet && log.window.complete && log.window.clear;
+    const auto movedInputs = static_cast<std::size_t>(std::ranges::count(moved, true));
+    for (std::size_t scoped = 0; scoped < ScopedInputs.size(); ++scoped) {
+        const auto input = ScopedInputs[scoped];
+        if (!moved[input]) continue;
+        if (movedInputs == 1) misses.onlyScoped[scoped].Add();
+        if (input != 1 && movedInputs == (moved[1] ? 2u : 1u) && (!moved[1] || logClears)) misses.withLog[scoped].Add();
+    }
+    if (!log.checked) return;
+    misses.logChecked.Add();
+    if (log.unscopedSet) misses.logUnscopedSet.Add();
+    else if (!log.window.complete) misses.logIncomplete.Add();
+    else if (log.window.clear) {
+        misses.logClears.Add();
+        if (std::ranges::count(moved, true) == 1) misses.logClearsAlone.Add();
+    } else (log.window.unranged ? misses.unrangedBlocks : misses.overlapBlocks)[static_cast<std::size_t>(log.window.blocker)].Add();
+}
+
+void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResources::ExitStamp& current, bool stalePlanes, bool copies, ShaderResources::StampAge age, const ProofLogCheck& log) {
     const std::array<bool, ExitInputs.size()> moved{proved.epoch != current.epoch, proved.proof != current.proof, proved.pending != current.pending, proved.releases != current.releases, proved.unwatch != current.unwatch, proved.importSet != current.importSet, proved.allocations != current.allocations, proved.surfaces != current.surfaces, stalePlanes, copies};
     const bool alone = std::ranges::count(moved, true) == 1;
     if (exitMissesCounted()) {
         auto& misses = exitMisses();
         misses.misses.Add();
+        noteProofLog(moved, log);
         misses.missed[static_cast<std::size_t>(age)].Add();
         if (alone && moved[1]) misses.proofAlone[static_cast<std::size_t>(age)].Add();
         for (std::size_t input = 0; input < moved.size(); ++input) {
@@ -4664,6 +4744,30 @@ void ShaderResources::recordFlushRanges() {
     for (const auto& span : GuestMemory::SubscriptionSpans(*writeSubscription)) flushRanges.push_back(span);
 }
 
+void ShaderResources::recordProofRanges() {
+    proofRanges = flushRanges;
+    for (const auto& range : describedRanges) {
+        proofRanges.emplace_back(range.address, range.address + range.bytes);
+        if (range.dccAddress != 0) proofRanges.emplace_back(range.dccAddress, range.dccAddress + DccKeyBytes(range.bytes));
+    }
+    for (const auto& surface : validatedTextures) {
+        if (surface.valid && surface.resource.dccAddress != 0) proofRanges.emplace_back(surface.resource.dccAddress, surface.resource.dccAddress + DccKeyBytes(surface.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        if (image != nullptr && image->Descriptor().dccAddress != 0) proofRanges.emplace_back(image->Descriptor().dccAddress, image->Descriptor().dccAddress + DccKeyBytes(image->GuestBytes()));
+    }
+    for (const auto& [address, copy] : comparedTableSpans) proofRanges.emplace_back(address, address + copy.size());
+    guestMemory.BoundRanges(proofRanges);
+    std::erase_if(proofRanges, [](const auto& range) { return range.second <= range.first; });
+    std::sort(proofRanges.begin(), proofRanges.end());
+    std::size_t kept = 0;
+    for (const auto& range : proofRanges) {
+        if (kept != 0 && range.first <= proofRanges[kept - 1].second) proofRanges[kept - 1].second = std::max(proofRanges[kept - 1].second, range.second);
+        else proofRanges[kept++] = range;
+    }
+    proofRanges.resize(kept);
+}
+
 bool ShaderResources::stalePlanesRead() {
     if (!DepthPlanesStale()) return false;
     if (flushUnscoped) return true;
@@ -4774,7 +4878,15 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         const bool counted = exitMissesCounted();
-        if (proved.epoch != 0 && (verifyingExits() || counted)) noteExitMiss(proved, stamp, stalePlanes, copies, provedAge);
+        if (proved.epoch != 0 && (verifyingExits() || counted)) {
+            ProofLogCheck log;
+            if (counted && proved.proof != stamp.proof && GuestMemory::ProofBreaksLogged()) {
+                log.checked = true;
+                log.unscopedSet = flushUnscoped;
+                if (!flushUnscoped) log.window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
+            }
+            noteExitMiss(proved, stamp, stalePlanes, copies, provedAge, log);
+        }
         std::optional<GuestMemory::ProofBreakTrace> trace;
         if (counted) trace.emplace();
         std::uint64_t flushBreaks = 0;
@@ -4782,6 +4894,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         noteEpochProof(false, false, false);
         proved = stamp;
         recordFlushRanges();
+        if (counted && GuestMemory::ProofBreaksLogged()) recordProofRanges();
         if (!ok || std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); })) proved.epoch = 0;
         if (counted) {
             provedAge = stampAge(stamp, currentExitStamp(), flushBreaks, trace->Count());
