@@ -418,7 +418,7 @@ void CommandBatch::Wait() {
     const auto waitFences = context.Function<PFN_vkWaitForFences>("vkWaitForFences");
     auto result = waitFences(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
     if (result == VK_TIMEOUT) stalledWaits.fetch_add(1, std::memory_order_relaxed);
-    for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
+    for (int waited = 5; result == VK_TIMEOUT && waited <= 5; waited += 5) {
         stalledSlices.fetch_add(1, std::memory_order_relaxed);
         std::fprintf(stderr, "[gpu] command batch still running on the GPU after %d s\n", waited);
         result = waitFences(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
