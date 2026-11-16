@@ -4191,6 +4191,7 @@ struct ExitMisses {
     ProfileCounter logClearsAlone;
     ProfileCounter logIncomplete;
     ProfileCounter logUnscopedSet;
+    ProfileCounter logExits;
     std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> overlapBlocks;
     std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> unrangedBlocks;
 };
@@ -4269,10 +4270,11 @@ void reportExitMisses() {
     const auto clearsAlone = misses.logClearsAlone.Take();
     const auto incomplete = misses.logIncomplete.Take();
     const auto unscopedSet = misses.logUnscopedSet.Take();
+    const auto logExits = misses.logExits.Take();
     const auto overlapping = blockSites(misses.overlapBlocks);
     const auto unranged = blockSites(misses.unrangedBlocks);
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits by the inputs that moved: %s; would hit if only that input were scoped: %s; with the proof scoped by the break log and only that input too: %s\n", combos.empty() ? "none" : combos.c_str(), only.c_str(), withLog.c_str());
-    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log: %llu exits taken because every break since the proof was outside the set (%s); over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(logExits), GuestMemory::ScopedProofBreaks() ? "on" : "off, APS5_NO_SCOPED_PROOFS", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
 }
 
 ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, const ShaderResources::ExitStamp& end, std::uint64_t flushBreaks, std::uint64_t ownBreaks) {
@@ -4857,7 +4859,19 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
-        const bool matched = stamp.epoch != 0 && proved == stamp && !stalePlanes;
+        bool matched = stamp.epoch != 0 && proved == stamp && !stalePlanes;
+        if (!matched && stamp.epoch != 0 && proved.epoch != 0 && !stalePlanes && proved.proof != stamp.proof && provedRanges && GuestMemory::ScopedProofBreaks()) {
+            auto others = stamp;
+            others.proof = proved.proof;
+            if (others == proved) {
+                const auto window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
+                if (window.complete && window.clear) {
+                    proved.proof = stamp.proof;
+                    matched = true;
+                    if (exitMissesCounted()) exitMisses().logExits.Add();
+                }
+            }
+        }
         const bool copies = matched && !refreshPerUseCopies();
         if (matched && !copies) {
             if (verifyingExits()) {
@@ -4882,8 +4896,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             ProofLogCheck log;
             if (counted && proved.proof != stamp.proof && GuestMemory::ProofBreaksLogged()) {
                 log.checked = true;
-                log.unscopedSet = flushUnscoped;
-                if (!flushUnscoped) log.window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
+                log.unscopedSet = !provedRanges;
+                if (provedRanges) log.window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
             }
             noteExitMiss(proved, stamp, stalePlanes, copies, provedAge, log);
         }
@@ -4894,7 +4908,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         noteEpochProof(false, false, false);
         proved = stamp;
         recordFlushRanges();
-        if (counted && GuestMemory::ProofBreaksLogged()) recordProofRanges();
+        provedRanges = GuestMemory::ProofBreaksLogged() && !flushUnscoped;
+        if (provedRanges) recordProofRanges();
         if (!ok || std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); })) proved.epoch = 0;
         if (counted) {
             provedAge = stampAge(stamp, currentExitStamp(), flushBreaks, trace->Count());
