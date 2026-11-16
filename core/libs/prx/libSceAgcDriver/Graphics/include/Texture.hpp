@@ -522,6 +522,11 @@ public:
         std::uint64_t completed;
         std::uint64_t discarded;
         std::uint64_t syncs;
+        std::uint64_t settled;
+        std::uint64_t restamped;
+        std::uint64_t staleApplies;
+        std::uint64_t staleDrops;
+        std::uint64_t expired;
     };
     static RebaseStatistics RebaseCounts();
     bool RebasePending() const;

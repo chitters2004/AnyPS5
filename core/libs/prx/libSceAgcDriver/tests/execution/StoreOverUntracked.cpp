@@ -417,6 +417,7 @@ Outcome RunDiscardedRebase() {
     if (!image->RebasePending()) return Outcome::Missed;
     auto* recorder = AgcDriver::Graphics::Recorder::Active();
     Require(recorder != nullptr, "discarded rebase: the device has no active recorder");
+    const auto inFlight = recorder->InFlightBatches();
     AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(1u);
     std::string thrown = "nothing";
     try {
@@ -426,17 +427,23 @@ Outcome RunDiscardedRebase() {
     }
     AgcDriver::Graphics::Recorder::FailNextSubmitsForTest(0u);
     const auto settled = StorageTexture::RebaseCounts();
+    const auto counts = [&] {
+        const auto delta = [](std::uint64_t now, std::uint64_t then) { return std::to_string(now - then); };
+        return " (since the unwatch: registered " + delta(settled.tickets, before.tickets) + ", applied " + delta(settled.completed, before.completed) + ", dropped " + delta(settled.discarded, before.discarded) + ", superseded by a store " + delta(settled.settled, before.settled) + ", by an upload " + delta(settled.restamped, before.restamped) + ", stale completions " + delta(settled.staleApplies, before.staleApplies) + ", stale discards " + delta(settled.staleDrops, before.staleDrops) + ", image gone " + delta(settled.expired, before.expired) + "; " + std::to_string(inFlight) + " batches were in flight at the sync)";
+    };
     if (settled.completed != before.completed) return Outcome::Missed;
-    Require(thrown.find("injected failure") != std::string::npos, "discarded rebase: the batch holding the store was not failed ('" + thrown + "')");
-    Require(!image->RebasePending(), "discarded rebase: the rebase still waits on a store whose batch was discarded");
-    Require(settled.discarded == before.discarded + 1u, "discarded rebase: the discarded batch did not drop its rebase");
+    Require(thrown.find("injected failure") != std::string::npos, "discarded rebase: the batch holding the store was not failed ('" + thrown + "')" + counts());
+    Require(!image->RebasePending(), "discarded rebase: the rebase still waits on a store whose batch was discarded" + counts());
+    Require(settled.tickets != before.tickets, "discarded rebase: the unwatch registered no rebase" + counts());
+    Require(settled.discarded - before.discarded == settled.tickets - before.tickets, "discarded rebase: the discarded batch did not drop every rebase that waited on it" + counts());
     image->MarkDirty();
     try {
         StorageTexture::FlushAllPending("store over untracked fixture");
     } catch (const std::exception&) {
     }
     const auto after = StorageTexture::RebaseCounts();
-    Require(after.syncs == before.syncs, "discarded rebase: a rebase whose batch was discarded fell back to a full sync");
+    Require(after.syncs == before.syncs, "discarded rebase: a rebase whose batch was discarded fell back to a full sync" + counts());
+    std::printf("discarded rebase:%s\n", counts().c_str());
     return Outcome::Kept;
 }
 
