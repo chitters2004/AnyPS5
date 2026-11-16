@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <list>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -23,6 +24,39 @@ struct PendingDrawPhases {
     std::uint64_t captures = 0;
     std::array<double, DrawDriverPhaseCount> ms{};
     std::chrono::steady_clock::time_point tailAt{};
+};
+
+enum class PhaseThread : std::uint8_t { Worker, Finisher, Other, Count };
+enum class PhaseGroup : std::uint8_t { Prepare, Lookup, Handoff, Graphics, Count };
+
+struct ThreadPhaseTotals {
+    static constexpr std::size_t Threads = static_cast<std::size_t>(PhaseThread::Count);
+    static constexpr std::size_t Groups = static_cast<std::size_t>(PhaseGroup::Count);
+    std::array<std::array<std::uint64_t, Groups>, Threads> groupNs{};
+    std::array<std::uint64_t, Threads> drawNs{}, draws{};
+    std::uint64_t busyNs = 0, submissions = 0, windowNs = 0;
+};
+
+class ThreadPhases {
+public:
+    static bool Enabled();
+    static PhaseThread Current();
+    static void AddPhase(DrawDriverPhase which, std::uint64_t ns);
+    static void AddDraw(std::uint64_t ns);
+    static void AddSubmission(std::uint64_t ns);
+    static ThreadPhaseTotals Take();
+    static std::string Text(const ThreadPhaseTotals& totals);
+
+    class Role {
+    public:
+        explicit Role(PhaseThread role);
+        ~Role();
+        Role(const Role&) = delete;
+        Role& operator=(const Role&) = delete;
+
+    private:
+        PhaseThread previous;
+    };
 };
 
 struct DrawPhaseTiming {
