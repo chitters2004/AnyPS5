@@ -7383,7 +7383,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::DrawSetCache::Fi
         }
         const auto same = [&] {
             if (entry.staged.size() != staged.size() || cached->snapshots.size() != snapshots.size() || !std::equal(entry.selected.begin(), entry.selected.end(), selected.begin(), selected.end())) return false;
-            if (!staged.empty() && std::memcmp(entry.staged.data(), staged.data(), staged.size()) != 0) return false;
+            
             for (std::size_t at = 0; at < snapshots.size(); ++at) {
                 const auto& current = snapshots[at];
                 const auto& held = cached->snapshots[at];
