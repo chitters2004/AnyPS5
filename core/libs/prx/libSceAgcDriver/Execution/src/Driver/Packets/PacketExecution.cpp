@@ -175,6 +175,17 @@ void Driver::execute(Submission& submission) {
             if (timed) ThreadPhases::AddSubmission(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         }
     } submissionClock{timedSubmission, outermostSubmission, outermostSubmission ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+    struct OutsideClock {
+        bool timed;
+        std::chrono::steady_clock::time_point last;
+        void Mark(OutsidePart part) {
+            if (!timed) return;
+            const auto now = std::chrono::steady_clock::now();
+            ThreadPhases::AddOutside(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()));
+            last = now;
+        }
+        ~OutsideClock() { Mark(OutsidePart::Teardown); }
+    } outside{outermostSubmission, submissionClock.start};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -212,7 +223,9 @@ void Driver::execute(Submission& submission) {
         }
     } pipelineDrain{pipelined};
     static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && orderedWaits;
+    outside.Mark(OutsidePart::Setup);
     if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    outside.Mark(OutsidePart::StartDrain);
     if (submission.suspend) {
         PerformanceContext timingContext(submissionTiming);
         PerformanceTimer timing("Driver.Suspend");
@@ -226,6 +239,7 @@ void Driver::execute(Submission& submission) {
             const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Flush);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            outside.Mark(OutsidePart::SuspendLock);
             const auto localDevice = device.Load();
             recordDeferredLabels(localDevice.get(), submission.queue);
             if (localDevice != nullptr) {
@@ -238,6 +252,7 @@ void Driver::execute(Submission& submission) {
             ++costs.suspendsSkipped;
         }
         resetGraphics = true;
+        outside.Mark(OutsidePart::SuspendSubmit);
         return;
     }
     QueueState* state = nullptr;
@@ -282,10 +297,12 @@ void Driver::execute(Submission& submission) {
     auto& packetCounters = PacketCounters::ThisThread();
 
     static const bool epochEach = std::getenv("APS5_SUBMISSION_EPOCH_EACH") != nullptr;
+    outside.Mark(OutsidePart::Setup);
     if (epochEach || submission.enqueuedAt == std::chrono::steady_clock::time_point{} || submission.enqueuedAt > lastEpochBump()) {
         if (!epochEach) noteReleasedTails(submission);
         bumpEpoch(&EpochBumps::submissions);
     }
+    outside.Mark(OutsidePart::Epoch);
     clearResolvedAhead();
     gateOpened() = true;
     struct ClearAhead {
@@ -300,6 +317,7 @@ void Driver::execute(Submission& submission) {
     std::size_t nextSegment = 0;
     auto* const executingPacket = workerPacket();
     const bool timedPackets = outermostSubmission;
+    outside.Mark(OutsidePart::Setup);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         struct PacketClock {
             bool timed;
@@ -666,14 +684,21 @@ void Driver::execute(Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    outside.Mark(OutsidePart::Loop);
 
     if (submission.queue == 0) {
         const bool traced = BoundaryTrace::Enabled();
         if (traced) BoundaryTrace::Note(BoundaryEvent::DrainBegin, static_cast<std::uint32_t>(DrawFinisher::Outstanding()), static_cast<std::uint32_t>(DrawPipeline::Queue0().Outstanding()));
+        outside.Mark(OutsidePart::DrainTrace);
         const auto endDrainStart = timedPackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         DrawFinisher::Get().Drain();
-        if (timedPackets) ThreadPhases::AddEndDrain(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - endDrainStart).count()));
+        if (timedPackets) {
+            const auto endDrainEnd = std::chrono::steady_clock::now();
+            ThreadPhases::AddEndDrain(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(endDrainEnd - endDrainStart).count()));
+            outside.last = endDrainEnd;
+        }
         if (traced) BoundaryTrace::Note(BoundaryEvent::DrainEnd);
+        outside.Mark(OutsidePart::DrainTrace);
     }
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
@@ -682,6 +707,7 @@ void Driver::execute(Submission& submission) {
         if (submission.rewindTail == nullptr) {
             flipHold.working = false;
             deferCompletion(submission);
+            outside.Mark(OutsidePart::Completion);
             return;
         }
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
@@ -692,31 +718,40 @@ void Driver::execute(Submission& submission) {
                 wakeQueueZeroForCompletions();
             }, {});
             endTiming.Finish();
+            outside.Mark(OutsidePart::Completion);
             executeRewindTail(submission);
+            outside.Mark(OutsidePart::RewindTail);
             return;
         }
     }
+    outside.Mark(OutsidePart::Completion);
     if (pipelined) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
+    outside.Mark(OutsidePart::EndPipelineDrain);
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);
         if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {
             ++costs.endSkipped;
             flipHold.Finish();
+            outside.Mark(OutsidePart::FlipFinish);
             return;
         }
         ++costs.endSubmits;
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        outside.Mark(OutsidePart::EndLock);
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
         if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+        outside.Mark(OutsidePart::EndSubmit);
     }
     flipHold.Finish();
     endTiming.Finish();
+    outside.Mark(OutsidePart::FlipFinish);
     if (submission.rewindTail != nullptr) {
         if (submission.progress) submitOpenWork(submission.progress);
         executeRewindTail(submission);
+        outside.Mark(OutsidePart::RewindTail);
     }
 }
 

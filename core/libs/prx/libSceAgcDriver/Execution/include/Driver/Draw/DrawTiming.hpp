@@ -28,6 +28,9 @@ struct PendingDrawPhases {
 };
 
 enum class PhaseThread : std::uint8_t { Worker, Finisher, Other, Count };
+enum class OutsidePart : std::uint8_t { Setup, StartDrain, SuspendLock, SuspendSubmit, Epoch, Loop, DrainTrace, Completion, EndPipelineDrain, EndLock, EndSubmit, FlipFinish, RewindTail, Teardown, Count };
+
+inline constexpr std::array<const char*, static_cast<std::size_t>(OutsidePart::Count)> OutsidePartNames{"setup", "start drain", "suspend lock", "suspend submit", "epoch", "loop", "drain trace", "completion hand-off", "end pipeline drain", "end lock", "end submit", "flip finish", "rewind tail", "teardown"};
 enum class PhaseGroup : std::uint8_t { Prepare, Lookup, Handoff, Graphics, Count };
 
 struct ThreadPhaseTotals {
@@ -40,6 +43,8 @@ struct ThreadPhaseTotals {
     std::uint64_t busyNs = 0, submissions = 0, windowNs = 0;
     std::array<std::uint64_t, PacketBuckets> packetNs{}, packets{};
     std::uint64_t packetDrains = 0, packetDrainNs = 0, endDrains = 0, endDrainNs = 0, roomWaits = 0, roomWaitNs = 0;
+    static constexpr std::size_t OutsideParts = static_cast<std::size_t>(OutsidePart::Count);
+    std::array<std::uint64_t, OutsideParts> outsideNs{}, outsideCounts{};
 };
 
 enum class BoundaryEvent : std::uint8_t { DrainBegin, DrainEnd, CommitBegin, CommitEnd, RoomWaitBegin, RoomWaitEnd };
@@ -84,6 +89,7 @@ public:
     static void AddPacketDrain(std::uint64_t ns);
     static void AddEndDrain(std::uint64_t ns);
     static void AddFinisherRoomWait(std::uint64_t ns);
+    static void AddOutside(OutsidePart part, std::uint64_t ns);
     static ThreadPhaseTotals Take();
     static std::string Text(const ThreadPhaseTotals& totals);
     static std::string PacketText(const ThreadPhaseTotals& totals);

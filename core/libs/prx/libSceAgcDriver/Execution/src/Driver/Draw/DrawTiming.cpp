@@ -54,6 +54,7 @@ std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::Threads> phaseLapNs{},
 std::atomic<std::uint64_t> phaseBusyNs{0}, phaseSubmissions{0};
 std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::PacketBuckets> phasePacketNs{}, phasePackets{};
 std::atomic<std::uint64_t> phasePacketDrains{0}, phasePacketDrainNs{0}, phaseEndDrains{0}, phaseEndDrainNs{0}, phaseRoomWaits{0}, phaseRoomWaitNs{0};
+std::array<std::atomic<std::uint64_t>, ThreadPhaseTotals::OutsideParts> phaseOutsideNs{}, phaseOutsideCounts{};
 std::atomic<std::int64_t> phaseWindowStart{std::chrono::steady_clock::now().time_since_epoch().count()};
 
 std::size_t groupOf(DrawDriverPhase which) {
@@ -138,6 +139,13 @@ void ThreadPhases::AddFinisherRoomWait(std::uint64_t ns) {
     phaseRoomWaits.fetch_add(1, std::memory_order_relaxed);
 }
 
+void ThreadPhases::AddOutside(OutsidePart part, std::uint64_t ns) {
+    const auto index = static_cast<std::size_t>(part);
+    if (index >= ThreadPhaseTotals::OutsideParts) return;
+    phaseOutsideNs[index].fetch_add(ns, std::memory_order_relaxed);
+    phaseOutsideCounts[index].fetch_add(1, std::memory_order_relaxed);
+}
+
 ThreadPhaseTotals ThreadPhases::Take() {
     ThreadPhaseTotals totals;
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -160,6 +168,10 @@ ThreadPhaseTotals ThreadPhases::Take() {
     totals.endDrainNs = phaseEndDrainNs.exchange(0, std::memory_order_relaxed);
     totals.roomWaits = phaseRoomWaits.exchange(0, std::memory_order_relaxed);
     totals.roomWaitNs = phaseRoomWaitNs.exchange(0, std::memory_order_relaxed);
+    for (std::size_t part = 0; part < ThreadPhaseTotals::OutsideParts; ++part) {
+        totals.outsideNs[part] = phaseOutsideNs[part].exchange(0, std::memory_order_relaxed);
+        totals.outsideCounts[part] = phaseOutsideCounts[part].exchange(0, std::memory_order_relaxed);
+    }
     return totals;
 }
 
@@ -180,9 +192,24 @@ std::string ThreadPhases::PacketText(const ThreadPhaseTotals& totals) {
         else std::snprintf(item, sizeof(item), " 0x%02zx x%llu %.1f ms", bucket, static_cast<unsigned long long>(totals.packets[bucket]), static_cast<double>(totals.packetNs[bucket]) / 1e6);
         text += item;
     }
+    const auto outsideNs = otherNs - static_cast<double>(timedNs);
     char tail[256];
-    std::snprintf(tail, sizeof(tail), "; finisher drains before packets %llu, %.1f ms; outside the packet loop %.1f ms, of which the end-of-submission finisher drain %llu, %.1f ms)", static_cast<unsigned long long>(totals.packetDrains), static_cast<double>(totals.packetDrainNs) / 1e6, (otherNs - static_cast<double>(timedNs)) / 1e6, static_cast<unsigned long long>(totals.endDrains), static_cast<double>(totals.endDrainNs) / 1e6);
-    return text + tail;
+    std::snprintf(tail, sizeof(tail), "; finisher drains before packets %llu, %.1f ms; outside the packet loop %.1f ms, of which the end-of-submission finisher drain %llu, %.1f ms", static_cast<unsigned long long>(totals.packetDrains), static_cast<double>(totals.packetDrainNs) / 1e6, outsideNs / 1e6, static_cast<unsigned long long>(totals.endDrains), static_cast<double>(totals.endDrainNs) / 1e6);
+    text += tail;
+    const auto loop = static_cast<std::size_t>(OutsidePart::Loop);
+    const auto betweenNs = static_cast<double>(totals.outsideNs[loop]) - static_cast<double>(timedNs) - static_cast<double>(totals.drawNs[worker]);
+    auto unattributedNs = outsideNs - static_cast<double>(totals.endDrainNs) - betweenNs;
+    for (std::size_t part = 0; part < ThreadPhaseTotals::OutsideParts; ++part) {
+        if (part == loop) continue;
+        unattributedNs -= static_cast<double>(totals.outsideNs[part]);
+        if (totals.outsideCounts[part] == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), ", %s %llu, %.1f ms", OutsidePartNames[part], static_cast<unsigned long long>(totals.outsideCounts[part]), static_cast<double>(totals.outsideNs[part]) / 1e6);
+        text += item;
+    }
+    char rest[128];
+    std::snprintf(rest, sizeof(rest), ", between packets %.1f ms, unattributed %.1f ms)", betweenNs / 1e6, unattributedNs / 1e6);
+    return text + rest;
 }
 
 std::string ThreadPhases::Text(const ThreadPhaseTotals& totals) {

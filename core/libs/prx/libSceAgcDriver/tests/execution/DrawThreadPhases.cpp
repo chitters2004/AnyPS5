@@ -351,6 +351,22 @@ void PacketsSplitByOpcode(const ThreadPhaseTotals& totals, const std::vector<std
     Require(text.find("by opcode: 0x") != std::string::npos, "the [draw-threads] line does not list packets by opcode: " + text);
 }
 
+void OutsideTheLoopIsSplit(const ThreadPhaseTotals& totals, const std::string& text) {
+    using AgcDriver::DriverDetail::OutsidePart;
+    const auto part = [&](OutsidePart which) { return static_cast<std::size_t>(which); };
+    std::uint64_t timedNs = 0;
+    for (const auto ns : totals.packetNs) timedNs += ns;
+    std::uint64_t partsNs = 0;
+    for (const auto ns : totals.outsideNs) partsNs += ns;
+    Require(totals.outsideCounts[part(OutsidePart::Teardown)] == totals.submissions, "the worker tore down " + std::to_string(totals.outsideCounts[part(OutsidePart::Teardown)]) + " timed submissions, not " + std::to_string(totals.submissions) + ": " + text);
+    Require(totals.outsideCounts[part(OutsidePart::Loop)] >= 1 && totals.outsideCounts[part(OutsidePart::Loop)] <= totals.submissions, "the packet loop was not timed once per submission that ran it: " + text);
+    Require(totals.outsideNs[part(OutsidePart::Loop)] >= timedNs + DrawNs(totals, PhaseThread::Worker), "the packet loop is shorter than the packets and draws inside it: " + text);
+    Require(partsNs + totals.endDrainNs <= totals.busyNs, "the worker's submission parts and its end drain add up past its busy time, so a part was counted twice: " + text);
+    const auto unattributedNs = totals.busyNs - partsNs - totals.endDrainNs;
+    Require(unattributedNs <= std::max<std::uint64_t>(totals.busyNs / 20u, 500'000u), "the submission parts leave " + std::to_string(unattributedNs) + " ns of the worker's " + std::to_string(totals.busyNs) + " ns busy time unattributed: " + text);
+    Require(text.find(", setup ") != std::string::npos && text.find(", between packets ") != std::string::npos && text.find(", unattributed ") != std::string::npos, "the [draw-threads] line does not split the time outside the packet loop: " + text);
+}
+
 int main() {
     try {
         FoldSeparatesStarvationFromSaturation();
@@ -384,6 +400,7 @@ int main() {
             std::uint64_t packetsTimed = 0;
             for (const auto count : totals.packets) packetsTimed += count;
             Require(packetsTimed == 0 && totals.packetDrains == 0 && totals.endDrains == 0 && totals.roomWaits == 0, "packet or finisher room wait times were counted without their gate: " + text);
+            for (const auto count : totals.outsideCounts) Require(count == 0, "submission parts outside the packet loop were counted without their gate: " + text);
             Require(totals.submissions == 0 && LapNs(totals, PhaseThread::Worker) == 0 && LapNs(totals, PhaseThread::Finisher) == 0 && Draws(totals, PhaseThread::Worker) == 0 && Draws(totals, PhaseThread::Finisher) == 0 && totals.busyNs == 0, "draw thread phases were counted without APS5_DRAW_THREAD_TIMES, APS5_PIPELINE_STATS or APS5_PROFILE_DRAW: " + text);
             AgcDriverShutdown_nid_postfix();
             std::cout << "draw thread phases stay off without their gate\n";
@@ -397,6 +414,7 @@ int main() {
         Require(Grouped(totals, PhaseThread::Worker) <= LapNs(totals, PhaseThread::Worker) && LapNs(totals, PhaseThread::Worker) <= DrawNs(totals, PhaseThread::Worker), "the worker's phase laps exceed its draw time: " + text);
         Require(Group(totals, PhaseThread::Worker, PhaseGroup::Prepare) > 0, "the worker's decode and prepare were not timed: " + text);
         PacketsSplitByOpcode(totals, commands, text);
+        OutsideTheLoopIsSplit(totals, text);
         if (finisher) {
             Require(Draws(totals, PhaseThread::Finisher) >= 1 && Draws(totals, PhaseThread::Finisher) <= Count, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " jobs for " + std::to_string(Count) + " draws: " + text);
             Require(Grouped(totals, PhaseThread::Finisher) <= LapNs(totals, PhaseThread::Finisher) && LapNs(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase laps exceed its job time: " + text);
