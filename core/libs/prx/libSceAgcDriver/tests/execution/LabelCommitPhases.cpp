@@ -75,6 +75,11 @@ void RequireSplit(const Phases::Totals& totals, std::uint64_t labels) {
     const auto summed = std::accumulate(totals.ns.begin(), totals.ns.end(), std::uint64_t{0});
     Require(summed == totals.holdNs, ("label phases: the phases sum to " + std::to_string(summed) + " ns, the hold to " + std::to_string(totals.holdNs) + " ns").c_str());
     Require(totals.holdNs > 0, "label phases: a label held for no time");
+    const auto drawn = static_cast<std::size_t>(Phases::PreSlot::DrawnLinear);
+    const auto readback = static_cast<std::size_t>(Phases::PreSlot::Readback);
+    Require(totals.preCalls[drawn] == labels && totals.preCalls[readback] == labels, ("label phases: pre detail timed " + std::to_string(totals.preCalls[drawn]) + " drawn-linear and " + std::to_string(totals.preCalls[readback]) + " readback calls for " + std::to_string(labels) + " labels").c_str());
+    const auto pre = totals.ns[static_cast<std::size_t>(Phases::Phase::Pre)];
+    Require(totals.preNs[drawn] + totals.preNs[readback] <= pre, ("label phases: pre detail " + std::to_string(totals.preNs[drawn] + totals.preNs[readback]) + " ns exceeds the pre phase " + std::to_string(pre) + " ns").c_str());
 }
 
 }
@@ -99,12 +104,13 @@ int main() {
         const auto totals = Phases::Take();
         RequireSplit(totals, 1);
         const auto line = Phases::Line(totals);
-        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos;
+        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos && line.find("; pre detail: drawn-linear ") != std::string::npos && line.find(" readback ") != std::string::npos;
         Require(shaped, ("label phases: unexpected report line: " + line).c_str());
         Require(Phases::Take().labels == 0, "label phases: a taken window was counted again");
         Phases::SetEnabled(false);
         Require(CommitShaped(*device, labels.Address() + 12, 0x5a5a0003u, 3) == 0, "label phases: the disabled label was not stored on the GPU");
         const auto disabled = Phases::Take();
+        Require(disabled.preCalls[0] == 0 && disabled.preCalls[1] == 0, "label phases: pre detail was timed while disabled");
         Require(disabled.labels == 0 && disabled.holdNs == 0 && std::accumulate(disabled.counts.begin(), disabled.counts.end(), std::uint64_t{0}) == 0, "label phases: a label was timed while disabled");
         device->SubmitRecorded(true);
         device->WaitIdle();

@@ -547,7 +547,12 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        if (localDevice != nullptr && queue == 0) {
+            LabelPhases::PreTimer timer(LabelPhases::PreSlot::DrawnLinear);
+            const auto stored = Graphics::StorageTexture::StoreDrawnLinear("label");
+            LabelPhases::CountDrawnStored(stored);
+            if (stored != 0) workOpen = true;
+        }
         reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();

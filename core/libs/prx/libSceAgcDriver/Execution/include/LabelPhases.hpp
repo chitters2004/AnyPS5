@@ -14,6 +14,10 @@ constexpr std::size_t PhaseCount = static_cast<std::size_t>(Phase::Count);
 
 enum class ReapTry : std::size_t { Reaped, Failed, Count };
 
+enum class PreSlot : std::size_t { DrawnLinear, Readback, Count };
+
+constexpr std::size_t PreSlotCount = static_cast<std::size_t>(PreSlot::Count);
+
 struct Totals {
     std::uint64_t labels = 0;
     std::uint64_t holdNs = 0;
@@ -21,6 +25,11 @@ struct Totals {
     std::array<std::uint64_t, PhaseCount> counts{};
     std::array<std::uint64_t, static_cast<std::size_t>(ReapTry::Count)> reapTries{};
     std::array<std::uint64_t, static_cast<std::size_t>(ReapTry::Count)> reapTryNs{};
+    std::array<std::uint64_t, PreSlotCount> preNs{};
+    std::array<std::uint64_t, PreSlotCount> preCalls{};
+    std::uint64_t drawnStored = 0;
+    std::uint64_t readbackScanned = 0;
+    std::uint64_t readbackFlushed = 0;
 };
 
 bool Enabled();
@@ -29,6 +38,22 @@ void Begin();
 void Mark(Phase phase);
 void End();
 void CountReapTry(ReapTry outcome, std::uint64_t ns);
+bool Active();
+void CountDrawnStored(std::uint64_t stored);
+void CountReadback(std::uint64_t scanned, std::uint64_t flushed);
+
+class PreTimer {
+public:
+    explicit PreTimer(PreSlot slot);
+    ~PreTimer();
+    PreTimer(const PreTimer&) = delete;
+    PreTimer& operator=(const PreTimer&) = delete;
+
+private:
+    PreSlot slot;
+    std::uint64_t started = 0;
+    bool on = false;
+};
 Totals Take();
 std::string Line(const Totals& totals);
 

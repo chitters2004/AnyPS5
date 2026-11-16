@@ -21,6 +21,11 @@ struct Counters {
     std::array<ProfileCounter, PhaseCount> counts;
     std::array<ProfileCounter, static_cast<std::size_t>(ReapTry::Count)> reapTries;
     std::array<ProfileCounter, static_cast<std::size_t>(ReapTry::Count)> reapTryNs;
+    std::array<ProfileCounter, PreSlotCount> preNs;
+    std::array<ProfileCounter, PreSlotCount> preCalls;
+    ProfileCounter drawnStored;
+    ProfileCounter readbackScanned;
+    ProfileCounter readbackFlushed;
 };
 
 Counters& Shared() {
@@ -38,6 +43,10 @@ thread_local Open open;
 
 std::uint64_t Nanoseconds(std::chrono::steady_clock::duration duration) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(duration).count());
+}
+
+std::uint64_t SteadyNs() {
+    return Nanoseconds(std::chrono::steady_clock::now().time_since_epoch());
 }
 
 void Add(Phase phase, std::chrono::steady_clock::time_point now) {
@@ -83,6 +92,31 @@ void CountReapTry(ReapTry outcome, std::uint64_t ns) {
     Shared().reapTryNs[index].Add(ns);
 }
 
+bool Active() {
+    return open.active;
+}
+
+void CountDrawnStored(std::uint64_t stored) {
+    if (open.active) Shared().drawnStored.Add(stored);
+}
+
+void CountReadback(std::uint64_t scanned, std::uint64_t flushed) {
+    if (!open.active) return;
+    Shared().readbackScanned.Add(scanned);
+    Shared().readbackFlushed.Add(flushed);
+}
+
+PreTimer::PreTimer(PreSlot slot) : slot(slot), on(open.active) {
+    if (on) started = SteadyNs();
+}
+
+PreTimer::~PreTimer() {
+    if (!on) return;
+    const auto index = static_cast<std::size_t>(slot);
+    Shared().preNs[index].Add(SteadyNs() - started);
+    Shared().preCalls[index].Add();
+}
+
 Totals Take() {
     Totals totals;
     auto& shared = Shared();
@@ -96,13 +130,20 @@ Totals Take() {
         totals.reapTries[i] = shared.reapTries[i].Take();
         totals.reapTryNs[i] = shared.reapTryNs[i].Take();
     }
+    for (std::size_t i = 0; i < PreSlotCount; ++i) {
+        totals.preNs[i] = shared.preNs[i].Take();
+        totals.preCalls[i] = shared.preCalls[i].Take();
+    }
+    totals.drawnStored = shared.drawnStored.Take();
+    totals.readbackScanned = shared.readbackScanned.Take();
+    totals.readbackFlushed = shared.readbackFlushed.Take();
     return totals;
 }
 
 std::string Line(const Totals& totals) {
     constexpr std::array<const char*, PhaseCount> names{"pre", "reap", "lookup", "record", "notes", "tail"};
     const double labels = totals.labels == 0 ? 1.0 : static_cast<double>(totals.labels);
-    std::array<char, 160> part{};
+    std::array<char, 256> part{};
     std::snprintf(part.data(), part.size(), "[labels] commit phases (10 s): %llu labels, held %.2f us/label =", static_cast<unsigned long long>(totals.labels), static_cast<double>(totals.holdNs) / 1000.0 / labels);
     std::string line = part.data();
     for (std::size_t i = 0; i < PhaseCount; ++i) {
@@ -111,6 +152,10 @@ std::string Line(const Totals& totals) {
     }
     const auto reaped = static_cast<std::size_t>(ReapTry::Reaped);
     const auto failed = static_cast<std::size_t>(ReapTry::Failed);
+    const auto drawn = static_cast<std::size_t>(PreSlot::DrawnLinear);
+    const auto readback = static_cast<std::size_t>(PreSlot::Readback);
+    std::snprintf(part.data(), part.size(), "; pre detail: drawn-linear %.2f us/label (%llu calls, %llu stored), readback %.2f us/label (%llu calls, %llu textures scanned, %llu flushed)", static_cast<double>(totals.preNs[drawn]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[drawn]), static_cast<unsigned long long>(totals.drawnStored), static_cast<double>(totals.preNs[readback]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[readback]), static_cast<unsigned long long>(totals.readbackScanned), static_cast<unsigned long long>(totals.readbackFlushed));
+    line += part.data();
     std::snprintf(part.data(), part.size(), "; boundary reap tries: %llu reaped (%.2f ms), %llu failed (%.2f ms)\n", static_cast<unsigned long long>(totals.reapTries[reaped]), static_cast<double>(totals.reapTryNs[reaped]) / 1e6, static_cast<unsigned long long>(totals.reapTries[failed]), static_cast<double>(totals.reapTryNs[failed]) / 1e6);
     line += part.data();
     return line;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LabelPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -5808,6 +5809,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     } ordered{gpuOrdered};
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::size_t>> occasional;
+    std::uint64_t scanned = 0;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -5824,6 +5826,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         };
 #endif
         for (const auto* texture : pending.textures) {
+            ++scanned;
             if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
 #if defined(__APPLE__)
             if (trap && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
@@ -5843,6 +5846,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));
+    if (LabelPhases::Active()) LabelPhases::CountReadback(scanned, ranges.size() + occasional.size());
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
