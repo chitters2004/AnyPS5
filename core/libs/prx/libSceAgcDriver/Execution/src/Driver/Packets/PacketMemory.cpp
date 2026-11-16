@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LabelPhases.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -539,6 +540,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    LabelPhases::Begin();
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
@@ -551,10 +553,12 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
             if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
+        LabelPhases::Mark(LabelPhases::Phase::Record);
         noteLabelStore(address, bytes, stamp, queue);
         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
         countLabelOutcome(reason);
         ++immediateLabels;
+        LabelPhases::Mark(LabelPhases::Phase::Notes);
     } else {
         ++noOpLabels;
     }
@@ -569,6 +573,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
     submitDueAfterCommit(localDevice.get());
+    LabelPhases::End();
 }
 
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
