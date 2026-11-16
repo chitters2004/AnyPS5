@@ -2329,31 +2329,62 @@ ProofBreakCounts TakeProofBreakCounts() {
 }
 
 namespace {
-struct LoggedBreak {
-    std::uint64_t serial = 0;
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    ProofBreakSite site = ProofBreakSite::Other;
-    bool ranged = false;
-};
-
 constexpr std::size_t LoggedBreakSlots = 4096;
-constexpr std::size_t LoggedBreakWalk = 1024;
-constexpr std::size_t LoggedRangesPerBreak = 8;
+constexpr std::uint64_t LoggedBreakWalk = 1024;
+constexpr std::size_t LoggedRangesPerBreak = 4;
 
-struct ProofBreakLog {
-    AgcDriver::Mutex mutex;
-    std::array<LoggedBreak, LoggedBreakSlots> slots{};
-    std::uint64_t written = 0;
-    void put(const LoggedBreak& entry) {
-        slots[static_cast<std::size_t>(written % LoggedBreakSlots)] = entry;
-        ++written;
-    }
+struct alignas(64) LoggedBreak {
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint32_t> shape{0};
+    std::array<std::atomic<std::uint64_t>, LoggedRangesPerBreak * 2> bounds{};
 };
 
-ProofBreakLog& proofBreakLog() {
-    static ProofBreakLog log;
+std::array<LoggedBreak, LoggedBreakSlots>& proofBreakLog() {
+    static std::array<LoggedBreak, LoggedBreakSlots> log;
     return log;
+}
+
+constexpr std::uint32_t RangedShape = 1u;
+
+std::uint32_t breakShape(ProofBreakSite site, bool ranged, std::size_t ranges) {
+    return (ranged ? RangedShape : 0u) | (static_cast<std::uint32_t>(site) << 8u) | (static_cast<std::uint32_t>(ranges) << 16u);
+}
+
+void logBreak(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool ranged) {
+    const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
+    auto& slot = proofBreakLog()[static_cast<std::size_t>(serial % LoggedBreakSlots)];
+    const auto claim = serial * 2u - 1u;
+    auto held = slot.sequence.load(std::memory_order_relaxed);
+    for (;;) {
+        if (held >= claim) return;
+        if ((held & 1u) != 0) {
+            SpinPause();
+            held = slot.sequence.load(std::memory_order_relaxed);
+            continue;
+        }
+        if (slot.sequence.compare_exchange_weak(held, claim, std::memory_order_relaxed)) break;
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    std::size_t kept = 0;
+    if (ranged && ranges.size() <= LoggedRangesPerBreak) {
+        for (const auto& [begin, end] : ranges) {
+            slot.bounds[kept * 2].store(begin, std::memory_order_relaxed);
+            slot.bounds[kept * 2 + 1].store(end, std::memory_order_relaxed);
+            ++kept;
+        }
+    } else if (ranged) {
+        auto low = ranges.front().first;
+        auto high = ranges.front().second;
+        for (const auto& [begin, end] : ranges) {
+            low = std::min(low, begin);
+            high = std::max(high, end);
+        }
+        slot.bounds[0].store(low, std::memory_order_relaxed);
+        slot.bounds[1].store(high, std::memory_order_relaxed);
+        kept = 1;
+    }
+    slot.shape.store(breakShape(site, ranged, kept), std::memory_order_relaxed);
+    slot.sequence.store(serial * 2u, std::memory_order_release);
 }
 
 void countBreak(ProofBreakSite site) {
@@ -2367,66 +2398,62 @@ bool ProofBreakScoped(ProofBreakSite site) {
 
 void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes) {
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
-    {
-        auto& log = proofBreakLog();
-        const std::lock_guard lock(log.mutex);
-        const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
-        const bool ranged = ProofBreakScoped(site) && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address;
-        log.put({serial, address, ranged ? address + bytes : 0, site, ranged});
-    }
+    const bool ranged = ProofBreakScoped(site) && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address;
+    const std::pair<std::uint64_t, std::uint64_t> range{address, ranged ? address + bytes : address};
+    logBreak(site, std::span(&range, 1), ranged);
     countBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, address, bytes});
 }
 
 void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    if (ranges.size() == 1 && ranges.front().second > ranges.front().first) return BreakProofs(site, ranges.front().first, ranges.front().second - ranges.front().first);
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
-    const bool ranged = ProofBreakScoped(site) && !ranges.empty() && ranges.size() <= LoggedRangesPerBreak && std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; });
-    {
-        auto& log = proofBreakLog();
-        const std::lock_guard lock(log.mutex);
-        const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (!ranged) log.put({serial, 0, 0, site, false});
-        else for (const auto& [begin, end] : ranges) log.put({serial, begin, end, site, true});
-    }
+    const bool ranged = ProofBreakScoped(site) && !ranges.empty() && std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; });
+    logBreak(site, ranges, ranged);
     countBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, ranges.empty() ? 0 : ranges.front().first, ranges.empty() ? 0 : ranges.front().second - ranges.front().first});
 }
 
 ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     ProofBreakWindow window;
-    auto& log = proofBreakLog();
-    const std::lock_guard lock(log.mutex);
     const auto current = proofSerial.load(std::memory_order_acquire);
-    if (current == serial) {
-        window.complete = window.clear = true;
-        return window;
-    }
     if (current < serial) return window;
     window.breaks = current - serial;
-    const auto available = std::min<std::uint64_t>(log.written, LoggedBreakSlots);
-    bool reached = log.written <= LoggedBreakSlots;
-    for (std::uint64_t walked = 0; walked < available; ++walked) {
-        if (walked >= LoggedBreakWalk) return window;
-        const auto& entry = log.slots[static_cast<std::size_t>((log.written - 1 - walked) % LoggedBreakSlots)];
-        if (entry.serial <= serial) {
-            reached = true;
-            break;
-        }
-        if (!entry.ranged) {
+    if (window.breaks > LoggedBreakWalk) return window;
+    std::uint64_t low = std::numeric_limits<std::uint64_t>::max();
+    std::uint64_t high = 0;
+    for (const auto& [begin, end] : ranges) {
+        low = std::min(low, begin);
+        high = std::max(high, end);
+    }
+    auto& log = proofBreakLog();
+    std::array<std::uint64_t, LoggedRangesPerBreak * 2> bounds{};
+    for (auto at = serial + 1; at <= current; ++at) {
+        const auto& slot = log[static_cast<std::size_t>(at % LoggedBreakSlots)];
+        const auto sequence = slot.sequence.load(std::memory_order_acquire);
+        if (sequence != at * 2u) return window;
+        const auto shape = slot.shape.load(std::memory_order_relaxed);
+        const auto count = std::min<std::size_t>(shape >> 16u, LoggedRangesPerBreak);
+        for (std::size_t index = 0; index < count * 2; ++index) bounds[index] = slot.bounds[index].load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (slot.sequence.load(std::memory_order_relaxed) != sequence) return window;
+        const auto site = static_cast<ProofBreakSite>((shape >> 8u) & 0xffu);
+        if ((shape & RangedShape) == 0) {
             window.complete = true;
             window.unranged = true;
-            window.blocker = entry.site;
+            window.blocker = site;
             return window;
         }
-        const bool overlaps = std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return entry.begin < range.second && range.first < entry.end; });
-        if (overlaps) {
-            window.complete = true;
-            window.blocker = entry.site;
-            return window;
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto begin = bounds[index * 2];
+            const auto end = bounds[index * 2 + 1];
+            if (begin >= high || end <= low) continue;
+            if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return begin < range.second && range.first < end; })) {
+                window.complete = true;
+                window.blocker = site;
+                return window;
+            }
         }
     }
-    if (!reached) return window;
     window.complete = window.clear = true;
     return window;
 }

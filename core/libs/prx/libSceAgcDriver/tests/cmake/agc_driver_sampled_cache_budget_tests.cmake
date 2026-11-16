@@ -43,6 +43,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_resource_cache_epoch_verify_work PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_proof_log_concurrent COMMAND agc_driver_sampled_cache_budget_tests proof-log-concurrent)
+    set_tests_properties(agc_driver_proof_log_concurrent PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "proof log under 4 breaking threads: [1-9][0-9]* windows checked, [0-9]+ cleared, 0 cleared over a window with breaks into the set.*proof log concurrent tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    if(WIN32)
+        set_tests_properties(agc_driver_proof_log_concurrent PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_resource_cache_epoch_proof_log COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-proof-log)
     set_tests_properties(agc_driver_resource_cache_epoch_proof_log PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "proof log: a marked-written break outside the set: the exit was taken\n.*proof log: outside breaks kept the exit: marked written yes, packet yes\n.*missed exits by the inputs that moved: proof 4; would hit if only that input were scoped: epoch 0, pending 0, releases 0, proof 4; with the proof scoped by the break log and only that input too: epoch 0, pending 0, releases 0\n[^\n]*break log: 2 exits taken because every break since the proof was outside the set \\(on\\); over the proof-moved misses: 4 checked, clears 0 \\(0 with nothing else moved\\), a set without recorded ranges 0, a window the log cannot cover 0; blocked by an overlapping break: marked written 1, non-draw packet 1; by an unranged break: driver store 1, non-draw packet 1\n.*resource cache epoch proof log tests passed"
