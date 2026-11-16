@@ -7251,7 +7251,6 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         if (override != moved.end() && override->inPlace != VK_NULL_HANDLE) {
             if (cacheable) drawSetCounters.uncachedInPlace.fetch_add(1, std::memory_order_relaxed);
-            cacheable = false;
             const auto begin = override->address - override->adjustment;
             const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(override->size, override->adjustment));
             recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DispatchElement);
