@@ -7206,7 +7206,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (const auto prepared = drawSetCounters.prepared.fetch_add(1, std::memory_order_relaxed) + 1; (prepared & 4095u) == 0) ReportDrawSets();
     const bool caching = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache);
-    bool cacheable = caching && faultRecord == nullptr;
+    bool cacheable = caching;
     if (caching && faultRecord != nullptr) drawSetCounters.uncachedFaultRecord.fetch_add(1, std::memory_order_relaxed);
     thread_local std::vector<std::byte>* stagedSlot = nullptr;
     auto& staged = ShaderRecompiler::ThreadOwned(stagedSlot);
