@@ -4189,7 +4189,7 @@ struct ExitMisses {
     std::array<ProfileCounter, StampAges> stored;
     std::array<ProfileCounter, StampAges> missed;
     std::array<ProfileCounter, StampAges> proofAlone;
-    std::array<ProfileCounter, 32> combos;
+    std::array<ProfileCounter, 64> combos;
     std::array<ProfileCounter, 4> onlyScoped;
     std::array<ProfileCounter, 4> withLog;
     ProfileCounter logChecked;
@@ -4202,7 +4202,7 @@ struct ExitMisses {
     std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> unrangedBlocks;
 };
 
-constexpr std::array<const char*, 5> ComboInputs{"epoch", "proof", "pending", "releases", "other"};
+constexpr std::array<const char*, 6> ComboInputs{"epoch", "proof", "pending", "releases", "retired imports", "other"};
 constexpr std::array<std::size_t, 4> ScopedInputs{0, 2, 3, 1};
 
 struct ProofLogCheck {
@@ -4300,10 +4300,10 @@ void reportBreakCensus() {
     std::string kinds;
     for (std::size_t kind = 0; kind < packets.size(); ++kind) {
         const auto& writes = packets[kind];
-        if (writes[0] + writes[1] + writes[2] == 0) continue;
-        kinds += (kinds.empty() ? "" : ", ") + std::string(DriverDetail::DrawPipeline::KindName(kind)) + " " + std::to_string(writes[0]) + "/" + std::to_string(writes[1]) + "/" + std::to_string(writes[2]);
+        if (writes[0] + writes[1] + writes[2] + writes[3] == 0) continue;
+        kinds += (kinds.empty() ? "" : ", ") + std::string(DriverDetail::DrawPipeline::KindName(kind)) + " " + std::to_string(writes[0]) + "/" + std::to_string(writes[1]) + "/" + std::to_string(writes[2]) + "/" + std::to_string(writes[3]);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) non-draw packet breaks by kind (declared writes/none declared/zero-length): %s\n", kinds.empty() ? "none" : kinds.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) non-draw packet breaks by kind (declared writes/none declared/zero-length/known to write nothing): %s\n", kinds.empty() ? "none" : kinds.c_str());
 }
 
 bool exitMissesCounted() {
@@ -4459,7 +4459,7 @@ void noteProofLog(const std::array<bool, ExitInputs.size()>& moved, const ProofL
     std::size_t mask = 0;
     for (std::size_t input = 0; input < moved.size(); ++input) {
         if (!moved[input]) continue;
-        mask |= input == 0 ? 1u : input == 1 ? 2u : input == 2 ? 4u : input == 3 ? 8u : 16u;
+        mask |= input < 4 ? 1u << input : input == 7 ? 16u : 32u;
     }
     misses.combos[mask].Add();
     const bool logClears = log.checked && !log.unscopedSet && log.window.complete && log.window.clear;

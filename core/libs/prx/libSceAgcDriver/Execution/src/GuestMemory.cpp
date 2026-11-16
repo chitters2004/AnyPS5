@@ -2441,6 +2441,15 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, ranges.empty() ? 0 : ranges.front().first, ranges.empty() ? 0 : ranges.front().second - ranges.front().first});
 }
 
+void BreakProofsWithoutWrites(ProofBreakSite site, std::uint8_t detail) {
+    if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
+    const bool ranged = ProofBreakScoped(site);
+    logBreak(site, {}, ranged, ranged, detail);
+    if (site == ProofBreakSite::Packet && ProofBreakCensusEnabled()) packetBreakCounters()[detail & (ProofBreakDetails - 1u)][static_cast<std::size_t>(PacketWrites::Writeless)].Add();
+    countBreak(site);
+    if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, 0, 0});
+}
+
 ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     ProofBreakWindow window;
     const auto current = proofSerial.load(std::memory_order_acquire);

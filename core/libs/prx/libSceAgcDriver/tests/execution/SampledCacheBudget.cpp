@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <cstring>
 #include <iostream>
 #include <memory>
@@ -823,6 +824,34 @@ void epochProofLogTests(Context context) {
     Require(flipped != scoped, "flipping APS5_NO_SCOPED_PROOFS at run time did not flip the scoped exit");
     const bool restored = check("a marked-written break outside the set with the switch restored", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, distant, 4096u); });
     Require(restored == scoped, "restoring APS5_NO_SCOPED_PROOFS did not restore the scoped exit");
+    using Pipeline = AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = Pipeline::Queue0();
+    const auto commitSeal = [&](Pipeline::Commit commit) {
+        std::exception_ptr failure;
+        std::thread committer([&] {
+            try {
+                pipeline.Enqueue(Pipeline::CommitKind::Seal, std::move(commit), {});
+                pipeline.Drain(Pipeline::DrainReason::Submission);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+        });
+        committer.join();
+        if (failure != nullptr) std::rethrow_exception(failure);
+    };
+    const bool writelessScope = !RuntimeSwitches::Set(RuntimeSwitch::NoWritelessPacketScope);
+    const bool writelessSeal = check("a pipelined seal that writes nothing", [&] { commitSeal([] {}); });
+    RuntimeSwitches::Assign(RuntimeSwitch::NoWritelessPacketScope, writelessScope);
+    const bool writelessFlipped = check("a pipelined seal that writes nothing with APS5_NO_WRITELESS_PACKET_SCOPE flipped", [&] { commitSeal([] {}); });
+    RuntimeSwitches::Assign(RuntimeSwitch::NoWritelessPacketScope, !writelessScope);
+    const std::array<std::byte, 64> stored{};
+    commitSeal([&] { AgcDriver::GuestMemory::Write(address + 256u, stored, 4); });
+    const bool storingSeal = exitTaken();
+    std::fprintf(stderr, "proof log: a pipelined seal that stores into the set: the exit %s\n", storingSeal ? "was taken" : "was refused");
+    std::fprintf(stderr, "proof log: writeless seals kept the exit: %s, flipped %s; a storing seal kept it: %s\n", writelessSeal ? "yes" : "no", writelessFlipped ? "yes" : "no", storingSeal ? "yes" : "no");
+    Require(writelessSeal == (scoped && writelessScope), "a seal that writes nothing did not keep the exit exactly when scoped proofs and the writeless packet scope are on");
+    Require(writelessFlipped == (scoped && !writelessScope), "flipping APS5_NO_WRITELESS_PACKET_SCOPE at run time did not flip the writeless seal");
+    Require(!storingSeal, "a seal that stores into the set let the exit through");
 }
 
 void concurrentProofLogTests() {

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
@@ -301,6 +302,12 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     GuestMemory::BumpCollectEpoch();
 }
 
+void DrawPipeline::breakPacketProofs(CommitKind kind, const std::vector<Range>& writes) {
+    const bool writeless = kind == CommitKind::Seal || kind == CommitKind::SubmitEnd || kind == CommitKind::Completion;
+    if (writeless && writes.empty() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoWritelessPacketScope)) GuestMemory::BreakProofsWithoutWrites(GuestMemory::ProofBreakSite::Packet, static_cast<std::uint8_t>(kind));
+    else GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::Packet, writes, static_cast<std::uint8_t>(kind));
+}
+
 const char* DrawPipeline::KindName(std::size_t kind) {
     return kind < KindNames.size() ? KindNames[kind] : "other";
 }
@@ -475,7 +482,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::Packet, *writes, static_cast<std::uint8_t>(kind));
+            if (!isDraw) breakPacketProofs(kind, *writes);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

@@ -86,6 +86,7 @@ private:
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
+    static void breakPacketProofs(CommitKind kind, const std::vector<Range>& writes);
 
     std::mutex mutex;
     std::condition_variable wake;
