@@ -2307,6 +2307,120 @@ void verifyServedSpace(const Context& context, const State& state, const Pm4::Dr
     throw std::runtime_error(message);
 }
 
+struct DrawResourceMemoSlot {
+    std::vector<std::uint32_t> key;
+    std::weak_ptr<ShaderResources> resources;
+    std::uint64_t membership = 0;
+};
+
+struct DrawResourceMemo {
+    static constexpr std::size_t Slots = 256;
+    static constexpr std::uint64_t TouchEvery = 16;
+    std::array<DrawResourceMemoSlot, Slots> slots{};
+    std::uint64_t hits = 0;
+};
+
+struct DrawResourceMemoStorage {};
+
+enum class MemoEvent : std::size_t { Hit, Empty, OtherKey, Expired, Moved, Stored, Touched, Verified, Count };
+
+struct MemoCounters {
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(MemoEvent::Count)> events{};
+    std::array<std::atomic<std::uint64_t>, 2> finds{};
+    std::array<std::atomic<std::uint64_t>, 2> findNs{};
+    std::atomic<std::int64_t> reportedAt{0};
+};
+
+MemoCounters& memoCounters() {
+    static auto* const counters = new MemoCounters();
+    return *counters;
+}
+
+bool memoStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return stats;
+}
+
+void noteMemo(MemoEvent event) {
+    if (memoStats()) memoCounters().events[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportMemo() {
+    auto& counters = memoCounters();
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (counters.reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, static_cast<std::size_t>(MemoEvent::Count)> taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counters.events[index].exchange(0, std::memory_order_relaxed);
+    std::array<unsigned long long, 2> finds{};
+    std::array<double, 2> findNs{};
+    for (std::size_t arm = 0; arm < 2; ++arm) {
+        finds[arm] = counters.finds[arm].exchange(0, std::memory_order_relaxed);
+        findNs[arm] = static_cast<double>(counters.findNs[arm].exchange(0, std::memory_order_relaxed));
+    }
+    const auto mean = [](double ns, unsigned long long count) { return count == 0 ? 0.0 : ns / static_cast<double>(count); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-resource-memo] 10 s: memo on: %llu finds, %.0f ns each (%llu memo hits; misses: %llu empty, %llu other key, %llu expired, %llu left the cache; %llu stored, %llu LRU touches, %llu verified); memo off: %llu finds, %.0f ns each\n", finds[1], mean(findNs[1], finds[1]), taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], finds[0], mean(findNs[0], finds[0]));
+}
+
+std::shared_ptr<ShaderResources> memoFind(const std::vector<std::uint32_t>& key) {
+    auto& memo = HostThreadLocal<DrawResourceMemo, DrawResourceMemoStorage>();
+    auto& slot = memo.slots[ResourceCache::Hash(key) % DrawResourceMemo::Slots];
+    if (slot.key.empty()) {
+        noteMemo(MemoEvent::Empty);
+    } else if (slot.key != key) {
+        noteMemo(MemoEvent::OtherKey);
+    } else if (auto held = slot.resources.lock(); held == nullptr) {
+        noteMemo(MemoEvent::Expired);
+    } else if (held->CacheMembership() != slot.membership) {
+        noteMemo(MemoEvent::Moved);
+    } else {
+        noteMemo(MemoEvent::Hit);
+        if (++memo.hits % DrawResourceMemo::TouchEvery == 0 && SharedResourceCache().Touch(key)) noteMemo(MemoEvent::Touched);
+        static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+        if (verify) {
+            Require(SharedResourceCache().Find(key) == held, "APS5_VERIFY_DRAW_PIPELINE: the draw resource memo served an object the resource cache does not hold under its key");
+            noteMemo(MemoEvent::Verified);
+        }
+        return held;
+    }
+    auto found = SharedResourceCache().Find(key);
+    if (found == nullptr) return found;
+    slot.membership = found->CacheMembership();
+    slot.key = key;
+    slot.resources = found;
+    noteMemo(MemoEvent::Stored);
+    return found;
+}
+
+std::shared_ptr<ShaderResources> findDrawResources(const std::vector<std::uint32_t>& key) {
+    const bool memo = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawResourceMemo);
+    if (!memoStats()) return memo ? memoFind(key) : SharedResourceCache().Find(key);
+    const auto start = std::chrono::steady_clock::now();
+    auto found = memo ? memoFind(key) : SharedResourceCache().Find(key);
+    auto& counters = memoCounters();
+    counters.finds[memo ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
+    counters.findNs[memo ? 1 : 0].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    reportMemo();
+    return found;
+}
+
+} // namespace
+
+DrawResourceMemoCounts TakeDrawResourceMemoCounts() {
+    auto& counters = memoCounters();
+    const auto take = [&](MemoEvent event) { return counters.events[static_cast<std::size_t>(event)].exchange(0, std::memory_order_relaxed); };
+    DrawResourceMemoCounts counts;
+    counts.memoFinds = counters.finds[1].exchange(0, std::memory_order_relaxed);
+    counts.plainFinds = counters.finds[0].exchange(0, std::memory_order_relaxed);
+    counts.hits = take(MemoEvent::Hit);
+    counts.moved = take(MemoEvent::Moved);
+    counts.expired = take(MemoEvent::Expired);
+    counts.stored = take(MemoEvent::Stored);
+    counts.verified = take(MemoEvent::Verified);
+    return counts;
+}
+
+namespace {
+
 bool drawStagingEnabled() {
     static const bool disabled = std::getenv("APS5_NO_DRAW_STAGING") != nullptr;
     return !disabled;
@@ -2332,7 +2446,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     else if (address == AddressStages::ReadOnly && !resolved.cacheable) reuse = AddressDrawReuse::NotSpaceOnly;
     if (resolved.cacheable) {
         resolved.contentKey = plan.contentKey;
-        if (auto cached = SharedResourceCache().Find(resolved.contentKey)) {
+        if (auto cached = findDrawResources(resolved.contentKey)) {
             const auto releaseSpace = [](ShaderResources* resources) { static_cast<void>(resources->ReleaseSpace()); };
             std::unique_ptr<ShaderResources, decltype(releaseSpace)> heldSpace(nullptr, releaseSpace);
             const bool counted = address == AddressStages::ReadOnly && cached->SpaceReuse();

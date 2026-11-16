@@ -51,6 +51,16 @@ struct PreparedDrawCounts {
     std::uint64_t inlinePlanNs = 0;
 };
 PreparedDrawCounts TakePreparedDrawCounts();
+struct DrawResourceMemoCounts {
+    std::uint64_t memoFinds = 0;
+    std::uint64_t plainFinds = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t moved = 0;
+    std::uint64_t expired = 0;
+    std::uint64_t stored = 0;
+    std::uint64_t verified = 0;
+};
+DrawResourceMemoCounts TakeDrawResourceMemoCounts();
 void SetPreparedDrawDeviceForTest(PreparedDraw& prepared, VkDevice device);
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const PreparedDraw* prepared = nullptr);

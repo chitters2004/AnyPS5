@@ -497,6 +497,20 @@ void PlansCameFromTheFinisher(const char* arm, bool on) {
     else Require(counts.planned == 0 && counts.used == 0 && counts.inlinePlans != 0, text + ", expected the committer to plan every draw itself");
 }
 
+void ResourcesCameFromTheMemo(std::string_view arm) {
+    const auto counts = AgcDriver::Graphics::TakeDrawResourceMemoCounts();
+    const auto text = std::string(arm) + ": " + std::to_string(counts.memoFinds) + " memo finds (" + std::to_string(counts.hits) + " hits, " + std::to_string(counts.verified) + " verified, " + std::to_string(counts.stored) + " stored, " + std::to_string(counts.moved) + " left the cache, " + std::to_string(counts.expired) + " expired) and " + std::to_string(counts.plainFinds) + " cache finds";
+    std::cout << text << '\n';
+    if (arm == "--no-draw-resource-memo") {
+        Require(counts.memoFinds == 0 && counts.hits == 0 && counts.stored == 0 && counts.plainFinds != 0, text + ", expected every find to go to the cache");
+        return;
+    }
+    Require(counts.plainFinds == 0 && counts.memoFinds != 0 && counts.stored != 0, text + ", expected every find to go through the memo");
+    if (std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr) Require(counts.verified == counts.hits, text + ", expected every memo hit to be checked against the cache");
+    if (arm == "--draw-resource-memo-evicting") Require(counts.moved + counts.expired != 0, text + ", expected an evicted entry to miss");
+    else Require(counts.hits != 0, text + ", expected a repeated draw to hit the memo");
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_NO_GPU_UNFOLDED_INDIRECT", "1");
@@ -534,8 +548,10 @@ int main(int argc, char** argv) {
             PlansCameFromTheFinisher("after APS5_NO_FINISHER_PREPARE was cleared mid-run", true);
         } else {
             const std::string_view arm = argc == 2 ? std::string_view(argv[1]) : std::string_view{};
-            Require(arm.empty() || arm == "--finisher-prepare" || arm == "--no-finisher-prepare", "unknown draw cache reuse argument");
+            const bool memoArm = arm == "--draw-resource-memo" || arm == "--no-draw-resource-memo" || arm == "--draw-resource-memo-evicting";
+            Require(arm.empty() || memoArm || arm == "--finisher-prepare" || arm == "--no-finisher-prepare", "unknown draw cache reuse argument");
             static_cast<void>(AgcDriver::Graphics::TakePreparedDrawCounts());
+            static_cast<void>(AgcDriver::Graphics::TakeDrawResourceMemoCounts());
             ThirdDrawHitsTheCache(libraries);
             UserDataDrawsReuseTheirShape(libraries);
             StageDataHitsRefreshTheirWords(libraries);
@@ -547,6 +563,7 @@ int main(int argc, char** argv) {
             IndirectPointsKeepTheirPointSize(libraries);
             if (arm == "--finisher-prepare") PlansCameFromTheFinisher("by default", true);
             if (arm == "--no-finisher-prepare") PlansCameFromTheFinisher("with APS5_NO_FINISHER_PREPARE set", false);
+            if (memoArm) ResourcesCameFromTheMemo(arm);
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

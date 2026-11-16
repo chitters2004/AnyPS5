@@ -323,6 +323,7 @@ public:
     bool ReadsImage(const StorageTexture* image) const;
     bool HasCachedStorageImages() const;
     bool HoldsReleasedTexture() const;
+    std::uint64_t CacheMembership() const { return cacheMembership.load(std::memory_order_acquire); }
     std::uint32_t TableElements() const { return tableElements[0] + tableElements[1]; }
     const std::vector<std::uint32_t>& LayoutKey() const { return layoutKey; }
     const std::vector<std::uint32_t>& FragmentLayoutKey() const { return fragmentLayoutKey; }
@@ -446,6 +447,8 @@ public:
     std::vector<PresyncSurface> PresyncSurfaces() const;
 
 private:
+    friend class ResourceCache;
+    std::atomic<std::uint64_t> cacheMembership{0};
     friend class AgcDriver::VulkanDevice;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
     std::optional<std::size_t> shaderDataAllocation(const CompiledShader& shader) const;
@@ -860,6 +863,7 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    static std::size_t Hash(const Key& key);
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
@@ -886,6 +890,7 @@ public:
 
 private:
     void erase(const Key& key);
+    static void unlinked(ShaderResources& resources);
     void noteMiss(const Key& key);
     void dropReleasedTextures(std::vector<std::shared_ptr<ShaderResources>>* evicted);
     void noteEvicted(const Key& key);
