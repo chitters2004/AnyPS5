@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -36,6 +37,7 @@
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::DriverDetail::DispatchVariant;
 using AgcDriver::DriverDetail::DrawMiss;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
@@ -248,6 +250,82 @@ void RelocationDrainsNameTheirIdentity(bool libraries) {
     Require(otherDrained + otherSkipped == 1, mode + ": " + std::to_string(otherDrained + otherSkipped) + " draws after a miss of other shaders were counted at the relocation drain, expected 1:" + text);
 }
 
+std::uint64_t DrawHits(std::span<const float* const> sources) {
+    const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    AgcDriver::DriverDetail::DrawEntryCounters counters = start;
+    for (const auto* source : sources) {
+        auto commands = DrawFrom({source});
+        Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+        Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
+        AgcDriverWaitIdle_nid_postfix();
+        counters = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    }
+    Require(counters.lookups - start.lookups == sources.size(), "the draws were not all looked up in the draw cache");
+    return counters.hits - start.hits;
+}
+
+std::uint64_t MovedDataHits(std::span<const std::array<float, 4>> sources) {
+    std::vector<const float*> addresses;
+    for (const auto& source : sources) addresses.push_back(source.data());
+    return DrawHits(addresses);
+}
+
+void RelocationOffServesNoMovedData(bool libraries) {
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    alignas(16) static std::array<std::array<float, 4>, 8> moved{};
+    for (auto& entry : moved) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    const auto hits = MovedDataHits(moved);
+    Require(hits == 0, mode + ": with APS5_NO_DRAW_RELOCATION " + std::to_string(hits) + " draws whose data moved reused a cached draw");
+}
+
+std::shared_ptr<const DispatchVariant> TaggedRuns() {
+    alignas(16) static constexpr std::array<std::uint32_t, 4> data{0x1000u, 0u, 0u, 0u};
+    constexpr std::uint64_t address = 0x2000;
+    const std::array<ShaderRecompiler::MemoryRegion, 1> regions{{{address, std::as_bytes(std::span(data))}}};
+    ShaderRecompiler::SrtUserDataUse use;
+    use.asBase = 0b1;
+    use.reads = {{address, 0}};
+    auto variant = std::make_shared<DispatchVariant>();
+    AgcDriver::DriverDetail::Driver::tagVariantRuns(*variant, regions, use, true, 0);
+    return variant;
+}
+
+void TaggingIgnoresTheSwitch() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto clear = TaggedRuns();
+    Switches::Assign(RuntimeSwitch::NoDrawRelocation, true);
+    const auto set = TaggedRuns();
+    Switches::Assign(RuntimeSwitch::NoDrawRelocation, false);
+    Require(clear->relocatableWords == 0b1, "a word read only as a base was not tagged relocatable");
+    Require(set->relocatableWords == clear->relocatableWords && set->runs == clear->runs, "a variant tagged while the relocation switch was set differs from one tagged with it clear, so it would ban its words once relocation is turned back on");
+}
+
+void RelocationSwitchFlipsMidRun(bool libraries) {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    TaggingIgnoresTheSwitch();
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    Require(!Switches::Set(RuntimeSwitch::NoDrawRelocation), "the relocation switch started set");
+    alignas(16) static std::array<std::array<float, 4>, 8> off{};
+    alignas(16) static std::array<std::array<float, 4>, 8> on{};
+    for (auto& entry : off) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    for (auto& entry : on) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    constexpr std::size_t Repeats = 3;
+    std::vector<const float*> offDraws;
+    for (const auto& source : off) offDraws.insert(offDraws.end(), Repeats, source.data());
+    Switches::Assign(RuntimeSwitch::NoDrawRelocation, true);
+    const auto offHits = DrawHits(offDraws);
+    Switches::Assign(RuntimeSwitch::NoDrawRelocation, false);
+    Require(offHits == off.size() * (Repeats - 2), mode + ": with the relocation switch set " + std::to_string(offHits) + " draws reused a cached draw, expected " + std::to_string(off.size() * (Repeats - 2)) + " repeats of unmoved data and no moved data");
+    const auto onHits = MovedDataHits(on);
+    Require(onHits >= 4, mode + ": after the relocation switch was cleared mid-run only " + std::to_string(onHits) + " of " + std::to_string(on.size()) + " draws whose data moved reused a cached draw, expected at least 4 as in a fresh run");
+}
+
 void SplitRunsNameTheirSharedWords() {
     alignas(16) static std::array<std::uint32_t, 4> data{1u, 2u, 3u, 4u};
     auto table = std::make_shared<ShaderRecompiler::SrtGuestWords>();
@@ -402,7 +480,9 @@ int main(int argc, char** argv) {
         const bool evicted = argc == 2 && std::string(argv[1]) == "--evicted";
         const bool kept = argc == 2 && std::string(argv[1]) == "--kept";
         const bool drains = argc == 2 && std::string(argv[1]) == "--drains";
-        if (!evicted && !kept && !drains) SplitRunsNameTheirSharedWords();
+        const bool off = argc == 2 && std::string(argv[1]) == "--relocation-off";
+        const bool flip = argc == 2 && std::string(argv[1]) == "--relocation-switch";
+        if (!evicted && !kept && !drains && !off && !flip) SplitRunsNameTheirSharedWords();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -414,6 +494,13 @@ int main(int argc, char** argv) {
             EvictedEntriesServeNoRelocation(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "An evicted draw served no relocation " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (off || flip) {
+            if (off) RelocationOffServesNoMovedData(libraries);
+            else RelocationSwitchFlipsMidRun(libraries);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << (off ? "Relocation off served no moved data " : "The relocation switch flipped mid-run ") << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
         }
         if (drains) {
