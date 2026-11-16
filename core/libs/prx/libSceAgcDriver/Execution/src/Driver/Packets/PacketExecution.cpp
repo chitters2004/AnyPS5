@@ -158,6 +158,14 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    ThreadPhases::Role phaseRole(submission.queue == 0 ? PhaseThread::Worker : PhaseThread::Other);
+    struct SubmissionClock {
+        bool timed;
+        std::chrono::steady_clock::time_point start;
+        ~SubmissionClock() {
+            if (timed) ThreadPhases::AddSubmission(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+        }
+    } submissionClock{ThreadPhases::Enabled() && submission.queue == 0, ThreadPhases::Enabled() && submission.queue == 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -530,7 +538,9 @@ void Driver::execute(const Submission& submission) {
 
                 try {
                     std::string rejected;
+                    const auto drawStart = ThreadPhases::Enabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const auto verdict = draw(queue, packet, submission, cursor, rejected);
+                    if (ThreadPhases::Enabled()) ThreadPhases::AddDraw(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - drawStart).count()));
                     drawn = verdict == DrawVerdict::Drawn;
                     CaptureTrace::Log("draw submission=%llu queue=%x offset=%zu target=%llx mask=%x verdict=%d reason=%.256s", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, static_cast<unsigned long long>(color), readRegister(queue.context, 0x8e), static_cast<int>(verdict), rejected.c_str());
                     if (verdict == DrawVerdict::Rejected) {
