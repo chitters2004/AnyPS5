@@ -4381,7 +4381,6 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
             descriptorImages[entry->position] = {VK_NULL_HANDLE, view, current->Layout()};
         }
         rebound = true;
-        drawSetCache->Clear();
         countIndex(IndexRebound);
     }
     const auto& log = lookupLog();
