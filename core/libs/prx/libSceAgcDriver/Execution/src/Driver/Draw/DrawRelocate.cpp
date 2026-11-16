@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -28,8 +29,7 @@ std::uint64_t AlignedWord(std::uint32_t word) {
 }
 
 bool Driver::drawRelocationEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_RELOCATION") == nullptr;
-    return enabled;
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDrawRelocation);
 }
 
 std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::uint32_t value, bool& readable) {
@@ -62,7 +62,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
 }
 
 void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& program) {
-    if (!drawRelocationEnabled() || variant.compiled == nullptr) return;
+    if (variant.compiled == nullptr) return;
     const auto& compiled = *variant.compiled;
     const auto& forwarded = compiled.shaderDataUserWords;
     const auto users = std::min<std::size_t>(program.userData.size(), 64);
@@ -137,7 +137,7 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
 
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
     variant.userWordsWalked = use.asBase | use.asValue;
-    std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
+    std::uint64_t relocatable = eligible ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
     const auto covered = [&](std::uint64_t address) {

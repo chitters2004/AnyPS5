@@ -11,8 +11,17 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_cache_relocation_drains COMMAND agc_driver_draw_cache_relocation_tests --drains)
     set_tests_properties(agc_driver_draw_cache_relocation_drains PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_cache_relocation_off COMMAND agc_driver_draw_cache_relocation_tests --relocation-off)
+    set_tests_properties(agc_driver_draw_cache_relocation_off PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_RELOCATION=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_cache_relocation_switch COMMAND agc_driver_draw_cache_relocation_tests --relocation-switch)
+    add_test(NAME agc_driver_draw_cache_relocation_switch_draw_pipeline COMMAND agc_driver_draw_cache_relocation_tests --relocation-switch)
+    set_tests_properties(agc_driver_draw_cache_relocation_switch PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_tests_properties(agc_driver_draw_cache_relocation_switch_draw_pipeline PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_cache_relocation_recipe_verify agc_driver_draw_cache_relocation_evicted agc_driver_draw_cache_relocation_kept agc_driver_draw_cache_relocation_drains PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_cache_relocation_recipe_verify agc_driver_draw_cache_relocation_evicted agc_driver_draw_cache_relocation_kept agc_driver_draw_cache_relocation_drains agc_driver_draw_cache_relocation_off agc_driver_draw_cache_relocation_switch agc_driver_draw_cache_relocation_switch_draw_pipeline PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     agc_add_draw_pipeline_test(agc_driver_draw_cache_relocation)
