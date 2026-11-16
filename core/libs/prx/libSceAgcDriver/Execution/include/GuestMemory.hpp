@@ -253,6 +253,17 @@ std::array<std::uint64_t, ProofBreakSiteCount> ProofBreakSiteTotals();
 void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t address = 0, std::uint64_t bytes = 0);
 bool ProofBreakVoidsCertificates(ProofBreakSite site);
 std::uint64_t CertificateBreakSerial();
+void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool ProofBreaksLogged();
+bool ProofBreakScoped(ProofBreakSite site);
+struct ProofBreakWindow {
+    bool complete = false;
+    bool clear = false;
+    bool unranged = false;
+    ProofBreakSite blocker = ProofBreakSite::Other;
+    std::uint64_t breaks = 0;
+};
+ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 struct ProofBreak {
     ProofBreakSite site = ProofBreakSite::Other;
     std::uint64_t address = 0;

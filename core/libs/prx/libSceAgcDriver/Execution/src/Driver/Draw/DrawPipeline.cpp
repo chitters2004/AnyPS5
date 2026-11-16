@@ -466,6 +466,7 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
+        const std::vector<Range>* writes = nullptr;
         bool isDraw = false;
         auto kind = CommitKind::Other;
         bool declaredWrites = false;
@@ -480,6 +481,7 @@ void DrawPipeline::run() {
             isDraw = items.front().draw;
             kind = items.front().kind;
             declaredWrites = !items.front().writes.empty();
+            writes = &items.front().writes;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -492,7 +494,7 @@ void DrawPipeline::run() {
                 if (commit != nullptr) (*commit)();
             }
             if (!isDraw) {
-                GuestMemory::BreakProofs(covered ? GuestMemory::ProofBreakSite::PacketCovered : GuestMemory::ProofBreakSite::Packet);
+                GuestMemory::BreakProofsOver(covered ? GuestMemory::ProofBreakSite::PacketCovered : GuestMemory::ProofBreakSite::Packet, *writes);
                 static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
                 if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }

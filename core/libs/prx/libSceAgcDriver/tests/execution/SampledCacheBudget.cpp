@@ -756,6 +756,63 @@ void epochReuseTests(Context context) {
     std::puts("resource proof reuse and invalidation passed");
 }
 
+void epochProofLogTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the proof-log fixture needs epoch proofs on");
+    Require(AgcDriver::GuestMemory::ProofBreaksLogged(), "the proof-log fixture needs the proof break log");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the proof-log template is not reusable");
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] { return resources->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Full && report.failure == ShaderResources::ProofFailure::None; };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 3; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("an unchanged template did not take the epoch exit");
+    using Site = AgcDriver::GuestMemory::ProofBreakSite;
+    const auto address = surface.Address();
+    const auto distant = address + SurfaceBytes + (std::uint64_t{64} << 20u);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> distantRanges{{{distant, distant + 4096u}, {distant + 65536u, distant + 69632u}}};
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> nearRanges{{{distant, distant + 4096u}, {address + 256u, address + 512u}}};
+    const auto check = [&](const char* label, auto&& brk) {
+        brk();
+        const bool taken = exitTaken();
+        std::fprintf(stderr, "proof log: %s: the exit %s\n", label, taken ? "was taken" : "was refused");
+        settle("the template did not take the exit again after a break");
+        return taken;
+    };
+    const bool distantWritten = check("a marked-written break outside the set", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, distant, 4096u); });
+    const bool nearWritten = check("a marked-written break over the set's surface", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, address, 4096u); });
+    const bool distantPacket = check("a packet break over two ranges outside the set", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, distantRanges); });
+    const bool nearPacket = check("a packet break with one range over the set's surface", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, nearRanges); });
+    const bool unrangedPacket = check("a packet break without declared writes", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, {}); });
+    const bool distantStore = check("a driver store outside the set", [&] { AgcDriver::GuestMemory::BreakProofs(Site::DriverStore, distant, 4096u); });
+    Require(!nearWritten, "a marked-written break over the set's surface let the exit through");
+    Require(!nearPacket, "a packet break over the set's surface let the exit through");
+    Require(!unrangedPacket, "a packet break without declared writes let the exit through");
+    Require(!distantStore, "a driver store, which the log does not scope, let the exit through");
+    std::fprintf(stderr, "proof log: outside breaks kept the exit: marked written %s, packet %s\n", distantWritten ? "yes" : "no", distantPacket ? "yes" : "no");
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+}
+
 void epochVerifyWorkTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1754,6 +1811,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochReuseTests(context);
             std::puts("resource cache epoch reuse tests passed");
+            return 0;
+        }
+        if (mode == "resource-epoch-proof-log") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            epochProofLogTests(context);
+            std::puts("resource cache epoch proof log tests passed");
             return 0;
         }
         if (mode == "resource-epoch-verify-work") {
