@@ -208,6 +208,7 @@ constexpr std::size_t ChunkSlots = 256;
 constexpr std::size_t ChunkCount = std::size_t{1} << 12;
 
 constexpr std::size_t InlineOwners = 2;
+constexpr std::uint32_t BumpTimingStride = 16;
 
 struct KeySlot {
     std::array<std::atomic<std::uint64_t>, InlineHandles> handles{};
@@ -264,7 +265,7 @@ struct WriteIndex {
     AgcDriver::Mutex overflowMutex;
     std::atomic<std::uint64_t> live{0};
     std::atomic<std::uint64_t> backedLive{0};
-    std::atomic<std::uint64_t> calls{0};
+    ProfileCounter calls;
     std::vector<std::uint32_t> freeSlots;
     std::uint64_t slotCount = 0;
     std::array<std::atomic<Chunk*>, ChunkCount> chunks{};
@@ -275,20 +276,20 @@ struct WriteIndex {
     std::vector<std::uint32_t> freeOwnerSlots;
     std::uint64_t ownerSlotCount = 0;
     std::atomic<std::uint64_t> owners{0};
-    std::atomic<std::uint64_t> ownerBumps{0};
-    std::atomic<std::uint64_t> ownerFastBumps{0};
+    ProfileCounter ownerBumps;
+    ProfileCounter ownerFastBumps;
     std::atomic<std::uint64_t> ownerDependencies{0};
     std::atomic<std::uint64_t> blockDependencies{0};
     std::atomic<std::uint64_t> subscriptions{0};
     std::atomic<std::uint64_t> blocks{0};
-    std::atomic<std::uint64_t> bumps{0};
-    std::atomic<std::uint64_t> lookups{0};
+    ProfileCounter bumps;
+    ProfileCounter lookups;
     std::atomic<std::uint64_t> sweeps{0};
     std::atomic<std::uint64_t> sweepFailures{0};
-    std::atomic<std::uint64_t> overflows{0};
-    std::atomic<std::uint64_t> lookupNanoseconds{0};
-    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
-    std::array<std::array<std::atomic<std::uint64_t>, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
+    ProfileCounter overflows;
+    ProfileCounter lookupNanoseconds;
+    std::array<ProfileCounter, static_cast<std::size_t>(WriteBumpSource::Count)> bySource{};
+    std::array<std::array<ProfileCounter, WriteBumpSizeBuckets>, static_cast<std::size_t>(WriteBumpSource::Count)> bySize{};
 };
 
 WriteIndex& Index() {
@@ -512,12 +513,14 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     if (bytes == 0 || index.live.load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
     if (storeBumpsMutedForTest()) return;
     const bool counting = indexCounting();
-    if (counting) index.calls.fetch_add(1, std::memory_order_relaxed);
-    static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (counting) index.calls.Add();
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    thread_local std::uint32_t timedCalls = 0;
+    const bool timed = profiled && (timedCalls++ & (BumpTimingStride - 1u)) == 0;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto first = address / IndexBlockBytes;
     const auto last = (address + bytes - 1) / IndexBlockBytes;
-    if (counting) index.bySize[static_cast<std::size_t>(source)][std::min<std::size_t>(WriteBumpSizeBuckets - 1, bytes <= 4096 ? 0 : static_cast<std::size_t>((std::bit_width(bytes - 1) - 12 + 1) / 2))].fetch_add(1, std::memory_order_relaxed);
+    if (counting) index.bySize[static_cast<std::size_t>(source)][std::min<std::size_t>(WriteBumpSizeBuckets - 1, bytes <= 4096 ? 0 : static_cast<std::size_t>((std::bit_width(bytes - 1) - 12 + 1) / 2))].Add();
     const auto end = address + bytes;
     const auto change = static_cast<std::size_t>(WriteChangeOf(source));
     const bool ownersHidden = certificateMutant.load(std::memory_order_relaxed) == CertificateMutant::HideOwnerBumps;
@@ -531,7 +534,7 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
             });
             if (covering != 0) {
                 if (!ownersHidden) ownerOf(covering).changes[change].fetch_add(1, std::memory_order_acq_rel);
-                if (counting) index.ownerFastBumps.fetch_add(1, std::memory_order_relaxed);
+                if (counting) index.ownerFastBumps.Add();
                 return;
             }
         }
@@ -561,7 +564,7 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
                 if (std::find(bumpedOwners.begin(), bumpedOwners.end(), owner) != bumpedOwners.end()) return;
                 bumpedOwners.push_back(owner);
                 if (!ownersHidden) entry.changes[change].fetch_add(1, std::memory_order_acq_rel);
-                if (counting) index.ownerBumps.fetch_add(1, std::memory_order_relaxed);
+                if (counting) index.ownerBumps.Add();
             });
         }
         forHandles(key, slot, [&](std::uint64_t handle) {
@@ -575,13 +578,13 @@ void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSour
     for (const auto key : backing) {
         if (auto* slot = slotOf(key, false)) visit(key, *slot);
     }
-    if (counting) index.lookups.fetch_add(lookups, std::memory_order_relaxed);
+    if (counting) index.lookups.Add(lookups);
     if (counting && bumped != 0) {
-        index.bumps.fetch_add(bumped, std::memory_order_relaxed);
-        index.bySource[static_cast<std::size_t>(source)].fetch_add(bumped, std::memory_order_relaxed);
+        index.bumps.Add(bumped);
+        index.bySource[static_cast<std::size_t>(source)].Add(bumped);
     }
-    if (counting && overflowed != 0) index.overflows.fetch_add(overflowed, std::memory_order_relaxed);
-    if (timed) index.lookupNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    if (counting && overflowed != 0) index.overflows.Add(overflowed);
+    if (timed) index.lookupNanoseconds.Add(BumpTimingStride * static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
 }
 
 void addHandle(std::uint64_t key, std::uint64_t handle) {
@@ -877,32 +880,33 @@ void NoteTextureReleased(std::uint64_t address) {
 WriteIndexStats WriteIndexCounted() {
     auto& index = Index();
     WriteIndexStats stats;
-    stats.calls = index.calls.load(std::memory_order_relaxed);
+    stats.calls = index.calls.Sum();
     stats.subscriptions = index.subscriptions.load(std::memory_order_relaxed);
     stats.blocks = index.blocks.load(std::memory_order_relaxed);
-    stats.bumps = index.bumps.load(std::memory_order_relaxed);
-    stats.lookups = index.lookups.load(std::memory_order_relaxed);
+    stats.bumps = index.bumps.Sum();
+    stats.lookups = index.lookups.Sum();
     stats.sweeps = index.sweeps.load(std::memory_order_relaxed);
     stats.sweepFailures = index.sweepFailures.load(std::memory_order_relaxed);
-    stats.overflows = index.overflows.load(std::memory_order_relaxed);
-    stats.lookupNanoseconds = index.lookupNanoseconds.load(std::memory_order_relaxed);
-    stats.ownerBumps = index.ownerBumps.load(std::memory_order_relaxed);
-    stats.ownerFastBumps = index.ownerFastBumps.load(std::memory_order_relaxed);
+    stats.overflows = index.overflows.Sum();
+    stats.lookupNanoseconds = index.lookupNanoseconds.Sum();
+    stats.ownerBumps = index.ownerBumps.Sum();
+    stats.ownerFastBumps = index.ownerFastBumps.Sum();
     stats.ownerDependencies = index.ownerDependencies.load(std::memory_order_relaxed);
     stats.blockDependencies = index.blockDependencies.load(std::memory_order_relaxed);
-    for (std::size_t i = 0; i < stats.bySource.size(); ++i) stats.bySource[i] = index.bySource[i].load(std::memory_order_relaxed);
+    for (std::size_t i = 0; i < stats.bySource.size(); ++i) stats.bySource[i] = index.bySource[i].Sum();
     for (std::size_t i = 0; i < stats.bySize.size(); ++i) {
-        for (std::size_t k = 0; k < WriteBumpSizeBuckets; ++k) stats.bySize[i][k] = index.bySize[i][k].load(std::memory_order_relaxed);
+        for (std::size_t k = 0; k < WriteBumpSizeBuckets; ++k) stats.bySize[i][k] = index.bySize[i][k].Sum();
     }
     return stats;
 }
 
 void ResetWriteIndexCounts() {
     auto& index = Index();
-    for (auto* counter : {&index.calls, &index.subscriptions, &index.blocks, &index.bumps, &index.lookups, &index.sweeps, &index.sweepFailures, &index.overflows, &index.lookupNanoseconds, &index.ownerBumps, &index.ownerFastBumps, &index.ownerDependencies, &index.blockDependencies}) counter->store(0, std::memory_order_relaxed);
-    for (auto& counter : index.bySource) counter.store(0, std::memory_order_relaxed);
+    for (auto* counter : {&index.subscriptions, &index.blocks, &index.sweeps, &index.sweepFailures, &index.ownerDependencies, &index.blockDependencies}) counter->store(0, std::memory_order_relaxed);
+    for (auto* counter : {&index.calls, &index.bumps, &index.lookups, &index.overflows, &index.lookupNanoseconds, &index.ownerBumps, &index.ownerFastBumps}) static_cast<void>(counter->Take());
+    for (auto& counter : index.bySource) static_cast<void>(counter.Take());
     for (auto& sizes : index.bySize) {
-        for (auto& counter : sizes) counter.store(0, std::memory_order_relaxed);
+        for (auto& counter : sizes) static_cast<void>(counter.Take());
     }
 }
 
