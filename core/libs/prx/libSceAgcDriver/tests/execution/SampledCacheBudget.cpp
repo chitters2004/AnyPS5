@@ -979,6 +979,80 @@ void epochVerifyWorkTests(Context context) {
     std::puts("epoch exit over a storage image stored to with its proof break held: taken");
 }
 
+void epochScopeLevelsTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the scope-level fixture needs epoch proofs on");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the scope-level template is not reusable");
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 3; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("an unchanged template did not take the epoch exit");
+    const auto address = surface.Address();
+    const auto distant = address + SurfaceBytes + (std::uint64_t{64} << 20u);
+    const auto miss = [&](const char* label, auto&& move) {
+        move();
+        const bool taken = exitTaken();
+        std::fprintf(stderr, "scope levels: %s: the exit %s\n", label, taken ? "was taken" : "was refused");
+        Require(!taken, "a moved input let the unscoped exit through");
+        settle("the template did not take the exit again after a miss");
+    };
+    miss("an image entering pending outside the set", [&] { StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + 4096u); });
+    miss("an image entering pending over the set's surface", [&] { StorageTexture::BumpPendingSerial(PendingBump::Mark, address, address + 4096u); });
+    miss("an image leaving pending", [&] { StorageTexture::BumpPendingSerial(PendingBump::Discard); });
+    miss("a written break and an image entering pending, both outside the set", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, distant, 4096u);
+        StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + 4096u);
+    });
+    miss("a new collect epoch with the surface unwritten", [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+}
+
+bool idleHoldTests() {
+    if (!AgcDriver::GuestMemory::ProofBreaksCounted()) return false;
+    static_cast<void>(AgcDriver::GuestMemory::TakeProofBreakCounts());
+    std::thread idle([] { std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex()); });
+    idle.join();
+    std::thread writing([] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, 4096u, 4096u);
+    });
+    writing.join();
+    std::thread pending([] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        StorageTexture::BumpPendingSerial(PendingBump::Discard);
+    });
+    pending.join();
+    const auto counts = AgcDriver::GuestMemory::TakeProofBreakCounts();
+    std::fprintf(stderr, "idle holds: GPU-lock holds off the proof thread %llu, idle %llu\n", static_cast<unsigned long long>(counts.offThreadHolds), static_cast<unsigned long long>(counts.idleHolds));
+    Require(counts.offThreadHolds == 3 && counts.idleHolds == 1, "the GPU-lock holds were not counted as one idle hold out of three");
+    return true;
+}
+
 bool epochGpuLabelTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -1914,6 +1988,11 @@ int main(int argc, char** argv) {
             std::puts("proof log concurrent tests passed");
             return 0;
         }
+        if (mode == "proof-break-idle-holds") {
+            if (!idleHoldTests()) return VulkanTestSkipped;
+            std::puts("idle hold tests passed");
+            return 0;
+        }
         if (mode == "device-selection-cpu") {
             deviceSelectionTests();
             return 0;
@@ -2009,6 +2088,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochVerifyWorkTests(context);
             std::puts("resource cache epoch verify work tests passed");
+            return 0;
+        }
+        if (mode == "resource-epoch-scope-levels") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            epochScopeLevelsTests(context);
+            std::puts("resource cache epoch scope level tests passed");
             return 0;
         }
         if (mode == "resource-epoch-gpu-label") {

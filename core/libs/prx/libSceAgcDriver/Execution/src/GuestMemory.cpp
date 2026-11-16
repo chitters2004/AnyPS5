@@ -2872,6 +2872,8 @@ std::atomic<std::uint64_t> proofSerial{1};
 std::atomic<std::uint64_t> certificateBreakSerial{1};
 constexpr std::uint32_t CertificateCoveredBreaks = (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::Written)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::DriverStore)) | (std::uint32_t{1} << static_cast<unsigned>(ProofBreakSite::PacketCovered));
 thread_local bool proofThread = false;
+thread_local bool holdTracked = false;
+thread_local std::uint64_t holdWrites = 0;
 thread_local ProofBreakTrace* proofBreakTrace = nullptr;
 std::array<std::atomic<std::uint64_t>, ProofBreakSiteCount> proofBreakTotals{};
 }
@@ -2905,6 +2907,8 @@ struct ProofBreakCounters {
     std::array<ProfileCounter, ProofBreakSiteCount> sites;
     ProfileCounter emptyWriteBacks;
     ProfileCounter unchangedWriteBacks;
+    ProfileCounter offThreadHolds;
+    ProfileCounter idleHolds;
 };
 
 ProofBreakCounters& proofBreakCounters() {
@@ -2913,6 +2917,10 @@ ProofBreakCounters& proofBreakCounters() {
 }
 
 std::atomic<bool> proofBreaksHeldForTest{false};
+}
+
+void NoteHoldPendingBump() {
+    if (holdTracked) ++holdWrites;
 }
 
 void HoldProofBreaksForTest(bool held) {
@@ -2941,6 +2949,8 @@ ProofBreakCounts TakeProofBreakCounts() {
     for (std::size_t site = 0; site < ProofBreakSiteCount; ++site) counts.sites[site] = counters.sites[site].Take();
     counts.emptyWriteBacks = counters.emptyWriteBacks.Take();
     counts.unchangedWriteBacks = counters.unchangedWriteBacks.Take();
+    counts.offThreadHolds = counters.offThreadHolds.Take();
+    counts.idleHolds = counters.idleHolds.Take();
     return counts;
 }
 
@@ -3020,6 +3030,7 @@ void logBreak(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std:
 }
 
 void noteBreak(ProofBreakSite site) {
+    if (holdTracked && site != ProofBreakSite::GpuMutex) ++holdWrites;
     if (ProofBreakVoidsCertificates(site)) certificateBreakSerial.fetch_add(1, std::memory_order_acq_rel);
     if (ProofBreaksCounted()) proofBreakCounters().sites[static_cast<std::size_t>(site)].Add();
     if (ProofBreakSitesTracked()) proofBreakTotals[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
@@ -4256,6 +4267,10 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
+        if (!proofThread && ProofBreaksCounted()) {
+            holdTracked = true;
+            holdWrites = 0;
+        }
         if (!proofThread) BreakProofs(ProofBreakSite::GpuMutex);
     }
 }
@@ -4294,6 +4309,11 @@ std::uint64_t GpuHoldSerial() {
 
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
+    if (outermost && holdTracked) {
+        holdTracked = false;
+        proofBreakCounters().offThreadHolds.Add();
+        if (holdWrites == 0) proofBreakCounters().idleHolds.Add();
+    }
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.

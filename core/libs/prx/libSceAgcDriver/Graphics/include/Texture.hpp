@@ -366,6 +366,12 @@ public:
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial(PendingBump source = PendingBump::Unlabelled);
+    static void BumpPendingSerial(PendingBump source, std::uint64_t begin, std::uint64_t end);
+    struct PendingEntryWindow {
+        bool complete = false;
+        bool clear = false;
+    };
+    static PendingEntryWindow PendingEntriesSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     // Whether an image with results pending, or one a FlushPending is storing right now, overlaps
     // any of the [begin, end) ranges: one acquisition of the registry's mutex.
     static bool AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);

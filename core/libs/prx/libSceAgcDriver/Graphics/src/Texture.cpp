@@ -4859,12 +4859,12 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial(PendingBump::MarkLent);
+        if (wasLent) BumpPendingSerial(PendingBump::MarkLent, descriptor.baseAddress, descriptor.baseAddress + guestBytes);
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
-    BumpPendingSerial(PendingBump::Mark);
+    BumpPendingSerial(PendingBump::Mark, descriptor.baseAddress, descriptor.baseAddress + guestBytes);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4876,7 +4876,8 @@ void StorageTexture::reconcilePending() {
     dirty = any;
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
-    BumpPendingSerial(PendingBump::Reconcile);
+    if (any) BumpPendingSerial(PendingBump::Reconcile, descriptor.baseAddress, descriptor.baseAddress + guestBytes);
+    else BumpPendingSerial(PendingBump::Reconcile);
 }
 
 bool StorageTexture::Dirty() const {
@@ -6330,9 +6331,69 @@ std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> PendingB
     return counts;
 }
 
+namespace {
+struct PendingEntry {
+    std::uint64_t serial = 0;
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    bool entering = false;
+};
+
+constexpr std::size_t PendingEntrySlots = 4096;
+constexpr std::size_t PendingEntryWalk = 1024;
+
+struct PendingEntryLog {
+    AgcDriver::Mutex mutex;
+    std::array<PendingEntry, PendingEntrySlots> slots{};
+    std::uint64_t written = 0;
+};
+
+PendingEntryLog& pendingEntryLog() {
+    static PendingEntryLog log;
+    return log;
+}
+
+void logPendingBump(std::atomic<std::uint64_t>& serial, bool entering, std::uint64_t begin, std::uint64_t end) {
+    auto& log = pendingEntryLog();
+    const std::lock_guard lock(log.mutex);
+    const auto bumped = serial.fetch_add(1, std::memory_order_release) + 1;
+    log.slots[static_cast<std::size_t>(log.written % PendingEntrySlots)] = {bumped, begin, end, entering && end > begin};
+    ++log.written;
+}
+}
+
 void StorageTexture::BumpPendingSerial(PendingBump source) {
-    pendingSerial.fetch_add(1, std::memory_order_release);
+    if (GuestMemory::ProofBreaksCounted()) {
+        logPendingBump(pendingSerial, false, 0, 0);
+        GuestMemory::NoteHoldPendingBump();
+    } else pendingSerial.fetch_add(1, std::memory_order_release);
     if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void StorageTexture::BumpPendingSerial(PendingBump source, std::uint64_t begin, std::uint64_t end) {
+    if (GuestMemory::ProofBreaksCounted()) {
+        logPendingBump(pendingSerial, true, begin, end);
+        GuestMemory::NoteHoldPendingBump();
+    } else pendingSerial.fetch_add(1, std::memory_order_release);
+    if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+}
+
+StorageTexture::PendingEntryWindow StorageTexture::PendingEntriesSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    PendingEntryWindow window;
+    if (!GuestMemory::ProofBreaksCounted()) return window;
+    auto& log = pendingEntryLog();
+    const std::lock_guard lock(log.mutex);
+    const auto current = pendingSerial.load(std::memory_order_acquire);
+    if (current == serial) return {true, true};
+    if (current < serial) return window;
+    const auto available = std::min<std::uint64_t>(log.written, PendingEntrySlots);
+    for (std::uint64_t walked = 0; walked < available && walked < PendingEntryWalk; ++walked) {
+        const auto& entry = log.slots[static_cast<std::size_t>((log.written - 1 - walked) % PendingEntrySlots)];
+        if (entry.serial <= serial) return {true, true};
+        if (entry.entering && std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return entry.begin < range.second && range.first < entry.end; })) return {true, false};
+    }
+    if (log.written <= PendingEntrySlots && available <= PendingEntryWalk) return {true, true};
+    return window;
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {

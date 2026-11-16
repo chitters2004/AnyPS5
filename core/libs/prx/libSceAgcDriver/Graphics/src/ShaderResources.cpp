@@ -4331,6 +4331,68 @@ ExitMisses& exitMisses() {
     return misses;
 }
 
+struct ScopeLevels {
+    ProfileCounter misses;
+    std::array<ProfileCounter, 4> hits;
+    ProfileCounter certifiableHits;
+    ProfileCounter pendingChecked;
+    ProfileCounter pendingIncomplete;
+    ProfileCounter pendingBlocked;
+    ProfileCounter ownReleased;
+    ProfileCounter setEpochs;
+};
+
+ScopeLevels& scopeLevels() {
+    static ScopeLevels levels;
+    return levels;
+}
+
+struct ScopeCheck {
+    bool counted = false;
+    bool blocked = false;
+    bool proofScoped = false;
+    bool releasesMoved = false;
+    bool releasesScoped = false;
+    bool pendingMoved = false;
+    bool pendingScoped = false;
+    bool epochMoved = false;
+    bool certifiable = false;
+};
+
+void noteScope(const ScopeCheck& scope, bool fullClean) {
+    auto& levels = scopeLevels();
+    levels.misses.Add();
+    if (scope.blocked || !scope.proofScoped) return;
+    const bool releases = !scope.releasesMoved || scope.releasesScoped;
+    const bool pending = !scope.pendingMoved || scope.pendingScoped;
+    if (!scope.releasesMoved && !scope.pendingMoved && !scope.epochMoved) levels.hits[0].Add();
+    if (releases && !scope.pendingMoved && !scope.epochMoved) levels.hits[1].Add();
+    if (releases && pending && !scope.epochMoved) levels.hits[2].Add();
+    if (releases && pending && (!scope.epochMoved || fullClean)) {
+        levels.hits[3].Add();
+        if (scope.certifiable) levels.certifiableHits.Add();
+    }
+}
+
+void reportScopeLevels(const GuestMemory::ProofBreakCounts& breaks) {
+    auto& levels = scopeLevels();
+    static std::uint64_t epochsBefore = 0;
+    const auto epochs = GuestMemory::CollectEpochBumps();
+    const auto newEpochs = epochs - std::exchange(epochsBefore, epochs);
+    const auto misses = levels.misses.Take();
+    const auto proof = levels.hits[0].Take();
+    const auto releases = levels.hits[1].Take();
+    const auto pending = levels.hits[2].Take();
+    const auto epoch = levels.hits[3].Take();
+    const auto certifiable = levels.certifiableHits.Take();
+    const auto checked = levels.pendingChecked.Take();
+    const auto incomplete = levels.pendingIncomplete.Take();
+    const auto blocked = levels.pendingBlocked.Take();
+    const auto released = levels.ownReleased.Take();
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) scoped would-hit over %llu misses, cumulative: proof %llu, +releases %llu, +pending %llu, +epoch %llu (certifiable %llu); pending entry log over the pending-moved misses: checked %llu, incomplete %llu, blocked by an entering bump in range %llu; releases moved with an own texture released %llu\n", static_cast<unsigned long long>(misses), static_cast<unsigned long long>(proof), static_cast<unsigned long long>(releases), static_cast<unsigned long long>(pending), static_cast<unsigned long long>(epoch), static_cast<unsigned long long>(certifiable), static_cast<unsigned long long>(checked), static_cast<unsigned long long>(incomplete), static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(released));
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) collect epochs %llu, sets first proved in a new epoch %llu; GPU-lock holds off the proof thread %llu, idle %llu (no other proof break or pending bump while held)\n", static_cast<unsigned long long>(newEpochs), static_cast<unsigned long long>(levels.setEpochs.Take()), static_cast<unsigned long long>(breaks.offThreadHolds), static_cast<unsigned long long>(breaks.idleHolds));
+}
+
 void reportExitMisses() {
     auto& misses = exitMisses();
     std::string inputs;
@@ -4356,6 +4418,7 @@ void reportExitMisses() {
         sites += std::string(GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site))) + " " + std::to_string(breaks.sites[site]);
     }
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks));
+    reportScopeLevels(breaks);
     std::string combos;
     for (std::size_t mask = 1; mask < misses.combos.size(); ++mask) {
         const auto count = misses.combos[mask].Take();
@@ -5150,6 +5213,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
+        if (exitMissesCounted() && stamp.epoch != epochSeen) {
+            epochSeen = stamp.epoch;
+            scopeLevels().setEpochs.Add();
+        }
         const auto censusGap = censusSeen != 0 && stamp.proof >= censusSeen ? stamp.proof - censusSeen : std::numeric_limits<std::uint64_t>::max();
         censusSeen = stamp.proof;
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
@@ -5187,8 +5254,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         const bool counted = exitMissesCounted();
+        ProofLogCheck log;
         if (proved.epoch != 0 && (verifyingExits() || counted)) {
-            ProofLogCheck log;
             if (counted && proved.proof != stamp.proof) {
                 log.checked = true;
                 log.unscopedSet = !provedRanges;
@@ -5208,10 +5275,32 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (proved.pending != stamp.pending) set |= EpochGateMissBit(EpochGateMiss::Pending);
             Certified().epochGateSets[set].fetch_add(1, std::memory_order_relaxed);
         }
+        ScopeCheck scope;
+        if (counted && proved.epoch != 0) {
+            scope.counted = true;
+            scope.blocked = stalePlanes || copies || proved.unwatch != stamp.unwatch || proved.importSet != stamp.importSet || proved.allocations != stamp.allocations || proved.retired != stamp.retired || proved.surfaces != stamp.surfaces;
+            scope.proofScoped = proved.proof == stamp.proof || (log.checked && !log.unscopedSet && log.window.complete && log.window.clear);
+            scope.releasesMoved = proved.releases != stamp.releases;
+            if (scope.releasesMoved) {
+                scope.releasesScoped = std::none_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); });
+                if (!scope.releasesScoped) scopeLevels().ownReleased.Add();
+            }
+            scope.pendingMoved = proved.pending != stamp.pending;
+            if (scope.pendingMoved && provedRanges) {
+                const auto window = StorageTexture::PendingEntriesSince(proved.pending, proofRanges);
+                scopeLevels().pendingChecked.Add();
+                if (!window.complete) scopeLevels().pendingIncomplete.Add();
+                else if (!window.clear) scopeLevels().pendingBlocked.Add();
+                scope.pendingScoped = window.complete && window.clear;
+            }
+            scope.epochMoved = proved.epoch != stamp.epoch;
+            scope.certifiable = !certifyRefusal().has_value();
+        }
         std::optional<GuestMemory::ProofBreakTrace> trace;
         if (counted) trace.emplace();
         std::uint64_t flushBreaks = 0;
         const bool ok = revalidateFull(shaders, report, counted ? &flushBreaks : nullptr, counted ? &*trace : nullptr);
+        if (scope.counted) noteScope(scope, ok && flushBreaks == 0 && trace->Count() == 0);
         noteEpochProof(false, false, false);
         proved = stamp;
         recordFlushRanges();

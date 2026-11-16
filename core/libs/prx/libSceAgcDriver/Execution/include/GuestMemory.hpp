@@ -244,8 +244,11 @@ struct ProofBreakCounts {
     std::array<std::uint64_t, ProofBreakSiteCount> sites{};
     std::uint64_t emptyWriteBacks = 0;
     std::uint64_t unchangedWriteBacks = 0;
+    std::uint64_t offThreadHolds = 0;
+    std::uint64_t idleHolds = 0;
 };
 bool ProofBreaksCounted();
+void NoteHoldPendingBump();
 void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
 bool ProofBreakSitesTracked();
