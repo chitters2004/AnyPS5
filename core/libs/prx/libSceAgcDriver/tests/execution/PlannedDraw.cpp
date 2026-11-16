@@ -73,7 +73,7 @@ struct Scene {
 
     void Draw(std::shared_ptr<AgcDriver::Graphics::PlannedDraw>* planned, const AgcDriver::Pm4::DrawParameters& parameters, bool drawn, const char* what) {
         pixels.fill(std::byte{0});
-        device.Draw(state, parameters, shaders, {}, nullptr, nullptr, 0, planned);
+        device.Draw(state, parameters, shaders, {}, nullptr, nullptr, 0, nullptr, planned);
         device.WaitIdle();
         const auto red = pixels[0] == std::byte{255} && pixels[1] == std::byte{0} && pixels[2] == std::byte{0} && pixels[3] == std::byte{255};
         const auto untouched = pixels[0] == std::byte{0} && pixels[3] == std::byte{0};
