@@ -4225,7 +4225,7 @@ void reportExitMisses() {
         sites += sites.empty() ? "" : ", ";
         sites += std::string(GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site))) + " " + std::to_string(breaks.sites[site]);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks));
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu; write-backs quiet %llu, unchanged over CPU writes %llu, held unchanged kept %llu (quiet write-backs %s)\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks), static_cast<unsigned long long>(breaks.quietWriteBacks), static_cast<unsigned long long>(breaks.cpuWrittenWriteBacks), static_cast<unsigned long long>(breaks.heldUnchangedWriteBacks), GuestMemory::QuietWriteBacks() ? "on" : "off");
 }
 
 ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, const ShaderResources::ExitStamp& end, std::uint64_t flushBreaks, std::uint64_t ownBreaks) {

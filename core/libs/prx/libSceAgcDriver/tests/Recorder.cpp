@@ -5032,6 +5032,101 @@ bool importedEpochReuseTests(const Device& device, Recorder& recorder) {
     return true;
 }
 
+bool quietWriteBackEpochTests(const Device& device, Recorder& recorder) {
+    namespace Memory = AgcDriver::GuestMemory;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    auto context = device.GetContext();
+    context.nullDescriptors = device.NullDescriptors();
+    if (context.hostImportAlignment == 0 || !context.nullDescriptors || !Memory::WriteWatched()) {
+        std::cout << "host imports, null descriptors or write watching unavailable: proofs across unchanged write-backs not tested\n";
+        return false;
+    }
+    Require(ShaderResources::EpochProofs(), "the quiet write-back epoch test needs epoch proofs on");
+    Memory::MarkProofThread();
+    recorder.Sync();
+    constexpr std::size_t bytes = 4u << 20u;
+    constexpr std::size_t elementBytes = 1u << 20u;
+    void* block = AllocateWatched(bytes, 65536);
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    std::memset(block, 0, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    const auto removeBlock = [&] {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    };
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the watched block refused: proofs across unchanged write-backs not tested\n";
+        removeBlock();
+        return false;
+    }
+    const auto element = address + 65536u;
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.guestDescriptor = {static_cast<std::uint32_t>(element), static_cast<std::uint32_t>(element >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31000000u};
+    binding.bufferWritten = {false};
+    binding.bufferRead = {true};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    Memory::BumpCollectEpoch();
+    auto resources = std::make_shared<ShaderResources>(context, compute);
+    const auto reads = resources->InPlaceReads();
+    const bool inPlace = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return range.first <= element && range.second >= element + elementBytes; });
+    if (!resources->Reusable() || !inPlace) {
+        std::cout << "the read-only watched element was not bound in place in a reusable build: proofs across unchanged write-backs not tested\n";
+        resources.reset();
+        removeBlock();
+        return false;
+    }
+    std::vector<std::byte> snapshot(4096);
+    const auto exits = [&] {
+        const auto before = EpochProofCounts().resourceReuses.Sum();
+        Require(resources->Revalidate(compute), "a read-only watched build did not prove current");
+        return EpochProofCounts().resourceReuses.Sum() != before;
+    };
+    auto* word = reinterpret_cast<volatile std::uint32_t*>(element + 0x40);
+    std::string failures;
+    const auto expect = [&](bool condition, const std::string& message) {
+        if (!condition) failures += (failures.empty() ? "" : "; ") + message;
+    };
+    for (const bool quiet : {true, false}) {
+        const std::string arm = quiet ? "quiet write-backs: " : "APS5_NO_QUIET_WRITE_BACKS: ";
+        Switches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoQuietWriteBacks, !quiet);
+        Require(resources->Revalidate(compute), "a read-only watched build did not prove current");
+        Memory::BreakProofs();
+        Require(resources->Revalidate(compute), "a read-only watched build did not prove current after a break");
+        expect(exits(), arm + "a proved build did not take the epoch exit");
+        std::memcpy(snapshot.data(), reinterpret_cast<const void*>(element), snapshot.size());
+        const bool watched = Memory::Watched(element, snapshot.size());
+        Memory::WriteChanged(element, snapshot, snapshot);
+        const bool kept = exits();
+        std::cout << arm << "an unchanged write-back over unwritten " << (watched ? "watched" : "compared") << " bytes " << (kept ? "kept" : "ended") << " the proof\n";
+        expect(kept == (quiet && watched), arm + (kept ? "an unchanged write-back kept the proof with the switch set or over bytes the tracker does not watch" : "an unchanged write-back over unwritten watched bytes ended the proof"));
+        *word = *word + 0x1234u;
+        Memory::WriteChanged(element, snapshot, snapshot);
+        expect(!exits(), arm + "the epoch exit reused a proof across a CPU write under an unchanged write-back");
+        expect(std::memcmp(reinterpret_cast<const void*>(element), snapshot.data(), snapshot.size()) != 0, arm + "an unchanged write-back replaced a CPU write");
+    }
+    Switches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoQuietWriteBacks, false);
+    resources.reset();
+    removeBlock();
+    static_cast<void>(HostImportFor(context, address, bytes));
+    recorder.Sync();
+    Require(failures.empty(), failures);
+    return true;
+}
+
 bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     if (context.hostImportAlignment == 0) {
@@ -17622,6 +17717,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--imported-epoch-reuse-only") {
             if (!importedEpochReuseTests(device, recorder)) return 77;
             std::cout << "imported epoch reuse tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--quiet-write-back-epoch-only") {
+            if (!quietWriteBackEpochTests(device, recorder)) return 77;
+            std::cout << "quiet write-back epoch tests passed\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--read-written-staging-only") {

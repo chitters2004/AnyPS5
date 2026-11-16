@@ -310,6 +310,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_imported_epoch_reuse PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_quiet_write_back_epoch COMMAND agc_driver_recorder_tests --quiet-write-back-epoch-only)
+    set_tests_properties(agc_quiet_write_back_epoch PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_quiet_write_back_epoch PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_imported_epoch_reuse_verify COMMAND agc_driver_recorder_tests --imported-epoch-reuse-only)
     set_tests_properties(agc_imported_epoch_reuse_verify PROPERTIES ENVIRONMENT "APS5_VERIFY_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "missed the exit, by input moved: [^\n]*imports 1, allocations 1.*imported epoch reuse tests passed"
