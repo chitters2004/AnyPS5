@@ -6926,6 +6926,16 @@ void CountShaderRead(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory me
     reportShaderReads();
 }
 
+ShaderReadTotal ShaderReadTotalForTests(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory) {
+    const auto& tally = ReadCounters().tallies[readTally(use, path, memory)];
+    return {tally.bytes.load(std::memory_order_relaxed), tally.bindings.load(std::memory_order_relaxed)};
+}
+
+ShaderReadTotal AddressExtentTotalForTests(ShaderReadUse use, ShaderReadMemory memory) {
+    const auto& tally = ReadCounters().tallies[extentTally(use, memory)];
+    return {tally.bytes.load(std::memory_order_relaxed), tally.bindings.load(std::memory_order_relaxed)};
+}
+
 void CountDrawSnapshotRead(std::uint64_t bytes) {
     addTally(SnapshotTally, bytes);
 }

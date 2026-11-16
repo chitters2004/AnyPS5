@@ -252,6 +252,12 @@ enum class ShaderReadMemory : std::uint8_t { Import, Device, Host, Count };
 bool ShaderReadsCounted();
 void CountShaderRead(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory, std::uint64_t bytes);
 void CountDrawSnapshotRead(std::uint64_t bytes);
+struct ShaderReadTotal {
+    std::uint64_t bytes = 0;
+    std::uint64_t bindings = 0;
+};
+ShaderReadTotal ShaderReadTotalForTests(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory memory);
+ShaderReadTotal AddressExtentTotalForTests(ShaderReadUse use, ShaderReadMemory memory);
 ShaderReadMemory BufferReadMemory(const Buffer& buffer);
 bool TraceCopyBacks();
 void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::optional<std::uint8_t> landing);
