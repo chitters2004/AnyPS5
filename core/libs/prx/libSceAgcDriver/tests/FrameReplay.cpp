@@ -914,6 +914,16 @@ void testRewindFilledAcrossChunks(const std::filesystem::path& tool) {
     check(replayed(tool, checkCapture(0), layout.label, 4) == std::vector<std::byte>{std::byte{Done}, std::byte{0}, std::byte{0}, std::byte{0}}, "the replay resumed the REWIND before the delta restored the buffer its tail jumps to");
 }
 
+bool deltaStoredBytes(const FrameCaptureReader& reader, const std::uint32_t* address) {
+    return std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
+        if (chunk.kind != FrameMemoryKind::Delta || chunk.address >= at(address) + 4 || at(address) >= chunk.address + chunk.bytes) return false;
+        const auto bytes = reader.Read(chunk);
+        const auto first = std::max(chunk.address, at(address));
+        const auto last = std::min(chunk.address + chunk.bytes, at(address) + 4);
+        return std::any_of(bytes.begin() + static_cast<std::ptrdiff_t>(first - chunk.address), bytes.begin() + static_cast<std::ptrdiff_t>(last - chunk.address), [](std::byte value) { return value != std::byte{0}; });
+    });
+}
+
 void checkGpuStoreBehindRewind(const std::filesystem::path& tool, bool halfStored) {
     constexpr std::uint32_t ComputeQueue = 0x20;
     constexpr std::uint32_t Half = 0x5a5au;
@@ -969,14 +979,9 @@ void checkGpuStoreBehindRewind(const std::filesystem::path& tool, bool halfStore
             return value == Done;
         });
     };
-    const auto touched = [&](const std::uint32_t* address) {
-        return std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
-            return chunk.kind == FrameMemoryKind::Delta && chunk.address < at(address) + 4 && at(address) < chunk.address + chunk.bytes;
-        });
-    };
     check(std::atomic_ref<std::uint32_t>(*released).load(std::memory_order_acquire) == releasedValue, "the graphics queue did not store the label the test expects");
     check(delta(title), "the memory delta lost the word the title wrote beside the label");
-    check(!touched(released), "the memory delta holds bytes of the label the graphics queue's RELEASE_MEM and DMA_DATA wrote, so the replay restores them before the work that produces them");
+    check(!deltaStoredBytes(reader, released), "the memory delta holds bytes of the label the graphics queue's RELEASE_MEM and DMA_DATA wrote, so the replay restores them before the work that produces them");
     check(replayed(tool, capture, layout.secondTarget, DataBytes) == read, "the replay released the compute queue before the copy ahead of the label it waits on");
 }
 
@@ -1247,9 +1252,7 @@ void testFillWordHalfStored(const std::filesystem::path& tool) {
     check(std::any_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
         return chunk.kind == FrameMemoryKind::Delta && chunk.address <= at(title) && at(title) + 4 <= chunk.address + chunk.bytes;
     }), "the memory delta lost the word the title wrote beside the filled word");
-    check(std::none_of(reader.Chunks().begin(), reader.Chunks().end(), [&](const auto& chunk) {
-        return chunk.kind == FrameMemoryKind::Delta && chunk.address < at(word) + 4 && at(word) < chunk.address + chunk.bytes;
-    }), "the memory delta holds bytes of a word the fill and a later 2-byte store wrote, so the replay restores them before that work");
+    check(!deltaStoredBytes(reader, word), "the memory delta holds bytes of a word the fill and a later 2-byte store wrote, so the replay restores them before that work");
     const auto replayedWord = replayed(tool, capture, word, 4);
     std::uint32_t value = 0;
     std::memcpy(&value, replayedWord.data(), sizeof(value));
