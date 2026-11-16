@@ -1,0 +1,219 @@
+#include "prx/libSceAudioOut/include/AudioOut2.hpp"
+#include <algorithm>
+#include <array>
+#include <cerrno>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <new>
+#include <stdexcept>
+#include <string>
+#include "SceTypes.hpp"
+#include "prx/libc/include/General.hpp"
+#include "AudioOut2Internal.hpp"
+
+namespace {
+
+struct GuestVbapParams {
+    const AudioOut2Position* positions;
+    std::uint32_t numSpeakers;
+    std::uint8_t is3d;
+    void* memory;
+    std::size_t memorySize;
+    std::uint32_t reserved;
+};
+
+constexpr std::uint32_t MaxSpeakers = 32;
+constexpr std::uint32_t AmbisonicsChannelFlag = 0x40;
+constexpr std::uint32_t MaxAmbisonicsOrder = 5;
+
+struct SpeakerArray {
+    std::uint32_t magic;
+    std::uint32_t numSpeakers;
+    AudioOut2Position directions[MaxSpeakers];
+};
+constexpr std::uint32_t SpeakerArrayMagic = 0x53504b41;
+
+constexpr int AmbisonicsErrorInvalidParam = static_cast<int>(0x80268001);
+constexpr std::uint32_t AmbisonicsKindAcn = 0;
+constexpr std::uint32_t AmbisonicsKindFuma = 1;
+constexpr std::int32_t MaxFumaOrder = 3;
+
+struct AmbisonicsEncodeParam {
+    std::uint32_t kind;
+    std::int32_t order;
+};
+
+struct FumaChannel {
+    std::uint32_t acn;
+    double weight;
+};
+
+const FumaChannel FumaChannels[16] = {
+    {0, 1 / std::sqrt(2.0)}, {3, 1}, {1, 1}, {2, 1},
+    {6, 1}, {7, 2 / std::sqrt(3.0)}, {5, 2 / std::sqrt(3.0)}, {8, 2 / std::sqrt(3.0)}, {4, 2 / std::sqrt(3.0)},
+    {12, 1}, {13, std::sqrt(45.0 / 32.0)}, {11, std::sqrt(45.0 / 32.0)}, {14, 3 / std::sqrt(5.0)}, {10, 3 / std::sqrt(5.0)}, {15, std::sqrt(8.0 / 5.0)}, {9, std::sqrt(8.0 / 5.0)},
+};
+
+SpeakerArray& Array(AudioOut2SpeakerArrayHandle handle) {
+    auto* array = static_cast<SpeakerArray*>(handle);
+    if (array == nullptr || array->magic != SpeakerArrayMagic) throw std::invalid_argument("invalid speaker array handle");
+    return *array;
+}
+
+float Sn3d(std::uint32_t acn, const AudioOut2Position& direction) {
+    const int n = static_cast<int>(std::sqrt(static_cast<double>(acn)));
+    const int m = static_cast<int>(acn) - n * n - n;
+    const int am = std::abs(m);
+    const double length = std::sqrt(double(direction.x) * direction.x + double(direction.y) * direction.y + double(direction.z) * direction.z);
+    const double sinEl = length > 0 ? direction.z / length : 0;
+    const double cosEl = std::sqrt(std::max(0.0, 1 - sinEl * sinEl));
+    const double azimuth = std::atan2(direction.y, direction.x);
+    double legendre = 1;
+    for (int i = 1; i <= am; ++i) legendre *= (2 * i - 1) * cosEl;
+    if (n > am) {
+        double previous = legendre;
+        double current = sinEl * (2 * am + 1) * legendre;
+        for (int l = am + 2; l <= n; ++l) {
+            const double next = (sinEl * (2 * l - 1) * current - (l + am - 1) * previous) / (l - am);
+            previous = current;
+            current = next;
+        }
+        legendre = current;
+    }
+    double ratio = 1;
+    for (int i = n - am + 1; i <= n + am; ++i) ratio /= i;
+    const double norm = std::sqrt((m == 0 ? 1.0 : 2.0) * ratio);
+    return static_cast<float>(norm * legendre * (m < 0 ? std::sin(am * azimuth) : std::cos(am * azimuth)));
+}
+
+}
+
+static bool ReadGuest(void* local, const void* guest, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool copied = GuestCopyIn_nid_no_patch(local, guest, bytes);
+    errno = savedErrno;
+    return copied;
+}
+
+static bool WriteGuest(void* guest, const void* local, std::size_t bytes) {
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(guest, local, bytes);
+    errno = savedErrno;
+    return copied;
+}
+
+extern "C" {
+
+int APS5_VABI sceAudioOut2SpeakerArrayCreate(AudioOut2SpeakerArrayHandle* handle, const void* vbap_params, const void* ambi_params) {
+    if (handle == nullptr || vbap_params == nullptr) APS5_INVALID_ARG_EX;
+    GuestVbapParams params{};
+    if (!ReadGuest(&params, vbap_params, sizeof(params))) APS5_INVALID_ARG_EX;
+    if (params.positions == nullptr || params.numSpeakers == 0 || params.numSpeakers > MaxSpeakers || params.memory == nullptr ||
+        params.memorySize < sizeof(SpeakerArray) || reinterpret_cast<std::uintptr_t>(params.memory) % alignof(SpeakerArray) != 0) {
+        APS5_INVALID_ARG_EX;
+    }
+    SpeakerArray array{SpeakerArrayMagic, params.numSpeakers, {}};
+    if (!ReadGuest(array.directions, params.positions, params.numSpeakers * sizeof(AudioOut2Position))) APS5_INVALID_ARG_EX;
+    if (!WriteGuest(params.memory, &array, sizeof(array))) APS5_INVALID_ARG_EX;
+    const AudioOut2SpeakerArrayHandle created = params.memory;
+    if (!WriteGuest(handle, &created, sizeof(created))) APS5_INVALID_ARG_EX;
+    return 0;
+}
+
+int APS5_VABI sceAudioOut2SpeakerArrayDestroy(AudioOut2SpeakerArrayHandle handle) {
+    Array(handle).magic = 0;
+    return 0;
+}
+
+int APS5_VABI sceAudioOut2GetSpeakerArrayAmbisonicsCoefficients(AudioOut2SpeakerArrayHandle handle, uint32_t ambisonics_channel, float* coefficients, uint32_t num_coefficients) {
+    const auto& array = Array(handle);
+    if (coefficients == nullptr || num_coefficients != array.numSpeakers) APS5_INVALID_ARG_EX;
+    const std::uint32_t acn = ambisonics_channel & ~AmbisonicsChannelFlag;
+    if ((ambisonics_channel & AmbisonicsChannelFlag) == 0 || acn >= (MaxAmbisonicsOrder + 1) * (MaxAmbisonicsOrder + 1)) {
+        throw std::invalid_argument("unsupported ambisonics channel " + std::to_string(ambisonics_channel));
+    }
+    const auto order = static_cast<std::uint32_t>(std::sqrt(static_cast<double>(acn)));
+    const std::uint32_t decodable = std::max<std::uint32_t>(1, (array.numSpeakers - 1) / 2);
+    std::array<float, MaxSpeakers> local{};
+    for (std::uint32_t speaker = 0; speaker < array.numSpeakers; ++speaker) {
+        local[speaker] = order > decodable ? 0.0f : Sn3d(acn, array.directions[speaker]) / static_cast<float>(array.numSpeakers);
+    }
+    if (!WriteGuest(coefficients, local.data(), array.numSpeakers * sizeof(float))) APS5_INVALID_ARG_EX;
+    return 0;
+}
+
+int APS5_VABI sceAudioOut2GetSpeakerArrayCoefficients(AudioOut2SpeakerArrayHandle handle, AudioOut2Position pos, float spread, float* coefficients, uint32_t num_coefficients, uint8_t height_aware, float downmix_spread_radius) {
+    (void)pos;
+    (void)spread;
+    (void)height_aware;
+    (void)downmix_spread_radius;
+    const SpeakerArray& array = Array(handle);
+    if (coefficients == nullptr || num_coefficients != array.numSpeakers) APS5_INVALID_ARG_EX;
+    std::fill_n(coefficients, array.numSpeakers, 0.0f);
+    if (array.numSpeakers > 0) coefficients[0] = 1.0f;
+    if (array.numSpeakers > 1) coefficients[1] = 1.0f;
+    return 0;
+}
+
+int APS5_VABI sceAudioOut2GetAmbisonicsEncodeCoefficients(const void* params, float* coefficients, AudioOut2Position direction) {
+    if (params == nullptr || coefficients == nullptr) return AmbisonicsErrorInvalidParam;
+    AmbisonicsEncodeParam localParam{};
+    if (!ReadGuest(&localParam, params, sizeof(localParam))) return AmbisonicsErrorInvalidParam;
+    const auto* param = &localParam;
+    const bool acn = param->kind == AmbisonicsKindAcn;
+    const std::int32_t order = param->order;
+    if (!acn && param->kind != AmbisonicsKindFuma) return AmbisonicsErrorInvalidParam;
+    if (!acn && order > MaxFumaOrder) return AmbisonicsErrorInvalidParam;
+    if (!acn && order < 0) throw std::invalid_argument("negative FuMa ambisonics order " + std::to_string(order));
+    const float lengthSquared = direction.x * direction.x + direction.y * direction.y + direction.z * direction.z;
+    const bool zero = !(lengthSquared > 0.0f);
+    if (acn && (order < 0 || order > static_cast<std::int32_t>(MaxAmbisonicsOrder))) {
+        if (zero) throw std::invalid_argument("zero direction with ambisonics order " + std::to_string(order));
+        return 0;
+    }
+    const auto channels = static_cast<std::uint32_t>((order + 1) * (order + 1));
+    std::array<float, (MaxAmbisonicsOrder + 1) * (MaxAmbisonicsOrder + 1)> local{};
+    if (zero) {
+        local[0] = acn ? 1.0f : static_cast<float>(FumaChannels[0].weight);
+    } else {
+        const AudioOut2Position axes{direction.z, -direction.x, direction.y};
+        for (std::uint32_t channel = 0; channel < channels; ++channel) {
+            local[channel] = acn ? Sn3d(channel, axes) : static_cast<float>(FumaChannels[channel].weight * Sn3d(FumaChannels[channel].acn, axes));
+        }
+    }
+    if (!WriteGuest(coefficients, local.data(), channels * sizeof(float))) return AmbisonicsErrorInvalidParam;
+    return 0;
+}
+
+size_t APS5_VABI sceAudioOut2GetSpeakerArrayMemorySize(uint32_t num_speakers, uint8_t is_3d, uint8_t is_ambisonics) {
+    (void)is_3d;
+    (void)is_ambisonics;
+    if (num_speakers == 0 || num_speakers > MaxSpeakers) APS5_INVALID_ARG_EX;
+    return sizeof(SpeakerArray);
+}
+
+int APS5_VABI sceAudioOut2GetSpeakerInfo(AudioOut2SpeakerInfo* info, uint32_t flags) {
+    constexpr int ErrorInvalidParam = static_cast<int>(0x80268001);
+    constexpr int ErrorNotInitialized = static_cast<int>(0x80268006);
+    constexpr int ErrorInvalidPointer = static_cast<int>(0x8026800C);
+    constexpr std::uint32_t MaxFlags = 1;
+    if (!AudioOut2IsInitialized_nid_no_patch()) return ErrorNotInitialized;
+    if (!info) return ErrorInvalidPointer;
+    if (flags > MaxFlags) return ErrorInvalidParam;
+    constexpr std::uint8_t SpeakerTypeTelevision = 0;
+    constexpr std::uint32_t FrontLeftAndRight = 0x3;
+    constexpr AudioOut2SpeakerAngle NoSpeaker = {-360, -360};
+    AudioOut2SpeakerInfo result{};
+    result.type = SpeakerTypeTelevision;
+    result.available_bits = FrontLeftAndRight;
+    for (auto& angle : result.speaker_angle) angle = NoSpeaker;
+    result.speaker_angle[0] = {30, 0};
+    result.speaker_angle[1] = {-30, 0};
+    const int savedErrno = errno;
+    const bool copied = GuestCopyOut_nid_no_patch(info, &result, sizeof(result));
+    errno = savedErrno;
+    return copied ? 0 : ErrorInvalidPointer;
+}
+
+}
