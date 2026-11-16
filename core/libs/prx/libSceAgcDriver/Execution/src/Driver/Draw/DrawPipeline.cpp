@@ -47,6 +47,31 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+bool WaitTimers() {
+    static const bool on = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return on;
+}
+
+struct WaitTally {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::uint64_t> ns{0};
+    void Add(std::chrono::steady_clock::time_point since) {
+        count.fetch_add(1, std::memory_order_relaxed);
+        ns.fetch_add(elapsedNs(since), std::memory_order_relaxed);
+    }
+};
+
+std::atomic<std::uint64_t> finisherSpinNs{0};
+WaitTally finisherSleepWaits;
+std::array<WaitTally, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> finisherDrainWaits;
+constexpr std::array<const char*, static_cast<std::size_t>(DrawFinisher::WaitSite::Count)> WaitSiteNames{"reloc", "lookup", "reads", "kept", "packet", "pipeline", "submission", "other"};
+WaitTally producerSettles;
+WaitTally producerRoom;
+WaitTally finisherCommitterRoom;
+WaitTally workerCommitterRoom;
+WaitTally finisherPipelineDrains;
+WaitTally workerPipelineDrains;
+
 std::atomic<std::uint64_t> finisherJobs{0};
 std::atomic<std::uint64_t> finisherBusyCpuNs{0};
 std::atomic<std::uint64_t> finisherBusyWallNs{0};
@@ -387,7 +412,10 @@ void DrawFinisher::Enqueue(Job job, Pending held, std::uint8_t tag) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    const bool full = jobs.size() >= depth && WaitTimers();
+    const auto fullStart = full ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (full) producerRoom.Add(fullStart);
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -410,13 +438,18 @@ void DrawFinisher::run() {
         Job* job = nullptr;
         bool failed = false;
         const auto idleSince = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto spinStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        if (timed) finisherSpinNs.fetch_add(elapsedNs(spinStart), std::memory_order_relaxed);
         {
             std::unique_lock lock(mutex);
             if (timed && jobs.empty()) finisherSleeps.fetch_add(1, std::memory_order_relaxed);
+            const bool sleeps = timed && jobs.empty();
+            const auto sleepStart = sleeps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             sleeping = true;
             wake.wait(lock, [&] { return !jobs.empty(); });
             sleeping = false;
+            if (sleeps) finisherSleepWaits.Add(sleepStart);
             job = &jobs.front();
             failed = failure != nullptr;
         }
@@ -452,19 +485,26 @@ void DrawFinisher::Settle() {
         return;
     }
     std::unique_lock lock(mutex);
+    if (jobs.empty()) return;
+    const auto start = WaitTimers() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     idle.wait(lock, [&] { return jobs.empty(); });
+    if (WaitTimers()) producerSettles.Add(start);
 }
 
-void DrawFinisher::Drain() {
+void DrawFinisher::Drain(WaitSite site) {
     if (OnFinisherThread()) return;
     if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const bool timed = WaitTimers() && Busy();
+    const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (Sequenced()) {
         ring->Drain();
+        if (timed) finisherDrainWaits[static_cast<std::size_t>(site)].Add(start);
         return;
     }
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (timed) finisherDrainWaits[static_cast<std::size_t>(site)].Add(start);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
@@ -714,7 +754,7 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 
 void DrawPipeline::enqueue(Item item) {
     if (!DrawFinisher::Sequenced()) {
-        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Pipeline);
         admit(std::move(item));
         return;
     }
@@ -733,7 +773,7 @@ void DrawPipeline::enqueue(Item item) {
     } else if (Active()) {
         const bool ringReads = CommitterPrepare();
         if (!ringReads) item.prepare = nullptr;
-        if (!ringReads && !item.reads.empty() && DrawFinisher::Busy()) finisher.Drain();
+        if (!ringReads && !item.reads.empty() && DrawFinisher::Busy()) finisher.Drain(DrawFinisher::WaitSite::Pipeline);
         if (item.prepare || DrawFinisher::Busy()) {
             const bool profile = pipelineStats();
             const auto pushStart = profile && item.prepare ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -767,7 +807,7 @@ void DrawPipeline::enqueue(Item item) {
         }
         item.sequence = finisher.Bypass();
     } else if (DrawFinisher::Busy()) {
-        finisher.Drain();
+        finisher.Drain(DrawFinisher::WaitSite::Pipeline);
     }
     admit(std::move(item));
 }
@@ -797,6 +837,7 @@ void DrawPipeline::admit(Item item) {
             idle.wait(lock);
         }
         fullWaitNs += elapsedNs(start);
+        if (WaitTimers()) (DrawFinisher::OnFinisherThread() ? finisherCommitterRoom : workerCommitterRoom).Add(start);
         rethrowFailure();
     }
     if (item.sequence != 0) {
@@ -906,9 +947,46 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         const auto workerNs = workerStarvedNs.exchange(0, std::memory_order_relaxed);
         AgcDriver::ProfilePrint_nid_no_patch("[committer-idle] (10 s): %llu waits for an item while the finisher held work (%.1f ms), %llu while it was idle (%.1f ms)\n", static_cast<unsigned long long>(preparerWaits), static_cast<double>(preparerNs) / 1e6, static_cast<unsigned long long>(workerWaits), static_cast<double>(workerNs) / 1e6);
     }
+    const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto finisherSpin = take(finisherSpinNs);
+    const auto finisherSleepCount = take(finisherSleepWaits.count);
+    const auto finisherSleepNs = take(finisherSleepWaits.ns);
+    std::uint64_t drainCount = 0, drainNs = 0;
+    std::string siteText;
+    for (std::size_t i = 0; i < finisherDrainWaits.size(); ++i) {
+        const auto count = take(finisherDrainWaits[i].count);
+        const auto ns = take(finisherDrainWaits[i].ns);
+        drainCount += count;
+        drainNs += ns;
+        char item[64];
+        std::snprintf(item, sizeof(item), "%s %s %llu (%.1f ms)", i == 0 ? "" : ",", WaitSiteNames[i], static_cast<unsigned long long>(count), ms(ns));
+        siteText += item;
+    }
+    const auto finisherRoomCount = take(finisherCommitterRoom.count);
+    const auto finisherRoomNs = take(finisherCommitterRoom.ns);
+    const auto finisherPipelineCount = take(finisherPipelineDrains.count);
+    const auto finisherPipelineNs = take(finisherPipelineDrains.ns);
+    const auto workerRoomCount = take(workerCommitterRoom.count);
+    const auto workerRoomNs = take(workerCommitterRoom.ns);
+    const auto workerPipelineCount = take(workerPipelineDrains.count);
+    const auto workerPipelineNs = take(workerPipelineDrains.ns);
+    const auto settleCount = take(producerSettles.count);
+    const auto settleNs = take(producerSettles.ns);
+    auto roomCount = take(producerRoom.count);
+    auto roomNs = take(producerRoom.ns);
+    char finisherText[160];
+    if (DrawFinisher::Sequenced()) {
+        roomCount += ringWork.fullWaits;
+        roomNs += ringWork.fullWaitNs;
+        std::snprintf(finisherText, sizeof(finisherText), "finisher waited %.1f ms for jobs (ring preparers, %llu sleeps; spin and sleep not split)", ms(ringWork.idleNs), static_cast<unsigned long long>(ringWork.preparerSleeps));
+    } else {
+        std::snprintf(finisherText, sizeof(finisherText), "finisher waited %.1f ms for jobs (spin %.1f ms, asleep %.1f ms in %llu sleeps)", ms(finisherSpin + finisherSleepNs), ms(finisherSpin), ms(finisherSleepNs), static_cast<unsigned long long>(finisherSleepCount));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[pipeline-waits] (10 s): committer waited %.1f ms for work (spin %.1f ms, asleep %.1f ms in %llu sleeps) and committed for %.1f ms; %s, %.1f ms for committer room in %llu waits, %.1f ms on pipeline drains in %llu; worker waited %.1f ms for committer room in %llu waits, %.1f ms on pipeline drains in %llu; producers waited %.1f ms on the finisher: drains %llu (%.1f ms) by site:%s; settles %llu (%.1f ms), full %llu (%.1f ms)\n", ms(idleSpinNs + idleSleepNs), ms(idleSpinNs), ms(idleSleepNs), static_cast<unsigned long long>(idleSleeps), ms(commitNs), finisherText, ms(finisherRoomNs), static_cast<unsigned long long>(finisherRoomCount), ms(finisherPipelineNs), static_cast<unsigned long long>(finisherPipelineCount), ms(workerRoomNs), static_cast<unsigned long long>(workerRoomCount), ms(workerPipelineNs), static_cast<unsigned long long>(workerPipelineCount), ms(drainNs + settleNs + roomNs), static_cast<unsigned long long>(drainCount), ms(drainNs), siteText.c_str(), static_cast<unsigned long long>(settleCount), ms(settleNs), static_cast<unsigned long long>(roomCount), ms(roomNs));
     const auto vk = Graphics::TakeVkDrawCounts();
     AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()));
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = idleSpinNs = idleSleepNs = idleSleeps = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -925,15 +1003,25 @@ void DrawPipeline::run() {
         const bool starved = pipelineStats() && outstanding.load(std::memory_order_acquire) == 0;
         const bool preparing = starved && DrawFinisher::Busy();
         const auto starvedAt = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool timed = WaitTimers();
+        const auto spinStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+        const auto spun = timed ? elapsedNs(spinStart) : 0;
         {
             std::unique_lock lock(mutex);
+            const bool sleeps = timed && items.empty() && !closing;
+            const auto sleepStart = sleeps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             committerWaiting = true;
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (starved) {
                 (preparing ? preparerStarved : workerStarved).fetch_add(1, std::memory_order_relaxed);
                 (preparing ? preparerStarvedNs : workerStarvedNs).fetch_add(elapsedNs(starvedAt), std::memory_order_relaxed);
+            }
+            idleSpinNs += spun;
+            if (sleeps) {
+                idleSleepNs += elapsedNs(sleepStart);
+                ++idleSleeps;
             }
             if (items.empty()) break;
             commit = stopped ? nullptr : &items.front().commit;
@@ -1007,7 +1095,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
-    if (finisherBusy) DrawFinisher::Get().Drain();
+    if (finisherBusy) DrawFinisher::Get().Drain(DrawFinisher::WaitSite::Pipeline);
     else DrawFinisher::Get().RethrowFailure();
     DrawFinisher::Get().AwaitTurn();
     if (!Busy()) {
@@ -1027,6 +1115,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
+    if (WaitTimers()) (DrawFinisher::OnFinisherThread() ? finisherPipelineDrains : workerPipelineDrains).Add(start);
     rethrowFailure();
 }
 

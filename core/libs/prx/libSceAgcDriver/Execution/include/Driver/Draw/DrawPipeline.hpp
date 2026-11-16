@@ -160,6 +160,9 @@ private:
     std::atomic<std::uint64_t> workerStarved{0};
     std::atomic<std::uint64_t> workerStarvedNs{0};
     std::uint64_t lockWaitNs = 0;
+    std::uint64_t idleSpinNs = 0;
+    std::uint64_t idleSleepNs = 0;
+    std::uint64_t idleSleeps = 0;
     std::thread thread;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
@@ -189,6 +192,7 @@ public:
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, End, Count };
+    enum class WaitSite : std::uint32_t { Relocation, Lookup, Reads, Kept, Packet, Pipeline, Submission, Other, Count };
     static void NoteDrain(DrainSite site, bool drained);
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
@@ -209,7 +213,7 @@ public:
     void Enqueue(Job job, Pending held, std::uint8_t tag);
     std::uint64_t Bypass();
     DrawPipeline::QueuedWrite StoredBytes(std::uint64_t address, std::size_t bytes, std::span<std::byte> out);
-    void Drain();
+    void Drain(WaitSite site = WaitSite::Other);
     void Settle();
     void ReleaseRan();
     void RethrowFailure();

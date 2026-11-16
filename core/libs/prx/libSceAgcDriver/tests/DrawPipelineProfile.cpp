@@ -59,12 +59,12 @@ public:
         return {std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
     }
 
-    std::string ReadReport() const {
+    std::string ReadReport(std::string_view prefix = "[draw] pipelined ") const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
             std::ifstream file(path, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            const auto begin = text.find("[draw] pipelined ");
+            const auto begin = text.find(prefix);
             if (begin != std::string::npos) {
                 const auto end = text.find('\n', begin);
                 if (end != std::string::npos) return text.substr(begin, end - begin);
@@ -85,6 +85,13 @@ std::size_t Count(std::string_view text, std::string_view value) {
     return count;
 }
 
+double Number(std::string_view text, std::string_view before, std::size_t skip = 0) {
+    auto at = text.find(before);
+    for (; skip != 0 && at != std::string_view::npos; --skip) at = text.find(before, at + before.size());
+    if (at == std::string_view::npos) throw std::runtime_error("pipeline wait report lost: " + std::string(before));
+    return std::stod(std::string(text.substr(at + before.size(), 32)));
+}
+
 void TestReport() {
     using AgcDriver::DriverDetail::DrawPipeline;
     auto& pipeline = DrawPipeline::Queue0();
@@ -94,6 +101,24 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
+        using AgcDriver::DriverDetail::DrawFinisher;
+        pipeline.Enqueue([] {}, {}, 0, {}, {}, false);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        auto& finisher = DrawFinisher::Get();
+        finisher.Enqueue([] { std::this_thread::sleep_for(std::chrono::milliseconds(200)); });
+        finisher.Drain(DrawFinisher::WaitSite::Relocation);
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        finisher.Enqueue([] {});
+        finisher.Drain(DrawFinisher::WaitSite::Pipeline);
+        pipeline.Enqueue([] { std::this_thread::sleep_for(std::chrono::milliseconds(150)); }, {}, 0, {}, {}, false);
+        for (std::size_t i = 0; i < DrawPipeline::Depth(); ++i) pipeline.Enqueue([] {}, {}, 0, {}, {}, false);
+        pipeline.Enqueue([] { std::this_thread::sleep_for(std::chrono::milliseconds(100)); }, {}, 0, {}, {}, false);
+        pipeline.Drain(DrawPipeline::DrainReason::Flush);
+        finisher.Enqueue([&] {
+            pipeline.Enqueue([] { std::this_thread::sleep_for(std::chrono::milliseconds(250)); }, {}, 0, {}, {}, false);
+            pipeline.Drain(DrawPipeline::DrainReason::Flush);
+        });
+        finisher.Drain(DrawFinisher::WaitSite::Lookup);
         pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
@@ -116,6 +141,28 @@ void TestReport() {
     const auto text = capture.Text();
     const auto idle = text.find("[committer-idle] (10 s): ");
     Check(idle != std::string::npos && text.find(" while the finisher held work (", idle) != std::string::npos && text.find(" while it was idle (", idle) != std::string::npos, "the committer idle counters were not reported");
+    const auto waits = capture.ReadReport("[pipeline-waits] ");
+    std::cout << waits << '\n';
+    Check(Number(waits, "committer waited ") >= 250.0, "committer wait for work was not timed");
+    Check(Number(waits, "committer waited ") <= 10500.0, "committer wait for work exceeds the report window");
+    Check(Number(waits, "asleep ") + Number(waits, "spin ") >= 250.0, "committer spin and sleep do not add up to its wait");
+    Check(Number(waits, " ms in ") >= 1.0, "committer sleeps were not counted");
+    Check(Number(waits, "finisher waited ") >= 50.0, "finisher wait for jobs was not timed");
+    Check(Number(waits, "by site: reloc ") == 1.0, "relocation drain was not counted at its site");
+    const auto reloc = waits.substr(waits.find("by site: reloc 1 (") + 18);
+    Check(std::stod(reloc) >= 150.0, "relocation drain wait was not timed");
+    Check(Number(waits, ", lookup ") == 1.0, "a drain was counted at the wrong site");
+    Check(Number(waits, ", pipeline ") == 1.0, "a drain was counted at the wrong site");
+    Check(Number(waits, "worker waited ") >= 100.0, "worker wait for committer room was not timed");
+    Check(Number(waits, "for committer room in ", 1) == 1.0, "worker waits for committer room were not counted");
+    Check(Number(waits, "for committer room in ") == 0.0, "a worker wait for committer room was counted on the finisher");
+    Check(Number(waits, "on pipeline drains in ") == 1.0, "finisher pipeline drains were not counted on the finisher");
+    Check(Number(waits, "on pipeline drains in ", 1) == 1.0, "worker pipeline drains were not counted on the worker");
+    Check(Number(waits, "room in 0 waits, ") >= 200.0, "finisher pipeline drain was not timed on the finisher");
+    Check(Number(waits, "room in 1 waits, ") >= 50.0 && Number(waits, "room in 1 waits, ") < 200.0, "worker pipeline drain was not timed on the worker");
+    Check(Number(waits, ", other ") == 0.0, "a drain was counted at the wrong site");
+    Check(waits.find("ring preparers, ") != std::string::npos ? Number(waits, "ring preparers, ") >= 1.0 : Number(waits, " ms in ", 1) >= 1.0, "finisher sleeps were not counted");
+    Check(Count(waits, "[pipeline-waits]") == 1, "pipeline wait counters were printed more than once");
 }
 
 }
