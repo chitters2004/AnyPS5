@@ -55,6 +55,49 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+struct DrawSetCounters {
+    std::atomic<std::uint64_t> prepared{0};
+    std::atomic<std::uint64_t> indexed{0};
+    std::atomic<std::uint64_t> setsWritten{0};
+    std::atomic<std::uint64_t> poolCountsBuilt{0};
+    std::atomic<std::uint64_t> cacheHits{0};
+    std::atomic<std::uint64_t> cacheUploadHits{0};
+    std::atomic<std::uint64_t> cacheMisses{0};
+    std::atomic<std::uint64_t> cacheExpired{0};
+    std::atomic<std::uint64_t> cacheCleared{0};
+    std::atomic<std::uint64_t> uncachedFaultRecord{0};
+    std::atomic<std::uint64_t> uncachedInPlace{0};
+};
+
+DrawSetCounters drawSetCounters;
+
+void ReportDrawSets() {
+    static std::mutex reportMutex;
+    static std::chrono::steady_clock::time_point lastReport{};
+    static ShaderResources::DrawSetCounts last{};
+    std::unique_lock lock(reportMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (lastReport == std::chrono::steady_clock::time_point{}) {
+        lastReport = now;
+        last = ShaderResources::DrawSetTotals();
+        return;
+    }
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    const auto totals = ShaderResources::DrawSetTotals();
+    const auto delta = [](std::uint64_t value, std::uint64_t before) { return static_cast<unsigned long long>(value - before); };
+    const auto hits = totals.cacheHits - last.cacheHits;
+    const auto misses = totals.cacheMisses - last.cacheMisses;
+    const auto lookups = hits + misses;
+    std::fprintf(stderr, "[draw-sets] (10 s): %llu prepared (%llu indexed), %llu sets written, %llu pool counts built; cache %llu hits (%llu by uploaded bytes), %llu misses (%llu after the set expired), hit rate %.1f %%, %llu cleared, uncached %llu with a per-draw fault record, %llu with in-place buffers%s%s\n", delta(totals.prepared, last.prepared), delta(totals.indexed, last.indexed), delta(totals.setsWritten, last.setsWritten), delta(totals.poolCountsBuilt, last.poolCountsBuilt), static_cast<unsigned long long>(hits), delta(totals.cacheUploadHits, last.cacheUploadHits), static_cast<unsigned long long>(misses), delta(totals.cacheExpired, last.cacheExpired), lookups == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / static_cast<double>(lookups), delta(totals.cacheCleared, last.cacheCleared), delta(totals.uncachedFaultRecord, last.uncachedFaultRecord), delta(totals.uncachedInPlace, last.uncachedInPlace), RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex) ? ", index off" : "", RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache) ? ", cache off" : "");
+    last = totals;
+    lastReport = now;
+}
+
+}
+
+namespace {
+
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
 }
@@ -4338,6 +4381,7 @@ bool ShaderResources::reresolveElements(const std::vector<std::size_t>& elements
             descriptorImages[entry->position] = {VK_NULL_HANDLE, view, current->Layout()};
         }
         rebound = true;
+        drawSetCache->Clear();
         countIndex(IndexRebound);
     }
     const auto& log = lookupLog();
@@ -7143,30 +7187,71 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         return entry.inPlace != VK_NULL_HANDLE && element.pushByte < 0 && element.dataAllocation == static_cast<std::int64_t>(data);
     };
     const bool inPlaceData = std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.inPlace != VK_NULL_HANDLE && allocations[entry.allocation].pushByte < 0; });
+    const bool indexed = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex);
+    constexpr auto Unmoved = std::numeric_limits<std::uint32_t>::max();
+    thread_local std::vector<std::uint32_t>* overrideSlot = nullptr;
+    auto& overrideOf = ShaderRecompiler::ThreadOwned(overrideSlot);
+    thread_local std::vector<std::uint8_t>* toldSlot = nullptr;
+    auto& toldIn = ShaderRecompiler::ThreadOwned(toldSlot);
+    if (indexed) {
+        overrideOf.assign(allocations.size(), Unmoved);
+        toldIn.assign(allocations.size(), 0);
+        for (std::size_t entry = 0; entry < moved.size(); ++entry) {
+            const auto& movedEntry = moved[entry];
+            if (movedEntry.allocation >= allocations.size()) continue;
+            if (overrideOf[movedEntry.allocation] == Unmoved) overrideOf[movedEntry.allocation] = static_cast<std::uint32_t>(entry);
+            const auto& element = allocations[movedEntry.allocation];
+            if (movedEntry.inPlace != VK_NULL_HANDLE && element.pushByte < 0 && element.dataAllocation >= 0 && static_cast<std::size_t>(element.dataAllocation) < allocations.size()) toldIn[static_cast<std::size_t>(element.dataAllocation)] = 1;
+        }
+    }
+    if (const auto prepared = drawSetCounters.prepared.fetch_add(1, std::memory_order_relaxed) + 1; (prepared & 4095u) == 0) ReportDrawSets();
+    const bool caching = !RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache);
+    bool cacheable = caching && faultRecord == nullptr;
+    if (caching && faultRecord != nullptr) drawSetCounters.uncachedFaultRecord.fetch_add(1, std::memory_order_relaxed);
+    thread_local std::vector<std::byte>* stagedSlot = nullptr;
+    auto& staged = ShaderRecompiler::ThreadOwned(stagedSlot);
+    staged.clear();
+    thread_local std::vector<std::pair<std::size_t, std::size_t>>* stagedAtSlot = nullptr;
+    auto& stagedAt = ShaderRecompiler::ThreadOwned(stagedAtSlot);
+    stagedAt.clear();
+    if (indexed) drawSetCounters.indexed.fetch_add(1, std::memory_order_relaxed);
     for (std::size_t index = 0; index < allocations.size(); ++index) {
         const auto& item = allocations[index];
-        const auto override = std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
+        const auto override = indexed ? (overrideOf[index] == Unmoved ? moved.end() : moved.begin() + overrideOf[index]) : std::find_if(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return entry.allocation == index; });
         const bool words = override != moved.end() && !override->words.empty();
-        const bool offsets = inPlaceData && !item.guest && item.buffer != nullptr && std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return toldInData(entry, index); });
+        const bool offsets = inPlaceData && !item.guest && item.buffer != nullptr && (indexed ? toldIn[index] != 0 : std::any_of(moved.begin(), moved.end(), [&](const MovedBuffer& entry) { return toldInData(entry, index); }));
         if (words || (offsets && override == moved.end())) {
             const auto size = words ? override->size : item.size;
-            auto slice = recorder.DrawUpload(size);
-            if (words) std::memcpy(slice.bytes, override->words.data(), size);
-            else if (!item.dataWords.empty()) std::memcpy(slice.bytes, item.dataWords.data(), std::min(size, item.dataWords.size() * sizeof(std::uint32_t)));
-            else std::memcpy(slice.bytes, item.buffer->Bytes().data(), size);
-            for (const auto& patch : dataPatches) {
-                if (patch.allocation == index && patch.byte < size) slice.bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
-            }
-            if (offsets) {
-                for (const auto& entry : moved) {
-                    if (toldInData(entry, index) && allocations[entry.allocation].dataByte < size) slice.bytes[allocations[entry.allocation].dataByte] = static_cast<std::byte>(entry.adjustment);
+            const auto fill = [&](std::byte* bytes) {
+                if (words) std::memcpy(bytes, override->words.data(), size);
+                else if (!item.dataWords.empty()) std::memcpy(bytes, item.dataWords.data(), std::min(size, item.dataWords.size() * sizeof(std::uint32_t)));
+                else std::memcpy(bytes, item.buffer->Bytes().data(), size);
+                for (const auto& patch : dataPatches) {
+                    if (patch.allocation == index && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
                 }
-            }
+                if (offsets) {
+                    for (const auto& entry : moved) {
+                        if (toldInData(entry, index) && allocations[entry.allocation].dataByte < size) bytes[allocations[entry.allocation].dataByte] = static_cast<std::byte>(entry.adjustment);
+                    }
+                }
+            };
             selected.push_back(index);
-            keep({0, std::move(slice.buffer), slice.offset, size});
+            if (caching) {
+                const auto at = staged.size();
+                staged.resize(at + size);
+                fill(staged.data() + at);
+                stagedAt.emplace_back(result->snapshots.size(), at);
+                keep({0, nullptr, 0, size, VK_NULL_HANDLE, true});
+                continue;
+            }
+            auto slice = recorder.DrawUpload(size);
+            fill(slice.bytes);
+            keep({0, std::move(slice.buffer), slice.offset, size, VK_NULL_HANDLE, true});
             continue;
         }
         if (override != moved.end() && override->inPlace != VK_NULL_HANDLE) {
+            if (cacheable) drawSetCounters.uncachedInPlace.fetch_add(1, std::memory_order_relaxed);
+            cacheable = false;
             const auto begin = override->address - override->adjustment;
             const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(override->size, override->adjustment));
             recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DispatchElement);
@@ -7236,7 +7321,25 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
-    writeDrawSets(*result, selected, faultRecord);
+    auto hit = cacheable ? drawSetCache->Find(result->snapshots, selected, staged) : nullptr;
+    if (hit != nullptr) {
+        drawSetCounters.cacheHits.fetch_add(1, std::memory_order_relaxed);
+        if (!stagedAt.empty()) drawSetCounters.cacheUploadHits.fetch_add(1, std::memory_order_relaxed);
+        result = std::move(hit);
+    } else {
+        for (const auto& [snapshot, at] : stagedAt) {
+            auto& entry = result->snapshots[snapshot];
+            auto slice = recorder.DrawUpload(entry.bytes);
+            std::memcpy(slice.bytes, staged.data() + at, entry.bytes);
+            entry.buffer = std::move(slice.buffer);
+            entry.offset = slice.offset;
+        }
+        writeDrawSets(*result, selected, faultRecord);
+        if (cacheable) {
+            drawSetCounters.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+            drawSetCache->Insert(result, selected, staged);
+        }
+    }
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
         if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
@@ -7244,11 +7347,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
-    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<bool, 2> described{};
-    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
-    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+void ShaderResources::countDrawPools(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const {
+    described = {};
     for (auto& sizes : counts) sizes.clear();
     for (const auto& binding : bindings) {
         const auto set = setOf(binding);
@@ -7261,6 +7361,97 @@ void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::s
         else sizes.push_back({binding.layout.descriptorType, count});
     }
     for (auto& sizes : counts) std::sort(sizes.begin(), sizes.end(), [](const VkDescriptorPoolSize& a, const VkDescriptorPoolSize& b) { return a.type < b.type; });
+}
+
+ShaderResources::DrawSetCounts ShaderResources::DrawSetTotals() {
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    const auto& c = drawSetCounters;
+    return {load(c.prepared), load(c.indexed), load(c.setsWritten), load(c.poolCountsBuilt), load(c.cacheHits), load(c.cacheUploadHits), load(c.cacheMisses), load(c.cacheExpired), load(c.cacheCleared), load(c.uncachedFaultRecord), load(c.uncachedInPlace)};
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::DrawSetCache::Find(std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, std::span<const std::byte> staged) {
+    std::lock_guard lock(mutex);
+    for (std::size_t index = 0; index < used;) {
+        auto& entry = entries[index];
+        auto cached = entry.bindings.lock();
+        if (cached == nullptr) {
+            drawSetCounters.cacheExpired.fetch_add(1, std::memory_order_relaxed);
+            entry.bindings.reset();
+            std::rotate(entries.begin() + static_cast<std::ptrdiff_t>(index), entries.begin() + static_cast<std::ptrdiff_t>(index) + 1, entries.begin() + static_cast<std::ptrdiff_t>(used));
+            --used;
+            continue;
+        }
+        const auto same = [&] {
+            if (entry.staged.size() != staged.size() || cached->snapshots.size() != snapshots.size() || !std::equal(entry.selected.begin(), entry.selected.end(), selected.begin(), selected.end())) return false;
+            if (!staged.empty() && std::memcmp(entry.staged.data(), staged.data(), staged.size()) != 0) return false;
+            for (std::size_t at = 0; at < snapshots.size(); ++at) {
+                const auto& current = snapshots[at];
+                const auto& held = cached->snapshots[at];
+                if (current.uploaded != held.uploaded || current.bytes != held.bytes) return false;
+                if (current.uploaded) continue;
+                if (current.buffer != held.buffer || current.handle != held.handle || current.offset != held.offset || current.address != held.address) return false;
+            }
+            return true;
+        }();
+        if (same) {
+            std::rotate(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(index), entries.begin() + static_cast<std::ptrdiff_t>(index) + 1);
+            return cached;
+        }
+        ++index;
+    }
+    return {};
+}
+
+void ShaderResources::DrawSetCache::Insert(const std::shared_ptr<DrawBindings>& bindings, std::span<const std::size_t> selected, std::span<const std::byte> staged) {
+    std::lock_guard lock(mutex);
+    if (used < Entries) ++used;
+    std::rotate(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(used) - 1, entries.begin() + static_cast<std::ptrdiff_t>(used));
+    auto& entry = entries.front();
+    entry.bindings = bindings;
+    entry.selected.assign(selected.begin(), selected.end());
+    entry.staged.assign(staged.begin(), staged.end());
+}
+
+void ShaderResources::DrawSetCache::Clear() {
+    std::lock_guard lock(mutex);
+    if (used == 0) return;
+    for (auto& entry : entries) entry.bindings.reset();
+    used = 0;
+    drawSetCounters.cacheCleared.fetch_add(1, std::memory_order_relaxed);
+}
+
+void ShaderResources::writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const {
+    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    std::array<bool, 2> described{};
+    thread_local std::array<std::vector<VkDescriptorPoolSize>, 2>* countsSlot = nullptr;
+    auto& counts = ShaderRecompiler::ThreadOwned(countsSlot);
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex)) {
+        countDrawPools(counts, described);
+    } else {
+        auto& memo = *drawPoolCounts;
+        std::lock_guard lock(memo.mutex);
+        const auto current = [&] {
+            for (std::size_t index = 0; index < memo.variableBindings.size(); ++index) {
+                if (std::max(1u, static_cast<std::uint32_t>(bindings[memo.variableBindings[index]].imageAllocations.size())) != memo.variableCounts[index]) return false;
+            }
+            return true;
+        };
+        if (!memo.built || !current()) {
+            countDrawPools(memo.sizes, memo.described);
+            memo.variableBindings.clear();
+            memo.variableCounts.clear();
+            for (std::size_t index = 0; index < bindings.size(); ++index) {
+                if ((bindings[index].flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) == 0) continue;
+                memo.variableBindings.push_back(index);
+                memo.variableCounts.push_back(std::max(1u, static_cast<std::uint32_t>(bindings[index].imageAllocations.size())));
+            }
+            memo.built = true;
+            drawSetCounters.poolCountsBuilt.fetch_add(1, std::memory_order_relaxed);
+        }
+        counts = memo.sizes;
+        described = memo.described;
+    }
+    drawSetCounters.setsWritten.fetch_add(1, std::memory_order_relaxed);
     const auto sizesOf = [&](std::size_t set) { return std::span<const VkDescriptorPoolSize>(counts[set]); };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result.cache = context.descriptorCache;
@@ -7348,6 +7539,7 @@ void ShaderResources::prepareFaultSlot() const {
     const auto* recorder = Recorder::Active();
     bda->NoteUse(recorder != nullptr && recorder->Device() == context.device ? recorder->OpenSerial() : std::numeric_limits<std::uint64_t>::max());
     if (!bda->TakeFaultSlot(context)) return;
+    drawSetCache->Clear();
     std::vector<VkWriteDescriptorSet> writes;
     writes.reserve(faultDescriptors.size());
     for (const auto& fault : faultDescriptors) {

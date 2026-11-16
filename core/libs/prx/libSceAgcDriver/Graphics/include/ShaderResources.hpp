@@ -220,6 +220,20 @@ public:
     std::span<const VkDescriptorBindingFlags> LayoutBindingFlags() const { return layoutBindingFlags; }
     VkDescriptorSetLayout FragmentLayout() const { return fragment.layout; }
     bool SplitSets() const { return splitSets; }
+    struct DrawSetCounts {
+        std::uint64_t prepared = 0;
+        std::uint64_t indexed = 0;
+        std::uint64_t setsWritten = 0;
+        std::uint64_t poolCountsBuilt = 0;
+        std::uint64_t cacheHits = 0;
+        std::uint64_t cacheUploadHits = 0;
+        std::uint64_t cacheMisses = 0;
+        std::uint64_t cacheExpired = 0;
+        std::uint64_t cacheCleared = 0;
+        std::uint64_t uncachedFaultRecord = 0;
+        std::uint64_t uncachedInPlace = 0;
+    };
+    static DrawSetCounts DrawSetTotals();
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
@@ -233,6 +247,7 @@ public:
             VkDeviceSize offset = 0;
             std::size_t bytes = 0;
             VkBuffer handle = VK_NULL_HANDLE;
+            bool uploaded = false;
             std::span<std::byte> Bytes() const { return buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes); }
         };
         DescriptorCache* cache = nullptr;
@@ -752,7 +767,31 @@ private:
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
-    mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
+    struct DrawPoolCounts {
+        std::mutex mutex;
+        bool built = false;
+        std::vector<std::size_t> variableBindings;
+        std::vector<std::uint32_t> variableCounts;
+        std::array<std::vector<VkDescriptorPoolSize>, 2> sizes;
+        std::array<bool, 2> described{};
+    };
+    std::shared_ptr<DrawPoolCounts> drawPoolCounts = std::make_shared<DrawPoolCounts>();
+    struct DrawSetCache {
+        static constexpr std::size_t Entries = 4;
+        std::mutex mutex;
+        struct Entry {
+            std::weak_ptr<DrawBindings> bindings;
+            std::vector<std::size_t> selected;
+            std::vector<std::byte> staged;
+        };
+        std::array<Entry, Entries> entries;
+        std::size_t used = 0;
+        std::shared_ptr<DrawBindings> Find(std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, std::span<const std::byte> staged);
+        void Insert(const std::shared_ptr<DrawBindings>& bindings, std::span<const std::size_t> selected, std::span<const std::byte> staged);
+        void Clear();
+    };
+    std::shared_ptr<DrawSetCache> drawSetCache = std::make_shared<DrawSetCache>();
+    void countDrawPools(std::array<std::vector<VkDescriptorPoolSize>, 2>& counts, std::array<bool, 2>& described) const;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write
     // notes (counted in MarkGpuWrites for the [buffers] line).
     std::size_t readOnlyBuffers = 0;

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -505,6 +506,42 @@ void OverflowedHistory(AgcDriver::VulkanDevice& device) {
 
 }
 
+void DrawSetRebind(AgcDriver::VulkanDevice& device) {
+    using AgcDriver::Graphics::ShaderResources;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const bool previous = Switches::Set(RuntimeSwitch::NoDrawSetCache);
+    Switches::Assign(RuntimeSwitch::NoDrawSetCache, false);
+    struct Restore {
+        bool previous;
+        ~Restore() { AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoDrawSetCache, previous); }
+    } restore{previous};
+    const auto describe = [](const ShaderResources::DrawSetCounts& before, const ShaderResources::DrawSetCounts& after) {
+        char text[256];
+        std::snprintf(text, sizeof(text), "prepared %llu, sets written %llu, hits %llu, misses %llu, cleared %llu", static_cast<unsigned long long>(after.prepared - before.prepared), static_cast<unsigned long long>(after.setsWritten - before.setsWritten), static_cast<unsigned long long>(after.cacheHits - before.cacheHits), static_cast<unsigned long long>(after.cacheMisses - before.cacheMisses), static_cast<unsigned long long>(after.cacheCleared - before.cacheCleared));
+        return std::string(text);
+    };
+    auto& scene = NewScene();
+    Build(device, scene);
+    Settle(device, scene, "drawsets");
+    GuestMemory::BumpCollectEpoch();
+    auto before = ShaderResources::DrawSetTotals();
+    device.Draw(scene.state, TriangleDraw, scene.shaders);
+    device.Draw(scene.state, TriangleDraw, scene.shaders);
+    auto after = ShaderResources::DrawSetTotals();
+    Require(after.cacheHits - before.cacheHits == 1u && after.setsWritten - before.setsWritten == 1u, "drawsets: the second unchanged draw in a batch did not reuse the first draw's set (" + describe(before, after) + ")");
+    Fill(scene.Texels(Key), 0.0f);
+    GuestMemory::BumpCollectEpoch();
+    before = ShaderResources::DrawSetTotals();
+    device.Draw(scene.state, TriangleDraw, scene.shaders);
+    after = ShaderResources::DrawSetTotals();
+    device.WaitIdle();
+    Require(Brightest() == 0u, "drawsets: the draw that re-bound the written texture sampled the old image (" + describe(before, after) + ")");
+    Require(after.cacheHits == before.cacheHits && after.cacheCleared - before.cacheCleared >= 1u, "drawsets: the re-bound draw reused a set naming the old image (" + describe(before, after) + ")");
+    const auto outcome = Draw(device, scene);
+    Require(outcome.brightest == 0u, "drawsets: the draw after the re-bind sampled the old image (" + outcome.Describe() + ")");
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -527,7 +564,7 @@ int main(int argc, char** argv) {
         TargetBytes = AgcDriver::Graphics::ColorTargetLayout(TargetWidth, TargetHeight, AgcDriver::Graphics::ColorTileMode::RenderTarget, 4).Bytes();
         GuestBlocks target((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = &target;
-        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 11> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}}};
+        const std::array<std::pair<const char*, std::function<void(AgcDriver::VulkanDevice&)>>, 12> cases{{{"cpu", &CpuWrite}, {"table", &TableWord}, {"pending", &PendingWrite}, {"remap", &Remap}, {"compared", &Compared}, {"driver", &DriverStore}, {"unwatch", &UnwatchRange}, {"release", &Released}, {"import", &Imported}, {"array", &ArraySlices}, {"overflow", &OverflowedHistory}, {"drawsets", &DrawSetRebind}}};
         for (const auto& [name, run] : cases) {
             if (!args.empty() && std::find(args.begin(), args.end(), name) == args.end()) continue;
             run(*device);

@@ -1,6 +1,7 @@
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
@@ -5303,8 +5304,61 @@ void RunHostImportValidityTests(const Context& context, const BdaTestAccess& acc
     std::cout << "host imports stay while their ranges are unchanged and retire when their backing changes\n";
 }
 
+void drawSetFaultSlotTests(const Context& shared) {
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    const bool previous = RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetCache, false);
+    struct Restore {
+        bool previous;
+        VkDevice device;
+        ~Restore() {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoDrawSetCache, previous);
+            BdaResources::NoteFinished(device, 1);
+        }
+    } restore{previous, shared.device};
+    auto context = shared;
+    context.bufferDeviceAddress = false;
+    DescriptorCache cache(context);
+    context.descriptorCache = &cache;
+    Recorder recorder(context);
+    recorder.Activate();
+    ShaderRecompiler::RecompileResult control;
+    control.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    auto srt = binding(Role::FlattenedSrt, 6);
+    srt.guestDescriptor = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+    control.bindings = {binding(Role::FaultBuffer, 5), srt};
+    const std::array<CompiledShader, 1> stages{{{ShaderRecompiler::ShaderStage::TessellationControl, &control, 0}}};
+    ShaderResources resources(context, stages, ColorTarget{}, 0, 0, 0, {});
+    std::array<std::uint32_t, 16> words{};
+    words.fill(9u);
+    const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, sizeof(words), words}}};
+    const auto first = resources.PrepareDrawBindings(recorder, moved);
+    auto before = ShaderResources::DrawSetTotals();
+    const auto repeat = resources.PrepareDrawBindings(recorder, moved);
+    auto after = ShaderResources::DrawSetTotals();
+    Require(first != nullptr && repeat == first && after.cacheHits - before.cacheHits == 1u, "a repeated draw of a template with a fault buffer did not reuse its set");
+    BdaResources::NoteFinished(context.device, recorder.OpenSerial());
+    std::vector<std::unique_ptr<BdaResources>> pressure;
+    const auto reclaimedBefore = BdaResources::FaultSlots(context.device).reclaimed;
+    while (BdaResources::FaultSlots(context.device).reclaimed == reclaimedBefore && pressure.size() < 4096) pressure.push_back(std::make_unique<BdaResources>(context));
+    Require(BdaResources::FaultSlots(context.device).reclaimed != reclaimedBefore, "the idle template did not give back its fault slot under pressure");
+    before = ShaderResources::DrawSetTotals();
+    const auto retaken = resources.PrepareDrawBindings(recorder, moved);
+    after = ShaderResources::DrawSetTotals();
+    Require(retaken != nullptr && retaken != first && after.cacheHits == before.cacheHits && after.cacheCleared - before.cacheCleared >= 1u && after.setsWritten - before.setsWritten == 1u, "a draw after its template took a new fault slot reused a set naming the slot it gave back");
+    BdaResources firstRecord(context);
+    BdaResources secondRecord(context);
+    before = ShaderResources::DrawSetTotals();
+    const auto recorded = resources.PrepareDrawBindings(recorder, moved, false, &firstRecord);
+    const auto recordedAgain = resources.PrepareDrawBindings(recorder, moved, false, &secondRecord);
+    after = ShaderResources::DrawSetTotals();
+    Require(recorded != nullptr && recordedAgain != nullptr && recordedAgain != recorded && after.cacheHits == before.cacheHits && after.uncachedFaultRecord - before.uncachedFaultRecord == 2u && after.setsWritten - before.setsWritten == 2u, "a draw with its own fault record reused a set naming another draw's fault buffer");
+    std::cout << "draw sets are dropped when their template takes a new fault slot and never shared across fault records\n";
+}
+
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     faultSlotTests(context, access);
+    drawSetFaultSlotTests(context);
     alignas(64) std::array<std::uint32_t, 16> guest{};
     guest[0] = 123;
     const auto address = reinterpret_cast<std::uintptr_t>(guest.data());
