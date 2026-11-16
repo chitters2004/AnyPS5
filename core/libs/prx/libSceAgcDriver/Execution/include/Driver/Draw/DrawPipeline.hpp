@@ -148,6 +148,7 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
+    static std::size_t Outstanding() { return outstanding.load(std::memory_order_acquire); }
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
