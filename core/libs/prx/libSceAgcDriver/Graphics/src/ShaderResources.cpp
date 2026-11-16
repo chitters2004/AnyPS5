@@ -4274,7 +4274,7 @@ void reportExitMisses() {
     const auto overlapping = blockSites(misses.overlapBlocks);
     const auto unranged = blockSites(misses.unrangedBlocks);
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits by the inputs that moved: %s; would hit if only that input were scoped: %s; with the proof scoped by the break log and only that input too: %s\n", combos.empty() ? "none" : combos.c_str(), only.c_str(), withLog.c_str());
-    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log: %llu exits taken because every break since the proof was outside the set (%s); over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(logExits), GuestMemory::ScopedProofBreaks() ? "on" : "off, APS5_NO_SCOPED_PROOFS", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log: %llu exits taken because every break since the proof was outside the set (%s); over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(logExits), RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) ? "off, APS5_NO_SCOPED_PROOFS" : "on", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
 }
 
 ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, const ShaderResources::ExitStamp& end, std::uint64_t flushBreaks, std::uint64_t ownBreaks) {
@@ -4860,7 +4860,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto stamp = currentExitStamp();
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
         bool matched = stamp.epoch != 0 && proved == stamp && !stalePlanes;
-        if (!matched && stamp.epoch != 0 && proved.epoch != 0 && !stalePlanes && proved.proof != stamp.proof && provedRanges && GuestMemory::ScopedProofBreaks()) {
+        if (!matched && stamp.epoch != 0 && proved.epoch != 0 && !stalePlanes && proved.proof != stamp.proof && provedRanges && !RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs)) {
             auto others = stamp;
             others.proof = proved.proof;
             if (others == proved) {
@@ -4894,7 +4894,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const bool counted = exitMissesCounted();
         if (proved.epoch != 0 && (verifyingExits() || counted)) {
             ProofLogCheck log;
-            if (counted && proved.proof != stamp.proof && GuestMemory::ProofBreaksLogged()) {
+            if (counted && proved.proof != stamp.proof) {
                 log.checked = true;
                 log.unscopedSet = !provedRanges;
                 if (provedRanges) log.window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
@@ -4908,7 +4908,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         noteEpochProof(false, false, false);
         proved = stamp;
         recordFlushRanges();
-        provedRanges = GuestMemory::ProofBreaksLogged() && !flushUnscoped;
+        provedRanges = !flushUnscoped;
         if (provedRanges) recordProofRanges();
         if (!ok || std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); })) proved.epoch = 0;
         if (counted) {

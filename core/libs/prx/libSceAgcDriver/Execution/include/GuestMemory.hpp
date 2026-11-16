@@ -167,8 +167,6 @@ void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
 void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t address = 0, std::uint64_t bytes = 0);
 void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
-bool ProofBreaksLogged();
-bool ScopedProofBreaks();
 bool ProofBreakScoped(ProofBreakSite site);
 struct ProofBreakWindow {
     bool complete = false;
