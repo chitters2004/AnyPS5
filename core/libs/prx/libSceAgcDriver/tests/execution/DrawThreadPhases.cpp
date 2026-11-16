@@ -137,12 +137,19 @@ void QueuedJobsKeepTheirOwnTimes() {
     static_cast<void>(ThreadPhases::Take());
     std::atomic<bool> filled{false};
     std::atomic<std::int64_t> heldNs{0};
+    std::atomic<std::size_t> peak{0};
+    std::atomic<std::int64_t> waitedNs{0};
     DrawFinisher::Pending blocker;
     blocker.unknown = false;
     DrawFinisher::Get().Enqueue([&] {
         const auto start = std::chrono::steady_clock::now();
         const auto deadline = start + std::chrono::seconds(10);
-        while (DrawFinisher::Outstanding() < Queued + 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        while (DrawFinisher::Outstanding() < Queued + 1 && std::chrono::steady_clock::now() < deadline) {
+            peak.store(std::max(peak.load(), DrawFinisher::Outstanding()));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        peak.store(std::max(peak.load(), DrawFinisher::Outstanding()));
+        waitedNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
         filled.store(DrawFinisher::Outstanding() >= Queued + 1);
         std::this_thread::sleep_for(Hold);
         heldNs.store(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -155,7 +162,7 @@ void QueuedJobsKeepTheirOwnTimes() {
     const auto totals = ThreadPhases::Take();
     const auto text = ThreadPhases::Text(totals);
     std::cout << text << '\n';
-    Require(filled.load(), "the worker did not queue " + std::to_string(Queued) + " draw jobs behind a held finisher job: " + text);
+    Require(filled.load(), "the worker did not queue " + std::to_string(Queued) + " draw jobs behind a held finisher job: the held job saw at most " + std::to_string(peak.load()) + " finisher jobs outstanding in " + std::to_string(waitedNs.load() / 1'000'000) + " ms: " + text);
     Require(totals.endDrains == 1 && totals.endDrainNs >= static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(Hold).count() / 2), "the submission's end drain behind the " + std::to_string(Hold.count()) + " ms held finisher job was not timed as one end-of-submission drain: " + text);
     Require(totals.endDrainNs <= totals.busyNs - DrawNs(totals, PhaseThread::Worker), "the end-of-submission drain is longer than the worker's time outside draws: " + text);
     Require(Draws(totals, PhaseThread::Finisher) == Queued, "the finisher ran " + std::to_string(Draws(totals, PhaseThread::Finisher)) + " of " + std::to_string(Queued) + " queued jobs: " + text);
