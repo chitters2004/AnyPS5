@@ -106,7 +106,7 @@ void TestReport() {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
         auto& finisher = DrawFinisher::Get();
         finisher.Enqueue([] { std::this_thread::sleep_for(std::chrono::milliseconds(200)); });
-        finisher.Drain(DrawFinisher::WaitSite::RelocationSame);
+        finisher.Drain(DrawFinisher::WaitSite::Kept);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         finisher.Enqueue([] {});
         finisher.Drain(DrawFinisher::WaitSite::Pipeline);
@@ -148,11 +148,10 @@ void TestReport() {
     Check(Number(waits, "asleep ") + Number(waits, "spin ") >= 250.0, "committer spin and sleep do not add up to its wait");
     Check(Number(waits, " ms in ") >= 1.0, "committer sleeps were not counted");
     Check(Number(waits, "finisher waited ") >= 50.0, "finisher wait for jobs was not timed");
-    Check(Number(waits, "by site: reloc same ") == 1.0, "relocation drain was not counted at its site");
-    Check(Number(waits, ", reloc other ") == 0.0, "a relocation drain was counted under the other identity");
-    const auto reloc = waits.substr(waits.find("by site: reloc same 1 (") + 23);
-    Check(std::stod(reloc) >= 150.0, "relocation drain wait was not timed");
-    Check(Number(waits, ", lookup ") == 1.0, "a drain was counted at the wrong site");
+    Check(Number(waits, ", kept ") == 1.0, "kept draw drain was not counted at its site");
+    const auto kept = waits.substr(waits.find(", kept 1 (") + 10);
+    Check(std::stod(kept) >= 150.0, "kept draw drain wait was not timed");
+    Check(Number(waits, "by site: lookup ") == 1.0, "a drain was counted at the wrong site");
     Check(Number(waits, ", pipeline ") == 1.0, "a drain was counted at the wrong site");
     Check(Number(waits, "worker waited ") >= 100.0, "worker wait for committer room was not timed");
     Check(Number(waits, "for committer room in ", 1) == 1.0, "worker waits for committer room were not counted");

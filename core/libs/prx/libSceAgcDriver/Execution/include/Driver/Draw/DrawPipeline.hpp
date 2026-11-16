@@ -191,9 +191,10 @@ public:
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
-    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, End, RelocationSame, RelocationOther, Count };
-    enum class WaitSite : std::uint32_t { RelocationSame, RelocationOther, Lookup, Reads, Kept, Packet, Pipeline, Submission, Other, Count };
+    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, End, Count };
+    enum class WaitSite : std::uint32_t { Lookup, Reads, Kept, Packet, Pipeline, Submission, Other, Count };
     static void NoteDrain(DrainSite site, bool drained);
+    static void NoteAfterRelocationMiss(bool sameIdentity);
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
