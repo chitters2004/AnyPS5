@@ -47,6 +47,16 @@ on:
         required: false
         default: false
         type: boolean
+      execution_tests:
+        description: Extra ANYPS5_AGC_EXECUTION_TESTS names (semicolon list) built for the asan and tsan jobs, such as CommandEncoder
+        required: false
+        default: ''
+        type: string
+      test_env:
+        description: Space-separated NAME=value pairs exported for the asan and tsan test runs
+        required: false
+        default: ''
+        type: string
   workflow_call:
     inputs:
       ref:
@@ -85,6 +95,14 @@ on:
         type: boolean
       tag:
         description: Prefix for artifact names and for the job names of a caller, such as memo-
+        required: false
+        default: ''
+        type: string
+      execution_tests:
+        required: false
+        default: ''
+        type: string
+      test_env:
         required: false
         default: ''
         type: string
@@ -570,12 +588,14 @@ jobs:
       - name: Configure
         env:
           GROUP: ${{ matrix.group }}
+          EXECUTION_TESTS: ${{ inputs.execution_tests }}
         run: |
           start=$(date +%s)
+          execution="F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown${EXECUTION_TESTS:+;$EXECUTION_TESTS}"
           case "$GROUP" in
             plain) extra=(-DANYPS5_ENABLE_SPIRV_TOOLS=ON "-DCMAKE_EXE_LINKER_FLAGS=${LINKER_FLAGS:-}" "-DCMAKE_SHARED_LINKER_FLAGS=${LINKER_FLAGS:-}" "-DCMAKE_MODULE_LINKER_FLAGS=${LINKER_FLAGS:-}") ;;
-            asan) extra=(-DANYPS5_ENABLE_ASAN=ON "-DCMAKE_C_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DCMAKE_CXX_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown") ;;
-            tsan) extra=(-DANYPS5_ENABLE_TSAN=ON "-DCMAKE_C_FLAGS=-g1" "-DCMAKE_CXX_FLAGS=-g1" "-DANYPS5_AGC_EXECUTION_TESTS=F16ToF32Unpack;F64FmaSubnormals;RegistrationPrepareShutdown") ;;
+            asan) extra=(-DANYPS5_ENABLE_ASAN=ON "-DCMAKE_C_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DCMAKE_CXX_FLAGS=-g1 -fsanitize=undefined -fno-sanitize=vptr" "-DANYPS5_AGC_EXECUTION_TESTS=$execution") ;;
+            tsan) extra=(-DANYPS5_ENABLE_TSAN=ON "-DCMAKE_C_FLAGS=-g1" "-DCMAKE_CXX_FLAGS=-g1" "-DANYPS5_AGC_EXECUTION_TESTS=$execution") ;;
           esac
           cmake -S . -B build $CONFIGURE "${extra[@]}"
           echo "CONFIGURE_S=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
@@ -726,8 +746,15 @@ jobs:
           ASAN_OPTIONS: detect_leaks=0
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           APS5_SKIP_TIMING_TESTS: 1
+          TEST_ENV: ${{ inputs.test_env }}
         run: |
           if [ "$KIND" = tsan ]; then export TSAN_OPTIONS="suppressions=$PWD/tools/tsan-suppressions.txt"; fi
+          for pair in $TEST_ENV; do
+            case "$pair" in
+              [A-Za-z_]*=*) export "$pair" ;;
+              *) echo "::error::test_env entry '$pair' is not NAME=value"; exit 1 ;;
+            esac
+          done
           start=$(date +%s)
           set +e
           ctest --test-dir build -R "$TESTS" --no-tests=error --output-on-failure --timeout 300 --parallel 4 --output-log ctest.log --output-junit ctest.xml
