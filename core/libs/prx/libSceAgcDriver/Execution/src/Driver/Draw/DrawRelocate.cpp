@@ -11,6 +11,7 @@
 #include <bit>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <limits>
 #include <optional>
 #include <span>
@@ -209,36 +210,31 @@ std::size_t dropEveryOther(TMap& map) {
 
 }
 
-void Driver::learnPendingRelocation() {
-    const auto pending = drawRelocationPending;
-    drawRelocationPending = {};
-    if (pending.key == 0) return;
-    const auto inserted = drawCache.find(pending.key);
-    if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
-    const auto& entry = *inserted->second;
+bool Driver::MergeDrawRelocation(DrawRelocation& shape, const DrawEntry& entry) {
     const auto& programs = entry.decode->programs;
-    if (entry.stages.size() != programs.size()) return;
-    const auto known = drawRelocations.find(pending.identity);
-    auto shape = std::make_shared<DrawRelocation>();
-    if (known != drawRelocations.end()) *shape = *known->second;
-    bool changed = known == drawRelocations.end();
+    bool changed = false;
+    const auto ban = [&](std::uint32_t reg) {
+        if (const auto held = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; }); held != shape.words.end()) {
+            shape.words.erase(held);
+            changed = true;
+        }
+        if (std::find(shape.banned.begin(), shape.banned.end(), reg) != shape.banned.end()) return;
+        shape.banned.push_back(reg);
+        changed = true;
+    };
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (entry.stages[i].empty()) continue;
         const auto& variant = *entry.stages[i].front();
         const auto& program = programs[i];
         for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size() && index < 64; ++index) {
             const auto reg = program.userDataBase + index - program.hiddenUserWords;
-            const auto held = std::find_if(shape->words.begin(), shape->words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
             const bool relocatable = (variant.relocatableWords >> index & 1u) != 0;
             const bool value = !relocatable && (variant.valueWords >> index & 1u) != 0;
             if (!relocatable && !value && (variant.calleeWords >> index & 1u) == 0) {
-                if (held == shape->words.end()) continue;
-                shape->words.erase(held);
-                shape->banned.push_back(reg);
-                changed = true;
+                ban(reg);
                 continue;
             }
-            if (held != shape->words.end() || std::find(shape->banned.begin(), shape->banned.end(), reg) != shape->banned.end()) continue;
+            if (std::find(shape.banned.begin(), shape.banned.end(), reg) != shape.banned.end()) continue;
             RelocatableUserWord word{reg, {}, value};
             for (const auto& [callee, length] : variant.calleeReads) {
                 if (callee != index) continue;
@@ -250,17 +246,45 @@ void Driver::learnPendingRelocation() {
                 if (variant.runBases[run] != static_cast<std::int8_t>(index)) continue;
                 word.reads.emplace_back(static_cast<std::int64_t>(variant.runs[run].first - base), static_cast<std::uint32_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t)));
             }
-            shape->words.push_back(std::move(word));
+            std::sort(word.reads.begin(), word.reads.end());
+            word.reads.erase(std::unique(word.reads.begin(), word.reads.end()), word.reads.end());
+            const auto held = std::find_if(shape.words.begin(), shape.words.end(), [&](const RelocatableUserWord& kept) { return kept.reg == reg; });
+            if (held == shape.words.end()) {
+                shape.words.push_back(std::move(word));
+                changed = true;
+                continue;
+            }
+            if (held->value != word.value || held->high != word.high) {
+                ban(reg);
+                continue;
+            }
+            std::vector<std::pair<std::int64_t, std::uint32_t>> reads;
+            std::set_union(held->reads.begin(), held->reads.end(), word.reads.begin(), word.reads.end(), std::back_inserter(reads));
+            if (reads.size() == held->reads.size()) continue;
+            held->reads = std::move(reads);
             changed = true;
         }
     }
     if (changed) {
-        std::sort(shape->words.begin(), shape->words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
-        drawRelocations[pending.identity] = std::move(shape);
+        std::sort(shape.words.begin(), shape.words.end(), [](const RelocatableUserWord& a, const RelocatableUserWord& b) { return a.reg < b.reg; });
+        std::sort(shape.banned.begin(), shape.banned.end());
     }
-    if (pending.alias == 0) return;
+    return changed;
+}
+
+void Driver::learnDrawRelocation(std::uint64_t key, const DrawRelocationSource& source) {
+    if (source.identity == 0) return;
+    const auto inserted = drawCache.find(key);
+    if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
+    const auto& entry = *inserted->second;
+    if (entry.stages.size() != entry.decode->programs.size()) return;
+    const auto known = drawRelocations.find(source.identity);
+    auto shape = std::make_shared<DrawRelocation>();
+    if (known != drawRelocations.end()) *shape = *known->second;
+    if (MergeDrawRelocation(*shape, entry) || known == drawRelocations.end()) drawRelocations[source.identity] = std::move(shape);
+    if (source.alias == 0) return;
     if (drawAliases.size() >= MaxAliases) drawRelocationCounters.evicted += dropEveryOther(drawAliases);
-    drawAliases[pending.alias] = pending.key;
+    drawAliases[source.alias] = key;
 }
 
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {

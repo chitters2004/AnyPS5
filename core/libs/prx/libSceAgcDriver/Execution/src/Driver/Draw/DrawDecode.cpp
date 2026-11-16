@@ -237,12 +237,12 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     return product;
 }
 
-void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile) {
-    if (decode == nullptr || verifyDrawRecipe()) {
+void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submission, const Graphics::Context& context, std::shared_ptr<const DrawDecode>& decode, bool registerKey, std::uint64_t drawKey, bool profile, bool verify) {
+    if (decode == nullptr || verify) {
         std::vector<Graphics::RegisterRead> readLog;
         const Graphics::RegisterReadLogScope logScope(verifyDrawRecipe() && registerKey ? &readLog : nullptr);
         auto fresh = decodeDraw(queue, submission, context);
-        if (verifyDrawRecipe() && registerKey) {
+        if (verify && registerKey) {
             std::uint64_t facadeMismatches = 0;
             for (const auto read : readLog) {
                 if (Graphics::DrawKeyCovers(read)) continue;

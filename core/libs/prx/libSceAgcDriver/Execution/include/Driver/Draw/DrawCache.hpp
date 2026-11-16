@@ -152,8 +152,8 @@ struct DrawUserPatch {
     std::uint32_t index, value;
 };
 
-struct DrawRelocationPending {
-    std::uint64_t key = 0, alias = 0, identity = 0;
+struct DrawRelocationSource {
+    std::uint64_t alias = 0, identity = 0;
 };
 
 struct DrawRelocationTrial {

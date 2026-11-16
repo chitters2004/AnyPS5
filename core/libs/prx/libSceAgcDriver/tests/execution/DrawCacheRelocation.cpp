@@ -18,6 +18,8 @@
 #else
 #include <sys/mman.h>
 #endif
+#include <algorithm>
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -34,11 +36,36 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static void Insert(std::uint64_t key, const std::shared_ptr<DispatchVariant>& variant, std::shared_ptr<const DrawDecode> decode, const DrawRelocationSource& source) {
+        std::vector<std::shared_ptr<DispatchVariant>> fresh{variant};
+        Driver::Get().insertDrawEntry(key, fresh, std::move(decode), 0, false, source);
+    }
+    static std::shared_ptr<const DrawRelocation> Learned(std::uint64_t identity) {
+        auto& driver = Driver::Get();
+        std::lock_guard lock(driver.drawCacheMutex);
+        const auto found = driver.drawRelocations.find(identity);
+        return found == driver.drawRelocations.end() ? nullptr : found->second;
+    }
+    static std::uint64_t Donor(std::uint64_t alias) {
+        auto& driver = Driver::Get();
+        std::lock_guard lock(driver.drawCacheMutex);
+        const auto found = driver.drawAliases.find(alias);
+        return found == driver.drawAliases.end() ? 0 : found->second;
+    }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
 using AgcDriver::DriverDetail::DispatchVariant;
+using AgcDriver::DriverDetail::DrawEntry;
 using AgcDriver::DriverDetail::DrawMiss;
+using AgcDriver::DriverDetail::DrawRelocation;
 
 alignas(256) constexpr std::array<std::uint32_t, 8> VertexCode{0x7e000208u, 0x7e020280u, 0x7e040280u, 0x7e0602f2u, 0xf80008cfu, 0x03020100u, 0xbf810000u, 0xbf810000u};
 alignas(256) constexpr std::array<std::uint32_t, 8> SecondVertexCode = VertexCode;
@@ -219,12 +246,13 @@ void RelocatingDrawsKeepTheirDonor(bool libraries) {
     Require(relocated.evictions - start.evictions >= 2, mode + ": draws of another vertex shader evicted " + std::to_string(relocated.evictions - start.evictions) + " entries, expected at least 2 (run with APS5_DRAW_CACHE_ENTRIES=2)");
 }
 
-std::pair<unsigned long long, unsigned long long> DrainCounts(const std::string& text, const std::string& site) {
-    const auto at = text.find(" " + site + " ");
-    Require(at != std::string::npos, "the finisher drain report has no '" + site + "' entry:" + text);
-    unsigned long long drained = 0, skipped = 0;
-    Require(std::sscanf(text.c_str() + at + site.size() + 2, "%llu/%llu", &drained, &skipped) == 2, "the finisher drain report's '" + site + "' entry has no counts:" + text);
-    return {drained, skipped};
+std::pair<unsigned long long, unsigned long long> AfterMissCounts(const std::string& text) {
+    const std::string label = "draws after a relocation miss (learned by the finisher, not waited for): same identity ";
+    const auto at = text.find(label);
+    Require(at != std::string::npos, "the finisher drain report has no relocation miss entry:" + text);
+    unsigned long long same = 0, other = 0;
+    Require(std::sscanf(text.c_str() + at + label.size(), "%llu, other identity %llu", &same, &other) == 2, "the finisher drain report's relocation miss entry has no counts:" + text);
+    return {same, other};
 }
 
 void RelocationDrainsNameTheirIdentity(bool libraries) {
@@ -244,10 +272,9 @@ void RelocationDrainsNameTheirIdentity(bool libraries) {
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
     const auto text = DrawFinisher::DrainText();
-    const auto [sameDrained, sameSkipped] = DrainCounts(text, "relocation (same identity)");
-    const auto [otherDrained, otherSkipped] = DrainCounts(text, "relocation (other identity)");
-    Require(sameDrained + sameSkipped == 2, mode + ": " + std::to_string(sameDrained + sameSkipped) + " draws after a miss of their own shaders were counted at the relocation drain, expected 2:" + text);
-    Require(otherDrained + otherSkipped == 1, mode + ": " + std::to_string(otherDrained + otherSkipped) + " draws after a miss of other shaders were counted at the relocation drain, expected 1:" + text);
+    const auto [sameCount, otherCount] = AfterMissCounts(text);
+    Require(sameCount == 2, mode + ": " + std::to_string(sameCount) + " draws after a miss of their own shaders were counted, expected 2:" + text);
+    Require(otherCount == 1, mode + ": " + std::to_string(otherCount) + " draws after a miss of other shaders were counted, expected 1:" + text);
 }
 
 std::uint64_t DrawHits(std::span<const float* const> sources) {
@@ -278,6 +305,21 @@ void RelocationOffServesNoMovedData(bool libraries) {
     for (auto& entry : moved) entry = {1.0f, 0.0f, 0.0f, 0.0f};
     const auto hits = MovedDataHits(moved);
     Require(hits == 0, mode + ": with APS5_NO_DRAW_RELOCATION " + std::to_string(hits) + " draws whose data moved reused a cached draw");
+}
+
+void PipelineVerifyChecksRelocatedHits(bool libraries) {
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    alignas(16) static std::array<std::array<float, 4>, 8> moved{};
+    for (auto& entry : moved) entry = {1.0f, 0.0f, 0.0f, 0.0f};
+    const auto start = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto hits = MovedDataHits(moved);
+    const auto counters = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Require(hits >= 4, mode + ": only " + std::to_string(hits) + " draws whose data moved reused a cached draw");
+    Require(counters.verifyHits - start.verifyHits == hits, mode + ": APS5_VERIFY_DRAW_PIPELINE rebuilt " + std::to_string(counters.verifyHits - start.verifyHits) + " of " + std::to_string(hits) + " relocated hits");
+    Require(counters.verifyDecodes > start.verifyDecodes, mode + ": APS5_VERIFY_DRAW_PIPELINE decoded no relocated hit again");
+    Require(counters.verifyMismatches == start.verifyMismatches && counters.verifyDecodeMismatches == start.verifyDecodeMismatches, mode + ": a relocated hit differed from its full rebuild (" + std::to_string(counters.verifyMismatches - start.verifyMismatches) + " stages, " + std::to_string(counters.verifyDecodeMismatches - start.verifyDecodeMismatches) + " decodes)");
 }
 
 std::shared_ptr<const DispatchVariant> TaggedRuns() {
@@ -324,6 +366,95 @@ void RelocationSwitchFlipsMidRun(bool libraries) {
     Require(offHits == off.size() * (Repeats - 2), mode + ": with the relocation switch set " + std::to_string(offHits) + " draws reused a cached draw, expected " + std::to_string(off.size() * (Repeats - 2)) + " repeats of unmoved data and no moved data");
     const auto onHits = MovedDataHits(on);
     Require(onHits >= 4, mode + ": after the relocation switch was cleared mid-run only " + std::to_string(onHits) + " of " + std::to_string(on.size()) + " draws whose data moved reused a cached draw, expected at least 4 as in a fresh run");
+}
+
+struct LearningInput {
+    std::shared_ptr<DispatchVariant> variant;
+    std::shared_ptr<const AgcDriver::DriverDetail::DrawDecode> decode;
+};
+
+constexpr std::uint32_t LearnedBase = 0x0c;
+constexpr std::uint32_t LearnedPointer = 0x1000;
+
+LearningInput Learning(std::uint64_t relocatable, std::uint64_t values, std::initializer_list<std::pair<std::uint64_t, std::uint64_t>> runs) {
+    auto variant = std::make_shared<DispatchVariant>();
+    variant->relocatableWords = relocatable;
+    variant->valueWords = values;
+    for (const auto& run : runs) {
+        variant->runs.push_back(run);
+        variant->runBases.push_back(0);
+    }
+    auto decode = std::make_shared<AgcDriver::DriverDetail::DrawDecode>();
+    AgcDriver::DriverDetail::DrawProgram program{};
+    program.userDataBase = LearnedBase;
+    program.userData = {LearnedPointer, 0, 0, 0, 0, 0};
+    decode->programs.push_back(std::move(program));
+    return {std::move(variant), std::move(decode)};
+}
+
+std::vector<LearningInput> LearningInputs() {
+    return {
+        Learning(0b01101, 0b10000, {{LearnedPointer + 0x10, LearnedPointer + 0x20}}),
+        Learning(0b01001, 0b10000, {{LearnedPointer + 0x40, LearnedPointer + 0x48}}),
+        Learning(0b11001, 0, {{LearnedPointer + 0x10, LearnedPointer + 0x20}}),
+    };
+}
+
+std::string ShapeText(const DrawRelocation& shape) {
+    std::string text = "words";
+    for (const auto& word : shape.words) {
+        text += " " + std::to_string(word.reg) + (word.value ? "v" : "r") + "@" + std::to_string(word.high) + "[";
+        for (const auto& [offset, words] : word.reads) text += std::to_string(offset) + "+" + std::to_string(words) + ";";
+        text += "]";
+    }
+    text += " banned";
+    for (const auto reg : shape.banned) text += " " + std::to_string(reg);
+    return text;
+}
+
+void LearningIgnoresInsertOrder() {
+    const auto inputs = LearningInputs();
+    std::array<std::size_t, 3> order{0, 1, 2};
+    std::string first;
+    do {
+        DrawRelocation shape;
+        for (const auto index : order) {
+            DrawEntry entry;
+            entry.decode = inputs[index].decode;
+            entry.stages = {{inputs[index].variant}};
+            AgcDriver::DriverDetail::Driver::MergeDrawRelocation(shape, entry);
+        }
+        const auto text = ShapeText(shape);
+        if (first.empty()) first = text;
+        Require(text == first, "learning in insert order " + std::to_string(order[0]) + std::to_string(order[1]) + std::to_string(order[2]) + " gave '" + text + "', the first order gave '" + first + "'");
+    } while (std::next_permutation(order.begin(), order.end()));
+    const auto expected = "words " + std::to_string(LearnedBase) + "r@0[16+4;64+2;] " + std::to_string(LearnedBase + 3) + "r@0[] banned " + std::to_string(LearnedBase + 1) + " " + std::to_string(LearnedBase + 2) + " " + std::to_string(LearnedBase + 4) + " " + std::to_string(LearnedBase + 5);
+    Require(first == expected, "learning the three variants gave '" + first + "', expected '" + expected + "'");
+}
+
+void LearningTakesEachJobsOwnKey() {
+    using AgcDriver::DriverDetail::DriverTestAccess;
+    const auto inputs = LearningInputs();
+    constexpr std::uint64_t Forward = 0x51000, Backward = 0x52000, Single = 0x53000;
+    const std::array<std::size_t, 3> forward{0, 1, 2}, backward{2, 0, 1};
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        DriverTestAccess::Insert(0xa100 + i, inputs[forward[i]].variant, inputs[forward[i]].decode, {0xb100 + i, Forward});
+        DriverTestAccess::Insert(0xa200 + i, inputs[backward[i]].variant, inputs[backward[i]].decode, {0xb200 + i, Backward});
+    }
+    DriverTestAccess::Insert(0xa300, inputs[1].variant, inputs[1].decode, {0xb300, Single});
+    for (std::size_t i = 0; i < inputs.size(); ++i) {
+        Require(DriverTestAccess::Donor(0xb100 + i) == 0xa100 + i && DriverTestAccess::Donor(0xb200 + i) == 0xa200 + i, "an alias names another job's draw key as its donor (alias " + std::to_string(i) + ")");
+    }
+    Require(DriverTestAccess::Donor(0xb300) == 0xa300, "the last job's alias names another job's draw key as its donor");
+    const auto forwardShape = DriverTestAccess::Learned(Forward), backwardShape = DriverTestAccess::Learned(Backward), single = DriverTestAccess::Learned(Single);
+    Require(forwardShape != nullptr && backwardShape != nullptr && single != nullptr, "an inserted job's identity learned no relocation");
+    Require(ShapeText(*forwardShape) == ShapeText(*backwardShape), "inserts of the same three jobs in two orders learned '" + ShapeText(*forwardShape) + "' and '" + ShapeText(*backwardShape) + "'");
+    DrawRelocation alone;
+    DrawEntry entry;
+    entry.decode = inputs[1].decode;
+    entry.stages = {{inputs[1].variant}};
+    AgcDriver::DriverDetail::Driver::MergeDrawRelocation(alone, entry);
+    Require(ShapeText(*single) == ShapeText(alone), "a job learned '" + ShapeText(*single) + "', not its own entry's '" + ShapeText(alone) + "'");
 }
 
 void SplitRunsNameTheirSharedWords() {
@@ -482,7 +613,14 @@ int main(int argc, char** argv) {
         const bool drains = argc == 2 && std::string(argv[1]) == "--drains";
         const bool off = argc == 2 && std::string(argv[1]) == "--relocation-off";
         const bool flip = argc == 2 && std::string(argv[1]) == "--relocation-switch";
-        if (!evicted && !kept && !drains && !off && !flip) SplitRunsNameTheirSharedWords();
+        const bool verify = argc == 2 && std::string(argv[1]) == "--pipeline-verify";
+        if (argc == 2 && std::string(argv[1]) == "--learning") {
+            LearningIgnoresInsertOrder();
+            LearningTakesEachJobsOwnKey();
+            std::cout << "Relocation learning took each job's own key in any insert order\n";
+            return 0;
+        }
+        if (!evicted && !kept && !drains && !off && !flip && !verify) SplitRunsNameTheirSharedWords();
         bool libraries = false;
         {
             const auto device = OpenVulkanTestDevice();
@@ -494,6 +632,12 @@ int main(int argc, char** argv) {
             EvictedEntriesServeNoRelocation(libraries);
             AgcDriverShutdown_nid_postfix();
             std::cout << "An evicted draw served no relocation " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
+            return 0;
+        }
+        if (verify) {
+            PipelineVerifyChecksRelocatedHits(libraries);
+            AgcDriverShutdown_nid_postfix();
+            std::cout << "APS5_VERIFY_DRAW_PIPELINE rebuilt every relocated hit " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";
             return 0;
         }
         if (off || flip) {
