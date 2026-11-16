@@ -167,6 +167,36 @@ void QueuedJobsKeepTheirOwnTimes() {
     Require(LapNs(totals, PhaseThread::Finisher) <= DrawNs(totals, PhaseThread::Finisher), "the finisher's phase laps for queued jobs sum past their job times, so a lap started before its job did: " + text);
 }
 
+
+void RewindTailsCountOnce() {
+    using AgcDriver::DriverDetail::ThreadPhases;
+    constexpr std::size_t Tails = 12;
+    alignas(8) static std::array<std::uint32_t, Tails> gates{};
+    alignas(8) static std::uint32_t done = 0;
+    const auto low = [](const void* address) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address)); };
+    const auto high = [](const void* address) { return static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(address) >> 32u); };
+    std::vector<std::uint32_t> commands;
+    for (auto& gate : gates) {
+        Append(commands, 0x59, {0x80000000u});
+        Append(commands, 0x3c, {0x13, low(&gate), high(&gate), 1, 0xffffffffu, 0x19});
+    }
+    Append(commands, 0x37, {0x00100200, low(&done), high(&done), 1});
+    static_cast<void>(ThreadPhases::Take());
+    Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
+    Require(sceAgcDriverSubmitDcb(&packet) == 0, "the rewind submission failed");
+    for (auto& gate : gates) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        std::atomic_ref<std::uint32_t>(gate).store(1);
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    const auto totals = ThreadPhases::Take();
+    const auto text = ThreadPhases::Text(totals);
+    std::cout << text << '\n';
+    Require(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last rewind tail did not run");
+    Require(totals.submissions == 1, "one submission with " + std::to_string(Tails) + " nested rewind tails was timed " + std::to_string(totals.submissions) + " times: " + text);
+    Require(totals.busyNs <= totals.windowNs, "the worker's busy time counts nested rewind tails more than once: " + text);
+}
+
 }
 
 int main() {
@@ -217,6 +247,7 @@ int main() {
             Require(Draws(totals, PhaseThread::Finisher) == 0 && Grouped(totals, PhaseThread::Finisher) == 0, "finisher time was counted with no finisher: " + text);
             Require(Group(totals, PhaseThread::Worker, PhaseGroup::Handoff) + Group(totals, PhaseThread::Worker, PhaseGroup::Graphics) > 0, "the worker's commit hand-off and Graphics::Draw were not timed: " + text);
         }
+        RewindTailsCountOnce();
         AgcDriverShutdown_nid_postfix();
         std::cout << "draw thread phases accounted " << (finisher ? "across the worker and the finisher, queued jobs included" : "on the worker") << "\n";
         return 0;

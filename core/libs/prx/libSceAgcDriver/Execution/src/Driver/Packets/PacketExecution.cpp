@@ -36,6 +36,7 @@ struct RingOrder {
 };
 
 thread_local RingOrder ringOrder;
+thread_local std::uint32_t submissionDepth = 0;
 
 void noteRingPacket(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::uint32_t header) {
     if (ringOrder.queue != queueId || ringOrder.serial != serial) ringOrder = {queueId, serial, false};
@@ -159,13 +160,18 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 
 void Driver::execute(const Submission& submission) {
     ThreadPhases::Role phaseRole(submission.queue == 0 ? PhaseThread::Worker : PhaseThread::Other);
+    const bool timedSubmission = ThreadPhases::Enabled() && submission.queue == 0;
+    const bool outermostSubmission = timedSubmission && submissionDepth == 0;
+    if (timedSubmission) ++submissionDepth;
     struct SubmissionClock {
+        bool nested;
         bool timed;
         std::chrono::steady_clock::time_point start;
         ~SubmissionClock() {
+            if (nested) --submissionDepth;
             if (timed) ThreadPhases::AddSubmission(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
         }
-    } submissionClock{ThreadPhases::Enabled() && submission.queue == 0, ThreadPhases::Enabled() && submission.queue == 0 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+    } submissionClock{timedSubmission, outermostSubmission, outermostSubmission ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
