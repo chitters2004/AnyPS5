@@ -30,6 +30,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DRAW_TABLE_SNAPSHOT",
     "APS5_NO_DRAW_RELOCATION",
     "APS5_NO_DRAW_SET_INDEX",
+    "APS5_NO_DRAW_SET_CACHE",
 };
 
 struct SwitchValues {
@@ -49,6 +50,7 @@ struct SwitchValues {
             std::getenv("APS5_DRAW_TABLE_SNAPSHOT") != nullptr,
             std::getenv("APS5_NO_DRAW_RELOCATION") != nullptr,
             std::getenv("APS5_NO_DRAW_SET_INDEX") != nullptr,
+            std::getenv("APS5_NO_DRAW_SET_CACHE") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
