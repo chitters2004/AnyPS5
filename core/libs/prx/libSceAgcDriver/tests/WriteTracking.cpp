@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -2650,6 +2651,57 @@ void CheckMarkPossiblyWrittenOrder() {
 #endif
 }
 
+void CheckQuietWriteBacks() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    void* memory = AllocateWatched(Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* guest = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, Block);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    auto since = CollectWrittenBlocks(base, Block, std::numeric_limits<std::uint64_t>::max(), written);
+    Require(since != 0 && written.empty(), "the quiet write-back block was not collected");
+    const std::vector<std::byte> original(4096, std::byte{0x11});
+    auto changed = original;
+    changed[0x40] = std::byte{0x5a};
+    const std::span<const std::byte> none;
+    const auto breaks = [](const auto& writeBack) {
+        const auto before = ProofSerial();
+        writeBack();
+        return ProofSerial() != before;
+    };
+    std::string failures;
+    const auto expect = [&](bool condition, const char* message) {
+        if (!condition) failures += std::string(failures.empty() ? "" : "; ") + message;
+    };
+    for (const bool quiet : {true, false}) {
+        Switches::Assign(RuntimeSwitch::NoQuietWriteBacks, !quiet);
+        expect(QuietWriteBacks() == quiet, "the quiet write-back switch did not follow its assignment");
+        expect(breaks([&] { WriteChanged(base + 0x1000, none, none); }) != quiet, quiet ? "an empty write-back broke proofs" : "an empty write-back with the switch set kept proofs");
+        expect(breaks([&] { WriteChanged(base + 0x1000, original, original); }) != quiet, quiet ? "an unchanged write-back broke proofs" : "an unchanged write-back with the switch set kept proofs");
+        expect(breaks([&] { WriteChangedKeepingGuest(base + 0x2000, original, original); }) != quiet, quiet ? "an unchanged keep-guest write-back broke proofs" : "an unchanged keep-guest write-back with the switch set kept proofs");
+        expect(breaks([&] { expect(WriteChangedIfHeld(base + 0x3000, original, original, 0) == 0, "an unchanged unconditional held write-back lost bytes"); }) != quiet, quiet ? "an unchanged unconditional held write-back broke proofs" : "an unchanged unconditional held write-back with the switch set kept proofs");
+        expect(breaks([&] { expect(WriteChangedIfHeld(base + 0x3000, none, none, since) == 0, "an empty held write-back lost bytes"); }) != quiet, quiet ? "an empty held write-back broke proofs" : "an empty held write-back with the switch set kept proofs");
+        expect(breaks([&] { WriteChanged(base + 0x4000, changed, original); }), "a write-back that changed one byte kept proofs");
+        expect(guest[0x4040] == 0x5a, "a write-back that changed one byte did not store it");
+        guest[0x4040] = 0x11;
+        since = CollectWrittenBlocks(base, Block, since, written);
+        const auto held = CollectWrittenBlocks(base, Block, std::numeric_limits<std::uint64_t>::max(), written);
+        guest[0x5020] = 0x33;
+        expect(breaks([&] { expect(WriteChangedIfHeld(base + 0x5000, original, original, held) == 4096, "an unchanged held write-back over a CPU write did not report its bytes lost"); }), "an unchanged held write-back over a CPU write kept proofs");
+        guest[0x6020] = 0x44;
+        static_cast<void>(breaks([&] { WriteChanged(base + 0x6000, original, original); }));
+        since = CollectWrittenBlocks(base, Block, since, written);
+        expect(std::find_if(written.begin(), written.end(), [&](const auto& run) { return run.first <= base + 0x6020 && base + 0x6020 < run.second; }) != written.end(), "a CPU write under an unchanged write-back was not listed by the next collect");
+        expect(guest[0x6020] == 0x44, "an unchanged write-back replaced a CPU byte");
+        guest[0x5020] = 0x11;
+        guest[0x6020] = 0x11;
+        since = CollectWrittenBlocks(base, Block, since, written);
+    }
+    Switches::Assign(RuntimeSwitch::NoQuietWriteBacks, false);
+    Require(failures.empty(), failures);
+}
+
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
@@ -2729,6 +2781,7 @@ int main(int argc, char** argv) {
         CheckRepeatedPossibleStores();
         CheckOwnStore();
         CheckGpuWriteNotListed();
+        CheckQuietWriteBacks();
         CheckUnwatch();
         CheckNewestStamp();
         CheckPartlyWatchedStore();

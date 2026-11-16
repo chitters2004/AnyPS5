@@ -165,8 +165,11 @@ struct ProofBreakCounts {
     std::array<std::uint64_t, ProofBreakSiteCount> sites{};
     std::uint64_t emptyWriteBacks = 0;
     std::uint64_t unchangedWriteBacks = 0;
+    std::uint64_t quietWriteBacks = 0;
+    std::uint64_t heldUnchangedWriteBacks = 0;
 };
 bool ProofBreaksCounted();
+bool QuietWriteBacks();
 void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
 void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t address = 0, std::uint64_t bytes = 0);

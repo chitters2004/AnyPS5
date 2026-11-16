@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/General.hpp"
@@ -2302,6 +2303,8 @@ struct ProofBreakCounters {
     std::array<ProfileCounter, ProofBreakSiteCount> sites;
     ProfileCounter emptyWriteBacks;
     ProfileCounter unchangedWriteBacks;
+    ProfileCounter quietWriteBacks;
+    ProfileCounter heldUnchangedWriteBacks;
 };
 
 ProofBreakCounters& proofBreakCounters() {
@@ -2327,6 +2330,8 @@ ProofBreakCounts TakeProofBreakCounts() {
     for (std::size_t site = 0; site < ProofBreakSiteCount; ++site) counts.sites[site] = counters.sites[site].Take();
     counts.emptyWriteBacks = counters.emptyWriteBacks.Take();
     counts.unchangedWriteBacks = counters.unchangedWriteBacks.Take();
+    counts.quietWriteBacks = counters.quietWriteBacks.Take();
+    counts.heldUnchangedWriteBacks = counters.heldUnchangedWriteBacks.Take();
     return counts;
 }
 
@@ -3850,8 +3855,23 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     WriteChanged(address, current, original, ChangedByteStoreLimit());
 }
 
+bool QuietWriteBacks() {
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoQuietWriteBacks);
+}
+
+static bool sameSnapshot(std::span<const std::byte> current, std::span<const std::byte> original) {
+    return current.empty() || std::memcmp(current.data(), original.data(), current.size()) == 0;
+}
+
+static bool quietWriteBack(std::span<const std::byte> current, std::span<const std::byte> original) {
+    if (!QuietWriteBacks() || !sameSnapshot(current, original)) return false;
+    if (ProofBreaksCounted()) proofBreakCounters().quietWriteBacks.Add();
+    return true;
+}
+
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    if (quietWriteBack(current, original)) return;
     BreakProofs(ProofBreakSite::WriteBack, address, current.size());
     if (current.empty()) {
         if (ProofBreaksCounted()) proofBreakCounters().emptyWriteBacks.Add();
@@ -3923,6 +3943,11 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    if (current.empty() || unchangedSince == 0u) {
+        if (quietWriteBack(current, original)) return 0;
+    } else if (ProofBreaksCounted() && QuietWriteBacks() && sameSnapshot(current, original)) {
+        proofBreakCounters().heldUnchangedWriteBacks.Add();
+    }
     BreakProofs(ProofBreakSite::WriteBackIfHeld, address, current.size());
     if (current.empty()) {
         if (ProofBreaksCounted()) proofBreakCounters().emptyWriteBacks.Add();
