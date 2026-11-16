@@ -168,6 +168,7 @@ struct DrawTail {
     std::vector<StageDataHit> stageData;
     bool drawHit = false;
     bool verifyHit = false;
+    DrawRelocationSource relocation;
     bool stageEntries = false;
     bool patchedStages = false;
     const Submission* submission = nullptr;
@@ -431,14 +432,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            if (drawRelocationPending.key != 0) {
-                const bool sameIdentity = drawRelocationPending.identity == drawIdentity;
-                const bool drain = DrawFinisher::Busy();
-                if (drain) DrawFinisher::Get().Drain(sameIdentity ? DrawFinisher::WaitSite::RelocationSame : DrawFinisher::WaitSite::RelocationOther);
-                if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(sameIdentity ? DrawFinisher::DrainSite::RelocationSame : DrawFinisher::DrainSite::RelocationOther, drain);
-            }
+            if (lastRelocationMiss != 0 && DrawFinisher::Overlap()) DrawFinisher::NoteAfterRelocationMiss(lastRelocationMiss == drawIdentity);
+            lastRelocationMiss = 0;
             std::lock_guard cacheLock(drawCacheMutex);
-            learnPendingRelocation();
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -475,7 +471,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
                 cacheLock.lock();
             }
-            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            if (drawIdentity != 0) {
+                tail.relocation = {drawAlias, drawIdentity};
+                lastRelocationMiss = drawIdentity;
+            }
             if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -540,13 +539,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         decode = std::move(refreshed);
     }
-    if (decode != nullptr && !userPatches.empty() && verifyDrawRecipe()) {
+    const bool verifyRelocated = !userPatches.empty() && verifyDrawPipeline();
+    if (decode != nullptr && !userPatches.empty() && (verifyDrawRecipe() || verifyRelocated)) {
         auto patched = std::make_shared<DrawDecode>(*decode);
         for (const auto& patch : userPatches) patched->programs.at(patch.program).userData.at(patch.index) = patch.value;
         decode = std::move(patched);
     }
     try {
-        resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile);
+        resolveDrawDecode(queue, submission, localDevice->graphicsContext(), decode, registerKey, drawKey, profile, verifyDrawRecipe() || verifyRelocated);
     } catch (...) {
         TraceDrawAttemptFailure(traceToken, "decode", "exception", submission.serial, submission.queue, packetOffset, ExceptionReason(std::current_exception()));
         throw;
@@ -689,7 +689,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
     try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData, verifyRelocated);
     } catch (...) {
         TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
         throw;
@@ -1064,7 +1064,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
     const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry, tail.relocation);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1501,6 +1501,7 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
     tail.dataEntry = nullptr;
     tail.drawHit = false;
     tail.verifyHit = false;
+    tail.relocation = {};
     tail.patchedStages = false;
     for (std::size_t i = 0; i < count; ++i) {
         tail.decodeReads[i].clear();
