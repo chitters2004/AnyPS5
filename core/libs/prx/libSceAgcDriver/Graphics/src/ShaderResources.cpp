@@ -4226,6 +4226,101 @@ struct ProofLogCheck {
     GuestMemory::ProofBreakWindow window;
 };
 
+constexpr std::size_t CensusGroups = 6;
+constexpr std::size_t CensusTiers = 5;
+constexpr std::array<const char*, CensusGroups> CensusGroupNames{"no declared writes", "zero-length writes", "overlapping writes", "unranged", "overlapping", "unscoped outside the set"};
+
+struct BreakCensusCounts {
+    ProfileCounter misses;
+    ProfileCounter walked;
+    ProfileCounter overwritten;
+    ProfileCounter unreadable;
+    std::array<ProfileCounter, CensusTiers> tiers;
+    std::array<ProfileCounter, 3> capLength;
+    std::array<ProfileCounter, 3> capGap;
+    std::array<std::array<ProfileCounter, 32>, CensusGroups> present;
+    std::array<std::array<ProfileCounter, 32>, CensusGroups> sole;
+};
+
+BreakCensusCounts& breakCensusCounts() {
+    static BreakCensusCounts counts;
+    return counts;
+}
+
+void noteBreakCensus(const GuestMemory::ProofBreakCensus& census, std::uint64_t gap) {
+    auto& counts = breakCensusCounts();
+    counts.misses.Add();
+    if (census.breaks > 1024u) {
+        counts.capLength[census.overwritten ? 2 : census.breaks <= 2048u ? 0 : 1].Add();
+        counts.capGap[gap <= 1024u ? 0 : gap < 4096u ? 1 : 2].Add();
+    }
+    if (census.overwritten) {
+        counts.overwritten.Add();
+        return;
+    }
+    if (!census.complete) {
+        counts.unreadable.Add();
+        return;
+    }
+    counts.walked.Add();
+    const std::array<std::uint32_t, CensusGroups> groups{census.noWritePackets, census.emptyRangePackets, census.overlapPackets, census.unrangedSites, census.overlapSites, census.outsideUnscopedSites};
+    std::size_t classes = 0;
+    for (const auto mask : groups) classes += static_cast<std::size_t>(std::popcount(mask));
+    for (std::size_t group = 0; group < CensusGroups; ++group) {
+        for (std::uint32_t bit = 0; bit < 32u; ++bit) {
+            if (((groups[group] >> bit) & 1u) == 0) continue;
+            counts.present[group][bit].Add();
+            if (classes == 1) counts.sole[group][bit].Add();
+        }
+    }
+    const auto gpuMutex = 1u << static_cast<std::uint32_t>(GuestMemory::ProofBreakSite::GpuMutex);
+    const std::array<bool, CensusTiers> clears{
+        classes == 0,
+        census.emptyRangePackets == 0 && census.overlapPackets == 0 && census.unrangedSites == 0 && census.overlapSites == 0 && census.outsideUnscopedSites == 0,
+        census.emptyRangePackets == 0 && census.overlapPackets == 0 && census.unrangedSites == 0 && census.overlapSites == 0,
+        census.emptyRangePackets == 0 && census.overlapPackets == 0 && (census.unrangedSites & ~gpuMutex) == 0 && census.overlapSites == 0,
+        census.overlapPackets == 0 && (census.unrangedSites & ~gpuMutex) == 0 && census.overlapSites == 0};
+    for (std::size_t tier = 0; tier < CensusTiers; ++tier) {
+        if (clears[tier]) counts.tiers[tier].Add();
+    }
+}
+
+void reportBreakCensus() {
+    auto& counts = breakCensusCounts();
+    const auto take = [](ProfileCounter& counter) { return static_cast<unsigned long long>(counter.Take()); };
+    std::string blocking;
+    for (std::size_t group = 0; group < CensusGroups; ++group) {
+        for (std::uint32_t bit = 0; bit < 32u; ++bit) {
+            const auto present = counts.present[group][bit].Take();
+            const auto sole = counts.sole[group][bit].Take();
+            if (present == 0) continue;
+            const char* name = group < 3 ? DriverDetail::DrawPipeline::KindName(bit) : GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(bit));
+            blocking += (blocking.empty() ? "" : ", ") + std::string(group < 3 ? "packet " : "") + name + " " + CensusGroupNames[group] + " " + std::to_string(present) + "/" + std::to_string(sole);
+        }
+    }
+    const auto misses = take(counts.misses);
+    const auto walked = take(counts.walked);
+    const auto overwritten = take(counts.overwritten);
+    const auto unreadable = take(counts.unreadable);
+    std::array<unsigned long long, CensusTiers> tiers{};
+    for (std::size_t tier = 0; tier < CensusTiers; ++tier) tiers[tier] = take(counts.tiers[tier]);
+    std::array<unsigned long long, 3> lengths{};
+    std::array<unsigned long long, 3> gaps{};
+    for (std::size_t bucket = 0; bucket < 3; ++bucket) {
+        lengths[bucket] = take(counts.capLength[bucket]);
+        gaps[bucket] = take(counts.capGap[bucket]);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break census over %llu proof-alone misses: %llu walked, %llu past the ring, %llu with a slot the log could not read; clear with the walk at the ring %llu, and packets without declared writes skipped %llu, and exact-range sites scoped %llu, and the off-thread GPU mutex skipped %llu, and zero-length packet writes skipped %llu; past the 1024 cap by breaks: up to 2048 %llu, up to 4095 %llu, past the ring %llu; by breaks since the set's previous check: up to 1024 %llu, up to 4095 %llu, more %llu; blocking (in the window/only blocker): %s\n", misses, walked, overwritten, unreadable, tiers[0], tiers[1], tiers[2], tiers[3], tiers[4], lengths[0], lengths[1], lengths[2], gaps[0], gaps[1], gaps[2], blocking.empty() ? "none" : blocking.c_str());
+    const auto packets = GuestMemory::TakePacketBreakCounts();
+    std::string kinds;
+    for (std::size_t kind = 0; kind < packets.size(); ++kind) {
+        const auto& writes = packets[kind];
+        if (writes[0] + writes[1] + writes[2] == 0) continue;
+        kinds += (kinds.empty() ? "" : ", ") + std::string(DriverDetail::DrawPipeline::KindName(kind)) + " " + std::to_string(writes[0]) + "/" + std::to_string(writes[1]) + "/" + std::to_string(writes[2]);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) non-draw packet breaks by kind (declared writes/none declared/zero-length): %s\n", kinds.empty() ? "none" : kinds.c_str());
+}
+
 bool exitMissesCounted() {
     static const bool counted = EpochProofCountsProfiled() || std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     return counted;
@@ -4296,6 +4391,7 @@ void reportExitMisses() {
     const auto unranged = blockSites(misses.unrangedBlocks);
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits by the inputs that moved: %s; would hit if only that input were scoped: %s; with the proof scoped by the break log and only that input too: %s\n", combos.empty() ? "none" : combos.c_str(), only.c_str(), withLog.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log: %llu exits taken because every break since the proof was outside the set (%s); over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(logExits), RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) ? "off, APS5_NO_SCOPED_PROOFS" : "on", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
+    if (GuestMemory::ProofBreakCensusEnabled()) reportBreakCensus();
 }
 
 ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, const ShaderResources::ExitStamp& end, std::uint64_t flushBreaks, std::uint64_t ownBreaks) {
@@ -5054,6 +5150,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
+        const auto censusGap = censusSeen != 0 && stamp.proof >= censusSeen ? stamp.proof - censusSeen : std::numeric_limits<std::uint64_t>::max();
+        censusSeen = stamp.proof;
         const bool stalePlanes = proved.epoch != 0 && stalePlanesRead();
         bool matched = stamp.epoch != 0 && proved == stamp && !stalePlanes;
         if (!matched && stamp.epoch != 0 && proved.epoch != 0 && !stalePlanes && proved.proof != stamp.proof && provedRanges && !RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs)) {
@@ -5097,6 +5195,11 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 if (provedRanges) log.window = GuestMemory::ProofBreaksSince(proved.proof, proofRanges);
             }
             noteExitMiss(proved, stamp, stalePlanes, copies, provedAge, log);
+            if (GuestMemory::ProofBreakCensusEnabled() && provedRanges && proved.proof != stamp.proof && !stalePlanes && !copies) {
+                auto others = stamp;
+                others.proof = proved.proof;
+                if (others == proved) noteBreakCensus(GuestMemory::ProofBreakCensusSince(proved.proof, proofRanges), censusGap);
+            }
         }
         if (proved.epoch != 0 && GuestMemory::ProofBreakSitesTracked()) {
             std::uint32_t set = 0;

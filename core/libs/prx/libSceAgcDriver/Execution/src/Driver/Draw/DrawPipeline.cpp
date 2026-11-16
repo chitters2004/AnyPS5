@@ -31,6 +31,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainRe
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
 
+static_assert(KindNames.size() <= GuestMemory::ProofBreakDetails);
+
 std::atomic<unsigned> runningCommitters{0};
 ProfileCounter drawKeys;
 ProfileCounter drawKeysSameAsPrevious;
@@ -301,6 +303,10 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     GuestMemory::BumpCollectEpoch();
 }
 
+const char* DrawPipeline::KindName(std::size_t kind) {
+    return kind < KindNames.size() ? KindNames[kind] : "other";
+}
+
 unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
@@ -494,7 +500,7 @@ void DrawPipeline::run() {
                 if (commit != nullptr) (*commit)();
             }
             if (!isDraw) {
-                GuestMemory::BreakProofsOver(covered ? GuestMemory::ProofBreakSite::PacketCovered : GuestMemory::ProofBreakSite::Packet, *writes);
+                GuestMemory::BreakProofsOver(covered ? GuestMemory::ProofBreakSite::PacketCovered : GuestMemory::ProofBreakSite::Packet, *writes, static_cast<std::uint8_t>(kind));
                 static const bool counted = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
                 if (counted) kindBreaks[static_cast<std::size_t>(kind)][declaredWrites ? 1 : 0].fetch_add(1, std::memory_order_relaxed);
             }

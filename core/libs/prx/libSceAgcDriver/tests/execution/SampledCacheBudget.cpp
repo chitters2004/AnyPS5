@@ -1,6 +1,7 @@
 #include "../PortabilitySubset.hpp"
 #include "../WatchedBlock.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -805,7 +806,7 @@ void epochProofLogTests(Context context) {
     const bool nearWritten = check("a marked-written break over the set's surface", [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, address, 4096u); });
     const bool distantPacket = check("a packet break over two ranges outside the set", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, distantRanges); });
     const bool nearPacket = check("a packet break with one range over the set's surface", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, nearRanges); });
-    const bool unrangedPacket = check("a packet break without declared writes", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, {}); });
+    const bool unrangedPacket = check("a packet break without declared writes", [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, {}, static_cast<std::uint8_t>(AgcDriver::DriverDetail::DrawPipeline::CommitKind::Completion)); });
     const bool distantStore = check("a driver store outside the set", [&] { AgcDriver::GuestMemory::BreakProofs(Site::DriverStore, distant, 4096u); });
     Require(!nearWritten, "a marked-written break over the set's surface let the exit through");
     Require(!nearPacket, "a packet break over the set's surface let the exit through");
