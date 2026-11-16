@@ -2757,11 +2757,24 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
     });
 }
 
+static void storeSmallBytes(std::uint64_t address, std::span<const std::byte> source) {
+    if (address % 4 != 0 || source.size() % 4 != 0) {
+        std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
+        return;
+    }
+    for (std::size_t at = 0; at < source.size(); at += 4) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, source.data() + at, sizeof(word));
+        std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(address + at)).store(word, std::memory_order_release);
+    }
+}
+
 static void copyOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
 #ifndef _WIN32
     if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
 #endif
-    std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
+    if (source.size() < PageBytes) storeSmallBytes(address, source);
+    else std::memcpy(reinterpret_cast<void*>(address), source.data(), source.size());
 }
 
 std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
@@ -3911,7 +3924,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     StoreOwnBytes(address, source.size(), [&](std::span<std::byte> image) {
         CheckRange(destination, source.size(), alignment, true);
         if (source.size() >= PageBytes) copyOwnBytes(address, source);
-        else std::memcpy(destination, source.data(), source.size());
+        else storeSmallBytes(address, source);
         if (!image.empty()) std::memcpy(image.data(), source.data(), source.size());
     });
 }
