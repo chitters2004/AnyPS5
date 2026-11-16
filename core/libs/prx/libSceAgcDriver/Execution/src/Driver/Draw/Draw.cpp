@@ -323,9 +323,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
     auto& phaseLap = tail.phaseLap;
-    phaseLap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool timedPhases = profile || ThreadPhases::Enabled();
+    phaseLap = timedPhases ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     tail.profile = profile;
-    tail.phaseTiming.profile = profile;
+    tail.phaseTiming.profile = timedPhases;
     auto& phaseTiming = tail.phaseTiming;
     if (profile && packetStartedAt() != std::chrono::steady_clock::time_point{}) phaseMs[DrawRowPrologue] = std::chrono::duration<double, std::milli>(phaseLap - packetStartedAt()).count();
 
@@ -764,6 +765,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
         DrawFinisher::Get().Enqueue([this, tailHolder] {
             auto& job = *tailHolder;
+            ThreadPhases::Role role(PhaseThread::Finisher);
+            struct JobClock {
+                bool timed;
+                std::chrono::steady_clock::time_point start;
+                ~JobClock() {
+                    if (timed) ThreadPhases::AddDraw(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
+                }
+            } clock{job.phaseTiming.profile, job.phaseTiming.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+            job.phaseLap = clock.start;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");
