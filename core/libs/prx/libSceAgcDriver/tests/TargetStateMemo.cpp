@@ -1636,8 +1636,65 @@ void pendingSplit(AgcDriver::VulkanDevice& device) {
     expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "draws around pending moves");
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 18> R3Scenarios{{
+std::uint64_t prepDraws(TargetPrepOutcome outcome) {
+    std::uint64_t draws = 0;
+    for (std::size_t thread = 0; thread < static_cast<std::size_t>(TargetPrepThread::Count); ++thread) draws += TargetPrepDraws(outcome, static_cast<TargetPrepThread>(thread));
+    return draws;
+}
+
+void requireCause(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, TargetMemoEvent cause, TargetPrepOutcome outcome, const std::string& what) {
+    const MemoEvents events;
+    const auto prepared = prepDraws(outcome);
+    draw(device, color, options);
+    std::uint64_t invalid = 0;
+    std::uint64_t fallback = 0;
+    for (auto event = static_cast<std::size_t>(TargetMemoEvent::InvalidNever); event <= static_cast<std::size_t>(TargetMemoEvent::InvalidMetadata); ++event) invalid += events.Moved(static_cast<TargetMemoEvent>(event));
+    for (auto event = static_cast<std::size_t>(TargetMemoEvent::DepthNotServed); event <= static_cast<std::size_t>(TargetMemoEvent::DepthVerify); ++event) fallback += events.Moved(static_cast<TargetMemoEvent>(event));
+    Require(invalid == events.Moved(TargetMemoEvent::Invalid), what + ": the invalid causes do not add up to the invalid lookups (" + events.Text() + ")");
+    Require(fallback == events.Moved(TargetMemoEvent::DepthFallback), what + ": the depth fallback causes do not add up to the depth fallbacks (" + events.Text() + ")");
+    requireMemoEvent(events, cause, 1u, what);
+    Require(prepDraws(outcome) == prepared + 1u, what + ": the draw's target prep was not timed as " + std::to_string(static_cast<int>(outcome)));
+}
+
+void causeSplit(AgcDriver::VulkanDevice& device) {
+    Require(memoCounted() && memoServes(), "the cause split test needs the target memo serving under APS5_PROFILE_DRAW");
+    auto color = colorTarget();
+    reset(device, color);
+    auto depth = depthTarget(true);
+    arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS});
+    {
+        const auto hits = prepDraws(TargetPrepOutcome::Hit);
+        draw(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS});
+        Require(prepDraws(TargetPrepOutcome::Hit) == hits + 1u, "an unchanged repeat was not timed as a hit");
+    }
+    auto changed = depth;
+    changed.clearDepth = 0.375f;
+    requireCause(device, color, {.scissor = Right, .depth = changed, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS, .depthValue = 0.75f}, TargetMemoEvent::DepthDescriptor, TargetPrepOutcome::HitDepthMiss, "a depth descriptor change");
+    arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS});
+    AgcDriver::GuestMemory::BreakProofs();
+    requireCause(device, color, {.scissor = Right, .depth = depth, .compare = VK_COMPARE_OP_ALWAYS}, TargetMemoEvent::DepthProof, TargetPrepOutcome::Miss, "a proof break");
+    auto msaa = depthTarget(false);
+    msaa.address = address(MultisampleStorage.data());
+    msaa.samples = 4;
+    msaa.htileAddress = 0;
+    arm(device, color, {.depth = msaa, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
+    requireCause(device, color, {.depth = msaa, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, TargetMemoEvent::DepthMemoInvalid, TargetPrepOutcome::HitDepthMiss, "an MSAA depth target");
+    auto aliased = colorTarget(true);
+    auto* metadata = allocateWatched(PlaneBytes);
+    std::memset(metadata, 0xff, PlaneBytes);
+    aliased.dccAddress = address(metadata);
+    reset(device, aliased);
+    auto htile = depthTarget(true);
+    htile.htileAddress = aliased.dccAddress;
+    arm(device, aliased);
+    draw(device, aliased, {.depth = htile, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
+    requireCause(device, aliased, {.depth = htile, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, TargetMemoEvent::InvalidDepthOverlap, TargetPrepOutcome::Miss, "color metadata aliased by the depth target");
+    std::cout << "cause split: invalid and depth fallback causes counted apart\n";
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 19> R3Scenarios{{
     {"pending-split", pendingSplit},
+    {"cause-split", causeSplit},
     {"memo-order", memoOrder},
     {"untracked-dcc", untrackedDccClear},
     {"untracked-cmask", untrackedCmaskClear},

@@ -216,6 +216,7 @@ double seconds(Clock::duration elapsed) {
 
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     if (local != nullptr) return;
+    boundName = name;
     if (!Configured()) {
         localName = name;
         return;
@@ -227,6 +228,10 @@ void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
     std::lock_guard lock(state.mutex);
     local = bound.get();
     state.threads.push_back(std::move(bound));
+}
+
+const char* PerformanceTrace::BoundName() {
+    return boundName;
 }
 
 TraceThread* PerformanceTrace::bindNamed() {

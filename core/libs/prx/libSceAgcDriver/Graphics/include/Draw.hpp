@@ -204,10 +204,15 @@ enum class TargetMemoEvent : std::uint8_t {
     Lookup, Hit, OverlapCached, OverlapComputed, Accept, AcceptWithDepthMiss, DepthHit, AvoidedRefreshLookups,
     Invalid, ThreadChanged, Descriptor, ResidentGone, ResidentEvicted, DepthOverlap, Metadata,
     Epoch, Proofs, Pending, Unwatch, Allocations, Surfaces, Released, Claims, Recorder, Device,
-    PostDepthInvalidated, DepthFallback, Admission, RecipeInvalidated, Build, VerifyChecked, PendingOwnRecording, PendingOther, Count
+    PostDepthInvalidated, DepthFallback, Admission, RecipeInvalidated, Build, VerifyChecked, PendingOwnRecording, PendingOther,
+    InvalidNever, InvalidThreadChanged, InvalidOff, InvalidAdmission, InvalidFailed, InvalidRecipe, InvalidEpoch, InvalidNoColors, InvalidUncached, InvalidMultisampled, InvalidFmask, InvalidDepthOverlap, InvalidMetadata,
+    DepthNotServed, DepthMemoInvalid, DepthOwner, DepthProof, DepthNoDescriptor, DepthDescriptor, DepthView, DepthAfterColors, DepthVerify, Count
 };
 std::uint64_t TargetMemoEvents(TargetMemoEvent event);
 const char* TargetMemoEventName(TargetMemoEvent event);
+enum class TargetPrepOutcome : std::uint8_t { AttachmentMemo, Unconsulted, Hit, HitDepthMiss, Miss, DepthOnlyHit, DepthOnlyMiss, Count };
+enum class TargetPrepThread : std::uint8_t { Committer, Finisher, Worker, Other, Count };
+std::uint64_t TargetPrepDraws(TargetPrepOutcome outcome, TargetPrepThread thread);
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const State& state, std::size_t repeats, std::size_t& hits);
 

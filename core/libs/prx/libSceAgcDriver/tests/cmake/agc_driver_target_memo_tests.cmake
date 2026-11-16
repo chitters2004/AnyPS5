@@ -90,6 +90,14 @@ if(BUILD_TESTING)
     if(WIN32)
         set_tests_properties(agc_driver_target_memo_pending_split PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_target_memo_cause_split COMMAND agc_driver_target_memo_tests --r3 cause-split)
+    set_tests_properties(agc_driver_target_memo_cause_split PROPERTIES
+            TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PROFILE_DRAW=1;APS5_NO_PASS_ATTACHMENT_MEMO=1"
+            PASS_REGULAR_EXPRESSION "cause split: invalid and depth fallback causes counted apart.*target state memo tests passed")
+    if(WIN32)
+        set_tests_properties(agc_driver_target_memo_cause_split PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     if(NOT WIN32)
         add_test(NAME agc_driver_target_memo_watched_imports COMMAND agc_driver_target_memo_tests)
         set_tests_properties(agc_driver_target_memo_watched_imports PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"

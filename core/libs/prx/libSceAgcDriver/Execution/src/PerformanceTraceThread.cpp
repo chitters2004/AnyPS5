@@ -16,6 +16,7 @@ std::uint64_t PerformanceTrace::OwnedDrawUnbound() {
 }
 thread_local TraceThread* PerformanceTrace::local = nullptr;
 thread_local const char* PerformanceTrace::localName = nullptr;
+thread_local const char* PerformanceTrace::boundName = nullptr;
 std::atomic<TraceThread* (*)()> PerformanceTrace::binder{nullptr};
 
 }
