@@ -3548,6 +3548,13 @@ bool StopHostWrites(std::uint32_t boundMs) {
     return true;
 }
 
+std::uint64_t LoadLabel(std::uint64_t address, std::size_t bytes) {
+    const auto word = [](std::uint64_t at) { return std::atomic_ref<std::uint32_t>(*reinterpret_cast<std::uint32_t*>(at)).load(std::memory_order_acquire); };
+    if (bytes != 8) return word(address);
+    if (address % 8 == 0) return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(address)).load(std::memory_order_acquire);
+    return word(address) | static_cast<std::uint64_t>(word(address + 4)) << 32u;
+}
+
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     GuardRead(address, destination.size());
