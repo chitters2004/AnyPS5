@@ -70,6 +70,9 @@ struct DrawSetCounters {
 };
 
 DrawSetCounters drawSetCounters;
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::DrawSetMiss::Count)> drawSetMisses{};
+std::atomic<std::uint64_t> drawSetHandleKeyHits{0};
+std::atomic<bool> drawSetMissTracking{std::getenv("APS5_PROFILE_DRAW_SETS") != nullptr};
 
 void ReportDrawSets() {
     static std::mutex reportMutex;
@@ -89,7 +92,14 @@ void ReportDrawSets() {
     const auto hits = totals.cacheHits - last.cacheHits;
     const auto misses = totals.cacheMisses - last.cacheMisses;
     const auto lookups = hits + misses;
-    std::fprintf(stderr, "[draw-sets] (10 s): %llu prepared (%llu indexed), %llu sets written, %llu pool counts built; cache %llu hits (%llu by uploaded bytes), %llu misses (%llu after the set expired), hit rate %.1f %%, %llu cleared, uncached %llu with a per-draw fault record, %llu with in-place buffers%s%s\n", delta(totals.prepared, last.prepared), delta(totals.indexed, last.indexed), delta(totals.setsWritten, last.setsWritten), delta(totals.poolCountsBuilt, last.poolCountsBuilt), static_cast<unsigned long long>(hits), delta(totals.cacheUploadHits, last.cacheUploadHits), static_cast<unsigned long long>(misses), delta(totals.cacheExpired, last.cacheExpired), lookups == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / static_cast<double>(lookups), delta(totals.cacheCleared, last.cacheCleared), delta(totals.uncachedFaultRecord, last.uncachedFaultRecord), delta(totals.uncachedInPlace, last.uncachedInPlace), RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex) ? ", index off" : "", RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache) ? ", cache off" : "");
+    std::fprintf(stderr, "[draw-sets] (10 s): %llu prepared (%llu indexed), %llu sets written, %llu pool counts built; cache %llu hits (%llu by uploaded bytes), %llu misses, %llu released sets dropped, hit rate %.1f %%, %llu cleared, uncached %llu with a per-draw fault record, %llu with in-place buffers%s%s\n", delta(totals.prepared, last.prepared), delta(totals.indexed, last.indexed), delta(totals.setsWritten, last.setsWritten), delta(totals.poolCountsBuilt, last.poolCountsBuilt), static_cast<unsigned long long>(hits), delta(totals.cacheUploadHits, last.cacheUploadHits), static_cast<unsigned long long>(misses), delta(totals.cacheExpired, last.cacheExpired), lookups == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / static_cast<double>(lookups), delta(totals.cacheCleared, last.cacheCleared), delta(totals.uncachedFaultRecord, last.uncachedFaultRecord), delta(totals.uncachedInPlace, last.uncachedInPlace), RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetIndex) ? ", index off" : "", RuntimeSwitches::Set(RuntimeSwitch::NoDrawSetCache) ? ", cache off" : "");
+    static ShaderResources::DrawSetMissCounts lastMisses{};
+    if (ShaderResources::DrawSetMissesTracked()) {
+        const auto missTotals = ShaderResources::DrawSetMissTotals();
+        const auto reason = [&](ShaderResources::DrawSetMiss miss) { const auto at = static_cast<std::size_t>(miss); return delta(missTotals.reasons[at], lastMisses.reasons[at]); };
+        std::fprintf(stderr, "[draw-sets] misses (10 s): %llu with no held set, %llu a released set would have hit, %llu other shape, %llu other uploaded bytes, %llu other guest address, %llu same address in a new snapshot; %llu a layout and buffer handle key would hit\n", reason(ShaderResources::DrawSetMiss::Empty), reason(ShaderResources::DrawSetMiss::ReleasedWouldHit), reason(ShaderResources::DrawSetMiss::Shape), reason(ShaderResources::DrawSetMiss::UploadedBytes), reason(ShaderResources::DrawSetMiss::OtherAddress), reason(ShaderResources::DrawSetMiss::Resnapshot), delta(missTotals.handleKeyHits, lastMisses.handleKeyHits));
+        lastMisses = missTotals;
+    }
     last = totals;
     lastReport = now;
 }
@@ -7369,35 +7379,114 @@ ShaderResources::DrawSetCounts ShaderResources::DrawSetTotals() {
     return {load(c.prepared), load(c.indexed), load(c.setsWritten), load(c.poolCountsBuilt), load(c.cacheHits), load(c.cacheUploadHits), load(c.cacheMisses), load(c.cacheExpired), load(c.cacheCleared), load(c.uncachedFaultRecord), load(c.uncachedInPlace)};
 }
 
+ShaderResources::DrawSetMissCounts ShaderResources::DrawSetMissTotals() {
+    DrawSetMissCounts counts;
+    for (std::size_t at = 0; at < counts.reasons.size(); ++at) counts.reasons[at] = drawSetMisses[at].load(std::memory_order_relaxed);
+    counts.handleKeyHits = drawSetHandleKeyHits.load(std::memory_order_relaxed);
+    return counts;
+}
+
+void ShaderResources::TrackDrawSetMisses(bool on) {
+    drawSetMissTracking.store(on, std::memory_order_relaxed);
+}
+
+bool ShaderResources::DrawSetMissesTracked() {
+    return drawSetMissTracking.load(std::memory_order_relaxed);
+}
+
+namespace {
+
+enum class KeyMatch { Shape, UploadedBytes, OtherAddress, Resnapshot, Same };
+
+struct HeldSnapshot {
+    const Buffer* buffer;
+    bool live;
+    VkBuffer handle;
+    VkBuffer bufferHandle;
+    VkDeviceSize offset;
+    std::uint64_t address;
+    std::size_t bytes;
+    bool uploaded;
+};
+
+template <typename Held>
+KeyMatch MatchKey(std::span<const std::size_t> heldSelected, std::span<const std::byte> heldStaged, std::size_t heldCount, Held&& held, std::span<const ShaderResources::DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, std::span<const std::byte> staged, bool& handleKey) {
+    handleKey = false;
+    if (heldStaged.size() != staged.size() || heldCount != snapshots.size() || !std::equal(heldSelected.begin(), heldSelected.end(), selected.begin(), selected.end())) return KeyMatch::Shape;
+    for (std::size_t at = 0; at < snapshots.size(); ++at) {
+        const auto entry = held(at);
+        if (snapshots[at].uploaded != entry.uploaded || snapshots[at].bytes != entry.bytes) return KeyMatch::Shape;
+    }
+    handleKey = true;
+    auto match = KeyMatch::Same;
+    if (!staged.empty() && std::memcmp(heldStaged.data(), staged.data(), staged.size()) != 0) match = KeyMatch::UploadedBytes;
+    for (std::size_t at = 0; at < snapshots.size(); ++at) {
+        const auto& current = snapshots[at];
+        const auto entry = held(at);
+        if (current.uploaded) continue;
+        const auto currentHandle = current.handle != VK_NULL_HANDLE || current.buffer == nullptr ? current.handle : current.buffer->Handle();
+        if (!entry.live || currentHandle != entry.bufferHandle) handleKey = false;
+        if (match != KeyMatch::Same) continue;
+        if (current.address != entry.address) match = KeyMatch::OtherAddress;
+        else if (current.buffer.get() != entry.buffer || !entry.live || current.handle != entry.handle || current.offset != entry.offset) match = KeyMatch::Resnapshot;
+    }
+    return match;
+}
+
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::DrawSetCache::Find(std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::size_t> selected, std::span<const std::byte> staged) {
     std::lock_guard lock(mutex);
+    const bool tracked = DrawSetMissesTracked();
+    bool releasedWouldHit = false;
+    bool handleKeyHit = false;
+    std::optional<KeyMatch> closest;
+    const auto note = [&](KeyMatch match, bool handleKey) {
+        handleKeyHit = handleKeyHit || handleKey;
+        if (!closest || static_cast<int>(match) > static_cast<int>(*closest)) closest = match;
+    };
     for (std::size_t index = 0; index < used;) {
         auto& entry = entries[index];
         auto cached = entry.bindings.lock();
         if (cached == nullptr) {
             drawSetCounters.cacheExpired.fetch_add(1, std::memory_order_relaxed);
+            if (tracked) {
+                bool handleKey = false;
+                const auto match = MatchKey(entry.selected, entry.staged, entry.shadow.size(), [&](std::size_t at) {
+                    const auto& shadow = entry.shadow[at];
+                    const auto buffer = shadow.buffer.lock();
+                    return HeldSnapshot{buffer.get(), buffer != nullptr || shadow.handle != VK_NULL_HANDLE, shadow.handle, shadow.handle != VK_NULL_HANDLE ? shadow.handle : (buffer != nullptr ? buffer->Handle() : VK_NULL_HANDLE), shadow.offset, shadow.address, shadow.bytes, shadow.uploaded};
+                }, snapshots, selected, staged, handleKey);
+                handleKeyHit = handleKeyHit || handleKey;
+                releasedWouldHit = releasedWouldHit || match == KeyMatch::Same;
+            }
             entry.bindings.reset();
+            entry.shadow.clear();
             std::rotate(entries.begin() + static_cast<std::ptrdiff_t>(index), entries.begin() + static_cast<std::ptrdiff_t>(index) + 1, entries.begin() + static_cast<std::ptrdiff_t>(used));
             --used;
             continue;
         }
-        const auto same = [&] {
-            if (entry.staged.size() != staged.size() || cached->snapshots.size() != snapshots.size() || !std::equal(entry.selected.begin(), entry.selected.end(), selected.begin(), selected.end())) return false;
-            if (!staged.empty() && std::memcmp(entry.staged.data(), staged.data(), staged.size()) != 0) return false;
-            for (std::size_t at = 0; at < snapshots.size(); ++at) {
-                const auto& current = snapshots[at];
-                const auto& held = cached->snapshots[at];
-                if (current.uploaded != held.uploaded || current.bytes != held.bytes) return false;
-                if (current.uploaded) continue;
-                if (current.buffer != held.buffer || current.handle != held.handle || current.offset != held.offset || current.address != held.address) return false;
-            }
-            return true;
-        }();
-        if (same) {
+        bool handleKey = false;
+        const auto match = MatchKey(entry.selected, entry.staged, cached->snapshots.size(), [&](std::size_t at) {
+            const auto& held = cached->snapshots[at];
+            return HeldSnapshot{held.buffer.get(), true, held.handle, held.handle != VK_NULL_HANDLE || held.buffer == nullptr ? held.handle : held.buffer->Handle(), held.offset, held.address, held.bytes, held.uploaded};
+        }, snapshots, selected, staged, handleKey);
+        if (match == KeyMatch::Same) {
             std::rotate(entries.begin(), entries.begin() + static_cast<std::ptrdiff_t>(index), entries.begin() + static_cast<std::ptrdiff_t>(index) + 1);
             return cached;
         }
+        if (tracked) note(match, handleKey);
         ++index;
+    }
+    if (tracked) {
+        auto reason = DrawSetMiss::Empty;
+        if (releasedWouldHit) reason = DrawSetMiss::ReleasedWouldHit;
+        else if (closest == KeyMatch::Shape) reason = DrawSetMiss::Shape;
+        else if (closest == KeyMatch::UploadedBytes) reason = DrawSetMiss::UploadedBytes;
+        else if (closest == KeyMatch::OtherAddress) reason = DrawSetMiss::OtherAddress;
+        else if (closest == KeyMatch::Resnapshot) reason = DrawSetMiss::Resnapshot;
+        drawSetMisses[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+        if (handleKeyHit) drawSetHandleKeyHits.fetch_add(1, std::memory_order_relaxed);
     }
     return {};
 }
@@ -7410,6 +7499,10 @@ void ShaderResources::DrawSetCache::Insert(const std::shared_ptr<DrawBindings>& 
     entry.bindings = bindings;
     entry.selected.assign(selected.begin(), selected.end());
     entry.staged.assign(staged.begin(), staged.end());
+    entry.shadow.clear();
+    if (DrawSetMissesTracked()) {
+        for (const auto& snapshot : bindings->snapshots) entry.shadow.push_back({snapshot.buffer, snapshot.handle, snapshot.offset, snapshot.address, snapshot.bytes, snapshot.uploaded});
+    }
 }
 
 void ShaderResources::DrawSetCache::Clear() {

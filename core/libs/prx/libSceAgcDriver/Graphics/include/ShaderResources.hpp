@@ -234,6 +234,14 @@ public:
         std::uint64_t uncachedInPlace = 0;
     };
     static DrawSetCounts DrawSetTotals();
+    enum class DrawSetMiss : std::size_t { Empty, ReleasedWouldHit, Shape, UploadedBytes, OtherAddress, Resnapshot, Count };
+    struct DrawSetMissCounts {
+        std::array<std::uint64_t, static_cast<std::size_t>(DrawSetMiss::Count)> reasons{};
+        std::uint64_t handleKeyHits = 0;
+    };
+    static DrawSetMissCounts DrawSetMissTotals();
+    static void TrackDrawSetMisses(bool on);
+    static bool DrawSetMissesTracked();
     PipelineSetLayouts SetLayouts() const { return {_layout, fragment.layout, splitSets, layoutKey, fragmentLayoutKey}; }
     void RequireGuestBuffers() const { requireGuestBuffers(); }
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
@@ -779,10 +787,19 @@ private:
     struct DrawSetCache {
         static constexpr std::size_t Entries = 4;
         std::mutex mutex;
+        struct Shadow {
+            std::weak_ptr<Buffer> buffer;
+            VkBuffer handle = VK_NULL_HANDLE;
+            VkDeviceSize offset = 0;
+            std::uint64_t address = 0;
+            std::size_t bytes = 0;
+            bool uploaded = false;
+        };
         struct Entry {
             std::weak_ptr<DrawBindings> bindings;
             std::vector<std::size_t> selected;
             std::vector<std::byte> staged;
+            std::vector<Shadow> shadow;
         };
         std::array<Entry, Entries> entries;
         std::size_t used = 0;
