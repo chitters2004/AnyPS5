@@ -14569,6 +14569,10 @@ PFN_vkVoidFunction VKAPI_CALL retentionProc(VkDevice device, const char* name) {
 
 void recordedDrawRetentionTests() {
     using namespace AgcDriver::Graphics;
+    std::vector<int> order(1024);
+    for (std::size_t i = 0; i < order.size(); ++i) order[i] = static_cast<int>(order.size() - i) / 2;
+    std::stable_sort(order.begin(), order.end());
+    Require(std::is_sorted(order.begin(), order.end()), "a stable sort through the temporary buffer left its input unsorted");
     mock = MockVulkan{};
     auto context = mockContext();
     context.deviceProc = retentionProc;
