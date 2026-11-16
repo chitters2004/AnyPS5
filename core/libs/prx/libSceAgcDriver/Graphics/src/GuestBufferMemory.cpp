@@ -6777,11 +6777,25 @@ struct ReadTally {
     std::atomic<std::uint64_t> bindings{0};
 };
 
-constexpr std::size_t ReadTallies = ReadUses * ReadPaths * ReadMemories + ReadUses * InPlaceReasons + 4;
+constexpr std::size_t CopyBackSites = Recorder::LandingSites + 1;
 constexpr std::size_t SnapshotTally = ReadUses * ReadPaths * ReadMemories + ReadUses * InPlaceReasons;
-constexpr std::size_t WholeCopyBackTally = SnapshotTally + 1;
-constexpr std::size_t CpuStoredTally = SnapshotTally + 2;
-constexpr std::size_t UntrackedCopyBackTally = SnapshotTally + 3;
+constexpr std::size_t UntrackedCopyBackTally = SnapshotTally + 1;
+constexpr std::size_t ExtentTally = SnapshotTally + 2;
+constexpr std::size_t WholeCopyBackTally = ExtentTally + ReadUses * ReadMemories;
+constexpr std::size_t CpuStoredTally = WholeCopyBackTally + CopyBackSites;
+constexpr std::size_t ReadTallies = CpuStoredTally + CopyBackSites;
+
+std::size_t extentTally(ShaderReadUse use, ShaderReadMemory memory) {
+    return ExtentTally + static_cast<std::size_t>(use) * ReadMemories + static_cast<std::size_t>(memory);
+}
+
+std::size_t copyBackSite(std::optional<std::uint8_t> site) {
+    return site && *site < Recorder::LandingSites ? std::size_t{*site} + 1u : 0u;
+}
+
+const char* copyBackSiteName(std::size_t site) {
+    return site == 0 ? "recorded with its work" : Recorder::LandingSiteName(static_cast<Recorder::LandingSite>(site - 1u));
+}
 
 struct ShaderReadCounters {
     std::array<ReadTally, ReadTallies> tallies{};
@@ -6789,6 +6803,9 @@ struct ShaderReadCounters {
     std::mutex reportMutex;
     std::array<std::pair<std::uint64_t, std::uint64_t>, ReadTallies> seen{};
     std::uint64_t seenFrames = 0;
+    std::mutex extentMutex;
+    std::uint64_t extentFrame = std::numeric_limits<std::uint64_t>::max();
+    std::set<std::array<std::uint64_t, 4>> extents;
 };
 
 ShaderReadCounters& ReadCounters() {
@@ -6808,6 +6825,17 @@ void addTally(std::size_t index, std::uint64_t bytes) {
     auto& tally = ReadCounters().tallies[index];
     tally.bytes.fetch_add(bytes, std::memory_order_relaxed);
     tally.bindings.fetch_add(1, std::memory_order_relaxed);
+}
+
+void countExtent(ShaderReadUse use, ShaderReadMemory memory, std::uint64_t begin, std::uint64_t end) {
+    auto& counters = ReadCounters();
+    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
+    std::lock_guard lock(counters.extentMutex);
+    if (frame != counters.extentFrame) {
+        counters.extentFrame = frame;
+        counters.extents.clear();
+    }
+    if (counters.extents.insert({static_cast<std::uint64_t>(use), static_cast<std::uint64_t>(memory), begin, end}).second) addTally(extentTally(use, memory), end - begin);
 }
 
 void reportShaderReads() {
@@ -6845,6 +6873,17 @@ void reportShaderReads() {
     }
     if (delta[SnapshotTally].second != 0) reads += "; " + entry("draw import reads rebound to host snapshots", delta[SnapshotTally]);
     AgcDriver::ProfilePrint_nid_no_patch("[reads] guest bytes bound per frame by use, path and memory, MiB/bindings (10 s, %llu frames): %s\n", static_cast<unsigned long long>(framesSeen), reads.empty() ? "none" : reads.c_str());
+    std::string extents;
+    for (std::size_t use = 0; use < ReadUses; ++use) {
+        std::string memories;
+        for (std::size_t memory = 0; memory < ReadMemories; ++memory) {
+            const auto& value = delta[extentTally(static_cast<ShaderReadUse>(use), static_cast<ShaderReadMemory>(memory))];
+            if (value.second == 0) continue;
+            memories += (memories.empty() ? "" : ", ") + entry(ReadMemoryNames[memory], value);
+        }
+        if (!memories.empty()) extents += std::string(extents.empty() ? "" : "; ") + ReadUseNames[use] + ": " + memories;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[reads] address-space extent per frame, each distinct range once a frame, MiB/ranges (10 s): %s\n", extents.empty() ? "none" : extents.c_str());
     std::string inPlace;
     for (std::size_t use = 0; use < ReadUses; ++use) {
         std::string reasons;
@@ -6857,10 +6896,22 @@ void reportShaderReads() {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[reads] import ranges bound in place per frame by why no input twin serves them, MiB/bindings (10 s): %s\n", inPlace.empty() ? "none" : inPlace.c_str());
     if (!TraceCopyBacks()) return;
-    const auto& whole = delta[WholeCopyBackTally];
-    const auto& stored = delta[CpuStoredTally];
+    std::pair<std::uint64_t, std::uint64_t> whole{};
+    std::pair<std::uint64_t, std::uint64_t> stored{};
+    std::string sites;
+    for (std::size_t site = 0; site < CopyBackSites; ++site) {
+        const auto& siteWhole = delta[WholeCopyBackTally + site];
+        const auto& siteStored = delta[CpuStoredTally + site];
+        whole = {whole.first + siteWhole.first, whole.second + siteWhole.second};
+        stored = {stored.first + siteStored.first, stored.second + siteStored.second};
+        if (siteWhole.second == 0) continue;
+        char text[160];
+        std::snprintf(text, sizeof(text), "%s %llu (%.2f MiB), stored into %llu (%.2f MiB)", copyBackSiteName(site), static_cast<unsigned long long>(siteWhole.second), static_cast<double>(siteWhole.first) / 1048576.0, static_cast<unsigned long long>(siteStored.second), static_cast<double>(siteStored.first) / 1048576.0);
+        sites += (sites.empty() ? "" : "; ") + std::string(text);
+    }
     const auto& untracked = delta[UntrackedCopyBackTally];
     AgcDriver::ProfilePrint_nid_no_patch("[copy-back] whole-range copy-backs (10 s): %llu ranges, %.2f MiB; the CPU stored into %llu of them (%.2f MiB) between the copy-back's recording and its batch's completion, an upper bound on stores it rolled back; %llu untracked (%.2f MiB)\n", static_cast<unsigned long long>(whole.second), static_cast<double>(whole.first) / 1048576.0, static_cast<unsigned long long>(stored.second), static_cast<double>(stored.first) / 1048576.0, static_cast<unsigned long long>(untracked.second), static_cast<double>(untracked.first) / 1048576.0);
+    if (!sites.empty()) AgcDriver::ProfilePrint_nid_no_patch("[copy-back] whole-range copy-backs by where they landed (10 s): %s\n", sites.c_str());
 }
 
 }
@@ -6888,7 +6939,7 @@ bool TraceCopyBacks() {
     return trace;
 }
 
-void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::optional<std::uint8_t> landing) {
     if (!TraceCopyBacks() || ranges.empty()) return;
     std::vector<std::array<std::uint64_t, 3>> watched;
     watched.reserve(ranges.size());
@@ -6896,14 +6947,14 @@ void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint6
         if (begin >= end) continue;
         watched.push_back({begin, end - begin, GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin))});
     }
-    recorder.OnComplete([watched = std::move(watched)] {
+    recorder.OnComplete([watched = std::move(watched), site = copyBackSite(landing)] {
         for (const auto& [begin, bytes, generation] : watched) {
-            addTally(WholeCopyBackTally, bytes);
+            addTally(WholeCopyBackTally + site, bytes);
             if (generation == 0) {
                 addTally(UntrackedCopyBackTally, bytes);
                 continue;
             }
-            if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)) == 0 || !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), generation)) addTally(CpuStoredTally, bytes);
+            if (GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)) == 0 || !GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), generation)) addTally(CpuStoredTally + site, bytes);
         }
         if (ShaderReadsCounted()) reportShaderReads();
     });
@@ -6941,6 +6992,7 @@ void GuestBufferMemory::CountReads(ShaderReadUse use) const {
         const auto bytes = end - region.begin;
         addTally(readTally(use, path, *memory), bytes);
         if (*memory == ShaderReadMemory::Import) addTally(inPlaceTally(use, reasonOf(region, bytes, path == ShaderReadPath::Address)), bytes);
+        if (path == ShaderReadPath::Address) countExtent(use, *memory, region.begin, end);
     };
     if (space != nullptr) {
         for (const auto& region : space->base) count(region, ShaderReadPath::Address);
@@ -8351,7 +8403,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
-    NoteWholeCopyBacks(recorder, wholeRanges);
+    NoteWholeCopyBacks(recorder, wholeRanges, std::nullopt);
 }
 
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {

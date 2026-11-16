@@ -254,7 +254,7 @@ void CountShaderRead(ShaderReadUse use, ShaderReadPath path, ShaderReadMemory me
 void CountDrawSnapshotRead(std::uint64_t bytes);
 ShaderReadMemory BufferReadMemory(const Buffer& buffer);
 bool TraceCopyBacks();
-void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+void NoteWholeCopyBacks(Recorder& recorder, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::optional<std::uint8_t> landing);
 void SetInputTwinLimitForTests(std::uint64_t bytes);
 void OutdateInputTwins(VkDevice device, std::uint64_t begin, std::uint64_t end);
 void OutdateInputTwins(VkDevice device);
