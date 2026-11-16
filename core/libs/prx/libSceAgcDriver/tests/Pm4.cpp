@@ -885,6 +885,28 @@ void testMemorySynchronization() {
     check(memory.destination == 42, "failed synchronization changed the destination");
 }
 
+void testWaitLabelPolledAcrossThreads() {
+    struct alignas(8) Shared {
+        std::uint32_t label = 0;
+        std::uint32_t payload = 0;
+    };
+    static Shared shared;
+    std::atomic_ref<std::uint32_t>(shared.label).store(0, std::memory_order_relaxed);
+    const auto packet = makePacket(0x3c, {0x13, low(&shared.label), high(&shared.label), 1, 0xffffffffu, 0x19});
+    std::atomic<bool> polling{false};
+    std::uint32_t seen = 0;
+    std::thread waiter([&] {
+        polling.store(true, std::memory_order_release);
+        while (!AgcDriver::Pm4::WaitSatisfiedUnchecked(packet)) std::this_thread::yield();
+        seen = shared.payload;
+    });
+    while (!polling.load(std::memory_order_acquire)) std::this_thread::yield();
+    shared.payload = 7;
+    std::atomic_ref<std::uint32_t>(shared.label).store(1, std::memory_order_release);
+    waiter.join();
+    check(seen == 7, "a satisfied wait did not see the data its label was released after");
+}
+
 void testConditionalValidation() {
     alignas(4) static std::uint32_t condition = 0;
     const auto valid = makePacket(0x22, {low(&condition), high(&condition), 0, 0x3fff});
@@ -2818,7 +2840,7 @@ int main(int argc, char** argv) {
         const std::pair<const char*, void (*)()> ringModes[]{
             {"ring", testSubmissionRing}, {"ring-empty", testEmptySubmissionRing}, {"ring-disabled", testDisabledSubmissionRing},
             {"ring-invalid", testInvalidSubmissionRing}, {"ring-report", testSubmissionRingFailureReport}, {"stall-watchdog", testStallWatchdog},
-            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"stall-clock", testStallClock}, {"stall-prompt-invalid", testInvalidStallPrompt}, {"stall-prompt-off", testStallPromptOff}, {"stall-prompt-zero", testStallPromptOff}, {"stall-prompt-rearm", testStallPromptRearm}, {"stall-prompt-real", testStallPromptRealPath}, {"stall-prompt-reentry", testStallPromptOneAtATime}, {"stall-prompt-quit", testStallPromptQuit}, {"stall-prompt-lock", testStallPromptLock}, {"stall-prompt-lock-unavailable", testStallPromptLockUnavailable}, {"rewind-trace", testRewindTailTrace}, {"rewind-copy", testRewindControlCopy}, {"rewind-size", testRewindSize}};
+            {"stall-watchdog-invalid", testInvalidStallWatchdog}, {"stall-watchdog-rewind", testStallWatchdogRewind}, {"stall-watchdog-order", testStallWatchdogOrder}, {"stall-clock", testStallClock}, {"stall-prompt-invalid", testInvalidStallPrompt}, {"stall-prompt-off", testStallPromptOff}, {"stall-prompt-zero", testStallPromptOff}, {"stall-prompt-rearm", testStallPromptRearm}, {"stall-prompt-real", testStallPromptRealPath}, {"stall-prompt-reentry", testStallPromptOneAtATime}, {"stall-prompt-quit", testStallPromptQuit}, {"stall-prompt-lock", testStallPromptLock}, {"stall-prompt-lock-unavailable", testStallPromptLockUnavailable}, {"rewind-trace", testRewindTailTrace}, {"rewind-copy", testRewindControlCopy}, {"rewind-size", testRewindSize}, {"wait-label-thread", testWaitLabelPolledAcrossThreads}};
         if (argc == 2 && std::string(argv[1]) == "ring-report-heap") {
 #ifdef _WIN32
             testSubmissionRingFailureReportHeap();
