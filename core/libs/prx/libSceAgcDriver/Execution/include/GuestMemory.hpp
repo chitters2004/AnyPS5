@@ -167,7 +167,23 @@ bool ProofBreaksCounted();
 void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
 void BreakProofs(ProofBreakSite site = ProofBreakSite::Other, std::uint64_t address = 0, std::uint64_t bytes = 0);
-void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint8_t detail = 0);
+inline constexpr std::size_t ProofBreakDetails = 16;
+enum class PacketWrites : std::uint8_t { Declared, None, Empty, Count };
+bool ProofBreakCensusEnabled();
+std::array<std::array<std::uint64_t, static_cast<std::size_t>(PacketWrites::Count)>, ProofBreakDetails> TakePacketBreakCounts();
+struct ProofBreakCensus {
+    bool complete = false;
+    bool overwritten = false;
+    std::uint64_t breaks = 0;
+    std::uint32_t noWritePackets = 0;
+    std::uint32_t emptyRangePackets = 0;
+    std::uint32_t overlapPackets = 0;
+    std::uint32_t unrangedSites = 0;
+    std::uint32_t overlapSites = 0;
+    std::uint32_t outsideUnscopedSites = 0;
+};
+ProofBreakCensus ProofBreakCensusSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ProofBreakScoped(ProofBreakSite site);
 struct ProofBreakWindow {
     bool complete = false;

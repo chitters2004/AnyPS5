@@ -29,6 +29,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainRe
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> KindNames{"other", "draw", "indirect", "colormeta", "dispatch", "sampledump", "dmafill", "dmawrite", "dmacopy", "store", "endofpipe", "seal", "submitend", "completion", "bufferfill"};
 
+static_assert(KindNames.size() <= GuestMemory::ProofBreakDetails);
+
 std::atomic<unsigned> runningCommitters{0};
 ProfileCounter drawKeys;
 ProfileCounter drawKeysSameAsPrevious;
@@ -299,6 +301,10 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     GuestMemory::BumpCollectEpoch();
 }
 
+const char* DrawPipeline::KindName(std::size_t kind) {
+    return kind < KindNames.size() ? KindNames[kind] : "other";
+}
+
 unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
@@ -450,6 +456,7 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         const std::vector<Range>* writes = nullptr;
         bool isDraw = false;
+        CommitKind kind = CommitKind::Other;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -460,6 +467,7 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             writes = &items.front().writes;
+            kind = items.front().kind;
         }
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
@@ -467,7 +475,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::Packet, *writes);
+            if (!isDraw) GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::Packet, *writes, static_cast<std::uint8_t>(kind));
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

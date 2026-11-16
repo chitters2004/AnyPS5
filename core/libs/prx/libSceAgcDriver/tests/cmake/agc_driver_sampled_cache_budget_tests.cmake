@@ -63,8 +63,12 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_resource_cache_epoch_proof_log_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_PIPELINE=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "verify: 8 reused resource proofs checked, 0 failed, 0 where the full proof stored to guest memory, 0 where only other threads broke proofs meanwhile, 0 where the full proof did work the exit skipped[;] 4 proved builds missed the exit[^\n]*\n.*proof log: outside breaks kept the exit: marked written yes, packet yes\n.*resource cache epoch proof log tests passed"
         FAIL_REGULAR_EXPRESSION "AGC graphics:|[1-9][0-9]* failed|verify: the full proof behind a reused proof")
+    add_test(NAME agc_driver_resource_cache_epoch_proof_log_census COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-proof-log)
+    set_tests_properties(agc_driver_resource_cache_epoch_proof_log_census PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1;APS5_PROOF_BREAK_CENSUS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "break census over 4 proof-alone misses: 4 walked, 0 past the ring, 0 with a slot the log could not read[;] clear with the walk at the ring 0, and packets without declared writes skipped 1, and exact-range sites scoped 2, and the off-thread GPU mutex skipped 2, and zero-length packet writes skipped 2[;] past the 1024 cap by breaks: up to 2048 0, up to 4095 0, past the ring 0[;] by breaks since the set's previous check: up to 1024 0, up to 4095 0, more 0[;] blocking \\(in the window/only blocker\\): packet completion no declared writes 1/1, packet other overlapping writes 1/1, marked written overlapping 1/1, driver store unscoped outside the set 1/1\n.*non-draw packet breaks by kind \\(declared writes/none declared/zero-length\\): other 2/0/0, completion 0/1/0\n.*resource cache epoch proof log tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
     if(WIN32)
-        set_tests_properties(agc_driver_resource_cache_epoch_proof_log agc_driver_resource_cache_epoch_proof_log_off agc_driver_resource_cache_epoch_proof_log_verify PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_resource_cache_epoch_proof_log agc_driver_resource_cache_epoch_proof_log_off agc_driver_resource_cache_epoch_proof_log_verify agc_driver_resource_cache_epoch_proof_log_census PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_resource_cache_lookup_changed COMMAND agc_driver_sampled_cache_budget_tests resource-lookup-changed)

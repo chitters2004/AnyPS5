@@ -828,6 +828,7 @@ private:
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;
     bool refreshPerUseCopies();
     StampAge provedAge = StampAge::Current;
+    std::uint64_t censusSeen = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
