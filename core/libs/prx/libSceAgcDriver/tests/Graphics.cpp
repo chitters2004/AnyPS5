@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
@@ -6057,6 +6058,8 @@ bool blockLibraryCreate = false;
 bool libraryCreateEntered = false;
 bool releaseLibraryCreate = false;
 bool blockOptimizedLink = false;
+bool createdDynamicBlendConstants = false;
+std::array<float, 4> createdBlendConstants{};
 bool releaseOptimizedLink = false;
 
 template<typename THandle>
@@ -9212,6 +9215,8 @@ VKAPI_ATTR VkResult VKAPI_CALL sampleLocationCreateGraphicsPipelines(VkDevice, V
         pipelineCreateCondition.wait(lock, [] { return releaseOptimizedLink; });
     }
     Require(count == 1, "the sample location mock expects one pipeline per call");
+    createdDynamicBlendConstants = infos[0].pDynamicState != nullptr && std::ranges::find(std::span(infos[0].pDynamicState->pDynamicStates, infos[0].pDynamicState->dynamicStateCount), VK_DYNAMIC_STATE_BLEND_CONSTANTS) != std::span(infos[0].pDynamicState->pDynamicStates, infos[0].pDynamicState->dynamicStateCount).end();
+    if (infos[0].pColorBlendState != nullptr) std::copy_n(infos[0].pColorBlendState->blendConstants, 4, createdBlendConstants.begin());
     const auto* locations = infos[0].pMultisampleState != nullptr ? static_cast<const VkPipelineSampleLocationsStateCreateInfoEXT*>(infos[0].pMultisampleState->pNext) : nullptr;
     if (locations != nullptr && locations->sType == VK_STRUCTURE_TYPE_PIPELINE_SAMPLE_LOCATIONS_STATE_CREATE_INFO_EXT && locations->sampleLocationsEnable) recordSampleLocations(pipelineSampleLocations, locations->sampleLocationsInfo);
     *pipelines = makeHandle<VkPipeline>();
@@ -9236,6 +9241,7 @@ VKAPI_ATTR void VKAPI_CALL sampleLocationDestroyFramebuffer(VkDevice, VkFramebuf
 VKAPI_ATTR void VKAPI_CALL sampleLocationSetViewport(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) {}
 VKAPI_ATTR void VKAPI_CALL sampleLocationSetScissor(VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) {}
 VKAPI_ATTR void VKAPI_CALL sampleLocationEndRenderPass(VkCommandBuffer) {}
+VKAPI_ATTR void VKAPI_CALL sampleLocationSetBlendConstants(VkCommandBuffer, const float[4]) {}
 
 VKAPI_ATTR void VKAPI_CALL sampleLocationBeginRenderPass(VkCommandBuffer, const VkRenderPassBeginInfo* begin, VkSubpassContents) {
     const auto* locations = static_cast<const VkRenderPassSampleLocationsBeginInfoEXT*>(begin->pNext);
@@ -9254,7 +9260,8 @@ PFN_vkVoidFunction VKAPI_CALL sampleLocationProc(VkDevice device, const char* na
         {"vkCmdBeginRenderPass", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationBeginRenderPass)},
         {"vkCmdSetViewport", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetViewport)},
         {"vkCmdEndRenderPass", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationEndRenderPass)},
-        {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetScissor)}
+        {"vkCmdSetScissor", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetScissor)},
+        {"vkCmdSetBlendConstants", reinterpret_cast<PFN_vkVoidFunction>(sampleLocationSetBlendConstants)}
     };
     const auto it = table.find(name);
     return it != table.end() ? it->second : mockProc(device, name);
@@ -14631,7 +14638,10 @@ void commandStateTests() {
     const std::array<VkDynamicState, 1> colorWriteMask{VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
     const auto maskSlot = CommandState::DynamicSlots(colorWriteMask);
     Require(maskSlot == CommandState::Mask(Slot::ColorWriteMask), "the color write mask dynamic state mapped to another slot");
-    Require((library | maskSlot) == (1u << CommandState::SlotCount) - 1u && (library & maskSlot) == 0, "the pipeline library's dynamic states and the color write mask do not cover every tracked slot");
+    const std::array<VkDynamicState, 1> blendConstants{VK_DYNAMIC_STATE_BLEND_CONSTANTS};
+    const auto constantsSlot = CommandState::DynamicSlots(blendConstants);
+    Require(constantsSlot == CommandState::Mask(Slot::BlendConstants), "the blend constants dynamic state mapped to another slot");
+    Require((library | maskSlot | constantsSlot) == (1u << CommandState::SlotCount) - 1u && (library & (maskSlot | constantsSlot)) == 0 && (maskSlot & constantsSlot) == 0, "the pipeline library's dynamic states, the color write mask and the blend constants do not cover every tracked slot");
     Require(fixed == (CommandState::Mask(Slot::Viewport) | CommandState::Mask(Slot::Scissor)), "the viewport and scissor dynamic states mapped to other slots");
     const std::array<VkDynamicState, 2> unmodelled{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_LINE_WIDTH};
     bool rejected = false;
@@ -14874,6 +14884,18 @@ void commandStateTests() {
         const std::array<std::uint32_t, 1> mainKey{41};
         const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, mainKey, {}};
         {
+            auto weighted = state;
+            weighted.blendConstants = {0.25f, 0.5f, 0.75f, 1.0f};
+            RuntimeSwitches::Assign(RuntimeSwitch::StaticBlendConstants, true);
+            {
+                const Pipeline baked(pipelineContext, weighted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                Require(!createdDynamicBlendConstants && createdBlendConstants == weighted.blendConstants && !baked.DynamicBlendConstants(), "a pipeline built with APS5_STATIC_BLEND_CONSTANTS did not keep its blend constants in the pipeline");
+            }
+            RuntimeSwitches::Assign(RuntimeSwitch::StaticBlendConstants, false);
+            {
+                const Pipeline dynamic(pipelineContext, weighted, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+                Require(createdDynamicBlendConstants && createdBlendConstants == std::array<float, 4>{} && dynamic.DynamicBlendConstants(), "a pipeline built with dynamic blend constants did not declare them dynamic or kept them in the pipeline");
+            }
             Pipeline first(pipelineContext, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
             Pipeline second(pipelineContext, state, VertexInputLayout{}, resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
             CommandState tracker;
@@ -14884,7 +14906,7 @@ void commandStateTests() {
             const auto bound = tracker.BoundPipeline();
             Require(bound != VK_NULL_HANDLE, "a pipeline continued through a tracker was not recorded as bound");
             const auto lines = stateLog;
-            Require(lines.size() == 5 && lines[0] == stateLine("bind", 0u, bound), "the first continued draw did not bind and set every dynamic state");
+            Require(lines.size() == 6 && lines[0] == stateLine("bind", 0u, bound) && lines[3] == stateLine("blendconstants", 0.0f, 0.0f, 0.0f, 0.0f), "the first continued draw did not bind and set every dynamic state");
             expectStateLog(lines, "the first continued draw");
             first.Continue(tracker, state);
             expectStateLog({}, "an unchanged continued draw");
@@ -14906,7 +14928,7 @@ void commandStateTests() {
             stateLog.clear();
             first.Begin(passes, *passFramebuffer, {64, 64}, state);
             const auto firstPass = stateLog;
-            Require(firstPass.size() == 5, "the first render pass of a batch did not bind and set every dynamic state");
+            Require(firstPass.size() == 6, "the first render pass of a batch did not bind and set every dynamic state");
             expectStateLog(firstPass, "the first render pass of a batch");
             EndRenderPass(pipelineContext, commands);
             first.Begin(passes, *passFramebuffer, {64, 64}, state);
@@ -14919,7 +14941,7 @@ void commandStateTests() {
             CommandState unsuppressed;
             unsuppressed.Begin(commands, false);
             first.Continue(unsuppressed, state);
-            Require(stateLog.size() == 5, "a continued draw through a tracker that does not suppress skipped commands");
+            Require(stateLog.size() == 6, "a continued draw through a tracker that does not suppress skipped commands");
             stateLog.clear();
             static int convertedTag = 0;
             auto converted = pipelineContext;
@@ -14940,7 +14962,7 @@ void commandStateTests() {
             scaled.Continue(scaledTracker, stored);
             const auto frontBound = scaledTracker.BoundPipeline();
             const auto scaledLines = stateLog;
-            Require(scaledLines.size() == 5 && scaledLines[3] == stateLine("bias", 512.0f, 0.0f, 1.0f), "a guest depth bias of 2 on a D16 target stored as D24 was not recorded as 512");
+            Require(scaledLines.size() == 6 && scaledLines[4] == stateLine("bias", 512.0f, 0.0f, 1.0f), "a guest depth bias of 2 on a D16 target stored as D24 was not recorded as 512");
             expectStateLog(scaledLines, "the first draw of a converted depth format");
             scaled.Continue(scaledTracker, stored);
             expectStateLog({}, "an equal guest depth bias on a converted depth format");
@@ -14965,7 +14987,7 @@ void commandStateTests() {
             librariesTracker.Begin(commands);
             stateLog.clear();
             scaledLibraries.Continue(librariesTracker, storedWhole);
-            Require(stateLog.size() == 16 && stateLog[5] == stateLine("bias", 768.0f, 0.0f, 1.0f), "a guest depth bias of 3 on a D16 target stored as D24 was not recorded as 768 by a graphics pipeline library pipeline");
+            Require(stateLog.size() == 17 && stateLog[6] == stateLine("bias", 768.0f, 0.0f, 1.0f), "a guest depth bias of 3 on a D16 target stored as D24 was not recorded as 768 by a graphics pipeline library pipeline");
             stateLog.clear();
             scaledLibraries.Continue(librariesTracker, storedWhole);
             expectStateLog({}, "an equal guest depth bias on a converted depth format drawn with a graphics pipeline library pipeline");
@@ -14986,7 +15008,7 @@ void commandStateTests() {
             const auto fastLinked = swapTracker.BoundPipeline();
             Require(fastLinked != VK_NULL_HANDLE, "a pipeline drawn before its optimized link completed did not bind a handle");
             Require(!linked.Optimized(), "the optimized link completed while it was blocked");
-            Require(stateLog.size() == 16, "the first draw of a graphics pipeline library pipeline did not bind and set every dynamic state");
+            Require(stateLog.size() == 17, "the first draw of a graphics pipeline library pipeline did not bind and set every dynamic state");
             stateLog.clear();
             linked.Continue(swapTracker, state);
             expectStateLog({}, "a second draw of the fast-linked handle");

@@ -62,6 +62,7 @@ public:
     const SampleOrder& HostSampleOrder() const { return sampleOrder; }
     bool ReordersSamples() const { return Graphics::ReordersSamples(sampleOrder); }
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
+    bool DynamicBlendConstants() const { return dynamicBlendConstants; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
@@ -80,6 +81,7 @@ private:
     void release() noexcept;
     void setLibraryState(CommandState& recording, const State& state) const;
     void setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const;
+    void setBlendConstants(CommandState& recording, const State& state) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -94,6 +96,7 @@ private:
     bool depthBounds = false;
     bool depthBias = false;
     bool libraries = false;
+    bool dynamicBlendConstants = false;
     std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;
@@ -128,6 +131,7 @@ struct PipelineStoreCounters {
     std::uint64_t evicted = 0;
     std::uint64_t cached = 0;
     std::uint64_t bound = 0;
+    std::uint64_t blendConstantsShared = 0;
 };
 PipelineStoreCounters PipelineStoreTotals();
 // Whether the store may still raise its bound (not fixed by APS5_PIPELINE_STORE_ENTRIES, below 4096).
