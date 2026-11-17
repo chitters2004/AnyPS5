@@ -87,12 +87,20 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_resource_cache_range_versions_storage PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "range versions over a storage image: (skipped, its host import left the memory unwatched|a new collect epoch: the exit was taken\n.*range versions over a storage image: evicted in a new collect epoch: the exit was refused)\n.*resource cache range version storage tests passed"
         FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    add_test(NAME agc_driver_resource_cache_range_versions_pending COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions-pending)
+    set_tests_properties(agc_driver_resource_cache_range_versions_pending PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch;APS5_PROFILE_EPOCH_PROOFS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "a foreign image pending over the source since the proof, the source's own results discarded, a new collect epoch: the exit was refused\n.*the foreign image stored, a new collect epoch: the exit was taken\n.*declined: [^\n]*other results pending over an own image [1-9][^\n]*\n.*resource cache range version pending tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:|range versions off for the run|range-version disagreement")
+    add_test(NAME agc_driver_resource_cache_range_versions_pending_verify COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions-pending)
+    set_tests_properties(agc_driver_resource_cache_range_versions_pending_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch;APS5_VERIFY_RANGE_VERSIONS=1;APS5_VERIFY_RANGE_VERSIONS_CONTINUE=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "the foreign image stored, a new collect epoch: the exit was taken\n.*resource cache range version pending tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:|range versions off for the run|range-version disagreement")
     add_test(NAME agc_driver_resource_cache_evicted_epoch_range_versions COMMAND agc_driver_sampled_cache_budget_tests resource-evicted-epoch)
     set_tests_properties(agc_driver_resource_cache_evicted_epoch_range_versions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RANGE_VERSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "evicted epoch: a held set over a storage image another thread evicted: the exit was refused\n.*resource cache tests passed"
         FAIL_REGULAR_EXPRESSION "AGC graphics:")
     if(WIN32)
-        set_tests_properties(agc_range_validate agc_range_validate_concurrent agc_driver_resource_cache_range_versions agc_driver_resource_cache_range_versions_verify agc_driver_resource_cache_range_versions_storage agc_driver_resource_cache_evicted_epoch_range_versions PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_range_validate agc_range_validate_concurrent agc_driver_resource_cache_range_versions agc_driver_resource_cache_range_versions_verify agc_driver_resource_cache_range_versions_storage agc_driver_resource_cache_range_versions_pending agc_driver_resource_cache_range_versions_pending_verify agc_driver_resource_cache_evicted_epoch_range_versions PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     add_test(NAME agc_driver_resource_cache_epoch_proof_log COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-proof-log)

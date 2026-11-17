@@ -867,6 +867,7 @@ private:
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
+    void reportRangeDisagreement(const ProofWorkTrace& work) const;
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;
     bool refreshPerUseCopies();
     StampAge provedAge = StampAge::Current;

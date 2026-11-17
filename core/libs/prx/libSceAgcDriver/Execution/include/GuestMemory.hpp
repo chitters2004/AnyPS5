@@ -276,7 +276,7 @@ struct RangeVersionBaseline {
     std::uint64_t unrangedProof = 0;
     std::uint64_t unrangedPending = 0;
 };
-enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, Collect, Changed, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
+enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, CollectUnwatched, Collect, Changed, ChangedPossibly, ChangedBlock, ChangedRefused, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
 const char* RangeVersionDeclineName(RangeVersionDecline decline);
 RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline);
 inline constexpr std::size_t ProofBreakDetails = 16;

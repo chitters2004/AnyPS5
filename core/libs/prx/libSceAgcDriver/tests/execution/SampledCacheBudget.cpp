@@ -1295,6 +1295,85 @@ void rangeVersionStorageTests(Context context) {
     Require(!evicted, "a storage template took the range-version exit over an evicted storage image");
 }
 
+bool rangeVersionPendingTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    if (context.hostImportAlignment == 0) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the range-version pending fixture requires host imports");
+        std::puts("range versions with other results pending: skipped, host imports are unavailable");
+        return false;
+    }
+    WatchedSurface surface(context, 2u * SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("range versions with other results pending: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    Require(ShaderResources::EpochProofs(), "the range-version pending fixture needs epoch proofs on");
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    struct Switches {
+        ~Switches() { RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false); }
+    } switches;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(address);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto sampled = std::make_shared<ShaderResources>(context, shader);
+    std::shared_ptr<StorageTexture> foreign;
+    struct Release {
+        std::shared_ptr<ShaderResources>& sampled;
+        std::shared_ptr<StorageTexture>& foreign;
+        VkDevice device;
+        ~Release() {
+            if (foreign != nullptr) foreign->Flush();
+            foreign.reset();
+            sampled.reset();
+            ClearCachedTextures(device);
+        }
+    } release{sampled, foreign, context.device};
+    Require(sampled->Reusable() && sampled->SampledTextures().size() == 1 && sampled->SampledTextures().front()->ViewsStorageImage(), "the range-version pending template does not bind a view of its storage image");
+    const auto source = sampled->SampledTextures().front()->SharedStorageSource();
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return sampled->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 4; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("the template over the imported surface never took the epoch exit");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool quiet = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: nothing pending, a new collect epoch: the exit %s\n", quiet ? "was taken" : "was refused");
+    Require(quiet, "the template over the imported surface did not take the range-version exit with nothing pending");
+    foreign = CachedStorageSurface(context, Resource(address + SurfaceBytes / 2u));
+    Require(foreign != nullptr && foreign != source, "no foreign storage image over the second half of the sampled surface");
+    foreign->MarkDirty();
+    source->MarkDirty();
+    settle("the template never took the epoch exit with its source and a foreign image pending");
+    Require(foreign->AnyLayerPending() && source->AnyLayerPending(), "the source and the foreign image are not both pending at the proof");
+    Require(StorageTexture::DiscardPendingInside(address, SurfaceBytes) != 0, "discarding the source's results discarded nothing");
+    Require(foreign->AnyLayerPending() && !source->AnyLayerPending(), "the foreign image did not stay pending alone over the source");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool pendingExit = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: a foreign image pending over the source since the proof, the source's own results discarded, a new collect epoch: the exit %s\n", pendingExit ? "was taken" : "was refused");
+    Require(!pendingExit, "a template took the range-version exit while another image's results stayed pending over its storage source");
+    foreign->Flush();
+    foreign.reset();
+    settle("the template did not take the epoch exit again after the foreign image was stored");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool stored = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: the foreign image stored, a new collect epoch: the exit %s\n", stored ? "was taken" : "was refused");
+    Require(stored, "the template did not take the range-version exit once nothing stayed pending over its source");
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+    return true;
+}
+
 void rangeValidateTests() {
     using AgcDriver::GuestMemory::RangeVersionDecline;
     constexpr std::size_t Bytes = 4u * 65536u;
@@ -1323,7 +1402,7 @@ void rangeValidateTests() {
     std::vector<std::uint8_t> host(8192, 0);
     const auto unwatched = (reinterpret_cast<std::uint64_t>(host.data()) + 4095u) & ~std::uint64_t{4095};
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> partly{{{address, address + 4096u}, {unwatched, unwatched + 4096u}}};
-    expect("a set with one range outside the tracker", AgcDriver::GuestMemory::ValidateProofRanges(partly, baseline), RangeVersionDecline::Collect);
+    expect("a set with one range outside the tracker", AgcDriver::GuestMemory::ValidateProofRanges(partly, baseline), RangeVersionDecline::CollectUnwatched);
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> beyond{{{std::uint64_t{1} << 48u, (std::uint64_t{1} << 48u) + 4096u}}};
     expect("a range past the tick span", AgcDriver::GuestMemory::ValidateProofRanges(beyond, baseline), RangeVersionDecline::Uncovered);
     auto wrapped = baseline;
@@ -1346,6 +1425,10 @@ void rangeValidateTests() {
     baseline = baselineNow();
     StorageTexture::BumpPendingSerial(PendingBump::Mark, address, address);
     expect("an entering pending bump without a range", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::UnrangedPending);
+    baseline = baselineNow();
+    std::memset(memory + 2u * 65536u + 32768u, 0x6b, 64u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect("a CPU write into another page of a set's block and a new epoch", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::None);
     baseline = baselineNow();
     std::memset(memory + 2u * 65536u, 0x6b, 64u);
     AgcDriver::GuestMemory::BumpCollectEpoch();
@@ -2495,6 +2578,12 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             rangeVersionTests(context);
             std::puts("resource cache range version tests passed");
+            return 0;
+        }
+        if (mode == "resource-range-versions-pending") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!rangeVersionPendingTests(context)) return VulkanTestSkipped;
+            std::puts("resource cache range version pending tests passed");
             return 0;
         }
         if (mode == "resource-range-versions-storage") {

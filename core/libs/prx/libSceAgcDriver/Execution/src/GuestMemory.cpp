@@ -2397,6 +2397,47 @@ struct WriteTracker {
         return unchanged(blockOf(address), blockOf(address + bytes - 1), since) || !storedOver(address, address + bytes, since, walked);
     }
 
+    RangeVersionDecline changeEvidence(std::uint64_t address, std::uint64_t end, std::uint64_t generation) const {
+        if (refusedSince(address, end, generation)) return RangeVersionDecline::ChangedRefused;
+        auto evidence = RangeVersionDecline::None;
+        const auto note = [&](RangeVersionDecline found) {
+            if (evidence == RangeVersionDecline::None || (evidence == RangeVersionDecline::ChangedBlock && found == RangeVersionDecline::ChangedPossibly)) evidence = found;
+        };
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            if (stampOf(block) <= generation) continue;
+            const auto begin = blockBegin(block);
+            const auto from = std::max(address, begin) - begin;
+            const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+            const auto newerPage = [&](const std::unordered_map<std::uint64_t, CpuPages>& pages) {
+                const auto found = pages.find(block);
+                if (found == pages.end()) return false;
+                for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+                    if (found->second.pages[page] > generation) return true;
+                }
+                return false;
+            };
+            if (newerPage(cpuPages) || newerPage(walkPages)) return RangeVersionDecline::Changed;
+            if (cpuPages.find(block) == cpuPages.end() && cpuStampOf(block) > generation) note(RangeVersionDecline::ChangedBlock);
+            const auto found = driverPieces.find(block);
+            if (found == driverPieces.end()) {
+                if (walkPages.find(block) != walkPages.end()) note(RangeVersionDecline::ChangedBlock);
+                continue;
+            }
+            const auto& entry = found->second;
+            if (entry.whole > generation) return RangeVersionDecline::Changed;
+            for (const auto& piece : entry.pieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) return RangeVersionDecline::Changed;
+            }
+            if (entry.dropped > generation) note(RangeVersionDecline::ChangedBlock);
+            if (entry.possibleWhole > generation) note(RangeVersionDecline::ChangedPossibly);
+            for (const auto& piece : entry.possiblePieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) note(RangeVersionDecline::ChangedPossibly);
+            }
+            if (entry.possibleDropped > generation) note(RangeVersionDecline::ChangedBlock);
+        }
+        return evidence == RangeVersionDecline::None ? RangeVersionDecline::ChangedBlock : evidence;
+    }
+
     bool cpuUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation) const {
         const auto first = blockOf(address);
         const auto last = blockOf(address + bytes - 1u);
@@ -3199,8 +3240,12 @@ const char* RangeVersionDeclineName(RangeVersionDecline decline) {
         case RangeVersionDecline::Baseline: return "no baseline";
         case RangeVersionDecline::Wrapped: return "serial past 2^62";
         case RangeVersionDecline::Uncovered: return "range not tracked";
-        case RangeVersionDecline::Collect: return "collect failed";
+        case RangeVersionDecline::CollectUnwatched: return "collect over unwatched memory";
+        case RangeVersionDecline::Collect: return "collect walk failed";
         case RangeVersionDecline::Changed: return "range written";
+        case RangeVersionDecline::ChangedPossibly: return "range possibly written by the driver";
+        case RangeVersionDecline::ChangedBlock: return "block written, bytes unknown";
+        case RangeVersionDecline::ChangedRefused: return "write walk refused";
         case RangeVersionDecline::InFlight: return "stamp in flight";
         case RangeVersionDecline::UnrangedProof: return "unranged proof break";
         case RangeVersionDecline::UnrangedPending: return "unranged pending entry";
@@ -3216,7 +3261,9 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
     if (baseline.proof >= RangeVersionSerialLimit || baseline.pending >= RangeVersionSerialLimit || baseline.unrangedProof >= RangeVersionSerialLimit || baseline.unrangedPending >= RangeVersionSerialLimit) return RangeVersionDecline::Wrapped;
     for (const auto& [begin, end] : ranges) {
         if (end <= begin || end > TickSpanBytes) return RangeVersionDecline::Uncovered;
-        if (CollectWrites(begin, static_cast<std::size_t>(end - begin)) == 0) return RangeVersionDecline::Collect;
+        const auto observed = Observe(begin, static_cast<std::size_t>(end - begin));
+        if (observed.status == Observation::Status::Uncovered) return RangeVersionDecline::CollectUnwatched;
+        if (observed.status != Observation::Status::Complete || observed.generation == 0) return RangeVersionDecline::Collect;
     }
     {
         auto& tracker = Tracker();
@@ -3226,7 +3273,7 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
         for (const auto& [begin, end] : ranges) {
             const auto bytes = static_cast<std::size_t>(end - begin);
             if (!tracker.covers(begin, bytes)) return RangeVersionDecline::Uncovered;
-            if (!tracker.rangeUnchanged(begin, bytes, baseline.generation)) return RangeVersionDecline::Changed;
+            if (!tracker.rangeUnchanged(begin, bytes, baseline.generation)) return tracker.changeEvidence(begin, end, baseline.generation);
         }
     }
     for (std::uint32_t spins = 0; rangeStampsInFlight.load(std::memory_order_acquire) != 0; ++spins) {
