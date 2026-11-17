@@ -10,6 +10,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
@@ -308,6 +309,8 @@ bool CoreVulkanCapability(std::uint32_t capability) {
     }
 }
 
+std::atomic<bool> computeCreationFeedback{false};
+
 void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create, VkPipelineCache cache, VkShaderModule module, VkPipelineLayout layout, VkPipelineCreateFlags flags, VkPipelineShaderStageCreateFlags stageFlags, const VkSpecializationInfo* specialization, std::uint32_t subgroupSize, VkPipeline* pipeline, Graphics::PipelineCacheSynchronization* synchronization = nullptr) {
     VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     info.flags = flags;
@@ -321,8 +324,11 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
+    Graphics::PipelineCreateProbe probe(computeCreationFeedback.load(std::memory_order_relaxed), info.pNext);
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
+    probe.Start();
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
+    probe.Finish(PipelineCreateKind::Compute);
     PerformanceCounters::CountPipeline();
 }
 
@@ -628,6 +634,7 @@ struct VulkanDevice::State {
     bool shaderResourceMinLod = false;
     bool shaderImageMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pipelineCreationFeedback = false;
     bool maintenance8 = false;
     bool pushDescriptors = false;
     bool depthUploadImage = false;
@@ -2458,6 +2465,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
+    }
+    if (AgcDriver::PipelineCreatesProfiled() && hasExtension(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME)) {
+        state->pipelineCreationFeedback = true;
+        computeCreationFeedback.store(true, std::memory_order_relaxed);
+        deviceExtensions.push_back(VK_EXT_PIPELINE_CREATION_FEEDBACK_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     }
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
@@ -4926,6 +4940,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.shaderResourceMinLod = state->shaderResourceMinLod;
     context.shaderImageMinLod = state->shaderImageMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.pipelineCreationFeedback = state->pipelineCreationFeedback;
     context.maintenance8 = state->maintenance8;
     context.pushDescriptors = state->pushDescriptors;
     context.depthUploadImage = state->depthUploadImage;

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1489,6 +1490,7 @@ CommitShape& drawCommitShape() {
 }
 
 void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
+    LeaveCommittedDraw();
     auto* const shape = &drawCommitShape();
     shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps, PerformanceCounters::ThreadPipelines() - timer.pipelinesBefore, outcome.buildReason, outcome.proofLead);
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
@@ -1504,6 +1506,7 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(report, DrawKindNames, DrawPhaseNames).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofLeadLine(report).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", PipelineCreates::Line(DevicePipelineCreates().Take()).c_str());
 }
 
 std::atomic<std::uint64_t> profiledCommits{0};
@@ -1521,6 +1524,7 @@ void startCommitShape(DrawTimer& timer) {
     timer.stamps = {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), GuestMemory::UnwatchSerial(), GuestAllocations::GuestAllocationsGeneration_nid_postfix(), DepthSurfacesSerial(), DepthSurfacesReleased(), Recorder::PublishGeneration()};
     timer.dependenciesBefore = Recorder::ThreadDependencyHits();
     timer.pipelinesBefore = PerformanceCounters::ThreadPipelines();
+    EnterCommittedDraw();
 }
 
 // One line per draw with the phases that took time (APS5_TRACE_DRAWS), and the 10 s totals.

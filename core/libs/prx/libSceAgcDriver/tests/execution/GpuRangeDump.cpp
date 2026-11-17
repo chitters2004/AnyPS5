@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreates.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -242,6 +243,43 @@ struct Range {
 
 }
 
+void CheckPipelineCreates(const AgcDriver::PipelineCreates::Report& report, bool libraries, bool feedback) {
+    using AgcDriver::MonolithicReason;
+    using AgcDriver::PipelineCreateKind;
+    const auto cell = [&](PipelineCreateKind kind) {
+        AgcDriver::PipelineCreates::Cell sum;
+        for (const auto& side : report.bySite) {
+            const auto& one = side[static_cast<std::size_t>(kind)];
+            sum.count += one.count;
+            sum.hits += one.hits;
+            sum.misses += one.misses;
+            sum.unknown += one.unknown;
+        }
+        return sum;
+    };
+    const auto monolithic = cell(PipelineCreateKind::Monolithic);
+    const auto links = cell(PipelineCreateKind::Link);
+    std::uint64_t reasons = 0;
+    for (const auto count : report.reasons) reasons += count;
+    Require(reasons == monolithic.count, "every monolithic create needs exactly one reason: " + AgcDriver::PipelineCreates::Line(report));
+    const auto noLibraries = report.reasons[static_cast<std::size_t>(MonolithicReason::NoLibraries)];
+    if (libraries) Require(links.count + monolithic.count - noLibraries >= 1 && noLibraries == 0, "a device with pipeline libraries created no linked pipeline and no monolithic one for a reason of its own: " + AgcDriver::PipelineCreates::Line(report));
+    else Require(noLibraries >= 1 && links.count == 0, "a device without pipeline libraries created no monolithic pipeline for that reason: " + AgcDriver::PipelineCreates::Line(report));
+    const auto& inDraws = report.bySite[1];
+    Require(inDraws[static_cast<std::size_t>(PipelineCreateKind::Link)].count + inDraws[static_cast<std::size_t>(PipelineCreateKind::Monolithic)].count >= 1, "the draws' pipeline was not counted inside the committed draws: " + AgcDriver::PipelineCreates::Line(report));
+    Require(inDraws[static_cast<std::size_t>(PipelineCreateKind::OptimizedRelink)].count == 0, "an optimized relink, which runs on the library worker, was counted inside a committed draw: " + AgcDriver::PipelineCreates::Line(report));
+    std::uint64_t total = 0, unknown = 0;
+    for (const auto& side : report.bySite) {
+        for (const auto& one : side) {
+            total += one.count;
+            unknown += one.unknown;
+        }
+    }
+    if (feedback) Require(unknown < total, "VK_EXT_pipeline_creation_feedback is enabled but no create reported valid feedback: " + AgcDriver::PipelineCreates::Line(report));
+    else Require(unknown == total, "a create reported cache feedback without the extension: " + AgcDriver::PipelineCreates::Line(report));
+    std::printf("%s\n", AgcDriver::PipelineCreates::Line(report).c_str());
+}
+
 int main() {
     try {
 #ifdef _WIN32
@@ -253,6 +291,10 @@ int main() {
         std::filesystem::remove(path);
         SetVariable("APS5_PROFILE_GPU_RANGES", path.string());
         SetVariable("APS5_PROFILE_GPU_DRAWS", "1");
+        SetVariable("APS5_PROFILE_COMMIT_SHAPE", "1");
+        AgcDriver::PipelineCreates::Report creates;
+        bool libraries = false;
+        bool feedback = false;
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
@@ -276,9 +318,14 @@ int main() {
                 std::puts("skipped, host imports are unavailable");
                 return VulkanTestSkipped;
             }
+            static_cast<void>(AgcDriver::DevicePipelineCreates().Take());
             Draw(*device, block);
             device->WaitIdle();
+            creates = AgcDriver::DevicePipelineCreates().Take();
+            libraries = context.graphicsPipelineLibrary;
+            feedback = context.pipelineCreationFeedback;
         }
+        CheckPipelineCreates(creates, libraries, feedback);
         AgcDriver::Graphics::Recorder::FlushGpuRangeDump();
         std::ifstream file(path);
         Require(file.good(), "no range file was written: the draws into a write-watched linear target were not recorded into a recorder batch");

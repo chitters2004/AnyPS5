@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -226,6 +227,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         VkPipeline handle = VK_NULL_HANDLE;
+        PipelineCreateProbe probe(context.pipelineCreationFeedback, create.pNext);
         // Built without the store's mutex: a draw whose parts are resident is not held behind
         // another thread's build, and builds from several threads (the registration prebuild, the
         // journal replay) run at once; a part another thread built meanwhile is kept, this one dropped.
@@ -233,7 +235,9 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkResult created;
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            probe.Start();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            if (created == VK_SUCCESS) probe.Finish(static_cast<PipelineCreateKind>(static_cast<std::size_t>(PipelineCreateKind::VertexInputPart) + part));
         }
         lock.lock();
         Check(created, "vkCreateGraphicsPipelines library");
@@ -281,8 +285,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
     VkPipeline pipeline = VK_NULL_HANDLE;
     lock.unlock();
     {
+        PipelineCreateProbe probe(context.pipelineCreationFeedback, create.pNext);
         auto pipelineCacheLock = context.LockPipelineCacheForUse();
+        probe.Start();
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+        probe.Finish(PipelineCreateKind::Link);
     }
     lock.lock();
     ++device.counters.linked;
@@ -295,7 +302,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         const auto cache = context.pipelineCache;
         const auto cacheSynchronization = context.pipelineCacheSynchronization;
         const auto libraryLayout = fullLayout;
-        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device] {
+        const bool feedback = context.pipelineCreationFeedback;
+        std::function<void()> relink = [slot, createPipelines, cache, cacheSynchronization, feedback, libraryLayout, libraries, sampleCounts, attachmentSamples, &store, devicePointer = &device] {
             if (slot->released.load()) return;
             auto linkedSamples = sampleCounts ? attachmentSamples(*sampleCounts) : VkAttachmentSampleCountInfoNV{};
             VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
@@ -310,8 +318,12 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             create.layout = libraryLayout;
             VkPipeline result = VK_NULL_HANDLE;
             const auto pipelineCreationResult = [&] {
+                PipelineCreateProbe probe(feedback, create.pNext);
                 auto pipelineCacheLock = cacheSynchronization != nullptr ? cacheSynchronization->LockForPipelineUse() : PipelineCacheSynchronization::PipelineUseLock{};
-                return createPipelines(slot->device, cache, 1, &create, nullptr, &result);
+                probe.Start();
+                const auto outcome = createPipelines(slot->device, cache, 1, &create, nullptr, &result);
+                if (outcome == VK_SUCCESS) probe.Finish(PipelineCreateKind::OptimizedRelink);
+                return outcome;
             }();
             if (pipelineCreationResult != VK_SUCCESS) return;
             slot->handle.store(result);

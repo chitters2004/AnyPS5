@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PatchVertexLayer.hpp"
@@ -389,9 +390,23 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
+MonolithicReason monolithicReason(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (!context.graphicsPipelineLibrary) return MonolithicReason::NoLibraries;
+    if (context.pipelineExecutableInfo) return MonolithicReason::Statistics;
+    if (state.stages.tessellation && !context.tessellationPipelineCache) return MonolithicReason::Tessellation;
+    if (state.depthBiasPerFace) return MonolithicReason::DepthBiasPerFace;
+    if (state.rectList) return MonolithicReason::RectList;
+    if (BarycentricPatches(state, shaders)) return MonolithicReason::BarycentricPatches;
+    if (SplitsAlternateAlpha(state)) return MonolithicReason::AlternateAlpha;
+    if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; })) return MonolithicReason::FunctionLds;
+    if (UsesMeshWindow(shaders)) return MonolithicReason::MeshWindow;
+    if (FragmentInterlock(shaders)) return MonolithicReason::Interlock;
+    return MonolithicReason::Count;
+}
+
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
+    if (monolithicReason(context, state, shaders) != MonolithicReason::Count) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -809,20 +824,31 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             return;
         }
         const VkPipelineCache pipelineCache = (state.stages.tessellation || barycentricPatches || state.rectList) && !context.tessellationPipelineCache ? VK_NULL_HANDLE : context.pipelineCache;
+        PipelineCreateProbe probe(context.pipelineCreationFeedback && !libraries, pipelineInfo.pNext);
+        const auto reason = libraries ? MonolithicReason::Count : [&] {
+            const auto found = monolithicReason(context, state, shaders);
+            return found == MonolithicReason::Count ? MonolithicReason::StageOrIdentity : found;
+        }();
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            probe.Start();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+            probe.Finish(PipelineCreateKind::Monolithic, reason);
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            probe.Start();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
+            probe.Finish(PipelineCreateKind::SecondChannel);
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            probe.Start();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
+            probe.Finish(PipelineCreateKind::BackFaces);
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
