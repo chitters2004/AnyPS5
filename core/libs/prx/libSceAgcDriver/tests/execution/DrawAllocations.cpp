@@ -280,7 +280,7 @@ struct Window {
     std::uint32_t busiest = 0;
 };
 
-Window Measure(std::vector<std::uint32_t>& commands) {
+Window Measure(std::vector<std::uint32_t>& commands, std::size_t submits) {
     lostThreads.store(0);
     lostSites.store(0);
     for (auto& site : sites) {
@@ -298,7 +298,7 @@ Window Measure(std::vector<std::uint32_t>& commands) {
         struct StopProbe {
             ~StopProbe() { hostProbe.store(nullptr, std::memory_order_release); }
         } stop;
-        Submit(commands);
+        for (std::size_t submit = 0; submit < submits; ++submit) Submit(commands);
     }
     Require(lostSites.load() == 0 && lostThreads.load() == 0, "draw allocations: the counter lost allocation sites or threads");
     Window window;
@@ -347,12 +347,17 @@ struct Shape {
     Ceiling pipelined;
 };
 
+constexpr std::size_t LeadingDrawsPerSubmit = 8;
+constexpr std::size_t MeasuredDrawsPerSubmit = 32;
+
 double ReportAllocations(const Shape& shape, std::size_t draws) {
-    auto empty = shape.build(0);
-    auto repeated = shape.build(draws);
+    const auto submits = std::max<std::size_t>(1, draws / MeasuredDrawsPerSubmit);
+    draws = submits * MeasuredDrawsPerSubmit;
+    auto empty = shape.build(LeadingDrawsPerSubmit);
+    auto repeated = shape.build(LeadingDrawsPerSubmit + MeasuredDrawsPerSubmit);
     for (int warm = 0; warm < 3; ++warm) Submit(repeated);
-    const auto base = Measure(empty);
-    const auto many = Measure(repeated);
+    const auto base = Measure(empty, submits);
+    const auto many = Measure(repeated, submits);
     Require(many.count > 0 && base.count > 0, std::string("draw allocations [") + shape.name + "]: the probe observed no allocations");
     const auto perDraw = PerDraw(many.count, base.count, draws);
     std::printf("draw allocations [%s]: %zu draws: %llu allocations %llu bytes, without them: %llu allocations %llu bytes, busiest thread %llu allocations\n", shape.name, draws, static_cast<unsigned long long>(many.count), static_cast<unsigned long long>(many.bytes), static_cast<unsigned long long>(base.count), static_cast<unsigned long long>(base.bytes), static_cast<unsigned long long>(many.busiestCount));
