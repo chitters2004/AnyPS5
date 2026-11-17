@@ -592,9 +592,26 @@ void CheckCoverageThreadAndDriverWrites() {
 
 }
 
+void CheckLatestCollectEpochCoversEveryIssuedEpoch() {
+    BumpCollectEpoch();
+    const auto stamp = LatestCollectEpoch();
+    Require(ThreadCollectEpoch() != 0 && ThreadCollectEpoch() <= stamp, "the latest collect epoch is below this thread's epoch " + std::to_string(ThreadCollectEpoch()) + " > " + std::to_string(stamp));
+    std::uint64_t other = 0;
+    std::thread([&] {
+        BumpCollectEpoch();
+        other = ThreadCollectEpoch();
+    }).join();
+    Require(other > stamp, "another thread's bump after the stamp produced epoch " + std::to_string(other) + ", not above the stamp " + std::to_string(stamp));
+    Require(ThreadCollectEpoch() <= stamp, "another thread's bump moved this thread's epoch above the stamp");
+    Require(LatestCollectEpoch() >= other, "the latest collect epoch does not cover another thread's bump");
+    BumpCollectEpoch();
+    Require(ThreadCollectEpoch() > stamp, "this thread's bump after the stamp produced epoch " + std::to_string(ThreadCollectEpoch()) + ", not above the stamp " + std::to_string(stamp));
+}
+
 int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
+        CheckLatestCollectEpochCoversEveryIssuedEpoch();
 #ifdef _WIN32
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";

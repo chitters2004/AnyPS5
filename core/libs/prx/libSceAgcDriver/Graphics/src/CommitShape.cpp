@@ -27,6 +27,16 @@ void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs
             ++counts.leadBuckets[bucket];
             if (lead.survived) ++counts.leadSurvived;
             if (lead.epochAdvanced) ++counts.leadEpochAdvanced;
+            if (lead.collectAdvanced) ++counts.leadCollectAdvanced;
+            if (lead.walked) {
+                ++counts.walkedStamped;
+                counts.walkedStampedUs += lead.revalidateUs;
+                if (lead.collectAdvanced) ++counts.walkedCollectAdvanced;
+                if (lead.survived && !lead.collectAdvanced) {
+                    ++counts.walkedKept;
+                    counts.walkedKeptUs += lead.revalidateUs;
+                }
+            }
         }
         if (lead.walked) {
             ++counts.walked;
@@ -182,6 +192,10 @@ std::string CommitShape::ProofLeadLine(const Report& report) {
         std::snprintf(item, sizeof(item), " %s %llu x %.2f us (%.1f%% of the time)%s", ProofEndingNames[ending], static_cast<unsigned long long>(count), count != 0 ? report.endingUs[ending] / static_cast<double>(count) : 0.0, totalUs > 0 ? 100.0 * report.endingUs[ending] / totalUs : 0.0, ending + 1 < ProofEndingCount ? "," : "");
         text += item;
     }
+    std::snprintf(item, sizeof(item), "; stamped draws whose collect epoch advanced since prepare %.1f%%; walked and stamped %llu: collect epoch advanced %.1f%%,", share(report.leadCollectAdvanced, report.leadStamped), static_cast<unsigned long long>(report.walkedStamped), share(report.walkedCollectAdvanced, report.walkedStamped));
+    text += item;
+    std::snprintf(item, sizeof(item), " token kept (serials unchanged and collect epoch not advanced) %.1f%%, walk time %.1f ms, kept %.1f ms (%.1f%%)", share(report.walkedKept, report.walkedStamped), report.walkedStampedUs / 1000.0, report.walkedKeptUs / 1000.0, report.walkedStampedUs > 0 ? 100.0 * report.walkedKeptUs / report.walkedStampedUs : 0.0);
+    text += item;
     return text;
 }
 

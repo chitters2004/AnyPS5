@@ -160,6 +160,23 @@ void ProofLeadSplitsSurvivalPurityAndLead() {
     Require(line.find("; revalidate epoch exit 1 x 2.00 us (6.2% of the time), fast-ending 0 x 0.00 us (0.0% of the time), full-walk-ending 1 x 30.00 us (93.8% of the time), refused before the walk 0 x 0.00 us (0.0% of the time)") != std::string::npos, "the revalidate split is wrong: " + line);
 }
 
+void ProofLeadKeepsTokensOnlyWithinTheCollectEpoch() {
+    CommitShape shape;
+    using Lead = AgcDriver::ProofLeadNote;
+    const auto note = [&](const Lead& lead) { shape.Note(1, NoPhases, 0, {}, 0, AgcDriver::BuildReasonCount, lead); };
+    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 50.0});
+    note({.looked = true, .stamped = true, .survived = true, .walked = true, .ending = AgcDriver::EndingFast, .revalidateUs = 4.0, .collectAdvanced = true});
+    note({.looked = true, .stamped = true, .survived = false, .walked = true, .ending = AgcDriver::EndingFast, .revalidateUs = 6.0});
+    note({.looked = true, .stamped = true, .survived = true, .walked = false, .ending = AgcDriver::EndingEpoch, .revalidateUs = 1.0, .collectAdvanced = true});
+    note({.looked = true, .stamped = false, .walked = true, .ending = AgcDriver::EndingFull, .revalidateUs = 40.0, .collectAdvanced = true});
+    const auto report = shape.Take();
+    Require(report.leadCollectAdvanced == 2, "stamped draws whose collect epoch advanced were miscounted");
+    Require(report.walkedStamped == 3 && report.walkedCollectAdvanced == 1 && report.walkedKept == 1, "the stamped walks and their kept tokens were miscounted");
+    Require(report.walkedStampedUs == 60.0 && report.walkedKeptUs == 50.0, "the stamped and kept walk time was miscounted");
+    const auto line = CommitShape::ProofLeadLine(report);
+    Require(line.find("; stamped draws whose collect epoch advanced since prepare 50.0%; walked and stamped 3: collect epoch advanced 33.3%, token kept (serials unchanged and collect epoch not advanced) 33.3%, walk time 0.1 ms, kept 0.1 ms (83.3%)") != std::string::npos, "the collect epoch clause is wrong: " + line);
+}
+
 int main() {
     try {
         UnchangedStampsSurviveEveryDistance();
@@ -169,6 +186,7 @@ int main() {
         TakeResetsCountsButKeepsHistory();
         BuildsSumPerReasonAndPipelinesPerKind();
         ProofLeadSplitsSurvivalPurityAndLead();
+        ProofLeadKeepsTokensOnlyWithinTheCollectEpoch();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "commit shape: %s\n", error.what());
         return 1;

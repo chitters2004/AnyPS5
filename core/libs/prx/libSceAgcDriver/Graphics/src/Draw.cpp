@@ -2315,6 +2315,8 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     lead.lead = commits > stamp->commits ? commits - stamp->commits - 1 : 0;
                     lead.survived = proofSerials() == stamp->serials;
                     lead.epochAdvanced = stamp->epochTokens->load(std::memory_order_relaxed) != stamp->epochToken;
+                    const auto collectEpoch = GuestMemory::ThreadCollectEpoch();
+                    lead.collectAdvanced = collectEpoch == 0 || collectEpoch > stamp->collectEpoch;
                 }
             }
             const auto revalidateStart = leadProfiled && spaceHeld ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4855,7 +4857,7 @@ CommitShape::Report TakeDrawCommitShape() {
 
 std::optional<ProofLeadStamp> StampProofLead(std::uint64_t epochToken, const std::atomic<std::uint64_t>& epochTokens) {
     if (!CommitShapeProfiled()) return std::nullopt;
-    return ProofLeadStamp{proofSerials(), epochToken, &epochTokens, profiledCommits.load(std::memory_order_relaxed)};
+    return ProofLeadStamp{proofSerials(), epochToken, &epochTokens, profiledCommits.load(std::memory_order_relaxed), GuestMemory::LatestCollectEpoch()};
 }
 
 ProofLeadScope::ProofLeadScope(const ProofLeadStamp* stamp) : previous(ProofLeadSlot::Get()) {

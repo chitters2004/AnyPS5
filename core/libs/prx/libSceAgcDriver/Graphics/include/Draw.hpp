@@ -30,6 +30,7 @@ struct ProofLeadStamp {
     std::uint64_t epochToken = 0;
     const std::atomic<std::uint64_t>* epochTokens = nullptr;
     std::uint64_t commits = 0;
+    std::uint64_t collectEpoch = 0;
 };
 std::optional<ProofLeadStamp> StampProofLead(std::uint64_t epochToken, const std::atomic<std::uint64_t>& epochTokens);
 class ProofLeadScope {

@@ -513,6 +513,9 @@ void BuildsKeptTheirReason(std::uint64_t pipelinesBefore) {
     std::uint64_t bucketed = 0;
     for (const auto count : report.leadBuckets) bucketed += count;
     Require(bucketed == report.leadStamped, "the lead buckets do not add up to the stamps: " + lead);
+    Require(report.leadCollectAdvanced <= report.leadStamped && report.walkedStamped <= report.walked && report.walkedStamped <= report.leadStamped && report.walkedCollectAdvanced <= report.walkedStamped && report.walkedKept + report.walkedCollectAdvanced <= report.walkedStamped, "the collect epoch counts do not fit inside the stamped walks: " + lead);
+    Require(report.walkedKeptUs <= report.walkedStampedUs, "the kept walk time is longer than the stamped walk time: " + lead);
+    std::cout << "collect epoch: " << report.leadCollectAdvanced << " of " << report.leadStamped << " stamped advanced, " << report.walkedStamped << " stamped walks, " << report.walkedCollectAdvanced << " advanced, " << report.walkedKept << " kept\n";
     std::uint64_t ended = 0;
     for (const auto count : report.endings) ended += count;
     Require(ended != 0 && ended <= report.leadLooked && report.endings[AgcDriver::EndingFast] + report.endings[AgcDriver::EndingFull] == report.walked, "the revalidate endings do not match the lookups and walks: " + lead);
