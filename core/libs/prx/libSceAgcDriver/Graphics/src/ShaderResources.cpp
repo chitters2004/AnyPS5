@@ -4354,6 +4354,75 @@ ScopeLevels& scopeLevels() {
     return levels;
 }
 
+bool verifyingExits();
+
+constexpr std::size_t RangeExitChecks = 5;
+constexpr std::size_t RangeDeclineCount = RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Count);
+enum class RangeSetClass : std::uint8_t { Storage, Tables, Sampled, Count };
+
+struct RangeVersionCounts {
+    std::array<ProfileCounter, 2> exits;
+    std::array<ProfileCounter, RangeDeclineCount> declines;
+    std::array<std::array<ProfileCounter, static_cast<std::size_t>(RangeSetClass::Count)>, 2> verified;
+    ProfileCounter disagreements;
+    ProfileCounter concurrent;
+};
+
+RangeVersionCounts& rangeVersionCounts() {
+    static RangeVersionCounts counts;
+    return counts;
+}
+
+std::atomic<bool> rangeVersionsDisabled{false};
+std::atomic<std::uint32_t> rangeDisagreementsShown{0};
+
+bool rangeVersionsOn() {
+    return RuntimeSwitches::Set(RuntimeSwitch::RangeVersions) && !rangeVersionsDisabled.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rangeVerifySample() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_VERIFY_RANGE_VERSIONS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool verifyRangeExit() {
+    if (verifyingExits()) return true;
+    const auto every = rangeVerifySample();
+    if (every == 0) return false;
+    thread_local std::uint64_t state = 0x9e3779b97f4a7c15ull ^ reinterpret_cast<std::uintptr_t>(&state);
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state % every == 0;
+}
+
+const char* rangeDeclineName(std::size_t decline) {
+    static constexpr std::array<const char*, RangeExitChecks> local{"none", "inputs moved", "stale planes or per-use copies", "storage image not cached", "own texture released"};
+    if (decline < local.size()) return local[decline];
+    if (decline == RangeExitChecks) return "CPU writes pending";
+    return GuestMemory::RangeVersionDeclineName(static_cast<GuestMemory::RangeVersionDecline>(decline - RangeExitChecks));
+}
+
+void reportRangeVersions() {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::RangeVersions)) return;
+    auto& counts = rangeVersionCounts();
+    std::string declines;
+    for (std::size_t decline = 1; decline < counts.declines.size(); ++decline) {
+        if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::None)) continue;
+        const auto count = counts.declines[decline].Take();
+        if (count == 0) continue;
+        declines += (declines.empty() ? "" : ", ") + std::string(rangeDeclineName(decline)) + " " + std::to_string(count);
+    }
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(RangeSetClass::Count)>, 2> verified{};
+    for (std::size_t kind = 0; kind < verified.size(); ++kind) {
+        for (std::size_t set = 0; set < verified[kind].size(); ++set) verified[kind][set] = counts.verified[kind][set].Take();
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) range-version exits: same epoch %llu, across epochs %llu%s; declined: %s; verified same epoch storage/tables/sampled %llu/%llu/%llu, across epochs %llu/%llu/%llu, disagreed %llu, broken meanwhile by other threads %llu\n", static_cast<unsigned long long>(counts.exits[0].Take()), static_cast<unsigned long long>(counts.exits[1].Take()), rangeVersionsDisabled.load(std::memory_order_relaxed) ? " (off after a disagreement)" : "", declines.empty() ? "none" : declines.c_str(), static_cast<unsigned long long>(verified[0][0]), static_cast<unsigned long long>(verified[0][1]), static_cast<unsigned long long>(verified[0][2]), static_cast<unsigned long long>(verified[1][0]), static_cast<unsigned long long>(verified[1][1]), static_cast<unsigned long long>(verified[1][2]), static_cast<unsigned long long>(counts.disagreements.Take()), static_cast<unsigned long long>(counts.concurrent.Take()));
+}
+
 struct ScopeCheck {
     bool counted = false;
     bool blocked = false;
@@ -4444,6 +4513,7 @@ void reportExitMisses() {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks));
     reportScopeLevels(breaks);
+    reportRangeVersions();
     std::string combos;
     for (std::size_t mask = 1; mask < misses.combos.size(); ++mask) {
         const auto count = misses.combos[mask].Take();
@@ -5243,6 +5313,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
+        const auto unrangedProof = GuestMemory::UnrangedProofSerial();
+        const auto unrangedPending = GuestMemory::UnrangedPendingSerial();
         if (exitMissesCounted() && stamp.epoch != epochSeen) {
             epochSeen = stamp.epoch;
             scopeLevels().setEpochs.Add();
@@ -5264,6 +5336,52 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
         }
         if (matched && !HasCachedStorageImages()) matched = false;
+        if (!matched && stamp.epoch != 0 && proved.epoch != 0 && provedRanges && !proofRanges.empty() && rangeVersionsOn()) {
+            const auto decline = rangeVersionDecline(stamp, stalePlanes);
+            const bool epochMoved = proved.epoch != stamp.epoch;
+            if (GuestMemory::ProofBreaksCounted()) {
+                if (decline == 0) rangeVersionCounts().exits[epochMoved ? 1 : 0].Add();
+                else rangeVersionCounts().declines[decline].Add();
+            }
+            if (decline == 0) {
+                if (verifyRangeExit()) {
+                    const auto startSerial = GuestMemory::ProofSerial();
+                    GuestMemory::ProofBreakTrace trace;
+                    ProofWorkTrace work;
+                    const bool ok = revalidateFull(shaders, report);
+                    const bool stored = trace.Count() != 0;
+                    const bool worked = work.Total() != 0;
+                    const bool concurrent = !stored && GuestMemory::ProofSerial() != startSerial;
+                    auto& counts = rangeVersionCounts();
+                    const auto setClass = !storageTextures.empty() ? RangeSetClass::Storage : !comparedTableSpans.empty() ? RangeSetClass::Tables : RangeSetClass::Sampled;
+                    counts.verified[epochMoved ? 1 : 0][static_cast<std::size_t>(setClass)].Add();
+                    if (concurrent) counts.concurrent.Add();
+                    if (!ok || stored || worked) {
+                        counts.disagreements.Add();
+                        rangeVersionsDisabled.store(true, std::memory_order_relaxed);
+                        if (rangeDisagreementsShown.fetch_add(1, std::memory_order_relaxed) < 8) {
+                            std::fprintf(stderr, "[epoch-proofs] range versions off for the run: the full proof behind a range-version exit %s (set %p, %s, %zu ranges; proved epoch %llu proof %llu pending %llu releases %llu, now epoch %llu proof %llu pending %llu releases %llu; generation %llu; %llu breaks, %llu units of work)\n", !ok ? "failed" : stored ? "stored" : "did work", static_cast<const void*>(this), epochMoved ? "across epochs" : "same epoch", proofRanges.size(), static_cast<unsigned long long>(proved.epoch), static_cast<unsigned long long>(proved.proof), static_cast<unsigned long long>(proved.pending), static_cast<unsigned long long>(proved.releases), static_cast<unsigned long long>(stamp.epoch), static_cast<unsigned long long>(stamp.proof), static_cast<unsigned long long>(stamp.pending), static_cast<unsigned long long>(stamp.releases), static_cast<unsigned long long>(provedGeneration), static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(work.Total()));
+                            for (const auto& entry : trace.Breaks()) std::fprintf(stderr, "[epoch-proofs]   break at %s 0x%llx+0x%llx\n", GuestMemory::ProofBreakSiteName(entry.site), static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes));
+                        }
+                        proved.epoch = 0;
+                        noteEpochProof(false, false, false);
+                        return ok;
+                    }
+                    proved = stamp;
+                    provedUnrangedProof = unrangedProof;
+                    provedUnrangedPending = unrangedPending;
+                    noteEpochProof(true, false, false);
+                    return ok;
+                }
+                proved = stamp;
+                provedUnrangedProof = unrangedProof;
+                provedUnrangedPending = unrangedPending;
+                if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+                noteEpochProof(true, false, false);
+                if (!certified) epochServed = true;
+                return true;
+            }
+        }
         const bool copies = matched && !refreshPerUseCopies();
         if (matched && !copies) {
             if (verifyingExits()) {
@@ -5335,7 +5453,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         std::optional<GuestMemory::ProofBreakTrace> trace;
         if (counted) trace.emplace();
         std::uint64_t flushBreaks = 0;
-        const auto generation = counted ? GuestMemory::WriteGeneration() : 0;
+        const auto generation = GuestMemory::WriteGeneration();
         const bool ok = revalidateFull(shaders, report, counted ? &flushBreaks : nullptr, counted ? &*trace : nullptr);
         if (scope.counted) {
             if (scope.epochMoved && provedRanges && provedGeneration != 0 && !proofRanges.empty()) {
@@ -5349,6 +5467,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         noteEpochProof(false, false, false);
         proved = stamp;
         provedGeneration = generation;
+        provedUnrangedProof = unrangedProof;
+        provedUnrangedPending = unrangedPending;
         recordFlushRanges();
         provedRanges = !flushUnscoped;
         if (provedRanges) recordProofRanges();
@@ -5360,6 +5480,17 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return ok;
     }
     return revalidateFull(shaders, report);
+}
+
+std::size_t ShaderResources::rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes) {
+    if (proved.unwatch != stamp.unwatch || proved.importSet != stamp.importSet || proved.allocations != stamp.allocations || proved.retired != stamp.retired || proved.surfaces != stamp.surfaces) return 1;
+    if (stalePlanes) return 2;
+    if (!HasCachedStorageImages()) return 3;
+    if (proved.releases != stamp.releases && std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); })) return 4;
+    if (AnyPendingCpuWrites(context)) return RangeExitChecks;
+    const auto decline = GuestMemory::ValidateProofRanges(proofRanges, {provedGeneration, proved.proof, proved.pending, provedUnrangedProof, provedUnrangedPending});
+    if (decline != GuestMemory::RangeVersionDecline::None) return RangeExitChecks + static_cast<std::size_t>(decline);
+    return refreshPerUseCopies() ? 0 : 2;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks, const GuestMemory::ProofBreakTrace* trace) {
