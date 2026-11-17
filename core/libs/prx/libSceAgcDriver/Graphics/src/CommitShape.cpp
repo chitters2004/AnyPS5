@@ -19,6 +19,21 @@ void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs
         if (lead.ending < ProofEndingCount) {
             ++counts.endings[lead.ending];
             counts.endingUs[lead.ending] += lead.revalidateUs;
+            if (lead.decline < ProofDeclineCount) {
+                ++counts.declineEndings[lead.decline][lead.ending];
+                counts.declineEndingUs[lead.decline][lead.ending] += lead.revalidateUs;
+                if (lead.declineAlone) ++counts.declineAlone[lead.decline];
+            }
+            if (lead.ending == EndingFull) {
+                const auto fastFail = lead.fastFail < FastFailSlots ? lead.fastFail : FastFailSlots;
+                ++counts.fullFastFails[fastFail];
+                counts.fullFastFailUs[fastFail] += lead.revalidateUs;
+                if (lead.served) ++counts.fullFastFailServed[fastFail];
+                if (lead.collectSource < CollectSourceCount) {
+                    ++counts.fullCollects[lead.collectSource];
+                    counts.fullCollectUs[lead.collectSource] += lead.revalidateUs;
+                }
+            }
         }
         if (lead.stamped) {
             ++counts.leadStamped;
@@ -196,6 +211,49 @@ std::string CommitShape::ProofLeadLine(const Report& report) {
     text += item;
     std::snprintf(item, sizeof(item), " token kept (serials unchanged and collect epoch not advanced) %.1f%%, walk time %.1f ms, kept %.1f ms (%.1f%%)", share(report.walkedKept, report.walkedStamped), report.walkedStampedUs / 1000.0, report.walkedKeptUs / 1000.0, report.walkedStampedUs > 0 ? 100.0 * report.walkedKeptUs / report.walkedStampedUs : 0.0);
     text += item;
+    return text;
+}
+
+std::string CommitShape::ProofDeclineLine(const Report& report, std::span<const char* const> fastFailNames) {
+    std::string text = "[proof-decline] 10 s: revalidations by why the epoch exit declined, as epoch exit / fast-ending / full-walk-ending / refused before the walk (count x us):";
+    char item[256];
+    const double fullUs = report.endingUs[EndingFull];
+    bool first = true;
+    for (std::size_t decline = 0; decline < ProofDeclineCount; ++decline) {
+        const auto& counts = report.declineEndings[decline];
+        if (counts[EndingEpoch] + counts[EndingFast] + counts[EndingFull] + counts[EndingRefused] == 0) continue;
+        std::snprintf(item, sizeof(item), "%s %s", first ? "" : ";", ProofDeclineNames[decline]);
+        text += item;
+        first = false;
+        if (decline >= DeclineEpoch && decline <= DeclineRetired) {
+            std::snprintf(item, sizeof(item), " (alone %llu)", static_cast<unsigned long long>(report.declineAlone[decline]));
+            text += item;
+        }
+        for (std::size_t ending = 0; ending < ProofEndingCount; ++ending) {
+            const auto count = counts[ending];
+            std::snprintf(item, sizeof(item), "%s %llu x %.2f", ending == 0 ? "" : " /", static_cast<unsigned long long>(count), count != 0 ? report.declineEndingUs[decline][ending] / static_cast<double>(count) : 0.0);
+            text += item;
+        }
+        std::snprintf(item, sizeof(item), " (%.1f%% of full-walk time)", fullUs > 0 ? 100.0 * report.declineEndingUs[decline][EndingFull] / fullUs : 0.0);
+        text += item;
+    }
+    text += "; full walks by the first failing fast check:";
+    first = true;
+    for (std::size_t reason = 0; reason <= FastFailSlots; ++reason) {
+        const auto count = report.fullFastFails[reason];
+        if (count == 0) continue;
+        const char* name = reason < fastFailNames.size() ? fastFailNames[reason] : reason == FastFailSlots ? "no fast proof ran" : "unnamed";
+        std::snprintf(item, sizeof(item), "%s %s %llu x %.2f us, %llu served (%.1f%% of full-walk time)", first ? "" : ",", name, static_cast<unsigned long long>(count), report.fullFastFailUs[reason] / static_cast<double>(count), static_cast<unsigned long long>(report.fullFastFailServed[reason]), fullUs > 0 ? 100.0 * report.fullFastFailUs[reason] / fullUs : 0.0);
+        text += item;
+        first = false;
+    }
+    if (first) text += " none";
+    text += "; collect fails behind full walks by source:";
+    for (std::size_t source = 0; source < CollectSourceCount; ++source) {
+        const auto count = report.fullCollects[source];
+        std::snprintf(item, sizeof(item), " %s %llu x %.2f us%s", CollectSourceNames[source], static_cast<unsigned long long>(count), count != 0 ? report.fullCollectUs[source] / static_cast<double>(count) : 0.0, source + 1 < CollectSourceCount ? "," : "");
+        text += item;
+    }
     return text;
 }
 

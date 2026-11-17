@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "../PortabilitySubset.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -619,6 +620,11 @@ ShaderRecompiler::RecompileResult SampledProgram(std::uint64_t address) {
     return program;
 }
 
+std::string FastFailName(const ShaderResources::ProofReport& report) {
+    const auto names = ShaderResources::FastFailNameList();
+    return report.fastFail < names.size() ? names[report.fastFail] : "none";
+}
+
 void replacedEntryTests(Context context) {
     PlaceholderImages placeholders(context);
     context.placeholderImages = &placeholders;
@@ -642,6 +648,9 @@ void replacedEntryTests(Context context) {
     ClearCachedTextures(context.device);
     Require(TextureCacheUsage().sampledEntries == 0, "clearing the sampled cache left entries");
     Require(!first->Revalidate(shader, &report), "a template binding a texture whose cache entry left still proved current");
+    std::printf("evicted entry: full walk sent by %s\n", FastFailName(report).c_str());
+    Require(report.path == ShaderResources::ProofPath::Full && FastFailName(report) == "replaced texture", "the full walk after the cache entry left is not named by the replaced-texture check: " + FastFailName(report));
+    Require(report.decline == (ShaderResources::EpochProofs() ? AgcDriver::DeclineNeverProved : AgcDriver::DeclineGateOff), "the full walk after the cache entry left has the wrong epoch decline: " + std::to_string(report.decline));
     const auto replacement = Sampled(context, surface.Address());
     Require(replacement != bound, "the lookup after the clear handed back the old texture");
     Require(!first->Revalidate(shader), "a template binding the replaced texture proved current against the new entry");
@@ -705,6 +714,7 @@ bool lookupChangedTests(Context context) {
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
     Require(first->Revalidate(shader, &report) && report.audited && report.path == ShaderResources::ProofPath::Full, "a proof past the audit interval after a host import was added did not audit the template");
+    Require(FastFailName(report) == "audit", "the audit's full walk is not named by the audit: " + FastFailName(report));
     Require(first->SampledTextures().front() == bound, "the audit after an unrelated host import changed the bound texture");
     Require(first->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Fast, "the proof right after an audit did not take the fast proof");
     if (HostImportFor(context, surface.Address(), SurfaceBytes) == nullptr) {
@@ -1384,6 +1394,8 @@ void collectRefusalTests(Context context) {
     auto storage = std::make_shared<ShaderResources>(context, storageShader);
     Require(storage->Reusable() && storage->StorageImages().size() == 1, "the storage template over the partial surface is not reusable");
     Require(storage->Revalidate(storageShader, &report) && report.path == ShaderResources::ProofPath::Full, "a storage template over a surface with an uncommitted page did not take the full walk");
+    Require(report.fastFail == collect, "the storage template's full walk is not named by the collect check: " + FastFailName(report));
+    Require(!AgcDriver::CommitShapeProfiled() || report.collectSource == AgcDriver::CollectUncommitted, "the storage template's collect fail over an uncommitted page was given source " + std::to_string(report.collectSource));
     const auto withStorage = ShaderResources::CollectRefusalCounts();
     Require(withStorage.storage - after.storage == 1 && withStorage.sampled == after.sampled, "a storage image's collect refusal was not counted as a storage one");
     Require(withStorage.uncommitted - after.uncommitted == 1, "a storage image's collect refusal over an uncommitted page was not counted as uncommitted");
@@ -1394,6 +1406,8 @@ void collectRefusalTests(Context context) {
     auto hosted = std::make_shared<ShaderResources>(context, hostShader);
     Require(hosted->Reusable() && hosted->SampledTextures().size() == 1, "the template over the host-allocated surface is not reusable");
     Require(hosted->Revalidate(hostShader, &report) && report.path == ShaderResources::ProofPath::Full, "a template over a host-allocated surface did not take the full walk");
+    Require(report.fastFail == collect, "the host-allocated template's full walk is not named by the collect check: " + FastFailName(report));
+    Require(!AgcDriver::CommitShapeProfiled() || report.collectSource == AgcDriver::CollectUnwatched, "the host-allocated template's collect fail was given source " + std::to_string(report.collectSource));
     const auto outside = ShaderResources::CollectRefusalCounts();
     Require(outside.sampled - withStorage.sampled == 1 && outside.unwatched - withStorage.unwatched == 1, "a host-allocated surface's collect refusal was not counted as unwatched");
     Require(outside.uncommitted == withStorage.uncommitted && outside.other == withStorage.other, "a host-allocated surface's collect refusal was counted under another cause");

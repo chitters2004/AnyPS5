@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -519,6 +520,23 @@ void BuildsKeptTheirReason(std::uint64_t pipelinesBefore) {
     std::uint64_t ended = 0;
     for (const auto count : report.endings) ended += count;
     Require(ended != 0 && ended <= report.leadLooked && report.endings[AgcDriver::EndingFast] + report.endings[AgcDriver::EndingFull] == report.walked, "the revalidate endings do not match the lookups and walks: " + lead);
+    const auto decline = AgcDriver::CommitShape::ProofDeclineLine(report, AgcDriver::Graphics::ShaderResources::FastFailNameList());
+    std::cout << decline << '\n';
+    for (std::size_t ending = 0; ending < AgcDriver::ProofEndingCount; ++ending) {
+        std::uint64_t declined = 0;
+        for (const auto& row : report.declineEndings) declined += row[ending];
+        Require(declined == report.endings[ending], std::string("the decline causes do not add up to the ") + AgcDriver::ProofEndingNames[ending] + " count: " + decline);
+    }
+    const auto& taken = report.declineEndings[AgcDriver::DeclineTaken];
+    Require(taken[AgcDriver::EndingEpoch] == report.endings[AgcDriver::EndingEpoch] && taken[AgcDriver::EndingFast] + taken[AgcDriver::EndingFull] + taken[AgcDriver::EndingRefused] == 0, "an epoch exit was noted under a decline cause, or a declined exit as taken: " + decline);
+    std::uint64_t fullByFastFail = 0;
+    for (const auto count : report.fullFastFails) fullByFastFail += count;
+    Require(fullByFastFail == report.endings[AgcDriver::EndingFull], "the full walks by first failing check do not add up to the full walks: " + decline);
+    std::uint64_t collects = 0;
+    for (const auto count : report.fullCollects) collects += count;
+    const auto names = AgcDriver::Graphics::ShaderResources::FastFailNameList();
+    const auto collect = static_cast<std::size_t>(std::find_if(names.begin(), names.end(), [](const char* name) { return std::string_view(name) == "collect"; }) - names.begin());
+    Require(collect < names.size() && collects == report.fullFastFails[collect], "the collect fails by source do not add up to the full walks the collect check sent there: " + decline);
     if (AgcDriver::DriverDetail::DrawFinisher::Enabled() && AgcDriver::DriverDetail::DrawFinisher::Overlap()) Require(report.leadStamped != 0 && report.servedStamped != 0, "no queued template lookup carried the stamp of its prepare: " + lead);
     else Require(report.leadStamped == 0, "an inline template lookup was stamped: " + lead);
     if (evicting) Require(returned != 0, "with one resource cache entry no build was for an evicted key that came back: " + line);

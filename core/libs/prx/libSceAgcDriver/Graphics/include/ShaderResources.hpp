@@ -374,7 +374,12 @@ public:
         bool walked = false;
         bool lookups = false;
         std::uint32_t effects = 0;
+        std::size_t decline = std::numeric_limits<std::size_t>::max();
+        bool declineAlone = false;
+        std::size_t fastFail = std::numeric_limits<std::size_t>::max();
+        std::size_t collectSource = std::numeric_limits<std::size_t>::max();
     };
+    static std::span<const char* const> FastFailNameList();
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
@@ -805,6 +810,7 @@ private:
     std::uint64_t provedProof = 0;
     std::uint64_t provedPending = 0;
     std::uint64_t provedRetired = 0;
+    std::size_t unprovedCause = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;

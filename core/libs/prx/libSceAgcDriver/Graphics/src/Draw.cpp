@@ -1481,6 +1481,7 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(report, DrawKindNames, DrawPhaseNames).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofLeadLine(report).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofDeclineLine(report, ShaderResources::FastFailNameList()).c_str());
 }
 
 std::atomic<std::uint64_t> profiledCommits{0};
@@ -2324,6 +2325,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             if (leadProfiled && spaceHeld) {
                 outcome.proofLead.revalidateUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - revalidateStart).count();
                 outcome.proofLead.ending = !proofReport.walked ? (valid ? EndingEpoch : EndingRefused) : proofReport.path == ShaderResources::ProofPath::Full ? EndingFull : EndingFast;
+                outcome.proofLead.decline = std::min<std::size_t>(proofReport.decline, ProofDeclineCount);
+                outcome.proofLead.declineAlone = proofReport.declineAlone;
+                outcome.proofLead.fastFail = std::min<std::size_t>(proofReport.fastFail, FastFailSlots);
+                outcome.proofLead.collectSource = std::min<std::size_t>(proofReport.collectSource, CollectSourceCount);
             }
             if (leadProfiled) {
                 outcome.proofLead.walked = proofReport.walked;

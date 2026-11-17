@@ -3504,6 +3504,14 @@ void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes)
     if (profile.refusedSurfaces.size() < RefusedSurfaceLimit || profile.refusedSurfaces.contains(address)) profile.refusedSurfaces[address] = bytes;
 }
 
+thread_local std::size_t collectSourceSeen = CollectSourceCount;
+
+void noteCollectSource(std::uint64_t address, std::size_t bytes) {
+    if (!CommitShapeProfiled()) return;
+    const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes);
+    collectSourceSeen = !accessible ? CollectUncommitted : !GuestMemory::Watched(address, bytes) ? CollectUnwatched : CollectOther;
+}
+
 void countOwnRefreshFallback(OwnRefreshFallback reason) {
     if (BuildProfiled()) Revalidations().ownFallbacks[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
 }
@@ -3808,6 +3816,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (surface.collected == 0) {
             countCollectRefusal(false, address, bytes);
+            noteCollectSource(address, bytes);
             return fail(FastFail::Collect);
         }
         const auto* source = surface.source;
@@ -3867,6 +3876,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (GuestMemory::CollectWrites(address, bytes) == 0) {
             countCollectRefusal(true, address, bytes);
+            noteCollectSource(address, bytes);
             return fail(FastFail::Collect);
         }
         if (own.dccAddress != 0) {
@@ -4462,10 +4472,21 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     return outcome(partial || !replaced.empty() ? IndexOutcome::Partial : IndexOutcome::Accepted);
 }
 
+std::span<const char* const> ShaderResources::FastFailNameList() {
+    return FastFailNames;
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const auto noteDecline = [report](std::size_t decline, bool alone) {
+        if (report == nullptr) return;
+        report->decline = decline;
+        report->declineAlone = alone;
+    };
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
+        noteDecline(DeclineViews, false);
         provedEpoch = 0;
+        unprovedCause = DeclineViews;
         return false;
     }
     if (EpochProofs()) {
@@ -4473,31 +4494,53 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
         const auto retired = RetiredImportSerial();
-        if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending && provedRetired == retired) {
+        std::size_t decline = DeclineTaken;
+        bool alone = false;
+        if (epoch == 0) {
+            decline = DeclineNoEpoch;
+        } else if (provedEpoch == 0) {
+            decline = unprovedCause != 0 ? unprovedCause : DeclineNeverProved;
+        } else {
+            const std::array<bool, 4> moved{provedEpoch != epoch, provedProof != proof, provedPending != pending, provedRetired != retired};
+            const auto first = static_cast<std::size_t>(std::find(moved.begin(), moved.end(), true) - moved.begin());
+            if (first < moved.size()) {
+                decline = DeclineEpoch + first;
+                alone = std::count(moved.begin(), moved.end(), true) == 1;
+            }
+        }
+        if (decline == DeclineTaken) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {
                 const bool ok = revalidateFull(shaders, report);
+                noteDecline(DeclineVerifySample, false);
                 noteEpochProof(true, true, !ok);
                 return ok;
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+            noteDecline(DeclineTaken, false);
             noteEpochProof(true, false, false);
             return true;
         }
         const bool ok = revalidateFull(shaders, report);
+        noteDecline(decline, alone);
         noteEpochProof(false, false, false);
         if (ok) {
-            provedEpoch = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); }) ? 0 : epoch;
+            const bool lookupTexture = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->HasReuseLookup(); });
+            provedEpoch = lookupTexture ? 0 : epoch;
+            unprovedCause = lookupTexture ? DeclineLookupTexture : 0;
             provedProof = proof;
             provedPending = pending;
             provedRetired = retired;
         } else {
             provedEpoch = 0;
+            unprovedCause = DeclineLastRefused;
         }
         return ok;
     }
-    return revalidateFull(shaders, report);
+    const bool ok = revalidateFull(shaders, report);
+    noteDecline(DeclineGateOff, false);
+    return ok;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
@@ -4691,6 +4734,8 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (report != nullptr) {
         report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
         report->audited = !fast && reason == FastFail::Audit;
+        if (!fast && reason != FastFail::Count) report->fastFail = static_cast<std::size_t>(reason);
+        if (!fast && reason == FastFail::Collect) report->collectSource = collectSourceSeen;
     }
     if (!fast) {
         countFullWalk(reason);

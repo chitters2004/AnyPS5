@@ -25,6 +25,11 @@ inline constexpr std::array<const char*, WalkEffectCount> WalkEffectNames{"depth
 
 enum ProofEnding : std::size_t { EndingEpoch, EndingFast, EndingFull, EndingRefused, ProofEndingCount };
 inline constexpr std::array<const char*, ProofEndingCount> ProofEndingNames{"epoch exit", "fast-ending", "full-walk-ending", "refused before the walk"};
+enum ProofDecline : std::size_t { DeclineTaken, DeclineGateOff, DeclineViews, DeclineNoEpoch, DeclineNeverProved, DeclineLookupTexture, DeclineLastRefused, DeclineEpoch, DeclineProof, DeclinePending, DeclineRetired, DeclineVerifySample, ProofDeclineCount };
+inline constexpr std::array<const char*, ProofDeclineCount> ProofDeclineNames{"exit taken", "epoch proofs off", "image views changed", "no collect epoch", "never proved", "reuse-lookup texture", "last proof refused", "collect epoch moved", "proof serial moved", "pending serial moved", "retired serial moved", "verify sample"};
+enum CollectSource : std::size_t { CollectUncommitted, CollectUnwatched, CollectOther, CollectSourceCount };
+inline constexpr std::array<const char*, CollectSourceCount> CollectSourceNames{"uncommitted pages", "unwatched", "other"};
+inline constexpr std::size_t FastFailSlots = 16;
 struct ProofLeadNote {
     bool looked = false;
     bool stamped = false;
@@ -38,6 +43,10 @@ struct ProofLeadNote {
     std::size_t ending = ProofEndingCount;
     double revalidateUs = 0;
     bool collectAdvanced = false;
+    std::size_t decline = ProofDeclineCount;
+    bool declineAlone = false;
+    std::size_t fastFail = FastFailSlots;
+    std::size_t collectSource = CollectSourceCount;
 };
 
 bool CommitShapeProfiled();
@@ -72,6 +81,14 @@ public:
         std::array<std::uint64_t, WalkEffectCount> servedEffects{};
         std::array<std::uint64_t, ProofEndingCount> endings{};
         std::array<double, ProofEndingCount> endingUs{};
+        std::array<std::array<std::uint64_t, ProofEndingCount>, ProofDeclineCount> declineEndings{};
+        std::array<std::array<double, ProofEndingCount>, ProofDeclineCount> declineEndingUs{};
+        std::array<std::uint64_t, ProofDeclineCount> declineAlone{};
+        std::array<std::uint64_t, FastFailSlots + 1> fullFastFails{};
+        std::array<double, FastFailSlots + 1> fullFastFailUs{};
+        std::array<std::uint64_t, FastFailSlots + 1> fullFastFailServed{};
+        std::array<std::uint64_t, CollectSourceCount> fullCollects{};
+        std::array<double, CollectSourceCount> fullCollectUs{};
     };
 
     void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines = 0, std::size_t buildReason = BuildReasonCount, const ProofLeadNote& lead = {});
@@ -80,6 +97,7 @@ public:
     static std::string Line(const Report& report, std::span<const char* const, Kinds> kindNames, std::span<const char* const, Phases> phaseNames);
     static std::string BuildLine(const Report& report, std::span<const char* const, Kinds> kindNames, std::size_t resourcesPhase, std::size_t pipelinePhase);
     static std::string ProofLeadLine(const Report& report);
+    static std::string ProofDeclineLine(const Report& report, std::span<const char* const> fastFailNames);
 
 private:
     Mutex mutex;
