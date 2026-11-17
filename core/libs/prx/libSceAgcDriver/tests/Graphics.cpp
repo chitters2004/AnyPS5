@@ -9865,6 +9865,55 @@ void pipelineLibraryClearWaitsForBuildTests() {
     Require(mock.live == 0, "clearing during a library build leaked Vulkan objects");
 }
 
+void pipelineLibraryInFlightPartTests() {
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    State state{};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 201;
+    fragment.variantId = 202;
+    const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    std::array<std::uint32_t, 1> mainKey{3}, fragmentKey{4};
+    PipelineSetLayouts resources{};
+    resources.main = makeHandle<VkDescriptorSetLayout>();
+    resources.fragment = makeHandle<VkDescriptorSetLayout>();
+    resources.mainKey = mainKey;
+    resources.fragmentKey = fragmentKey;
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockLibraryCreate = true;
+        libraryCreateEntered = false;
+        releaseLibraryCreate = false;
+    }
+    const auto prebuild = [&] { Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped"); };
+    std::thread first(prebuild);
+    {
+        std::unique_lock lock(pipelineCreateMutex);
+        pipelineCreateCondition.wait(lock, [] { return libraryCreateEntered; });
+    }
+    std::thread second(prebuild);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (PipelineLibraryCountersOf(context.device).waited[0] == 0 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    {
+        std::lock_guard lock(pipelineCreateMutex);
+        blockLibraryCreate = false;
+        releaseLibraryCreate = true;
+    }
+    pipelineCreateCondition.notify_all();
+    first.join();
+    second.join();
+    const auto counters = PipelineLibraryCountersOf(context.device);
+    Require(counters.waited[0] == 1, "a second request for a vertex input part another thread was building did not wait for it");
+    Require(counters.built == std::array<std::uint64_t, 4>{1, 1, 1, 1} && counters.duplicates == 0, "two requests for the same parts compiled a part twice");
+    ClearCachedPipelines(context.device);
+    Require(mock.live == 0, "concurrent part requests leaked Vulkan objects");
+}
+
 void tessellationPipelineLibraryCacheTests() {
     using namespace AgcDriver::Graphics;
     for (const auto shared : {true, false}) {
@@ -15041,6 +15090,11 @@ int main(int argc, char** argv) {
             std::cout << "pipeline journal recipe, record and replay tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-in-flight-parts") {
+            pipelineLibraryInFlightPartTests();
+            std::cout << "pipeline library requests wait for a part another thread is building\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {
             pipelineLibraryClearWaitsForBuildTests();
             std::cout << "pipeline library clear waits for active part builds\n";
@@ -15380,6 +15434,7 @@ int main(int argc, char** argv) {
         retainedPixelStageTests();
         pipelineLibrarySetTests();
         pipelineLibraryClearWaitsForBuildTests();
+        pipelineLibraryInFlightPartTests();
         tessellationPipelineLibraryCacheTests();
         framebufferOwnerTests();
         hdrComponentSwapTests();
