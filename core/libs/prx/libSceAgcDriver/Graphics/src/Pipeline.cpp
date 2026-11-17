@@ -1053,7 +1053,6 @@ void Pipeline::setLibraryState(CommandState& recording, const State& state) cons
     recording.SetCullMode(context, state.cullMode);
     recording.SetFrontFace(context, state.frontFace);
     recording.SetDepthBias(context, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
-    if (dynamicDepthBiasEnable) recording.SetDepthBiasEnable(context, depthBias);
     recording.SetDepthBounds(context, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
     recording.SetDepthTestEnable(context, depth && state.depthTest);
     recording.SetDepthWriteEnable(context, depth && state.depthWrite);
