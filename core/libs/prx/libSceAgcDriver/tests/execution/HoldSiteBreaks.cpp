@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -71,6 +72,23 @@ void KeysFillCases() {
     Require(miss.complete && miss.clear, "a key fill memo blocked a set outside its keys");
 }
 
+void ClosedPipelineCases() {
+    auto& pipeline = DriverDetail::DrawPipeline::Queue0();
+    pipeline.Stop();
+    const auto proof = GuestMemory::ProofSerial();
+    bool committed = false;
+    OnThread(false, [&] {
+        pipeline.Enqueue([&] {
+            std::lock_guard hold(GuestMemory::GpuMutex());
+            committed = true;
+        }, {});
+    });
+    Require(committed, "a commit enqueued after the pipeline closed did not run");
+    const std::array<Range, 1> any{{{0x1000, 0x2000}}};
+    const auto window = GuestMemory::ProofBreaksSince(proof, any);
+    Require(window.complete && window.unranged && window.blocker == GuestMemory::ProofBreakSite::GpuMutex, "a commit run inline after the pipeline closed broke no proof, although it skips the committer's packet breaks");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -79,9 +97,11 @@ int main(int argc, char** argv) {
         if (mode == "--acquire") Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::NoHoldSiteBreaks, true);
         IdleHoldCases();
         KeysFillCases();
+        ClosedPipelineCases();
         Graphics::RuntimeSwitches::Assign(Graphics::RuntimeSwitch::NoHoldSiteBreaks, !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks));
         IdleHoldCases();
         KeysFillCases();
+        ClosedPipelineCases();
         std::puts("hold site break tests passed");
         return 0;
     } catch (const std::exception& error) {
