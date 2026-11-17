@@ -31,7 +31,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_address_draw_space_reuse_held PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(gate IN ITEMS "committer|on" "finisher|on|APS5_DRAW_PIPELINE=1" "inline|off|APS5_PIPELINED_DRAWS=0" "switched_off|off|APS5_NO_EPOCH_PROOFS=1")
+    foreach(gate IN ITEMS "committer|on" "finisher|on|APS5_DRAW_PIPELINE=1" "inline|off|APS5_PIPELINED_DRAWS=0" "switched_off|off|APS5_NO_EPOCH_PROOFS=1" "hold_site_breaks_off|on|APS5_NO_HOLD_SITE_BREAKS=1")
         string(REPLACE "|" ";" fields "${gate}")
         list(GET fields 0 name)
         list(GET fields 1 expected)

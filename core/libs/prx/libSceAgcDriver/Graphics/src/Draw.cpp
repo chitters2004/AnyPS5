@@ -3393,9 +3393,7 @@ struct AttachmentMemo {
     VkDevice device = VK_NULL_HANDLE;
     std::uint64_t recorder = 0;
     std::uint64_t generation = 0;
-    std::uint64_t epoch = 0;
-    std::uint64_t proof = 0;
-    std::uint64_t pending = 0;
+    AttachmentMemoSerials serials;
     std::uint64_t depthSerial = 0;
     std::uint64_t depthReleased = 0;
     std::vector<ColorTarget> colors;
@@ -3417,6 +3415,10 @@ AttachmentMemo& attachmentMemo() {
     return HostThreadLocal<AttachmentMemo, AttachmentMemoStorage>();
 }
 
+}
+
+AttachmentMemoSerials CurrentAttachmentMemoSerials() {
+    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), RuntimeSwitches::Set(RuntimeSwitch::NoHoldSiteBreaks) ? 0 : GuestMemory::UnwatchSerial()};
 }
 
 bool PassAttachmentMemoEnabled() {
@@ -3451,7 +3453,7 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
     if (!memo.valid || memo.device != context.device) return miss(AttachmentEvent::NoMemo);
     const auto* recorder = Recorder::Active();
     if (recorder == nullptr || recorder->Id() != memo.recorder || !recorder->RenderPassOpen() || recorder->RenderPassGeneration() != memo.generation) return miss(AttachmentEvent::Pass);
-    if (GuestMemory::CollectEpoch() != memo.epoch || GuestMemory::ProofSerial() != memo.proof || StorageTexture::PendingSerial() != memo.pending) return miss(AttachmentEvent::Serials);
+    if (CurrentAttachmentMemoSerials() != memo.serials) return miss(AttachmentEvent::Serials);
     if (state.colors.size() != memo.colors.size()) return miss(AttachmentEvent::Targets);
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         if (!sameColorTarget(state.colors[index], memo.colors[index])) return miss(AttachmentEvent::Targets);
@@ -3510,9 +3512,7 @@ void rememberAttachments(const Context& context, const State& state, const Prepa
     memo.device = context.device;
     memo.recorder = recorder->Id();
     memo.generation = recorder->RenderPassGeneration();
-    memo.epoch = epoch;
-    memo.proof = GuestMemory::ProofSerial();
-    memo.pending = StorageTexture::PendingSerial();
+    memo.serials = CurrentAttachmentMemoSerials();
     memo.depthSerial = DepthSurfacesSerial();
     memo.depthReleased = DepthSurfacesReleased();
     memo.colors.assign(state.colors.begin(), state.colors.end());

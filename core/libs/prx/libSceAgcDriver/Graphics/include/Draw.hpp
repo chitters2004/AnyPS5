@@ -181,6 +181,15 @@ void RunColorMetadataPass(const Context& context, const ColorMetadataPass& pass)
 std::vector<std::pair<std::uint64_t, std::uint64_t>> PipelinedColorMetadataPassWrites(const ColorMetadataPass& pass);
 bool DrawPipelineEnabled();
 bool CommitTrims();
+struct AttachmentMemoSerials {
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t unwatch = 0;
+    bool operator==(const AttachmentMemoSerials&) const = default;
+};
+
+AttachmentMemoSerials CurrentAttachmentMemoSerials();
 bool PassAttachmentMemoEnabled();
 struct FragmentOutputLookups {
     std::uint64_t last = 0;

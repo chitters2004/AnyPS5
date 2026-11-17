@@ -69,6 +69,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/RunReportComponent.hpp"
@@ -3993,16 +3994,27 @@ bool NoResidentPresent() {
 // texture of the image would (see cachedTexture). The uncached walk: the collect memo is per worker
 // packet, so on this thread a memoized answer could miss a CPU write that landed after a worker's
 // walk of the same range.
+}
+
 bool RefreshPresented(Graphics::StorageTexture& resident, const DisplayBuffer& buffer, std::uint32_t layer) {
     static const bool noAdopt = std::getenv("APS5_NO_PRESENT_EPOCH") != nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    static std::atomic<std::uint64_t> staleRefreshes{0};
     const auto bytes = DisplayBufferSize(buffer);
     if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
     GuestMemory::CollectWritesUncached(buffer.address, bytes);
     if (GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes)) && (buffer.dccAddress == 0 || !ResidentKeysMoved(resident))) return false;
+    if (!noAdopt && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks)) GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::HeldState, buffer.address, bytes);
     if (resident.ImageLayers() > 1) resident.RefreshLayers(layer, 1);
     else resident.Refresh();
+    if (verify && !GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes))) {
+        const auto stale = staleRefreshes.fetch_add(1, std::memory_order_relaxed) + 1;
+        std::fprintf(stderr, "[present] APS5_VERIFY_DRAW_PIPELINE: a present refresh left CPU writes unmerged at 0x%llx (stale %llu)\n", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(stale));
+    }
     return true;
 }
+
+namespace {
 
 struct PlaneSource {
     std::shared_ptr<Graphics::StorageTexture> resident;

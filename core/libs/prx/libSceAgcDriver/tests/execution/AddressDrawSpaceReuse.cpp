@@ -1054,6 +1054,45 @@ void LimitPinWait() {
 
 using Case = void (*)(Scene&);
 
+constexpr std::uint32_t ImageSide = 64;
+std::array<std::uint8_t, 2 * BlockBytes> SegmentData{};
+
+std::uint8_t* SegmentBlock() {
+    const auto begin = reinterpret_cast<std::uintptr_t>(SegmentData.data());
+    return SegmentData.data() + (((begin + BlockBytes - 1) & ~std::uintptr_t{BlockBytes - 1}) - begin);
+}
+alignas(256) constexpr std::array<std::uint32_t, 7> ImageStoreCode{
+    0x7e040300u, 0x7e060280u, 0x7e0202ffu, 0x12345678u, 0xf0200108u, 0x00020102u, 0xbf810000u,
+};
+
+void StoreImage(Scene& scene, std::uint64_t address) {
+    std::vector<std::uint32_t> userData(16, 0u);
+    const std::array<std::uint32_t, 8> texture{
+        static_cast<std::uint32_t>(address >> 8u),
+        static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (20u << 20u) | (((ImageSide - 1u) & 3u) << 30u),
+        ((ImageSide - 1u) >> 2u) | ((ImageSide - 1u) << 14u),
+        0xfacu | (9u << 28u),
+        0u,
+        0u,
+        0u,
+        0u,
+    };
+    std::copy(texture.begin(), texture.end(), userData.begin() + 8);
+    const std::span<const std::uint32_t> program(ImageStoreCode);
+    const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(program.data()), std::as_bytes(program)}}};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{8, 1, 1}, 0u, {false, false, false}, false, 1};
+    ShaderRecompiler::RecompileRequest request{
+        {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(program.data()), program, 0, {}},
+        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        scene.device.Target(),
+        {0, 0, 0, 128}
+    };
+    request.useCache = false;
+    const auto result = ShaderRecompiler::Recompile(request);
+    scene.device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(program.data()));
+    scene.device.WaitIdle();
+}
+
 void EpochMirrors(Scene& scene, bool expected) {
     Require(AgcDriver::Graphics::ShaderResources::EpochProofs() == expected, std::string("address draw space reuse: epoch proofs are ") + (expected ? "off" : "on") + " where the gate expects them " + (expected ? "on" : "off"));
     auto& counts = AgcDriver::Graphics::EpochProofCounts();
@@ -1076,6 +1115,35 @@ void EpochMirrors(Scene& scene, bool expected) {
     Require(scene.Color() == 70 && Builds() == builds, "address draw space reuse: the draws inside one collect epoch were not served by the cached build");
     const bool second = expected ? counts.mirrorRefreshes.Sum() - refreshed == 1 && counts.mirrorReuses.Sum() - reused == 1 : counts.mirrorRefreshes.Sum() == refreshed && counts.mirrorReuses.Sum() == reused;
     Require(second, std::string("address draw space reuse: ") + (expected ? "the second retake of a cached space in one collect epoch did not reuse the epoch's refresh" : "a cached space reused its epoch's refresh while epoch proofs are off") + " (" + seen() + ")");
+    if (expected) {
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.RegisterMainImage();
+        }
+        AgcDriver::Graphics::SetHostImportBudget(std::max<std::uint64_t>(AgcDriver::Graphics::HostImportLiveBytes(), 1));
+        {
+            GuestAllocations::Mutation mutation;
+            mutation.Protect(SegmentBlock(), BlockBytes, true, true, true, [] {});
+        }
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        scene.Draw();
+        scene.device.WaitIdle();
+        scene.Draw();
+        scene.device.WaitIdle();
+        const auto beforeStore = counts.mirrorRefreshes.Sum();
+        const auto imageAt = AddressOf(SegmentBlock());
+        StoreImage(scene, imageAt);
+        Require(AgcDriver::Graphics::StorageTexture::FindPending(imageAt, ImageSide * ImageSide * 4u) != nullptr, "address draw space reuse: the image store into the constants block left no pending results");
+        scene.Draw();
+        scene.device.WaitIdle();
+        const bool scoped = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoHoldSiteBreaks);
+        const bool refreshedAfterStore = counts.mirrorRefreshes.Sum() - beforeStore == 1;
+        Require(refreshedAfterStore == scoped, std::string("address draw space reuse: a retake after an image store left results pending over a writable mirror in the same collect epoch ") + (scoped ? "reused the refresh taken before the store" : "refreshed while APS5_NO_HOLD_SITE_BREAKS keeps the old key") + " (" + seen() + ")");
+        AgcDriver::Graphics::StorageTexture::FlushPending(imageAt, ImageSide * ImageSide * 4u, nullptr, "test release");
+        scene.device.WaitIdle();
+        AgcDriver::Graphics::SetHostImportBudget(0);
+    }
     scene.Store(scene.constants, 0, 30);
     AgcDriver::GuestMemory::BumpCollectEpoch();
     Require(scene.DrawnColor() == 30, "address draw space reuse: a CPU write before a new collect epoch was not seen by the next draw");

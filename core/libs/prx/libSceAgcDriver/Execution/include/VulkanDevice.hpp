@@ -29,6 +29,8 @@ class StorageTexture;
 struct HtileMaskClear;
 }
 
+bool RefreshPresented(Graphics::StorageTexture& resident, const DisplayBuffer& buffer, std::uint32_t layer);
+
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
 struct ComputePipelineObjects;
