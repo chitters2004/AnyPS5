@@ -125,6 +125,10 @@ private:
     const char* value;
 };
 
+struct DeviceFunctions;
+void WrapDeviceFunctions(DeviceFunctions& functions);
+void UnwrapDeviceFunctions(DeviceFunctions& functions);
+
 template<typename TFunction>
 class TrackedFunction {
 public:
@@ -135,6 +139,8 @@ public:
 
 private:
     friend struct Context;
+    friend void WrapDeviceFunctions(DeviceFunctions& functions);
+    friend void UnwrapDeviceFunctions(DeviceFunctions& functions);
     TFunction function = nullptr;
 };
 

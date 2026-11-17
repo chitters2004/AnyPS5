@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VkEntryProfile.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "VulkanTestDevice.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -489,6 +490,25 @@ void FullVertexPushDataLeavesRoomForTheFragment(bool libraries) {
 
 }
 
+void VkEntrySplitsRecord() {
+    const auto report = AgcDriver::Graphics::TakeDrawVkEntryShape();
+    if (!AgcDriver::VkEntryProfiled()) {
+        Require(report.draws == 0, std::to_string(report.draws) + " draws were split into driver time without APS5_PROFILE_VK_ENTRY");
+        std::cout << "vk entry off: no draw split\n";
+        return;
+    }
+    constexpr std::array<const char*, AgcDriver::VkEntryShape::Phases> names{"validate", "vertex", "setup", "readTarget", "prepare", "lookup", "resources", "pipeline", "record", "keep", "sync", "writeBack", "describe"};
+    constexpr std::size_t record = 8;
+    const auto line = AgcDriver::VkEntryShape::Line(report, names, AgcDriver::VkEntryUnwrappedSlots());
+    std::cout << line << '\n';
+    Require(report.draws != 0, "no draw was split into driver time under APS5_PROFILE_VK_ENTRY: " + line);
+    const auto& tally = report.phases[record];
+    Require(tally.calls[AgcDriver::VkEntryCommands] != 0 && tally.nanoseconds[AgcDriver::VkEntryCommands] != 0, "the record phase made no timed vkCmd call: " + line);
+    double driverUs = 0;
+    for (const auto nanoseconds : tally.nanoseconds) driverUs += static_cast<double>(nanoseconds) / 1000.0;
+    Require(driverUs <= report.phaseUs[record], "the record phase's driver time is longer than the phase: " + line);
+}
+
 void BuildsKeptTheirReason(std::uint64_t pipelinesBefore) {
     const char* entries = std::getenv("APS5_RESOURCE_CACHE_ENTRIES");
     const bool evicting = entries != nullptr && std::string_view(entries) == "1";
@@ -548,6 +568,7 @@ int main(int argc, char** argv) {
         const bool buildReasons = argc == 2 && std::string_view(argv[1]) == "--build-reasons";
         Require(!buildReasons || AgcDriver::CommitShapeProfiled(), "--build-reasons needs APS5_PROFILE_COMMIT_SHAPE");
         static_cast<void>(AgcDriver::Graphics::TakeDrawCommitShape());
+        static_cast<void>(AgcDriver::Graphics::TakeDrawVkEntryShape());
         const auto pipelinesBefore = AgcDriver::PerformanceCounters::Pipelines();
         if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
@@ -561,6 +582,7 @@ int main(int argc, char** argv) {
             FullVertexPushDataLeavesRoomForTheFragment(libraries);
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
+            if (buildReasons) VkEntrySplitsRecord();
             if (buildReasons) BuildsKeptTheirReason(pipelinesBefore);
         }
         AgcDriverShutdown_nid_postfix();

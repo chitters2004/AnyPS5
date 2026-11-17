@@ -5,6 +5,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VkEntryProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -24,6 +25,7 @@ struct VkDrawCounts {
 };
 VkDrawCounts TakeVkDrawCounts();
 CommitShape::Report TakeDrawCommitShape();
+VkEntryShape::Report TakeDrawVkEntryShape();
 
 struct ProofLeadStamp {
     std::array<std::uint64_t, 3> serials{};

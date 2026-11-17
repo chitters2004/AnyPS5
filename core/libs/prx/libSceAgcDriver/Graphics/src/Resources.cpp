@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/VkEntryProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -321,6 +322,7 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
     functions.mapMemory = context.Function<PFN_vkMapMemory>("vkMapMemory");
     functions.unmapMemory = context.Function<PFN_vkUnmapMemory>("vkUnmapMemory");
+    WrapDeviceFunctions(functions);
 }
 
 RenderTarget::RenderTarget(const Context& context, const ColorTarget& target, bool blending) : context(context) {

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VkEntryProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1443,12 +1444,31 @@ struct DrawTimer {
     CommitStamps stamps{};
     std::uint64_t dependenciesBefore = 0;
     std::uint64_t pipelinesBefore = 0;
-    explicit DrawTimer(bool profile) : profile(profile), timed(profile || CommitShapeProfiled()), phaseStart(std::chrono::steady_clock::now()) {}
+    bool vkEntry;
+    VkEntryTally vkMark{};
+    std::array<VkEntryTally, PhaseCount> vk{};
+    explicit DrawTimer(bool profile) : profile(profile), timed(profile || CommitShapeProfiled()), phaseStart(std::chrono::steady_clock::now()), vkEntry(timed && CommitShapeProfiled() && VkEntryProfiled()) {
+        if (vkEntry) vkMark = markVkEntry();
+    }
+    static VkEntryTally markVkEntry() {
+        auto mark = ThreadVkEntryTally();
+        mark.lookups = DeviceProcLookups();
+        return mark;
+    }
     void phase(DrawPhase which) {
         if (!timed) return;
         const auto now = std::chrono::steady_clock::now();
         us[which] += std::chrono::duration<double, std::micro>(now - phaseStart).count();
         phaseStart = now;
+        if (!vkEntry) return;
+        const auto mark = markVkEntry();
+        auto& into = vk[which];
+        for (std::size_t kind = 0; kind < VkEntryKindCount; ++kind) {
+            into.nanoseconds[kind] += mark.nanoseconds[kind] - vkMark.nanoseconds[kind];
+            into.calls[kind] += mark.calls[kind] - vkMark.calls[kind];
+        }
+        into.lookups += mark.lookups - vkMark.lookups;
+        vkMark = mark;
     }
     void charge(DrawPhase which, std::chrono::steady_clock::time_point start) {
         if (!timed) return;
@@ -1465,9 +1485,15 @@ CommitShape& drawCommitShape() {
     return *shape;
 }
 
+VkEntryShape& drawVkEntryShape() {
+    static auto* const shape = new VkEntryShape();
+    return *shape;
+}
+
 void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     auto* const shape = &drawCommitShape();
     shape->Note(outcome.kind, std::span<const double, PhaseCount>(timer.us), Recorder::ThreadDependencyHits() - timer.dependenciesBefore, timer.stamps, PerformanceCounters::ThreadPipelines() - timer.pipelinesBefore, outcome.buildReason, outcome.proofLead);
+    if (timer.vkEntry) drawVkEntryShape().Note(std::span<const double, PhaseCount>(timer.us), std::span<const VkEntryTally, PhaseCount>(timer.vk));
     static std::atomic<std::chrono::steady_clock::rep> nextReport{0};
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
     const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
@@ -1481,6 +1507,7 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::Line(report, DrawKindNames, DrawPhaseNames).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofLeadLine(report).c_str());
+    if (VkEntryProfiled()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", VkEntryShape::Line(drawVkEntryShape().Take(), DrawPhaseNames, VkEntryUnwrappedSlots()).c_str());
 }
 
 std::atomic<std::uint64_t> profiledCommits{0};
@@ -4853,6 +4880,10 @@ FragmentOutputLookups ThreadFragmentOutputLookups() {
 
 CommitShape::Report TakeDrawCommitShape() {
     return drawCommitShape().Take();
+}
+
+VkEntryShape::Report TakeDrawVkEntryShape() {
+    return drawVkEntryShape().Take();
 }
 
 std::optional<ProofLeadStamp> StampProofLead(std::uint64_t epochToken, const std::atomic<std::uint64_t>& epochTokens) {
