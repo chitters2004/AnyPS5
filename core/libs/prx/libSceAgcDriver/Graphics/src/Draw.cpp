@@ -2646,7 +2646,12 @@ struct StagedWrite {
     VkRect2D area{};
 };
 
-struct RecordedDraw {
+struct BorrowedDraw {
+    BorrowedDraw(const std::shared_ptr<ShaderResources>& resources, const std::shared_ptr<Pipeline>& pipeline, const std::shared_ptr<Framebuffer>& framebuffer) : resources(resources), pipeline(pipeline), framebuffer(framebuffer) {}
+    BorrowedDraw(const BorrowedDraw&) = delete;
+    BorrowedDraw(BorrowedDraw&&) = delete;
+    BorrowedDraw& operator=(const BorrowedDraw&) = delete;
+    BorrowedDraw& operator=(BorrowedDraw&&) = delete;
     const std::shared_ptr<ShaderResources>& resources;
     const std::shared_ptr<Pipeline>& pipeline;
     const std::shared_ptr<Framebuffer>& framebuffer;
@@ -2849,7 +2854,7 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
-void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
+void recordDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, BorrowedDraw& record, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs, const DrawTraceContext* trace = nullptr) {
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -2885,6 +2890,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
     const bool addressBased = resources.HoldsLease();
+    thread_local bool recordingDraw = false;
+    Require(!recordingDraw, "a draw was recorded on a thread already recording one, over its thread-owned pass access");
+    recordingDraw = true;
+    const struct RecordingDraw {
+        bool& flag;
+        ~RecordingDraw() { flag = false; }
+    } recordingDrawScope{recordingDraw};
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
@@ -4369,7 +4381,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     InlineList<std::pair<std::uint32_t, std::uint32_t>, 8> slices;
     for (const auto& binding : targets) slices.EmplaceBack(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u);
     if (lean) {
-        RecordedDraw record{resources, pipeline, framebuffer};
+        BorrowedDraw record{resources, pipeline, framebuffer};
         record.recorder = recorder;
         record.moved = resolved.moved;
         record.targetViews = targetViews;
@@ -4960,7 +4972,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     }
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    RecordedDraw record{resources, pipeline, framebuffer};
+    BorrowedDraw record{resources, pipeline, framebuffer};
     record.recorder = recorder;
     record.masked = recipe.masked.has_value() ? &*recipe.masked : nullptr;
     record.completion = outcome.completion;
