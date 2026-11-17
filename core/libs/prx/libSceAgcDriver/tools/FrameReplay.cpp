@@ -424,10 +424,15 @@ std::uint64_t runBytes(const Runs& runs) {
 struct Differing {
     Runs runs;
     std::uint64_t ownedBytes = 0;
+    std::uint64_t pages = 0;
+    std::uint64_t comparisons = 0;
+    std::uint64_t scanNs = 0;
+    std::uint64_t restoreNs = 0;
 };
 
 Differing restoreDiffering(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> snapshot, const Runs& candidates, const Runs& owned, std::vector<std::byte>& desired, Staged& staged) {
     Differing differing;
+    const auto restoreStart = std::chrono::steady_clock::now();
     auto& runs = differing.runs;
     for (const auto& [first, last] : candidates) {
         for (auto window = first; window < last; window += ResetWindow) {
@@ -441,12 +446,18 @@ Differing restoreDiffering(const FrameCaptureReader& reader, std::span<const Fra
                     std::memcpy(actual, wanted, static_cast<std::size_t>(end - address));
                     if (!runs.empty() && runs.back().second == address) runs.back().second = end;
                     else runs.emplace_back(address, end);
-                    if (std::any_of(owned.begin(), owned.end(), [&](const auto& held) { return held.first < end && address < held.first + held.second; })) differing.ownedBytes += end - address;
+                    const auto scanStart = std::chrono::steady_clock::now();
+                    std::uint64_t compared = 0;
+                    if (std::any_of(owned.begin(), owned.end(), [&](const auto& held) { ++compared; return held.first < end && address < held.first + held.second; })) differing.ownedBytes += end - address;
+                    differing.scanNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - scanStart).count());
+                    differing.comparisons += compared;
+                    ++differing.pages;
                 }
                 address = end;
             }
         }
     }
+    differing.restoreNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - restoreStart).count());
     return differing;
 }
 
@@ -651,6 +662,18 @@ ResetResult resetMemory(const FrameCaptureReader& reader, const Skipped& skipped
         const auto pieces = splitRuns(candidates);
         std::vector<Differing> runs(pieces.size());
         result.workers = parallelPieces(pieces.size(), [&](std::size_t index, std::vector<std::byte>& desired, Staged& staged) { runs[index] = restoreDiffering(reader, plan.snapshot, pieces[index].runs, owned[pieces[index].range], desired, staged); });
+        {
+            std::uint64_t pages = 0, comparisons = 0, scanNs = 0, restoreNs = 0;
+            std::size_t largest = 0;
+            for (const auto& list : owned) largest = std::max(largest, list.size());
+            for (const auto& part : runs) {
+                pages += part.pages;
+                comparisons += part.comparisons;
+                scanNs += part.scanNs;
+                restoreNs += part.restoreNs;
+            }
+            std::fprintf(stderr, "[frame-replay] owner scan: %llu differing pages, %zu owner runs in the largest range, %llu comparisons, %.3f ms scanning of %.3f ms restoring (summed over workers)\n", static_cast<unsigned long long>(pages), largest, static_cast<unsigned long long>(comparisons), static_cast<double>(scanNs) / 1e6, static_cast<double>(restoreNs) / 1e6);
+        }
         Runs replaced;
         for (const auto& part : runs) {
             for (const auto& run : part.runs) {
