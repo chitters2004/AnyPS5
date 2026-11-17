@@ -391,7 +391,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 }
 
 bool narrowLibraryKeysNow() {
-    return !RuntimeSwitches::Set(RuntimeSwitch::WideLibraryKeys);
+    return false;
 }
 
 bool shadesPerSample(const ShaderRecompiler::RecompileResult& program) {
