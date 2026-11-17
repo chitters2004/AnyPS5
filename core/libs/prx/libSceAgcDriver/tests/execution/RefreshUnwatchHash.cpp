@@ -240,12 +240,17 @@ bool RunKeptByCpu() {
     Require(StorageTexture::FindPending(address, SurfaceBytes) != nullptr, "kept by the CPU: the stored results are not pending");
     for (std::size_t offset = 0; offset < SurfaceBytes; offset += Page) static_cast<volatile std::uint32_t*>(texels)[offset / 4u] = Untouched + 1u;
     const auto pendingBefore = StorageTexture::PendingSerial();
-    std::size_t images = 0, evicted = 0;
-    bool kept = false;
-    std::thread access([&] { kept = StorageTexture::AccessKeptByCpu(address, std::size_t{1} << 20u, &images, &evicted); });
-    access.join();
-    Require(kept && images == 1 && evicted == 1, "kept by the CPU: an access over a surface the CPU rewrote did not evict its stale results (kept " + std::to_string(kept) + ", images " + std::to_string(images) + ", evicted " + std::to_string(evicted) + ")");
-    Require(StorageTexture::PendingSerial() != pendingBefore, "kept by the CPU: evicting stale pending results moved no pending serial, so a proof that saw them pending can be reused");
+    std::size_t evictedTotal = 0;
+    for (std::size_t half = 0; half < 2; ++half) {
+        std::size_t images = 0, evicted = 0;
+        bool kept = false;
+        std::thread access([&] { kept = StorageTexture::AccessKeptByCpu(address + half * StorageTexture::ClassifyLimit, StorageTexture::ClassifyLimit, &images, &evicted); });
+        access.join();
+        Require(kept && images == 1, "kept by the CPU: an access over a surface the CPU rewrote was not kept (half " + std::to_string(half) + ", kept " + std::to_string(kept) + ", images " + std::to_string(images) + ")");
+        Require(StorageTexture::PendingSerial() != pendingBefore, "kept by the CPU: evicting stale pending results moved no pending serial, so a proof that saw them pending can be reused");
+        evictedTotal += evicted;
+    }
+    Require(evictedTotal == 1 && StorageTexture::FindPending(address, SurfaceBytes) == nullptr, "kept by the CPU: accesses over a surface the CPU rewrote did not evict its stale results (evicted " + std::to_string(evictedTotal) + ")");
     return true;
 }
 
