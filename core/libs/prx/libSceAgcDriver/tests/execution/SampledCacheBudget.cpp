@@ -1166,6 +1166,36 @@ void rangeVersionTests(Context context) {
     RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
     check("an image entering pending over the set while range versions were off", false, [] {});
     check("a new collect epoch with range versions on again", true, [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    static std::uint64_t hookAddress = 0;
+    static ShaderResources::RangeVersionPoint hookPoint = ShaderResources::RangeVersionPoint::AfterFullProof;
+    static bool hookFired = false;
+    hookAddress = address;
+    const auto arm = [](ShaderResources::RangeVersionPoint point) {
+        hookPoint = point;
+        hookFired = false;
+        ShaderResources::SetRangeVersionHookForTest([](ShaderResources::RangeVersionPoint at) {
+            if (at != hookPoint || hookFired) return;
+            hookFired = true;
+            if (at == ShaderResources::RangeVersionPoint::AfterRangeValidation) {
+                AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, hookAddress, 4096u);
+                return;
+            }
+            std::memset(reinterpret_cast<void*>(hookAddress + 12288u), 0x3c, 64u);
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(hookAddress, SurfaceBytes));
+        });
+    };
+    struct Unhook {
+        ~Unhook() { ShaderResources::SetRangeVersionHookForTest(nullptr); }
+    } unhook;
+    arm(ShaderResources::RangeVersionPoint::AfterRangeValidation);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool beforeBreak = exitTaken();
+    ShaderResources::SetRangeVersionHookForTest(nullptr);
+    Require(hookFired && beforeBreak, "the exit validated before the injected break was not taken");
+    const bool afterBreak = exitTaken();
+    std::fprintf(stderr, "range versions: a break over the set between the range check and the stamp save: the next exit %s\n", afterBreak ? "was taken" : "was refused");
+    Require(!afterBreak, "a break between the range check and the stamp save was hidden by the saved stamp");
+    settle("the template did not take the exit again after the injected break");
     const auto last = [&](const char* label, auto&& move) {
         move();
         const bool taken = exitTaken();
@@ -1180,6 +1210,13 @@ void rangeVersionTests(Context context) {
     last("a driver store into the set", [&] {
         const std::array<std::byte, 64> stored{};
         static_cast<void>(AgcDriver::GuestMemory::StoreOwnBytes(address + 256u, stored));
+    });
+    last("a write landing after the full proof's walk, then a new collect epoch", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        arm(ShaderResources::RangeVersionPoint::AfterFullProof);
+        Require(!exitTaken() && hookFired, "the injected write did not run after a full proof");
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
     });
     last("a CPU write into the set and a new collect epoch", [&] {
         std::memset(reinterpret_cast<void*>(address + 8192u), 0x6b, 4096u);

@@ -429,6 +429,8 @@ public:
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
+    enum class RangeVersionPoint : std::uint8_t { AfterFullProof, AfterRangeValidation };
+    static void SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point));
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }

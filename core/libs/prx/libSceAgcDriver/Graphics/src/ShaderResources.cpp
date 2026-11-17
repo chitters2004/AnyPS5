@@ -4151,6 +4151,18 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
     return nullptr;
 }
 
+namespace {
+std::atomic<void (*)(ShaderResources::RangeVersionPoint)> rangeVersionHook{nullptr};
+
+void rangeVersionPoint(ShaderResources::RangeVersionPoint point) {
+    if (auto* hook = rangeVersionHook.load(std::memory_order_acquire); hook != nullptr) hook(point);
+}
+}
+
+void ShaderResources::SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point)) {
+    rangeVersionHook.store(hook, std::memory_order_release);
+}
+
 bool ShaderResources::EpochProofs() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoEpochProofs) && DriverDetail::DrawPipeline::Depth() != 0;
 }
@@ -4407,7 +4419,6 @@ const char* rangeDeclineName(std::size_t decline) {
 }
 
 void reportRangeVersions() {
-    if (!RuntimeSwitches::Set(RuntimeSwitch::RangeVersions)) return;
     auto& counts = rangeVersionCounts();
     std::string declines;
     for (std::size_t decline = 1; decline < counts.declines.size(); ++decline) {
@@ -4420,7 +4431,7 @@ void reportRangeVersions() {
     for (std::size_t kind = 0; kind < verified.size(); ++kind) {
         for (std::size_t set = 0; set < verified[kind].size(); ++set) verified[kind][set] = counts.verified[kind][set].Take();
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) range-version exits: same epoch %llu, across epochs %llu%s; declined: %s; verified same epoch storage/tables/sampled %llu/%llu/%llu, across epochs %llu/%llu/%llu, disagreed %llu, broken meanwhile by other threads %llu\n", static_cast<unsigned long long>(counts.exits[0].Take()), static_cast<unsigned long long>(counts.exits[1].Take()), rangeVersionsDisabled.load(std::memory_order_relaxed) ? " (off after a disagreement)" : "", declines.empty() ? "none" : declines.c_str(), static_cast<unsigned long long>(verified[0][0]), static_cast<unsigned long long>(verified[0][1]), static_cast<unsigned long long>(verified[0][2]), static_cast<unsigned long long>(verified[1][0]), static_cast<unsigned long long>(verified[1][1]), static_cast<unsigned long long>(verified[1][2]), static_cast<unsigned long long>(counts.disagreements.Take()), static_cast<unsigned long long>(counts.concurrent.Take()));
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) range-version exits (APS5_RANGE_VERSIONS %s at the report): same epoch %llu, across epochs %llu%s; declined: %s; verified same epoch storage/tables/sampled %llu/%llu/%llu, across epochs %llu/%llu/%llu, disagreed %llu, broken meanwhile by other threads %llu\n", RuntimeSwitches::Set(RuntimeSwitch::RangeVersions) ? "on" : "off", static_cast<unsigned long long>(counts.exits[0].Take()), static_cast<unsigned long long>(counts.exits[1].Take()), rangeVersionsDisabled.load(std::memory_order_relaxed) ? " (off after a disagreement)" : "", declines.empty() ? "none" : declines.c_str(), static_cast<unsigned long long>(verified[0][0]), static_cast<unsigned long long>(verified[0][1]), static_cast<unsigned long long>(verified[0][2]), static_cast<unsigned long long>(verified[1][0]), static_cast<unsigned long long>(verified[1][1]), static_cast<unsigned long long>(verified[1][2]), static_cast<unsigned long long>(counts.disagreements.Take()), static_cast<unsigned long long>(counts.concurrent.Take()));
 }
 
 struct ScopeCheck {
@@ -5344,6 +5355,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 else rangeVersionCounts().declines[decline].Add();
             }
             if (decline == 0) {
+                rangeVersionPoint(RangeVersionPoint::AfterRangeValidation);
                 if (verifyRangeExit()) {
                     const auto startSerial = GuestMemory::ProofSerial();
                     GuestMemory::ProofBreakTrace trace;
@@ -5455,6 +5467,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         std::uint64_t flushBreaks = 0;
         const auto generation = GuestMemory::WriteGeneration();
         const bool ok = revalidateFull(shaders, report, counted ? &flushBreaks : nullptr, counted ? &*trace : nullptr);
+        rangeVersionPoint(RangeVersionPoint::AfterFullProof);
         if (scope.counted) {
             if (scope.epochMoved && provedRanges && provedGeneration != 0 && !proofRanges.empty()) {
                 std::vector<GuestMemory::UnchangedQuery> queries;
