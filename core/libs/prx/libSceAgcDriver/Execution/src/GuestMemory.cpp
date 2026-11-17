@@ -3007,13 +3007,13 @@ std::array<std::array<ProfileCounter, static_cast<std::size_t>(PacketWrites::Cou
     return counters;
 }
 
-void logBreak(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool ranged, bool bounded, std::uint8_t detail) {
+std::uint64_t logBreak(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool ranged, bool bounded, std::uint8_t detail) {
     const auto serial = proofSerial.fetch_add(1, std::memory_order_acq_rel) + 1;
     auto& slot = proofBreakLog()[static_cast<std::size_t>(serial % LoggedBreakSlots)];
     const auto claim = serial * 2u - 1u;
     auto held = slot.sequence.load(std::memory_order_relaxed);
     for (;;) {
-        if (held >= claim) return;
+        if (held >= claim) return serial;
         if ((held & 1u) != 0) {
             SpinPause();
             held = slot.sequence.load(std::memory_order_relaxed);
@@ -3043,6 +3043,65 @@ void logBreak(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std:
     const auto flags = (ranged ? RangedShape : 0u) | (bounded ? BoundedShape : 0u) | (ranges.empty() ? NoWritesShape : 0u);
     slot.shape.store(breakShape(site, flags, kept, detail), std::memory_order_relaxed);
     slot.sequence.store(serial * 2u, std::memory_order_release);
+    return serial;
+}
+
+constexpr std::uint64_t TickLeafBlocks = 4096;
+constexpr std::uint64_t TickLeafCount = std::uint64_t{1} << 19;
+constexpr std::uint64_t TickSpanBytes = TickLeafCount * TickLeafBlocks * WriteBlockBytes;
+constexpr std::uint64_t MaxStampedBlocks = 4096;
+constexpr std::uint64_t RangeVersionSerialLimit = std::uint64_t{1} << 62;
+
+struct TickLeaf {
+    std::array<std::atomic<std::uint64_t>, TickLeafBlocks> effect{};
+    std::array<std::atomic<std::uint64_t>, TickLeafBlocks> pending{};
+};
+
+std::array<std::atomic<TickLeaf*>, TickLeafCount>& tickLeaves() {
+    static std::array<std::atomic<TickLeaf*>, TickLeafCount> leaves{};
+    return leaves;
+}
+
+std::atomic<std::uint64_t> rangeStampsInFlight{0};
+std::atomic<std::uint64_t> unrangedProofSerial{1};
+std::atomic<std::uint64_t> unrangedPendingSerial{1};
+
+TickLeaf& tickLeaf(std::uint64_t index) {
+    auto& slot = tickLeaves()[static_cast<std::size_t>(index)];
+    auto* leaf = slot.load(std::memory_order_acquire);
+    if (leaf != nullptr) return *leaf;
+    auto* fresh = new TickLeaf();
+    if (slot.compare_exchange_strong(leaf, fresh, std::memory_order_acq_rel, std::memory_order_acquire)) return *fresh;
+    delete fresh;
+    return *leaf;
+}
+
+std::uint64_t tickOf(bool pending, std::uint64_t block) {
+    const auto* leaf = tickLeaves()[static_cast<std::size_t>(block / TickLeafBlocks)].load(std::memory_order_acquire);
+    if (leaf == nullptr) return 0;
+    return (pending ? leaf->pending : leaf->effect)[block % TickLeafBlocks].load(std::memory_order_acquire);
+}
+
+bool stampTicks(bool pending, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t value) {
+    if (ranges.empty()) return false;
+    std::uint64_t blocks = 0;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || end > TickSpanBytes) return false;
+        blocks += (end - 1) / WriteBlockBytes - begin / WriteBlockBytes + 1;
+        if (blocks > MaxStampedBlocks) return false;
+    }
+    for (const auto& [begin, end] : ranges) {
+        for (auto block = begin / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
+            auto& tick = (pending ? tickLeaf(block / TickLeafBlocks).pending : tickLeaf(block / TickLeafBlocks).effect)[block % TickLeafBlocks];
+            auto held = tick.load(std::memory_order_relaxed);
+            while (held < value && !tick.compare_exchange_weak(held, value, std::memory_order_release, std::memory_order_relaxed)) {}
+        }
+    }
+    return true;
+}
+
+void stampBreak(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool ranged) {
+    if (!ranged || !stampTicks(false, ranges, serial)) unrangedProofSerial.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void noteBreak(ProofBreakSite site) {
@@ -3076,7 +3135,8 @@ void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes
     const bool bounded = bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address;
     const bool ranged = ProofBreakScoped(site) && bounded;
     const std::pair<std::uint64_t, std::uint64_t> range{address, bounded ? address + bytes : address};
-    logBreak(site, std::span(&range, 1), ranged, bounded, 0);
+    const RangeStampScope stamping;
+    stampBreak(logBreak(site, std::span(&range, 1), ranged, bounded, 0), std::span(&range, 1), ranged);
     noteBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, address, bytes});
 }
@@ -3085,7 +3145,10 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
     const bool bounded = !ranges.empty() && std::all_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.second > range.first; });
     const bool ranged = ProofBreakScoped(site) && bounded;
-    logBreak(site, ranges, ranged, bounded, detail);
+    {
+        const RangeStampScope stamping;
+        stampBreak(logBreak(site, ranges, ranged, bounded, detail), ranges, ranged);
+    }
     if ((site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered) && ProofBreakCensusEnabled()) {
         const auto writes = bounded ? PacketWrites::Declared : ranges.empty() ? PacketWrites::None : PacketWrites::Empty;
         packetBreakCounters()[detail & (ProofBreakDetails - 1u)][static_cast<std::size_t>(writes)].Add();
@@ -3097,10 +3160,87 @@ void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_
 void BreakProofsWithoutWrites(ProofBreakSite site, std::uint8_t detail) {
     if (proofBreaksHeldForTest.load(std::memory_order_relaxed)) return;
     const bool ranged = ProofBreakScoped(site);
-    logBreak(site, {}, ranged, ranged, detail);
+    if (ranged) logBreak(site, {}, ranged, ranged, detail);
+    else {
+        const RangeStampScope stamping;
+        logBreak(site, {}, ranged, ranged, detail);
+        unrangedProofSerial.fetch_add(1, std::memory_order_acq_rel);
+    }
     if ((site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered) && ProofBreakCensusEnabled()) packetBreakCounters()[detail & (ProofBreakDetails - 1u)][static_cast<std::size_t>(PacketWrites::Writeless)].Add();
     noteBreak(site);
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, 0, 0});
+}
+
+RangeStampScope::RangeStampScope() {
+    rangeStampsInFlight.fetch_add(1, std::memory_order_acq_rel);
+}
+
+RangeStampScope::~RangeStampScope() {
+    rangeStampsInFlight.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+void StampPendingEntering(std::uint64_t begin, std::uint64_t end, std::uint64_t serial) {
+    const std::pair<std::uint64_t, std::uint64_t> range{begin, end};
+    if (!stampTicks(true, std::span(&range, 1), serial)) unrangedPendingSerial.fetch_add(1, std::memory_order_acq_rel);
+}
+
+std::uint64_t UnrangedProofSerial() {
+    return unrangedProofSerial.load(std::memory_order_acquire);
+}
+
+std::uint64_t UnrangedPendingSerial() {
+    return unrangedPendingSerial.load(std::memory_order_acquire);
+}
+
+const char* RangeVersionDeclineName(RangeVersionDecline decline) {
+    switch (decline) {
+        case RangeVersionDecline::None: return "none";
+        case RangeVersionDecline::Baseline: return "no baseline";
+        case RangeVersionDecline::Wrapped: return "serial past 2^62";
+        case RangeVersionDecline::Uncovered: return "range not tracked";
+        case RangeVersionDecline::Collect: return "collect failed";
+        case RangeVersionDecline::Changed: return "range written";
+        case RangeVersionDecline::InFlight: return "stamp in flight";
+        case RangeVersionDecline::UnrangedProof: return "unranged proof break";
+        case RangeVersionDecline::UnrangedPending: return "unranged pending entry";
+        case RangeVersionDecline::Effect: return "ranged proof break";
+        case RangeVersionDecline::Pending: return "ranged pending entry";
+        case RangeVersionDecline::Count: break;
+    }
+    return "?";
+}
+
+RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline) {
+    if (ranges.empty() || baseline.generation == 0 || baseline.proof == 0) return RangeVersionDecline::Baseline;
+    if (baseline.proof >= RangeVersionSerialLimit || baseline.pending >= RangeVersionSerialLimit || baseline.unrangedProof >= RangeVersionSerialLimit || baseline.unrangedPending >= RangeVersionSerialLimit) return RangeVersionDecline::Wrapped;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || end > TickSpanBytes) return RangeVersionDecline::Uncovered;
+        if (CollectWrites(begin, static_cast<std::size_t>(end - begin)) == 0) return RangeVersionDecline::Collect;
+    }
+    {
+        auto& tracker = Tracker();
+        const auto lock = lockTracker(tracker);
+        tracker.initialize();
+        if (!tracker.watched) return RangeVersionDecline::Uncovered;
+        for (const auto& [begin, end] : ranges) {
+            const auto bytes = static_cast<std::size_t>(end - begin);
+            if (!tracker.covers(begin, bytes)) return RangeVersionDecline::Uncovered;
+            if (!tracker.rangeUnchanged(begin, bytes, baseline.generation)) return RangeVersionDecline::Changed;
+        }
+    }
+    for (std::uint32_t spins = 0; rangeStampsInFlight.load(std::memory_order_acquire) != 0; ++spins) {
+        if (spins >= 256) return RangeVersionDecline::InFlight;
+        SpinPause();
+    }
+    if (unrangedProofSerial.load(std::memory_order_acquire) != baseline.unrangedProof) return RangeVersionDecline::UnrangedProof;
+    if (unrangedPendingSerial.load(std::memory_order_acquire) != baseline.unrangedPending) return RangeVersionDecline::UnrangedPending;
+    for (const auto& [begin, end] : ranges) {
+        for (auto block = begin / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
+            if (tickOf(false, block) > baseline.proof) return RangeVersionDecline::Effect;
+            if (tickOf(true, block) > baseline.pending) return RangeVersionDecline::Pending;
+        }
+    }
+    return RangeVersionDecline::None;
 }
 
 namespace {

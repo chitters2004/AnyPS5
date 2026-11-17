@@ -67,6 +67,34 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_proof_log_concurrent PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_range_validate COMMAND agc_driver_sampled_cache_budget_tests range-validate)
+    set_tests_properties(agc_range_validate PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "range validate: the same write with the generation taken after it: none\n.*range validate tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    add_test(NAME agc_range_validate_concurrent COMMAND agc_driver_sampled_cache_budget_tests range-validate-concurrent)
+    set_tests_properties(agc_range_validate_concurrent PROPERTIES TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "range validate under 4 stamping threads: [1-9][0-9]* checks, 0 accepted over a window with breaks into the set[;] a quiet window with one outside break: none\n.*range validate concurrent tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    add_test(NAME agc_driver_resource_cache_range_versions COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions)
+    set_tests_properties(agc_driver_resource_cache_range_versions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "range-version exits: same epoch 3, across epochs 4[;] declined: range written 2, unranged proof break 3, unranged pending entry 1, ranged proof break 2, ranged pending entry 2[;] verified same epoch storage/tables/sampled 0/0/0, across epochs 0/0/0, disagreed 0, broken meanwhile by other threads 0\n.*resource cache range version tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    add_test(NAME agc_driver_resource_cache_range_versions_verify COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions)
+    set_tests_properties(agc_driver_resource_cache_range_versions_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1;APS5_VERIFY_RANGE_VERSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "range-version exits: same epoch 3, across epochs 4[;] declined: [^\n]*[;] verified same epoch storage/tables/sampled 0/0/3, across epochs 0/0/4, disagreed 0, broken meanwhile by other threads 0\n.*resource cache range version tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:|range versions off for the run")
+    add_test(NAME agc_driver_resource_cache_range_versions_storage COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions-storage)
+    set_tests_properties(agc_driver_resource_cache_range_versions_storage PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_WRITE_WATCH_IMPORTS=watch" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "range versions over a storage image: (skipped, its host import left the memory unwatched|a new collect epoch: the exit was taken\n.*range versions over a storage image: evicted in a new collect epoch: the exit was refused)\n.*resource cache range version storage tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    add_test(NAME agc_driver_resource_cache_evicted_epoch_range_versions COMMAND agc_driver_sampled_cache_budget_tests resource-evicted-epoch)
+    set_tests_properties(agc_driver_resource_cache_evicted_epoch_range_versions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RANGE_VERSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
+        PASS_REGULAR_EXPRESSION "evicted epoch: a held set over a storage image another thread evicted: the exit was refused\n.*resource cache tests passed"
+        FAIL_REGULAR_EXPRESSION "AGC graphics:")
+    if(WIN32)
+        set_tests_properties(agc_range_validate agc_range_validate_concurrent agc_driver_resource_cache_range_versions agc_driver_resource_cache_range_versions_verify agc_driver_resource_cache_range_versions_storage agc_driver_resource_cache_evicted_epoch_range_versions PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_resource_cache_epoch_proof_log COMMAND agc_driver_sampled_cache_budget_tests resource-epoch-proof-log)
     set_tests_properties(agc_driver_resource_cache_epoch_proof_log PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
         PASS_REGULAR_EXPRESSION "proof log: a marked-written break outside the set: the exit was taken\n.*proof log: outside breaks kept the exit: marked written yes, packet yes\n.*missed exits by the inputs that moved: proof 4[;] would hit if only that input were scoped: epoch 0, pending 0, releases 0, proof 4[;] with the proof scoped by the break log and only that input too: epoch 0, pending 0, releases 0\n.*break log: 2 exits taken because every break since the proof was outside the set \\(on\\)[;] over the proof-moved misses: 4 checked, clears 0 \\(0 with nothing else moved\\), a set without recorded ranges 0, a window the log cannot cover 0[;] blocked by an overlapping break: marked written 1, non-draw packet 1[;] by an unranged break: driver store 1, non-draw packet 1\n.*proof log: writeless seals kept the exit: yes, flipped no[;] a storing seal kept it: no\n.*resource cache epoch proof log tests passed"

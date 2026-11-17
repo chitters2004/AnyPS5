@@ -6355,12 +6355,13 @@ PendingEntryLog& pendingEntryLog() {
     return log;
 }
 
-void logPendingBump(std::atomic<std::uint64_t>& serial, bool entering, std::uint64_t begin, std::uint64_t end) {
+std::uint64_t logPendingBump(std::atomic<std::uint64_t>& serial, bool entering, std::uint64_t begin, std::uint64_t end) {
     auto& log = pendingEntryLog();
     const std::lock_guard lock(log.mutex);
     const auto bumped = serial.fetch_add(1, std::memory_order_release) + 1;
     log.slots[static_cast<std::size_t>(log.written % PendingEntrySlots)] = {bumped, begin, end, entering && end > begin};
     ++log.written;
+    return bumped;
 }
 }
 
@@ -6373,10 +6374,15 @@ void StorageTexture::BumpPendingSerial(PendingBump source) {
 }
 
 void StorageTexture::BumpPendingSerial(PendingBump source, std::uint64_t begin, std::uint64_t end) {
-    if (GuestMemory::ProofBreaksCounted()) {
-        logPendingBump(pendingSerial, true, begin, end);
-        GuestMemory::NoteHoldPendingBump();
-    } else pendingSerial.fetch_add(1, std::memory_order_release);
+    {
+        const GuestMemory::RangeStampScope stamping;
+        std::uint64_t bumped = 0;
+        if (GuestMemory::ProofBreaksCounted()) {
+            bumped = logPendingBump(pendingSerial, true, begin, end);
+            GuestMemory::NoteHoldPendingBump();
+        } else bumped = pendingSerial.fetch_add(1, std::memory_order_release) + 1;
+        GuestMemory::StampPendingEntering(begin, end, bumped);
+    }
     if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
