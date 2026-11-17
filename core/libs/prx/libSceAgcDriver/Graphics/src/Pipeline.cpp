@@ -409,7 +409,27 @@ MonolithicReason monolithicReason(const Context& context, const State& state, st
     return MonolithicReason::Count;
 }
 
-bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, bool dynamicBlendConstants) {
+bool narrowLibraryKeysNow() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::WideLibraryKeys);
+}
+
+bool shadesPerSample(const ShaderRecompiler::RecompileResult& program) {
+    const auto words = program.spirv.Words();
+    if (words.size() < 5) return true;
+    for (std::size_t cursor = 5; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0 || count > words.size() - cursor) return true;
+        if (static_cast<spv::Op>(words[cursor] & 0xffffu) == spv::OpDecorate && count >= 3) {
+            const auto decoration = words[cursor + 2];
+            if (decoration == spv::DecorationSample) return true;
+            if (decoration == spv::DecorationBuiltIn && count >= 4 && (words[cursor + 3] == spv::BuiltInSampleId || words[cursor + 3] == spv::BuiltInSamplePosition)) return true;
+        }
+        cursor += count;
+    }
+    return false;
+}
+
+bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, bool dynamicBlendConstants, bool narrow) {
     using Stage = ShaderRecompiler::ShaderStage;
     if (monolithicReason(context, state, shaders) != MonolithicReason::Count) return false;
     keys = {};
@@ -460,28 +480,28 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.preRasterization, state.depth.has_value() && state.depthBias);
     appendKey(keys.preRasterization, state.stages.tessellation.has_value());
     if (state.stages.tessellation) appendKey(keys.preRasterization, state.stages.tessellation->inputControlPoints);
-    appendKey(keys.fragmentShader, state.samples);
-    appendKey(keys.fragmentOutput, state.samples);
-    appendKey(keys.fragmentShader, state.perSampleShading);
-    appendKey(keys.fragmentOutput, state.perSampleShading);
-    appendKey(keys.fragmentShader, state.mergedCoverage);
-    appendKey(keys.fragmentOutput, state.mergedCoverage);
-    appendKey(keys.fragmentShader, state.truncatedCoverage);
-    appendKey(keys.fragmentOutput, state.truncatedCoverage);
+    keys.narrow = narrow;
+    keys.fragmentPerSample = state.perSampleShading || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.stage == Stage::Fragment && shadesPerSample(*shader.program); });
+    appendKey(keys.preRasterization, narrow);
+    appendKey(keys.fragmentShader, narrow);
+    const bool fragmentSamples = !narrow || keys.fragmentPerSample;
+    appendKey(keys.fragmentShader, fragmentSamples);
+    const auto sampleKey = [&](const auto& value) {
+        if (fragmentSamples) appendKey(keys.fragmentShader, value);
+        appendKey(keys.fragmentOutput, value);
+    };
+    sampleKey(state.samples);
+    sampleKey(state.perSampleShading);
+    sampleKey(state.mergedCoverage);
+    sampleKey(state.truncatedCoverage);
     const auto sampleLocationsEnabled = ValidateSampleLocations(context, state);
-    appendKey(keys.fragmentShader, sampleLocationsEnabled);
-    appendKey(keys.fragmentOutput, sampleLocationsEnabled);
-    appendKey(keys.fragmentShader, state.customSampleLocations);
-    appendKey(keys.fragmentOutput, state.customSampleLocations);
+    sampleKey(sampleLocationsEnabled);
+    sampleKey(state.customSampleLocations);
     if (state.customSampleLocations) {
-        appendKey(keys.fragmentShader, state.sampleLocationGrid);
-        appendKey(keys.fragmentOutput, state.sampleLocationGrid);
+        sampleKey(state.sampleLocationGrid);
         const auto grid = SampleLocationGrid(state);
         for (std::uint32_t pixel = 0; pixel < grid.width * grid.height; ++pixel) {
-            for (std::uint32_t sample = 0; sample < state.samples; ++sample) {
-                appendKey(keys.fragmentShader, state.sampleLocations[pixel * 8u + sample]);
-                appendKey(keys.fragmentOutput, state.sampleLocations[pixel * 8u + sample]);
-            }
+            for (std::uint32_t sample = 0; sample < state.samples; ++sample) sampleKey(state.sampleLocations[pixel * 8u + sample]);
         }
     }
     for (const auto& blend : state.blends) appendKey(keys.fragmentOutput, keyedBlend(context, blend));
@@ -498,8 +518,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     }
     appendKey(keys.renderPass, state.depth.has_value());
     if (state.depth) appendKey(keys.renderPass, state.depth->format);
-    appendKey(keys.fragmentShader, HostSampleMask(state));
-    appendKey(keys.fragmentOutput, HostSampleMask(state));
+    sampleKey(HostSampleMask(state));
     for (auto* key : {&keys.fragmentShader, &keys.fragmentOutput}) {
         appendKey(*key, context.sampleLocationSampleCounts);
         appendKey(*key, context.sampleLocationGridSampleCounts);
@@ -709,7 +728,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         viewports.viewportCount = 1;
         viewports.scissorCount = 1;
         PipelineLibraryKeys keys;
-        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders, dynamicBlendConstants);
+        narrowLibraryKeys = narrowLibraryKeysNow();
+        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders, dynamicBlendConstants, narrowLibraryKeys);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         if (state.stencilReplayReference) dynamicStates.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
@@ -1161,7 +1181,7 @@ void append(KeyWriter& key, const TValue& value) {
 // replay insert an entry a later draw finds; a generated stage (rect-list pair, geometry) is keyed
 // by its identity like the others, so a replayed pipeline built from another device's generated
 // module is missed rather than used.
-std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool dynamicBlendConstants) {
+std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool dynamicBlendConstants, bool narrowLibraryKeys) {
     const auto capacity = 512 + sizeof(State) + sizeof(Context) + shaders.size() * 64 + input.bindings.size() * sizeof(VkVertexInputBindingDescription) + input.attributes.size() * sizeof(VkVertexInputAttributeDescription) + resources.mainKey.size_bytes() + resources.fragmentKey.size_bytes() + state.blends.size() * sizeof(VkPipelineColorBlendAttachmentState) + state.colors.size() * 64;
     KeyWriter key(storage, capacity);
     append(key, context.device);
@@ -1205,6 +1225,7 @@ std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context,
     append(key, state.blends.size());
     for (const auto& blend : state.blends) append(key, keyedBlend(context, blend));
     key.Put(state.colorRop);
+    append(key, narrowLibraryKeys);
     append(key, dynamicBlendConstants);
     if (!dynamicBlendConstants) key.PutBytes(state.blendConstants.data(), sizeof(state.blendConstants));
     append(key, state.samples);
@@ -1418,7 +1439,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     struct PipelineKeyStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
     const bool dynamicBlendConstants = dynamicBlendConstantsNow();
-    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstants);
+    const bool narrowLibraryKeys = narrowLibraryKeysNow();
+    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstants, narrowLibraryKeys);
     const std::span<const std::byte> key(storage.data(), length);
     if (key.empty()) {
         std::lock_guard lock(store.mutex);
@@ -1475,7 +1497,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     const bool replaying = PipelineJournalReplaying();
     {
         std::lock_guard lock(store.mutex);
-        if (pipeline->DynamicBlendConstants() != dynamicBlendConstants) {
+        if (pipeline->DynamicBlendConstants() != dynamicBlendConstants || pipeline->NarrowLibraryKeys() != narrowLibraryKeys) {
             ++store.uncached;
             ++store.totals.uncached;
             return pipeline;
@@ -1543,7 +1565,7 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     struct PipelineScratchStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineScratchStorage>();
-    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstantsNow());
+    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstantsNow(), narrowLibraryKeysNow());
     key.assign(storage.begin(), storage.begin() + static_cast<std::ptrdiff_t>(length));
 }
 

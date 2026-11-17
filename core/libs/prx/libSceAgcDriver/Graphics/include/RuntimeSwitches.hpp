@@ -24,6 +24,7 @@ enum class RuntimeSwitch : std::size_t {
     TableSnapshot,
     NoDrawRelocation,
     StaticBlendConstants,
+    WideLibraryKeys,
     Count,
 };
 

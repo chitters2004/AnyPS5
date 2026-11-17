@@ -62,6 +62,7 @@ public:
     const SampleOrder& HostSampleOrder() const { return sampleOrder; }
     bool ReordersSamples() const { return Graphics::ReordersSamples(sampleOrder); }
     bool SampleLocationsEnabled() const { return sampleLocationsEnabled; }
+    bool NarrowLibraryKeys() const { return narrowLibraryKeys; }
     bool DynamicBlendConstants() const { return dynamicBlendConstants; }
     VkExtent2D HostSampleLocationGrid() const { return sampleLocationGrid; }
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
@@ -96,6 +97,7 @@ private:
     bool depthBounds = false;
     bool depthBias = false;
     bool libraries = false;
+    bool narrowLibraryKeys = false;
     bool dynamicBlendConstants = false;
     std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
