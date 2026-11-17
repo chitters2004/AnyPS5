@@ -5506,6 +5506,7 @@ void StorageTexture::SaveBeforeUnwatch(std::uint64_t address, std::size_t bytes)
     if (overlapping.empty() && live.empty()) return;
     RequireGpuLockBeforeImports("the unwatch hook");
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::HeldState, address, bytes);
     for (const auto& texture : live) {
         texture->hashBeforeUnwatch(address, bytes, proven);
         texture->rebaseBeforeUnwatch(address, bytes, proven);
@@ -6268,6 +6269,7 @@ bool StorageTexture::evictStale(std::uint64_t address, std::size_t bytes, std::s
     }
     // As the empty write-back leaves the layers: no results pending, the generation unchanged (the
     // stamps make their next Refresh re-upload), `original` no longer vouching for the bytes.
+    BumpPendingSerial(PendingBump::Reconcile);
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!selected(layer)) continue;
         layerPending[layer] = false;

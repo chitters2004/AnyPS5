@@ -370,6 +370,7 @@ void DrawPipeline::enqueue(Item item) {
     rethrowFailure();
     if (closing) {
         lock.unlock();
+        if (!GuestMemory::OnProofThread()) GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::GpuMutex);
         item.commit();
         return;
     }

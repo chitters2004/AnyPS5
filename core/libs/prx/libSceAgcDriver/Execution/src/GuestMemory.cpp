@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -2906,6 +2907,7 @@ const char* ProofBreakSiteName(ProofBreakSite site) {
         case ProofBreakSite::ResourceWriteBack: return "resource write-back";
         case ProofBreakSite::PacketCovered: return "non-draw packet with covered effects";
         case ProofBreakSite::GpuLabel: return "label stored on the GPU";
+        case ProofBreakSite::HeldState: return "state changed under the GPU mutex";
         case ProofBreakSite::Other: break;
     }
     return "other";
@@ -2926,10 +2928,15 @@ ProofBreakCounters& proofBreakCounters() {
 }
 
 std::atomic<bool> proofBreaksHeldForTest{false};
+std::atomic<std::uint64_t> skippedHoldBreaks{0};
 }
 
 void NoteHoldPendingBump() {
     if (holdTracked) ++holdWrites;
+}
+
+std::uint64_t SkippedHoldBreaks() {
+    return skippedHoldBreaks.load(std::memory_order_relaxed);
 }
 
 void HoldProofBreaksForTest(bool held) {
@@ -3061,7 +3068,7 @@ std::array<std::array<std::uint64_t, static_cast<std::size_t>(PacketWrites::Coun
 }
 
 bool ProofBreakScoped(ProofBreakSite site) {
-    return site == ProofBreakSite::Written || site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered || site == ProofBreakSite::GpuLabel;
+    return site == ProofBreakSite::Written || site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered || site == ProofBreakSite::GpuLabel || site == ProofBreakSite::HeldState;
 }
 
 void BreakProofs(ProofBreakSite site, std::uint64_t address, std::uint64_t bytes) {
@@ -3217,6 +3224,10 @@ void ProofBreakTrace::Note(const ProofBreak& entry) {
 
 void MarkProofThread() {
     proofThread = true;
+}
+
+bool OnProofThread() {
+    return proofThread;
 }
 
 std::uint64_t CollectEpoch() {
@@ -4297,7 +4308,14 @@ void GpuMutexType::acquired() {
             holdTracked = true;
             holdWrites = 0;
         }
-        if (!proofThread) BreakProofs(ProofBreakSite::GpuMutex);
+        if (!proofThread) {
+            if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks)) {
+                BreakProofs(ProofBreakSite::GpuMutex);
+            } else if (!proofBreaksHeldForTest.load(std::memory_order_relaxed)) {
+                noteBreak(ProofBreakSite::GpuMutex);
+                skippedHoldBreaks.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
 }
 

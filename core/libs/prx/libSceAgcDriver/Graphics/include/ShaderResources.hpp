@@ -87,6 +87,7 @@ struct CertifiedProofOutcomes {
 };
 CertifiedProofOutcomes CertifiedProofOutcomesCounted();
 bool CertifiedProofs();
+std::uint64_t TextureReleaseSerial();
 std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage = false);
 struct StorageTextureBudgetSnapshot {
     std::optional<std::uint32_t> heap;

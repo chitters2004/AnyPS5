@@ -3703,6 +3703,8 @@ void storeStaleStencil(DepthSurface& surface) {
 }
 
 void retire(DepthSurface& surface) {
+    surfacesSerial.fetch_add(1, std::memory_order_release);
+    GuestMemory::NoteHoldPendingBump();
     surface.retired = true;
     for (auto* owners : {&depthOwners(), &stencilOwners()}) {
         std::erase_if(*owners, [&](const auto& entry) { return entry.second.surface == &surface; });
@@ -3776,7 +3778,11 @@ void proveOverwrittenPlanes(std::uint64_t address, std::size_t bytes) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     for (const auto& surface : surfaces()) {
-        if (surface->sampling.overwriteStencil && surface->active->load(std::memory_order_acquire) && surface->Overlaps(address, bytes)) surface->ProveOverwrite();
+        if (surface->sampling.overwriteStencil && surface->active->load(std::memory_order_acquire) && surface->Overlaps(address, bytes)) {
+            surfacesSerial.fetch_add(1, std::memory_order_release);
+            GuestMemory::NoteHoldPendingBump();
+            surface->ProveOverwrite();
+        }
     }
 }
 

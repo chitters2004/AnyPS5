@@ -118,7 +118,9 @@ int main(int argc, char** argv) {
                 const auto again = Store(*device, base, surface, stride, !profile);
                 Require(again != nullptr && again == images[surface].lock(), "surface " + std::to_string(surface) + " was made again while the cache held " + std::to_string(Entries) + " of its " + std::to_string(Entries) + " entries");
             }
+            const auto releasesBefore = AgcDriver::Graphics::TextureReleaseSerial();
             for (std::uint32_t surface = Entries; surface < Surfaces; ++surface) images[surface] = Store(*device, base, surface, stride, !profile);
+            Require(unlimited || AgcDriver::Graphics::TextureReleaseSerial() != releasesBefore, "evicting storage images moved no proof input, so a set bound to an evicted image can keep its proof");
             for (std::uint32_t surface = 0; surface < Surfaces; ++surface) {
                 const bool cached = StorageTexture::FindLive(base + surface * stride, SurfaceBytes) != nullptr;
                 Require(cached == (unlimited || surface >= Surfaces - Entries), "surface " + std::to_string(surface) + (cached ? " is still cached" : " was evicted") + " after " + std::to_string(Surfaces) + " small surfaces under " + limit + " and a 1024 MiB budget");

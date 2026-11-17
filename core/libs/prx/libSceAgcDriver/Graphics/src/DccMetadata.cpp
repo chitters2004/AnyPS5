@@ -280,6 +280,7 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
     static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
     if (disabled || count == 0) return;
+    GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::HeldState, begin, count);
     auto& memo = Memo();
     std::lock_guard lock(memo.mutex);
     const auto end = begin + count;

@@ -193,8 +193,10 @@ void Run(const Context& context) {
     RetireDepthSurfaces(context.device, DepthAddress + depthBytes, 0x10000);
     Require(Refused(context, mips), "a write past the depth plane retired the depth surface");
 
+    const auto surfacesBefore = DepthSurfacesSerial();
     RetireDepthSurfaces(context.device, DepthAddress + 0x100, 0x1000);
     Require(!DepthSurfaceAt(DepthAddress), "a color target over the depth plane left the depth surface live");
+    Require(DepthSurfacesSerial() != surfacesBefore, "retiring the depth surface did not move the depth surfaces serial, so a proof that read it can be reused");
     Require(Sample(context, mips) == nullptr, "depth, then a color target, then a view with two levels: the view was not left to guest memory");
     Require(Sample(context, exact) == nullptr, "depth, then a color target, then its own view: the retired depth surface served it");
 

@@ -237,9 +237,9 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 void BumpCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
-enum class ProofBreakSite : std::uint8_t { Other, DriverStore, Written, GpuMutex, WriteBack, WriteBackIfHeld, Packet, CompletionStore, RecordedWork, WrittenBack, KeptDraw, ResourceWriteBack, PacketCovered, GpuLabel };
+enum class ProofBreakSite : std::uint8_t { Other, DriverStore, Written, GpuMutex, WriteBack, WriteBackIfHeld, Packet, CompletionStore, RecordedWork, WrittenBack, KeptDraw, ResourceWriteBack, PacketCovered, GpuLabel, HeldState };
 const char* ProofBreakSiteName(ProofBreakSite site);
-inline constexpr std::size_t ProofBreakSiteCount = static_cast<std::size_t>(ProofBreakSite::GpuLabel) + 1;
+inline constexpr std::size_t ProofBreakSiteCount = static_cast<std::size_t>(ProofBreakSite::HeldState) + 1;
 struct ProofBreakCounts {
     std::array<std::uint64_t, ProofBreakSiteCount> sites{};
     std::uint64_t emptyWriteBacks = 0;
@@ -249,6 +249,7 @@ struct ProofBreakCounts {
 };
 bool ProofBreaksCounted();
 void NoteHoldPendingBump();
+std::uint64_t SkippedHoldBreaks();
 void HoldProofBreaksForTest(bool held);
 ProofBreakCounts TakeProofBreakCounts();
 bool ProofBreakSitesTracked();
@@ -305,6 +306,7 @@ private:
     ProofBreakTrace* previous = nullptr;
 };
 void MarkProofThread();
+bool OnProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 void NoteFollowedEpoch();

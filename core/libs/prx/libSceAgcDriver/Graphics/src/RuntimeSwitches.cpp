@@ -36,6 +36,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_WHOLE_PENDING_BUMPS",
     "APS5_NO_SCOPED_PROOFS",
     "APS5_NO_WRITELESS_PACKET_SCOPE",
+    "APS5_NO_HOLD_SITE_BREAKS",
 };
 
 struct SwitchValues {
@@ -61,6 +62,7 @@ struct SwitchValues {
             std::getenv("APS5_WHOLE_PENDING_BUMPS") != nullptr,
             std::getenv("APS5_NO_SCOPED_PROOFS") != nullptr,
             std::getenv("APS5_NO_WRITELESS_PACKET_SCOPE") != nullptr,
+            std::getenv("APS5_NO_HOLD_SITE_BREAKS") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }

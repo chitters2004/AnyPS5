@@ -1444,6 +1444,8 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, bool store = true, const char* reason = "cache eviction") {
     auto texture = it->texture;
+    textureReleases.fetch_add(1, std::memory_order_release);
+    GuestMemory::NoteHoldPendingBump();
     it->texture->SetCached(false);
     noteUncached(it->texture);
     if (store) it->texture->Flush(reason);
@@ -5090,6 +5092,10 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     return outcome(partial || !replaced.empty() ? IndexOutcome::Partial : IndexOutcome::Accepted);
 }
 
+std::uint64_t TextureReleaseSerial() {
+    return textureReleases.load(std::memory_order_acquire);
+}
+
 ShaderResources::ExitStamp ShaderResources::currentExitStamp() const {
     const bool imported = !directRegions.empty();
     return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), textureReleases.load(std::memory_order_acquire), GuestMemory::UnwatchSerial(), imported ? HostImportSetGeneration() : 0, imported ? GuestAllocations::GuestAllocationsGeneration_nid_postfix() : 0, RetiredImportSerial(), DepthSurfacesSerial()};
@@ -5225,6 +5231,7 @@ void ShaderResources::noteUncertified(UncertifiedCause cause, CertifyRefusal ref
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    GuestMemory::AssertGpuLockHeld("ShaderResources::Revalidate");
     if (CertifiedProofs()) {
         if (const auto proved = certifiedRevalidate(shaders, report); proved.has_value()) return *proved;
     }
@@ -8455,6 +8462,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     if (usesBda && !bdaReadOnly) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reachable;
         guestMemory.AddressStores(reachable);
+        if (!reachable.empty() && !GuestMemory::OnProofThread()) GuestMemory::BreakProofsOver(GuestMemory::ProofBreakSite::HeldState, reachable);
         recorder.NotePendingReach(reachable);
     }
     guestMemory.MarkDirectWrites();
