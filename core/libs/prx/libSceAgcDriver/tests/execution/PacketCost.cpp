@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #include <windows.h>
@@ -116,27 +117,38 @@ int main(int argc, char** argv) {
             Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
             const auto start = std::chrono::steady_clock::now();
             AgcDriver::Submit(&packet, 0);
+            const auto submitted = std::chrono::steady_clock::now();
             Await(label, serial);
-            const auto spent = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count();
+            const auto landed = std::chrono::steady_clock::now();
             AgcDriverWaitIdle_nid_postfix();
-            return spent;
+            return std::pair{std::chrono::duration<double, std::nano>(landed - start).count(), std::chrono::duration<double, std::nano>(submitted - start).count()};
         };
         submitTimed({});
         std::vector<double> empty;
-        for (std::size_t round = 0; round < rounds; ++round) empty.push_back(submitTimed({}));
+        std::vector<double> emptySubmit;
+        for (std::size_t round = 0; round < rounds; ++round) {
+            const auto [spent, submit] = submitTimed({});
+            empty.push_back(spent);
+            emptySubmit.push_back(submit);
+        }
         const auto emptyNs = Median(empty);
-        std::printf("[packet-cost] empty submission: %.1f us (median of %zu)\n", emptyNs / 1e3, rounds);
+        const auto emptySubmitNs = Median(emptySubmit);
+        std::printf("[packet-cost] empty submission: %.1f us, Submit returns after %.1f us (median of %zu)\n", emptyNs / 1e3, emptySubmitNs / 1e3, rounds);
         for (const auto& mix : Mixes) {
             const auto words = RegisterStream(mix, packets);
             std::vector<double> table;
             std::vector<double> worker;
+            std::vector<double> submitted;
             for (std::size_t round = 0; round < rounds; ++round) {
                 table.push_back(TableNanoseconds(words, packets));
-                worker.push_back((submitTimed(words) - emptyNs) / static_cast<double>(packets));
+                const auto [spent, submit] = submitTimed(words);
+                worker.push_back((spent - emptyNs) / static_cast<double>(packets));
+                submitted.push_back((submit - emptySubmitNs) / static_cast<double>(packets));
             }
             const auto tableNs = Median(table);
             const auto workerNs = Median(worker);
-            std::printf("[packet-cost] %-20s %zu packets: Pm4::Execute %.1f ns/packet, worker loop %.1f ns/packet (%.1fx), loop overhead %.1f ns/packet\n", mix.name, packets, tableNs, workerNs, tableNs > 0 ? workerNs / tableNs : 0.0, workerNs - tableNs);
+            const auto submitNs = Median(submitted);
+            std::printf("[packet-cost] %-20s %zu packets: Pm4::Execute %.1f ns/packet, worker loop %.1f ns/packet (%.1fx), loop overhead %.1f ns/packet, of which Submit %.1f ns/packet\n", mix.name, packets, tableNs, workerNs, tableNs > 0 ? workerNs / tableNs : 0.0, workerNs - tableNs, submitNs);
             Require(workerNs > 0, std::string(mix.name) + ": the worker loop measured no time");
         }
 #ifdef _WIN32
