@@ -1,6 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/EpochProofCounters.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -254,9 +259,78 @@ bool RunKeptByCpu() {
     return true;
 }
 
+bool RunPresentAfterCpuWrite() {
+    WatchedBlock surface(SurfaceBytes);
+    struct WaitForWork {
+        ~WaitForWork() { AgcDriverWaitIdle_nid_postfix(); }
+    } waitForWork;
+    const auto address = surface.Address();
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("present after a CPU write: skipped, the surface is not write-watched");
+        return false;
+    }
+    auto* texels = reinterpret_cast<std::uint32_t*>(surface.Data());
+    std::fill(texels, texels + SurfaceBytes / 4u, Untouched);
+    Store(texels);
+    AgcDriverWaitIdle_nid_postfix();
+    std::unique_lock hold(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushAllPending("present after a CPU write fixture");
+    hold.unlock();
+    {
+        std::vector<std::byte> settled(SurfaceBytes);
+        AgcDriver::GuestMemory::Read(address, settled);
+    }
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("present after a CPU write: skipped, the surface's host import is compared, not write-watched");
+        return false;
+    }
+    hold.lock();
+    const auto image = StorageTexture::FindLive(address, SurfaceBytes);
+    Require(image != nullptr, "present after a CPU write: the surface has no storage image");
+    Require(AgcDriver::Graphics::ShaderResources::EpochProofs(), "present after a CPU write: epoch proofs are off on the proof thread");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    image->Refresh();
+    Require(AgcDriver::GuestMemory::UnchangedSince(address, SurfaceBytes, image->GenerationFor(address, SurfaceBytes)), "present after a CPU write: the image does not match the surface before the write");
+    const auto reusesBefore = AgcDriver::Graphics::EpochProofCounts().storageReuses.Sum();
+    for (int attempt = 0; attempt < 4 && AgcDriver::Graphics::EpochProofCounts().storageReuses.Sum() == reusesBefore; ++attempt) image->Refresh();
+    Require(AgcDriver::Graphics::EpochProofCounts().storageReuses.Sum() != reusesBefore, "present after a CPU write: later refreshes in the collect epoch did not reuse a stored proof");
+    hold.unlock();
+    auto* written = surface.Data() + 2 * Block;
+    for (std::size_t offset = 0; offset < Page; ++offset) static_cast<volatile std::uint8_t*>(written)[offset] = Pattern(offset);
+    bool refreshed = false, merged = false;
+    std::thread presenter([&] {
+        std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        refreshed = AgcDriver::RefreshPresented(*image, AgcDriver::DisplayBuffer{address, 0x8000000000000000ull, Width, Height}, 0);
+        merged = AgcDriver::GuestMemory::UnchangedSince(address, SurfaceBytes, image->GenerationFor(address, SurfaceBytes));
+    });
+    presenter.join();
+    Require(refreshed, "present after a CPU write: the present did not see the CPU write");
+    const bool scoped = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoHoldSiteBreaks);
+    Require(merged || !scoped, "present after a CPU write: the present refresh adopted the epoch the image was proved in and skipped the CPU write it had just collected");
+    return true;
 }
 
-int main() {
+bool RunAttachmentMemoUnwatch() {
+    WatchedBlock surface(SurfaceBytes);
+    const auto address = surface.Address();
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("attachment memo unwatch: skipped, the surface is not write-watched");
+        return false;
+    }
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto before = AgcDriver::Graphics::CurrentAttachmentMemoSerials();
+    AgcDriver::GuestMemory::Unwatch(address, SurfaceBytes);
+    Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "attachment memo unwatch: the surface is still write-watched");
+    const bool scoped = !AgcDriver::Graphics::RuntimeSwitches::Set(AgcDriver::Graphics::RuntimeSwitch::NoHoldSiteBreaks);
+    const bool moved = AgcDriver::Graphics::CurrentAttachmentMemoSerials() != before;
+    Require(moved == scoped, scoped ? "attachment memo unwatch: an unwatch inside one hold left the attachment memo's key unchanged, so a memo stored before it can still answer" : "attachment memo unwatch: the key moved while APS5_NO_HOLD_SITE_BREAKS keeps the old key");
+    return true;
+}
+
+}
+
+int main(int argc, char** argv) {
     try {
         {
             const auto device = OpenVulkanTestDevice();
@@ -268,6 +342,21 @@ int main() {
         {
             WatchedBlock probe(SurfaceBytes);
             Require(AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(probe.Data()))).guestBytes == SurfaceBytes, "refresh unwatch hash: unexpected surface size");
+        }
+        const std::string mode = argc > 1 ? argv[1] : "";
+        Require(mode.empty() || mode == "--present" || mode == "--attachment-memo", "usage: [--present | --attachment-memo]");
+        if (mode == "--present") {
+            AgcDriver::GuestMemory::MarkProofThread();
+            if (!RunPresentAfterCpuWrite()) return VulkanTestSkipped;
+            AgcDriverShutdown_nid_postfix();
+            std::puts("refresh unwatch hash: present after a CPU write passed");
+            return 0;
+        }
+        if (mode == "--attachment-memo") {
+            if (!RunAttachmentMemoUnwatch()) return VulkanTestSkipped;
+            AgcDriverShutdown_nid_postfix();
+            std::puts("refresh unwatch hash: attachment memo unwatch passed");
+            return 0;
         }
         if (!Run()) return VulkanTestSkipped;
         if (!RunKeptByCpu()) return VulkanTestSkipped;

@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SnapshotCopies.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
@@ -159,6 +160,7 @@ struct GuestBufferMemory::AddressSpace {
     std::unique_ptr<std::atomic<std::uint64_t>[]> verified;
     mutable std::atomic<std::uint64_t> refreshedEpoch{0};
     mutable std::atomic<std::uint64_t> refreshedProof{0};
+    mutable std::atomic<std::uint64_t> refreshedPending{0};
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
@@ -5936,6 +5938,15 @@ bool epochMirrors() {
 void noteEpochMirrors(bool reused, const GuestBufferMemory::AddressSpace& space) {
     (reused ? EpochProofCounts().mirrorReuses : EpochProofCounts().mirrorRefreshes).Add();
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
+    if (reused && verify && StorageTexture::PendingSerial() != space.refreshedPending.load(std::memory_order_relaxed)) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto index : space.writableMirrors) ranges.emplace_back(space.base[index].begin, space.base[index].end);
+        if (StorageTexture::AnyPendingOverlaps(ranges)) {
+            static std::atomic<std::uint64_t> overPending{0};
+            const auto count = overPending.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1u)) == 0u) std::fprintf(stderr, "[epoch-mirrors] verify: %llu reuses over images marked pending since the refresh\n", static_cast<unsigned long long>(count));
+        }
+    }
     thread_local std::uint64_t reuses = 0;
     if (!reused || !verify || reuses++ % 64u != 0u) return;
     static std::atomic<std::uint64_t> compared{0}, differing{0};
@@ -5982,9 +5993,18 @@ bool GuestBufferMemory::RetakeSpace() {
     std::vector<RefreshBlock> blocks;
     const auto epoch = GuestMemory::CollectEpoch();
     const auto proof = GuestMemory::ProofSerial();
-    const bool reuse = epochMirrors() && epoch != 0 && space->refreshedEpoch.load(std::memory_order_relaxed) == epoch && space->refreshedProof.load(std::memory_order_relaxed) == proof;
+    const auto pending = StorageTexture::PendingSerial();
+    const auto pendingKept = [&] {
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks) || space->refreshedPending.load(std::memory_order_relaxed) == pending) return true;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        ranges.reserve(space->writableMirrors.size());
+        for (const auto index : space->writableMirrors) ranges.emplace_back(space->base[index].begin, space->base[index].end);
+        return !StorageTexture::AnyPendingOverlaps(ranges);
+    };
+    const bool reuse = epochMirrors() && epoch != 0 && space->refreshedEpoch.load(std::memory_order_relaxed) == epoch && space->refreshedProof.load(std::memory_order_relaxed) == proof && pendingKept();
     if (reuse) {
         noteEpochMirrors(true, *space);
+        space->refreshedPending.store(pending, std::memory_order_relaxed);
     } else {
         for (const auto index : space->writableMirrors) {
             const auto& region = space->base[index];
@@ -5998,6 +6018,7 @@ bool GuestBufferMemory::RetakeSpace() {
     if (!reuse && epoch != 0) {
         space->refreshedEpoch.store(epoch, std::memory_order_relaxed);
         space->refreshedProof.store(proof, std::memory_order_relaxed);
+        space->refreshedPending.store(pending, std::memory_order_relaxed);
     }
     {
         auto& state = Imports();
