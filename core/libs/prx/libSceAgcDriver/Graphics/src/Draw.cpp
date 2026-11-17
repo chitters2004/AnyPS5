@@ -3606,6 +3606,7 @@ struct ColorMemo {
     std::optional<DepthFootprint> clearOfDepth;
     std::optional<TargetProof> recorded;
     TargetMemoEvent invalidCause = TargetMemoEvent::InvalidNever;
+    std::size_t uncachedSlot = 0;
 };
 
 struct DepthMemo {
@@ -3685,6 +3686,45 @@ void noteTargetMemo(TargetMemoEvent event, std::uint64_t count = 1) {
 #endif
 }
 
+constexpr std::size_t UncachedEvicted = static_cast<std::size_t>(StorageUncache::Count) + 1;
+constexpr std::size_t UncachedSlots = 2 + 2 * UncachedEvicted;
+constexpr std::array<const char*, UncachedEvicted> UncacheNames{"budget", "entry cap", "mips grown", "metadata moved", "memory reclaim", "cache cleared", "never cached"};
+
+struct UncachedCounts {
+    std::array<std::array<ProfileCounter, UncachedSlots>, 2> slots;
+    ProfileCounter sameTarget;
+    ProfileCounter severalTargets;
+};
+
+UncachedCounts& uncachedCounts() {
+    static UncachedCounts counts;
+    return counts;
+}
+
+thread_local std::uint64_t targetResolveSerial = 0;
+thread_local std::uint64_t lastUncachedTarget = 0;
+
+std::size_t uncachedSlot(const TargetBinding& binding) {
+    if (binding.resident == nullptr) return ColorTileModeIsLinear(binding.color.tileMode) ? 0 : 1;
+    const auto reason = static_cast<std::size_t>(binding.resident->UncachedFor());
+    return 2 + (binding.resident->UncachedAt() > targetResolveSerial ? 0 : UncachedEvicted) + reason;
+}
+
+std::string uncachedLine(std::size_t kind) {
+    auto& slots = uncachedCounts().slots[kind];
+    std::array<std::uint64_t, UncachedSlots> counts{};
+    for (std::size_t slot = 0; slot < UncachedSlots; ++slot) counts[slot] = slots[slot].Take();
+    const auto evicted = [&](std::size_t base) {
+        std::string text;
+        for (std::size_t reason = 0; reason < UncachedEvicted; ++reason) {
+            if (counts[base + reason] == 0) continue;
+            text += (text.empty() ? "" : ", ") + std::string(UncacheNames[reason]) + " " + std::to_string(counts[base + reason]);
+        }
+        return text.empty() ? std::string("none") : text;
+    };
+    return "no resident image (linear " + std::to_string(counts[0]) + ", other " + std::to_string(counts[1]) + "); evicted while this draw resolved its targets (" + evicted(2) + "); evicted before (" + evicted(2 + UncachedEvicted) + ")";
+}
+
 void reportTargetMemo() {
     using Clock = std::chrono::steady_clock;
     static std::atomic<std::int64_t> reported{Clock::now().time_since_epoch().count()};
@@ -3714,6 +3754,9 @@ void reportTargetMemo() {
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) target prep by outcome and thread:%s\n", prep.empty() ? " none" : prep.c_str());
+    const auto lookups = uncachedLine(0);
+    const auto builds = uncachedLine(1);
+    AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) invalid: uncached, at lookups: %s; at builds: %s; builds whose uncached target was the previous uncached build's %llu, with several color targets %llu\n", lookups.c_str(), builds.c_str(), static_cast<unsigned long long>(uncachedCounts().sameTarget.Take()), static_cast<unsigned long long>(uncachedCounts().severalTargets.Take()));
 }
 
 bool colorProofMatches(const TargetProof& before, const TargetProof& after, const std::optional<TargetProof>* recorded = nullptr) {
@@ -3812,7 +3855,16 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         return TargetMemoEvent::Count;
     };
     auto cause = !TargetMemoEnabled() ? TargetMemoEvent::InvalidOff : proof.epoch == 0 ? TargetMemoEvent::InvalidEpoch : targets.empty() ? TargetMemoEvent::InvalidNoColors : TargetMemoEvent::Count;
-    for (std::size_t index = 0; cause == TargetMemoEvent::Count && index < targets.size(); ++index) cause = ineligible(targets[index]);
+    std::size_t checked = 0;
+    for (; cause == TargetMemoEvent::Count && checked < targets.size(); ++checked) cause = ineligible(targets[checked]);
+    if (cause == TargetMemoEvent::InvalidUncached && targetMemoProfiled) {
+        const auto& binding = targets[checked - 1];
+        colors.uncachedSlot = uncachedSlot(binding);
+        uncachedCounts().slots[1][colors.uncachedSlot].Add();
+        if (binding.color.address == lastUncachedTarget) uncachedCounts().sameTarget.Add();
+        if (targets.size() > 1) uncachedCounts().severalTargets.Add();
+        lastUncachedTarget = binding.color.address;
+    }
     colors.valid = enabled && !targets.empty() && cause == TargetMemoEvent::Count;
     if (!colors.valid) colors.invalidCause = cause;
     colors.recorded.reset();
@@ -3840,6 +3892,7 @@ bool repeatColors(const Context& context, const State& state, const TargetProof&
     if (!memo.valid || !TargetMemoEnabled()) {
         noteTargetMemo(TargetMemoEvent::Invalid);
         noteTargetMemo(memo.valid ? TargetMemoEvent::InvalidOff : memo.invalidCause);
+        if (targetMemoProfiled && !memo.valid && memo.invalidCause == TargetMemoEvent::InvalidUncached) uncachedCounts().slots[0][memo.uncachedSlot].Add();
         return false;
     }
     if (!colorProofMatches(memo.proof, proof, targetMemoProfiled ? &memo.recorded : nullptr)) return false;
@@ -3983,6 +4036,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         repeatedColors = repeatColors(context, state, targetProof, targets, targetViews);
     }
     const auto prepareColors = [&] {
+        if (targetMemoProfiled) targetResolveSerial = StorageTexture::UncacheSerial();
         if (targetsUsed) {
             targets.clear();
             targets.resize(state.colors.size());

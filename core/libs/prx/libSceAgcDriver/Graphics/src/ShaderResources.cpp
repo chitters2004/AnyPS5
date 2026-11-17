@@ -1435,8 +1435,9 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
-std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, bool store = true, const char* reason = "cache eviction") {
+std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, StorageUncache why, bool store = true, const char* reason = "cache eviction") {
     auto texture = it->texture;
+    it->texture->NoteUncache(why);
     it->texture->SetCached(false);
     noteUncached(it->texture);
     if (store) it->texture->Flush(reason);
@@ -1561,12 +1562,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
-            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found));
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found, StorageUncache::MipsGrown));
         }
         auto it = findStorage(cache, key);
         std::shared_ptr<StorageTexture> detached;
         if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
-            detached = evictStorage(cache, it, false);
+            detached = evictStorage(cache, it, StorageUncache::MetadataMoved, false);
             evicted.push_back(detached);
             it = cache.entries.end();
         }
@@ -1598,7 +1599,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
                 if (!overBudget && cache.entries.size() < storageEntries()) break;
                 const auto back = std::prev(cache.entries.end());
                 if (back->texture->TakeUsed()) cache.entries.splice(cache.entries.begin(), cache.entries, back);
-                else evicted.push_back(evictStorage(cache, back, true, overBudget ? "cache eviction" : "entry cap"));
+                else evicted.push_back(evictStorage(cache, back, overBudget ? StorageUncache::Budget : StorageUncache::EntryCap, true, overBudget ? "cache eviction" : "entry cap"));
             }
             cache.bytes += entry.accounted;
             texture = entry.texture;
@@ -1767,6 +1768,7 @@ void ClearCachedTextures(VkDevice device) {
                 continue;
             }
             cleared.push_back(it->texture);
+            it->texture->NoteUncache(StorageUncache::Cleared);
             it->texture->SetCached(false);
             noteUncached(it->texture);
             storage.bytes -= it->accounted;
@@ -1849,7 +1851,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                                 spared = true;
                                 continue;
                             }
-                            image = evictStorage(cache, it);
+                            image = evictStorage(cache, it, StorageUncache::Reclaim);
                             break;
                         }
                         if (image == nullptr) {

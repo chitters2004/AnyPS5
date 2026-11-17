@@ -7079,6 +7079,24 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
     return keys;
 }
 
+namespace {
+
+std::atomic<std::uint64_t>& uncacheSerial() {
+    static std::atomic<std::uint64_t> serial{0};
+    return serial;
+}
+
+}
+
+void StorageTexture::NoteUncache(StorageUncache why) {
+    uncachedFor.store(why, std::memory_order_release);
+    uncachedAt.store(uncacheSerial().fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
+}
+
+std::uint64_t StorageTexture::UncacheSerial() {
+    return uncacheSerial().load(std::memory_order_acquire);
+}
+
 bool StorageTexture::AnyLayerPending() const {
     return anyLayerPending();
 }

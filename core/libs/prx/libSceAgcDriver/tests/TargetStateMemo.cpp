@@ -1153,6 +1153,7 @@ void colorMemoResidentEviction(AgcDriver::VulkanDevice& device) {
     }
     requireMoved(before, "", "evicting a clean retained color resident");
     Require(!resident->Cached(), "the negative control did not evict the resident");
+    Require(resident->UncachedFor() == StorageUncache::Cleared && resident->UncachedAt() != 0 && resident->UncachedAt() <= StorageTexture::UncacheSerial(), "the cleared resident does not record why and when it left the cache");
     const MemoEvents events;
     mustLookUp(device, color, {}, "an evicted color resident was reused");
     requireMemoEvent(events, TargetMemoEvent::ResidentEvicted, memoServes() && memoCounted() ? 1u : 0u, "an evicted color resident");

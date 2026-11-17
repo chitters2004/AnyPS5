@@ -280,6 +280,8 @@ private:
 // either at once (WriteBack) or deferred: MarkDirty keeps them on the GPU until something reads that
 // memory (FlushPending, through the GuestMemory flush hook), the image is refreshed after a CPU write,
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
+enum class StorageUncache : std::uint8_t { Budget, EntryCap, MipsGrown, MetadataMoved, Reclaim, Cleared, Count };
+
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     struct CreationHandOver {
@@ -441,6 +443,10 @@ public:
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }
+    void NoteUncache(StorageUncache why);
+    StorageUncache UncachedFor() const { return uncachedFor.load(std::memory_order_acquire); }
+    std::uint64_t UncachedAt() const { return uncachedAt.load(std::memory_order_acquire); }
+    static std::uint64_t UncacheSerial();
     void SetCached(bool value) { cached.store(value, std::memory_order_release); }
     // The pending image whose surface starts at `address` and covers at least `bytes` (a mip chain
     // contains a descriptor of its first mips), if any; the caller decides whether the geometry fits
@@ -922,6 +928,8 @@ private:
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;
     std::atomic<bool> cached{false};
+    std::atomic<StorageUncache> uncachedFor{StorageUncache::Count};
+    std::atomic<std::uint64_t> uncachedAt{0};
     // The present a consumer last proved the image current at (NoteProved).
     mutable std::atomic<std::uint64_t> provedPresent{0};
     mutable std::atomic<bool> usedUnlisted{false};
