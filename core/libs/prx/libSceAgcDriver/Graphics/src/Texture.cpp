@@ -1207,6 +1207,10 @@ bool Texture::refreshSrgbExpand() {
     return true;
 }
 
+bool Texture::DepthCopyStale() const {
+    return perUseCopy == PerUseCopy::RefreshedOnReuse && storageSource != nullptr && (!copiedOnce || storageSource->Version() != copiedVersion);
+}
+
 bool Texture::RefreshDepthCopy() {
     if (perUseCopy != PerUseCopy::RefreshedOnReuse || storageSource == nullptr) return false;
     if (copiedOnce && storageSource->Version() == copiedVersion) return false;

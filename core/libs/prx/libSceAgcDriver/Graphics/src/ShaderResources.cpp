@@ -4122,6 +4122,16 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+static void noteDepthCopyReuse(const std::vector<std::shared_ptr<Texture>>& textures) {
+    static std::atomic<std::uint64_t> reuses{0}, holding{0}, stale{0};
+    const bool copies = std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->IsDepthCopy(); });
+    const bool skipped = copies && std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->DepthCopyStale(); });
+    const auto count = reuses.fetch_add(1, std::memory_order_relaxed) + 1u;
+    if (copies) holding.fetch_add(1, std::memory_order_relaxed);
+    const auto staleCount = skipped ? stale.fetch_add(1, std::memory_order_relaxed) + 1u : 0u;
+    if (count % 262144u == 0u || (staleCount != 0u && (staleCount & (staleCount - 1u)) == 0u)) std::fprintf(stderr, "[epoch-proofs] depth copies (APS5_COUNT_STALE_DEPTH_COPY_REUSE): %llu epoch reuses, %llu holding a depth copy, %llu with a depth copy whose storage source moved since its last copy (the refresh the reuse skips)\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(holding.load(std::memory_order_relaxed)), static_cast<unsigned long long>(stale.load(std::memory_order_relaxed)));
+}
+
 namespace {
 
 constexpr std::size_t TableSpanElement = std::numeric_limits<std::size_t>::max();
@@ -4451,6 +4461,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
+            static const bool countDepthCopies = std::getenv("APS5_COUNT_STALE_DEPTH_COPY_REUSE") != nullptr;
+            if (countDepthCopies) noteDepthCopyReuse(textures);
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
             if (verify && ++reuses % 64u == 0u) {

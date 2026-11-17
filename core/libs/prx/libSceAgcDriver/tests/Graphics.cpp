@@ -6847,6 +6847,12 @@ void depthCopyKeptBytesTests() {
                         Require(from.region.imageSubresource.mipLevel == mip && to.region.imageSubresource.mipLevel == mip && from.region.imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT && to.region.imageSubresource.aspectMask == VK_IMAGE_ASPECT_DEPTH_BIT && from.region.bufferOffset == (mip == 0 ? 0 : 8 * 8 * sizeof(float)) && to.region.bufferOffset == from.region.bufferOffset, "the depth refresh's mip offsets or aspects changed");
                     }
                     Require(!depth.RefreshDepthCopy() && mock.imageBufferCopies.size() == begin + 4, "an unchanged storage version made another linear depth copy");
+                    Require(!depth.DepthCopyStale(), "a refreshed depth copy read as stale");
+                    if (batch == 2) {
+                        const auto version = source->Version();
+                        source->MarkDirty();
+                        Require(source->Version() != version && depth.DepthCopyStale(), "a depth copy whose storage source moved did not read as stale");
+                    }
                 }
                 Require(recorder.OpenKeptBytes() == Recorder::KeptBytesBudget, "the real depth-copy linear buffer did not complete the kept-byte budget");
                 Require(!pool->Take(bytes, usage, properties) && !mock.destroyedImages.contains(depths.back()), "a recorded depth transfer released its linear buffer or destination before its fence");

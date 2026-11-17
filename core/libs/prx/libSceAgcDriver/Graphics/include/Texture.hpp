@@ -93,6 +93,7 @@ public:
     static bool CanRepackCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
     bool IsDepthCopy() const { return perUseCopy == PerUseCopy::RefreshedOnReuse; }
     bool RefreshDepthCopy();
+    bool DepthCopyStale() const;
     struct DepthCopyCounts {
         std::uint64_t textures;
         std::uint64_t refreshes;
