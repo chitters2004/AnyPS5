@@ -502,7 +502,10 @@ bool SceneWatched(AgcDriver::VulkanDevice& device) {
     Build(device, scene);
     static_cast<void>(Draw(device, scene, true, false));
     device.WaitIdle();
-    return GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.table.base), scene.table.bytes) && GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.textures.base), scene.textures.bytes);
+    const bool table = GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.table.base), scene.table.bytes);
+    const bool textures = GuestMemory::Watched(reinterpret_cast<std::uintptr_t>(scene.textures.base), scene.textures.bytes);
+    if (!table || !textures) std::printf("certified proofs: after the first draw the table at %p is %s and the texels at %p are %s\n", static_cast<void*>(scene.table.base), table ? "watched" : "compared", static_cast<void*>(scene.textures.base), textures ? "watched" : "compared");
+    return table && textures;
 }
 
 void Causes(AgcDriver::VulkanDevice& device) {
@@ -1054,12 +1057,15 @@ int main(int argc, char** argv) {
         if (!watched) {
             std::puts("certified proofs: private guest memory is compared on this device (no second queue to settle its host imports on); running every case on shared guest memory, whose import aliases keep the write watch");
             device->WaitIdle();
+            auto privateScenes = std::move(Scenes);
             Scenes.clear();
-            target.reset();
+            const auto privateTarget = std::move(target);
             SharedGuestMemory = true;
             target = std::make_unique<GuestBlocks>((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
             Target = target.get();
             watched = SceneWatched(*device);
+            device->WaitIdle();
+            privateScenes.clear();
         }
 #endif
         if (!watched) {
