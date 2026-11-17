@@ -5232,7 +5232,7 @@ void ShaderResources::noteUncertified(UncertifiedCause cause, CertifyRefusal ref
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     GuestMemory::AssertGpuLockHeld("ShaderResources::Revalidate");
-    if (CertifiedProofs()) {
+    if (CertifiedProofs() && HasCachedStorageImages()) {
         if (const auto proved = certifiedRevalidate(shaders, report); proved.has_value()) return *proved;
     }
     if (!registeredImageViewsCurrent(registeredImageViews)) {
@@ -5263,6 +5263,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 }
             }
         }
+        if (matched && !HasCachedStorageImages()) matched = false;
         const bool copies = matched && !refreshPerUseCopies();
         if (matched && !copies) {
             if (verifyingExits()) {

@@ -424,7 +424,7 @@ std::shared_ptr<Texture> SampledFastCleared(const Context& context, std::uint64_
     return texture;
 }
 
-std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
+ShaderRecompiler::RecompileResult ImageProgram(const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
     ShaderRecompiler::DescriptorBinding binding{};
     binding.kind = sampled ? ShaderRecompiler::DescriptorKind::SampledImage : ShaderRecompiler::DescriptorKind::StorageImage;
     binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
@@ -440,6 +440,11 @@ std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Bl
     }
     ShaderRecompiler::RecompileResult program;
     program.bindings.push_back(std::move(binding));
+    return program;
+}
+
+std::shared_ptr<ShaderResources> ImageResources(const Context& context, const Block& block, std::size_t first, std::uint32_t count, bool sampled) {
+    const auto program = ImageProgram(block, first, count, sampled);
     const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
     return std::make_shared<ShaderResources>(context, shader);
 }
@@ -513,6 +518,42 @@ bool resourceCacheTests(Context context, const std::string& mode) {
             Require(!image.expired() && !storageSet.expired(), "cache clear destroyed an active caller's resources");
             storage.reset();
             Require(image.expired() && storageSet.expired(), "cleared storage image outlived its last active resource");
+        } else if (mode == "resource-evicted-epoch") {
+            Require(ShaderResources::EpochProofs(), "the evicted-image fixture needs epoch proofs on");
+            ClearCachedTextures(context.device);
+            std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex());
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            const auto program = ImageProgram(block, 0, 1, false);
+            const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            auto held = std::make_shared<ShaderResources>(context, shader);
+            const auto image = StorageTexture::FindLive(block.Surface(0), SurfaceBytes);
+            Require(held->StorageImages().size() == 1 && image != nullptr && image->Cached(), "the evicted-image fixture has no cached storage image");
+            const auto exitTaken = [&] {
+                const auto proofs = EpochProofCounts().resourceProofs.Sum();
+                return held->Revalidate(shader) && EpochProofCounts().resourceProofs.Sum() == proofs;
+            };
+            bool settled = false;
+            for (int round = 0; round < 3 && !settled; ++round) settled = exitTaken();
+            Require(settled, "a held set over a clean storage image did not take the epoch exit");
+            gpu.unlock();
+            std::exception_ptr failure;
+            std::thread evictor([&] {
+                try {
+                    std::lock_guard hold(AgcDriver::GuestMemory::GpuMutex());
+                    for (std::size_t surface = 1; surface < Surfaces; ++surface) CachedStorageSurface(context, Resource(block.Surface(surface)));
+                } catch (...) {
+                    failure = std::current_exception();
+                }
+            });
+            evictor.join();
+            if (failure != nullptr) std::rethrow_exception(failure);
+            gpu.lock();
+            Require(!image->Cached(), "storage images over the entry cap did not evict the held set's image");
+            const bool taken = exitTaken();
+            std::printf("evicted epoch: a held set over a storage image another thread evicted: the exit %s\n", taken ? "was taken" : "was refused");
+            Require(!taken, "a held set reused its proof over a storage image another thread evicted under the GPU lock");
+            held.reset();
+            gpu.unlock();
         } else if (mode == "resource-oversized") {
             for (const bool sampledImages : {false, true}) {
                 const std::weak_ptr<StorageTexture> early = CachedStorageSurface(context, Resource(block.Surface(0)));
@@ -2014,7 +2055,7 @@ int main(int argc, char** argv) {
             deviceSelectionTests();
             return 0;
         }
-        const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear";
+        const bool resources = mode == "resource-admission" || mode == "resource-oversized" || mode == "resource-clear" || mode == "resource-evicted-epoch";
         const bool disableStorageImageMultisample = mode == "without-storage-image-multisample";
         const bool recover = mode == "recover-sampled" || mode == "recover-storage" || mode == "recover-srgb" || mode == "recover-repack";
 #ifdef _WIN32
@@ -2066,7 +2107,8 @@ int main(int argc, char** argv) {
         TextureDetiler detiler(context);
         context.detiler = &detiler;
         if (resources) {
-            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            std::unique_lock gpu(AgcDriver::GuestMemory::GpuMutex(), std::defer_lock);
+            if (mode != "resource-evicted-epoch") gpu.lock();
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
             std::puts("resource cache tests passed");
             return 0;
