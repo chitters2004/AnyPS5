@@ -177,6 +177,10 @@ struct DeviceFunctions {
     PFN_vkCmdDrawIndexed cmdDrawIndexed = nullptr;
     PFN_vkCmdDrawIndirect cmdDrawIndirect = nullptr;
     PFN_vkCmdDrawIndexedIndirect cmdDrawIndexedIndirect = nullptr;
+    PFN_vkCmdDrawIndirectCountKHR cmdDrawIndirectCount = nullptr;
+    PFN_vkCmdDrawIndexedIndirectCountKHR cmdDrawIndexedIndirectCount = nullptr;
+    PFN_vkCmdDrawMeshTasksEXT cmdDrawMeshTasks = nullptr;
+    PFN_vkCmdDrawMeshTasksIndirectEXT cmdDrawMeshTasksIndirect = nullptr;
     PFN_vkCmdCopyBufferToImage cmdCopyBufferToImage = nullptr;
     PFN_vkCmdCopyImageToBuffer cmdCopyImageToBuffer = nullptr;
     PFN_vkCmdClearColorImage cmdClearColorImage = nullptr;

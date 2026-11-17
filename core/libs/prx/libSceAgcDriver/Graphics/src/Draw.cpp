@@ -2352,7 +2352,7 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && (args != nullptr || state.tessellationCapture != nullptr)) {
         CountVkDraw(VkDrawKind::Mesh);
-        context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
+        context.Resolved(&DeviceFunctions::cmdDrawMeshTasksIndirect, "vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
         recorded(subdraw++);
         emitted = true;
         return true;
@@ -2360,7 +2360,7 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
     if (state.stages.mesh) {
         APS5_LOG_OUT_DEBUG("vkCmdDrawMeshTasksEXT groups=%u instances=%u layers=%u", inputs.meshGroups, draw.instanceCount, inputs.meshLayers);
         CountVkDraw(VkDrawKind::Mesh);
-        context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, inputs.meshLayers);
+        context.Resolved(&DeviceFunctions::cmdDrawMeshTasks, "vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, inputs.meshLayers);
         recorded(subdraw++);
         emitted = true;
         return true;
@@ -2390,8 +2390,8 @@ bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, co
         emitted = true;
         if (args->countIndirect) {
             CountVkDraw(VkDrawKind::Indirect);
-            if (draw.indexed) context.Function<PFN_vkCmdDrawIndexedIndirectCountKHR>("vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirect->countImport->buffer, HostImportOffset(*indirect->countImport, args->countAddress), args->count, args->stride);
-            else context.Function<PFN_vkCmdDrawIndirectCountKHR>("vkCmdDrawIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirect->countImport->buffer, HostImportOffset(*indirect->countImport, args->countAddress), args->count, args->stride);
+            if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirectCount, "vkCmdDrawIndexedIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirect->countImport->buffer, HostImportOffset(*indirect->countImport, args->countAddress), args->count, args->stride);
+            else context.Resolved(&DeviceFunctions::cmdDrawIndirectCount, "vkCmdDrawIndirectCountKHR")(commands, argumentBuffer, argumentOffset, indirect->countImport->buffer, HostImportOffset(*indirect->countImport, args->countAddress), args->count, args->stride);
         } else if (args->count <= 1 || context.multiDrawIndirect) {
             CountVkDraw(VkDrawKind::Indirect);
             if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexedIndirect, "vkCmdDrawIndexedIndirect")(commands, argumentBuffer, argumentOffset, args->count, args->stride);

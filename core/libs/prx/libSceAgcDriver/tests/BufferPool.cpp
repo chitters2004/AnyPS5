@@ -1613,6 +1613,23 @@ void TableFill() {
         {filled.unmapMemory == mockUnmapMemory, "vkUnmapMemory"},
     }};
     for (const auto& [same, name] : entries) Expect(same, std::string("the device function table's member for ") + name + " was not filled from that name");
+    Expect(filled.cmdDrawIndirectCount == nullptr && filled.cmdDrawIndexedIndirectCount == nullptr && filled.cmdDrawMeshTasks == nullptr && filled.cmdDrawMeshTasksIndirect == nullptr, "the device function table holds count-indirect or mesh draws for a device without those features");
+    mock = MockDevice{};
+    mock.anyName = true;
+    auto featured = mockContext();
+    featured.drawIndirectCount = true;
+    featured.meshShader = true;
+    DeviceFunctions drawTable{};
+    FillDeviceFunctions(featured, drawTable);
+    mock.anyName = false;
+    Expect(drawTable.cmdDrawIndirectCount != nullptr && drawTable.cmdDrawIndexedIndirectCount != nullptr && drawTable.cmdDrawMeshTasks != nullptr && drawTable.cmdDrawMeshTasksIndirect != nullptr, "the device function table lacks a count-indirect or mesh draw the device supports");
+    featured.functions = &drawTable;
+    const auto before = mock.lookups;
+    static_cast<void>(featured.Resolved(&DeviceFunctions::cmdDrawIndirectCount, "vkCmdDrawIndirectCountKHR"));
+    static_cast<void>(featured.Resolved(&DeviceFunctions::cmdDrawIndexedIndirectCount, "vkCmdDrawIndexedIndirectCountKHR"));
+    static_cast<void>(featured.Resolved(&DeviceFunctions::cmdDrawMeshTasks, "vkCmdDrawMeshTasksEXT"));
+    static_cast<void>(featured.Resolved(&DeviceFunctions::cmdDrawMeshTasksIndirect, "vkCmdDrawMeshTasksIndirectEXT"));
+    Expect(mock.lookups == before, "resolving the count-indirect and mesh draws looked up " + std::to_string(mock.lookups - before) + " Vulkan functions by name while the device's function table holds them");
 }
 
 void TableLookups() {
