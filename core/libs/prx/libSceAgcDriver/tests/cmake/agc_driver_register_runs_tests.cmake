@@ -1,0 +1,10 @@
+if(BUILD_TESTING)
+    add_test(NAME agc_driver_register_runs_draw_pipeline COMMAND agc_driver_register_runs_tests)
+    set(agcRegisterRunsTests agc_driver_register_runs agc_driver_register_runs_draw_pipeline agc_driver_packet_cost)
+    set_tests_properties(${agcRegisterRunsTests} PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 120 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    set_property(TEST agc_driver_register_runs_draw_pipeline APPEND PROPERTY ENVIRONMENT "APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1")
+    if(WIN32)
+        set_property(TEST ${agcRegisterRunsTests} APPEND PROPERTY ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

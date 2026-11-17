@@ -59,6 +59,14 @@ bool orderedFills() {
     return ordered;
 }
 
+bool registerRunOpcode(std::uint32_t opcode) {
+    return opcode == 0x69 || opcode == 0x76 || opcode == 0x79;
+}
+
+bool registerRuns() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RegisterRuns) && !APS5_ENABLE_TIMING_LOG && !PerformanceTrace::Recording() && !CaptureTrace::Enabled();
+}
+
 bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode) {
     if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
     if (Pm4::DrawOpcode(opcode)) return true;
@@ -299,6 +307,30 @@ void Driver::execute(Submission& submission) {
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (!predicated && registerRunOpcode(opcode) && !packetEpoch() && registerRuns()) {
+            flushBetweenPackets(submission.queue, header, false);
+            GuestMemory::SetCurrentPacket(opcode, submission.queue);
+            const bool ringNotes = submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled();
+            std::uint64_t run = 0;
+            auto runHeader = header;
+            while (true) {
+                const auto runOpcode = (runHeader >> 8u) & 0xffu;
+                const auto runCount = Pm4::PacketWords(runHeader);
+                if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | runOpcode, std::memory_order_relaxed);
+                if (ringNotes) noteRingPacket(submission.queue, submission.serial, runOpcode, runHeader);
+                Pm4::Execute(std::span(submission.commands).subspan(cursor, runCount), queue);
+                recent.Record(cursor);
+                if (profilePackets) ++packetProfile.byOpcode[runOpcode].first;
+                ++run;
+                cursor += runCount;
+                if (cursor >= submission.commands.size()) break;
+                if (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) break;
+                runHeader = submission.commands[cursor];
+                if (!registerRunOpcode((runHeader >> 8u) & 0xffu) || (Pm4::Predicated(runHeader) && queue.predication.operation != 0)) break;
+            }
+            packetsDone.fetch_add(run);
+            continue;
+        }
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);

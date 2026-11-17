@@ -28,6 +28,7 @@ enum class RuntimeSwitch : std::size_t {
     NoTargetMemoOverlapCache,
     LeanFront,
     LeanListDirect,
+    RegisterRuns,
     Count,
 };
 
