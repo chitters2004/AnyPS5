@@ -37,6 +37,7 @@ struct RingOrder {
 
 thread_local RingOrder ringOrder;
 thread_local std::uint32_t submissionDepth = 0;
+thread_local std::chrono::steady_clock::time_point* outsideMark = nullptr;
 
 void noteRingPacket(std::uint32_t queueId, std::uint64_t serial, std::uint32_t opcode, std::uint32_t header) {
     if (ringOrder.queue != queueId || ringOrder.serial != serial) ringOrder = {queueId, serial, false};
@@ -176,16 +177,28 @@ void Driver::execute(Submission& submission) {
         }
     } submissionClock{timedSubmission, outermostSubmission, outermostSubmission ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     struct OutsideClock {
+        bool outermost;
         bool timed;
         std::chrono::steady_clock::time_point last;
-        void Mark(OutsidePart part) {
+        std::chrono::steady_clock::time_point* at;
+        OutsideClock(bool outermost, bool nested, std::chrono::steady_clock::time_point start) : outermost(outermost), timed(outermost || (nested && outsideMark != nullptr)), last(start), at(outermost ? &last : outsideMark) {
+            if (outermost) outsideMark = &last;
+            else Mark(OutsidePart::RewindTail, true);
+        }
+        OutsideClock(const OutsideClock&) = delete;
+        OutsideClock& operator=(const OutsideClock&) = delete;
+        void Mark(OutsidePart part) { Mark(part, outermost && part != OutsidePart::RewindTail); }
+        void Mark(OutsidePart part, bool counted) {
             if (!timed) return;
             const auto now = std::chrono::steady_clock::now();
-            ThreadPhases::AddOutside(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count()));
-            last = now;
+            ThreadPhases::AddOutside(part, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - *at).count()), counted);
+            *at = now;
         }
-        ~OutsideClock() { Mark(OutsidePart::Teardown); }
-    } outside{outermostSubmission, submissionClock.start};
+        ~OutsideClock() {
+            Mark(OutsidePart::Teardown);
+            if (outermost) outsideMark = nullptr;
+        }
+    } outside(outermostSubmission, timedSubmission && !outermostSubmission, submissionClock.start);
     auto* submissionTiming = includeTimingSubmission(submission, true);
     struct FlipHold {
         Driver& driver;
@@ -316,7 +329,7 @@ void Driver::execute(Submission& submission) {
     } settleFinisher{submission.queue == 0};
     std::size_t nextSegment = 0;
     auto* const executingPacket = workerPacket();
-    const bool timedPackets = outermostSubmission;
+    const bool timedPackets = outside.timed;
     outside.Mark(OutsidePart::Setup);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         struct PacketClock {
@@ -695,7 +708,7 @@ void Driver::execute(Submission& submission) {
         if (timedPackets) {
             const auto endDrainEnd = std::chrono::steady_clock::now();
             ThreadPhases::AddEndDrain(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(endDrainEnd - endDrainStart).count()));
-            outside.last = endDrainEnd;
+            if (outside.timed) *outside.at = endDrainEnd;
         }
         if (traced) BoundaryTrace::Note(BoundaryEvent::DrainEnd);
         outside.Mark(OutsidePart::DrainTrace);

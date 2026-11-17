@@ -220,6 +220,18 @@ void RewindTailsCountOnce() {
     Require(std::atomic_ref<std::uint32_t>(done).load() == 1, "the last rewind tail did not run");
     Require(totals.submissions == 1, "one submission with " + std::to_string(Tails) + " nested rewind tails was timed " + std::to_string(totals.submissions) + " times: " + text);
     Require(totals.busyNs <= totals.windowNs, "the worker's busy time counts nested rewind tails more than once: " + text);
+    using AgcDriver::DriverDetail::OutsidePart;
+    const auto part = [](OutsidePart which) { return static_cast<std::size_t>(which); };
+    std::uint64_t timedNs = 0;
+    for (const auto ns : totals.packetNs) timedNs += ns;
+    std::uint64_t partsNs = 0;
+    for (const auto ns : totals.outsideNs) partsNs += ns;
+    Require(totals.outsideCounts[part(OutsidePart::RewindTail)] == Tails && totals.outsideCounts[part(OutsidePart::Loop)] == 1 && totals.outsideCounts[part(OutsidePart::Teardown)] == 1, "the " + std::to_string(Tails) + " nested rewind tails were not counted once per tail inside one timed submission with one packet loop and one teardown: " + text);
+    Require(totals.outsideNs[part(OutsidePart::Loop)] >= timedNs + DrawNs(totals, PhaseThread::Worker), "the packet loop is shorter than the packets and draws inside it, so the nested tails' packets were charged to the rewind tail instead of the loop: " + text);
+    Require(partsNs + totals.endDrainNs <= totals.busyNs, "the submission parts add up past the worker's busy time, so a nested tail's time was counted twice: " + text);
+    Require(text.find("between packets -") == std::string::npos, "the time between packets is negative: " + text);
+    Require(totals.packets[0x3c] == Tails && totals.packets[0x59] == Tails, "the nested rewind tails' packets were not timed by opcode once each: " + text);
+    Require(totals.outsideNs[part(OutsidePart::Loop)] - timedNs - DrawNs(totals, PhaseThread::Worker) < totals.packetNs[0x3c], "the time between packets is larger than the gate waits inside the nested tails' packets, so their packets were left untimed: " + text);
 }
 
 }

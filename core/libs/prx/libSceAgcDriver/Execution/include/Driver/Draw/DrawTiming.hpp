@@ -89,7 +89,7 @@ public:
     static void AddPacketDrain(std::uint64_t ns);
     static void AddEndDrain(std::uint64_t ns);
     static void AddFinisherRoomWait(std::uint64_t ns);
-    static void AddOutside(OutsidePart part, std::uint64_t ns);
+    static void AddOutside(OutsidePart part, std::uint64_t ns, bool counted = true);
     static ThreadPhaseTotals Take();
     static std::string Text(const ThreadPhaseTotals& totals);
     static std::string PacketText(const ThreadPhaseTotals& totals);

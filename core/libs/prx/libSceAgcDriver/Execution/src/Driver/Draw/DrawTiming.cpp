@@ -139,11 +139,11 @@ void ThreadPhases::AddFinisherRoomWait(std::uint64_t ns) {
     phaseRoomWaits.fetch_add(1, std::memory_order_relaxed);
 }
 
-void ThreadPhases::AddOutside(OutsidePart part, std::uint64_t ns) {
+void ThreadPhases::AddOutside(OutsidePart part, std::uint64_t ns, bool counted) {
     const auto index = static_cast<std::size_t>(part);
     if (index >= ThreadPhaseTotals::OutsideParts) return;
     phaseOutsideNs[index].fetch_add(ns, std::memory_order_relaxed);
-    phaseOutsideCounts[index].fetch_add(1, std::memory_order_relaxed);
+    if (counted) phaseOutsideCounts[index].fetch_add(1, std::memory_order_relaxed);
 }
 
 ThreadPhaseTotals ThreadPhases::Take() {
