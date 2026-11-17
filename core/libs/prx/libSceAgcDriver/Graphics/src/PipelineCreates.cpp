@@ -33,6 +33,18 @@ void PipelineCreates::Note(PipelineCreateKind kind, bool inDraw, PipelineCacheOu
     }
 }
 
+void PipelineCreates::NoteWait(std::size_t part, bool inDraw, double ms) {
+    if (part >= 4) return;
+    std::lock_guard lock(mutex);
+    ++counts.waited[inDraw ? 1 : 0][part];
+    counts.waitedMs[inDraw ? 1 : 0][part] += ms;
+}
+
+void PipelineCreates::NoteDuplicate() {
+    std::lock_guard lock(mutex);
+    ++counts.duplicates;
+}
+
 PipelineCreates::Report PipelineCreates::Take() {
     std::lock_guard lock(mutex);
     const auto report = counts;
@@ -67,6 +79,19 @@ std::string PipelineCreates::Line(const Report& report) {
         any = true;
     }
     if (!any) text += " none";
+    text += "; in-flight parts waited for:";
+    bool waited = false;
+    for (std::size_t side = 2; side-- > 0;) {
+        for (std::size_t part = 0; part < 4; ++part) {
+            if (report.waited[side][part] == 0) continue;
+            std::snprintf(item, sizeof(item), "%s %s %s %llu %.1f ms", waited ? "," : "", side == 1 ? "in committed draws" : "outside draws", PipelineCreateKindNames[part], static_cast<unsigned long long>(report.waited[side][part]), report.waitedMs[side][part]);
+            text += item;
+            waited = true;
+        }
+    }
+    if (!waited) text += " none";
+    std::snprintf(item, sizeof(item), "; duplicate parts built %llu", static_cast<unsigned long long>(report.duplicates));
+    text += item;
     if (total == 0) text += " (no pipelines created)";
     return text;
 }

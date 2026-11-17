@@ -37,6 +37,15 @@ void CountsBySideKindAndOutcome() {
     Require(report.bySite[0][Index(PipelineCreateKind::OptimizedRelink)].count == 1 && report.bySite[1][Index(PipelineCreateKind::OptimizedRelink)].count == 0, "a create outside draws is counted in them");
     const auto rect = static_cast<std::size_t>(MonolithicReason::RectList);
     Require(report.reasons[rect] == 2 && report.reasonMs[rect] == 201.0, "monolithic reasons are not counted");
+    creates.NoteWait(Index(PipelineCreateKind::FragmentShaderPart), true, 30.0);
+    creates.NoteWait(Index(PipelineCreateKind::FragmentShaderPart), true, 12.0);
+    creates.NoteWait(Index(PipelineCreateKind::VertexInputPart), false, 1.5);
+    creates.NoteWait(4, true, 1.0);
+    creates.NoteDuplicate();
+    const auto waits = creates.Take();
+    Require(waits.waited[1][Index(PipelineCreateKind::FragmentShaderPart)] == 2 && waits.waitedMs[1][Index(PipelineCreateKind::FragmentShaderPart)] == 42.0 && waits.waited[0][Index(PipelineCreateKind::VertexInputPart)] == 1 && waits.duplicates == 1, "in-flight waits or duplicates are not counted by side and part");
+    const auto waitLine = PipelineCreates::Line(waits);
+    Require(waitLine.find("; in-flight parts waited for: in committed draws fragment part 2 42.0 ms, outside draws vertex-input part 1 1.5 ms; duplicate parts built 1") != std::string::npos, "the line does not give the in-flight waits and duplicates: " + waitLine);
     const auto again = creates.Take();
     Require(again.bySite[1][Index(PipelineCreateKind::FragmentShaderPart)].count == 0 && again.reasons[rect] == 0, "Take does not reset the window");
     const auto line = PipelineCreates::Line(report);
@@ -50,7 +59,7 @@ void CountsBySideKindAndOutcome() {
 void EmptyWindowSaysSo() {
     PipelineCreates creates;
     const auto line = PipelineCreates::Line(creates.Take());
-    Require(line == "[pipeline-creates] 10 s: in committed draws 0; outside draws 0; monolithic because: none (no pipelines created)", "an empty window prints: " + line);
+    Require(line == "[pipeline-creates] 10 s: in committed draws 0; outside draws 0; monolithic because: none; in-flight parts waited for: none; duplicate parts built 0 (no pipelines created)", "an empty window prints: " + line);
 }
 
 }

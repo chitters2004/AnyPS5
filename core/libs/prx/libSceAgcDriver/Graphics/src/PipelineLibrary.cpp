@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -196,7 +197,9 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         auto& building = device.building[part];
         if (building.contains(key)) {
             ++device.counters.waited[part];
+            const auto waitStarted = std::chrono::steady_clock::now();
             store.partBuilt.wait(lock, [&] { return !building.contains(key); });
+            if (PipelineCreatesProfiled()) DevicePipelineCreates().NoteWait(part, InCommittedDraw(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count());
         }
         if (const auto found = cache.find(key); found != cache.end()) {
             libraries.push_back(found->second);
@@ -260,6 +263,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             ++device.counters.duplicates;
+            if (PipelineCreatesProfiled()) DevicePipelineCreates().NoteDuplicate();
             device.destroyPipeline(context.device, handle, nullptr);
             libraries.push_back(raced->second);
             continue;

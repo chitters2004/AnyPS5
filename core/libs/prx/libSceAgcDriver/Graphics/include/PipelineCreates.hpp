@@ -37,9 +37,14 @@ public:
         std::array<std::array<Cell, Kinds>, 2> bySite{};
         std::array<std::uint64_t, Reasons> reasons{};
         std::array<double, Reasons> reasonMs{};
+        std::array<std::array<std::uint64_t, 4>, 2> waited{};
+        std::array<std::array<double, 4>, 2> waitedMs{};
+        std::uint64_t duplicates = 0;
     };
 
     void Note(PipelineCreateKind kind, bool inDraw, PipelineCacheOutcome outcome, double ms, MonolithicReason reason = MonolithicReason::Count);
+    void NoteWait(std::size_t part, bool inDraw, double ms);
+    void NoteDuplicate();
     Report Take();
 
     static std::string Line(const Report& report);
