@@ -1,6 +1,7 @@
 if(BUILD_TESTING)
     add_test_executable(agc_driver_bounded_fifo_tests tests/BoundedFifo.cpp)
     target_include_directories(agc_driver_bounded_fifo_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    configure_host_test_executable(agc_driver_bounded_fifo_tests)
     add_test(NAME agc_driver_bounded_fifo COMMAND agc_driver_bounded_fifo_tests)
     set_tests_properties(agc_driver_bounded_fifo PROPERTIES TIMEOUT 20)
 endif()
