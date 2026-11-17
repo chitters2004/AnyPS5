@@ -3068,7 +3068,7 @@ std::array<std::array<std::uint64_t, static_cast<std::size_t>(PacketWrites::Coun
 }
 
 bool ProofBreakScoped(ProofBreakSite site) {
-    if (site == ProofBreakSite::DriverStore || site == ProofBreakSite::WriteBack || site == ProofBreakSite::WriteBackIfHeld) return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoScopedDriverStores);
+    if (site == ProofBreakSite::DriverStore || site == ProofBreakSite::WriteBackIfHeld) return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoScopedDriverStores);
     return site == ProofBreakSite::Written || site == ProofBreakSite::Packet || site == ProofBreakSite::PacketCovered || site == ProofBreakSite::GpuLabel || site == ProofBreakSite::HeldState;
 }
 
