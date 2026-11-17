@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -16,6 +17,7 @@
 #include <cstring>
 #include <iostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -65,8 +67,12 @@ void Run(AgcDriver::VulkanDevice& device, GuestBlock& guest, std::uint32_t waveS
     };
     request.useCache = false;
     const auto result = ShaderRecompiler::Recompile(request);
+    const auto proof = AgcDriver::GuestMemory::ProofSerial();
     device.Dispatch(result, groups, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{address, address + words * 4u}}};
+    const auto census = AgcDriver::GuestMemory::ProofBreakCensusSince(proof, stored);
+    Require(census.complete && (census.overlapSites & (1u << static_cast<unsigned>(AgcDriver::GuestMemory::ProofBreakSite::HeldState))) != 0, "a global store recorded off the draw committer broke no proof over the addresses it can reach");
     for (std::size_t index = 0; index < BlockBytes / 4u; ++index) {
         const auto original = static_cast<std::uint32_t>(index * 0x9e3779b1u);
         const auto expected = index < words ? (original & keep) | value : original;
