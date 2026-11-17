@@ -2457,9 +2457,9 @@ void UpdateComparedPages(std::uint64_t address, std::span<const std::byte> bytes
     for (auto found = comparedPages.lower_bound(first); found != comparedPages.end() && found->first + WritePageBytes <= address + bytes.size(); ++found) found->second = {HashPage(bytes.data() + (found->first - address)), true};
 }
 
-void ChangedComparedPages(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed) {
+std::size_t ChangedComparedPages(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& changed) {
     changed.clear();
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     const auto end = address + bytes;
     std::vector<std::pair<std::uint64_t, ComparedPage>> pages;
     {
@@ -2478,16 +2478,17 @@ void ChangedComparedPages(std::uint64_t address, std::size_t bytes, std::vector<
         if (!changed.empty() && changed.back().second == begin) changed.back().second = stop;
         else changed.emplace_back(begin, stop);
     }
-    if (pages.empty()) return;
+    if (pages.empty()) return 0;
     if (const auto hook = comparedDecisionHookForTest.load(std::memory_order_acquire)) hook();
     auto& tracker = Tracker();
     const auto trackerLock = lockTracker(tracker);
     tracker.initialize();
-    if (!tracker.watched) return;
+    if (!tracker.watched) return pages.size() * WritePageBytes;
     const std::lock_guard lock(comparedMutex);
     for (const auto page : addresses) {
         if (tracker.covers(page, WritePageBytes)) comparedPages.erase(page);
     }
+    return pages.size() * WritePageBytes;
 }
 
 void SetComparedDecisionHookForTest(void (*hook)()) {

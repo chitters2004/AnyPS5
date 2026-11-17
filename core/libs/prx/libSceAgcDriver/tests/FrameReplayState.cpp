@@ -427,6 +427,24 @@ void unwatchComparedRacePage() {
     std::fill_n(comparedRacePage + 32, 16, std::byte{0x5c});
 }
 
+void testManyComparedPages() {
+    constexpr std::size_t Page = 4096;
+    constexpr std::size_t Pages = 4096;
+    auto* bytes = allocate(Pages * Page);
+    std::fill_n(bytes, Pages * Page, std::byte{0});
+    struct ComparedReset {
+        ~ComparedReset() { AgcDriver::GuestMemory::SetLeftWatchCompare(false); }
+    } reset;
+    AgcDriver::GuestMemory::SetLeftWatchCompare(true);
+    AgcDriver::GuestMemory::SeedComparedPages(address(bytes), std::span<const std::byte>(bytes, Pages * Page));
+    for (const std::size_t page : {std::size_t{0}, Pages / 2 + 1, Pages - 1}) bytes[page * Page + 7] = std::byte{0x3c};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changed;
+    const auto hashed = AgcDriver::GuestMemory::ChangedComparedPages(address(bytes), Pages * Page, changed);
+    check(hashed == Pages * Page, "not every compared page was hashed");
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> expected{{address(bytes), address(bytes) + Page}, {address(bytes) + (Pages / 2 + 1) * Page, address(bytes) + (Pages / 2 + 2) * Page}, {address(bytes) + (Pages - 1) * Page, address(bytes) + Pages * Page}};
+    check(changed == expected, "the stores to the first, a middle and the last of 4096 compared pages were not each reported once");
+}
+
 void testComparedUnwatchRace() {
     constexpr std::size_t Size = 1u << 20;
     constexpr std::size_t Page = 4096;
@@ -1182,6 +1200,7 @@ int main(int argc, char** argv) {
         else if (mode == "store_between_walks") testStoreBetweenWalks(directory);
         else if (mode == "store_after_unwatch") testStoreAfterUnwatch(directory);
         else if (mode == "compared_unwatch_race") testComparedUnwatchRace();
+        else if (mode == "compared_pages_many") testManyComparedPages();
         else if (mode == "store_window") testStoreWindow(directory);
         else if (mode == "store_window_unwritten") testStoreWindowUnwritten(directory);
         else if (mode == "store_window_stopped") testStoreWindowStopped(directory);

@@ -111,6 +111,8 @@ private:
     std::uint64_t startGeneration = 0;
     std::uint64_t deltaGroups = 0;
     std::uint64_t deltaBytes = 0;
+    std::uint64_t comparedBytesHashed = 0;
+    double comparedHashSeconds = 0;
     std::uint64_t snapshotBytes = 0;
     std::uint64_t recordedCalls = 0;
     std::uint64_t startAttempts = 0;

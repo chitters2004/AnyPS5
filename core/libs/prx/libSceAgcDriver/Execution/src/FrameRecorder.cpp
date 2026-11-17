@@ -450,7 +450,9 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     for (auto& span : spans) {
         span.since = GuestMemory::CollectWrittenBlocks(span.address, static_cast<std::size_t>(span.bytes), span.since, written);
         blocks.insert(blocks.end(), written.begin(), written.end());
-        GuestMemory::ChangedComparedPages(span.address, static_cast<std::size_t>(span.bytes), written);
+        const auto hashing = std::chrono::steady_clock::now();
+        comparedBytesHashed += GuestMemory::ChangedComparedPages(span.address, static_cast<std::size_t>(span.bytes), written);
+        comparedHashSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - hashing).count();
         blocks.insert(blocks.end(), written.begin(), written.end());
     }
     std::ranges::sort(blocks);
@@ -659,6 +661,7 @@ void FrameRecorder::finish() {
     writer->WriteCall(end);
     writeReferenceFrames();
     writer->Finish(header());
+    std::fprintf(stderr, "[frame-capture] pages outside the write watch: %.1f MiB hashed in %.2f s over %llu memory deltas\n", static_cast<double>(comparedBytesHashed) / (1024.0 * 1024.0), comparedHashSeconds, static_cast<unsigned long long>(deltaGroups));
     std::fprintf(stderr, "[frame-capture] %llu frames, %llu calls, %llu memory deltas (%.1f MiB), %.1f MiB raw, %.1f MiB stored in %s\n", static_cast<unsigned long long>(recordedFrames),
                  static_cast<unsigned long long>(recordedCalls), static_cast<unsigned long long>(deltaGroups), static_cast<double>(deltaBytes) / (1024.0 * 1024.0),
                  static_cast<double>(writer->RawBytes()) / (1024.0 * 1024.0), static_cast<double>(writer->StoredBytes()) / (1024.0 * 1024.0), directory.string().c_str());
