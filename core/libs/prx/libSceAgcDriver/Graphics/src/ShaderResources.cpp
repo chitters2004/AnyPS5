@@ -5341,19 +5341,21 @@ void ShaderResources::noteUncertified(UncertifiedCause cause, CertifyRefusal ref
     epochServed = false;
 }
 
-void ShaderResources::reportRangeDisagreement(const ProofWorkTrace& work) const {
+void ShaderResources::reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const {
     std::string ranges;
     for (const auto& [begin, end] : proofRanges) {
         char text[64];
         std::snprintf(text, sizeof(text), "%s0x%llx+0x%llx", ranges.empty() ? "" : ", ", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
         ranges += text;
     }
-    std::fprintf(stderr, "[epoch-proofs]   work skipped: %llu CPU write syncs, %llu storage image uploads; proof ranges: %s\n", static_cast<unsigned long long>(work.Count(ProofWork::CpuWriteSync)), static_cast<unsigned long long>(work.Count(ProofWork::StorageUpload)), ranges.empty() ? "none" : ranges.c_str());
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofPath::Count)> paths{"fast", "own objects refreshed", "full walk"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofFailure::Count)> failures{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
+    std::fprintf(stderr, "[epoch-proofs]   the full proof took the %s path%s%s%s%s; work skipped: %llu CPU write syncs, %llu storage image uploads; proof ranges: %s\n", paths[static_cast<std::size_t>(verified.path)], verified.failure != ProofFailure::None ? " after a fast-proof failure (" : "", verified.failure != ProofFailure::None ? failures[static_cast<std::size_t>(verified.failure)] : "", verified.failure != ProofFailure::None ? ")" : "", verified.audited ? ", audited" : "", static_cast<unsigned long long>(work.Count(ProofWork::CpuWriteSync)), static_cast<unsigned long long>(work.Count(ProofWork::StorageUpload)), ranges.empty() ? "none" : ranges.c_str());
     const auto describe = [&](const char* role, std::size_t index, const StorageTexture* image) {
         if (image == nullptr) return;
         StorageTexture::PendingQuery query{image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes(), image, nullptr, false};
         static_cast<void>(StorageTexture::ScanPending(std::span(&query, 1)));
-        std::fprintf(stderr, "[epoch-proofs]   %s %zu: image 0x%llx+0x%llx dcc 0x%llx, %u layers, cached %d, own results pending %d, other results pending over it %d, generation %llu (whole surface %llu)\n", role, index, static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<unsigned long long>(image->GuestBytes()), static_cast<unsigned long long>(image->Descriptor().dccAddress), image->ImageLayers(), image->Cached() ? 1 : 0, image->AnyLayerPending() ? 1 : 0, query.overlaps ? 1 : 0, static_cast<unsigned long long>(image->Generation()), static_cast<unsigned long long>(image->GenerationFor(image->Descriptor().baseAddress, image->GuestBytes())));
+        std::fprintf(stderr, "[epoch-proofs]   %s %zu: image 0x%llx+0x%llx dcc 0x%llx, %u layers, cached %d, own results pending %d, other results pending over it %d, version %llu, generation %llu (whole surface %llu)\n", role, index, static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<unsigned long long>(image->GuestBytes()), static_cast<unsigned long long>(image->Descriptor().dccAddress), image->ImageLayers(), image->Cached() ? 1 : 0, image->AnyLayerPending() ? 1 : 0, query.overlaps ? 1 : 0, static_cast<unsigned long long>(image->Version()), static_cast<unsigned long long>(image->Generation()), static_cast<unsigned long long>(image->GenerationFor(image->Descriptor().baseAddress, image->GuestBytes())));
     };
     for (std::size_t i = 0; i < textures.size(); ++i) {
         if (textures[i] != nullptr) describe("sampled texture's source", i, textures[i]->StorageSource());
@@ -5415,7 +5417,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                     const auto startSerial = GuestMemory::ProofSerial();
                     GuestMemory::ProofBreakTrace trace;
                     ProofWorkTrace work;
-                    const bool ok = revalidateFull(shaders, report);
+                    ProofReport verified{};
+                    const bool ok = revalidateFull(shaders, report != nullptr ? report : &verified);
+                    if (report != nullptr) verified = *report;
                     const bool stored = trace.Count() != 0;
                     const bool worked = work.Total() != 0;
                     const bool concurrent = !stored && GuestMemory::ProofSerial() != startSerial;
@@ -5430,7 +5434,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                         if (continues || rangeDisagreementsShown.fetch_add(1, std::memory_order_relaxed) < 8) {
                             std::fprintf(stderr, "[epoch-proofs] %s: the full proof behind a range-version exit %s (set %p, %s, %zu ranges; proved epoch %llu proof %llu pending %llu releases %llu, now epoch %llu proof %llu pending %llu releases %llu; generation %llu; %llu breaks, %llu units of work)\n", continues ? "range-version disagreement, range versions stay on" : "range versions off for the run", !ok ? "failed" : stored ? "stored" : "did work", static_cast<const void*>(this), epochMoved ? "across epochs" : "same epoch", proofRanges.size(), static_cast<unsigned long long>(proved.epoch), static_cast<unsigned long long>(proved.proof), static_cast<unsigned long long>(proved.pending), static_cast<unsigned long long>(proved.releases), static_cast<unsigned long long>(stamp.epoch), static_cast<unsigned long long>(stamp.proof), static_cast<unsigned long long>(stamp.pending), static_cast<unsigned long long>(stamp.releases), static_cast<unsigned long long>(provedGeneration), static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(work.Total()));
                             for (const auto& entry : trace.Breaks()) std::fprintf(stderr, "[epoch-proofs]   break at %s 0x%llx+0x%llx\n", GuestMemory::ProofBreakSiteName(entry.site), static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes));
-                            if (continues) reportRangeDisagreement(work);
+                            if (continues) reportRangeDisagreement(work, verified);
                         }
                         proved.epoch = 0;
                         noteEpochProof(false, false, false);

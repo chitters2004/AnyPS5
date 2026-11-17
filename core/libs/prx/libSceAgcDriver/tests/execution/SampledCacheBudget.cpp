@@ -1370,6 +1370,27 @@ bool rangeVersionPendingTests(Context context) {
     const bool stored = exitTaken();
     std::fprintf(stderr, "range versions with other results pending: the foreign image stored, a new collect epoch: the exit %s\n", stored ? "was taken" : "was refused");
     Require(stored, "the template did not take the range-version exit once nothing stayed pending over its source");
+    if (std::getenv("APS5_VERIFY_RANGE_VERSIONS_CONTINUE") != nullptr) {
+        static std::uint64_t written = 0;
+        written = address;
+        ShaderResources::SetRangeVersionHookForTest([](ShaderResources::RangeVersionPoint at) {
+            if (at != ShaderResources::RangeVersionPoint::AfterRangeValidation || written == 0) return;
+            std::memset(reinterpret_cast<void*>(written + 8192u), 0x3c, 64u);
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(written, SurfaceBytes));
+            written = 0;
+        });
+        struct Unhook {
+            ~Unhook() { ShaderResources::SetRangeVersionHookForTest(nullptr); }
+        } unhook;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        static_cast<void>(exitTaken());
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        settle("the template did not take the epoch exit again after a disagreement under APS5_VERIFY_RANGE_VERSIONS_CONTINUE");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const bool after = exitTaken();
+        std::fprintf(stderr, "range versions with other results pending: after a disagreement, a new collect epoch: the exit %s\n", after ? "was taken" : "was refused");
+        Require(after, "range versions did not stay on after a disagreement under APS5_VERIFY_RANGE_VERSIONS_CONTINUE");
+    }
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
     return true;
 }
