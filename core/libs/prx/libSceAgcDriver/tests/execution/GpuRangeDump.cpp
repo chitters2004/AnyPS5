@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <system_error>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -288,7 +289,8 @@ int main() {
         const auto pid = getpid();
 #endif
         const auto path = std::filesystem::temp_directory_path() / ("aps5-gpu-ranges-" + std::to_string(pid) + ".txt");
-        std::filesystem::remove(path);
+        std::error_code stale;
+        std::filesystem::remove(path, stale);
         SetVariable("APS5_PROFILE_GPU_RANGES", path.string());
         SetVariable("APS5_PROFILE_GPU_DRAWS", "1");
         SetVariable("APS5_PROFILE_COMMIT_SHAPE", "1");
@@ -394,7 +396,8 @@ int main() {
         Require(!batches.empty() && batchRanges == batches.size(), "not every batch has its whole-batch range");
         Require(passes >= 1, "no draw class range was written");
         Require(draws == Draws, "expected one per-draw range for each of the " + std::to_string(Draws) + " draws, found " + std::to_string(draws));
-        std::filesystem::remove(path);
+        std::error_code removed;
+        std::filesystem::remove(path, removed);
         std::printf("gpu range dump tests passed (%zu batches, %zu passes, %zu draws)\n", batches.size(), passes, draws);
         return 0;
     } catch (const std::exception& error) {
