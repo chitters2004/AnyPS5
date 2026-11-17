@@ -1218,6 +1218,17 @@ void rangeVersionTests(Context context) {
         ShaderResources::SetRangeVersionHookForTest(nullptr);
         AgcDriver::GuestMemory::BumpCollectEpoch();
     });
+    ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t{1} << 30u);
+    struct Snapshots {
+        ~Snapshots() { ShaderResources::SetRangeWriteSnapshotBytesForTest(0); }
+    } snapshots;
+    last("a CPU write of the bytes already in the set and a new collect epoch", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        Require(!exitTaken(), "an unranged break did not force the full proof that takes the byte snapshots");
+        auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
     last("a CPU write into the set and a new collect epoch", [&] {
         std::memset(reinterpret_cast<void*>(address + 8192u), 0x6b, 4096u);
         AgcDriver::GuestMemory::BumpCollectEpoch();
