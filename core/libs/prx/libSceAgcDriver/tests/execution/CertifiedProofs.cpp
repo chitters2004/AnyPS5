@@ -91,7 +91,12 @@ public:
     explicit GuestBlocks(std::size_t bytes) : bytes(bytes) {
 #ifdef _WIN32
         base = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, BlockBytes));
-        if (base != nullptr) GuestArena::GuestArenaCommit_nid_postfix(base, bytes, PAGE_READWRITE, bytes);
+        if (base != nullptr) {
+            const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, static_cast<DWORD>(static_cast<std::uint64_t>(bytes) >> 32u), static_cast<DWORD>(bytes), nullptr);
+            Require(section != nullptr, "certified proofs: cannot create shared guest memory");
+            GuestArena::GuestArenaMap_nid_postfix(base, bytes, section, 0, PAGE_READWRITE);
+            CloseHandle(section);
+        }
 #else
         void* mapped = mmap(nullptr, bytes + BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mapped != MAP_FAILED) {
