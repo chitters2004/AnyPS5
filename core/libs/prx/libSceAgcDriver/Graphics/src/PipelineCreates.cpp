@@ -45,6 +45,34 @@ void PipelineCreates::NoteDuplicate() {
     ++counts.duplicates;
 }
 
+void PipelineCreates::NotePartMiss(std::size_t part, const PartOrigin& origin, bool inDraw) {
+    if (!inDraw || part < 1 || part > 2) return;
+    std::lock_guard lock(mutex);
+    auto cause = PartMissCause::NewModule;
+    if (const auto found = origins[part - 1].find(origin.module); found != origins[part - 1].end()) {
+        const auto& seen = found->second;
+        const auto any = [&](auto&& match) { return std::ranges::any_of(seen, match); };
+        if (!any([&](const PartOrigin& other) { return other.bindings == origin.bindings; })) cause = PartMissCause::Bindings;
+        else if (!any([&](const PartOrigin& other) { return other.bindings == origin.bindings && other.specialization == origin.specialization; })) cause = PartMissCause::Specialization;
+        else if (!any([&](const PartOrigin& other) { return other.bindings == origin.bindings && other.specialization == origin.specialization && other.context == origin.context; })) cause = PartMissCause::Context;
+        else cause = PartMissCause::State;
+    }
+    ++counts.missCauses[part - 1][static_cast<std::size_t>(cause)];
+}
+
+void PipelineCreates::NotePartBuilt(std::size_t part, const PartOrigin& origin, bool inDraw) {
+    if (part < 1 || part > 2) return;
+    std::lock_guard lock(mutex);
+    origins[part - 1][origin.module].push_back(origin);
+    if (!inDraw) unusedOutside[part - 1].insert(origin.key);
+}
+
+void PipelineCreates::NotePartHit(std::size_t part, const PartOrigin& origin, bool inDraw) {
+    if (!inDraw || part < 1 || part > 2) return;
+    std::lock_guard lock(mutex);
+    if (unusedOutside[part - 1].erase(origin.key) != 0) ++counts.prebuiltUsed[part - 1];
+}
+
 PipelineCreates::Report PipelineCreates::Take() {
     std::lock_guard lock(mutex);
     const auto report = counts;
@@ -91,6 +119,17 @@ std::string PipelineCreates::Line(const Report& report) {
     }
     if (!waited) text += " none";
     std::snprintf(item, sizeof(item), "; duplicate parts built %llu", static_cast<unsigned long long>(report.duplicates));
+    text += item;
+    text += "; part misses in committed draws by cause:";
+    for (std::size_t part = 0; part < 2; ++part) {
+        text += part == 0 ? " " : "; ";
+        text += PipelineCreateKindNames[part + 1];
+        for (std::size_t cause = 0; cause < Causes; ++cause) {
+            std::snprintf(item, sizeof(item), "%s %s %llu", cause == 0 ? "" : ",", PartMissCauseNames[cause], static_cast<unsigned long long>(report.missCauses[part][cause]));
+            text += item;
+        }
+    }
+    std::snprintf(item, sizeof(item), "; parts built outside draws first used in a committed draw: pre-raster part %llu, fragment part %llu", static_cast<unsigned long long>(report.prebuiltUsed[0]), static_cast<unsigned long long>(report.prebuiltUsed[1]));
     text += item;
     if (total == 0) text += " (no pipelines created)";
     return text;

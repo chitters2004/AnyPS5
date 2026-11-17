@@ -27,6 +27,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreates.hpp"
 #include "SceShaders.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
@@ -10017,6 +10019,68 @@ void pipelineLibraryDynamicRasterizerDiscardTests() {
     RuntimeSwitches::Assign(RuntimeSwitch::WideLibraryKeys, false);
 }
 
+void partMissCauseTests() {
+    using namespace AgcDriver::Graphics;
+    using AgcDriver::PartMissCause;
+    Require(AgcDriver::PipelineCreatesProfiled(), "part miss cause tests need APS5_PROFILE_COMMIT_SHAPE");
+    static_cast<void>(AgcDriver::DevicePipelineCreates().Take());
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    State state{};
+    ShaderRecompiler::RecompileResult vertex, fragment, specialized, respecialized, rebound, other;
+    vertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    specialized.spirv = makeModule({.fragment = true});
+    specialized.specialization = {{7u, 1u}};
+    respecialized.spirv = makeModule({.fragment = true});
+    respecialized.specialization = {{7u, 2u}};
+    other.spirv = makeModule({.fragment = true, .fragDepth = true});
+    vertex.variantId = 351;
+    fragment.variantId = 352;
+    specialized.variantId = 353;
+    other.variantId = 354;
+    respecialized.variantId = 355;
+    rebound.spirv = makeModule({.fragment = true});
+    rebound.bindings.push_back({});
+    rebound.bindings.back().binding = 3;
+    rebound.variantId = 356;
+    std::array<std::uint32_t, 1> firstLayout{1}, secondLayout{2};
+    PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, firstLayout, {}};
+    const auto prebuild = [&](const ShaderRecompiler::RecompileResult& pixel) {
+        const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &pixel, PipelinePushSlotBytes}}};
+        Require(Pipeline::Prebuild(context, state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped");
+    };
+    prebuild(fragment);
+    prebuild(specialized);
+    EnterCommittedDraw();
+    prebuild(fragment);
+    prebuild(respecialized);
+    prebuild(rebound);
+    prebuild(other);
+    resources.mainKey = secondLayout;
+    prebuild(other);
+    resources.mainKey = firstLayout;
+    context.conservativeRasterization = true;
+    state.conservativeRasterization = VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT;
+    prebuild(fragment);
+    LeaveCommittedDraw();
+    const auto report = AgcDriver::DevicePipelineCreates().Take();
+    const auto cause = [&](std::size_t part, PartMissCause value) { return report.missCauses[part][static_cast<std::size_t>(value)]; };
+    Require(report.prebuiltUsed[0] == 1 && report.prebuiltUsed[1] == 1, "the parts built before the draws were not counted once when a draw first used them");
+    Require(cause(1, PartMissCause::Specialization) == 1, "a fragment part that differs only in specialization values was not classified as such");
+    Require(cause(1, PartMissCause::NewModule) == 1, "a fragment part of a module never built was not classified as a new module");
+    Require(cause(0, PartMissCause::State) == 1, "a pre-raster part that differs only in rasterization state was not classified as fixed-function state");
+    std::uint64_t total = 0;
+    for (const auto& part : report.missCauses) for (const auto count : part) total += count;
+    Require(cause(1, PartMissCause::Context) == 1 && cause(0, PartMissCause::Context) == 1, "parts that differ only in their layout were not classified as such");
+    Require(cause(1, PartMissCause::Bindings) == 1, "a fragment part whose module binds other descriptors was not classified as such");
+    Require(total == 6, "draws that found their parts were counted as misses");
+    ClearPipelineLibraries(context.device);
+    Require(mock.live == 0, "part miss cause tests leaked Vulkan objects");
+}
+
 void pipelineLibraryClearWaitsForBuildTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -15350,6 +15414,11 @@ int main(int argc, char** argv) {
             pipelineLibraryDynamicDepthBiasTests();
             pipelineLibraryDynamicRasterizerDiscardTests();
             std::cout << "shader pipeline libraries are keyed only by the state their subset reads\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--part-miss-causes") {
+            partMissCauseTests();
+            std::cout << "part misses in committed draws are classified by cause\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {

@@ -59,7 +59,37 @@ void CountsBySideKindAndOutcome() {
 void EmptyWindowSaysSo() {
     PipelineCreates creates;
     const auto line = PipelineCreates::Line(creates.Take());
-    Require(line == "[pipeline-creates] 10 s: in committed draws 0; outside draws 0; monolithic because: none; in-flight parts waited for: none; duplicate parts built 0 (no pipelines created)", "an empty window prints: " + line);
+    Require(line == "[pipeline-creates] 10 s: in committed draws 0; outside draws 0; monolithic because: none; in-flight parts waited for: none; duplicate parts built 0; part misses in committed draws by cause: pre-raster part new module 0, other bindings 0, other specialization values 0, other layout or attachments 0, other fixed-function state 0; fragment part new module 0, other bindings 0, other specialization values 0, other layout or attachments 0, other fixed-function state 0; parts built outside draws first used in a committed draw: pre-raster part 0, fragment part 0 (no pipelines created)", "an empty window prints: " + line);
+}
+
+void PartMissesAreClassifiedAgainstBuiltParts() {
+    using AgcDriver::PartMissCause;
+    using AgcDriver::PartOrigin;
+    PipelineCreates creates;
+    const PartOrigin prebuilt{1, 2, 3, 4, 5};
+    creates.NotePartBuilt(2, prebuilt, false);
+    creates.NotePartMiss(2, {9, 2, 3, 4, 6}, true);
+    creates.NotePartMiss(2, {1, 7, 3, 4, 6}, true);
+    creates.NotePartMiss(2, {1, 2, 8, 4, 6}, true);
+    creates.NotePartMiss(2, {1, 2, 3, 9, 6}, true);
+    creates.NotePartMiss(2, {1, 2, 3, 4, 6}, true);
+    creates.NotePartMiss(2, {9, 2, 3, 4, 6}, false);
+    creates.NotePartMiss(1, {1, 2, 3, 4, 6}, true);
+    creates.NotePartMiss(0, {1, 2, 3, 4, 6}, true);
+    creates.NotePartHit(2, prebuilt, true);
+    creates.NotePartHit(2, prebuilt, true);
+    creates.NotePartBuilt(1, {1, 2, 3, 4, 5}, true);
+    creates.NotePartHit(1, {1, 2, 3, 4, 5}, true);
+    const auto report = creates.Take();
+    const auto cause = [](PartMissCause value) { return static_cast<std::size_t>(value); };
+    const auto& fragment = report.missCauses[1];
+    Require(fragment[cause(PartMissCause::NewModule)] == 1 && fragment[cause(PartMissCause::Bindings)] == 1 && fragment[cause(PartMissCause::Specialization)] == 1 && fragment[cause(PartMissCause::Context)] == 1 && fragment[cause(PartMissCause::State)] == 1, "fragment part misses are not classified by the first field that differs from a built part of the same module");
+    Require(report.missCauses[0][cause(PartMissCause::NewModule)] == 1, "a pre-raster miss is classified against fragment parts");
+    Require(report.prebuiltUsed[1] == 1 && report.prebuiltUsed[0] == 0, "a prebuilt part is counted once on its first use in a draw, and a part built in a draw is not counted as prebuilt");
+    const auto line = PipelineCreates::Line(report);
+    Require(line.find("fragment part new module 1, other bindings 1, other specialization values 1, other layout or attachments 1, other fixed-function state 1; parts built outside draws first used in a committed draw: pre-raster part 0, fragment part 1") != std::string::npos, "the line does not give the miss causes and prebuilt uses: " + line);
+    creates.NotePartMiss(2, {1, 2, 3, 4, 6}, true);
+    Require(creates.Take().missCauses[1][cause(PartMissCause::State)] == 1, "built parts are forgotten when the window is taken");
 }
 
 }
@@ -68,6 +98,7 @@ int main() {
     try {
         CountsBySideKindAndOutcome();
         EmptyWindowSaysSo();
+        PartMissesAreClassifiedAgainstBuiltParts();
         std::puts("pipeline creates tests passed");
         return 0;
     } catch (const std::exception& error) {

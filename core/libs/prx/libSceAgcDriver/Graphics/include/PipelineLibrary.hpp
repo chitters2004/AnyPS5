@@ -26,6 +26,9 @@ struct PipelineLibraryKeys {
     std::uint32_t fragmentSets = 0;
     bool narrow = false;
     bool fragmentPerSample = false;
+    std::array<std::uint64_t, 2> modules{};
+    std::array<std::uint64_t, 2> bindings{};
+    std::array<std::uint64_t, 2> specializations{};
 };
 
 std::span<const VkDynamicState> PipelineLibraryDynamicStates();

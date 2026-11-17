@@ -4,8 +4,11 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <set>
 #include <string>
+#include <vector>
 
 namespace AgcDriver {
 
@@ -19,10 +22,23 @@ inline constexpr std::array<const char*, static_cast<std::size_t>(MonolithicReas
 
 enum class PipelineCacheOutcome : std::uint8_t { Hit, Miss, Unknown };
 
+enum class PartMissCause : std::size_t { NewModule, Bindings, Specialization, Context, State, Count };
+
+inline constexpr std::array<const char*, static_cast<std::size_t>(PartMissCause::Count)> PartMissCauseNames{"new module", "other bindings", "other specialization values", "other layout or attachments", "other fixed-function state"};
+
+struct PartOrigin {
+    std::uint64_t module = 0;
+    std::uint64_t bindings = 0;
+    std::uint64_t specialization = 0;
+    std::uint64_t context = 0;
+    std::uint64_t key = 0;
+};
+
 class PipelineCreates {
 public:
     static constexpr std::size_t Kinds = static_cast<std::size_t>(PipelineCreateKind::Count);
     static constexpr std::size_t Reasons = static_cast<std::size_t>(MonolithicReason::Count);
+    static constexpr std::size_t Causes = static_cast<std::size_t>(PartMissCause::Count);
 
     struct Cell {
         std::uint64_t count = 0;
@@ -40,11 +56,16 @@ public:
         std::array<std::array<std::uint64_t, 4>, 2> waited{};
         std::array<std::array<double, 4>, 2> waitedMs{};
         std::uint64_t duplicates = 0;
+        std::array<std::array<std::uint64_t, Causes>, 2> missCauses{};
+        std::array<std::uint64_t, 2> prebuiltUsed{};
     };
 
     void Note(PipelineCreateKind kind, bool inDraw, PipelineCacheOutcome outcome, double ms, MonolithicReason reason = MonolithicReason::Count);
     void NoteWait(std::size_t part, bool inDraw, double ms);
     void NoteDuplicate();
+    void NotePartMiss(std::size_t part, const PartOrigin& origin, bool inDraw);
+    void NotePartBuilt(std::size_t part, const PartOrigin& origin, bool inDraw);
+    void NotePartHit(std::size_t part, const PartOrigin& origin, bool inDraw);
     Report Take();
 
     static std::string Line(const Report& report);
@@ -52,6 +73,8 @@ public:
 private:
     std::mutex mutex;
     Report counts;
+    std::array<std::map<std::uint64_t, std::vector<PartOrigin>>, 2> origins;
+    std::array<std::set<std::uint64_t>, 2> unusedOutside;
 };
 
 bool PipelineCreatesProfiled();

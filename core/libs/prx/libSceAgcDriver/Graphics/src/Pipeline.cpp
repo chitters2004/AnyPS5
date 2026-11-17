@@ -437,6 +437,15 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         const auto identity = shader.program->Identity();
         if (shader.stage == Stage::Geometry || identity.Empty()) return false;
         auto& key = shader.stage == Stage::Fragment ? keys.fragmentShader : keys.preRasterization;
+        const std::size_t subset = shader.stage == Stage::Fragment ? 1u : 0u;
+        const auto mix = [](std::uint64_t& hash, std::uint64_t value) { hash = (hash ^ value) * 0x100000001b3ull + 0x9e3779b97f4a7c15ull; };
+        const auto module = shader.program->spirv.ContentHash();
+        mix(keys.modules[subset], module.low);
+        mix(keys.modules[subset], module.high);
+        for (const auto& binding : shader.program->bindings) mix(keys.bindings[subset], binding.descriptorSet | (static_cast<std::uint64_t>(binding.binding) << 16u) | (static_cast<std::uint64_t>(binding.kind) << 40u) | (static_cast<std::uint64_t>(binding.count) << 48u));
+        mix(keys.bindings[subset], shader.program->bindings.size());
+        for (const auto& constant : shader.program->specialization) mix(keys.specializations[subset], constant.id | (static_cast<std::uint64_t>(constant.value) << 32u));
+        mix(keys.specializations[subset], shader.program->specialization.size());
         appendKey(key, shader.stage);
         appendKey(key, identity.low);
         appendKey(key, identity.high);

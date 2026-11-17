@@ -41,6 +41,12 @@ constexpr std::array<VkDynamicState, 15> dynamicStates{
 
 using Key = std::vector<std::byte>;
 
+std::uint64_t keyHash(const Key& key) {
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    for (const auto byte : key) hash = (hash ^ static_cast<std::uint64_t>(byte)) * 0x100000001b3ull;
+    return hash;
+}
+
 struct DeviceLibraries {
     PFN_vkDestroyPipeline destroyPipeline = nullptr;
     PFN_vkDestroyPipelineLayout destroyLayout = nullptr;
@@ -195,6 +201,8 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         key.push_back(static_cast<std::byte>(optimize));
         auto& cache = device.parts[part];
         auto& building = device.building[part];
+        const bool traced = (part == 1 || part == 2) && PipelineCreatesProfiled();
+        const auto origin = traced ? PartOrigin{keys.modules[part - 1], keys.bindings[part - 1], keys.specializations[part - 1], keyHash(*contextKeys[part]), keyHash(key)} : PartOrigin{};
         if (building.contains(key)) {
             ++device.counters.waited[part];
             const auto waitStarted = std::chrono::steady_clock::now();
@@ -202,9 +210,11 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             if (PipelineCreatesProfiled()) DevicePipelineCreates().NoteWait(part, InCommittedDraw(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStarted).count());
         }
         if (const auto found = cache.find(key); found != cache.end()) {
+            if (traced) DevicePipelineCreates().NotePartHit(part, origin, InCommittedDraw());
             libraries.push_back(found->second);
             continue;
         }
+        if (traced) DevicePipelineCreates().NotePartMiss(part, origin, InCommittedDraw());
         building.insert(key);
         struct InFlight {
             LibraryStore& store;
@@ -269,6 +279,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
+        if (traced) DevicePipelineCreates().NotePartBuilt(part, origin, InCommittedDraw());
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {
