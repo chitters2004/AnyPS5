@@ -2316,17 +2316,20 @@ void eachPage(std::uint64_t address, std::size_t bytes, const Each& each) {
 }
 
 std::vector<std::optional<std::uint64_t>> hashGuestPages(std::span<const std::uint64_t> pages) {
-    std::vector<std::optional<std::uint64_t>> hashes(pages.size());
+    std::vector<std::uint8_t> readable(pages.size(), 0);
     for (std::size_t from = 0; from < pages.size();) {
         auto to = from + 1;
         while (to < pages.size() && pages[to] == pages[to - 1] + WritePageBytes) ++to;
         const bool whole = Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pages[from])), (to - from) * WritePageBytes);
-        for (auto index = from; index < to; ++index) {
-            const auto* pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(pages[index]));
-            if (whole || Accessible(pointer, WritePageBytes)) hashes[index] = HashPage(pointer);
-        }
+        for (auto index = from; index < to; ++index) readable[index] = whole || Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(pages[index])), WritePageBytes);
         from = to;
     }
+    std::vector<std::optional<std::uint64_t>> hashes(pages.size());
+    SplitPages(pages.size(), [&](std::size_t from, std::size_t to) {
+        for (auto index = from; index < to; ++index) {
+            if (readable[index] != 0) hashes[index] = HashPage(reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(pages[index])));
+        }
+    });
     return hashes;
 }
 
