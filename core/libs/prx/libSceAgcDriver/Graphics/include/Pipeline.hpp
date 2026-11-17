@@ -3,7 +3,10 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include <array>
+#include <atomic>
 #include <set>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -96,6 +99,10 @@ private:
     std::uint32_t boundColorAttachments = 0;
     bool depthBounds = false;
     bool depthBias = false;
+    bool fragmentShader = false;
+    std::uint64_t preRasterizationShaders = 0;
+    mutable std::atomic<bool> discardNoted{false};
+    void noteDiscardDraw(const State& state) const;
     bool libraries = false;
     bool narrowLibraryKeys = false;
     bool dynamicBlendConstants = false;
@@ -123,6 +130,19 @@ private:
 // doubles up to 4096 for a journal replay that does not fit and while pipelines it evicted keep
 // coming back; it never shrinks during a run. APS5_PIPELINE_STORE_ENTRIES fixes it. Debug aid:
 // APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
+struct DiscardDrawReport {
+    std::uint64_t draws = 0;
+    std::array<std::uint64_t, 2> discarded{};
+    std::array<std::uint64_t, 2> fragmentShader{};
+    std::array<std::uint64_t, 2> colorTarget{};
+    std::uint64_t shaderSets = 0;
+    std::uint64_t shaderSetsBoth = 0;
+};
+
+bool DiscardDrawsCounted();
+DiscardDrawReport TakeDiscardDraws();
+std::string DiscardDrawsLine(const DiscardDrawReport& report);
+
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storeHash = nullptr);

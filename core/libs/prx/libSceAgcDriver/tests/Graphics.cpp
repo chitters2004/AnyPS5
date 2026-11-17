@@ -10017,6 +10017,70 @@ void pipelineLibraryDynamicRasterizerDiscardTests() {
     RuntimeSwitches::Assign(RuntimeSwitch::WideLibraryKeys, false);
 }
 
+void discardDrawCounterTests() {
+    using namespace AgcDriver::Graphics;
+    Require(DiscardDrawsCounted(), "the discard draw counter test runs without APS5_PROFILE_DISCARD_DRAWS");
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.graphicsPipelineLibrary = true;
+    context.pipelineLinkTimeOptimization = false;
+    const auto functions = CommandStateLog::stateFunctions();
+    context.functions = &functions;
+    context.limits.maxColorAttachments = 1;
+    context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+    context.limits.maxFramebufferWidth = 64;
+    context.limits.maxFramebufferHeight = 64;
+    context.limits.maxFramebufferLayers = 1;
+    ShaderRecompiler::RecompileResult vertex, otherVertex, fragment;
+    vertex.spirv = makeModule({});
+    otherVertex.spirv = makeModule({});
+    fragment.spirv = makeModule({.fragment = true});
+    vertex.variantId = 331;
+    otherVertex.variantId = 332;
+    fragment.variantId = 333;
+    const std::array<CompiledShader, 2> shaded{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    const std::array<CompiledShader, 2> otherShaded{{{ShaderRecompiler::ShaderStage::Vertex, &otherVertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+    const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, {}, {}};
+    State drawn{};
+    drawn.viewport = {0.0f, 0.0f, 64.0f, 64.0f, 0.0f, 1.0f};
+    drawn.scissor = {{0, 0}, {64, 64}};
+    auto colored = drawn;
+    colored.color = {0, {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, 64u * 64u * 4u, 0xe4u};
+    colored.colors = {colored.color};
+    colored.hasColorTarget = true;
+    colored.blend.colorWriteMask = 15;
+    colored.blends = {colored.blend};
+    auto discarded = colored;
+    discarded.rasterizerDiscard = true;
+    auto captured = drawn;
+    captured.rasterizerDiscard = true;
+    captured.tessellationCapture = std::make_shared<TessellationCapture>();
+    static_cast<void>(TakeDiscardDraws());
+    {
+        Pipeline coloredPipeline(context, colored, VertexInputLayout{}, resources, shaded, VK_IMAGE_LAYOUT_GENERAL);
+        Pipeline discardedPipeline(context, discarded, VertexInputLayout{}, resources, shaded, VK_IMAGE_LAYOUT_GENERAL);
+        Pipeline capturedPipeline(context, captured, VertexInputLayout{}, resources, otherShaded, VK_IMAGE_LAYOUT_GENERAL);
+        CommandState tracker;
+        tracker.Begin(makeHandle<VkCommandBuffer>());
+        coloredPipeline.Continue(tracker, colored);
+        discardedPipeline.Continue(tracker, discarded);
+        discardedPipeline.Continue(tracker, discarded);
+        capturedPipeline.Continue(tracker, captured);
+        CommandStateLog::stateLog.clear();
+    }
+    const auto report = TakeDiscardDraws();
+    Require(report.draws == 4, "the discard draw counter counted " + std::to_string(report.draws) + " of 4 draws");
+    Require(report.discarded[0] == 2 && report.fragmentShader[0] == 2 && report.colorTarget[0] == 2, "discarded draws without a position export were not counted with their fragment shader and color target");
+    Require(report.discarded[1] == 1 && report.fragmentShader[1] == 1 && report.colorTarget[1] == 0, "a tessellation capture draw was not counted as one with a fragment shader and without a color target");
+    Require(report.shaderSets == 2 && report.shaderSetsBoth == 1, "the shader set drawn with and without discard was not found among " + std::to_string(report.shaderSets) + " sets");
+    const auto again = TakeDiscardDraws();
+    Require(again.draws == 0 && again.discarded[0] == 0 && again.shaderSetsBoth == 1, "taking the discard draw counts did not reset the per-period counts or kept no shader sets");
+    const auto line = DiscardDrawsLine(report);
+    Require(line == "[discard-draws] 10 s: 4 draws, discarded without a position export 2 (with a fragment shader 2, with a color target 2), discarded in tessellation capture 1 (with a fragment shader 1, with a color target 0); pre-rasterization shader sets since start 2, drawn both with and without discard 1", "the discard draw line differs: " + line);
+    ClearPipelineLibraries(context.device);
+    Require(mock.live == 0, "discard draw counter tests leaked Vulkan objects");
+}
+
 void pipelineLibraryClearWaitsForBuildTests() {
     using namespace AgcDriver::Graphics;
     mock = MockVulkan{};
@@ -15350,6 +15414,11 @@ int main(int argc, char** argv) {
             pipelineLibraryDynamicDepthBiasTests();
             pipelineLibraryDynamicRasterizerDiscardTests();
             std::cout << "shader pipeline libraries are keyed only by the state their subset reads\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--discard-draws") {
+            discardDrawCounterTests();
+            std::cout << "discard draws are counted by cause, fragment shader and color target\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-clear-waits-for-build") {

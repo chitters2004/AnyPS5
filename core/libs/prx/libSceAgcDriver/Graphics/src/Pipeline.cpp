@@ -555,6 +555,15 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout) {}
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) {
+            fragmentShader = true;
+            continue;
+        }
+        const auto variant = shader.program == nullptr ? 0u : shader.program->variantId != 0 ? shader.program->variantId : static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(shader.program));
+        preRasterizationShaders = (preRasterizationShaders ^ (static_cast<std::uint64_t>(shader.stage) + 1u)) * 0x100000001b3ull;
+        preRasterizationShaders = (preRasterizationShaders ^ variant) * 0x100000001b3ull;
+    }
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     dynamicBlendConstants = dynamicBlendConstantsNow();
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
@@ -1054,7 +1063,85 @@ void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, Vk
     Continue(recording, state, masked);
 }
 
+namespace {
+
+struct DiscardDrawCounts {
+    std::atomic<std::uint64_t> draws{0};
+    std::array<std::atomic<std::uint64_t>, 2> discarded{};
+    std::array<std::atomic<std::uint64_t>, 2> fragmentShader{};
+    std::array<std::atomic<std::uint64_t>, 2> colorTarget{};
+    std::atomic<std::chrono::steady_clock::rep> nextReport{0};
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint8_t> shaderSets;
+    std::uint64_t shaderSetsBoth = 0;
+};
+
+DiscardDrawCounts& discardDrawCounts() {
+    static auto* counts = new DiscardDrawCounts;
+    return *counts;
+}
+
+}
+
+bool DiscardDrawsCounted() {
+    static const bool counted = std::getenv("APS5_PROFILE_DISCARD_DRAWS") != nullptr;
+    return counted;
+}
+
+DiscardDrawReport TakeDiscardDraws() {
+    auto& counts = discardDrawCounts();
+    DiscardDrawReport report;
+    report.draws = counts.draws.exchange(0, std::memory_order_relaxed);
+    for (std::size_t cause = 0; cause < 2; ++cause) {
+        report.discarded[cause] = counts.discarded[cause].exchange(0, std::memory_order_relaxed);
+        report.fragmentShader[cause] = counts.fragmentShader[cause].exchange(0, std::memory_order_relaxed);
+        report.colorTarget[cause] = counts.colorTarget[cause].exchange(0, std::memory_order_relaxed);
+    }
+    std::lock_guard lock(counts.mutex);
+    report.shaderSets = counts.shaderSets.size();
+    report.shaderSetsBoth = counts.shaderSetsBoth;
+    return report;
+}
+
+std::string DiscardDrawsLine(const DiscardDrawReport& report) {
+    constexpr std::array<const char*, 2> causes{"without a position export", "in tessellation capture"};
+    std::string text = "[discard-draws] 10 s: " + std::to_string(report.draws) + " draws";
+    for (std::size_t cause = 0; cause < 2; ++cause) text += ", discarded " + std::string(causes[cause]) + " " + std::to_string(report.discarded[cause]) + " (with a fragment shader " + std::to_string(report.fragmentShader[cause]) + ", with a color target " + std::to_string(report.colorTarget[cause]) + ")";
+    text += "; pre-rasterization shader sets since start " + std::to_string(report.shaderSets) + ", drawn both with and without discard " + std::to_string(report.shaderSetsBoth);
+    return text;
+}
+
+void Pipeline::noteDiscardDraw(const State& state) const {
+    auto& counts = discardDrawCounts();
+    counts.draws.fetch_add(1, std::memory_order_relaxed);
+    if (state.rasterizerDiscard) {
+        const std::size_t cause = state.tessellationCapture != nullptr ? 1u : 0u;
+        counts.discarded[cause].fetch_add(1, std::memory_order_relaxed);
+        if (fragmentShader) counts.fragmentShader[cause].fetch_add(1, std::memory_order_relaxed);
+        if (colorAttachments != 0) counts.colorTarget[cause].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (!discardNoted.exchange(true, std::memory_order_relaxed)) {
+        std::lock_guard lock(counts.mutex);
+        auto& seen = counts.shaderSets[preRasterizationShaders];
+        const std::uint8_t bit = state.rasterizerDiscard ? 2u : 1u;
+        if ((seen & bit) == 0) {
+            seen |= bit;
+            if (seen == 3u) ++counts.shaderSetsBoth;
+        }
+    }
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    const auto period = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count();
+    auto due = counts.nextReport.load(std::memory_order_relaxed);
+    if (due == 0) {
+        counts.nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed);
+        return;
+    }
+    if (now < due || !counts.nextReport.compare_exchange_strong(due, now + period, std::memory_order_relaxed)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", DiscardDrawsLine(TakeDiscardDraws()).c_str());
+}
+
 void Pipeline::Continue(CommandState& recording, const State& state, const State* masked) const {
+    if (DiscardDrawsCounted()) noteDiscardDraw(state);
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
