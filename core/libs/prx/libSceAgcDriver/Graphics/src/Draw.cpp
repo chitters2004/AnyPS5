@@ -3840,6 +3840,17 @@ void noteTargetMemoRecorded(const Context& context) {
     if (moved != 0 && pendingOnly == stamp.proof && moved == StorageTexture::OwnPendingMoves() - stamp.ownPending) colors.recorded = after;
 }
 
+void printInvalidTarget(const State& state, std::span<const TargetBinding> targets, const TargetBinding& binding, TargetMemoEvent cause) {
+    static AgcDriver::Mutex printMutex;
+    static std::set<std::pair<std::uint64_t, std::size_t>> printed;
+    {
+        std::lock_guard lock(printMutex);
+        if (printed.size() >= 16u || !printed.emplace(binding.color.address, static_cast<std::size_t>(cause)).second) return;
+    }
+    const auto& color = binding.color;
+    std::fprintf(stderr, "[target-memo] %s target: color 0x%llx format %d tile %d element %u bytes extent %ux%u samples %u fmask 0x%llx dcc 0x%llx cmask 0x%llx resident %s; depth %s format %d samples %u; color targets %zu\n", TargetMemoEventName(cause), static_cast<unsigned long long>(color.address), static_cast<int>(color.format), static_cast<int>(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.samples, static_cast<unsigned long long>(color.fmaskAddress), static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), binding.resident == nullptr ? "none" : binding.resident->Cached() ? "cached" : "uncached", state.depth ? "bound" : "none", state.depth ? static_cast<int>(state.depth->format) : 0, state.depth ? state.depth->samples : 0u, targets.size());
+}
+
 void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
     ++targetMemoBuilds;
     noteTargetMemo(TargetMemoEvent::Build);
@@ -3847,8 +3858,8 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
     auto& depth = ThreadTargetMemo().depth;
     const bool enabled = TargetMemoEnabled() && proof.epoch != 0;
     const auto ineligible = [&](const TargetBinding& binding) {
-        if (binding.resident == nullptr || !binding.resident->Cached()) return TargetMemoEvent::InvalidUncached;
         if (binding.multisampled) return TargetMemoEvent::InvalidMultisampled;
+        if (binding.resident == nullptr || !binding.resident->Cached()) return TargetMemoEvent::InvalidUncached;
         if (binding.color.fmaskAddress != 0) return TargetMemoEvent::InvalidFmask;
         if (colorOverlapsDepth(state, binding)) return TargetMemoEvent::InvalidDepthOverlap;
         if (!metadataProved(binding.color)) return TargetMemoEvent::InvalidMetadata;
@@ -3865,6 +3876,7 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         if (targets.size() > 1) uncachedCounts().severalTargets.Add();
         lastUncachedTarget = binding.color.address;
     }
+    if (targetMemoProfiled && checked != 0 && (cause == TargetMemoEvent::InvalidUncached || cause == TargetMemoEvent::InvalidMultisampled)) printInvalidTarget(state, targets, targets[checked - 1], cause);
     colors.valid = enabled && !targets.empty() && cause == TargetMemoEvent::Count;
     if (!colors.valid) colors.invalidCause = cause;
     colors.recorded.reset();

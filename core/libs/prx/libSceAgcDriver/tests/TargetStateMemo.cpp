@@ -612,7 +612,12 @@ void resolveBetween(AgcDriver::VulkanDevice& device) {
     multisampled.coverageSamples = 4;
     const auto color = colorTarget();
     reset(device, color);
+    for (int repeat = 0; repeat < 3; ++repeat) draw(device, multisampled, {.scissor = Whole});
+    const MemoEvents repeated;
     draw(device, multisampled, {.scissor = Whole});
+    const auto counted = memoServes() && memoCounted() ? 1u : 0u;
+    requireMemoEvent(repeated, TargetMemoEvent::InvalidMultisampled, counted, "a repeated multisampled draw");
+    requireMemoEvent(repeated, TargetMemoEvent::InvalidUncached, 0u, "a repeated multisampled draw");
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.WaitIdle();
