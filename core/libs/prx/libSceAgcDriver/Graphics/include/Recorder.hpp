@@ -54,6 +54,7 @@ public:
         ReferenceFront,
         ReferenceBack,
         ColorWriteMask,
+        BlendConstants,
         SlotCount
     };
     static constexpr std::uint32_t Mask(Slot slot) { return 1u << slot; }
@@ -86,6 +87,7 @@ public:
     void SetStencilWriteMask(const Context& context, VkStencilFaceFlags faces, std::uint32_t mask);
     void SetStencilReference(const Context& context, VkStencilFaceFlags faces, std::uint32_t reference);
     void SetColorWriteMasks(const Context& context, std::span<const VkColorComponentFlags> masks);
+    void SetBlendConstants(const Context& context, const std::array<float, 4>& constants);
 
 private:
     struct StencilOps {
@@ -128,6 +130,7 @@ private:
     std::array<std::uint32_t, 2> writeMasks{};
     std::array<std::uint32_t, 2> references{};
     ColorWriteMasks colorWriteMasks{};
+    std::array<float, 4> blendConstants{};
 };
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the

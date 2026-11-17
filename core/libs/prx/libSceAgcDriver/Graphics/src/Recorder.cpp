@@ -1581,6 +1581,7 @@ std::uint32_t CommandState::DynamicSlots(std::span<const VkDynamicState> states)
         case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: slots |= Mask(WriteMaskFront) | Mask(WriteMaskBack); break;
         case VK_DYNAMIC_STATE_STENCIL_REFERENCE: slots |= Mask(ReferenceFront) | Mask(ReferenceBack); break;
         case VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT: slots |= Mask(ColorWriteMask); break;
+        case VK_DYNAMIC_STATE_BLEND_CONSTANTS: slots |= Mask(BlendConstants); break;
         default: throw std::runtime_error("AGC graphics: a pipeline declares a dynamic state the command tracker does not follow");
         }
     }
@@ -1662,6 +1663,10 @@ void CommandState::SetDepthBias(const Context& context, float constant, float cl
 void CommandState::SetDepthBounds(const Context& context, float minimum, float maximum) {
     const std::array<float, 2> bounds{minimum, maximum};
     apply(DepthBounds, &CommandState::depthBounds, bounds, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, minimum, maximum); });
+}
+
+void CommandState::SetBlendConstants(const Context& context, const std::array<float, 4>& constants) {
+    apply(BlendConstants, &CommandState::blendConstants, constants, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetBlendConstants, "vkCmdSetBlendConstants")(commands, constants.data()); });
 }
 
 void CommandState::SetCullMode(const Context& context, VkCullModeFlags mode) {

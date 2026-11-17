@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -389,7 +390,11 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
     key.insert(key.end(), bytes.begin(), bytes.end());
 }
 
-bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
+bool dynamicBlendConstantsNow() {
+    return !RuntimeSwitches::Set(RuntimeSwitch::StaticBlendConstants);
+}
+
+bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, bool dynamicBlendConstants) {
     using Stage = ShaderRecompiler::ShaderStage;
     if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
     keys = {};
@@ -466,7 +471,10 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     }
     for (const auto& blend : state.blends) appendKey(keys.fragmentOutput, keyedBlend(context, blend));
     appendKey(keys.fragmentOutput, state.colorRop);
-    for (const auto value : state.blendConstants) appendKey(keys.fragmentOutput, value);
+    appendKey(keys.fragmentOutput, dynamicBlendConstants);
+    if (!dynamicBlendConstants) {
+        for (const auto value : state.blendConstants) appendKey(keys.fragmentOutput, value);
+    }
     appendKey(keys.renderPass, state.blends.size());
     for (const auto& color : state.colors) {
         appendKey(keys.renderPass, color.format);
@@ -514,6 +522,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias), dynamicRendering(context.graphicsPipelineLibrary) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
+    dynamicBlendConstants = dynamicBlendConstantsNow();
     for (const auto& color : state.colors) boundAttachments.push_back(color.partialWriteMask == 0u);
     if (state.depth) boundAttachments.push_back(true);
     sampleLocationsEnabled = ValidateSampleLocations(context, state);
@@ -686,13 +695,14 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         viewports.viewportCount = ViewportCount(state);
         viewports.scissorCount = ViewportCount(state);
         PipelineLibraryKeys keys;
-        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
+        libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders, dynamicBlendConstants);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         if (state.stencilReplayReference) dynamicStates.push_back(VK_DYNAMIC_STATE_STENCIL_REFERENCE);
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
         if (libraries) dynamicStates.assign(PipelineLibraryDynamicStates().begin(), PipelineLibraryDynamicStates().end());
         if (context.dynamicColorWriteMask) dynamicStates.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+        if (dynamicBlendConstants) dynamicStates.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
         dynamicSlots = CommandState::DynamicSlots(dynamicStates);
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
@@ -776,7 +786,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         blend.attachmentCount = static_cast<std::uint32_t>(firstChannels.size());
         blend.pAttachments = firstChannels.empty() ? nullptr : firstChannels.data();
-        std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
+        if (!dynamicBlendConstants) std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
         pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
@@ -1014,6 +1024,7 @@ void Pipeline::Continue(CommandState& recording, const State& state, const State
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
     setViewports(recording, state);
     setColorWriteMasks(recording, state, masked, false);
+    setBlendConstants(recording, state);
     if (state.stencilReplayReference) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
         setLibraryState(recording, state);
@@ -1055,6 +1066,11 @@ void Pipeline::ContinueSecondChannel(CommandState& recording, const State& state
     Require(secondChannel != VK_NULL_HANDLE, "the pipeline blends every channel in one pass");
     recording.BindPipeline(context, secondChannel, dynamicSlots);
     setColorWriteMasks(recording, state, masked, true);
+    setBlendConstants(recording, state);
+}
+
+void Pipeline::setBlendConstants(CommandState& recording, const State& state) const {
+    if (dynamicBlendConstants) recording.SetBlendConstants(context, state.blendConstants);
 }
 
 void Pipeline::setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const {
@@ -1067,6 +1083,7 @@ void Pipeline::ContinueBackFaces(CommandState& recording, const State& state, co
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
     recording.BindPipeline(context, backFaces, dynamicSlots);
     setColorWriteMasks(recording, state, masked, false);
+    setBlendConstants(recording, state);
     setViewports(recording, state);
     recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
@@ -1130,7 +1147,7 @@ void append(KeyWriter& key, const TValue& value) {
 // replay insert an entry a later draw finds; a generated stage (rect-list pair, geometry) is keyed
 // by its identity like the others, so a replayed pipeline built from another device's generated
 // module is missed rather than used.
-std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool dynamicBlendConstants) {
     const auto capacity = 512 + sizeof(State) + sizeof(Context) + shaders.size() * 64 + input.bindings.size() * sizeof(VkVertexInputBindingDescription) + input.attributes.size() * sizeof(VkVertexInputAttributeDescription) + resources.mainKey.size_bytes() + resources.fragmentKey.size_bytes() + state.blends.size() * sizeof(VkPipelineColorBlendAttachmentState) + state.colors.size() * 64;
     KeyWriter key(storage, capacity);
     append(key, context.device);
@@ -1175,7 +1192,8 @@ std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context,
     append(key, state.blends.size());
     for (const auto& blend : state.blends) append(key, keyedBlend(context, blend));
     key.Put(state.colorRop);
-    key.PutBytes(state.blendConstants.data(), sizeof(state.blendConstants));
+    append(key, dynamicBlendConstants);
+    if (!dynamicBlendConstants) key.PutBytes(state.blendConstants.data(), sizeof(state.blendConstants));
     append(key, state.samples);
     append(key, state.perSampleShading);
     append(key, state.mergedCoverage);
@@ -1261,6 +1279,7 @@ struct PipelineStore {
         std::uint64_t hash;
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
+        std::vector<std::array<float, 4>> blendConstants;
     };
     AgcDriver::Mutex mutex;
     // Least recently used first.
@@ -1270,6 +1289,7 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
+    std::uint64_t blendConstantsShared = 0;
     PipelineStoreCounters totals;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::size_t capacity = 0;
@@ -1281,6 +1301,20 @@ struct PipelineStore {
     static constexpr std::size_t BaseEntries = 1024;
     static constexpr std::size_t MaximumEntries = 4096;
 };
+
+std::vector<std::array<float, 4>> blendConstantsOf(bool dynamicBlendConstants, const State& state) {
+    if (!dynamicBlendConstants) return {};
+    return {state.blendConstants};
+}
+
+void noteBlendConstants(PipelineStore& store, PipelineStore::Entry& entry, const std::array<float, 4>& constants) {
+    constexpr std::size_t Remembered = 64;
+    const auto same = [&](const std::array<float, 4>& seen) { return std::memcmp(seen.data(), constants.data(), sizeof(constants)) == 0; };
+    if (entry.blendConstants.size() >= Remembered || std::ranges::any_of(entry.blendConstants, same)) return;
+    entry.blendConstants.push_back(constants);
+    ++store.blendConstantsShared;
+    ++store.totals.blendConstantsShared;
+}
 
 // Never destroyed: the pipelines belong to a device that may already be gone when statics die, and
 // the device's teardown (ClearCachedPipelines) is the place to destroy them.
@@ -1352,8 +1386,8 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    store.hits = store.misses = store.uncached = store.evicted = 0;
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached, %llu shared across blend constants\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(store.blendConstantsShared));
+    store.hits = store.misses = store.uncached = store.evicted = store.blendConstantsShared = 0;
 }
 
 }
@@ -1370,7 +1404,8 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     auto& store = Pipelines();
     struct PipelineKeyStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
-    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const bool dynamicBlendConstants = dynamicBlendConstantsNow();
+    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstants);
     const std::span<const std::byte> key(storage.data(), length);
     if (key.empty()) {
         std::lock_guard lock(store.mutex);
@@ -1394,6 +1429,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
         if (alive(*it, context)) {
             store.entries.splice(store.entries.end(), store.entries, it);
+            if (dynamicBlendConstants) noteBlendConstants(store, *it, state.blendConstants);
             return it->pipeline;
         }
         abandon(store, it);
@@ -1426,6 +1462,11 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     const bool replaying = PipelineJournalReplaying();
     {
         std::lock_guard lock(store.mutex);
+        if (pipeline->DynamicBlendConstants() != dynamicBlendConstants) {
+            ++store.uncached;
+            ++store.totals.uncached;
+            return pipeline;
+        }
         bool collision = false;
         if (auto raced = lookup(collision)) {
             if (storeHash != nullptr) *storeHash = hash;
@@ -1448,10 +1489,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             store.capacity = std::min(store.capacity * 2u, PipelineStore::MaximumEntries);
         }
         if (replaying) {
-            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline});
+            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline, blendConstantsOf(dynamicBlendConstants, state)});
             store.index[hash] = store.entries.begin();
         } else {
-            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline});
+            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline, blendConstantsOf(dynamicBlendConstants, state)});
             store.index[hash] = std::prev(store.entries.end());
         }
         while (store.entries.size() > storeBound(store)) {
@@ -1489,7 +1530,7 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     struct PipelineScratchStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineScratchStorage>();
-    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout, dynamicBlendConstantsNow());
     key.assign(storage.begin(), storage.begin() + static_cast<std::ptrdiff_t>(length));
 }
 

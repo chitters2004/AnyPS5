@@ -159,6 +159,7 @@ struct DeviceFunctions {
     TrackedFunction<PFN_vkCmdSetScissor> cmdSetScissor;
     TrackedFunction<PFN_vkCmdSetColorWriteMaskEXT> cmdSetColorWriteMask;
     TrackedFunction<PFN_vkCmdSetDepthBounds> cmdSetDepthBounds;
+    TrackedFunction<PFN_vkCmdSetBlendConstants> cmdSetBlendConstants;
     TrackedFunction<PFN_vkCmdSetDepthBias> cmdSetDepthBias;
     TrackedFunction<PFN_vkCmdSetCullModeEXT> cmdSetCullMode;
     TrackedFunction<PFN_vkCmdSetFrontFaceEXT> cmdSetFrontFace;
