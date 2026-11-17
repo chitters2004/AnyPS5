@@ -1642,6 +1642,12 @@ void pendingSplit(AgcDriver::VulkanDevice& device) {
     expect(device, color, [](std::uint32_t x) { return leftOver(x, Old); }, "draws around pending moves");
 }
 
+std::uint64_t missDraws() {
+    std::uint64_t draws = 0;
+    for (std::size_t cause = 0; cause <= static_cast<std::size_t>(TargetMemoEvent::Count); ++cause) draws += TargetMissDraws(static_cast<TargetMemoEvent>(cause));
+    return draws;
+}
+
 std::uint64_t prepDraws(TargetPrepOutcome outcome) {
     std::uint64_t draws = 0;
     for (std::size_t thread = 0; thread < static_cast<std::size_t>(TargetPrepThread::Count); ++thread) draws += TargetPrepDraws(outcome, static_cast<TargetPrepThread>(thread));
@@ -1651,6 +1657,8 @@ std::uint64_t prepDraws(TargetPrepOutcome outcome) {
 void requireCause(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options, TargetMemoEvent cause, TargetPrepOutcome outcome, const std::string& what) {
     const MemoEvents events;
     const auto prepared = prepDraws(outcome);
+    const auto missed = TargetMissDraws(cause);
+    const auto missedAll = missDraws();
     draw(device, color, options);
     std::uint64_t invalid = 0;
     std::uint64_t fallback = 0;
@@ -1660,6 +1668,9 @@ void requireCause(AgcDriver::VulkanDevice& device, const ColorTarget& color, con
     Require(fallback == events.Moved(TargetMemoEvent::DepthFallback), what + ": the depth fallback causes do not add up to the depth fallbacks (" + events.Text() + ")");
     requireMemoEvent(events, cause, 1u, what);
     Require(prepDraws(outcome) == prepared + 1u, what + ": the draw's target prep was not timed as " + std::to_string(static_cast<int>(outcome)));
+    const bool colorCause = cause >= TargetMemoEvent::InvalidNever && cause <= TargetMemoEvent::InvalidMetadata;
+    Require(missDraws() == missedAll + (outcome == TargetPrepOutcome::Miss ? 1u : 0u), what + ": the miss time by cause did not move with the draw's outcome");
+    if (outcome == TargetPrepOutcome::Miss && colorCause) Require(TargetMissDraws(cause) == missed + 1u, what + ": the miss was not timed under its cause " + TargetMemoEventName(cause));
 }
 
 void causeSplit(AgcDriver::VulkanDevice& device) {

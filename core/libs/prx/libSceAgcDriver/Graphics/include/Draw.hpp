@@ -214,6 +214,7 @@ const char* TargetMemoEventName(TargetMemoEvent event);
 enum class TargetPrepOutcome : std::uint8_t { AttachmentMemo, Unconsulted, Hit, HitDepthMiss, Miss, DepthOnlyHit, DepthOnlyMiss, Count };
 enum class TargetPrepThread : std::uint8_t { Committer, Finisher, Worker, Other, Count };
 std::uint64_t TargetPrepDraws(TargetPrepOutcome outcome, TargetPrepThread thread);
+std::uint64_t TargetMissDraws(TargetMemoEvent cause);
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const State& state, std::size_t repeats, std::size_t& hits);
 

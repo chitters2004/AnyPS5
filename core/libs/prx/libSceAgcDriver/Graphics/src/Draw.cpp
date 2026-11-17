@@ -3656,6 +3656,16 @@ TargetPrepCounts& targetPrepCounts() {
     return counts;
 }
 
+struct MissCauseCounts {
+    std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count) + 1> draws;
+    std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count) + 1> nanoseconds;
+};
+
+MissCauseCounts& missCauseCounts() {
+    static MissCauseCounts counts;
+    return counts;
+}
+
 TargetPrepThread targetPrepThread() {
     thread_local std::optional<TargetPrepThread> cached;
     if (cached) return *cached;
@@ -3677,7 +3687,10 @@ std::array<ProfileCounter, static_cast<std::size_t>(TargetMemoEvent::Count)>& ta
 
 const bool targetMemoProfiled = std::getenv("APS5_PROFILE_TARGET_MEMO") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
 
+thread_local TargetMemoEvent lastTargetMemoEvent = TargetMemoEvent::Count;
+
 void noteTargetMemo(TargetMemoEvent event, std::uint64_t count = 1) {
+    lastTargetMemoEvent = event;
     if (targetMemoProfiled) targetMemoEvents()[static_cast<std::size_t>(event)].Add(count);
 #ifdef TRACY_ENABLE
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TargetMemoEvent::Count)> counts{};
@@ -3754,6 +3767,16 @@ void reportTargetMemo() {
         }
     }
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) target prep by outcome and thread:%s\n", prep.empty() ? " none" : prep.c_str());
+    std::string misses;
+    for (std::size_t cause = 0; cause < missCauseCounts().draws.size(); ++cause) {
+        const auto draws = missCauseCounts().draws[cause].Take();
+        const auto nanoseconds = missCauseCounts().nanoseconds[cause].Take();
+        if (draws == 0) continue;
+        char item[160];
+        std::snprintf(item, sizeof(item), "%s%s %llu draws, %.2f us each, %.1f ms", misses.empty() ? " " : "; ", cause < TargetMemoEventNames.size() ? TargetMemoEventNames[cause] : "no cause noted", static_cast<unsigned long long>(draws), static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(draws), static_cast<double>(nanoseconds) / 1e6);
+        misses += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) miss time by cause:%s\n", misses.empty() ? " none" : misses.c_str());
     const auto lookups = uncachedLine(0);
     const auto builds = uncachedLine(1);
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) invalid: uncached, at lookups: %s; at builds: %s; builds whose uncached target was the previous uncached build's %llu, with several color targets %llu\n", lookups.c_str(), builds.c_str(), static_cast<unsigned long long>(uncachedCounts().sameTarget.Take()), static_cast<unsigned long long>(uncachedCounts().severalTargets.Take()));
@@ -4038,6 +4061,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     TargetProof targetProof;
     TargetProof admissionProof;
     bool repeatedColors = false;
+    auto missCause = TargetMemoEvent::Count;
     if (memoConsulted) {
         static_cast<void>(ownsTargetMemo(ThreadTargetMemo()));
         targetProof = currentTargetProof(context);
@@ -4045,7 +4069,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (memoServes) {
         targetsUsed = true;
+        lastTargetMemoEvent = TargetMemoEvent::Count;
         repeatedColors = repeatColors(context, state, targetProof, targets, targetViews);
+        missCause = repeatedColors ? TargetMemoEvent::Count : lastTargetMemoEvent;
     }
     const auto prepareColors = [&] {
         if (targetMemoProfiled) targetResolveSerial = StorageTexture::UncacheSerial();
@@ -4252,7 +4278,13 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const auto outcome = prepared.attachmentsFromMemo ? TargetPrepOutcome::AttachmentMemo : !memoConsulted ? TargetPrepOutcome::Unconsulted : state.colors.empty() ? (repeatedDepth ? TargetPrepOutcome::DepthOnlyHit : TargetPrepOutcome::DepthOnlyMiss) : !repeatedColors ? TargetPrepOutcome::Miss : state.depth && !repeatedDepth ? TargetPrepOutcome::HitDepthMiss : TargetPrepOutcome::Hit;
         const auto slot = targetPrepSlot(outcome, targetPrepThread());
         targetPrepCounts().draws[slot].Add();
-        targetPrepCounts().nanoseconds[slot].Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - targetPrepStart).count()));
+        const auto prepNanoseconds = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - targetPrepStart).count());
+        targetPrepCounts().nanoseconds[slot].Add(prepNanoseconds);
+        if (outcome == TargetPrepOutcome::Miss) {
+            const auto cause = missCause == TargetMemoEvent::Lookup || missCause == TargetMemoEvent::Invalid ? static_cast<std::size_t>(TargetMemoEvent::Count) : static_cast<std::size_t>(missCause);
+            missCauseCounts().draws[cause].Add();
+            missCauseCounts().nanoseconds[cause].Add(prepNanoseconds);
+        }
     }
     if (verifyAttachments) checkAttachments(state, prepared);
     timer.phase(PhasePrepare);
@@ -5271,6 +5303,10 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop) {
 
 std::uint64_t TargetMemoEvents(TargetMemoEvent event) {
     return targetMemoEvents()[static_cast<std::size_t>(event)].Sum();
+}
+
+std::uint64_t TargetMissDraws(TargetMemoEvent cause) {
+    return missCauseCounts().draws[static_cast<std::size_t>(cause)].Sum();
 }
 
 std::uint64_t TargetPrepDraws(TargetPrepOutcome outcome, TargetPrepThread thread) {
