@@ -28,6 +28,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <utility>
 
 namespace {
 
@@ -140,6 +141,7 @@ struct Unwatching {
     std::uint64_t address = 0;
     bool reached = false;
     bool watchedBefore = false;
+    bool brokeOverSurface = false;
 };
 
 Unwatching unwatching;
@@ -148,7 +150,11 @@ void UnwatchDuringRefresh(std::uint64_t address, std::size_t bytes) {
     if (unwatching.reached || address != unwatching.address || bytes != SurfaceBytes) return;
     unwatching.reached = true;
     unwatching.watchedBefore = AgcDriver::GuestMemory::Watched(address, bytes);
+    const auto before = AgcDriver::GuestMemory::ProofSerial();
     AgcDriver::GuestMemory::Unwatch(address, bytes);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+    const auto census = AgcDriver::GuestMemory::ProofBreakCensusSince(before, range);
+    unwatching.brokeOverSurface = census.complete && (census.overlapSites & (1u << static_cast<unsigned>(AgcDriver::GuestMemory::ProofBreakSite::HeldState))) != 0;
 }
 
 bool Run() {
@@ -196,6 +202,7 @@ bool Run() {
     image->Refresh();
     StorageTexture::SetRefreshUnchangedHookForTest(nullptr);
     Require(unwatching.reached && unwatching.watchedBefore, "refresh unwatch hash: the refresh did not find the watched surface unchanged");
+    Require(unwatching.brokeOverSurface, "refresh unwatch hash: the save before the unwatch broke no proof over the surface, so a set reading it can keep its proof until the unwatch serial moves");
     Require(!AgcDriver::GuestMemory::Watched(address, SurfaceBytes), "refresh unwatch hash: the surface is still write-watched");
     image->MarkDirty();
     Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "refresh unwatch hash: the results are not pending");
