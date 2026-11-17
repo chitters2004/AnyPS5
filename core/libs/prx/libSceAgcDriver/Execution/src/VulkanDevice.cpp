@@ -626,6 +626,7 @@ struct VulkanDevice::State {
     bool pipelineLinkTimeOptimization = true;
     bool dynamicColorWriteMask = false;
     bool dynamicDepthBiasEnable = false;
+    bool dynamicRasterizerDiscardEnable = false;
     bool imageViewMinLod = false;
     bool shaderResourceMinLod = false;
     bool shaderImageMinLod = false;
@@ -2099,8 +2100,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     if (state->graphicsPipelineLibrary && hasExtension(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME)) {
         VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &dynamicState2Features};
         state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
-        state->dynamicDepthBiasEnable = dynamicState2Features.extendedDynamicState2 == VK_TRUE && std::getenv("APS5_NO_DYNAMIC_DEPTH_BIAS_ENABLE") == nullptr;
-        if (state->dynamicDepthBiasEnable) deviceExtensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+        const bool dynamicState2 = dynamicState2Features.extendedDynamicState2 == VK_TRUE;
+        state->dynamicDepthBiasEnable = dynamicState2 && std::getenv("APS5_NO_DYNAMIC_DEPTH_BIAS_ENABLE") == nullptr;
+        state->dynamicRasterizerDiscardEnable = dynamicState2 && std::getenv("APS5_NO_DYNAMIC_RASTERIZER_DISCARD") == nullptr;
+        if (state->dynamicDepthBiasEnable || state->dynamicRasterizerDiscardEnable) deviceExtensions.push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
     }
     dynamicState2Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_2_FEATURES_EXT};
     dynamicState2Features.extendedDynamicState2 = VK_TRUE;
@@ -2345,7 +2348,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         dynamicState3Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &dynamicState3Features;
     }
-    if (state->dynamicDepthBiasEnable) {
+    if (state->dynamicDepthBiasEnable || state->dynamicRasterizerDiscardEnable) {
         dynamicState2Features.pNext = const_cast<void*>(deviceInfo.pNext);
         deviceInfo.pNext = &dynamicState2Features;
     }
@@ -4906,6 +4909,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.pipelineLinkTimeOptimization = state->pipelineLinkTimeOptimization;
     context.dynamicColorWriteMask = state->dynamicColorWriteMask;
     context.dynamicDepthBiasEnable = state->dynamicDepthBiasEnable;
+    context.dynamicRasterizerDiscardEnable = state->dynamicRasterizerDiscardEnable;
     context.drawInputsInPlace = state->drawInputsInPlace;
     context.discreteGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
     context.integratedGpu = state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
