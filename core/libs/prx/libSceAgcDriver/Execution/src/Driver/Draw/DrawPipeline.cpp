@@ -195,15 +195,14 @@ void DrawFinisher::Enqueue(Job job) {
 
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
-    constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
-    auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
-    const ClearOnExit<Job> clearReclaim{reclaim};
+    auto& reclaim = HostThreadLocal<std::vector<Ran>, ReclaimStorage>();
+    const ClearOnExit<Ran> clearReclaim{reclaim};
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
-    if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (jobs.full() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    idle.wait(lock, [&] { return !jobs.full(); });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
@@ -241,7 +240,7 @@ void DrawFinisher::run() {
         }
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
-        ran.push_back(std::move(jobs.front()));
+        ran.push_back({std::move(jobs.front()), std::move(pending.front().keep)});
         jobs.pop_front();
         pending.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
@@ -266,7 +265,7 @@ void DrawFinisher::Drain() {
 }
 
 void DrawFinisher::ReleaseRan() {
-    std::vector<Job> done;
+    std::vector<Ran> done;
     std::lock_guard lock(mutex);
     std::swap(done, ran);
 }
@@ -392,10 +391,10 @@ void DrawPipeline::enqueue(Item item) {
         item.commit();
         return;
     }
-    if (items.size() >= Depth()) {
+    if (items.full()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
+        resumeAt = items.capacity() - 1;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;

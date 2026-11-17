@@ -1,15 +1,17 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRAW_DRAWPIPELINE_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/BoundedFifo.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -91,7 +93,7 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
-    std::deque<Item> items;
+    BoundedFifo<Item> items{std::max<std::size_t>(Depth(), 1)};
     std::vector<std::pair<Range, std::uint32_t>> queuedWrites;
     std::vector<Item> retired;
     std::exception_ptr failure;
@@ -134,6 +136,11 @@ public:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::shared_ptr<void> keep;
+    };
+    struct Ran {
+        Job job;
+        std::shared_ptr<void> keep;
     };
     enum class LabelLookup : std::uint8_t { NotHeld, Value, Unknown };
     static bool Overlap();
@@ -162,9 +169,10 @@ private:
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
-    std::deque<Job> jobs;
-    std::deque<Pending> pending;
-    std::vector<Job> ran;
+    static constexpr std::size_t FinisherDepth = 16;
+    BoundedFifo<Job> jobs{FinisherDepth};
+    BoundedFifo<Pending> pending{FinisherDepth};
+    std::vector<Ran> ran;
     std::exception_ptr failure;
     bool running = false;
     bool sleeping = false;

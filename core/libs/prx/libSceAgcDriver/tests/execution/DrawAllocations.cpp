@@ -431,10 +431,10 @@ int main() {
         Table = &table;
         Output = &output;
         const std::array<Shape, 4> shapes{{
-            {"recipe auto draw", [](std::size_t count) { return Draws(*Vertices, *Target, count); }, false, {45.0, 8100.0, 42}, {48.5, 8200.0, 45}},
-            {"indexed draw, guest indices", [](std::size_t count) { return Draws(*Vertices, *Target, count, DrawKind::Indexed, IndexBlock->At(0)); }, false, {47.5, 8300.0, 44}, {50.5, 8450.0, 47}},
-            {"indexed draw, image indices", [](std::size_t count) { return Draws(*Vertices, *Target, count, DrawKind::Indexed, reinterpret_cast<std::uintptr_t>(ImageIndices.data())); }, false, {47.5, 10250.0, 44}, {50.5, 10450.0, 47}},
-            {"compute dispatch", [](std::size_t count) { return Dispatches(*Table, *Output, count); }, true, {13.5, 1150.0, 10}, {16.0, 1500.0, 13}},
+            {"recipe auto draw", [](std::size_t count) { return Draws(*Vertices, *Target, count); }, false, {40.5, 8000.0, 40}, {41.5, 8100.0, 41}},
+            {"indexed draw, guest indices", [](std::size_t count) { return Draws(*Vertices, *Target, count, DrawKind::Indexed, IndexBlock->At(0)); }, false, {41.5, 8100.0, 41}, {42.5, 8200.0, 42}},
+            {"indexed draw, image indices", [](std::size_t count) { return Draws(*Vertices, *Target, count, DrawKind::Indexed, reinterpret_cast<std::uintptr_t>(ImageIndices.data())); }, false, {41.4, 10050.0, 41}, {42.4, 10150.0, 42}},
+            {"compute dispatch", [](std::size_t count) { return Dispatches(*Table, *Output, count); }, true, {13.5, 1150.0, 10}, {13.8, 1150.0, 13}},
         }};
         const auto draws = static_cast<std::size_t>(std::max(1, std::atoi(std::getenv("APS5_DRAW_ALLOCATIONS_DRAWS") != nullptr ? std::getenv("APS5_DRAW_ALLOCATIONS_DRAWS") : "256")));
         const auto only = std::getenv("APS5_DRAW_ALLOCATIONS_SHAPE");
