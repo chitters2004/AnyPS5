@@ -147,8 +147,8 @@ public:
     static DrawFinisher& Get();
     static bool Enabled();
     static bool OnFinisherThread();
-    static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
-    static std::size_t Outstanding() { return outstanding.load(std::memory_order_acquire); }
+    static bool Busy();
+    static std::size_t Outstanding();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -158,7 +158,7 @@ public:
 private:
     DrawFinisher() = default;
     void run();
-    inline static std::atomic<std::size_t> outstanding{0};
+    static std::atomic<std::size_t> outstanding;
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;

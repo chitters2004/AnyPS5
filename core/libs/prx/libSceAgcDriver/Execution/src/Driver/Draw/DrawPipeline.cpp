@@ -56,6 +56,16 @@ thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
 }
 
+std::atomic<std::size_t> DrawFinisher::outstanding{0};
+
+bool DrawFinisher::Busy() {
+    return outstanding.load(std::memory_order_acquire) != 0;
+}
+
+std::size_t DrawFinisher::Outstanding() {
+    return outstanding.load(std::memory_order_acquire);
+}
+
 DrawFinisher& DrawFinisher::Get() {
     static DrawFinisher* finisher = new DrawFinisher();
     return *finisher;
