@@ -1039,6 +1039,35 @@ void epochScopeLevelsTests(Context context) {
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
 }
 
+void followAdoptTests() {
+    using Pipeline = AgcDriver::DriverDetail::DrawPipeline;
+    namespace Memory = AgcDriver::GuestMemory;
+    const bool initial = RuntimeSwitches::Set(RuntimeSwitch::NoFollowAdopt);
+    for (const bool adopt : {true, false, true}) {
+        RuntimeSwitches::Assign(RuntimeSwitch::NoFollowAdopt, !adopt);
+        const auto epoch = Memory::BumpCollectEpoch();
+        Pipeline::PublishEpoch(epoch);
+        const auto token = Pipeline::EpochToken().load(std::memory_order_relaxed);
+        std::uint64_t seen = 0;
+        std::uint64_t bumps = 0;
+        std::uint64_t adopted = 0;
+        std::thread follower([&] {
+            const auto bumpsBefore = Memory::CollectEpochBumps();
+            const auto adoptedBefore = Memory::AdoptedEpochFollows();
+            Pipeline::FollowEpoch(token);
+            Pipeline::FollowEpoch(token);
+            seen = Memory::ThreadCollectEpoch();
+            bumps = Memory::CollectEpochBumps() - bumpsBefore;
+            adopted = Memory::AdoptedEpochFollows() - adoptedBefore;
+        });
+        follower.join();
+        std::printf("follow adopt %s: the follower %s the driver's epoch, new global bumps %llu, adopted %llu\n", adopt ? "on" : "off", seen == epoch ? "took" : "did not take", static_cast<unsigned long long>(bumps), static_cast<unsigned long long>(adopted));
+        if (adopt) Require(seen == epoch && bumps == 0 && adopted == 1, "a followed token did not adopt the driver's epoch without a new global bump");
+        else Require(seen > epoch && bumps == 1 && adopted == 0, "with APS5_NO_FOLLOW_ADOPT a followed token did not start a new epoch");
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::NoFollowAdopt, initial);
+}
+
 bool idleHoldTests() {
     if (!AgcDriver::GuestMemory::ProofBreaksCounted()) return false;
     static_cast<void>(AgcDriver::GuestMemory::TakeProofBreakCounts());
@@ -2003,6 +2032,11 @@ int main(int argc, char** argv) {
         if (mode == "proof-log-concurrent") {
             concurrentProofLogTests();
             std::puts("proof log concurrent tests passed");
+            return 0;
+        }
+        if (mode == "follow-adopt") {
+            followAdoptTests();
+            std::puts("follow adopt tests passed");
             return 0;
         }
         if (mode == "proof-break-idle-holds") {

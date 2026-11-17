@@ -923,6 +923,7 @@ std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> followedEpochBumps{0};
+std::atomic<std::uint64_t> adoptedEpochFollows{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -2843,12 +2844,18 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     return tracker.generation.load(std::memory_order_relaxed);
 }
 
-void BumpCollectEpoch() {
+std::uint64_t BumpCollectEpoch() {
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    return epoch;
+}
+
+void AdoptCollectEpoch(std::uint64_t epoch) {
+    adoptedEpochFollows.fetch_add(1, std::memory_order_relaxed);
+    if (epoch > HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get()) HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -2874,6 +2881,10 @@ void NoteFollowedEpoch() {
 
 std::uint64_t FollowedEpochBumps() {
     return followedEpochBumps.load(std::memory_order_relaxed);
+}
+
+std::uint64_t AdoptedEpochFollows() {
+    return adoptedEpochFollows.load(std::memory_order_relaxed);
 }
 
 namespace {

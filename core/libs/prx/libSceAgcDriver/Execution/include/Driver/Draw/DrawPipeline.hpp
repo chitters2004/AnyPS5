@@ -40,6 +40,7 @@ public:
     static bool& Active();
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
+    static void PublishEpoch(std::uint64_t epoch);
     static unsigned Committers();
     static const char* KindName(std::size_t kind);
 

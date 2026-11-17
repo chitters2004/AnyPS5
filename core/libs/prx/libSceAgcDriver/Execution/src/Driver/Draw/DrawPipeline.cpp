@@ -297,10 +297,29 @@ std::atomic<std::uint64_t>& DrawPipeline::EpochToken() {
     return token;
 }
 
+namespace {
+constexpr std::uint64_t AdoptedToken = std::uint64_t{1} << 63u;
+}
+
+void DrawPipeline::PublishEpoch(std::uint64_t epoch) {
+    auto& token = EpochToken();
+    auto current = token.load(std::memory_order_relaxed);
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoFollowAdopt)) {
+        while (!token.compare_exchange_weak(current, (current & ~AdoptedToken) + 1, std::memory_order_relaxed)) {}
+        return;
+    }
+    const auto published = epoch | AdoptedToken;
+    while (((current & AdoptedToken) == 0 || current < published) && !token.compare_exchange_weak(current, published, std::memory_order_relaxed)) {}
+}
+
 void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
+    if ((token & AdoptedToken) != 0) {
+        GuestMemory::AdoptCollectEpoch(token & ~AdoptedToken);
+        return;
+    }
     GuestMemory::BumpCollectEpoch();
     GuestMemory::NoteFollowedEpoch();
 }
