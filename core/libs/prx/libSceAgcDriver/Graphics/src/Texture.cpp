@@ -6133,6 +6133,11 @@ bool StorageTexture::PendingClearOnThread(std::uint64_t address, std::size_t byt
     return pending.textures.ClearOnThread(address, bytes) && pending.flushingCount.load(std::memory_order_acquire) == 0;
 }
 
+bool StorageTexture::EpochProofHolds() const {
+    const auto epoch = ShaderResources::EpochProofs() && !ProofWorkTrace::Active() ? GuestMemory::CollectEpoch() : 0;
+    return epoch != 0 && provedEpoch.load(std::memory_order_relaxed) == epoch && provedProof.load(std::memory_order_relaxed) == GuestMemory::ProofSerial() && provedPending.load(std::memory_order_relaxed) == PendingSerial();
+}
+
 void StorageTexture::NoteProved() const {
     provedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
 }

@@ -4004,6 +4004,11 @@ bool RefreshPresented(Graphics::StorageTexture& resident, const DisplayBuffer& b
     if (!noAdopt) GuestMemory::AdoptLatestCollectEpoch();
     GuestMemory::CollectWritesUncached(buffer.address, bytes);
     if (GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes)) && (buffer.dccAddress == 0 || !ResidentKeysMoved(resident))) return false;
+    if (GuestMemory::ProofBreaksCounted() && resident.EpochProofHolds()) {
+        static std::atomic<std::uint64_t> answered{0};
+        const auto count = answered.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1u)) == 0u || count % 1024u == 0u) AgcDriver::ProfilePrint_nid_no_patch("[gap-counters] P1: %llu present refreshes over CPU writes the image's epoch proof would have skipped\n", static_cast<unsigned long long>(count));
+    }
     if (!noAdopt && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks)) GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::HeldState, buffer.address, bytes);
     if (resident.ImageLayers() > 1) resident.RefreshLayers(layer, 1);
     else resident.Refresh();

@@ -445,6 +445,7 @@ public:
     static bool OrderedFlushArmedForTest();
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
+    bool EpochProofHolds() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
     // clear before the eviction's flush): what a lookup of its surface would return.
     bool Cached() const { return cached.load(std::memory_order_acquire); }

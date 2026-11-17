@@ -3453,7 +3453,14 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
     if (!memo.valid || memo.device != context.device) return miss(AttachmentEvent::NoMemo);
     const auto* recorder = Recorder::Active();
     if (recorder == nullptr || recorder->Id() != memo.recorder || !recorder->RenderPassOpen() || recorder->RenderPassGeneration() != memo.generation) return miss(AttachmentEvent::Pass);
-    if (CurrentAttachmentMemoSerials() != memo.serials) return miss(AttachmentEvent::Serials);
+    if (const auto serials = CurrentAttachmentMemoSerials(); serials != memo.serials) {
+        if (GuestMemory::ProofBreaksCounted() && serials.epoch == memo.serials.epoch && serials.proof == memo.serials.proof && serials.pending == memo.serials.pending) {
+            static std::atomic<std::uint64_t> unwatched{0};
+            const auto count = unwatched.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1u)) == 0u || count % 1024u == 0u) AgcDriver::ProfilePrint_nid_no_patch("[gap-counters] S1: %llu attachment memo misses on the unwatch serial alone\n", static_cast<unsigned long long>(count));
+        }
+        return miss(AttachmentEvent::Serials);
+    }
     if (state.colors.size() != memo.colors.size()) return miss(AttachmentEvent::Targets);
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         if (!sameColorTarget(state.colors[index], memo.colors[index])) return miss(AttachmentEvent::Targets);
