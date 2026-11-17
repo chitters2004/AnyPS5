@@ -775,8 +775,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (DrawTableSnapshotEnabled()) KeepUserDataTables(*shaderMemory, programs);
         DrawFinisher::Pending held;
         if (DrawFinisher::Overlap()) held = heldWrites(tail);
-        DrawFinisher::Get().Enqueue([this, tailHolder] {
-            auto& job = *tailHolder;
+        held.keep = tailHolder;
+        DrawFinisher::Get().Enqueue([this, finished = tailHolder.get()] {
+            auto& job = *finished;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
             PerformanceTimer finishTiming("Driver.DrawFinish");

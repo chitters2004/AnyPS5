@@ -99,6 +99,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(4);
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin != 0) ranges.emplace_back(begin, begin + bytes);
     };
@@ -160,6 +161,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> Driver::drawWriteRanges(con
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> QueuedDrawReadRanges(const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(4);
     const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
         if (begin == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - begin) return;
         ranges.emplace_back(begin, begin + bytes);
