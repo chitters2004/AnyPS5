@@ -5793,11 +5793,47 @@ void TwoSampleDitheredAlphaToCoverageTests() {
     singleSample.context[0x2f8] = 0;
     singleSample.context[0x292] = 2;
     singleSample.context[0x203] &= ~0x800u;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(singleSample); }, "requires two matched raster/DB_EQAA samples");
-    Require(AgcDriver::Graphics::DrawRejection(singleSample, false).find("requires two matched raster/DB_EQAA samples") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0xe701 on a single-sample target");
-    singleSample.context[0x2dc] = 0x18701;
-    expectFailure([&] { AgcDriver::Graphics::DecodeState(singleSample); }, "requires eight matched raster/DB_EQAA samples");
-    Require(AgcDriver::Graphics::DrawRejection(singleSample, false).find("requires eight matched raster/DB_EQAA samples") != std::string::npos, "the precheck accepted DB_ALPHA_TO_MASK 0x18701 on a single-sample target");
+    singleSample.context[0x201] = 0;
+    for (const auto alpha : {0xe701u, 0x18701u}) {
+        singleSample.context[0x2dc] = alpha;
+        for (const auto format : {4u, 9u}) {
+            singleSample.context[0x1c5] = format;
+            const auto decoded = AgcDriver::Graphics::DecodeState(singleSample);
+            const auto pattern = alpha == 0xe701u ? ShaderRecompiler::SingleSampleDither::E701 : ShaderRecompiler::SingleSampleDither::Rounded18701;
+            Require(decoded.alphaToCoverage && decoded.ditheredAlphaToCoverage && decoded.ditheredAlphaSamples == 1u && decoded.singleSampleDither == pattern && decoded.samples == 1u, "a measured single-sample dither did not reach the shader state");
+            Require(AgcDriver::Graphics::DrawRejection(singleSample, false).empty(), "the precheck refused a measured single-sample dither");
+            Require(AgcDriver::Graphics::CanonicalPipelineState(decoded).singleSampleDither == ShaderRecompiler::SingleSampleDither::None, "shader-only alpha dither entered the pipeline journal state");
+            for (const auto& locations : std::array{
+                std::array{0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u},
+                std::array{0x77777777u, 0x77777777u, 0x77777777u, 0x77777777u},
+                std::array{0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u},
+                std::array{0x01234567u, 0x89abcdefu, 0xfedcba98u, 0x76543210u}}) {
+                auto shifted = singleSample;
+                for (std::uint32_t pixel = 0; pixel < locations.size(); ++pixel) shifted.context[0x2feu + pixel * 4u] = locations[pixel];
+                const auto state = AgcDriver::Graphics::DecodeState(shifted);
+                Require(state.samples == 1u && state.singleSampleDither == pattern && !state.customSampleLocations && !state.sampleLocationGrid && std::ranges::all_of(state.sampleLocations, [](auto location) { return location == 0; }), "single-sample dither retained ignored sample locations without MSAA_ENABLE");
+                Require(AgcDriver::Graphics::DrawRejection(shifted, false).empty(), "the single-sample dither precheck refused ignored sample locations without MSAA_ENABLE");
+            }
+        }
+        for (const auto eqaa : {0x100u, 0x1000u, 0x10u, 0x1u}) {
+            auto invalid = singleSample;
+            invalid.context[0x201] = eqaa;
+            expectFailure([&] { AgcDriver::Graphics::DecodeState(invalid); }, "matched raster/DB_EQAA samples");
+            Require(!AgcDriver::Graphics::DrawRejection(invalid, false).empty(), "the precheck accepted unmeasured single-sample EQAA");
+        }
+        auto invalid = singleSample;
+        invalid.context[0x292] |= 1u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(invalid); }, "matched raster/DB_EQAA samples");
+        Require(!AgcDriver::Graphics::DrawRejection(invalid, false).empty(), "the precheck accepted MSAA_ENABLE for the single-sample dither");
+        invalid = singleSample;
+        invalid.context[0x1c5] = 5u;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(invalid); }, "FP16_ABGR or 32_ABGR");
+        Require(!AgcDriver::Graphics::DrawRejection(invalid, false).empty(), "the precheck accepted an unmeasured single-sample export packing");
+        invalid = singleSample;
+        invalid.context[0x203] |= 0x800u;
+        const auto disabled = AgcDriver::Graphics::DecodeState(invalid);
+        Require(!disabled.alphaToCoverage && disabled.singleSampleDither == ShaderRecompiler::SingleSampleDither::None, "the single-sample dither ignored the shader disable override");
+    }
 }
 
 void AlphaToCoverageTests() {
@@ -5888,14 +5924,11 @@ void InitialContextTests() {
     Require(queue.context.at(0x3) == 0 && queue.context.at(0x8) == 0 && queue.context.at(0x9) == 0x3f800000, "depth bounds overlap render override");
     Require(queue.context.at(0x2dc) == 0xaa00 && queue.context.at(0x313) == 0x6000 && queue.context.at(0x2f9) == 0x2d, "initial raster controls are incomplete");
     Require(queue.context.at(0x30e) == 0xffffffff && queue.context.at(0x30f) == 0xffffffff, "initial sample mask excludes samples");
-    Require(queue.context.at(0x206) == 0, "the initial viewport control is not its reset value");
-    Require(queue.context.at(0x8e) == 0xffffffffu && queue.context.at(0x8f) == 0xffffffffu, "the initial color masks are not their reset values");
     queue.userConfig[0x242] = 4;
     for (const auto offset : {0x2d5u, 0x204u, 0x8eu, 0x8fu, 0x1c3u, 0x1c5u, 0x31cu, 0x3b0u, 0x3b8u, 0x318u, 0x390u, 0x10fu, 0x110u, 0x111u, 0x112u, 0x113u, 0x114u, 0xb4u, 0xb5u}) queue.context.at(offset) = configured.context.at(offset);
     const auto state = AgcDriver::Graphics::DecodeState(queue);
     Require(state.color.address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && state.color.bytes == colorMemory.size(), "sparse guest setup lost its render target");
-    Require(state.viewport.x == 0.0f && state.viewport.y == 0.0f && state.viewport.width == static_cast<float>(state.renderExtent.width) && state.viewport.height == static_cast<float>(state.renderExtent.height), "a draw without a viewport transform did not get a viewport covering its render target");
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).find("PA_CL_VTE_CNTL") == std::string::npos, "a draw with the reset viewport control was rejected for its viewport control");
+    Require(queue.context.at(0x206) == 0x43f, "initial homogeneous viewport mode changed");
     for (const auto control : {0x3fu, 0x43eu, 0x53fu, 0x63fu, 0x8000043fu}) {
         queue.context[0x206] = control;
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "PA_CL_VTE_CNTL=0x");
@@ -5907,7 +5940,7 @@ void InitialContextTests() {
     queue.context.erase(0x2dc);
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "missing register");
     queue.ClearContext();
-    Require(queue.context.at(0x2dc) == 0xaa00 && queue.context.at(0x318) == 0 && queue.context.at(0x8e) == 0xffffffffu && queue.context.at(0x206) == 0, "clear did not restore controls, color masks and viewport control");
+    Require(queue.context.at(0x2dc) == 0xaa00 && queue.context.at(0x318) == 0 && queue.context.at(0x8e) == 0, "clear did not restore controls and discard target state");
     Require(!queue.context.contains(0xdead), "unknown context register acquired a default");
 }
 
