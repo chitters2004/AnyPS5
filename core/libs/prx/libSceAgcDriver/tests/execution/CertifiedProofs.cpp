@@ -1053,19 +1053,19 @@ int main(int argc, char** argv) {
         auto target = std::make_unique<GuestBlocks>((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
         Target = target.get();
         bool watched = SceneWatched(*device);
+        std::vector<std::unique_ptr<Scene>> privateScenes;
+        std::unique_ptr<GuestBlocks> privateTarget;
 #ifdef _WIN32
         if (!watched) {
             std::puts("certified proofs: private guest memory is compared on this device (no second queue to settle its host imports on); running every case on shared guest memory, whose import aliases keep the write watch");
             device->WaitIdle();
-            auto privateScenes = std::move(Scenes);
+            privateScenes = std::move(Scenes);
             Scenes.clear();
-            const auto privateTarget = std::move(target);
+            privateTarget = std::move(target);
             SharedGuestMemory = true;
             target = std::make_unique<GuestBlocks>((TargetBytes + BlockBytes - 1) / BlockBytes * BlockBytes);
             Target = target.get();
             watched = SceneWatched(*device);
-            device->WaitIdle();
-            privateScenes.clear();
         }
 #endif
         if (!watched) {
@@ -1081,6 +1081,8 @@ int main(int argc, char** argv) {
         device->WaitIdle();
         Scenes.clear();
         target.reset();
+        privateScenes.clear();
+        privateTarget.reset();
         std::puts(SharedGuestMemory ? "certified proofs tests passed on shared guest memory" : "certified proofs tests passed");
         return 0;
     } catch (const std::exception& error) {
