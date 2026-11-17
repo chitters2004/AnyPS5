@@ -223,6 +223,32 @@ bool Run() {
     return true;
 }
 
+bool RunKeptByCpu() {
+    WatchedBlock surface(SurfaceBytes);
+    struct WaitForWork {
+        ~WaitForWork() { AgcDriverWaitIdle_nid_postfix(); }
+    } waitForWork;
+    const auto address = surface.Address();
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("kept by the CPU: skipped, the surface is not write-watched");
+        return false;
+    }
+    auto* texels = reinterpret_cast<std::uint32_t*>(surface.Data());
+    std::fill(texels, texels + SurfaceBytes / 4u, Untouched);
+    Store(texels);
+    AgcDriverWaitIdle_nid_postfix();
+    Require(StorageTexture::FindPending(address, SurfaceBytes) != nullptr, "kept by the CPU: the stored results are not pending");
+    for (std::size_t offset = 0; offset < SurfaceBytes; offset += Page) static_cast<volatile std::uint32_t*>(texels)[offset / 4u] = Untouched + 1u;
+    const auto pendingBefore = StorageTexture::PendingSerial();
+    std::size_t images = 0, evicted = 0;
+    bool kept = false;
+    std::thread access([&] { kept = StorageTexture::AccessKeptByCpu(address, std::size_t{1} << 20u, &images, &evicted); });
+    access.join();
+    Require(kept && images == 1 && evicted == 1, "kept by the CPU: an access over a surface the CPU rewrote did not evict its stale results (kept " + std::to_string(kept) + ", images " + std::to_string(images) + ", evicted " + std::to_string(evicted) + ")");
+    Require(StorageTexture::PendingSerial() != pendingBefore, "kept by the CPU: evicting stale pending results moved no pending serial, so a proof that saw them pending can be reused");
+    return true;
+}
+
 }
 
 int main() {
@@ -239,6 +265,7 @@ int main() {
             Require(AgcDriver::Graphics::DescribeSurface(AgcDriver::Graphics::DecodeTextureResource(TextureDescriptor(probe.Data()))).guestBytes == SurfaceBytes, "refresh unwatch hash: unexpected surface size");
         }
         if (!Run()) return VulkanTestSkipped;
+        if (!RunKeptByCpu()) return VulkanTestSkipped;
         AgcDriverShutdown_nid_postfix();
         std::puts("refresh unwatch hash tests passed");
         return 0;
