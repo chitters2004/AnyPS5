@@ -348,6 +348,7 @@ public:
     static constexpr std::uint64_t OccasionalWriteFlips = 8;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason, VkDevice device = VK_NULL_HANDLE);
+    static std::uint64_t LabelReadbackSkips();
     static std::size_t StoreDrawnLinear(const char* reason);
     static void NoteFlip();
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);

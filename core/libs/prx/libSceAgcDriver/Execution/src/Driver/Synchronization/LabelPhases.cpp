@@ -26,6 +26,7 @@ struct Counters {
     ProfileCounter drawnStored;
     ProfileCounter readbackScanned;
     ProfileCounter readbackFlushed;
+    ProfileCounter readbackSkipped;
     ProfileCounter labelReaps;
     ProfileCounter labelReapsWithWork;
     ProfileCounter labelReapRetired;
@@ -110,6 +111,10 @@ void CountReadback(std::uint64_t scanned, std::uint64_t flushed) {
     Shared().readbackFlushed.Add(flushed);
 }
 
+void CountReadbackSkipped() {
+    if (open.active) Shared().readbackSkipped.Add();
+}
+
 void CountLabelReap(std::uint64_t inFlightBefore, std::uint64_t inFlightAfter) {
     if (!open.active) return;
     const auto retired = inFlightBefore > inFlightAfter ? inFlightBefore - inFlightAfter : 0;
@@ -150,6 +155,7 @@ Totals Take() {
     totals.drawnStored = shared.drawnStored.Take();
     totals.readbackScanned = shared.readbackScanned.Take();
     totals.readbackFlushed = shared.readbackFlushed.Take();
+    totals.readbackSkipped = shared.readbackSkipped.Take();
     totals.labelReaps = shared.labelReaps.Take();
     totals.labelReapsWithWork = shared.labelReapsWithWork.Take();
     totals.labelReapRetired = shared.labelReapRetired.Take();
@@ -172,6 +178,8 @@ std::string Line(const Totals& totals) {
     const auto drawn = static_cast<std::size_t>(PreSlot::DrawnLinear);
     const auto readback = static_cast<std::size_t>(PreSlot::Readback);
     std::snprintf(part.data(), part.size(), "; pre detail: drawn-linear %.2f us/label (%llu calls, %llu stored), readback %.2f us/label (%llu calls, %llu textures scanned, %llu flushed)", static_cast<double>(totals.preNs[drawn]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[drawn]), static_cast<unsigned long long>(totals.drawnStored), static_cast<double>(totals.preNs[readback]) / 1000.0 / labels, static_cast<unsigned long long>(totals.preCalls[readback]), static_cast<unsigned long long>(totals.readbackScanned), static_cast<unsigned long long>(totals.readbackFlushed));
+    line += part.data();
+    std::snprintf(part.data(), part.size(), ", readback skipped %llu", static_cast<unsigned long long>(totals.readbackSkipped));
     line += part.data();
     std::snprintf(part.data(), part.size(), "; in-label reaps: %llu, %llu retired a batch (%llu batches), %llu batches in flight before them", static_cast<unsigned long long>(totals.labelReaps), static_cast<unsigned long long>(totals.labelReapsWithWork), static_cast<unsigned long long>(totals.labelReapRetired), static_cast<unsigned long long>(totals.labelReapInFlight));
     line += part.data();

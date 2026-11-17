@@ -7804,6 +7804,151 @@ vm_prot_t HostPageProtection(const void* page) {
 }
 #endif
 
+bool labelReadbackSkipTests(const Device& device, Recorder& recorder) {
+    using namespace AgcDriver::GuestMemory;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    const auto& base = device.GetContext();
+    constexpr std::size_t bytes = 1u << 20u;
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "skipped, no write watching\n";
+        return false;
+    }
+    struct Release {
+        void* block;
+        ~Release() { ReleaseWatched(block, bytes); }
+    } release{block};
+    auto* memory = static_cast<std::uint8_t*>(block);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    std::memset(memory, 0x55, bytes);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    struct Unregister {
+        void* block;
+        ~Unregister() {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(block);
+        }
+    } unregister{block};
+    CollectWritesUncached(address, bytes);
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto settle = [&] {
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+    };
+    const auto surface = [&](std::uint64_t offset, std::uint32_t extent, TextureTileMode tileMode) {
+        GuestTextureResource resource{};
+        resource.baseAddress = address + offset;
+        resource.width = extent;
+        resource.height = extent;
+        resource.mipCount = 1;
+        resource.tileMode = tileMode;
+        resource.dimension = TextureDimension::k2D;
+        resource.format = 56;
+        resource.dstSelX = 4;
+        resource.dstSelY = 5;
+        resource.dstSelZ = 6;
+        resource.dstSelW = 7;
+        return resource;
+    };
+    const auto small = surface(0x10000, 32, TextureTileMode::kLinear);
+    const auto large = surface(0x40000, 256, TextureTileMode::kStandard4KB);
+    const auto smallBytes = static_cast<std::size_t>(DescribeSurface(small).guestBytes);
+    const auto largeBytes = static_cast<std::size_t>(DescribeSurface(large).guestBytes);
+    Require(smallBytes <= StorageTexture::SmallStoreBytes && small.baseAddress + smallBytes <= large.baseAddress, "label readback skip: the small linear surface does not fit before the large one");
+    Require(largeBytes > StorageTexture::SmallStoreBytes && largeBytes <= StorageTexture::OccasionalStoreBytes && large.baseAddress + largeBytes <= address + bytes, "label readback skip: the large tiled surface is not an occasional store that fits in the block");
+    auto smallImage = StorageTexture::Create(context, detiler, small, 0);
+    auto largeImage = StorageTexture::Create(context, detiler, large, 0);
+    smallImage->Refresh();
+    largeImage->Refresh();
+    settle();
+    const auto write = [&](const std::shared_ptr<StorageTexture>& image, std::uint32_t extent, std::uint8_t value) {
+        auto source = std::make_shared<Buffer>(context, extent * extent * 4u, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::fill(source->Bytes().begin(), source->Bytes().end(), std::byte{value});
+        const auto commands = recorder.Commands();
+        recorder.Keep(image);
+        recorder.Keep(source);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {extent, extent, 1};
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, source->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        image->MarkDirty();
+    };
+    const auto holds = [&](const GuestTextureResource& resource, std::size_t extentBytes, std::uint8_t value) { return static_cast<std::size_t>(std::count(memory + (resource.baseAddress - address), memory + (resource.baseAddress - address) + extentBytes, value)); };
+    const auto label = [&] {
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        settle();
+    };
+    const auto skippedBy = [&](const std::function<void()>& run) {
+        const auto before = StorageTexture::LabelReadbackSkips();
+        run();
+        return StorageTexture::LabelReadbackSkips() - before;
+    };
+    Switches::Assign(RuntimeSwitch::NoLabelReadbackSkip, false);
+    write(smallImage, 32, 0x21);
+    write(largeImage, 256, 0x22);
+    Require(skippedBy(label) == 0, "label readback skip: a label skipped new pending images");
+    Require(holds(small, smallBytes, 0x21) >= 32u * 32u * 4u, "label readback skip: the first label did not store the small linear image");
+    Require(holds(large, largeBytes, 0x22) == largeBytes, "label readback skip: the first label did not store the first write of the large image");
+    Require(skippedBy(label) == 0, "label readback skip: the label after a store skipped before it had seen the stored set");
+    Require(skippedBy(label) == 1, "label readback skip: a label with no new image writes scanned the pending images again");
+
+    write(smallImage, 32, 0x31);
+    Require(skippedBy(label) == 0 && holds(small, smallBytes, 0x31) >= 32u * 32u * 4u, "label readback skip: a label after a new small image write skipped its store");
+
+    write(largeImage, 256, 0x32);
+    Require(skippedBy(label) == 0 && holds(large, largeBytes, 0x32) == 0, "label readback skip: a frequent large image write was stored at a label");
+    static_cast<void>(skippedBy(label));
+    Require(skippedBy(label) == 1, "label readback skip: a pending frequent large image kept every label scanning");
+    for (std::uint64_t flip = 0; flip <= StorageTexture::OccasionalWriteFlips; ++flip) StorageTexture::NoteFlip();
+    write(largeImage, 256, 0x33);
+    Require(skippedBy(label) == 0, "label readback skip: a label skipped after an already pending image became an occasional store");
+    Require(holds(large, largeBytes, 0x33) == largeBytes, "label readback skip: the occasional large image was not stored at the label after a skip");
+    for (std::uint64_t flip = 0; flip <= StorageTexture::OccasionalWriteFlips; ++flip) StorageTexture::NoteFlip();
+    write(largeImage, 256, 0x35);
+    auto* const otherDevice = reinterpret_cast<VkDevice>(static_cast<std::uintptr_t>(0x10));
+    Require(otherDevice != context.device, "label readback skip: the other device handle is the test device");
+    StorageTexture::StoreReadbackBeforeLabel("readback before label", otherDevice);
+    settle();
+    Require(holds(large, largeBytes, 0x35) == 0, "label readback skip: a label for another device stored the occasional large image");
+    Require(skippedBy(label) == 0 && holds(large, largeBytes, 0x35) == largeBytes, "label readback skip: a label skipped an occasional image that a label for another device left behind");
+
+    Switches::Assign(RuntimeSwitch::NoLabelReadbackSkip, true);
+    static_cast<void>(skippedBy(label));
+    const auto scanned = skippedBy([&] {
+        label();
+        label();
+    });
+    Switches::Assign(RuntimeSwitch::NoLabelReadbackSkip, false);
+    Require(scanned == 0, "label readback skip: APS5_NO_LABEL_READBACK_SKIP did not keep labels scanning");
+    const auto runs = 20000;
+    const auto timed = [&](bool off) {
+        Switches::Assign(RuntimeSwitch::NoLabelReadbackSkip, off);
+        StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        const auto start = std::chrono::steady_clock::now();
+        for (int run = 0; run < runs; ++run) StorageTexture::StoreReadbackBeforeLabel("readback before label");
+        return std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / runs;
+    };
+    write(largeImage, 256, 0x34);
+    label();
+    const auto scanNs = timed(true);
+    const auto skipNs = timed(false);
+    Switches::Assign(RuntimeSwitch::NoLabelReadbackSkip, false);
+    std::printf("[label-readback-bench] one pending tiled image: scan %.1f ns, skip %.1f ns per label\n", scanNs, skipNs);
+    Require(StorageTexture::FlushPending(large.baseAddress, largeBytes, nullptr, "memory access", PublishScope::None), "label readback skip: the pending large image was not stored at the end");
+    settle();
+    Require(holds(large, largeBytes, 0x34) == largeBytes, "label readback skip: the final store of the large image did not publish it");
+    return true;
+}
+
 bool smallTiledShadowLabelTests(const Device& device, Recorder& recorder) {
     using namespace AgcDriver::GuestMemory;
     constexpr std::size_t unit = 65536;
@@ -17514,6 +17659,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--unwatch-snapshot-scope-edge-only") return UnwatchScopeTest::Run(device.GetContext(), recorder, false, true) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--unwatch-snapshot-scope-linear-only") return UnwatchScopeTest::Run(device.GetContext(), recorder, false, false, true) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--unwatch-snapshot-scope-linear-refresh-only") return UnwatchScopeTest::Run(device.GetContext(), recorder, true, false, true) ? 0 : 77;
+        if (argc == 2 && std::string_view(argv[1]) == "--label-readback-skip-only") return labelReadbackSkipTests(device, recorder) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--small-tiled-shadow-label-only") {
             return smallTiledShadowLabelTests(device, recorder) ? 0 : 77;
         }

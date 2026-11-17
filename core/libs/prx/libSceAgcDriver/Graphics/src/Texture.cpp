@@ -1983,6 +1983,9 @@ DrawnPending drawnPending() {
 
 // See StorageTexture::PendingSerial: bumped after every mutation of the registry above.
 std::atomic<std::uint64_t> pendingSerial{0};
+std::atomic<std::uint64_t> labelReadbackWork{0};
+std::uint64_t labelReadbackClean = std::numeric_limits<std::uint64_t>::max();
+std::atomic<std::uint64_t> labelReadbackSkips{0};
 
 // The texel layout a clear value is built from (FillClearColor): channels in memory order with
 // their bit offset and width inside the element and the clear component they feed (R, G, B, A).
@@ -4753,6 +4756,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto flip = flipSerial.load(std::memory_order_relaxed); writes == 1u || flip != writtenFlip) {
         writtenOccasionally = writes == 1u || flip - writtenFlip > OccasionalWriteFlips;
         writtenFlip = flip;
+        if (writtenOccasionally.load(std::memory_order_relaxed)) labelReadbackWork.fetch_add(1, std::memory_order_release);
     }
     std::optional<MapImportGate::PublishHold> publication;
     if (!layerPending.Any()) publication.emplace(descriptor.baseAddress, guestBytes);
@@ -5810,9 +5814,16 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::size_t>> occasional;
     std::uint64_t scanned = 0;
+    bool unclean = false;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        const auto work = labelReadbackWork.load(std::memory_order_acquire);
+        if (work == labelReadbackClean && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoLabelReadbackSkip)) {
+            labelReadbackSkips.fetch_add(1, std::memory_order_relaxed);
+            if (LabelPhases::Active()) LabelPhases::CountReadbackSkipped();
+            return;
+        }
 #if defined(__APPLE__)
         const bool trap = LabelTrapsEnabled();
         if (trap) labelTrapsSet.store(true, std::memory_order_relaxed);
@@ -5831,6 +5842,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
 #if defined(__APPLE__)
             if (trap && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
                 texture->readTrapped.store(true, std::memory_order_release);
+                unclean = true;
                 continue;
             }
 #endif
@@ -5838,15 +5850,23 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         }
         for (auto* texture : pending.textures) {
             if (texture->descriptor.tileMode == TextureTileMode::kLinear || texture->guestBytes <= SmallStoreBytes || texture->guestBytes > OccasionalStoreBytes) continue;
-            if (device != VK_NULL_HANDLE && texture->context.device != device) continue;
+            if (device != VK_NULL_HANDLE && texture->context.device != device) {
+                unclean = unclean || texture->writtenOccasionally.load(std::memory_order_relaxed);
+                continue;
+            }
             if (!texture->writtenOccasionally.exchange(false, std::memory_order_relaxed)) continue;
             occasionalLabelStores.fetch_add(1, std::memory_order_relaxed);
             occasional.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
+        labelReadbackClean = ranges.empty() && occasional.empty() && !unclean ? work : std::numeric_limits<std::uint64_t>::max();
     }
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));
     if (LabelPhases::Active()) LabelPhases::CountReadback(scanned, ranges.size() + occasional.size());
+}
+
+std::uint64_t StorageTexture::LabelReadbackSkips() {
+    return labelReadbackSkips.load(std::memory_order_relaxed);
 }
 
 std::size_t StorageTexture::StoreDrawnLinear(const char* reason) {
@@ -6304,6 +6324,7 @@ bool StorageTexture::OrderedFlushArmedForTest() {
 
 void StorageTexture::BumpPendingSerial() {
     pendingSerial.fetch_add(1, std::memory_order_release);
+    labelReadbackWork.fetch_add(1, std::memory_order_release);
 }
 
 bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
