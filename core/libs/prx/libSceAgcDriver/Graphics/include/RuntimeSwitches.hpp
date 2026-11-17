@@ -31,6 +31,7 @@ enum class RuntimeSwitch : std::size_t {
     NoScopedProofs,
     NoWritelessPacketScope,
     NoHoldSiteBreaks,
+    NoScopedDriverStores,
     Count,
 };
 
