@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LabelPhases.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -88,6 +89,7 @@ void RequireSplit(const Phases::Totals& totals, std::uint64_t labels) {
 
 int main() {
     try {
+        AgcDriver::Graphics::RuntimeSwitches::Assign(AgcDriver::Graphics::RuntimeSwitch::NoTimelineReapGate, true);
         Phases::SetEnabled(true);
         static_cast<void>(Phases::Take());
         Block labels;
@@ -115,7 +117,7 @@ int main() {
         RequireSplit(totals, 1);
         Require(totals.labelReaps == 1 && totals.labelReapsWithWork == 1 && totals.labelReapRetired == 1 && totals.labelReapInFlight == 1, ("label phases: the in-label reap over one finished batch counted " + std::to_string(totals.labelReaps) + " reaps, " + std::to_string(totals.labelReapsWithWork) + " with work, " + std::to_string(totals.labelReapRetired) + " retired of " + std::to_string(totals.labelReapInFlight) + " in flight").c_str());
         const auto line = Phases::Line(totals);
-        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos && line.find("; pre detail: drawn-linear ") != std::string::npos && line.find(" readback ") != std::string::npos && line.find("; in-label reaps: 1, 1 retired a batch (1 batches), 1 batches in flight before them") != std::string::npos;
+        const bool shaped = line.find("1 labels, held ") != std::string::npos && line.find(" + lookup ") != std::string::npos && line.find(" + tail ") != std::string::npos && line.find("1 reaped (5.00 ms), 1 failed (0.00 ms)") != std::string::npos && line.find("; pre detail: drawn-linear ") != std::string::npos && line.find(" readback ") != std::string::npos && line.find("; in-label reaps: 1, 1 retired a batch (1 batches), 1 batches in flight before them, 0 gated before the batch was seen complete") != std::string::npos;
         Require(shaped, ("label phases: unexpected report line: " + line).c_str());
         Require(Phases::Take().labels == 0, "label phases: a taken window was counted again");
         Phases::SetEnabled(false);

@@ -408,6 +408,10 @@ public:
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
+    // Reap, unless the progress watcher has not yet seen the oldest in-flight batch complete.
+    bool ReapCompleted();
+    // Reaps ReapCompleted skipped because the oldest batch was not seen complete (test aid).
+    static std::uint64_t GatedReaps();
     std::uint64_t Submissions() const { return submissions; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }

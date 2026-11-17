@@ -3106,8 +3106,9 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
         const auto inFlight = recorder.InFlightBatches();
-        recorder.Reap();
-        LabelPhases::CountLabelReap(inFlight, recorder.InFlightBatches());
+        const auto gated = Graphics::Recorder::GatedReaps();
+        recorder.ReapCompleted();
+        LabelPhases::CountLabelReap(inFlight, recorder.InFlightBatches(), Graphics::Recorder::GatedReaps() != gated);
     }
     LabelPhases::Mark(LabelPhases::Phase::Reap);
     if (recorder.Idle()) return 1;

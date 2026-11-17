@@ -1335,6 +1335,8 @@ void TeardownCheckpointMarkers() noexcept {
 
 struct Recorder::ProgressWatcher {
     std::atomic<std::uint64_t> submitted{0};
+    std::atomic<std::uint64_t> completed{0};
+    std::atomic<bool> failed{false};
     std::atomic<bool> stop{false};
     std::atomic<std::uint32_t> wakes{0};
     std::thread thread;
@@ -1359,11 +1361,13 @@ struct Recorder::ProgressWatcher {
                 if (result == VK_TIMEOUT) continue;
                 if (result != VK_SUCCESS) {
                     std::fprintf(stderr, "[gpu] progress watcher: vkWaitSemaphoresKHR failed (%d), watcher stops\n", static_cast<int>(result));
+                    failed.store(true, std::memory_order_release);
                     return;
                 }
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                completed.store(seen, std::memory_order_release);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
@@ -5157,6 +5161,22 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
     }
     batchesLeftInFlight.fetch_add(inFlight.size(), std::memory_order_relaxed);
     return true;
+}
+
+namespace {
+std::atomic<std::uint64_t> gatedReaps{0};
+}
+
+std::uint64_t Recorder::GatedReaps() {
+    return gatedReaps.load(std::memory_order_relaxed);
+}
+
+bool Recorder::ReapCompleted() {
+    if (!inFlight.empty() && progressWatcher && !progressWatcher->failed.load(std::memory_order_acquire) && inFlight.front()->serial > progressWatcher->completed.load(std::memory_order_acquire) && !RuntimeSwitches::Set(RuntimeSwitch::NoTimelineReapGate)) {
+        gatedReaps.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return Reap();
 }
 
 bool Recorder::Reap() {

@@ -34,6 +34,7 @@ struct Totals {
     std::uint64_t labelReapsWithWork = 0;
     std::uint64_t labelReapRetired = 0;
     std::uint64_t labelReapInFlight = 0;
+    std::uint64_t labelReapsGated = 0;
 };
 
 bool Enabled();
@@ -45,7 +46,7 @@ void CountReapTry(ReapTry outcome, std::uint64_t ns);
 bool Active();
 void CountDrawnStored(std::uint64_t stored);
 void CountReadback(std::uint64_t scanned, std::uint64_t flushed);
-void CountLabelReap(std::uint64_t inFlightBefore, std::uint64_t inFlightAfter);
+void CountLabelReap(std::uint64_t inFlightBefore, std::uint64_t inFlightAfter, bool gated = false);
 
 class PreTimer {
 public:
