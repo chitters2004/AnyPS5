@@ -102,6 +102,7 @@ private:
     mutable std::atomic<bool> discardNoted{false};
     void noteDiscardDraw(const State& state) const;
     bool libraries = false;
+    bool staticDiscard = false;
     std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;

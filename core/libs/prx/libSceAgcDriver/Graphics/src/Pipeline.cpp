@@ -391,7 +391,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
+    if (!context.graphicsPipelineLibrary || state.rasterizerDiscard || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders)) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -702,6 +702,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
         if (libraries) dynamicStates.assign(PipelineLibraryDynamicStates().begin(), PipelineLibraryDynamicStates().end());
         if (context.dynamicColorWriteMask) dynamicStates.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
+        staticDiscard = state.rasterizerDiscard;
+        if (staticDiscard) std::erase_if(dynamicStates, [](VkDynamicState dynamicState) { return dynamicState == VK_DYNAMIC_STATE_STENCIL_REFERENCE || dynamicState == VK_DYNAMIC_STATE_DEPTH_BOUNDS || dynamicState == VK_DYNAMIC_STATE_BLEND_CONSTANTS || dynamicState == VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT; });
         dynamicSlots = CommandState::DynamicSlots(dynamicStates);
         VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
         dynamic.dynamicStateCount = static_cast<std::uint32_t>(dynamicStates.size());
@@ -788,6 +790,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         std::copy(state.blendConstants.begin(), state.blendConstants.end(), blend.blendConstants);
         VkGraphicsPipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
         pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
+        if (staticDiscard) std::erase_if(stages, [](const VkPipelineShaderStageCreateInfo& stage) { return stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT; });
         pipelineInfo.stageCount = static_cast<std::uint32_t>(stages.size());
         pipelineInfo.pStages = stages.data();
         VkPipelineTessellationStateCreateInfo tessellation{VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO};
@@ -805,6 +808,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.pDynamicState = &dynamic;
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
+        if (staticDiscard) {
+            rendering.pNext = nullptr;
+            rendering.colorAttachmentCount = 0;
+            rendering.pColorAttachmentFormats = nullptr;
+            rendering.depthAttachmentFormat = VK_FORMAT_UNDEFINED;
+            rendering.stencilAttachmentFormat = VK_FORMAT_UNDEFINED;
+        }
         if (dynamicRendering) pipelineInfo.pNext = &rendering;
         timing.Mark("modules_and_state");
         if (prebuilding && !libraries) {
@@ -1101,13 +1111,13 @@ void Pipeline::Continue(CommandState& recording, const State& state, const State
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
     setViewports(recording, state);
     setColorWriteMasks(recording, state, masked, false);
-    if (state.stencilReplayReference) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
+    if (state.stencilReplayReference && !staticDiscard) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
         setLibraryState(recording, state);
         return;
     }
     if (depthBias) recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant), state.depthBiasClamp, state.depthBiasSlope);
-    if (!depthBounds) return;
+    if (!depthBounds || staticDiscard) return;
     recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
 
@@ -1145,7 +1155,7 @@ void Pipeline::ContinueSecondChannel(CommandState& recording, const State& state
 }
 
 void Pipeline::setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const {
-    if (!context.dynamicColorWriteMask || state.blends.empty()) return;
+    if (!context.dynamicColorWriteMask || state.blends.empty() || staticDiscard) return;
     const auto masks = channelWriteMasks(state, masked != nullptr ? std::span(masked->blends) : std::span(state.blends), secondChannel);
     recording.SetColorWriteMasks(context, std::span(masks).first(state.blends.size()));
 }
