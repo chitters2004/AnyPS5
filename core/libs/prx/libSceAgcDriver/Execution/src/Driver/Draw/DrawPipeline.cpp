@@ -302,6 +302,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     if (followed == token) return;
     followed = token;
     GuestMemory::BumpCollectEpoch();
+    GuestMemory::NoteFollowedEpoch();
 }
 
 void DrawPipeline::breakPacketProofs(CommitKind kind, const std::vector<Range>& writes, GuestMemory::ProofBreakSite site) {

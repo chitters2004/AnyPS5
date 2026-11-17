@@ -869,6 +869,7 @@ private:
     StampAge provedAge = StampAge::Current;
     std::uint64_t censusSeen = 0;
     std::uint64_t epochSeen = 0;
+    std::uint64_t provedGeneration = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
     ProofFailure proveImports();
     ProofFailure recordStaging();

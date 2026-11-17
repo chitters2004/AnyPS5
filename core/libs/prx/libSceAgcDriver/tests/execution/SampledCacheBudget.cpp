@@ -1029,6 +1029,13 @@ void epochScopeLevelsTests(Context context) {
         StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + 4096u);
     });
     miss("a new collect epoch with the surface unwritten", [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    miss("a driver store outside the set", [&] { AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::DriverStore, distant, 4096u); });
+    miss("a GPU-lock break from another thread", [] { AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::GpuMutex); });
+    miss("a driver store over the set's surface", [&] { AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::DriverStore, address, 4096u); });
+    std::memset(reinterpret_cast<void*>(address), 0x6b, 4096u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(!exitTaken(), "a new collect epoch over a written surface let the exit through");
+    std::fprintf(stderr, "scope levels: a new collect epoch with the surface written: the exit was refused\n");
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
 }
 
@@ -1047,6 +1054,16 @@ bool idleHoldTests() {
         StorageTexture::BumpPendingSerial(PendingBump::Discard);
     });
     pending.join();
+    const auto followedBefore = AgcDriver::GuestMemory::FollowedEpochBumps();
+    std::thread follower([] {
+        const auto token = AgcDriver::DriverDetail::DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed) + 1;
+        AgcDriver::DriverDetail::DrawPipeline::FollowEpoch(token);
+        AgcDriver::DriverDetail::DrawPipeline::FollowEpoch(token);
+    });
+    follower.join();
+    const auto followed = AgcDriver::GuestMemory::FollowedEpochBumps() - followedBefore;
+    std::fprintf(stderr, "idle holds: followed epochs %llu\n", static_cast<unsigned long long>(followed));
+    Require(followed == 1, "a thread following one token twice was not counted as one followed epoch");
     const auto counts = AgcDriver::GuestMemory::TakeProofBreakCounts();
     std::fprintf(stderr, "idle holds: GPU-lock holds off the proof thread %llu, idle %llu\n", static_cast<unsigned long long>(counts.offThreadHolds), static_cast<unsigned long long>(counts.idleHolds));
     Require(counts.offThreadHolds == 3 && counts.idleHolds == 1, "the GPU-lock holds were not counted as one idle hold out of three");

@@ -922,6 +922,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+std::atomic<std::uint64_t> followedEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -2867,6 +2868,14 @@ std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
 }
 
+void NoteFollowedEpoch() {
+    followedEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t FollowedEpochBumps() {
+    return followedEpochBumps.load(std::memory_order_relaxed);
+}
+
 namespace {
 std::atomic<std::uint64_t> proofSerial{1};
 std::atomic<std::uint64_t> certificateBreakSerial{1};
@@ -3087,7 +3096,13 @@ void BreakProofsWithoutWrites(ProofBreakSite site, std::uint8_t detail) {
     if (proofBreakTrace != nullptr) proofBreakTrace->Note({site, 0, 0});
 }
 
-ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+namespace {
+
+bool simulatedScoped(ProofBreakSite site) {
+    return site == ProofBreakSite::DriverStore || site == ProofBreakSite::WriteBack || site == ProofBreakSite::WriteBackIfHeld;
+}
+
+ProofBreakWindow walkBreaks(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, bool simulated) {
     ProofBreakWindow window;
     const auto current = proofSerial.load(std::memory_order_acquire);
     if (current < serial) return window;
@@ -3111,7 +3126,8 @@ ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pai
         std::atomic_thread_fence(std::memory_order_acquire);
         if (slot.sequence.load(std::memory_order_relaxed) != sequence) return window;
         const auto site = static_cast<ProofBreakSite>((shape >> 8u) & 0xffu);
-        if ((shape & RangedShape) == 0) {
+        if (simulated && (shape & RangedShape) == 0 && site == ProofBreakSite::GpuMutex) continue;
+        if ((shape & RangedShape) == 0 && !(simulated && (shape & BoundedShape) != 0 && simulatedScoped(site))) {
             window.complete = true;
             window.unranged = true;
             window.blocker = site;
@@ -3130,6 +3146,16 @@ ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pai
     }
     window.complete = window.clear = true;
     return window;
+}
+
+}
+
+ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return walkBreaks(serial, ranges, false);
+}
+
+ProofBreakWindow ProofBreaksSinceSimulated(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return walkBreaks(serial, ranges, true);
 }
 
 ProofBreakCensus ProofBreakCensusSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {

@@ -283,6 +283,7 @@ struct ProofBreakWindow {
     std::uint64_t breaks = 0;
 };
 ProofBreakWindow ProofBreaksSince(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+ProofBreakWindow ProofBreaksSinceSimulated(std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 struct ProofBreak {
     ProofBreakSite site = ProofBreakSite::Other;
     std::uint64_t address = 0;
@@ -306,6 +307,8 @@ private:
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
+void NoteFollowedEpoch();
+std::uint64_t FollowedEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
