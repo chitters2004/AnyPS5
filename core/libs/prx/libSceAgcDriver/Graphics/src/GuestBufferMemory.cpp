@@ -5999,7 +5999,13 @@ bool GuestBufferMemory::RetakeSpace() {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
         ranges.reserve(space->writableMirrors.size());
         for (const auto index : space->writableMirrors) ranges.emplace_back(space->base[index].begin, space->base[index].end);
-        return !StorageTexture::AnyPendingOverlaps(ranges);
+        const bool overlapped = StorageTexture::AnyPendingOverlaps(ranges);
+        if (overlapped && GuestMemory::ProofBreaksCounted() && epochMirrors() && epoch != 0 && space->refreshedEpoch.load(std::memory_order_relaxed) == epoch && space->refreshedProof.load(std::memory_order_relaxed) == proof) {
+            static std::atomic<std::uint64_t> refused{0};
+            const auto count = refused.fetch_add(1, std::memory_order_relaxed) + 1;
+            if ((count & (count - 1u)) == 0u || count % 1024u == 0u) AgcDriver::ProfilePrint_nid_no_patch("[gap-counters] M1: %llu mirror reuses refused over images marked pending since the refresh\n", static_cast<unsigned long long>(count));
+        }
+        return !overlapped;
     };
     const bool reuse = epochMirrors() && epoch != 0 && space->refreshedEpoch.load(std::memory_order_relaxed) == epoch && space->refreshedProof.load(std::memory_order_relaxed) == proof && pendingKept();
     if (reuse) {
