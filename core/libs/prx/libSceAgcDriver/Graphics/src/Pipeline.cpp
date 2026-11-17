@@ -470,7 +470,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     }
     appendKey(keys.vertexInput, state.topology);
     appendKey(keys.vertexInput, state.primitiveRestart);
-    appendKey(keys.preRasterization, state.rasterizerDiscard);
+    if (!narrow || !context.dynamicRasterizerDiscardEnable) appendKey(keys.preRasterization, state.rasterizerDiscard);
     appendKey(keys.preRasterization, state.provokingVertexMode);
     appendKey(keys.preRasterization, state.polygonMode);
     appendKey(keys.preRasterization, state.lineWidth);
@@ -737,6 +737,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (libraries) dynamicStates.assign(PipelineLibraryDynamicStates().begin(), PipelineLibraryDynamicStates().end());
         dynamicDepthBiasEnable = libraries && narrowLibraryKeys && context.dynamicDepthBiasEnable;
         if (dynamicDepthBiasEnable) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE);
+        dynamicRasterizerDiscard = libraries && narrowLibraryKeys && context.dynamicRasterizerDiscardEnable;
+        if (dynamicRasterizerDiscard) dynamicStates.push_back(VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE);
         if (context.dynamicColorWriteMask) dynamicStates.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
         if (dynamicBlendConstants) dynamicStates.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
         dynamicSlots = CommandState::DynamicSlots(dynamicStates);
@@ -1024,7 +1026,7 @@ void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, Vk
         VkRenderingInfoKHR rendering{VK_STRUCTURE_TYPE_RENDERING_INFO_KHR};
         rendering.renderArea = {{0, 0}, extent};
         rendering.layerCount = state.renderLayers;
-        const bool outputs = !state.rasterizerDiscard;
+        const bool outputs = !state.rasterizerDiscard || dynamicRasterizerDiscard;
         rendering.colorAttachmentCount = outputs ? static_cast<std::uint32_t>(colors.size()) : 0u;
         rendering.pColorAttachments = outputs && !colors.empty() ? colors.data() : nullptr;
         if (outputs && depthFormat != VK_FORMAT_UNDEFINED) rendering.pDepthAttachment = &depth;
@@ -1076,6 +1078,7 @@ void Pipeline::setLibraryState(CommandState& recording, const State& state) cons
     recording.SetFrontFace(context, state.frontFace);
     recording.SetDepthBias(context, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
     if (dynamicDepthBiasEnable) recording.SetDepthBiasEnable(context, depthBias);
+    if (dynamicRasterizerDiscard) recording.SetRasterizerDiscardEnable(context, state.rasterizerDiscard);
     recording.SetDepthBounds(context, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
     recording.SetDepthTestEnable(context, depth && state.depthTest);
     recording.SetDepthWriteEnable(context, depth && state.depthWrite);

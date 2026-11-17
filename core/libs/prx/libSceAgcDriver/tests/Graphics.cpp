@@ -6048,6 +6048,7 @@ struct MockVulkan {
     std::vector<VkFormat> shaderLibraryDepthFormats;
     std::vector<bool> fragmentLibraryMultisample;
     std::vector<bool> preRasterizationBiasEnableDynamic;
+    std::vector<bool> preRasterizationDiscardDynamic;
     std::uint32_t pipelineCreateCount = 0;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
@@ -6324,6 +6325,7 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineC
     }
     if (library->flags == VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT) mock.fragmentLibraryMultisample.push_back(infos[0].pMultisampleState != nullptr);
     if (library->flags == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT && infos[0].pRasterizationState != nullptr) mock.preRasterizationDiscards.push_back(infos[0].pRasterizationState->rasterizerDiscardEnable);
+    if (library->flags == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT && infos[0].pDynamicState != nullptr) mock.preRasterizationDiscardDynamic.push_back(std::ranges::count(std::span(infos[0].pDynamicState->pDynamicStates, infos[0].pDynamicState->dynamicStateCount), VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE) == 1);
     if (library->flags == VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT && infos[0].pDynamicState != nullptr) mock.preRasterizationBiasEnableDynamic.push_back(std::ranges::count(std::span(infos[0].pDynamicState->pDynamicStates, infos[0].pDynamicState->dynamicStateCount), VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE) == 1);
     *pipelines = makeHandle<VkPipeline>();
     ++mock.live;
@@ -9978,6 +9980,38 @@ void pipelineLibraryDynamicDepthBiasTests() {
             Require(mock.preRasterizationBiasEnableDynamic.size() == built[1] && std::ranges::all_of(mock.preRasterizationBiasEnableDynamic, [&](bool given) { return given == shared; }), shared ? "a narrow pre-rasterization library baked the depth bias enable" : "a pre-rasterization library made the depth bias enable dynamic without narrow keys and the device feature");
             ClearPipelineLibraries(context.device);
             Require(mock.live == 0, "dynamic depth bias library tests leaked Vulkan objects");
+        }
+    }
+    RuntimeSwitches::Assign(RuntimeSwitch::WideLibraryKeys, false);
+}
+
+void pipelineLibraryDynamicRasterizerDiscardTests() {
+    using namespace AgcDriver::Graphics;
+    for (const bool wide : {false, true}) {
+        for (const bool dynamic : {false, true}) {
+            mock = MockVulkan{};
+            RuntimeSwitches::Assign(RuntimeSwitch::WideLibraryKeys, wide);
+            auto context = mockContext();
+            context.graphicsPipelineLibrary = true;
+            context.dynamicRasterizerDiscardEnable = dynamic;
+            context.limits.framebufferNoAttachmentsSampleCounts = VK_SAMPLE_COUNT_1_BIT;
+            ShaderRecompiler::RecompileResult vertex, fragment;
+            vertex.spirv = makeModule({});
+            fragment.spirv = makeModule({.fragment = true});
+            vertex.variantId = 321;
+            fragment.variantId = 322;
+            const std::array<CompiledShader, 2> shaders{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, PipelinePushSlotBytes}}};
+            const PipelineSetLayouts resources{makeHandle<VkDescriptorSetLayout>(), VK_NULL_HANDLE, false, {}, {}};
+            State drawn{};
+            auto discarded = drawn;
+            discarded.rasterizerDiscard = true;
+            for (const auto* state : {&drawn, &discarded, &drawn, &discarded}) Require(Pipeline::Prebuild(context, *state, VertexInputLayout{}, resources, shaders), "graphics pipeline library prebuild was skipped");
+            const auto built = PipelineLibraryCountersOf(context.device).built;
+            const bool shared = !wide && dynamic;
+            Require(built[1] == (shared ? 1u : 2u), shared ? "a rasterizer discard split the pre-rasterization library although the device sets it per draw" : "a pre-rasterization library that bakes the rasterizer discard was shared across it");
+            Require(mock.preRasterizationDiscardDynamic.size() == built[1] && std::ranges::all_of(mock.preRasterizationDiscardDynamic, [&](bool given) { return given == shared; }), shared ? "a narrow pre-rasterization library baked the rasterizer discard" : "a pre-rasterization library made the rasterizer discard dynamic without narrow keys and the device feature");
+            ClearPipelineLibraries(context.device);
+            Require(mock.live == 0, "dynamic rasterizer discard library tests leaked Vulkan objects");
         }
     }
     RuntimeSwitches::Assign(RuntimeSwitch::WideLibraryKeys, false);
@@ -14820,7 +14854,16 @@ void commandStateTests() {
     const std::array<VkDynamicState, 1> depthBiasEnable{VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE};
     const auto biasEnableSlot = CommandState::DynamicSlots(depthBiasEnable);
     Require(biasEnableSlot == CommandState::Mask(Slot::DepthBiasEnable), "the depth bias enable dynamic state mapped to another slot");
-    Require((library | maskSlot | constantsSlot | biasEnableSlot) == (1u << CommandState::SlotCount) - 1u && (library & (maskSlot | constantsSlot | biasEnableSlot)) == 0 && (maskSlot & constantsSlot) == 0 && ((maskSlot | constantsSlot) & biasEnableSlot) == 0, "the pipeline library's dynamic states, the color write mask, the blend constants and the depth bias enable do not cover every tracked slot");
+    const std::array<VkDynamicState, 1> rasterizerDiscard{VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE};
+    const auto discardSlot = CommandState::DynamicSlots(rasterizerDiscard);
+    Require(discardSlot == CommandState::Mask(Slot::RasterizerDiscard), "the rasterizer discard enable dynamic state mapped to another slot");
+    std::uint32_t coveredSlots = 0;
+    bool disjointSlots = true;
+    for (const auto slots : {library, maskSlot, constantsSlot, biasEnableSlot, discardSlot}) {
+        disjointSlots = disjointSlots && (coveredSlots & slots) == 0;
+        coveredSlots |= slots;
+    }
+    Require(coveredSlots == (1u << CommandState::SlotCount) - 1u && disjointSlots, "the pipeline library's dynamic states, the color write mask, the blend constants, the depth bias enable and the rasterizer discard enable do not each cover distinct tracked slots");
     Require(fixed == (CommandState::Mask(Slot::Viewport) | CommandState::Mask(Slot::Scissor)), "the viewport and scissor dynamic states mapped to other slots");
     const std::array<VkDynamicState, 2> unmodelled{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_LINE_WIDTH};
     bool rejected = false;
@@ -14863,6 +14906,21 @@ void commandStateTests() {
         tracker.BindPipeline(context, pipelineA, library | biasEnableSlot);
         tracker.SetDepthBiasEnable(context, 0u);
         expectStateLog({stateLine("bind", 0u, pipelineA), stateLine("biasenable", 1u), stateLine("biasenable", 0u), stateLine("bind", 0u, pipelineB), stateLine("bind", 0u, pipelineC), stateLine("bind", 0u, pipelineA), stateLine("biasenable", 0u)}, "depth bias enables across binds of pipelines that make it dynamic or static");
+    }
+
+    {
+        CommandState tracker;
+        tracker.Begin(commands);
+        tracker.BindPipeline(context, pipelineA, library | discardSlot);
+        for (const auto enable : {1u, 1u, 0u, 0u}) tracker.SetRasterizerDiscardEnable(context, enable);
+        tracker.BindPipeline(context, pipelineB, library | discardSlot);
+        tracker.SetRasterizerDiscardEnable(context, 0u);
+        Require(tracker.Known(Slot::RasterizerDiscard), "binding another pipeline with a dynamic rasterizer discard forgot it");
+        tracker.BindPipeline(context, pipelineC, library);
+        Require(!tracker.Known(Slot::RasterizerDiscard), "binding a pipeline with a static rasterizer discard kept it known");
+        tracker.BindPipeline(context, pipelineA, library | discardSlot);
+        tracker.SetRasterizerDiscardEnable(context, 0u);
+        expectStateLog({stateLine("bind", 0u, pipelineA), stateLine("discard", 1u), stateLine("discard", 0u), stateLine("bind", 0u, pipelineB), stateLine("bind", 0u, pipelineC), stateLine("bind", 0u, pipelineA), stateLine("discard", 0u)}, "rasterizer discard enables across binds of pipelines that make it dynamic or static");
     }
 
     {
@@ -15290,6 +15348,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--pipeline-library-narrow-keys") {
             pipelineLibraryNarrowKeyTests();
             pipelineLibraryDynamicDepthBiasTests();
+            pipelineLibraryDynamicRasterizerDiscardTests();
             std::cout << "shader pipeline libraries are keyed only by the state their subset reads\n";
             return 0;
         }
@@ -15634,6 +15693,7 @@ int main(int argc, char** argv) {
         pipelineLibraryRasterizerDiscardTests();
         pipelineLibraryNarrowKeyTests();
         pipelineLibraryDynamicDepthBiasTests();
+        pipelineLibraryDynamicRasterizerDiscardTests();
         pipelineLibraryClearWaitsForBuildTests();
         pipelineLibraryInFlightPartTests();
         tessellationPipelineLibraryCacheTests();

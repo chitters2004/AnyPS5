@@ -100,6 +100,7 @@ private:
     bool narrowLibraryKeys = false;
     bool dynamicBlendConstants = false;
     bool dynamicDepthBiasEnable = false;
+    bool dynamicRasterizerDiscard = false;
     std::uint32_t dynamicSlots = 0;
     std::shared_ptr<OptimizedPipeline> optimized;
     bool dynamicRendering = false;

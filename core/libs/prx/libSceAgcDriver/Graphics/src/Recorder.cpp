@@ -1592,6 +1592,7 @@ std::uint32_t CommandState::DynamicSlots(std::span<const VkDynamicState> states)
         case VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT: slots |= Mask(ColorWriteMask); break;
         case VK_DYNAMIC_STATE_BLEND_CONSTANTS: slots |= Mask(BlendConstants); break;
         case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE: slots |= Mask(DepthBiasEnable); break;
+        case VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE: slots |= Mask(RasterizerDiscard); break;
         default: throw std::runtime_error("AGC graphics: a pipeline declares a dynamic state the command tracker does not follow");
         }
     }
@@ -1683,6 +1684,10 @@ void CommandState::SetDepthTestEnable(const Context& context, VkBool32 enable) {
 
 void CommandState::SetDepthBiasEnable(const Context& context, VkBool32 enable) {
     apply(DepthBiasEnable, &CommandState::depthBiasEnable, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetDepthBiasEnable, "vkCmdSetDepthBiasEnableEXT")(commands, enable); });
+}
+
+void CommandState::SetRasterizerDiscardEnable(const Context& context, VkBool32 enable) {
+    apply(RasterizerDiscard, &CommandState::rasterizerDiscard, enable, std::equal_to<>{}, [&] { context.tracked(&DeviceFunctions::cmdSetRasterizerDiscardEnable, "vkCmdSetRasterizerDiscardEnableEXT")(commands, enable); });
 }
 
 void CommandState::SetDepthWriteEnable(const Context& context, VkBool32 enable) {

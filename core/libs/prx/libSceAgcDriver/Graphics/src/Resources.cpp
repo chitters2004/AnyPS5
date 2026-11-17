@@ -285,6 +285,7 @@ void FillDeviceFunctions(const Context& context, DeviceFunctions& functions) {
     functions.cmdSetScissor = context.lookup<PFN_vkCmdSetScissor>("vkCmdSetScissor");
     if (context.dynamicColorWriteMask) functions.cmdSetColorWriteMask = context.lookup<PFN_vkCmdSetColorWriteMaskEXT>("vkCmdSetColorWriteMaskEXT");
     if (context.dynamicDepthBiasEnable) functions.cmdSetDepthBiasEnable = context.lookup<PFN_vkCmdSetDepthBiasEnableEXT>("vkCmdSetDepthBiasEnableEXT");
+    if (context.dynamicRasterizerDiscardEnable) functions.cmdSetRasterizerDiscardEnable = context.lookup<PFN_vkCmdSetRasterizerDiscardEnableEXT>("vkCmdSetRasterizerDiscardEnableEXT");
     functions.cmdSetDepthBounds = context.lookup<PFN_vkCmdSetDepthBounds>("vkCmdSetDepthBounds");
     functions.cmdSetBlendConstants = context.lookup<PFN_vkCmdSetBlendConstants>("vkCmdSetBlendConstants");
     functions.cmdSetDepthBias = context.lookup<PFN_vkCmdSetDepthBias>("vkCmdSetDepthBias");

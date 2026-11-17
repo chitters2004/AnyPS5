@@ -57,6 +57,7 @@ public:
         ColorWriteMask,
         BlendConstants,
         DepthBiasEnable,
+        RasterizerDiscard,
         SlotCount
     };
     static constexpr std::uint32_t Mask(Slot slot) { return 1u << slot; }
@@ -90,6 +91,7 @@ public:
     void SetColorWriteMasks(const Context& context, std::span<const VkColorComponentFlags> masks);
     void SetBlendConstants(const Context& context, const std::array<float, 4>& constants);
     void SetDepthBiasEnable(const Context& context, VkBool32 enable);
+    void SetRasterizerDiscardEnable(const Context& context, VkBool32 enable);
 
 private:
     struct StencilOps {
@@ -134,6 +136,7 @@ private:
     ColorWriteMasks colorWriteMasks{};
     std::array<float, 4> blendConstants{};
     VkBool32 depthBiasEnable = 0;
+    VkBool32 rasterizerDiscard = 0;
 };
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
