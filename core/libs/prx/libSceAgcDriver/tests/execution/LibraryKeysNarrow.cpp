@@ -104,7 +104,6 @@ void Arm(AgcDriver::VulkanDevice& device, const Shaders& compiled, std::span<con
             Require(equal == (biased ? 0u : Covered), arm + ", " + std::string(target.name) + ": " + std::to_string(equal) + " pixels of a draw " + (biased ? "with" : "without") + " depth bias passed an equal test against the depth it wrote");
         }
         for (const bool discarded : {true, false, true}) {
-            if (discarded && !dynamicDiscard) continue;
             const auto covered = DepthFastClearHarness::Draw(device, compiled, target.surface, {.depthCompare = VK_COMPARE_OP_ALWAYS, .rasterizerDiscard = discarded});
             Require(covered == (discarded ? 0u : Covered), arm + ", " + std::string(target.name) + ": a draw " + (discarded ? "with" : "without") + " rasterizer discard covered " + std::to_string(covered) + " of " + std::to_string(Covered) + " pixels");
         }

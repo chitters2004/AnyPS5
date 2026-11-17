@@ -13,9 +13,9 @@ enum class PipelineCreateKind : std::size_t { VertexInputPart, PreRasterizationP
 
 inline constexpr std::array<const char*, static_cast<std::size_t>(PipelineCreateKind::Count)> PipelineCreateKindNames{"vertex-input part", "pre-raster part", "fragment part", "output part", "link", "optimized relink", "monolithic", "second channel", "back faces", "compute"};
 
-enum class MonolithicReason : std::size_t { NoLibraries, Statistics, Tessellation, DepthBiasPerFace, RectList, BarycentricPatches, AlternateAlpha, FunctionLds, MeshWindow, Interlock, StageOrIdentity, Count };
+enum class MonolithicReason : std::size_t { NoLibraries, Statistics, Tessellation, DepthBiasPerFace, RectList, BarycentricPatches, AlternateAlpha, FunctionLds, MeshWindow, Interlock, StaticDiscard, StageOrIdentity, Count };
 
-inline constexpr std::array<const char*, static_cast<std::size_t>(MonolithicReason::Count)> MonolithicReasonNames{"no pipeline libraries", "pipeline statistics", "tessellation", "per-face depth bias", "rect list", "barycentric patches", "alternate alpha", "function LDS", "mesh window", "fragment interlock", "geometry stage or no identity"};
+inline constexpr std::array<const char*, static_cast<std::size_t>(MonolithicReason::Count)> MonolithicReasonNames{"no pipeline libraries", "pipeline statistics", "tessellation", "per-face depth bias", "rect list", "barycentric patches", "alternate alpha", "function LDS", "mesh window", "fragment interlock", "static rasterizer discard", "geometry stage or no identity"};
 
 enum class PipelineCacheOutcome : std::uint8_t { Hit, Miss, Unknown };
 

@@ -104,6 +104,7 @@ private:
     mutable std::atomic<bool> discardNoted{false};
     void noteDiscardDraw(const State& state) const;
     bool libraries = false;
+    bool staticDiscard = false;
     bool narrowLibraryKeys = false;
     bool dynamicBlendConstants = false;
     bool dynamicDepthBiasEnable = false;
