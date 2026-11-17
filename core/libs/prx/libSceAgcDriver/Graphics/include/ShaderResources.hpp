@@ -877,6 +877,7 @@ private:
     std::uint64_t provedUnrangedProof = 0;
     std::uint64_t provedUnrangedPending = 0;
     std::size_t rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes);
+    void noteRangeWrite() const;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
     ProofFailure proveImports();
     ProofFailure recordStaging();

@@ -2438,6 +2438,52 @@ struct WriteTracker {
         return evidence == RangeVersionDecline::None ? RangeVersionDecline::ChangedBlock : evidence;
     }
 
+    bool describeWrites(std::uint64_t address, std::uint64_t end, std::uint64_t generation, RangeWriteShape& shape) const {
+        bool found = false;
+        bool straddles = true;
+        std::uint64_t low = end;
+        std::uint64_t high = address;
+        std::uint64_t written = 0;
+        const auto unit = [&](RangeWriteSource source, std::uint64_t begin, std::uint64_t stop, bool exact) {
+            const auto from = std::max(begin, address);
+            const auto to = std::min(stop, end);
+            if (from >= to) return;
+            found = true;
+            ++shape.units[static_cast<std::size_t>(source)];
+            low = std::min(low, from);
+            high = std::max(high, to);
+            written += to - from;
+            if (exact || (begin >= address && stop <= end)) straddles = false;
+        };
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            if (stampOf(block) <= generation) continue;
+            const auto base = blockBegin(block);
+            const auto pages = [&](const std::unordered_map<std::uint64_t, CpuPages>& map, RangeWriteSource source) {
+                const auto found = map.find(block);
+                if (found == map.end()) return;
+                for (std::size_t page = 0; page < found->second.pages.size(); ++page) {
+                    if (found->second.pages[page] > generation) unit(source, base + page * WritePageBytes, base + (page + 1) * WritePageBytes, false);
+                }
+            };
+            pages(cpuPages, RangeWriteSource::CpuPage);
+            pages(walkPages, RangeWriteSource::WalkPage);
+            const auto entry = driverPieces.find(block);
+            if (entry == driverPieces.end()) continue;
+            if (entry->second.whole > generation) unit(RangeWriteSource::DriverBlock, base, base + WriteBlockBytes, false);
+            for (const auto& piece : entry->second.pieces) {
+                if (piece.generation > generation) unit(RangeWriteSource::DriverPiece, base + piece.begin, base + piece.end, true);
+            }
+        }
+        if (!found) return false;
+        shape.rangeBegin = address;
+        shape.rangeEnd = end;
+        shape.writeBegin = low;
+        shape.writeEnd = high;
+        shape.writtenBytes = std::min(written, end - address);
+        shape.straddlesOnly = straddles;
+        return true;
+    }
+
     bool cpuUnchanged(std::uint64_t address, std::size_t bytes, std::uint64_t generation) const {
         const auto first = blockOf(address);
         const auto last = blockOf(address + bytes - 1u);
@@ -3289,6 +3335,19 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
         }
     }
     return RangeVersionDecline::None;
+}
+
+RangeWriteShape DescribeRangeWrite(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation) {
+    RangeWriteShape shape;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return shape;
+    for (const auto& [begin, end] : ranges) {
+        if (end <= begin || end > TickSpanBytes || !tracker.covers(begin, static_cast<std::size_t>(end - begin))) continue;
+        if (tracker.describeWrites(begin, end, generation, shape)) break;
+    }
+    return shape;
 }
 
 namespace {

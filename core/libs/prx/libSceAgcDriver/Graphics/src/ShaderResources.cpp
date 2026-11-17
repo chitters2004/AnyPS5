@@ -4387,6 +4387,58 @@ RangeVersionCounts& rangeVersionCounts() {
     return counts;
 }
 
+enum class RangeWriteOwner : std::size_t { TableSpan, DccKeys, ImageTable, Described, Texture, StorageImage, Other, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RangeWriteOwner::Count)> RangeWriteOwnerNames{"compared table span", "DCC keys", "described image table", "described range", "texture surface", "storage image", "other recorded range"};
+constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::RangeWriteSource::Count)> RangeWriteSourceNames{"CPU page", "write-walk page", "driver block", "driver piece"};
+constexpr std::array<const char*, 4> RangeWriteShares{"under 1/16", "under 1/4", "under all", "all"};
+constexpr std::array<const char*, 4> RangeWriteSizes{"under 4 KiB", "under 64 KiB", "under 1 MiB", "1 MiB or more"};
+
+struct RangeWriteCounts {
+    std::array<ProfileCounter, static_cast<std::size_t>(GuestMemory::RangeWriteSource::Count)> sources;
+    ProfileCounter straddlesOnly;
+    std::array<ProfileCounter, RangeWriteShares.size()> shares;
+    std::array<ProfileCounter, RangeWriteSizes.size()> sizes;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> owners;
+    ProfileCounter sameTableBytes;
+    ProfileCounter undescribed;
+};
+
+RangeWriteCounts& rangeWriteCounts() {
+    static RangeWriteCounts counts;
+    return counts;
+}
+
+std::size_t rangeWriteShare(std::uint64_t written, std::uint64_t bytes) {
+    if (written >= bytes) return 3;
+    if (written * 16 < bytes) return 0;
+    if (written * 4 < bytes) return 1;
+    return 2;
+}
+
+std::size_t rangeWriteSize(std::uint64_t bytes) {
+    if (bytes < 4096) return 0;
+    if (bytes < 65536) return 1;
+    if (bytes < 1048576) return 2;
+    return 3;
+}
+
+std::string takeRangeWriteLine() {
+    auto& counts = rangeWriteCounts();
+    const auto list = [](auto& counters, const auto& names) {
+        std::string text;
+        for (std::size_t index = 0; index < counters.size(); ++index) text += (index == 0 ? "" : ", ") + std::string(names[index]) + " " + std::to_string(counters[index].Take());
+        return text;
+    };
+    const auto sources = list(counts.sources, RangeWriteSourceNames);
+    const auto straddles = counts.straddlesOnly.Take();
+    const auto shares = list(counts.shares, RangeWriteShares);
+    const auto sizes = list(counts.sizes, RangeWriteSizes);
+    const auto owners = list(counts.owners, RangeWriteOwnerNames);
+    const auto same = counts.sameTableBytes.Take();
+    const auto undescribed = counts.undescribed.Take();
+    return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed);
+}
+
 std::atomic<bool> rangeVersionsDisabled{false};
 std::atomic<std::uint32_t> rangeDisagreementsShown{0};
 
@@ -4461,6 +4513,7 @@ void reportRangeVersions() {
     for (std::size_t kind = 0; kind < verified.size(); ++kind) {
         for (std::size_t set = 0; set < verified[kind].size(); ++set) verified[kind][set] = counts.verified[kind][set].Take();
     }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) %s\n", takeRangeWriteLine().c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) range-version exits (APS5_RANGE_VERSIONS %s at the report): same epoch %llu, across epochs %llu%s; declined: %s; verified same epoch storage/tables/sampled %llu/%llu/%llu, across epochs %llu/%llu/%llu, disagreed %llu, broken meanwhile by other threads %llu\n", RuntimeSwitches::Set(RuntimeSwitch::RangeVersions) ? "on" : "off", static_cast<unsigned long long>(counts.exits[0].Take()), static_cast<unsigned long long>(counts.exits[1].Take()), rangeVersionsDisabled.load(std::memory_order_relaxed) ? " (off after a disagreement)" : "", declines.empty() ? "none" : declines.c_str(), static_cast<unsigned long long>(verified[0][0]), static_cast<unsigned long long>(verified[0][1]), static_cast<unsigned long long>(verified[0][2]), static_cast<unsigned long long>(verified[1][0]), static_cast<unsigned long long>(verified[1][1]), static_cast<unsigned long long>(verified[1][2]), static_cast<unsigned long long>(counts.disagreements.Take()), static_cast<unsigned long long>(counts.concurrent.Take()));
 }
 
@@ -5410,6 +5463,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (GuestMemory::ProofBreaksCounted()) {
                 if (decline == 0) rangeVersionCounts().exits[epochMoved ? 1 : 0].Add();
                 else rangeVersionCounts().declines[decline].Add();
+                if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Changed)) noteRangeWrite();
             }
             if (decline == 0) {
                 rangeVersionPoint(RangeVersionPoint::AfterRangeValidation);
@@ -5554,6 +5608,57 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return ok;
     }
     return revalidateFull(shaders, report);
+}
+
+void ShaderResources::noteRangeWrite() const {
+    auto& counts = rangeWriteCounts();
+    const auto shape = GuestMemory::DescribeRangeWrite(proofRanges, provedGeneration);
+    if (shape.writeEnd <= shape.writeBegin) {
+        counts.undescribed.Add();
+        return;
+    }
+    for (std::size_t source = 0; source < shape.units.size(); ++source) {
+        if (shape.units[source] != 0) counts.sources[source].Add();
+    }
+    if (shape.straddlesOnly) counts.straddlesOnly.Add();
+    const auto bytes = shape.rangeEnd - shape.rangeBegin;
+    counts.shares[rangeWriteShare(shape.writtenBytes, bytes)].Add();
+    counts.sizes[rangeWriteSize(bytes)].Add();
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return begin < shape.writeEnd && shape.writeBegin < end; };
+    const auto owner = [&] {
+        bool table = false;
+        bool same = true;
+        for (const auto& [address, copy] : comparedTableSpans) {
+            if (!overlaps(address, address + copy.size())) continue;
+            table = true;
+            if (GuestMemory::CompareMapped(address, copy) != GuestMemory::Compare::Equal) same = false;
+        }
+        if (table) {
+            if (same) counts.sameTableBytes.Add();
+            return RangeWriteOwner::TableSpan;
+        }
+        const auto dccOver = [&](std::uint64_t dcc, std::uint64_t guestBytes) { return dcc != 0 && overlaps(dcc, dcc + DccKeyBytes(guestBytes)); };
+        for (const auto& range : describedRanges) {
+            if (dccOver(range.dccAddress, range.bytes)) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& surface : validatedTextures) {
+            if (surface.valid && dccOver(surface.resource.dccAddress, surface.bytes)) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr && dccOver(image->Descriptor().dccAddress, image->GuestBytes())) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& range : describedRanges) {
+            if (overlaps(range.address, range.address + range.bytes)) return range.imageTable ? RangeWriteOwner::ImageTable : RangeWriteOwner::Described;
+        }
+        for (const auto& surface : validatedTextures) {
+            if (overlaps(surface.resource.baseAddress, surface.resource.baseAddress + surface.bytes)) return RangeWriteOwner::Texture;
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr && overlaps(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes())) return RangeWriteOwner::StorageImage;
+        }
+        return RangeWriteOwner::Other;
+    }();
+    counts.owners[static_cast<std::size_t>(owner)].Add();
 }
 
 std::size_t ShaderResources::rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes) {

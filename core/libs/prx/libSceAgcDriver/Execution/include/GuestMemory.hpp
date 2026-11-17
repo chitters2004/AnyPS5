@@ -279,6 +279,17 @@ struct RangeVersionBaseline {
 enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, CollectUnwatched, Collect, Changed, ChangedPossibly, ChangedBlock, ChangedRefused, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
 const char* RangeVersionDeclineName(RangeVersionDecline decline);
 RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline);
+enum class RangeWriteSource : std::uint8_t { CpuPage, WalkPage, DriverBlock, DriverPiece, Count };
+struct RangeWriteShape {
+    std::uint64_t rangeBegin = 0;
+    std::uint64_t rangeEnd = 0;
+    std::uint64_t writeBegin = 0;
+    std::uint64_t writeEnd = 0;
+    std::uint64_t writtenBytes = 0;
+    std::array<std::uint32_t, static_cast<std::size_t>(RangeWriteSource::Count)> units{};
+    bool straddlesOnly = false;
+};
+RangeWriteShape DescribeRangeWrite(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 inline constexpr std::size_t ProofBreakDetails = 16;
 enum class PacketWrites : std::uint8_t { Declared, None, Empty, Writeless, Count };
 bool ProofBreakCensusEnabled();

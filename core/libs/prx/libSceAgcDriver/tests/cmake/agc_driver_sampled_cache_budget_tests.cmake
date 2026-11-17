@@ -77,7 +77,7 @@ if(BUILD_TESTING)
         FAIL_REGULAR_EXPRESSION "AGC graphics:")
     add_test(NAME agc_driver_resource_cache_range_versions COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions)
     set_tests_properties(agc_driver_resource_cache_range_versions PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
-        PASS_REGULAR_EXPRESSION "range-version exits \\(APS5_RANGE_VERSIONS on at the report\\): same epoch 4, across epochs 5[;] declined: range written 3, unranged proof break 3, unranged pending entry 1, ranged proof break 3, ranged pending entry 2[;] verified same epoch storage/tables/sampled 0/0/0, across epochs 0/0/0, disagreed 0, broken meanwhile by other threads 0\n.*resource cache range version tests passed"
+        PASS_REGULAR_EXPRESSION "range written: write evidence [^\n]*written share of the range under 1/16 3, [^\n]*first written owner [^\n]*described range 3, [^\n]*no write found 0\n[^\n]*range-version exits \\(APS5_RANGE_VERSIONS on at the report\\): same epoch 4, across epochs 5[;] declined: range written 3, unranged proof break 3, unranged pending entry 1, ranged proof break 3, ranged pending entry 2[;] verified same epoch storage/tables/sampled 0/0/0, across epochs 0/0/0, disagreed 0, broken meanwhile by other threads 0\n.*resource cache range version tests passed"
         FAIL_REGULAR_EXPRESSION "AGC graphics:")
     add_test(NAME agc_driver_resource_cache_range_versions_verify COMMAND agc_driver_sampled_cache_budget_tests resource-range-versions)
     set_tests_properties(agc_driver_resource_cache_range_versions_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_EPOCH_PROOFS=1;APS5_VERIFY_RANGE_VERSIONS=1" SKIP_RETURN_CODE 77 TIMEOUT 30
