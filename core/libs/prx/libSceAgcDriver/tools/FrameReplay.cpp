@@ -535,7 +535,14 @@ struct Replay {
         const auto began = Clock::now();
         const auto deadline = began + options.busyTimeout;
         { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] waiting for captured park: replay %llu/%llu blocked%s\n", (unsigned long long)a, (unsigned long long)c, describeBlocked().c_str()); }
+        std::string last;
         while (Clock::now() < deadline) {
+            {
+                const auto [a, c] = progress();
+                const auto state = "settled " + std::to_string(AgcDriverSettled_nid_postfix()) + " at park " + std::to_string(atCapturedPark(call)) + " replay " + std::to_string(a) + "/" + std::to_string(c) + " blocked" + describeBlocked();
+                if (state != last) std::fprintf(stderr, "[dbg] +%lld us %s\n", (long long)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - began).count(), state.c_str());
+                last = state;
+            }
             if (atCapturedPark(call) && AgcDriverHoldSettled_nid_postfix(0)) {
                 const SettledHold hold{true};
                 if (!atCapturedPark(call)) continue;
@@ -547,6 +554,7 @@ struct Replay {
             if (AgcDriverSettled_nid_postfix() && !atCapturedPark(call)) { const auto [a, c] = progress(); std::fprintf(stderr, "[dbg] gave up re-restore: replay %llu/%llu blocked%s\n", (unsigned long long)a, (unsigned long long)c, describeBlocked().c_str()); break; }
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+        std::fprintf(stderr, "[dbg] left the park wait after %lld us\n", (long long)std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - began).count());
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
     }
 
