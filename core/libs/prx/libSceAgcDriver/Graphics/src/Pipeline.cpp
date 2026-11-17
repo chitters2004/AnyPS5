@@ -477,7 +477,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.preRasterization, state.negativeOneToOne);
     appendKey(keys.preRasterization, state.depthClamp && context.depthClamp);
     appendKey(keys.preRasterization, state.conservativeRasterization);
-    appendKey(keys.preRasterization, state.depth.has_value() && state.depthBias);
+    if (!narrow || !context.dynamicDepthBiasEnable) appendKey(keys.preRasterization, state.depth.has_value() && state.depthBias);
     appendKey(keys.preRasterization, state.stages.tessellation.has_value());
     if (state.stages.tessellation) appendKey(keys.preRasterization, state.stages.tessellation->inputControlPoints);
     keys.narrow = narrow;
@@ -735,6 +735,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);
         if (libraries) dynamicStates.assign(PipelineLibraryDynamicStates().begin(), PipelineLibraryDynamicStates().end());
+        dynamicDepthBiasEnable = libraries && narrowLibraryKeys && context.dynamicDepthBiasEnable;
+        if (dynamicDepthBiasEnable) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE);
         if (context.dynamicColorWriteMask) dynamicStates.push_back(VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT);
         if (dynamicBlendConstants) dynamicStates.push_back(VK_DYNAMIC_STATE_BLEND_CONSTANTS);
         dynamicSlots = CommandState::DynamicSlots(dynamicStates);
@@ -1073,6 +1075,7 @@ void Pipeline::setLibraryState(CommandState& recording, const State& state) cons
     recording.SetCullMode(context, state.cullMode);
     recording.SetFrontFace(context, state.frontFace);
     recording.SetDepthBias(context, depthBias ? HostDepthBiasConstant(context, state.depth->format, state.depthBiasConstant) : 0.0f, depthBias ? state.depthBiasClamp : 0.0f, depthBias ? state.depthBiasSlope : 0.0f);
+    if (dynamicDepthBiasEnable) recording.SetDepthBiasEnable(context, depthBias);
     recording.SetDepthBounds(context, depthBounds ? state.minDepthBounds : 0.0f, depthBounds ? state.maxDepthBounds : 1.0f);
     recording.SetDepthTestEnable(context, depth && state.depthTest);
     recording.SetDepthWriteEnable(context, depth && state.depthWrite);
