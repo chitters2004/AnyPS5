@@ -421,6 +421,9 @@ struct MemoPatch {
     std::uint32_t flattenedSrt = NoBinding;
     bool pushData = false;
     bool valid = false;
+    std::uint32_t touchedAllocations = 0;
+    std::uint32_t untouchedWordAllocations = 0;
+    std::uint32_t invariantAllocations = 0;
 };
 
 struct ResultMemoEntry {
@@ -1868,6 +1871,7 @@ struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, patched{0}, misses{0}, evictions{0}, trimmed{0}, populateNanoseconds{0}, patchNanoseconds{0}, mismatches{0};
     std::atomic<std::uint64_t> evictedReseenPatched{0}, evictedReseenMissed{0}, patchedReseen{0}, patchCopyNanoseconds{0};
     std::atomic<std::uint64_t> totalEvictedReseenPatched{0}, totalEvictedReseenMissed{0}, totalPatchedReseen{0};
+    std::atomic<std::uint64_t> copyTouched{0}, copyUntouchedWords{0}, copyInvariant{0}, totalCopyTouched{0}, totalCopyUntouchedWords{0}, totalCopyInvariant{0};
     MemoKeyGhosts evictedKeys, patchedKeys;
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
@@ -2046,6 +2050,33 @@ void verifyPatchedResult(const RecompileResult& patched, const RecompileResult& 
     if (const auto index = printed.fetch_add(1, std::memory_order_relaxed); index < 20u) std::fprintf(stderr, "[recompile] masked result memo mismatch %u: variant %016llx differs in its %s\n", index + 1u, static_cast<unsigned long long>(variantId), difference);
 }
 
+void censusCopy(const RecompileResult& result, MemoPatch& patch) {
+    const auto allocates = [](const auto& values) { return values.empty() ? 0u : 1u; };
+    const auto spills = [](const ElementFlags& flags) { return flags.size() > 64u ? 1u : 0u; };
+    std::vector<std::uint8_t> touched(result.bindings.size(), 0u);
+    for (const auto& [binding, resources] : patch.buffers) {
+        if (binding < touched.size()) touched[binding] = 1u;
+    }
+    if (!patch.userWords.empty() && !patch.pushData && patch.shaderData < touched.size()) touched[patch.shaderData] = 1u;
+    if (patch.flattenedSrt < touched.size()) touched[patch.flattenedSrt] = 1u;
+    std::uint32_t touchedCount = allocates(result.bindings) + (patch.pushData && !patch.userWords.empty() ? allocates(result.pushConstants) : 0u);
+    std::uint32_t untouched = 0;
+    std::uint32_t invariant = (patch.pushData && !patch.userWords.empty() ? 0u : allocates(result.pushConstants));
+    invariant += allocates(result.vertexInputPatches) + allocates(result.runtimeImageResources) + allocates(result.vertexInputs) + allocates(result.parameterExports) + allocates(result.fragmentParameters) + allocates(result.stencilReferences) + allocates(result.shaderDataUserWords) + allocates(result.specialization) + allocates(result.vertexAttributes) + allocates(result.imageTablePoison) + allocates(result.imageTableRanges) + allocates(result.imageTableReadRanges);
+    for (const auto& ranges : result.imageTableReadRanges) invariant += allocates(ranges);
+    if (result.meshBarycentrics.has_value()) invariant += allocates(result.meshBarycentrics->parameters);
+    for (std::size_t index = 0; index < result.bindings.size(); ++index) {
+        const auto& binding = result.bindings[index];
+        if (touched[index] != 0u) touchedCount += allocates(binding.guestDescriptor);
+        else untouched += allocates(binding.guestDescriptor);
+        invariant += allocates(binding.imageShapes) + allocates(binding.imageSamplers) + allocates(binding.bufferExtent);
+        for (const auto* flags : {&binding.samplerDepthCompare, &binding.imageWritten, &binding.imageDepthCompare, &binding.imageAtomic, &binding.imageAtomic64, &binding.imageUintStorage, &binding.bufferAtomic, &binding.bufferWritten, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferRead}) invariant += spills(*flags);
+    }
+    patch.touchedAllocations = touchedCount;
+    patch.untouchedWordAllocations = untouched;
+    patch.invariantAllocations = invariant;
+}
+
 void reportResultMemo() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -2069,8 +2100,12 @@ void reportResultMemo() {
     const auto evictedMissed = counters.evictedReseenMissed.exchange(0, std::memory_order_relaxed);
     const auto patchedReseen = counters.patchedReseen.exchange(0, std::memory_order_relaxed);
     const auto patchCopy = counters.patchCopyNanoseconds.exchange(0, std::memory_order_relaxed);
+    const auto copyTouched = counters.copyTouched.exchange(0, std::memory_order_relaxed);
+    const auto copyUntouched = counters.copyUntouchedWords.exchange(0, std::memory_order_relaxed);
+    const auto copyInvariant = counters.copyInvariant.exchange(0, std::memory_order_relaxed);
+    const auto perPatch = [&](std::uint64_t count) { return patched != 0 ? static_cast<double>(count) / static_cast<double>(patched) : 0.0; };
     const auto total = static_cast<double>(hits + patched + misses);
-    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0);
+    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each; allocations per patch copy: %.1f the patch rewrites, %.1f untouched binding words, %.1f invariant per variant\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, perPatch(copyTouched), perPatch(copyUntouched), perPatch(copyInvariant));
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2294,6 +2329,14 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     std::shared_ptr<MemoPatch> patch;
     if (donor != nullptr) {
         result = std::make_shared<RecompileResult>(*donor);
+        if (profile) {
+            counters.copyTouched.fetch_add(donorPatch->touchedAllocations, std::memory_order_relaxed);
+            counters.copyUntouchedWords.fetch_add(donorPatch->untouchedWordAllocations, std::memory_order_relaxed);
+            counters.copyInvariant.fetch_add(donorPatch->invariantAllocations, std::memory_order_relaxed);
+            counters.totalCopyTouched.fetch_add(donorPatch->touchedAllocations, std::memory_order_relaxed);
+            counters.totalCopyUntouchedWords.fetch_add(donorPatch->untouchedWordAllocations, std::memory_order_relaxed);
+            counters.totalCopyInvariant.fetch_add(donorPatch->invariantAllocations, std::memory_order_relaxed);
+        }
         if (profile) counters.patchCopyNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         applyMemoPatch(*result, *donorPatch, snapshot);
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
@@ -2302,6 +2345,7 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
     } else {
         if (masking) patch = std::make_shared<MemoPatch>();
         result = std::make_shared<RecompileResult>(materializeResult(*variant, request, snapshot, false, patch.get(), &substitutes));
+        if (profile && patch != nullptr && patch->valid) censusCopy(*result, *patch);
         if (profile) counters.populateNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         counters.misses.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2635,7 +2679,7 @@ std::uint64_t ResultMemoBytes() {
 
 ResultMemoReseen ResultMemoReseenCounts() {
     auto& counters = resultMemoCounters();
-    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed)};
+    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed), counters.totalCopyTouched.load(std::memory_order_relaxed), counters.totalCopyUntouchedWords.load(std::memory_order_relaxed), counters.totalCopyInvariant.load(std::memory_order_relaxed)};
 }
 
 void SetResourcePlanBudget(std::uint64_t bytes) {

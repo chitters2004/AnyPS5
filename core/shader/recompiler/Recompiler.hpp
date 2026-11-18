@@ -1044,6 +1044,9 @@ struct ResultMemoReseen {
     std::uint64_t evictedThenPatched = 0;
     std::uint64_t evictedThenPopulated = 0;
     std::uint64_t patchedBefore = 0;
+    std::uint64_t copyTouched = 0;
+    std::uint64_t copyUntouchedWords = 0;
+    std::uint64_t copyInvariant = 0;
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoTrimHook(std::function<void()> hook);
