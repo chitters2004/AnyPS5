@@ -1220,8 +1220,12 @@ void rangeVersionTests(Context context) {
         AgcDriver::GuestMemory::BumpCollectEpoch();
     });
     ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t{1} << 30u);
+    ShaderResources::SetRangeSnapshotsEagerForTest(true);
     struct Snapshots {
-        ~Snapshots() { ShaderResources::SetRangeWriteSnapshotBytesForTest(0); }
+        ~Snapshots() {
+            ShaderResources::SetRangeSnapshotsEagerForTest(false);
+            ShaderResources::SetRangeWriteSnapshotBytesForTest(0);
+        }
     } snapshots;
     last("a write landing after the full proof's walk with byte snapshots on, then a new collect epoch", [&] {
         AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
@@ -1267,6 +1271,21 @@ void rangeVersionTests(Context context) {
         std::memset(reinterpret_cast<void*>(address + 8192u), 0x6b, 4096u);
         AgcDriver::GuestMemory::BumpCollectEpoch();
     });
+    ShaderResources::SetRangeSnapshotsEagerForTest(false);
+    const auto rewrite = [&] {
+        auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    };
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+    Require(!exitTaken(), "an unranged break did not force the full proof before the lazy snapshot check");
+    rewrite();
+    const bool coldTaken = exitTaken();
+    rewrite();
+    const bool warmTaken = exitTaken();
+    std::fprintf(stderr, "range versions: lazy snapshots: a rewrite of the same bytes into a range never seen written: the exit %s; the same rewrite after that range was seen written: the exit %s\n", coldTaken ? "was taken" : "was refused", warmTaken ? "was taken" : "was refused");
+    Require(!coldTaken, "a range never seen written was snapshotted");
+    Require(warmTaken, "a range seen written was not snapshotted by the next full proof");
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
     std::fprintf(stderr, "range versions: exits matched the producers\n");
 }

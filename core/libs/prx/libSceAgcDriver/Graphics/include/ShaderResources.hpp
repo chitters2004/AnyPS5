@@ -432,6 +432,7 @@ public:
     enum class RangeVersionPoint : std::uint8_t { AfterFullProof, AfterRangeValidation };
     static void SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point));
     static void SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes);
+    static void SetRangeSnapshotsEagerForTest(bool eager);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }

@@ -4415,6 +4415,11 @@ struct RangeWriteCounts {
     ProfileCounter noSnapshot;
     ProfileCounter snapshotsTaken;
     ProfileCounter snapshotsDropped;
+    ProfileCounter snapshotsSkippedCold;
+    ProfileCounter markedVolatile;
+    ProfileCounter takeNanos;
+    ProfileCounter compareNanos;
+    ProfileCounter rebaseNanos;
     std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unwatchedOwners;
     std::array<ProfileCounter, RangeWriteSizes.size()> unwatchedSizes;
     std::array<ProfileCounter, 3> unwatchedImports;
@@ -4439,6 +4444,34 @@ RangeWriteCounts& rangeWriteCounts() {
 constexpr std::uint64_t RangeWriteSnapshotBytes = 4096;
 constexpr std::uint64_t RangeSnapshotSetBytes = 16384;
 std::atomic<std::uint64_t> rangeWriteSnapshotBytes{RangeWriteSnapshotBytes};
+
+constexpr std::size_t VolatileRangeSlots = 8192;
+std::array<std::atomic<std::uint64_t>, VolatileRangeSlots> volatileRanges{};
+std::atomic<bool> eagerRangeSnapshots{false};
+
+std::uint64_t volatileKey(std::uint64_t begin, std::uint64_t bytes) {
+    return (begin << 13u) | bytes;
+}
+
+std::atomic<std::uint64_t>& volatileSlot(std::uint64_t key) {
+    return volatileRanges[static_cast<std::size_t>((key * 0x9e3779b97f4a7c15ull) >> 51u)];
+}
+
+bool rangeSeenWritten(std::uint64_t begin, std::uint64_t bytes) {
+    return eagerRangeSnapshots.load(std::memory_order_relaxed) || volatileSlot(volatileKey(begin, bytes)).load(std::memory_order_relaxed) == volatileKey(begin, bytes);
+}
+
+void noteRangeWritten(std::uint64_t begin, std::uint64_t bytes) {
+    const auto key = volatileKey(begin, bytes);
+    auto& slot = volatileSlot(key);
+    if (slot.load(std::memory_order_relaxed) == key) return;
+    slot.store(key, std::memory_order_relaxed);
+    if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().markedVolatile.Add();
+}
+
+std::uint64_t nanosSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+}
 
 std::size_t rangeWriteShare(std::uint64_t written, std::uint64_t bytes) {
     if (written >= bytes) return 3;
@@ -4485,6 +4518,12 @@ std::string takeRangeWriteLine() {
     const auto noSnapshot = counts.noSnapshot.Take();
     const auto taken = counts.snapshotsTaken.Take();
     const auto dropped = counts.snapshotsDropped.Take();
+    const auto skippedCold = counts.snapshotsSkippedCold.Take();
+    const auto markedVolatile = counts.markedVolatile.Take();
+    const auto takeNanos = counts.takeNanos.Take();
+    const auto compareNanos = counts.compareNanos.Take();
+    const auto rebaseNanos = counts.rebaseNanos.Take();
+    const auto perCall = [](std::uint64_t nanos, std::uint64_t calls) { return calls == 0 ? std::string("n/a") : std::to_string(nanos / calls) + " ns"; };
     const auto unwatchedOwners = list(counts.unwatchedOwners, RangeWriteOwnerNames);
     std::array<const char*, GuestMemory::ProofBreakSiteCount> siteNames{};
     for (std::size_t site = 0; site < siteNames.size(); ++site) siteNames[site] = GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site));
@@ -4500,7 +4539,7 @@ std::string takeRangeWriteLine() {
     const auto heldBytes = snapshotBytesHeldTotal.load(std::memory_order_relaxed);
     const auto peakBytes = snapshotBytesHeldPeak.exchange(heldBytes, std::memory_order_relaxed);
     const auto unwatchedSizes = list(counts.unwatchedSizes, RangeWriteSizes);
-    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
+    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + ", skipped as never seen written " + std::to_string(skippedCold) + "; ranges marked written (later proofs snapshot them) " + std::to_string(markedVolatile) + "; time: snapshot takes " + std::to_string(takeNanos / 1000) + " us over " + std::to_string(taken + dropped) + " (" + perCall(takeNanos, taken + dropped) + " each), compares " + std::to_string(compareNanos / 1000) + " us (" + perCall(compareNanos, calls) + " each), rebases " + std::to_string(rebaseNanos / 1000) + " us (" + perCall(rebaseNanos, rebased) + " each); collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
     return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed) + "; sub-page ranges whose bytes match the proof's: " + (bytes.empty() ? "none compared" : bytes);
 }
 
@@ -5377,17 +5416,25 @@ void ShaderResources::recordProofRanges() {
     const auto limit = rangeWriteSnapshotBytes.load(std::memory_order_relaxed);
     const auto setLimit = std::max(limit, RangeSnapshotSetBytes);
     std::uint64_t snapshotBytes = 0;
+    const bool counted = GuestMemory::ProofBreaksCounted();
     for (const auto& [begin, end] : proofRanges) {
         const auto bytes = end - begin;
         if (bytes > limit || snapshotBytes + bytes > setLimit) continue;
+        if (!rangeSeenWritten(begin, bytes)) {
+            if (counted) rangeWriteCounts().snapshotsSkippedCold.Add();
+            continue;
+        }
+        const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::vector<std::byte> copy(static_cast<std::size_t>(bytes));
-        if (!GuestMemory::SnapshotUnchangedSince(begin, copy, provedGeneration)) {
-            if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().snapshotsDropped.Add();
+        const bool kept = GuestMemory::SnapshotUnchangedSince(begin, copy, provedGeneration);
+        if (counted) rangeWriteCounts().takeNanos.Add(nanosSince(start));
+        if (!kept) {
+            if (counted) rangeWriteCounts().snapshotsDropped.Add();
             continue;
         }
         snapshotBytes += bytes;
         proofRangeBytes.emplace_back(begin, std::move(copy));
-        if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().snapshotsTaken.Add();
+        if (counted) rangeWriteCounts().snapshotsTaken.Add();
     }
     accountSnapshots(true);
 }
@@ -5724,6 +5771,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     return revalidateFull(shaders, report);
 }
 
+void ShaderResources::SetRangeSnapshotsEagerForTest(bool eager) {
+    eagerRangeSnapshots.store(eager, std::memory_order_relaxed);
+    if (eager) return;
+    for (auto& slot : volatileRanges) slot.store(0, std::memory_order_relaxed);
+}
+
 void ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes) {
     rangeWriteSnapshotBytes.store(bytes == 0 ? RangeWriteSnapshotBytes : bytes, std::memory_order_relaxed);
 }
@@ -5777,14 +5830,21 @@ bool ShaderResources::proofBytesUnchanged(std::size_t index, std::uint64_t begin
     const bool counted = GuestMemory::ProofBreaksCounted();
     const auto snapshot = std::find_if(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const auto& entry) { return entry.first == begin && entry.second.size() == end - begin; });
     if (snapshot == proofRangeBytes.end()) {
+        if (end - begin <= rangeWriteSnapshotBytes.load(std::memory_order_relaxed)) noteRangeWritten(begin, end - begin);
         if (counted) rangeWriteCounts().noSnapshot.Add();
         return false;
     }
+    const auto start = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto rebase = GuestMemory::SnapshotMatches(snapshot->first, snapshot->second);
+    if (counted) rangeWriteCounts().compareNanos.Add(nanosSince(start));
     const bool same = rebase != 0;
     if (same && index < proofRangeGenerations.size() && rebase > proofRangeGenerations[index]) {
+        const auto stored = counted ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         proofRangeGenerations[index] = rebase;
-        if (counted) rangeWriteCounts().rebased.Add();
+        if (counted) {
+            rangeWriteCounts().rebaseNanos.Add(nanosSince(stored));
+            rangeWriteCounts().rebased.Add();
+        }
     }
     if (counted) {
         auto& counts = rangeWriteCounts();
@@ -5853,7 +5913,7 @@ std::size_t ShaderResources::rangeVersionDecline(const ExitStamp& stamp, bool st
     if (proved.releases != stamp.releases && std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); })) return 4;
     if (AnyPendingCpuWrites(context)) return RangeExitChecks;
     GuestMemory::RangeValidation validation;
-    if (!proofRangeBytes.empty()) validation.bytesUnchanged = [this](std::size_t index, std::uint64_t begin, std::uint64_t end) { return proofBytesUnchanged(index, begin, end); };
+    if (rangeVersionsOn()) validation.bytesUnchanged = [this](std::size_t index, std::uint64_t begin, std::uint64_t end) { return proofBytesUnchanged(index, begin, end); };
     validation.generations = proofRangeGenerations;
     const auto decline = GuestMemory::ValidateProofRanges(proofRanges, {provedGeneration, proved.proof, proved.pending, provedUnrangedProof, provedUnrangedPending}, &validation);
     rangePassedOnBytes = validation.passedOnBytes;
