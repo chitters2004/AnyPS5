@@ -191,6 +191,14 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
     *completed = done;
 }
 
+extern "C" void AgcDriverBuiltLibraryParts_nid_postfix(std::uint64_t* parts, std::uint64_t* nanoseconds) {
+    auto& driver = AgcDriver::DriverDetail::Driver::Get();
+    const auto built = driver.PrebuiltLibraries();
+    std::copy(built.begin(), built.end(), parts);
+    const auto spent = driver.LibraryBuildNanoseconds();
+    std::copy(spent.begin(), spent.end(), nanoseconds);
+}
+
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitSettledFor(std::chrono::milliseconds(milliseconds));
 }

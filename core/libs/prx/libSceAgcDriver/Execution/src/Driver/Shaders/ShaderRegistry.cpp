@@ -2529,6 +2529,13 @@ std::array<std::uint64_t, 4> Driver::PrebuiltLibraries() {
     return Graphics::PipelineLibraryCountersOf(localDevice->Device()).built;
 }
 
+std::array<std::uint64_t, 4> Driver::LibraryBuildNanoseconds() {
+    if (auto* pool = RegistrationPreparePool::ExistingPrebuild()) pool->AwaitSubmitted();
+    const auto localDevice = device.Load();
+    if (localDevice == nullptr) return {};
+    return Graphics::PipelineLibraryCountersOf(localDevice->Device()).builtNanoseconds;
+}
+
 void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
     BindTitleThread();
     PerformanceContext timingContext(FrameTiming::Preparation());
