@@ -1354,6 +1354,39 @@ constexpr std::array<const char*, static_cast<std::size_t>(ModuleField::Count)> 
 
 using TaggedModuleKey = std::vector<std::pair<ModuleField, std::uint32_t>>;
 
+constexpr std::array<const char*, 18> DescriptorClassNames{
+    "buffer word1", "buffer word3", "buffer tail", "buffer misalignment", "image mode and swizzle", "store quantize", "emulated compare", "texel-offset fold", "unnormalized base level", "unnormalized mirror", "min LOD", "sampler LOD bias", "FMASK format", "volume gather", "image components", "normalized image", "descriptor index", "other",
+};
+
+std::size_t DescriptorClass(std::uint32_t id) {
+    namespace P = PipelineSpecialization;
+    if (id < P::ImageBase) return (id - P::BufferBase) % P::BufferWords;
+    if (id < P::VertexBase) return 4;
+    if (id >= P::StoreQuantizeBase && id < P::DescriptorIndexBase) return 5;
+    if (id >= P::DescriptorIndexBase && id < P::CompareBase) return 16;
+    if (id >= P::CompareBase && id < P::FoldOffsetBase) return 6;
+    if (id >= P::FoldOffsetBase && id < P::UnnormalizedBaseLevelBase) return 7;
+    if (id >= P::UnnormalizedBaseLevelBase && id < P::MirrorUnnormalizedBase) return 8;
+    if (id >= P::MirrorUnnormalizedBase && id < P::MinLodBase) return 9;
+    if (id >= P::MinLodBase && id < P::SamplerLodBiasBase) return 10;
+    if (id >= P::SamplerLodBiasBase && id < P::FmaskFormatBase) return 11;
+    if (id >= P::FmaskFormatBase && id < P::VolumeGatherBase) return 12;
+    if (id >= P::VolumeGatherBase && id < P::ImageComponentBase) return 13;
+    if (id >= P::ImageComponentBase && id < P::NormalizedImageBase) return 14;
+    if (id >= P::NormalizedImageBase && id < P::NormalizedImageBase + ShaderInfo::MaxImages) return 15;
+    return 17;
+}
+
+std::map<std::uint32_t, std::uint32_t> DescriptorValues(const TaggedModuleKey& key) {
+    std::map<std::uint32_t, std::uint32_t> values;
+    for (std::size_t index = 0; index + 1 < key.size(); ++index) {
+        if (key[index].first != ModuleField::DescriptorValues) continue;
+        values[key[index].second] = key[index + 1].second;
+        ++index;
+    }
+    return values;
+}
+
 struct VariantModules {
     std::set<TaggedModuleKey> registration;
     std::set<TaggedModuleKey> drawn;
@@ -1374,6 +1407,7 @@ struct ModuleVariantTally {
     std::array<std::uint64_t, 3> notRegistrationByStage{};
     std::uint64_t shape = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ModuleField::Count)> firstDiffering{};
+    std::array<std::uint64_t, DescriptorClassNames.size()> descriptorClasses{};
 };
 
 ModuleVariantTally& moduleVariants() {
@@ -1427,15 +1461,29 @@ void noteModuleVariant(const RecompileRequest& request, const CompiledVariant& v
     }
     std::size_t best = 0;
     std::optional<ModuleField> field;
+    const TaggedModuleKey* nearest = nullptr;
     for (const auto& registered : modules.registration) {
         std::size_t common = 0;
         while (common < key.size() && common < registered.size() && key[common] == registered[common]) ++common;
-        if (common < best || (common == best && field.has_value())) continue;
+        if (nearest != nullptr && (common < best || (common == best && field.has_value()))) continue;
         best = common;
+        nearest = &registered;
         field = common < key.size() && common < registered.size() && key[common].first == registered[common].first ? std::optional(key[common].first) : std::nullopt;
     }
     if (field) ++tally.firstDiffering[static_cast<std::size_t>(*field)];
     else ++tally.shape;
+    if (nearest == nullptr) return;
+    const auto drawn = DescriptorValues(key);
+    const auto registered = DescriptorValues(*nearest);
+    std::array<bool, DescriptorClassNames.size()> differs{};
+    for (const auto& [id, value] : drawn) {
+        const auto found = registered.find(id);
+        if (found == registered.end() || found->second != value) differs[DescriptorClass(id)] = true;
+    }
+    for (const auto& [id, value] : registered) {
+        if (!drawn.contains(id)) differs[DescriptorClass(id)] = true;
+    }
+    for (std::size_t index = 0; index < differs.size(); ++index) tally.descriptorClasses[index] += differs[index] ? 1u : 0u;
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, MemoPatch* patch = nullptr, const std::vector<BufferSubstitute>* substituteSnapshot = nullptr) {
@@ -2621,7 +2669,9 @@ std::string ModuleVariantsLine() {
     text += ", not in registration form " + number(tally.notRegistrationForm) + " (fragment " + number(tally.notRegistrationByStage[0]) + ", of them over the registration word limit " + number(tally.overWordLimit) + "; vertex-family " + number(tally.notRegistrationByStage[1]) + "; compute " + number(tally.notRegistrationByStage[2]) + ")";
     text += ", differing first in:";
     for (std::size_t field = 0; field < ModuleFieldNames.size(); ++field) text += std::string(field == 0 ? " " : ", ") + ModuleFieldNames[field] + " " + number(tally.firstDiffering[field]);
-    text += ", other key shape " + number(tally.shape) + "; variants drawn " + std::to_string(drawnVariants) + ", with more than one draw module " + std::to_string(splitVariants) + ", most draw modules for one variant " + std::to_string(most);
+    text += ", other key shape " + number(tally.shape) + "; differing descriptor values by class:";
+    for (std::size_t index = 0; index < DescriptorClassNames.size(); ++index) text += std::string(index == 0 ? " " : ", ") + DescriptorClassNames[index] + " " + number(tally.descriptorClasses[index]);
+    text += "; variants drawn " + std::to_string(drawnVariants) + ", with more than one draw module " + std::to_string(splitVariants) + ", most draw modules for one variant " + std::to_string(most);
     return text;
 }
 
