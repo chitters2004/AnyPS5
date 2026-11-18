@@ -3962,7 +3962,7 @@ VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& ta
     auto* surface = drawnDepth;
     if (surface == nullptr || surface->retired || surface->syncing || surface->pendingClear != 0u || surface->context.device != context.device || !surface->active->load(std::memory_order_acquire) || !sameSurface(surface->target, target)) return VK_NULL_HANDLE;
     if (multisampled) {
-        if (findClearedHtile(target) != clearedHtiles().end() || !ownsPlane(*surface) || surface->sampling.overwriteStencil || surface->sampling.unprovenStencil) return VK_NULL_HANDLE;
+        if (!ownsPlane(*surface) || surface->sampling.overwriteStencil || surface->sampling.unprovenStencil) return VK_NULL_HANDLE;
         if (surface->samplingActive) surface->CheckCurrent();
         surface->NoteMemory();
     }
