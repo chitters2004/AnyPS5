@@ -541,6 +541,31 @@ void verifyResultMemoBudgetThreads() {
     SetResultMemoBudget(0u);
 }
 
+void verifyResultMemoReseenEvicted() {
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t values = 300u;
+    for (std::uint32_t value = 1; value <= values; ++value) require(!compileResultMemoPixel(value), "result memo reseen evicted: a first compile hit the memo");
+    const auto before = ResultMemoReseenCounts();
+    require(before.evictedThenPopulated == 0u && before.evictedThenPatched == 0u && before.patchedBefore == 0u, "result memo reseen evicted: first compiles were counted as seen again");
+    std::uint32_t hits = 0;
+    for (std::uint32_t value = 1; value <= values; ++value) hits += compileResultMemoPixel(value) ? 1u : 0u;
+    const auto after = ResultMemoReseenCounts();
+    require(hits < values, "result memo reseen evicted: three hundred results fit without an eviction");
+    require(after.evictedThenPatched == 0u && after.patchedBefore == 0u, "result memo reseen evicted: an unmasked memo counted a patch");
+    require(hits + after.evictedThenPopulated == values, std::string("result memo reseen evicted: " + std::to_string(hits) + " hits and " + std::to_string(after.evictedThenPopulated) + " evicted keys seen again do not cover " + std::to_string(values) + " repeats").c_str());
+}
+
+void verifyResultMemoReseenPatched() {
+    using namespace ShaderRecompiler;
+    require(!compileResultMemoPixel(1u) && !compileResultMemoPixel(2u), "result memo reseen patched: a new snapshot hit the memo");
+    require(ResultMemoReseenCounts().patchedBefore == 0u, "result memo reseen patched: a first patch was counted as patched before");
+    require(!compileResultMemoPixel(2u), "result memo reseen patched: a patched result was kept");
+    require(ResultMemoReseenCounts().patchedBefore == 1u, "result memo reseen patched: a repeated patch was not counted");
+    require(!compileResultMemoPixel(3u) && ResultMemoReseenCounts().patchedBefore == 1u, "result memo reseen patched: a new patch was counted as patched before");
+    const auto counts = ResultMemoReseenCounts();
+    require(counts.evictedThenPatched == 0u && counts.evictedThenPopulated == 0u, "result memo reseen patched: a memo without evictions counted an evicted key");
+}
+
 void verifyResultMemoBudgetMasked() {
     using namespace ShaderRecompiler;
     require(ResultMemoBytes() == 0u, "result memo budget masked: the memo held results before the first compile");
@@ -13272,6 +13297,16 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget") {
             verifyResultMemoBudget();
             std::cout << "The result memo keeps its most recently used results within its byte budget\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-reseen-evicted") {
+            verifyResultMemoReseenEvicted();
+            std::cout << "The result memo counts exact misses for keys it evicted\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--result-memo-reseen-patched") {
+            verifyResultMemoReseenPatched();
+            std::cout << "The result memo counts patches of keys it patched before\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--result-memo-budget-masked") {

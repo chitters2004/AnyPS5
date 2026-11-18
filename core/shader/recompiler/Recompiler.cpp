@@ -1838,8 +1838,37 @@ ResultMemoEntry* memoSet(const std::unique_ptr<ResultMemoTable>& table, std::uin
     return table->data() + static_cast<std::size_t>((index ^ (index >> 32u)) % ResultMemoSets) * ResultMemoWays;
 }
 
+class MemoKeyGhosts {
+public:
+    static constexpr std::size_t Slots = std::size_t{1} << 16;
+
+    static std::uint64_t Key(std::uint64_t variantId, std::uint64_t hash) {
+        auto key = (variantId * 0x9e3779b97f4a7c15ull) ^ (hash + 0x632be59bd9b4e019ull + (variantId << 6u));
+        key ^= key >> 29u;
+        key *= 0xbf58476d1ce4e5b9ull;
+        key ^= key >> 32u;
+        return key | 1u;
+    }
+
+    void Note(std::uint64_t key) { slot(key).store(key, std::memory_order_relaxed); }
+
+    bool Seen(std::uint64_t key) { return slot(key).load(std::memory_order_relaxed) == key; }
+
+private:
+    std::atomic<std::uint64_t>& slot(std::uint64_t key) {
+        std::call_once(allocated, [this] { slots = std::make_unique<std::atomic<std::uint64_t>[]>(Slots); });
+        return slots[static_cast<std::size_t>(key >> 48u) % Slots];
+    }
+
+    std::once_flag allocated;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> slots;
+};
+
 struct ResultMemoCounters {
     std::atomic<std::uint64_t> hits{0}, patched{0}, misses{0}, evictions{0}, trimmed{0}, populateNanoseconds{0}, patchNanoseconds{0}, mismatches{0};
+    std::atomic<std::uint64_t> evictedReseenPatched{0}, evictedReseenMissed{0}, patchedReseen{0}, patchCopyNanoseconds{0};
+    std::atomic<std::uint64_t> totalEvictedReseenPatched{0}, totalEvictedReseenMissed{0}, totalPatchedReseen{0};
+    MemoKeyGhosts evictedKeys, patchedKeys;
     std::atomic<std::int64_t> lastReport{0};
     std::atomic<std::uint64_t> clock{0}, heldBytes{0}, heldEntries{0};
 };
@@ -2036,7 +2065,12 @@ void reportResultMemo() {
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto patching = counters.patchNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto mismatches = counters.mismatches.exchange(0, std::memory_order_relaxed);
+    const auto evictedPatched = counters.evictedReseenPatched.exchange(0, std::memory_order_relaxed);
+    const auto evictedMissed = counters.evictedReseenMissed.exchange(0, std::memory_order_relaxed);
+    const auto patchedReseen = counters.patchedReseen.exchange(0, std::memory_order_relaxed);
+    const auto patchCopy = counters.patchCopyNanoseconds.exchange(0, std::memory_order_relaxed);
     const auto total = static_cast<double>(hits + patched + misses);
+    std::fprintf(stderr, "[recompile] result memo keys (10 s): %llu exact misses were for keys evicted earlier (%llu then patched, %llu populated, of %llu evictions); %llu of %llu patches were for keys patched before (patched results are not kept); patch copy %.2f us, rest %.2f us each\n", static_cast<unsigned long long>(evictedPatched + evictedMissed), static_cast<unsigned long long>(evictedPatched), static_cast<unsigned long long>(evictedMissed), static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(patchedReseen), static_cast<unsigned long long>(patched), patched != 0 ? static_cast<double>(patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0, patched != 0 && patching >= patchCopy ? static_cast<double>(patching - patchCopy) / 1000.0 / static_cast<double>(patched) : 0.0);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu patched, %llu misses (%.1f%% hits, %.1f%% patched), Populate %.1f us per miss / %.1f ms in total, patch %.1f us each / %.1f ms in total, %llu evictions, %llu patch mismatches, %llu trimmed; %llu results held, %.1f MiB\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(patched), static_cast<unsigned long long>(misses), total != 0.0 ? 100.0 * static_cast<double>(hits) / total : 0.0, total != 0.0 ? 100.0 * static_cast<double>(patched) / total : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, patched != 0 ? static_cast<double>(patching) / 1000.0 / static_cast<double>(patched) : 0.0, static_cast<double>(patching) / 1e6, static_cast<unsigned long long>(evictions), static_cast<unsigned long long>(mismatches), static_cast<unsigned long long>(trimmed), static_cast<unsigned long long>(counters.heldEntries.load(std::memory_order_relaxed)), static_cast<double>(counters.heldBytes.load(std::memory_order_relaxed)) / 1048576.0);
     auto& plans = resourcePlans();
     const auto interval = TakeResourcePlanInterval();
@@ -2241,11 +2275,26 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
         }
     }
     if (memoOnly && donor == nullptr) return nullptr;
+    if (profile) {
+        const auto key = MemoKeyGhosts::Key(variantId, hash);
+        if (counters.evictedKeys.Seen(key)) {
+            (donor != nullptr ? counters.evictedReseenPatched : counters.evictedReseenMissed).fetch_add(1, std::memory_order_relaxed);
+            (donor != nullptr ? counters.totalEvictedReseenPatched : counters.totalEvictedReseenMissed).fetch_add(1, std::memory_order_relaxed);
+        }
+        if (donor != nullptr) {
+            if (counters.patchedKeys.Seen(key)) {
+                counters.patchedReseen.fetch_add(1, std::memory_order_relaxed);
+                counters.totalPatchedReseen.fetch_add(1, std::memory_order_relaxed);
+            }
+            counters.patchedKeys.Note(key);
+        }
+    }
     const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::shared_ptr<RecompileResult> result;
     std::shared_ptr<MemoPatch> patch;
     if (donor != nullptr) {
         result = std::make_shared<RecompileResult>(*donor);
+        if (profile) counters.patchCopyNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         applyMemoPatch(*result, *donorPatch, snapshot);
         if (VerifyMaskedResultMemo()) verifyPatchedResult(*result, materializeResult(*variant, request, snapshot, false, nullptr, &substitutes), variantId);
         if (profile) counters.patchNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
@@ -2283,7 +2332,10 @@ std::shared_ptr<const RecompileResult> materializePreparedMemoized(SourceEntry& 
             if (entry.used < victim->used) victim = &entry;
         }
         if (victim->result != nullptr) {
-            if (count) counters.evictions.fetch_add(1, std::memory_order_relaxed);
+            if (count) {
+                counters.evictions.fetch_add(1, std::memory_order_relaxed);
+                if (profile) counters.evictedKeys.Note(MemoKeyGhosts::Key(victim->variantId, victim->hash));
+            }
             counters.heldBytes.fetch_sub(victim->bytes, std::memory_order_relaxed);
             counters.heldEntries.fetch_sub(1, std::memory_order_relaxed);
         }
@@ -2579,6 +2631,11 @@ void SetResultMemoTrimHook(std::function<void()> hook) {
 
 std::uint64_t ResultMemoBytes() {
     return resultMemoCounters().heldBytes.load(std::memory_order_relaxed);
+}
+
+ResultMemoReseen ResultMemoReseenCounts() {
+    auto& counters = resultMemoCounters();
+    return {counters.totalEvictedReseenPatched.load(std::memory_order_relaxed), counters.totalEvictedReseenMissed.load(std::memory_order_relaxed), counters.totalPatchedReseen.load(std::memory_order_relaxed)};
 }
 
 void SetResourcePlanBudget(std::uint64_t bytes) {

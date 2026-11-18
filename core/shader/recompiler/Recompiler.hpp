@@ -1040,6 +1040,12 @@ struct ResourceCapture;
 [[nodiscard]] std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit = nullptr);
 void SetResultMemoBudget(std::uint64_t bytes);
 [[nodiscard]] std::uint64_t ResultMemoBytes();
+struct ResultMemoReseen {
+    std::uint64_t evictedThenPatched = 0;
+    std::uint64_t evictedThenPopulated = 0;
+    std::uint64_t patchedBefore = 0;
+};
+[[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoTrimHook(std::function<void()> hook);
 struct ResourcePlanCounters {
     std::uint64_t heldBytes = 0;
