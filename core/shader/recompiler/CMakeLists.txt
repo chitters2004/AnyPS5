@@ -295,6 +295,7 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            ModuleVariantsLine
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CommitShape.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreateProbe.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1507,6 +1508,7 @@ void noteCommitShape(const DrawTimer& timer, const DrawOutcome& outcome) {
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::BuildLine(report, DrawKindNames, PhaseResources, PhasePipeline).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", CommitShape::ProofLeadLine(report).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s\n", PipelineCreates::Line(DevicePipelineCreates().Take()).c_str());
+    if (const auto modules = ShaderRecompiler::ModuleVariantsLine(); !modules.empty()) AgcDriver::ProfilePrint_nid_no_patch("%s\n", modules.c_str());
 }
 
 std::atomic<std::uint64_t> profiledCommits{0};

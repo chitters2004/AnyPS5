@@ -23,6 +23,7 @@
 #include <set>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <shared_mutex>
 #include <tuple>
 #include <unordered_map>
@@ -1333,6 +1334,91 @@ void recordMemoPatch(MemoPatch& patch, const DescriptorBindingPlan& plan, const 
     patch.valid = layout.userDataRegisters.size() <= layout.DispatchThreadLimitDword() && (patch.userWords.empty() || patch.pushData || patch.shaderData != MemoPatch::NoBinding);
 }
 
+enum class ModuleField : std::uint8_t {
+    PushOffset,
+    StencilReference,
+    ExportPacking,
+    DualSourceBlend,
+    ReversedBlend,
+    RasterPrimitive,
+    LayerExported,
+    DepthRemap,
+    VertexSelectors,
+    DescriptorValues,
+    Count,
+};
+
+constexpr std::array<const char*, static_cast<std::size_t>(ModuleField::Count)> ModuleFieldNames{
+    "push offset", "stencil reference offset", "export packing", "dual-source blend", "reversed blend", "raster primitive", "layer export", "depth remap", "vertex input selectors", "descriptor-derived values",
+};
+
+using TaggedModuleKey = std::vector<std::pair<ModuleField, std::uint32_t>>;
+
+struct VariantModules {
+    std::set<TaggedModuleKey> registration;
+    std::set<TaggedModuleKey> drawn;
+};
+
+struct ModuleVariantTally {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, VariantModules> variants;
+    std::unordered_map<const std::uint32_t*, std::set<std::uint64_t>> registeredVariantsByCode;
+    std::uint64_t drawModules = 0;
+    std::uint64_t equal = 0;
+    std::uint64_t otherVariant = 0;
+    std::uint64_t noRegistration = 0;
+    std::uint64_t notRegistrationForm = 0;
+    std::uint64_t shape = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ModuleField::Count)> firstDiffering{};
+};
+
+ModuleVariantTally& moduleVariants() {
+    static ModuleVariantTally tally;
+    return tally;
+}
+
+bool moduleVariantsProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_MODULE_VARIANTS") != nullptr;
+    return profiled;
+}
+
+void noteModuleVariant(const RecompileRequest& request, const CompiledVariant& variant, const TaggedModuleKey& key, bool registration) {
+    auto& tally = moduleVariants();
+    std::lock_guard lock(tally.mutex);
+    auto& modules = tally.variants[variant.artifact.variantId];
+    if (registration) {
+        modules.registration.insert(key);
+        tally.registeredVariantsByCode[request.shader.code.data()].insert(variant.artifact.variantId);
+        return;
+    }
+    if (!modules.drawn.insert(key).second) return;
+    ++tally.drawModules;
+    if (!variant.artifact.registrationModule) {
+        ++tally.notRegistrationForm;
+        return;
+    }
+    if (modules.registration.empty()) {
+        const auto found = tally.registeredVariantsByCode.find(request.shader.code.data());
+        ++(found != tally.registeredVariantsByCode.end() && !found->second.empty() ? tally.otherVariant : tally.noRegistration);
+        return;
+    }
+    if (modules.registration.contains(key)) {
+        ++tally.equal;
+        return;
+    }
+    std::size_t best = 0;
+    std::optional<ModuleField> field;
+    for (const auto& registered : modules.registration) {
+        std::size_t common = 0;
+        while (common < key.size() && common < registered.size() && key[common] == registered[common]) ++common;
+        if (common < best || (common == best && field.has_value())) continue;
+        best = common;
+        field = common < key.size() && common < registered.size() && key[common].first == registered[common].first ? std::optional(key[common].first) : std::nullopt;
+    }
+    if (field) ++tally.firstDiffering[static_cast<std::size_t>(*field)];
+    else ++tally.shape;
+}
+
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& captured, bool registrationDefaults = false, MemoPatch* patch = nullptr, const std::vector<BufferSubstitute>* substituteSnapshot = nullptr) {
     const auto localSubstitutes = substituteSnapshot == nullptr && bufferSubstitutesEnabled() && variant.substitutes != nullptr ? variant.substitutes->Slots() : std::vector<BufferSubstitute>{};
     const auto substitutes = substituteSnapshot != nullptr ? std::span<const BufferSubstitute>(*substituteSnapshot) : std::span<const BufferSubstitute>(localSubstitutes);
@@ -1384,21 +1470,27 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     struct LocalModuleKeyStorage {};
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
     moduleKey.clear();
-    if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
-    if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
+    const bool profiledModule = moduleVariantsProfiled();
+    TaggedModuleKey taggedKey;
+    const auto addKey = [&](ModuleField field, std::uint32_t value) {
+        moduleKey.push_back(value);
+        if (profiledModule) taggedKey.emplace_back(field, value);
+    };
+    if (variant.bindings.layout.UsesPushData()) addKey(ModuleField::PushOffset, request.layout.pushConstantOffsetBytes / 4u);
+    if (!artifact.stencilReferences.empty()) addKey(ModuleField::StencilReference, request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
     if (request.context.pixel) {
-        for (const auto packing : request.context.pixel->targetExportPacking) moduleKey.push_back(static_cast<std::uint32_t>(packing));
-        moduleKey.push_back(request.context.pixel->dualSourceBlend ? 1u : 0u);
-        moduleKey.push_back(request.context.pixel->reversedBlend);
-        if (variant.info.info.rasterPrimitive) moduleKey.push_back(static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
-        if (variant.info.info.layerExported) moduleKey.push_back(request.context.pixel->layerExported ? 1u : 0u);
+        for (const auto packing : request.context.pixel->targetExportPacking) addKey(ModuleField::ExportPacking, static_cast<std::uint32_t>(packing));
+        addKey(ModuleField::DualSourceBlend, request.context.pixel->dualSourceBlend ? 1u : 0u);
+        addKey(ModuleField::ReversedBlend, request.context.pixel->reversedBlend);
+        if (variant.info.info.rasterPrimitive) addKey(ModuleField::RasterPrimitive, static_cast<std::uint32_t>(request.context.pixel->rasterPrimitive));
+        if (variant.info.info.layerExported) addKey(ModuleField::LayerExported, request.context.pixel->layerExported ? 1u : 0u);
     }
     const bool depthRemap = request.target.depthRangeRemap && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::TessellationEvaluation) && request.context.vertex.has_value();
     if (depthRemap) {
         if (request.context.vertex->depthRemapMode != 0u && request.layout.pushConstantOffsetBytes % (RuntimeAbi::PushConstantDwords * 4u) + request.layout.pushConstantSizeBytes > DepthRemapPushOffsetBytes) {
             throw std::runtime_error("a remapped raster shader's push data must end before the depth remap words");
         }
-        moduleKey.push_back(request.context.vertex->depthRemapMode);
+        addKey(ModuleField::DepthRemap, request.context.vertex->depthRemapMode);
     }
     result.vertexAttributes.reserve(result.vertexInputs.size());
     std::array<std::uint32_t, ShaderVertexStageInfo::MaxResources> vertexClasses{};
@@ -1430,9 +1522,16 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 if (selector >= 4u) formatComponents = std::max(formatComponents, selector - 3u);
                 selectors |= selector << (component * 3u);
             }
-            moduleKey.push_back(artifact.registrationModule ? selectors & ~0xfffu : selectors);
+            addKey(ModuleField::VertexSelectors, artifact.registrationModule ? selectors & ~0xfffu : selectors);
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
+    }
+    if (profiledModule) {
+        for (const auto& constant : plan->bindings.specialization) {
+            taggedKey.emplace_back(ModuleField::DescriptorValues, constant.id);
+            taggedKey.emplace_back(ModuleField::DescriptorValues, constant.value);
+        }
+        noteModuleVariant(request, variant, taggedKey, registrationDefaults);
     }
     if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap || request.shader.stage == ShaderStage::Mesh) {
         {
@@ -2481,6 +2580,30 @@ std::uint64_t PreparedShaderInvocation::SnapshotKey(const ResourceCapture& captu
 const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
     if (handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
     return handle.artifact->artifact;
+}
+
+std::string ModuleVariantsLine() {
+    if (!moduleVariantsProfiled()) return {};
+    auto& tally = moduleVariants();
+    std::lock_guard lock(tally.mutex);
+    std::size_t drawnVariants = 0;
+    std::size_t splitVariants = 0;
+    std::size_t most = 0;
+    for (const auto& [id, modules] : tally.variants) {
+        if (modules.drawn.empty()) continue;
+        ++drawnVariants;
+        if (modules.drawn.size() > 1) ++splitVariants;
+        most = std::max(most, modules.drawn.size());
+    }
+    char item[192];
+    std::snprintf(item, sizeof(item), "[module-variants] since start: draw modules %llu: same as a registration module %llu, registered only as another variant of the same code %llu, no registration module %llu, not in registration form %llu, differing first in:", static_cast<unsigned long long>(tally.drawModules), static_cast<unsigned long long>(tally.equal), static_cast<unsigned long long>(tally.otherVariant), static_cast<unsigned long long>(tally.noRegistration), static_cast<unsigned long long>(tally.notRegistrationForm));
+    std::string text = item;
+    for (std::size_t field = 0; field < ModuleFieldNames.size(); ++field) {
+        std::snprintf(item, sizeof(item), "%s %s %llu", field == 0 ? "" : ",", ModuleFieldNames[field], static_cast<unsigned long long>(tally.firstDiffering[field]));
+        text += item;
+    }
+    std::snprintf(item, sizeof(item), ", other key shape %llu; variants drawn %zu, with more than one draw module %zu, most draw modules for one variant %zu", static_cast<unsigned long long>(tally.shape), drawnVariants, splitVariants, most);
+    return text + item;
 }
 
 std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest& request, const SourceHandle& handle) {
