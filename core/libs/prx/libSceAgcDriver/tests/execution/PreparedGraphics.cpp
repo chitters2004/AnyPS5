@@ -780,6 +780,92 @@ void NullPixelMatchesRegistration(AgcDriver::VulkanDevice& device) {
 
 }
 
+void FormattedBufferPrebuildReuse(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::DriverDetail;
+    using namespace ShaderRecompiler;
+    constexpr std::uint32_t extent = 64u;
+    alignas(256) static std::array<std::uint32_t, extent * extent> pixels{};
+    alignas(256) static constexpr std::array<std::array<float, 4>, 3> positions{{{-1, -1, 0, 1}, {3, -1, 0, 1}, {-1, 3, 0, 1}}};
+    alignas(256) static constexpr std::array<float, 4> one{1.0f, 1.0f, 1.0f, 1.0f};
+    constexpr std::array<std::uint32_t, 6> vertexCode{0xe0382000u, 0x80000005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
+    constexpr std::array<std::uint32_t, 6> pixelCode{0xe0000000u, 0x80000200u, 0xbf8c3f70u, 0xf800180fu, 0x02020202u, 0xbf810000u};
+    DrawDecode decoded{};
+    decoded.state.stages = {AgcDriver::Graphics::ShaderPath::Vertex, 0u, 32u, 32u, {}, {}};
+    decoded.pixel.wave32 = true;
+    decoded.pixel.targetOutputMode[0] = 9u;
+    decoded.pixel.targetExportMapping.fill(0xe4u);
+    const auto append = [&](ShaderStage stage, std::span<const std::uint32_t> code, std::vector<std::uint32_t> users) {
+        auto snapshot = std::make_shared<ShaderSnapshot>();
+        snapshot->codeAddress = reinterpret_cast<std::uintptr_t>(code.data());
+        snapshot->headerAddress = 0u;
+        snapshot->type = stage == ShaderStage::Vertex ? 2u : 1u;
+        snapshot->code.assign(code.begin(), code.end());
+        DrawProgram program{{stage, snapshot->codeAddress, snapshot->code, 0u, {}}, 0u, 0u, std::move(users), {{{snapshot->codeAddress, std::as_bytes(std::span(snapshot->code))}, {0u, {}}}}, snapshot, 0u};
+        decoded.programs.push_back(std::move(program));
+        decoded.roles.push_back(stage == ShaderStage::Vertex ? ProgramRole::Main : ProgramRole::Fragment);
+    };
+    const auto vertices = reinterpret_cast<std::uintptr_t>(positions.data());
+    const auto values = reinterpret_cast<std::uintptr_t>(one.data());
+    append(ShaderStage::Vertex, vertexCode, {static_cast<std::uint32_t>(vertices), static_cast<std::uint32_t>(vertices >> 32u) | (16u << 16u), 3u, 0x01016facu});
+    append(ShaderStage::Fragment, pixelCode, {static_cast<std::uint32_t>(values), static_cast<std::uint32_t>(values >> 32u) | (16u << 16u), 1u, 0x01016facu});
+    const auto target = device.Target();
+    const auto stages = PrepareGraphicsStages(decoded, target);
+    Require(stages.size() == 2u && stages[1].stage == ShaderStage::Fragment, "formatted buffer prebuild lost a required graphics stage");
+    Require(stages[1].registration != nullptr, "formatted buffer prebuild: a fragment stage that reads a formatted buffer has no registration module");
+    for (const auto& stage : stages) stage.snapshot->prepared->entries.push_back(stage.entry);
+    std::vector<LinkedProgram> linked;
+    std::vector<MemoryRegion> memory;
+    for (std::size_t index = 0u; index < decoded.programs.size(); ++index) {
+        const auto& program = decoded.programs[index];
+        linked.push_back({decoded.roles[index], program.binary, program.userDataBase, program.firstUserSgpr, program.userData});
+        memory.insert(memory.end(), program.memory.begin(), program.memory.end());
+    }
+    const bool libraries = device.GraphicsPipelineLibraries();
+    const auto fragmentParts = [&] { return AgcDriver::Graphics::PipelineLibraryCountersOf(device.Device()).built[2]; };
+    if (libraries) {
+        const std::array<AgcDriver::Graphics::CompiledShader, 1> registered{{{ShaderStage::Fragment, stages[1].registration.get(), stages[1].pushOffset}}};
+        Require(device.PrebuildGraphicsLibraries(decoded.state.stages, registered), "formatted buffer prebuild: the fragment registration module was not prebuilt");
+    }
+    const auto prebuilt = libraries ? fragmentParts() : 0u;
+    std::vector<std::shared_ptr<const RecompileResult>> owners;
+    std::vector<AgcDriver::Graphics::CompiledShader> shaders;
+    for (std::size_t index = 0u; index < decoded.programs.size(); ++index) {
+        const auto& program = decoded.programs[index];
+        const auto& stage = stages[index];
+        const bool pixel = stage.stage == ShaderStage::Fragment;
+        std::optional<ShaderVertexStageInfo> vertex;
+        if (!pixel) {
+            vertex = AgcDriver::Graphics::DecodeVertexStageInfo({}, 0u, program.userData, nullptr, true, 8u);
+            vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), 0u, program.binary.code, 0u);
+        }
+        const auto room = AgcDriver::Graphics::PipelinePushSlotBytes - stage.pushOffset % AgcDriver::Graphics::PipelinePushSlotBytes;
+        RecompileRequest request{program.binary, {32u, 0u, program.userData, {}, pixel ? std::optional(decoded.pixel) : std::nullopt, vertex, memory}, target, {0u, 0u, stage.pushOffset, room}, GraphicsCompileContext{0u, linked, {}, {}, {0u, 3u, 4u, 1u}}};
+        const auto invocation = InvocationFor(*program.snapshot, 0u, request);
+        const auto capture = invocation.Capture(SrtRuntime{program.userData, program.binary.codeAddress});
+        owners.push_back(invocation.Materialize(*capture));
+        if (pixel) Require(owners.back()->spirv.Copy() == stages[1].registration->spirv.Copy(), "formatted buffer prebuild: the draw's fragment module differs from its registration module");
+        shaders.push_back({stage.stage, owners.back().get(), stage.pushOffset});
+    }
+    auto state = decoded.state;
+    pixels.fill(0x40404040u);
+    state.color = {reinterpret_cast<std::uintptr_t>(pixels.data()), {extent, extent}, VK_FORMAT_R8G8B8A8_UNORM, sizeof(pixels), 0xe4u};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {extent, extent};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(extent), static_cast<float>(extent), -static_cast<float>(extent), 0, 1};
+    state.scissor = {{0u, 0u}, {extent, extent}};
+    state.cullMode = VK_CULL_MODE_NONE;
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.negativeOneToOne = false;
+    state.blend.colorWriteMask = 15u;
+    state.blends = {state.blend};
+    device.Draw(state, {0u, 3u, 0u, 1u, 0u, false}, shaders);
+    device.WaitIdle();
+    Require(std::ranges::all_of(pixels, [](const auto value) { return value == 0xffffffffu; }), "formatted buffer prebuild: the fragment stage did not read its formatted buffer");
+    Require(!libraries || fragmentParts() == prebuilt, "formatted buffer prebuild: a draw built the fragment library its registration module had prebuilt");
+}
+
 int main(int argc, char** argv) {
     try {
         auto device = OpenVulkanTestDevice();
@@ -791,6 +877,7 @@ int main(int argc, char** argv) {
             Require(mode == "unset" ? value == nullptr : (mode == "0" || mode == "1") && value != nullptr && mode == value, "prebuild policy test has the wrong startup environment");
             if (!device->Target().registrationModules) return VulkanTestSkipped;
             PrebuildPolicyReadback(*device, mode == "1");
+            if (mode != "1") FormattedBufferPrebuildReuse(*device);
             std::cout << "prebuild policy native readback passed\n";
             return 0;
         }
