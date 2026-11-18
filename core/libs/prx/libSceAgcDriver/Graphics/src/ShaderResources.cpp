@@ -7431,7 +7431,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
     } else {
-        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+        thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* pendingSlot = nullptr;
+        auto& pending = ShaderRecompiler::ThreadOwned(pendingSlot);
+        guestMemory.InPlaceReads(pending);
+        recorder.NotePendingReads(pending, kind);
     }
     const auto inRun = std::exchange(afterRunSelf, nullptr);
     if (SkipWriteBack()) return;
