@@ -3717,6 +3717,63 @@ UncachedCounts& uncachedCounts() {
 thread_local std::uint64_t targetResolveSerial = 0;
 thread_local std::uint64_t lastUncachedTarget = 0;
 
+struct MultisampleRefusalCounts {
+    ProfileCounter builds;
+    std::array<ProfileCounter, 3> samples;
+    ProfileCounter staged;
+    ProfileCounter fmask;
+    ProfileCounter cmask;
+    ProfileCounter cmaskFastClear;
+    ProfileCounter dcc;
+    ProfileCounter severalTargets;
+    ProfileCounter mixedTargets;
+    ProfileCounter depthMultisampled;
+    ProfileCounter depthSingle;
+    ProfileCounter depthNone;
+    ProfileCounter depthHtile;
+    ProfileCounter repeats;
+    ProfileCounter depthMemoRefused;
+    ProfileCounter depthMemoRefusedWithColorsSingle;
+};
+
+MultisampleRefusalCounts& multisampleRefusals() {
+    static MultisampleRefusalCounts counts;
+    return counts;
+}
+
+struct NoColorsCounts {
+    ProfileCounter depthOnlyBuilds;
+    ProfileCounter depthOnlyRuns;
+    ProfileCounter misses;
+    ProfileCounter sameTargets;
+    ProfileCounter sameTargetsMemoized;
+    ProfileCounter otherTargets;
+    ProfileCounter noColorBuildBefore;
+    ProfileCounter sameDepth;
+    std::array<ProfileCounter, 3> runLengths;
+    ProfileCounter proofsOwn;
+    ProfileCounter proofsOther;
+};
+
+NoColorsCounts& noColorsCounts() {
+    static NoColorsCounts counts;
+    return counts;
+}
+
+struct ColorBuildTrail {
+    std::vector<ColorTarget> colors;
+    std::optional<DepthTarget> depth;
+    bool memoized = false;
+    bool any = false;
+};
+
+thread_local ColorBuildTrail lastColorBuild;
+thread_local ColorBuildTrail beforeDepthOnly;
+thread_local std::uint64_t depthOnlyRun = 0;
+thread_local std::vector<ColorTarget> lastMultisampleColors;
+thread_local std::optional<DepthTarget> lastMultisampleDepth;
+thread_local std::uint64_t memoOwnBreaks = 0;
+
 std::size_t uncachedSlot(const TargetBinding& binding) {
     if (binding.resident == nullptr) return ColorTileModeIsLinear(binding.color.tileMode) ? 0 : 1;
     const auto reason = static_cast<std::size_t>(binding.resident->UncachedFor());
@@ -3779,6 +3836,44 @@ void reportTargetMemo() {
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) miss time by cause:%s\n", misses.empty() ? " none" : misses.c_str());
     const auto lookups = uncachedLine(0);
     const auto builds = uncachedLine(1);
+    {
+        auto& ms = multisampleRefusals();
+        const auto take = [](ProfileCounter& counter) { return static_cast<unsigned long long>(counter.Take()); };
+        const auto builds = take(ms.builds);
+        const auto s2 = take(ms.samples[0]);
+        const auto s4 = take(ms.samples[1]);
+        const auto s8 = take(ms.samples[2]);
+        const auto staged = take(ms.staged);
+        const auto fmask = take(ms.fmask);
+        const auto cmask = take(ms.cmask);
+        const auto fastClear = take(ms.cmaskFastClear);
+        const auto dcc = take(ms.dcc);
+        const auto several = take(ms.severalTargets);
+        const auto mixed = take(ms.mixedTargets);
+        const auto depthMs = take(ms.depthMultisampled);
+        const auto depthSingle = take(ms.depthSingle);
+        const auto depthNone = take(ms.depthNone);
+        const auto htile = take(ms.depthHtile);
+        const auto repeats = take(ms.repeats);
+        const auto depthRefused = take(ms.depthMemoRefused);
+        const auto depthRefusedSingle = take(ms.depthMemoRefusedWithColorsSingle);
+        AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) builds refused as multisampled %llu: color samples 2 %llu, 4 %llu, 8 or more %llu; staged %llu; fmask %llu, cmask %llu (fast clear %llu), dcc %llu; several color targets %llu (with a single-sampled one %llu); depth multisampled %llu (htile %llu), single-sampled %llu, none %llu; same color targets and depth as the previous refused build %llu; depth memo refused for multisampled depth %llu (with no multisampled color target %llu)\n", builds, s2, s4, s8, staged, fmask, cmask, fastClear, dcc, several, mixed, depthMs, htile, depthSingle, depthNone, repeats, depthRefused, depthRefusedSingle);
+        auto& nc = noColorsCounts();
+        const auto depthOnly = take(nc.depthOnlyBuilds);
+        const auto runs = take(nc.depthOnlyRuns);
+        const auto misses = take(nc.misses);
+        const auto same = take(nc.sameTargets);
+        const auto sameMemo = take(nc.sameTargetsMemoized);
+        const auto other = take(nc.otherTargets);
+        const auto none = take(nc.noColorBuildBefore);
+        const auto sameDepth = take(nc.sameDepth);
+        const auto run1 = take(nc.runLengths[0]);
+        const auto run4 = take(nc.runLengths[1]);
+        const auto runMore = take(nc.runLengths[2]);
+        const auto own = take(nc.proofsOwn);
+        const auto others = take(nc.proofsOther);
+        AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) depth-only builds %llu in %llu runs; color misses after a depth-only build %llu: the color targets of the build before the run %llu (that build memoized %llu), other targets %llu, no color build before %llu; the same depth too %llu; depth-only builds in the run 1 %llu, 2-4 %llu, 5 or more %llu; proof moves at lookups: only this thread's own breaks %llu, other threads' %llu\n", depthOnly, runs, misses, same, sameMemo, other, none, sameDepth, run1, run4, runMore, own, others);
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) invalid: uncached, at lookups: %s; at builds: %s; builds whose uncached target was the previous uncached build's %llu, with several color targets %llu\n", lookups.c_str(), builds.c_str(), static_cast<unsigned long long>(uncachedCounts().sameTarget.Take()), static_cast<unsigned long long>(uncachedCounts().severalTargets.Take()));
 }
 
@@ -3787,6 +3882,10 @@ bool colorProofMatches(const TargetProof& before, const TargetProof& after, cons
     const auto note = [&](bool changed, TargetMemoEvent event) { if (changed) noteTargetMemo(event); };
     note(before.epoch != after.epoch, TargetMemoEvent::Epoch);
     note(before.proofs != after.proofs, TargetMemoEvent::Proofs);
+    if (targetMemoProfiled && recorded != nullptr && before.proofs != after.proofs) {
+        if (after.proofs - before.proofs == GuestMemory::OwnProofBreaks() - memoOwnBreaks) noColorsCounts().proofsOwn.Add();
+        else noColorsCounts().proofsOther.Add();
+    }
     note(before.pending != after.pending, TargetMemoEvent::Pending);
     if (recorded != nullptr && before.pending != after.pending) {
         const bool ownRecording = recorded->has_value() && **recorded == after;
@@ -3874,6 +3973,87 @@ void printInvalidTarget(const State& state, std::span<const TargetBinding> targe
     std::fprintf(stderr, "[target-memo] %s target: color 0x%llx format %d tile %d element %u bytes extent %ux%u samples %u fmask 0x%llx dcc 0x%llx cmask 0x%llx resident %s; depth %s format %d samples %u; color targets %zu\n", TargetMemoEventName(cause), static_cast<unsigned long long>(color.address), static_cast<int>(color.format), static_cast<int>(color.tileMode), color.elementBytes, color.extent.width, color.extent.height, color.samples, static_cast<unsigned long long>(color.fmaskAddress), static_cast<unsigned long long>(color.dccAddress), static_cast<unsigned long long>(color.cmaskAddress), binding.resident == nullptr ? "none" : binding.resident->Cached() ? "cached" : "uncached", state.depth ? "bound" : "none", state.depth ? static_cast<int>(state.depth->format) : 0, state.depth ? state.depth->samples : 0u, targets.size());
 }
 
+void noteMultisampleRefusal(const State& state, std::span<const TargetBinding> targets) {
+    auto& counts = multisampleRefusals();
+    counts.builds.Add();
+    std::uint32_t samples = 1;
+    bool staged = false;
+    bool fmask = false;
+    bool cmask = false;
+    bool fastClear = false;
+    bool dcc = false;
+    bool single = false;
+    for (const auto& binding : targets) {
+        const auto& color = binding.color;
+        if (!binding.multisampled) {
+            single = true;
+            continue;
+        }
+        samples = std::max(samples, color.samples);
+        staged = staged || color.staged;
+        fmask = fmask || color.fmaskAddress != 0;
+        cmask = cmask || color.cmaskAddress != 0;
+        fastClear = fastClear || color.cmaskFastClear;
+        dcc = dcc || color.dccAddress != 0;
+    }
+    counts.samples[samples <= 2u ? 0 : samples <= 4u ? 1 : 2].Add();
+    if (staged) counts.staged.Add();
+    if (fmask) counts.fmask.Add();
+    if (cmask) counts.cmask.Add();
+    if (fastClear) counts.cmaskFastClear.Add();
+    if (dcc) counts.dcc.Add();
+    if (targets.size() > 1) counts.severalTargets.Add();
+    if (single) counts.mixedTargets.Add();
+    if (!state.depth) counts.depthNone.Add();
+    else if (state.depth->samples > 1u) {
+        counts.depthMultisampled.Add();
+        if (state.depth->htileAddress != 0) counts.depthHtile.Add();
+    } else counts.depthSingle.Add();
+    const bool same = lastMultisampleColors.size() == state.colors.size() && std::equal(state.colors.begin(), state.colors.end(), lastMultisampleColors.begin()) && lastMultisampleDepth == state.depth;
+    if (same) counts.repeats.Add();
+    lastMultisampleColors.assign(state.colors.begin(), state.colors.end());
+    lastMultisampleDepth = state.depth;
+}
+
+void noteColorBuild(const State& state, bool memoized) {
+    if (state.colors.empty()) {
+        noColorsCounts().depthOnlyBuilds.Add();
+        if (depthOnlyRun++ == 0) {
+            noColorsCounts().depthOnlyRuns.Add();
+            beforeDepthOnly = lastColorBuild;
+        }
+        return;
+    }
+    lastColorBuild.colors.assign(state.colors.begin(), state.colors.end());
+    lastColorBuild.depth = state.depth;
+    lastColorBuild.memoized = memoized;
+    lastColorBuild.any = true;
+}
+
+void noteNoColorsMiss(const State& state, std::uint64_t prepNanoseconds) {
+    auto& counts = noColorsCounts();
+    counts.misses.Add();
+    const auto run = depthOnlyRun;
+    counts.runLengths[run <= 1u ? 0 : run <= 4u ? 1 : 2].Add();
+    const bool sameColors = beforeDepthOnly.any && beforeDepthOnly.colors.size() == state.colors.size() && std::equal(state.colors.begin(), state.colors.end(), beforeDepthOnly.colors.begin());
+    if (!beforeDepthOnly.any) counts.noColorBuildBefore.Add();
+    else if (sameColors) {
+        counts.sameTargets.Add();
+        if (beforeDepthOnly.memoized) counts.sameTargetsMemoized.Add();
+    } else counts.otherTargets.Add();
+    if (beforeDepthOnly.any && beforeDepthOnly.depth == state.depth) counts.sameDepth.Add();
+    static AgcDriver::Mutex printMutex;
+    static std::set<std::pair<std::uint64_t, std::uint64_t>> printed;
+    const auto colorAddress = state.colors.empty() ? 0ull : static_cast<unsigned long long>(state.colors.front().address);
+    const auto depthAddress = state.depth ? static_cast<unsigned long long>(state.depth->address) : 0ull;
+    {
+        std::lock_guard lock(printMutex);
+        if (printed.size() >= 16u || !printed.emplace(colorAddress, depthAddress).second) return;
+    }
+    const auto& color = state.colors.front();
+    std::fprintf(stderr, "[target-memo] color miss after %llu depth-only builds: %.1f us; color targets %zu, first 0x%llx format %d tile %d extent %ux%u samples %u cmask 0x%llx dcc 0x%llx; depth %s 0x%llx format %d extent %ux%u samples %u htile 0x%llx; the build before the run: %s, depth 0x%llx\n", static_cast<unsigned long long>(run), static_cast<double>(prepNanoseconds) / 1000.0, state.colors.size(), colorAddress, static_cast<int>(color.format), static_cast<int>(color.tileMode), color.extent.width, color.extent.height, color.samples, static_cast<unsigned long long>(color.cmaskAddress), static_cast<unsigned long long>(color.dccAddress), state.depth ? "bound" : "none", depthAddress, state.depth ? static_cast<int>(state.depth->format) : 0, state.depth ? state.depth->extent.width : 0u, state.depth ? state.depth->extent.height : 0u, state.depth ? state.depth->samples : 0u, state.depth ? static_cast<unsigned long long>(state.depth->htileAddress) : 0ull, !beforeDepthOnly.any ? "none" : sameColors ? "same color targets" : "other color targets", beforeDepthOnly.depth ? static_cast<unsigned long long>(beforeDepthOnly.depth->address) : 0ull);
+}
+
 void rememberTargets(const State& state, std::span<const TargetBinding> targets, std::span<const VkImageView> views, const TargetProof& proof) {
     ++targetMemoBuilds;
     noteTargetMemo(TargetMemoEvent::Build);
@@ -3900,6 +4080,7 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         lastUncachedTarget = binding.color.address;
     }
     if (targetMemoProfiled && checked != 0 && (cause == TargetMemoEvent::InvalidUncached || cause == TargetMemoEvent::InvalidMultisampled)) printInvalidTarget(state, targets, targets[checked - 1], cause);
+    if (targetMemoProfiled && cause == TargetMemoEvent::InvalidMultisampled) noteMultisampleRefusal(state, targets);
     colors.valid = enabled && !targets.empty() && cause == TargetMemoEvent::Count;
     if (!colors.valid) colors.invalidCause = cause;
     colors.recorded.reset();
@@ -3912,6 +4093,14 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         for (std::size_t index = 0; index < targets.size(); ++index) colors.attachments[index] = {targets[index].resident, targets[index].proxied, views[index]};
     }
     depth.valid = enabled && (!state.depth || state.depth->samples == 1u);
+    if (targetMemoProfiled) {
+        if (enabled && state.depth && state.depth->samples > 1u) {
+            multisampleRefusals().depthMemoRefused.Add();
+            if (std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; })) multisampleRefusals().depthMemoRefusedWithColorsSingle.Add();
+        }
+        noteColorBuild(state, colors.valid);
+        if (colors.valid) memoOwnBreaks = GuestMemory::OwnProofBreaks();
+    }
     if (depth.valid) {
         depth.proof = proof;
         depth.descriptor = state.depth;
@@ -4284,7 +4473,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             const auto cause = missCause == TargetMemoEvent::Lookup || missCause == TargetMemoEvent::Invalid ? static_cast<std::size_t>(TargetMemoEvent::Count) : static_cast<std::size_t>(missCause);
             missCauseCounts().draws[cause].Add();
             missCauseCounts().nanoseconds[cause].Add(prepNanoseconds);
+            if (missCause == TargetMemoEvent::InvalidNoColors) noteNoColorsMiss(state, prepNanoseconds);
         }
+        if (!state.colors.empty()) depthOnlyRun = 0;
     }
     if (verifyAttachments) checkAttachments(state, prepared);
     timer.phase(PhasePrepare);
@@ -5303,6 +5494,12 @@ void SetDrawStopAfterResolveForTest(DrawStopForTest stop) {
 
 std::uint64_t TargetMemoEvents(TargetMemoEvent event) {
     return targetMemoEvents()[static_cast<std::size_t>(event)].Sum();
+}
+
+TargetRefusalSums TargetRefusalSumsForTest() {
+    auto& ms = multisampleRefusals();
+    auto& nc = noColorsCounts();
+    return {ms.builds.Sum(), ms.samples[1].Sum(), ms.repeats.Sum(), nc.depthOnlyBuilds.Sum(), nc.misses.Sum(), nc.sameTargets.Sum(), nc.sameTargetsMemoized.Sum(), nc.proofsOwn.Sum(), nc.proofsOther.Sum()};
 }
 
 std::uint64_t TargetMissDraws(TargetMemoEvent cause) {

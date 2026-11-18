@@ -215,6 +215,18 @@ enum class TargetPrepOutcome : std::uint8_t { AttachmentMemo, Unconsulted, Hit, 
 enum class TargetPrepThread : std::uint8_t { Committer, Finisher, Worker, Other, Count };
 std::uint64_t TargetPrepDraws(TargetPrepOutcome outcome, TargetPrepThread thread);
 std::uint64_t TargetMissDraws(TargetMemoEvent cause);
+struct TargetRefusalSums {
+    std::uint64_t multisampledBuilds = 0;
+    std::uint64_t fourSamples = 0;
+    std::uint64_t multisampledRepeats = 0;
+    std::uint64_t depthOnlyBuilds = 0;
+    std::uint64_t noColorsMisses = 0;
+    std::uint64_t noColorsSameTargets = 0;
+    std::uint64_t noColorsSameMemoized = 0;
+    std::uint64_t proofsOwn = 0;
+    std::uint64_t proofsOther = 0;
+};
+TargetRefusalSums TargetRefusalSumsForTest();
 std::uint64_t TargetMemoBuildsForTest();
 std::uint64_t TargetMemoHitNanosecondsForTest(const Context& context, const State& state, std::size_t repeats, std::size_t& hits);
 

@@ -130,6 +130,7 @@ struct DrawOptions {
     bool prepareOnly = false;
     bool changePadding = false;
     std::optional<std::uint8_t> stencilWrite;
+    bool noColors = false;
 };
 
 void setDescriptorPadding(ColorTarget& color, DepthTarget* depth, std::uint8_t padding) {
@@ -148,6 +149,10 @@ State drawState(const ColorTarget& color, const DrawOptions& options) {
     state.color = color;
     state.colors = {color};
     state.hasColorTarget = true;
+    if (options.noColors) {
+        state.colors.clear();
+        state.hasColorTarget = false;
+    }
     state.depth = options.depth;
     if (options.changePadding) {
         static std::uint8_t padding = 0;
@@ -618,6 +623,14 @@ void resolveBetween(AgcDriver::VulkanDevice& device) {
     const auto counted = memoServes() && memoCounted() ? 1u : 0u;
     requireMemoEvent(repeated, TargetMemoEvent::InvalidMultisampled, counted, "a repeated multisampled draw");
     requireMemoEvent(repeated, TargetMemoEvent::InvalidUncached, 0u, "a repeated multisampled draw");
+    if (counted != 0u) {
+        const auto before = TargetRefusalSumsForTest();
+        draw(device, multisampled, {.scissor = Whole});
+        const auto after = TargetRefusalSumsForTest();
+        Require(after.multisampledBuilds == before.multisampledBuilds + 1u && after.fourSamples == before.fourSamples + 1u, "a refused multisampled build was not counted under four samples");
+        Require(after.multisampledRepeats == before.multisampledRepeats + 1u, "a multisampled build with the previous one's targets was not counted as a repeat");
+        std::cout << "multisampled refusals: counted by samples and repeats\n";
+    }
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.WaitIdle();
@@ -1689,7 +1702,21 @@ void causeSplit(AgcDriver::VulkanDevice& device) {
     requireCause(device, color, {.scissor = Right, .depth = changed, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS, .depthValue = 0.75f}, TargetMemoEvent::DepthDescriptor, TargetPrepOutcome::HitDepthMiss, "a depth descriptor change");
     arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS});
     AgcDriver::GuestMemory::BreakProofs();
+    const auto ownBefore = TargetRefusalSumsForTest();
     requireCause(device, color, {.scissor = Right, .depth = depth, .compare = VK_COMPARE_OP_ALWAYS}, TargetMemoEvent::DepthProof, TargetPrepOutcome::Miss, "a proof break");
+    const auto ownAfter = TargetRefusalSumsForTest();
+    Require(ownAfter.proofsOwn == ownBefore.proofsOwn + 1u && ownAfter.proofsOther == ownBefore.proofsOther, "a proof moved by this thread's own break was not counted as own");
+    arm(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS});
+    {
+        const auto before = TargetRefusalSumsForTest();
+        draw(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true, .noColors = true});
+        const auto between = TargetRefusalSumsForTest();
+        Require(between.depthOnlyBuilds == before.depthOnlyBuilds + 1u, "a depth-only build was not counted");
+        requireCause(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS}, TargetMemoEvent::InvalidNoColors, TargetPrepOutcome::Miss, "a color draw after a depth-only build");
+        const auto after = TargetRefusalSumsForTest();
+        Require(after.noColorsMisses == before.noColorsMisses + 1u && after.noColorsSameTargets == before.noColorsSameTargets + 1u && after.noColorsSameMemoized == before.noColorsSameMemoized + 1u, "a color miss after a depth-only build was not counted with the memoized targets before it");
+        std::cout << "no color targets: the color miss after a depth-only build matched the memoized targets before it\n";
+    }
     auto msaa = depthTarget(false);
     msaa.address = address(MultisampleStorage.data());
     msaa.samples = 4;
