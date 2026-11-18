@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -411,6 +412,7 @@ struct HostImports {
     std::uint64_t settlesKeptCompared = 0;
     std::uint64_t settlesParked = 0;
     std::uint64_t settleUnmapWaits = 0;
+    ImportSpanRewatchCounts spanRewatches;
 #endif
     std::uint64_t useCounter = 0;
     std::uint64_t buildFloor = 0;
@@ -1447,6 +1449,7 @@ void rewatchSettledImports(HostImports& state) {
         if (import == state.imports.end() || !GuestMemory::Watched(base, static_cast<std::size_t>(import->second.bytes))) continue;
         import->second.unwatched = false;
         ++state.settlesRewatched;
+        if (std::exchange(import->second.spanRewatch, false)) ++state.spanRewatches.rewatched;
     }
 }
 
@@ -2641,14 +2644,24 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     entry.lastUse = ++state.useCounter;
     state.pendingImports.insert(base);
 #ifdef _WIN32
-    if (deferredSettles.load(std::memory_order_relaxed) && entry.alias == nullptr && state.watchPrivateImports && writable) {
-        if (entry.unwatched) {
-            state.pendingSettles.insert_or_assign(base, PendingSettle{});
-            state.settleWanted.push_back(base);
-        } else if (base % settleBlockBytes == 0 && bytes % settleBlockBytes == 0 && settled && !GuestMemory::Watched(base, static_cast<std::size_t>(bytes))) {
+    const bool settles = deferredSettles.load(std::memory_order_relaxed) && entry.alias == nullptr && state.watchPrivateImports && writable;
+    if (settles && entry.unwatched) {
+        state.pendingSettles.insert_or_assign(base, PendingSettle{});
+        state.settleWanted.push_back(base);
+    } else if (!entry.unwatched && !GuestMemory::Watched(base, static_cast<std::size_t>(bytes))) {
+        if (settles && base % settleBlockBytes == 0 && bytes % settleBlockBytes == 0 && settled) {
             entry.unwatched = true;
             state.pendingSettles.insert_or_assign(base, PendingSettle{SettlePhase::Settled, 0});
             state.settleReady.push_back(base);
+        } else if (settles && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoImportSpanRewatch)) {
+            entry.unwatched = true;
+            entry.spanRewatch = true;
+            state.pendingSettles.insert_or_assign(base, PendingSettle{});
+            state.settleWanted.push_back(base);
+            ++state.spanRewatches.queued;
+        } else {
+            const auto left = settles ? ImportSpanLeft::SwitchOff : !deferredSettles.load(std::memory_order_relaxed) ? ImportSpanLeft::DeferredSettlesOff : entry.alias != nullptr ? ImportSpanLeft::Alias : !state.watchPrivateImports ? ImportSpanLeft::PrivateWatchOff : ImportSpanLeft::ReadOnly;
+            ++state.spanRewatches.left[static_cast<std::size_t>(left)];
         }
     }
 #endif
@@ -4037,6 +4050,9 @@ void reportMirrors() {
     auto& imports = Imports();
     std::lock_guard importsLock(imports.mutex);
     if (imports.settlesSubmitted != 0 || imports.settlesWaited != 0 || !imports.settles.empty()) AgcDriver::ProfilePrint_nid_no_patch("[buffers] host imports under %llu KiB: %llu settle reads submitted, %llu back in the write watch, %llu kept compared under a storage image, %llu retired during their read (%llu unmaps waited for it), %zu pending; %llu larger imports settled inside their window\n", static_cast<unsigned long long>(settleFloorBytes >> 10u), static_cast<unsigned long long>(imports.settlesSubmitted), static_cast<unsigned long long>(imports.settlesRewatched), static_cast<unsigned long long>(imports.settlesKeptCompared), static_cast<unsigned long long>(imports.settlesParked), static_cast<unsigned long long>(imports.settleUnmapWaits), imports.settles.size(), static_cast<unsigned long long>(imports.settlesWaited));
+    const auto& span = imports.spanRewatches;
+    const auto left = [&](ImportSpanLeft reason) { return static_cast<unsigned long long>(span.left[static_cast<std::size_t>(reason)]); };
+    if (span.queued != 0 || std::any_of(span.left.begin(), span.left.end(), [](std::uint64_t count) { return count != 0; })) AgcDriver::ProfilePrint_nid_no_patch("[buffers] imports left with unwatched spans: %llu queued to settle and rewatch, %llu back in the write watch; left unwatched: %llu switch off, %llu deferred settles off, %llu aliases, %llu private watch off, %llu read-only\n", static_cast<unsigned long long>(span.queued), static_cast<unsigned long long>(span.rewatched), left(ImportSpanLeft::SwitchOff), left(ImportSpanLeft::DeferredSettlesOff), left(ImportSpanLeft::Alias), left(ImportSpanLeft::PrivateWatchOff), left(ImportSpanLeft::ReadOnly));
 #endif
 }
 
@@ -4905,6 +4921,16 @@ HostImportSettleCounts HostImportSettles() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     return {state.settlesSubmitted, state.settlesWaited, state.settlesRewatched, state.settlesParked, state.settleUnmapWaits, state.settlesKeptCompared};
+#else
+    return {};
+#endif
+}
+
+ImportSpanRewatchCounts ImportSpanRewatches() {
+#ifdef _WIN32
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return state.spanRewatches;
 #else
     return {};
 #endif

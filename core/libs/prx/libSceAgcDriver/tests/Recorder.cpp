@@ -2709,6 +2709,61 @@ bool deferredSettleTests(const Device& device) {
     unregisterRange(small);
     unregisterRange(large);
     HostImportFor(context, address, unit);
+    void* odd = AllocateWatched(settledBytes + unit, unit);
+    struct ReleaseOdd {
+        void* odd;
+        ~ReleaseOdd() {
+            SetImportWalkFailureForTest(0);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoImportSpanRewatch, false);
+            ReleaseWatched(odd, settledBytes + unit);
+        }
+    } releaseOdd{odd};
+    std::memset(odd, 0x33, settledBytes + unit);
+    auto* oddRange = static_cast<std::uint8_t*>(odd) + 4096;
+    const auto oddAddress = reinterpret_cast<std::uint64_t>(oddRange);
+    const auto pump = [&](const std::function<bool()>& done) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!done() && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            HostImportFor(context, oddAddress, settledBytes);
+        }
+        return done();
+    };
+    for (const bool switchedOff : {false, true}) {
+        const std::string what = switchedOff ? "(e) with APS5_NO_IMPORT_SPAN_REWATCH, an unaligned 1 MiB import whose span walk failed" : "(e) an unaligned 1 MiB import whose span walk failed";
+        RuntimeSwitches::Assign(RuntimeSwitch::NoImportSpanRewatch, switchedOff);
+        const auto before = ImportSpanRewatches();
+        registerRange(oddRange, settledBytes);
+        SetImportWalkFailureForTest(2);
+        const auto* spanImport = HostImportFor(context, oddAddress, settledBytes);
+        SetImportWalkFailureForTest(0);
+        Require(spanImport != nullptr && spanImport->base == oddAddress && !Watched(oddAddress, settledBytes), what + " was refused or kept its write watch");
+        if (switchedOff) {
+            for (int round = 0; round < 20; ++round) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                HostImportFor(context, oddAddress, settledBytes);
+            }
+            const auto after = ImportSpanRewatches();
+            Require(!Watched(oddAddress, settledBytes) && !HostImportFor(context, oddAddress, settledBytes)->unwatched, what + " returned to the write watch");
+            Require(after.queued == before.queued && after.left[static_cast<std::size_t>(ImportSpanLeft::SwitchOff)] == before.left[static_cast<std::size_t>(ImportSpanLeft::SwitchOff)] + 1, what + " was not counted as left by the switch");
+        } else {
+            Require(spanImport->unwatched, what + " was not marked compared");
+            Require(pump([&] { return Watched(oddAddress, settledBytes); }), what + " did not return to the write watch after its settle");
+            const auto after = ImportSpanRewatches();
+            Require(!HostImportFor(context, oddAddress, settledBytes)->unwatched, what + " is still marked compared back in the write watch");
+            Require(after.queued == before.queued + 1 && after.rewatched == before.rewatched + 1, what + " was not counted as queued and rewatched");
+            BumpCollectEpoch();
+            const auto collected = CollectWrites(oddAddress, settledBytes);
+            Require(collected != 0, what + ": the rewatched import is not collected");
+            oddRange[8192] = 0x44;
+            CollectWritesUncached(oddAddress, settledBytes);
+            Require(!UnchangedSince(oddAddress, settledBytes, collected), what + ": a CPU store after the rewatch was missed");
+        }
+        unregisterRange(oddRange);
+        HostImportFor(context, oddAddress, settledBytes);
+    }
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> oddSpan{{{oddAddress, oddAddress + settledBytes}}};
+    Rewatch(oddSpan);
     std::cout << "deferred settle tests passed\n";
     return true;
 }

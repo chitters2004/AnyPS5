@@ -2251,7 +2251,7 @@ void CheckUnwatchCauses() {
     Require(UnwatchedCause(base + 2 * Block, Block) == UnwatchCause::Explicit, "an explicit unwatch was not given its cause");
     Require(UnwatchedCause(base + Block, 2 * Block) == UnwatchCause::Explicit, "a range reaching an explicit unwatch was not given its cause");
     Require(UnwatchedCause(base + 3 * Block, Block) == UnwatchCause::Watched, "a block next to an explicit unwatch lost its watch");
-    Require(std::string_view(UnwatchCauseName(UnwatchCause::ImportSpanUnwalked)) == "import span not walked" && std::string_view(UnwatchCauseName(UnwatchCause::Count)) == "unknown", "an unwatch cause is misnamed");
+    Require(std::string_view(UnwatchCauseName(UnwatchCause::ImportSpanUncovered)) == "import span not covered" && std::string_view(UnwatchCauseName(UnwatchCause::ImportWalkBefore)) == "import walk before failed" && std::string_view(UnwatchCauseName(UnwatchCause::ImportWalkAfter)) == "import walk after failed" && std::string_view(UnwatchCauseName(UnwatchCause::Count)) == "unknown", "an unwatch cause is misnamed");
 }
 
 void CheckImportWalkUnwatchHooks() {
@@ -2286,7 +2286,7 @@ void CheckImportWalkUnwatchHooks() {
         Require(!call.proven, what + " ran the unwatch hook as if the CPU writes to its block were proven");
         Require(hookedBeforeImport == (walk == 1), what + (walk == 1 ? " ran the unwatch hook after the import" : " ran the unwatch hook before the import"));
         Require(!Watched(imported, Block), what + " left its block watched");
-        Require(UnwatchedCause(imported, Block) == UnwatchCause::ImportSpanUnwalked, what + " was given unwatch cause " + UnwatchCauseName(UnwatchedCause(imported, Block)));
+        Require(UnwatchedCause(imported, Block) == (walk == 1 ? UnwatchCause::ImportWalkBefore : UnwatchCause::ImportWalkAfter), what + " was given unwatch cause " + UnwatchCauseName(UnwatchedCause(imported, Block)));
     }
     importHookCalls.clear();
     importHookProbe = base + 3 * Block;
@@ -2332,6 +2332,8 @@ void CheckImportWalkHookKeepsLaterWindows() {
     Require(collectDuringHookCalls == 1, "the span whose page walk failed after the import did not run the unwatch hook once");
     Require(!Watched(base, Block), "the span whose page walk failed after the import stayed watched");
     Require(Watched(base + 2 * Block, 2 * Block), "the span whose page walk succeeded left the write watch");
+    Require(UnwatchedCause(base, Block) == UnwatchCause::ImportWalkAfter, std::string("the span whose page walk failed after the import was given cause ") + UnwatchCauseName(UnwatchedCause(base, Block)));
+    Require(UnwatchedCause(base + Block, Block) == UnwatchCause::Explicit, std::string("an import over an unwatched block replaced its cause with ") + UnwatchCauseName(UnwatchedCause(base + Block, Block)));
     const std::array<std::uint64_t, 2> generations{synced, synced};
     std::array<std::uint8_t, 2> changed{};
     std::array<std::uint8_t, 2> cpu{};

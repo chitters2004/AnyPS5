@@ -41,6 +41,7 @@ struct HostImport {
     std::uint64_t serial = 0;
     bool unwatched = false;
     bool settleOnDemand = false;
+    bool spanRewatch = false;
     bool dmaBuf = false;
     bool joined = false;
     std::shared_ptr<void> chunk;
@@ -158,6 +159,13 @@ struct HostImportSettleCounts {
     std::uint64_t keptCompared = 0;
 };
 HostImportSettleCounts HostImportSettles();
+enum class ImportSpanLeft : std::uint8_t { SwitchOff, DeferredSettlesOff, Alias, PrivateWatchOff, ReadOnly, Count };
+struct ImportSpanRewatchCounts {
+    std::uint64_t queued = 0;
+    std::uint64_t rewatched = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(ImportSpanLeft::Count)> left{};
+};
+ImportSpanRewatchCounts ImportSpanRewatches();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);

@@ -2511,7 +2511,13 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return true;
     });
     leave(leaving);
+    const auto tagLeaving = [&](UnwatchCause cause) {
+        for (const auto& [begin, end] : leaving) {
+            if (tracker.inArena(begin, static_cast<std::size_t>(end - begin))) tracker.unwatchCauses.Fill(begin, end, static_cast<std::uint8_t>(cause));
+        }
+    };
     if (!runImport()) return false;
+    tagLeaving(UnwatchCause::ImportWalkBefore);
     bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
     const WindowCopy window{first, hashes, {}, StampKind::ImportWindow, unknown};
     leaving.clear();
@@ -2526,12 +2532,13 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return false;
     });
     leave(leaving);
+    tagLeaving(UnwatchCause::ImportWalkAfter);
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
-        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom), UnwatchCause::ImportSpanUnwalked);
+        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom), UnwatchCause::ImportSpanUncovered);
         unwatchedFrom = end;
     }
-    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom), UnwatchCause::ImportSpanUnwalked);
+    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom), UnwatchCause::ImportSpanUncovered);
     return true;
 }
 
