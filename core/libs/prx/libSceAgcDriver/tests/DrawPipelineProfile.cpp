@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <algorithm>
 #include <cstring>
 #include <cstdio>
 #include <exception>
@@ -7,6 +10,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <new>
 #include <semaphore>
 #include <stdexcept>
 #include <string>
@@ -16,6 +20,22 @@
 #include <io.h>
 #else
 #include <unistd.h>
+#endif
+
+namespace {
+
+std::atomic<std::uint64_t> newCalls{0};
+
+}
+
+#ifndef _WIN32
+void* operator new(std::size_t bytes) {
+    newCalls.fetch_add(1, std::memory_order_relaxed);
+    if (void* block = std::malloc(bytes != 0 ? bytes : 1)) return block;
+    throw std::bad_alloc();
+}
+void operator delete(void* block) noexcept { std::free(block); }
+void operator delete(void* block, std::size_t) noexcept { std::free(block); }
 #endif
 
 namespace {
@@ -124,10 +144,47 @@ void TestUntimedCommits() {
     Check(DrawPipeline::CommitClockReads() == 0, "the committer read the clock with draw profiling and pipeline statistics off");
 }
 
+void TestWatchReuse() {
+    using AgcDriver::DriverDetail::DrawPipeline;
+    auto& pipeline = DrawPipeline::Queue0();
+    Check(DrawPipeline::Depth() >= 2, "test requires at least two pipeline slots");
+    std::binary_semaphore release{0};
+    std::exception_ptr failure;
+    DrawPipeline::Watch watch;
+    try {
+        pipeline.Enqueue([&] { release.acquire(); }, {{0x1000, 0x1010}, {0x2000, 0x2010}}, 0, {}, {}, true);
+        pipeline.Enqueue([] {}, {{0x3000, 0x3010}}, 0, {}, {}, true);
+        pipeline.WatchWrites(watch);
+        const auto first = watch.writes;
+        Check(watch.items >= 1 && std::find(first.begin(), first.end(), DrawPipeline::Range{0x3000, 0x3010}) != first.end(), "a watch missed a queued item's writes");
+        const auto before = newCalls.load(std::memory_order_relaxed);
+        pipeline.WatchWrites(watch);
+        const auto during = newCalls.load(std::memory_order_relaxed) - before;
+#ifndef _WIN32
+        Check(during == 0, "a watch refilled into its own storage allocated");
+#endif
+        Check(watch.writes == first, "a refilled watch kept or lost queued writes");
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    release.release();
+    pipeline.Stop();
+    if (failure) std::rethrow_exception(failure);
+    Check(pipeline.WrittenSince(watch, {{0x3004, 0x3008}}), "a write that retired after the watch was not reported");
+    Check(!pipeline.WrittenSince(watch, {{0x9000, 0x9008}}), "a range no item wrote was reported written");
+    pipeline.WatchWrites(watch);
+    Check(watch.items == 0 && watch.writes.empty() && watch.retired == pipeline.Retired(), "an idle watch kept the last queue's writes");
+}
+
 }
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--watch") == 0) {
+            TestWatchReuse();
+            std::cout << "Draw pipeline watch reuse passed\n";
+            return 0;
+        }
         if (argc == 2 && std::strcmp(argv[1], "--untimed") == 0) {
             TestUntimedCommits();
             std::cout << "Draw pipeline untimed commits passed\n";

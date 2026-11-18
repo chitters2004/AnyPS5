@@ -41,11 +41,12 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     };
     if (!DrawPipeline::Active()) return decode();
     auto& queue = DrawPipeline::Queue0();
-    const auto watch = queue.WatchWrites();
+    thread_local DrawPipeline::Watch watch;
+    queue.WatchWrites(watch);
     auto info = decode();
     if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;
-    std::vector<DrawPipeline::Range> ranges;
-    ranges.reserve(reads.size());
+    thread_local std::vector<DrawPipeline::Range> ranges;
+    ranges.clear();
     for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
     if (!queue.WrittenSince(watch, ranges)) return info;
     queue.NoteDecodeDrain();

@@ -653,12 +653,17 @@ void DrawPipeline::countWrites(const std::vector<Range>& writes, bool added) {
     }
 }
 
-DrawPipeline::Watch DrawPipeline::WatchWrites() {
-    if (!Busy()) return {Retired(), 0, {}};
+void DrawPipeline::WatchWrites(Watch& watch) {
+    watch.writes.clear();
+    if (!Busy()) {
+        watch.retired = Retired();
+        watch.items = 0;
+        return;
+    }
     std::lock_guard lock(mutex);
-    Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
+    watch.retired = retiredItems.load(std::memory_order_relaxed);
+    watch.items = items.size();
     for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
-    return watch;
 }
 
 bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
