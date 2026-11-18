@@ -45,6 +45,7 @@ extern "C" void AgcDriverCheckFailure_nid_postfix();
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix();
+extern "C" std::uint64_t AgcDriverRegisterRunPackets_nid_postfix();
 extern "C" void AgcDriverSetAheadAdoptHook_nid_postfix(void (*hook)());
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader);
 extern "C" std::uint32_t AgcDriverInstructionWords_nid_postfix(std::span<const std::uint32_t> code, std::uint32_t index);

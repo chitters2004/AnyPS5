@@ -1,5 +1,6 @@
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <array>
@@ -25,6 +26,8 @@ constexpr auto CompletionDeadline = std::chrono::seconds(60);
 constexpr std::uint32_t ContextBase = 0xa000;
 constexpr std::uint32_t ShaderBase = 0x2c00;
 constexpr std::uint32_t UserConfigBase = 0xc000;
+
+bool traceSlicing = false;
 
 void Require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -67,6 +70,7 @@ void RunArm(bool runs, std::uint32_t* page, std::uint32_t serial) {
     auto* copied = page + 16;
     std::memset(copied, 0xee, 8 * sizeof(std::uint32_t));
     const auto base = serial * 0x100u;
+    const auto coveredBefore = AgcDriverRegisterRunPackets_nid_postfix();
 
     std::vector<std::uint32_t> ending;
     SetRegisters(ending, 0x69, 0x110, {base + 1});
@@ -96,7 +100,10 @@ void RunArm(bool runs, std::uint32_t* page, std::uint32_t serial) {
     for (std::size_t index = 0; index < expected.size(); ++index) {
         Require(copied[index] == expected[index], arm + ": register 0x" + std::to_string(registers[index]) + " read " + std::to_string(copied[index]) + ", expected " + std::to_string(expected[index]));
     }
-    std::printf("[register-runs] %s: %zu registers match\n", arm.c_str(), expected.size());
+    const auto covered = AgcDriverRegisterRunPackets_nid_postfix() - coveredBefore;
+    const std::uint64_t expectedCovered = runs && !traceSlicing ? 10 : 0;
+    Require(covered == expectedCovered, arm + ": runs covered " + std::to_string(covered) + " register packets, expected " + std::to_string(expectedCovered));
+    std::printf("[register-runs] %s: %zu registers match, %llu packets ran in runs\n", arm.c_str(), expected.size(), static_cast<unsigned long long>(covered));
 }
 
 }
@@ -116,11 +123,18 @@ int main() {
         std::memset(block, 0, 65536);
         GuestAllocations::Mutation().Add(block, 65536, true, true, true);
         auto* page = static_cast<std::uint32_t*>(block);
+        const bool traced = std::getenv("APS5_TRACE_SUMMARY_EVERY") != nullptr || std::getenv("APS5_TRACE_FRAMES") != nullptr;
+        if (traced) {
+            AgcDriver::PerformanceTrace::Present(1, 1, nullptr);
+            Require(AgcDriver::PerformanceTrace::Recording(), "the trace is not recording after the first present");
+            traceSlicing = std::getenv("APS5_TRACE_FRAMES") != nullptr;
+        }
         RunArm(false, page, 1);
         RunArm(true, page, 2);
         RunArm(false, page, 3);
         RunArm(true, page, 4);
         RuntimeSwitches::Assign(RuntimeSwitch::RegisterRuns, false);
+        if (traced) AgcDriver::PerformanceTrace::StopOutput();
 #ifdef _WIN32
         VirtualFree(block, 0, MEM_RELEASE);
 #else

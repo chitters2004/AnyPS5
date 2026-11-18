@@ -15,7 +15,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -25,6 +27,8 @@
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
+
+std::atomic<std::uint64_t> registerRunPackets{0};
 
 namespace {
 
@@ -56,8 +60,40 @@ bool registerRunOpcode(std::uint32_t opcode) {
     return opcode == 0x69 || opcode == 0x76 || opcode == 0x79;
 }
 
+bool registerRunsBlocked() {
+    return APS5_ENABLE_TIMING_LOG || PerformanceTrace::Slicing() || CaptureTrace::Enabled();
+}
+
 bool registerRuns() {
-    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RegisterRuns) && !APS5_ENABLE_TIMING_LOG && !PerformanceTrace::Recording() && !CaptureTrace::Enabled();
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RegisterRuns) && !registerRunsBlocked();
+}
+
+bool registerRunStats() {
+    static const bool stats = std::getenv("APS5_REGISTER_RUN_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return stats;
+}
+
+void noteRegisterRun(std::uint64_t packets) {
+    enum Event : std::size_t { Runs, Covered, Outside, Refused, Count };
+    static std::array<std::atomic<std::uint64_t>, Count> counts{};
+    static std::atomic<std::uint64_t> longest{0};
+    static std::atomic<std::int64_t> reportedAt{0};
+    if (packets != 0) {
+        counts[Runs].fetch_add(1, std::memory_order_relaxed);
+        counts[Covered].fetch_add(packets, std::memory_order_relaxed);
+        auto seen = longest.load(std::memory_order_relaxed);
+        while (seen < packets && !longest.compare_exchange_weak(seen, packets, std::memory_order_relaxed)) {
+        }
+    } else {
+        counts[Outside].fetch_add(1, std::memory_order_relaxed);
+        if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RegisterRuns)) counts[Refused].fetch_add(1, std::memory_order_relaxed);
+    }
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    std::array<unsigned long long, Count> taken{};
+    for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
+    const unsigned long long longestRun = longest.exchange(0, std::memory_order_relaxed);
+    AgcDriver::ProfilePrint_nid_no_patch("[register-runs] 10 s: switch %s, runs %llu, packets covered %llu, longest run %llu; %llu register packets outside runs, %llu of them refused while the switch was on\n", Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::RegisterRuns) ? "on" : "off", taken[Runs], taken[Covered], longestRun, taken[Outside], taken[Refused]);
 }
 
 bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode) {
@@ -316,7 +352,8 @@ void Driver::execute(Submission& submission) {
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
-        if (!predicated && registerRunOpcode(opcode) && !packetEpoch() && registerRuns()) {
+        const bool registerSet = !predicated && registerRunOpcode(opcode);
+        if (registerSet && !packetEpoch() && registerRuns()) {
             flushBetweenPackets(submission.queue, header, false);
             GuestMemory::SetCurrentPacket(opcode, submission.queue);
             const bool ringNotes = submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled();
@@ -338,8 +375,11 @@ void Driver::execute(Submission& submission) {
                 if (!registerRunOpcode((runHeader >> 8u) & 0xffu) || (Pm4::Predicated(runHeader) && queue.predication.operation != 0)) break;
             }
             packetsDone.fetch_add(run);
+            registerRunPackets.fetch_add(run, std::memory_order_relaxed);
+            if (registerRunStats()) noteRegisterRun(run);
             continue;
         }
+        if (registerSet && registerRunStats()) noteRegisterRun(0);
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
@@ -711,4 +751,8 @@ void Driver::execute(Submission& submission) {
     }
 }
 
+}
+
+extern "C" std::uint64_t AgcDriverRegisterRunPackets_nid_postfix() {
+    return AgcDriver::DriverDetail::registerRunPackets.load(std::memory_order_relaxed);
 }
