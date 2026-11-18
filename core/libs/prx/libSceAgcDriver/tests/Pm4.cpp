@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -44,6 +45,26 @@
 #else
 #include <fcntl.h>
 #include <unistd.h>
+#endif
+
+#ifndef _WIN32
+namespace {
+std::atomic<std::size_t> testNewCalls{0};
+}
+
+void* operator new(std::size_t bytes) {
+    testNewCalls.fetch_add(1, std::memory_order_relaxed);
+    if (void* pointer = std::malloc(bytes == 0 ? 1 : bytes)) return pointer;
+    throw std::bad_alloc();
+}
+
+void operator delete(void* pointer) noexcept {
+    std::free(pointer);
+}
+
+void operator delete(void* pointer, std::size_t) noexcept {
+    std::free(pointer);
+}
 #endif
 
 namespace {
@@ -174,6 +195,80 @@ void testRegisters() {
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x28, {0x80000000}), 0); }, "packet size");
     expectFailure([&] { execute(state, makePacket(0x69, {0xffff, 1, 2})); }, "overflow");
     expectFailure([&] { AgcDriver::Pm4::Validate(makePacket(0x9f, {0, 0, 0x80000000, 0}), 0x20); }, "compute");
+}
+
+void testRegisterLists() {
+    std::array<std::uint32_t, 3> values{0x11u, 0x22u, 0x33u};
+    std::vector<std::uint32_t> out{7u, 8u};
+    const auto consecutive = makePacket(0x63, {low(values.data()), high(values.data()), 0x0a, 3});
+    AgcDriver::Pm4::ReadIndirectRegisters(consecutive, out);
+    check(out == std::vector<std::uint32_t>{7u, 8u, 0x0au, 0x11u, 0x0bu, 0x22u, 0x0cu, 0x33u}, "consecutive indirect registers were not appended as register and value pairs");
+    check(AgcDriver::Pm4::ReadIndirectRegisters(consecutive) == std::vector<std::uint32_t>(out.begin() + 2, out.end()), "the returned indirect register list differs from the appended one");
+    std::array<std::uint32_t, 4> pairs{0x10u, 41u, 0x11u, 42u};
+    const auto listed = makePacket(0x63, {low(pairs.data()), high(pairs.data()), 0x80000000u, 2});
+    AgcDriver::Pm4::ReadIndirectRegisters(listed, out);
+    check(std::equal(pairs.begin(), pairs.end(), out.end() - 4) && out.size() == 12, "listed indirect register pairs were not appended as read");
+
+    AgcDriver::DriverDetail::RegisterLists lists;
+    lists.Emplace(2, [&](std::vector<std::uint32_t>& words) { AgcDriver::Pm4::ReadIndirectRegisters(consecutive, words); });
+    lists.Add(10, std::vector<std::uint32_t>{0x20u, 1u});
+    try {
+        lists.Emplace(15, [](std::vector<std::uint32_t>& words) {
+            words.push_back(99u);
+            throw std::runtime_error("unreadable");
+        });
+        check(false, "a failed register list read was swallowed");
+    } catch (const std::runtime_error& error) {
+        check(std::string(error.what()) == "unreadable", error.what());
+    }
+    check(!lists.Find(15).has_value() && lists.size() == 2, "a failed register list read left an entry");
+    lists.Add(20, std::vector<std::uint32_t>{0x30u, 3u});
+    check(lists.Find(20).has_value() && std::ranges::equal(*lists.Find(20), std::vector<std::uint32_t>{0x30u, 3u}), "a failed register list read shifted the next list");
+    check(std::ranges::equal(lists.At(2), std::vector<std::uint32_t>{0x0au, 0x11u, 0x0bu, 0x22u, 0x0cu, 0x33u}), "a read register list was not found at its cursor");
+    check(!lists.Find(3).has_value() && !lists.Find(0).has_value() && !lists.Find(21).has_value(), "a register list was found at a cursor without one");
+    bool missing = false;
+    try {
+        static_cast<void>(lists.At(11));
+    } catch (const std::out_of_range&) {
+        missing = true;
+    }
+    check(missing, "At accepted a cursor without a register list");
+    for (const std::size_t cursor : {std::size_t{10}, std::size_t{20}}) {
+        bool unordered = false;
+        try {
+            lists.Add(cursor, std::vector<std::uint32_t>{0u, 0u});
+        } catch (const std::logic_error&) {
+            unordered = true;
+        }
+        check(unordered && lists.size() == 3, "a register list was added out of cursor order or twice at one cursor");
+    }
+
+    AgcDriver::DriverDetail::RegisterLists inserted;
+    inserted.Add(0, std::vector<std::uint32_t>{0x40u, 4u});
+    inserted.Add(4, std::vector<std::uint32_t>{0x41u, 5u});
+    lists.Splice(8, 15, 3, inserted);
+    check(lists.size() == 4, "a splice did not replace the lists inside its segment");
+    check(lists.Find(2).has_value() && lists.Find(2)->size() == 6, "a splice moved a list before its segment");
+    check(!lists.Find(10).has_value() && !lists.Find(20).has_value(), "a splice kept a list at its old cursor");
+    check(lists.Find(8).has_value() && std::ranges::equal(*lists.Find(8), std::vector<std::uint32_t>{0x40u, 4u}), "a splice did not place the segment's first list at its start");
+    check(lists.Find(12).has_value() && std::ranges::equal(*lists.Find(12), std::vector<std::uint32_t>{0x41u, 5u}), "a splice did not offset the segment's lists by its start");
+    check(lists.Find(23).has_value() && std::ranges::equal(*lists.Find(23), std::vector<std::uint32_t>{0x30u, 3u}), "a splice did not shift a list after its segment");
+
+#ifndef _WIN32
+    const std::vector<std::uint32_t> list{0x50u, 1u, 0x51u, 2u};
+    AgcDriver::DriverDetail::RegisterLists fresh;
+    const auto before = testNewCalls.load(std::memory_order_relaxed);
+    for (std::size_t cursor = 0; cursor < 256; ++cursor) fresh.Add(cursor * 5, list);
+    const auto filled = testNewCalls.load(std::memory_order_relaxed) - before;
+    if (filled > 24) throw std::runtime_error("256 register lists allocated " + std::to_string(filled) + " times, more than the growth of two vectors");
+    const auto grown = testNewCalls.load(std::memory_order_relaxed);
+    for (int round = 0; round < 4; ++round) {
+        fresh.clear();
+        for (std::size_t cursor = 0; cursor < 256; ++cursor) fresh.Emplace(cursor * 5, [&](std::vector<std::uint32_t>& words) { AgcDriver::Pm4::ReadIndirectRegisters(listed, words); });
+    }
+    check(testNewCalls.load(std::memory_order_relaxed) == grown, "register lists read again after a clear allocated");
+    check(fresh.size() == 256 && std::ranges::equal(fresh.At(255 * 5), pairs), "register lists read again after a clear lost their pairs");
+#endif
 }
 
 void testContextRegRmw() {
@@ -2846,6 +2941,7 @@ int main(int argc, char** argv) {
         testWriteChangedStoresExactlyTheChangedRuns();
         testWriteChangedKeepingGuestKeepsCpuWrites();
         testRegisters();
+        testRegisterLists();
         testContextRegRmw();
         testRegisterFile();
         testContextAndBases();

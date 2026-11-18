@@ -596,7 +596,7 @@ void Driver::execute(Submission& submission) {
         } else if (opcode != 0x42 && opcode != 0x46 && opcode != 0x58) {
             if (!wroteOnGpu) {
                 if (Pm4::IndirectRegisterOpcode(opcode)) {
-                    const auto& listed = submission.registerLists.at(cursor);
+                    const auto listed = submission.registerLists.At(cursor);
                     if (Pm4::IndirectRegistersValid(listed)) {
                         Pm4::ExecuteIndirectRegisters(packet, listed, queue);
                     } else {

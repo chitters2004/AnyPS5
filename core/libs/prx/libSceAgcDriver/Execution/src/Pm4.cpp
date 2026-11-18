@@ -1060,23 +1060,29 @@ DrawParameters ResolveDraw(std::span<const std::uint32_t> packet, const QueueSta
     return {address, count, indexSize, queue.instanceCount, packet.back(), true, indexOffset->second, 0};
 }
 
-std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet) {
+void ReadIndirectRegisters(std::span<const std::uint32_t> packet, std::vector<std::uint32_t>& out) {
     require(packet.size() == 5 && IndirectRegisterOpcode((packet[0] >> 8u) & 0xffu), "expected indirect register packet");
     // Named for the [hooksync] attribution (the read goes through the flush hook).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Registers);
-    if (packet[3] != 0x80000000u) {
-        std::vector<std::uint32_t> values(packet[4]);
-        GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(values)), 4);
-        std::vector<std::uint32_t> pairs;
-        pairs.reserve(values.size() * 2);
-        for (std::size_t i = 0; i < values.size(); ++i) {
-            pairs.push_back(packet[3] + static_cast<std::uint32_t>(i));
-            pairs.push_back(values[i]);
-        }
-        return pairs;
+    const auto base = out.size();
+    const auto count = static_cast<std::size_t>(packet[4]);
+    out.resize(base + count * 2);
+    const auto pairs = std::span(out).subspan(base);
+    if (packet[3] == 0x80000000u) {
+        GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(pairs), 4);
+        return;
     }
-    std::vector<std::uint32_t> pairs(static_cast<std::size_t>(packet[4]) * 2);
-    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(std::span(pairs)), 4);
+    GuestMemory::Read(address(packet[1], packet[2]), std::as_writable_bytes(pairs.subspan(count)), 4);
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto value = pairs[count + i];
+        pairs[i * 2] = packet[3] + static_cast<std::uint32_t>(i);
+        pairs[i * 2 + 1] = value;
+    }
+}
+
+std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet) {
+    std::vector<std::uint32_t> pairs;
+    ReadIndirectRegisters(packet, pairs);
     return pairs;
 }
 
