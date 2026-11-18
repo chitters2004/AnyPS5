@@ -1611,7 +1611,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             entry = found != plan->modules.end() ? found->second : plan->modules.emplace(moduleKey, std::make_shared<PreparedModuleEntry>()).first->second;
         }
         const auto specialize = [&] {
-            auto constants = plan->bindings.specialization;
+            auto constants = artifact.registrationModule ? std::vector<PipelineSpecializationConstant>{} : plan->bindings.specialization;
             constants.push_back({PipelineSpecialization::MeshLayerBase, 0u});
             constants.push_back({PipelineSpecialization::MeshLayerCount, 0xffffffffu});
             std::size_t index = 0;
@@ -1637,7 +1637,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            return artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            return artifact.registrationModule ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, vertexClasses, constants, request.target);
         };
         SharedSpirv built;
         const auto prepare = [&] {
@@ -1697,17 +1697,29 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.pushConstants.resize(result.pushConstants.size() + sizeof(std::uint32_t));
     }
     const auto& layout = variant.bindings.layout;
-    if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
-        const auto first = layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors;
-        if (layout.runtimeStateDwords > runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
+    const auto writeShaderData = [&](std::uint32_t first, std::span<const std::uint32_t> words, const char* what) {
         if (layout.UsesPushData()) {
-            if ((first + layout.runtimeStateDwords) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error("vertex selector state lies outside the push data");
-            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), runtimeSelectors.data(), layout.runtimeStateDwords * sizeof(std::uint32_t));
+            if ((first + words.size()) * sizeof(std::uint32_t) > result.pushConstants.size()) throw std::runtime_error(std::string(what) + " lies outside the push data");
+            std::memcpy(result.pushConstants.data() + first * sizeof(std::uint32_t), words.data(), words.size_bytes());
         } else {
             const auto data = std::ranges::find_if(result.bindings, [](const DescriptorBinding& binding) { return binding.role == DescriptorRole::ShaderData; });
-            if (data == result.bindings.end() || first + layout.runtimeStateDwords > data->guestDescriptor.size()) throw std::runtime_error("vertex selector state lies outside the shader data");
-            std::copy_n(runtimeSelectors.begin(), layout.runtimeStateDwords, data->guestDescriptor.begin() + first);
+            if (data == result.bindings.end() || first + words.size() > data->guestDescriptor.size()) throw std::runtime_error(std::string(what) + " lies outside the shader data");
+            std::ranges::copy(words, data->guestDescriptor.begin() + first);
         }
+    };
+    if (artifact.registrationModule && request.shader.stage != ShaderStage::Fragment && layout.runtimeStateDwords != 0u) {
+        if (layout.runtimeStateDwords > runtimeSelectors.size()) throw std::runtime_error("vertex selector state exceeds its capacity");
+        writeShaderData(layout.RuntimeStateDword() + RuntimeAbi::StateVertexSelectors, std::span<const std::uint32_t>(runtimeSelectors.data(), layout.runtimeStateDwords), "vertex selector state");
+    }
+    if (artifact.registrationModule && !layout.runtimeSpecializationIds.empty()) {
+        std::vector<std::uint32_t> table(layout.runtimeSpecializationIds.size());
+        for (std::size_t slot = 0; slot < table.size(); ++slot) {
+            const auto id = layout.runtimeSpecializationIds[slot];
+            const auto found = std::ranges::find(plan->bindings.specialization, id, &PipelineSpecializationConstant::id);
+            if (found == plan->bindings.specialization.end()) throw std::runtime_error("the binding plan has no value for runtime specialization " + std::to_string(id));
+            table[slot] = found->value;
+        }
+        writeShaderData(layout.RuntimeSpecializationDword(), table, "runtime specialization table");
     }
     result.shaderDataUserWords = std::move(bindings.shaderDataUserWords);
     result.poisonedSrtReads = static_cast<std::uint32_t>(snapshot.srtPoison.size()) + snapshot.nullRootReads;
