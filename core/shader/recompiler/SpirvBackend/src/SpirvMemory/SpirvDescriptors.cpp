@@ -55,7 +55,7 @@ std::uint32_t DescriptorElementPointer(SpirvEmitterState& state, std::uint32_t r
 }
 
 std::uint32_t DescriptorSpecialization(SpirvEmitterState& state, std::uint32_t id) {
-    if (!state.registrationModules) return state.module.SpecializationConstant(TypeU32(state), id, 0u);
+    if (!state.registrationModules) return state.module.SpecializationConstant(TypeU32(state), id, PipelineSpecialization::DefaultValue);
     const auto& layout = state.program.Metadata().bindings;
     const auto found = std::ranges::find(layout.runtimeSpecializationIds, id);
     if (found == layout.runtimeSpecializationIds.end()) FailEmit("a registration module reads descriptor-derived value " + std::to_string(id) + ", which its runtime specialization table does not hold");

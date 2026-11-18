@@ -1716,8 +1716,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         for (std::size_t slot = 0; slot < table.size(); ++slot) {
             const auto id = layout.runtimeSpecializationIds[slot];
             const auto found = std::ranges::find(plan->bindings.specialization, id, &PipelineSpecializationConstant::id);
-            if (found == plan->bindings.specialization.end()) throw std::runtime_error("the binding plan has no value for runtime specialization " + std::to_string(id));
-            table[slot] = found->value;
+            table[slot] = found == plan->bindings.specialization.end() ? PipelineSpecialization::DefaultValue : found->value;
         }
         writeShaderData(layout.RuntimeSpecializationDword(), table, "runtime specialization table");
     }
