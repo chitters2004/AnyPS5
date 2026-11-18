@@ -79,6 +79,8 @@ const std::span<std::byte, PlaneBytes> DepthStorage{reinterpret_cast<std::byte*>
 alignas(4096) std::array<std::uint8_t, 4096> Keys{};
 alignas(4096) std::array<std::uint8_t, 4096> Cmask{};
 alignas(4096) std::array<std::uint32_t, HtileBytes / 4u> Htile{};
+alignas(4096) std::array<std::uint8_t, 4096> MultisampleCmask{};
+alignas(4096) std::array<std::uint8_t, 16384> MultisampleFmask{};
 
 alignas(4096) std::array<std::byte, 3 * PlaneBytes> OuterBlock{};
 const std::span<std::byte, 2 * PlaneBytes> OuterStorage{reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(OuterBlock.data()) + PlaneBytes - 1u) & ~std::uintptr_t{PlaneBytes - 1u}), 2 * PlaneBytes};
@@ -621,16 +623,9 @@ void resolveBetween(AgcDriver::VulkanDevice& device) {
     const MemoEvents repeated;
     draw(device, multisampled, {.scissor = Whole});
     const auto counted = memoServes() && memoCounted() ? 1u : 0u;
-    requireMemoEvent(repeated, TargetMemoEvent::InvalidMultisampled, counted, "a repeated multisampled draw");
-    requireMemoEvent(repeated, TargetMemoEvent::InvalidUncached, 0u, "a repeated multisampled draw");
-    if (counted != 0u) {
-        const auto before = TargetRefusalSumsForTest();
-        draw(device, multisampled, {.scissor = Whole});
-        const auto after = TargetRefusalSumsForTest();
-        Require(after.multisampledBuilds == before.multisampledBuilds + 1u && after.fourSamples == before.fourSamples + 1u, "a refused multisampled build was not counted under four samples");
-        Require(after.multisampledRepeats == before.multisampledRepeats + 1u, "a multisampled build with the previous one's targets was not counted as a repeat");
-        std::cout << "multisampled refusals: counted by samples and repeats\n";
-    }
+    requireMemoEvent(repeated, TargetMemoEvent::InvalidMultisampled, 0u, "a repeated multisampled draw");
+    requireMemoEvent(repeated, TargetMemoEvent::MultisampleHit, counted, "a repeated multisampled draw");
+    requireMemoEvent(repeated, TargetMemoEvent::Accept, counted, "a repeated multisampled draw");
     {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.WaitIdle();
@@ -1053,7 +1048,7 @@ void colorMemoWithMsaaDepth(AgcDriver::VulkanDevice& device) {
     draw(device, color, {.depth = depth, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
     Require(!LookupOutcomes::Profiled() || (lookups() != before) == memoResolves(), "unchanged colors were not reused while MSAA depth took its full path");
     const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    Require(RepeatDepthSurfaceView(context, depth, false, false) == VK_NULL_HANDLE, "MSAA depth acquired a repeat certificate");
+    Require(RepeatDepthSurfaceView(context, depth, false, false) != VK_NULL_HANDLE, "the MSAA depth drawn last took no repeat certificate");
 }
 
 void colorMemoProofBreak(AgcDriver::VulkanDevice& device) {
@@ -1722,7 +1717,7 @@ void causeSplit(AgcDriver::VulkanDevice& device) {
     msaa.samples = 4;
     msaa.htileAddress = 0;
     arm(device, color, {.depth = msaa, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true});
-    requireCause(device, color, {.depth = msaa, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, TargetMemoEvent::DepthMemoInvalid, TargetPrepOutcome::HitDepthMiss, "an MSAA depth target");
+    requireCause(device, color, {.depth = msaa, .compare = VK_COMPARE_OP_ALWAYS, .prepareOnly = true}, TargetMemoEvent::MultisampleDepthHit, TargetPrepOutcome::Hit, "an MSAA depth target");
     auto aliased = colorTarget(true);
     auto* metadata = allocateWatched(PlaneBytes);
     std::memset(metadata, 0xff, PlaneBytes);
@@ -1736,7 +1731,100 @@ void causeSplit(AgcDriver::VulkanDevice& device) {
     std::cout << "cause split: invalid and depth fallback causes counted apart\n";
 }
 
-const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 19> R3Scenarios{{
+std::uint32_t fewestSamples(AgcDriver::VulkanDevice& device) {
+    const auto counts = AgcDriver::VulkanDeviceTestAccess::ContextOf(device).limits.framebufferColorSampleCounts;
+    return (counts & VK_SAMPLE_COUNT_2_BIT) != 0 ? 2u : 4u;
+}
+
+ColorTarget fastClearedTarget(std::uint32_t samples) {
+    auto multisampled = colorTarget();
+    multisampled.address = address(MultisampleStorage.data());
+    multisampled.surfaceAddress = multisampled.address;
+    multisampled.samples = samples;
+    multisampled.coverageSamples = samples;
+    multisampled.cmaskAddress = address(MultisampleCmask.data());
+    multisampled.cmaskBytes = CmaskLayout(Width, Height).Bytes();
+    multisampled.cmaskFastClear = true;
+    multisampled.fmaskAddress = address(MultisampleFmask.data());
+    return multisampled;
+}
+
+void resolveInto(AgcDriver::VulkanDevice& device, const ColorTarget& multisampled, const ColorTarget& color) {
+    ColorMetadataPass pass{};
+    pass.mode = ColorMetadataPass::Mode::Resolve;
+    pass.source = multisampled;
+    pass.targets = {color};
+    device.ColorMetadataPass(pass);
+}
+
+void expectResolved(AgcDriver::VulkanDevice& device, const ColorTarget& color, std::uint32_t edge, std::uint32_t before, std::uint32_t after, const std::string& what) {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    StorageTexture::FlushPending(color.address, color.bytes, nullptr, "test");
+    device.WaitIdle();
+    const ColorTargetLayout layout(Width, Height, color.tileMode, 4);
+    for (std::uint32_t y = 0; y < Height; ++y) {
+        for (std::uint32_t x = 0; x < Width; ++x) {
+            if (x + 1u == edge) continue;
+            std::uint32_t stored = 0;
+            std::memcpy(&stored, SurfaceStorage.data() + layout.Offset(x, y), 4);
+            Require(stored == (x < edge ? before : after), what + ": texel (" + std::to_string(x) + ", " + std::to_string(y) + ") holds " + std::to_string(stored));
+        }
+    }
+}
+
+void multisampleFastClear(AgcDriver::VulkanDevice& device) {
+    const auto color = colorTarget();
+    reset(device, color);
+    const auto samples = fewestSamples(device);
+    std::cout << "fast-cleared target with " << samples << " samples\n";
+    const auto multisampled = fastClearedTarget(samples);
+    AgcDriver::GuestMemory::Write(multisampled.cmaskAddress, std::vector<std::byte>(MultisampleCmask.size(), std::byte{0xcc}));
+    AgcDriver::GuestMemory::Write(multisampled.fmaskAddress, std::vector<std::byte>(MultisampleFmask.size(), std::byte{0x10}));
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Htile.fill(0xffffffffu);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    auto depth = depthTarget(false);
+    depth.samples = samples;
+    const auto served = memoServes() && memoCounted() ? 1u : 0u;
+    const DrawOptions whole{.scissor = Whole, .depth = depth, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS};
+    for (int repeat = 0; repeat < 3; ++repeat) draw(device, multisampled, whole);
+    const MemoEvents repeated;
+    draw(device, multisampled, whole);
+    requireMemoEvent(repeated, TargetMemoEvent::MultisampleHit, served, "a repeated multisampled draw");
+    requireMemoEvent(repeated, TargetMemoEvent::MultisampleDepthHit, served, "a repeated multisampled draw");
+    const MemoEvents cleared;
+    const ProofFields before;
+    NoteColorMetadataFill(multisampled.cmaskAddress, static_cast<std::size_t>(multisampled.cmaskBytes), 0u);
+    Require(moved(before).empty(), "a CMASK fast clear noted without a store moved [" + moved(before) + "]");
+    draw(device, multisampled, {.scissor = Right, .depth = depth, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS});
+    requireMemoEvent(cleared, TargetMemoEvent::MultisampleHit, served, "a draw after a CMASK fast clear of a multisampled target");
+    requireMemoEvent(cleared, TargetMemoEvent::Accept, served, "a draw after a CMASK fast clear of a multisampled target");
+    const MemoEvents depthCleared;
+    NoteDepthMetadataFill(depth.htileAddress, HtileBytes, 0u);
+    draw(device, multisampled, {.scissor = Right, .depth = depth, .depthWrite = true, .compare = VK_COMPARE_OP_ALWAYS});
+    requireMemoEvent(depthCleared, TargetMemoEvent::MultisampleDepthHit, 0u, "a draw after an HTILE clear of a multisampled depth target");
+    std::cout << "multisampled depth: repeated, and refused after an HTILE clear (" << depthCleared.Text() << ")\n";
+    resolveInto(device, multisampled, color);
+    expectResolved(device, color, Width - LeftWidth, Clear, Drawn, "a multisampled fast clear between memo hits");
+    std::cout << "multisampled fast clear: applied on a target memo hit\n";
+    for (int repeat = 0; repeat < 3; ++repeat) draw(device, multisampled, whole);
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.WaitIdle();
+        ClearMultisampleTargets(AgcDriver::VulkanDeviceTestAccess::ContextOf(device).device);
+    }
+    const MemoEvents retired;
+    draw(device, multisampled, {.scissor = Left});
+    requireMemoEvent(retired, TargetMemoEvent::Hit, 0u, "a draw after its multisampled target retired");
+    std::cout << "retired multisampled target: " << retired.Text() << '\n';
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.WaitIdle();
+        ClearMultisampleTargets(AgcDriver::VulkanDeviceTestAccess::ContextOf(device).device);
+    }
+}
+
+const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 20> R3Scenarios{{
     {"pending-split", pendingSplit},
     {"cause-split", causeSplit},
     {"memo-order", memoOrder},
@@ -1753,6 +1841,7 @@ const std::array<std::pair<const char*, void (*)(AgcDriver::VulkanDevice&)>, 19>
     {"fallback", depthFallbackInvalidatesColor},
     {"descriptor", colorMemoDepthDescriptorChange},
     {"msaa", colorMemoWithMsaaDepth},
+    {"msaa-clear", multisampleFastClear},
     {"proof", colorMemoProofBreak},
     {"metadata", colorMetadataDepthAlias},
     {"eviction", colorMemoResidentEviction}
@@ -1824,6 +1913,8 @@ int main(int argc, char** argv) {
             mutation.Add(OuterStorage.data(), OuterStorage.size(), true, true, true);
             mutation.Add(MultisampleStorage.data(), MultisampleStorage.size(), true, true, true);
             mutation.Add(StencilStorage.data(), StencilStorage.size(), true, true, true);
+            mutation.Add(MultisampleCmask.data(), MultisampleCmask.size(), true, true, true);
+            mutation.Add(MultisampleFmask.data(), MultisampleFmask.size(), true, true, true);
         }
         AgcDriver::GuestMemory::MarkProofThread();
         AgcDriver::GuestMemory::BumpCollectEpoch();
@@ -1855,6 +1946,8 @@ int main(int argc, char** argv) {
             mutation.Remove(OuterStorage.data());
             mutation.Remove(MultisampleStorage.data());
             mutation.Remove(StencilStorage.data());
+            mutation.Remove(MultisampleCmask.data());
+            mutation.Remove(MultisampleFmask.data());
         }
         std::cout << "target state memo tests passed\n";
         return 0;

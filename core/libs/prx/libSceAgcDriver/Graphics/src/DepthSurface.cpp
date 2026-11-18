@@ -3934,12 +3934,38 @@ float HostDepthBiasConstant(const Context& context, VkFormat format, float const
     return constant * 256.0f;
 }
 
+std::array<std::pair<std::uint64_t, std::uint64_t>, 3> depthPlanes(const DepthTarget& target) {
+    const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
+    return {{{target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)}, {target.stencilAddress, target.stencilAddress != 0u ? planeBytes(1u) : 0u}, {target.htileAddress, target.htileAddress != 0u ? HtileMetadataBytes(target.extent) : 0u}}};
+}
+
+void claimDepthPlanes(const DepthTarget& target) {
+    for (const auto& [address, bytes] : depthPlanes(target)) {
+        if (bytes != 0u) ClaimMultisampleTargetMemory(address, bytes);
+    }
+}
+
+bool multisampleColorOverPlanes(const DepthTarget& target) {
+    return std::ranges::any_of(depthPlanes(target), [](const auto& plane) { return plane.second != 0u && MultisampleColorTargetOverlaps(plane.first, plane.second); });
+}
+
 VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilWritten) {
     if (target.depthPartiallyResident || target.stencilPartiallyResident) return VK_NULL_HANDLE;
+    const bool multisampled = target.samples != 1u;
+    if (multisampled) {
+        if (multisampleColorOverPlanes(target)) return VK_NULL_HANDLE;
+        claimDepthPlanes(target);
+    }
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (multisampled) settlePendingHtileClear(context, target.address);
     std::lock_guard lock(surfacesMutex());
     auto* surface = drawnDepth;
-    if (surface == nullptr || target.samples != 1u || surface->retired || surface->syncing || surface->pendingClear != 0u || surface->context.device != context.device || !surface->active->load(std::memory_order_acquire) || !sameSurface(surface->target, target)) return VK_NULL_HANDLE;
+    if (surface == nullptr || surface->retired || surface->syncing || surface->pendingClear != 0u || surface->context.device != context.device || !surface->active->load(std::memory_order_acquire) || !sameSurface(surface->target, target)) return VK_NULL_HANDLE;
+    if (multisampled) {
+        if (findClearedHtile(target) != clearedHtiles().end() || !ownsPlane(*surface) || surface->sampling.overwriteStencil || surface->sampling.unprovenStencil) return VK_NULL_HANDLE;
+        if (surface->samplingActive) surface->CheckCurrent();
+        surface->NoteMemory();
+    }
     surface->written = ++depthWrites;
     if (depthWritten && mirrorable(target)) {
         surface->NoteDepthWork();
@@ -4035,9 +4061,7 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
     if (target.stencilPartiallyResident) Require(resident(target.stencilAddress, planeBytes(1u)), "partially resident stencil (DB_STENCIL_INFO) with pages that are not mapped is unsupported");
-    ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
-    if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
-    if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
+    claimDepthPlanes(target);
     const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);

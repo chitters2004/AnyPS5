@@ -1317,51 +1317,55 @@ bool holdHostOnly(const MultisampleTarget& target) {
     return true;
 }
 
+MultisampleTarget* reuse(const Context& context, const std::shared_ptr<MultisampleTarget>& target, const ColorTarget& requested) {
+    auto use = requested;
+    use.format = target->target.format;
+    if (recreated(target->target, use)) {
+        {
+            std::unique_lock lock(guardedMutex());
+            if (!target->active->load(std::memory_order_acquire)) return nullptr;
+            std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active; });
+            anyGuarded().store(!guarded().empty(), std::memory_order_release);
+        }
+        target->Recreate(use);
+        target->use->hostOnly.store(true, std::memory_order_release);
+        guard(context, use, target->active, target->metadataValid, target->use);
+        target->ApplyFastClear(use);
+        return target.get();
+    }
+    {
+        std::unique_lock lock(guardedMutex());
+        if (!target->active->load(std::memory_order_acquire)) return nullptr;
+        target->use->hostOnly.store(true, std::memory_order_release);
+        if (use.eqaaFragments != 0 && use.fmaskAddress != target->target.fmaskAddress) {
+            std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active && range.plane == fmaskPlane; });
+            guarded().push_back({context.device, use.fmaskAddress, fmaskBytes(use), use.samples, target->active, nullptr, target->use, false, fmaskPlane});
+            guardedGeneration().fetch_add(1, std::memory_order_release);
+            moveGuardSpans();
+            target->target.fmaskAddress = use.fmaskAddress;
+            target->target.fmaskPipeBankXor = use.fmaskPipeBankXor;
+            target->target.gcnFmaskBytes = use.gcnFmaskBytes;
+        }
+    }
+    if (target->fromTexture && use.cmaskAddress != 0) {
+        target->fromTexture = false;
+        target->cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
+    }
+    target->cmask.CheckAddress(use.cmaskAddress);
+    target->Keep();
+    target->SettleStorageWrites();
+    target->ApplyFastClear(use);
+    collectFmaskWrites(target->target);
+    stampUse(*target->use, target->target.address, guardedColorBytes(target->target));
+    return target.get();
+}
+
 MultisampleTarget& acquire(const Context& context, const ColorTarget& requested, std::optional<VkClearColorValue> initialClear = std::nullopt, std::shared_ptr<Buffer> initialUpload = {}, std::vector<std::byte> initialBaseline = {}) {
     discardRetiredTargets();
     for (const auto& target : targets()) {
         if (!target->active->load(std::memory_order_acquire)) continue;
         if (target->context.device != context.device || !target->Serves(requested)) continue;
-        auto use = requested;
-        use.format = target->target.format;
-        if (recreated(target->target, use)) {
-            {
-                std::unique_lock lock(guardedMutex());
-                if (!target->active->load(std::memory_order_acquire)) continue;
-                std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active; });
-                anyGuarded().store(!guarded().empty(), std::memory_order_release);
-            }
-            target->Recreate(use);
-            target->use->hostOnly.store(true, std::memory_order_release);
-            guard(context, use, target->active, target->metadataValid, target->use);
-            target->ApplyFastClear(use);
-            return *target;
-        }
-        {
-            std::unique_lock lock(guardedMutex());
-            if (!target->active->load(std::memory_order_acquire)) continue;
-            target->use->hostOnly.store(true, std::memory_order_release);
-            if (use.eqaaFragments != 0 && use.fmaskAddress != target->target.fmaskAddress) {
-                std::erase_if(guarded(), [&](const auto& range) { return range.active == target->active && range.plane == fmaskPlane; });
-                guarded().push_back({context.device, use.fmaskAddress, fmaskBytes(use), use.samples, target->active, nullptr, target->use, false, fmaskPlane});
-                guardedGeneration().fetch_add(1, std::memory_order_release);
-                moveGuardSpans();
-                target->target.fmaskAddress = use.fmaskAddress;
-                target->target.fmaskPipeBankXor = use.fmaskPipeBankXor;
-                target->target.gcnFmaskBytes = use.gcnFmaskBytes;
-            }
-        }
-        if (target->fromTexture && use.cmaskAddress != 0) {
-            target->fromTexture = false;
-            target->cmask = MultisampledCmask(use.cmaskAddress, use.cmaskBytes);
-        }
-        target->cmask.CheckAddress(use.cmaskAddress);
-        target->Keep();
-        target->SettleStorageWrites();
-        target->ApplyFastClear(use);
-        collectFmaskWrites(target->target);
-        stampUse(*target->use, target->target.address, guardedColorBytes(target->target));
-        return *target;
+        if (auto* reused = reuse(context, target, requested)) return *reused;
     }
     const auto& use = requested;
     auto target = std::make_shared<MultisampleTarget>(context, use, false, initialClear, std::move(initialUpload), std::move(initialBaseline));
@@ -1764,6 +1768,19 @@ VkImageView MultisampleTargetView(const Context& context, const ColorTarget& tar
     owner = acquired.shared_from_this();
     if (image != nullptr) *image = acquired.image;
     return acquired.View(target.format);
+}
+
+VkImageView RepeatMultisampleTargetView(const Context& context, const ColorTarget& target, const std::shared_ptr<void>& owner, VkImage* image) {
+    if (target.staged) return VK_NULL_HANDLE;
+    TargetsLock lock;
+    const auto held = std::static_pointer_cast<MultisampleTarget>(owner);
+    if (!held->active->load(std::memory_order_acquire) || held->context.device != context.device || !held->Serves(target)) return VK_NULL_HANDLE;
+    auto* reused = reuse(context, held, target);
+    if (reused == nullptr) return VK_NULL_HANDLE;
+    reused->drawn = true;
+    ++reused->contents;
+    if (image != nullptr) *image = reused->image;
+    return reused->View(target.format);
 }
 
 void KeepMultisampleTarget_nid_no_patch(const std::shared_ptr<void>& owner) {

@@ -3598,6 +3598,7 @@ struct ColorMemo {
         std::weak_ptr<StorageTexture> resident;
         bool proxied = false;
         VkImageView view = VK_NULL_HANDLE;
+        std::weak_ptr<void> multisample;
     };
     bool valid = false;
     TargetProof proof;
@@ -3639,7 +3640,8 @@ constexpr std::array<const char*, static_cast<std::size_t>(TargetMemoEvent::Coun
     "post-depth invalidated", "depth fallback", "admission", "recipe invalidated", "build", "verify checked",
     "pending own recording", "pending other",
     "invalid: never built", "invalid: thread changed", "invalid: memo off", "invalid: admission", "invalid: failed draw", "invalid: recipe", "invalid: epoch 0", "invalid: no color targets", "invalid: uncached", "invalid: multisampled", "invalid: fmask", "invalid: depth overlap", "invalid: metadata",
-    "depth fallback: memo not serving", "depth fallback: depth memo invalid", "depth fallback: owner changed", "depth fallback: proof moved", "depth fallback: no depth remembered", "depth fallback: descriptor changed", "depth fallback: view refused", "depth fallback: after colors invalidated", "depth fallback: verify"
+    "depth fallback: memo not serving", "depth fallback: depth memo invalid", "depth fallback: owner changed", "depth fallback: proof moved", "depth fallback: no depth remembered", "depth fallback: descriptor changed", "depth fallback: view refused", "depth fallback: after colors invalidated", "depth fallback: verify",
+    "multisample hit", "multisample gone", "multisample declined", "multisample depth hit"
 };
 
 constexpr std::array<const char*, static_cast<std::size_t>(TargetPrepOutcome::Count)> TargetPrepOutcomeNames{"attachment memo", "target memo not consulted", "hit", "hit with depth fallback", "miss", "depth only hit", "depth only miss"};
@@ -3732,8 +3734,6 @@ struct MultisampleRefusalCounts {
     ProfileCounter depthNone;
     ProfileCounter depthHtile;
     ProfileCounter repeats;
-    ProfileCounter depthMemoRefused;
-    ProfileCounter depthMemoRefusedWithColorsSingle;
 };
 
 MultisampleRefusalCounts& multisampleRefusals() {
@@ -3855,9 +3855,7 @@ void reportTargetMemo() {
         const auto depthNone = take(ms.depthNone);
         const auto htile = take(ms.depthHtile);
         const auto repeats = take(ms.repeats);
-        const auto depthRefused = take(ms.depthMemoRefused);
-        const auto depthRefusedSingle = take(ms.depthMemoRefusedWithColorsSingle);
-        AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) builds refused as multisampled %llu: color samples 2 %llu, 4 %llu, 8 or more %llu; staged %llu; fmask %llu, cmask %llu (fast clear %llu), dcc %llu; several color targets %llu (with a single-sampled one %llu); depth multisampled %llu (htile %llu), single-sampled %llu, none %llu; same color targets and depth as the previous refused build %llu; depth memo refused for multisampled depth %llu (with no multisampled color target %llu)\n", builds, s2, s4, s8, staged, fmask, cmask, fastClear, dcc, several, mixed, depthMs, htile, depthSingle, depthNone, repeats, depthRefused, depthRefusedSingle);
+        AgcDriver::ProfilePrint_nid_no_patch("[target-memo] (10 s) builds refused as multisampled (staged) %llu: color samples 2 %llu, 4 %llu, 8 or more %llu; staged %llu; fmask %llu, cmask %llu (fast clear %llu), dcc %llu; several color targets %llu (with a single-sampled one %llu); depth multisampled %llu (htile %llu), single-sampled %llu, none %llu; same color targets and depth as the previous refused build %llu\n", builds, s2, s4, s8, staged, fmask, cmask, fastClear, dcc, several, mixed, depthMs, htile, depthSingle, depthNone, repeats);
         auto& nc = noColorsCounts();
         const auto depthOnly = take(nc.depthOnlyBuilds);
         const auto runs = take(nc.depthOnlyRuns);
@@ -3926,6 +3924,15 @@ bool colorOverlapsDepth(const State& state, const TargetBinding& binding) {
         (color.dccAddress != 0 && DepthTargetOverlaps(*state.depth, color.dccAddress, std::max<std::size_t>(colorKeyCount(color, color.bytes), 1u))) ||
         (color.chainDccAddress != 0 && DepthTargetOverlaps(*state.depth, color.chainDccAddress, std::max<std::size_t>(colorKeyCount(color, color.bytes), 1u))) ||
         (color.cmaskAddress != 0 && DepthTargetOverlaps(*state.depth, color.cmaskAddress, color.cmaskBytes));
+}
+
+bool multisampleOverlapsDepth(const State& state, const ColorTarget& color) {
+    if (!state.depth) return false;
+    const auto bytes = std::max<std::uint64_t>(color.bytes, 1u) * std::max(color.samples, 1u);
+    return DepthTargetOverlaps(*state.depth, color.address, bytes) ||
+        (color.fmaskAddress != 0 && DepthTargetOverlaps(*state.depth, color.fmaskAddress, std::max<std::uint64_t>(color.gcnFmaskBytes, 1u))) ||
+        (color.cmaskAddress != 0 && DepthTargetOverlaps(*state.depth, color.cmaskAddress, color.cmaskBytes)) ||
+        (color.dccAddress != 0 && DepthTargetOverlaps(*state.depth, color.dccAddress, std::max<std::size_t>(colorKeyCount(color, color.bytes), 1u)));
 }
 
 bool metadataProved(const ColorTarget& color) {
@@ -4061,7 +4068,10 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
     auto& depth = ThreadTargetMemo().depth;
     const bool enabled = TargetMemoEnabled() && proof.epoch != 0;
     const auto ineligible = [&](const TargetBinding& binding) {
-        if (binding.multisampled) return TargetMemoEvent::InvalidMultisampled;
+        if (binding.multisampled) {
+            if (binding.color.staged || binding.multisampleOwner == nullptr) return TargetMemoEvent::InvalidMultisampled;
+            return multisampleOverlapsDepth(state, binding.color) ? TargetMemoEvent::InvalidDepthOverlap : TargetMemoEvent::Count;
+        }
         if (binding.resident == nullptr || !binding.resident->Cached()) return TargetMemoEvent::InvalidUncached;
         if (binding.color.fmaskAddress != 0) return TargetMemoEvent::InvalidFmask;
         if (colorOverlapsDepth(state, binding)) return TargetMemoEvent::InvalidDepthOverlap;
@@ -4090,14 +4100,10 @@ void rememberTargets(const State& state, std::span<const TargetBinding> targets,
         colors.clearOfDepth = depthFootprint(state.depth);
         colors.descriptors.assign(state.colors.begin(), state.colors.end());
         colors.attachments.resize(targets.size());
-        for (std::size_t index = 0; index < targets.size(); ++index) colors.attachments[index] = {targets[index].resident, targets[index].proxied, views[index]};
+        for (std::size_t index = 0; index < targets.size(); ++index) colors.attachments[index] = {targets[index].resident, targets[index].proxied, views[index], targets[index].multisampleOwner};
     }
-    depth.valid = enabled && (!state.depth || state.depth->samples == 1u);
+    depth.valid = enabled;
     if (targetMemoProfiled) {
-        if (enabled && state.depth && state.depth->samples > 1u) {
-            multisampleRefusals().depthMemoRefused.Add();
-            if (std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.multisampled; })) multisampleRefusals().depthMemoRefusedWithColorsSingle.Add();
-        }
         noteColorBuild(state, colors.valid);
         if (colors.valid) memoOwnBreaks = GuestMemory::OwnProofBreaks();
     }
@@ -4126,8 +4132,23 @@ bool repeatColors(const Context& context, const State& state, const TargetProof&
     }
     const auto footprint = depthFootprint(state.depth);
     const bool overlapKnown = footprint == memo.clearOfDepth && !RuntimeSwitches::Set(RuntimeSwitch::NoTargetMemoOverlapCache);
+    bool multisampled = false;
+    const auto firstView = views.size();
     for (std::size_t index = 0; index < targets.size(); ++index) {
         auto& binding = targets[index];
+        if (state.colors[index].samples > 1u) {
+            binding.color = state.colors[index];
+            binding.gpuTiling = binding.color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
+            binding.multisampled = true;
+            binding.multisampleOwner = memo.attachments[index].multisample.lock();
+            if (binding.multisampleOwner == nullptr) {
+                noteTargetMemo(TargetMemoEvent::MultisampleGone);
+                return false;
+            }
+            multisampled = true;
+            views.push_back(VK_NULL_HANDLE);
+            continue;
+        }
         binding.resident = memo.attachments[index].resident.lock();
         if (binding.resident == nullptr || !binding.resident->Cached()) {
             noteTargetMemo(binding.resident == nullptr ? TargetMemoEvent::ResidentGone : TargetMemoEvent::ResidentEvicted);
@@ -4142,6 +4163,17 @@ bool repeatColors(const Context& context, const State& state, const TargetProof&
         binding.gpuTiling = binding.color.tileMode == ColorTileMode::RenderTarget && context.detiler != nullptr;
         binding.proxied = memo.attachments[index].proxied;
         views.push_back(memo.attachments[index].view);
+    }
+    for (std::size_t index = 0; multisampled && index < targets.size(); ++index) {
+        auto& binding = targets[index];
+        if (!binding.multisampled) continue;
+        auto& view = views[firstView + index];
+        view = RepeatMultisampleTargetView(context, binding.color, binding.multisampleOwner, &binding.multisampleImage);
+        if (view == VK_NULL_HANDLE) {
+            noteTargetMemo(TargetMemoEvent::MultisampleDeclined);
+            return false;
+        }
+        noteTargetMemo(TargetMemoEvent::MultisampleHit);
     }
     noteTargetMemo(TargetMemoEvent::Hit);
     noteTargetMemo(overlapKnown ? TargetMemoEvent::OverlapCached : TargetMemoEvent::OverlapComputed);
@@ -4163,12 +4195,15 @@ TargetMemoEvent depthFallbackCause(const Context& context, const State& state, c
 VkImageView repeatDepth(const Context& context, const State& state, const TargetProof* proof) {
     const auto& memo = ThreadTargetMemo().depth;
     if (!state.depth || !memo.valid || !TargetMemoEnabled() || targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || memo.proof != (proof != nullptr ? *proof : currentTargetProof(context)) || !memo.descriptor) return VK_NULL_HANDLE;
-    if (*memo.descriptor != *state.depth) return VK_NULL_HANDLE;
-    return RepeatDepthSurfaceView(context, *state.depth, state.depthWrite, writesStencilTarget(state));
+    if (*memo.descriptor != *state.depth || (state.depth->samples != 1u && overwrittenStencil(state))) return VK_NULL_HANDLE;
+    const auto view = RepeatDepthSurfaceView(context, *state.depth, state.depthWrite, writesStencilTarget(state));
+    if (view != VK_NULL_HANDLE && state.depth->samples != 1u) noteTargetMemo(TargetMemoEvent::MultisampleDepthHit);
+    return view;
 }
 
 const char* targetObligation(const Context& context, const State& state, std::span<const TargetBinding> targets, bool repeatedDepth) {
     for (const auto& binding : targets) {
+        if (binding.multisampled) continue;
         const auto& color = binding.color;
         const auto layers = color.arrayLastSlice != 0 ? color.layers : 0u;
         if (const auto* owed = binding.resident->RefreshObligation(layers != 0 ? color.arraySlice : 0u, layers)) return owed;
@@ -4408,7 +4443,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     bool repeatedDepth = state.depth && depthView != VK_NULL_HANDLE;
     if (repeatedDepth) noteTargetMemo(TargetMemoEvent::DepthHit);
     if (state.depth && !repeatedDepth && !prepared.attachmentsFromMemo) depthView = prepareDepth(targetMemoProfiled ? depthFallbackCause(context, state, repeatedColors ? &targetProof : nullptr, memoServes) : TargetMemoEvent::DepthFallback);
-    if (repeatedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !colorProofMatches(targetProof, currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.resident->Cached(); }))) {
+    if (repeatedColors && (targetMemoOwner.load(std::memory_order_relaxed) != &ThreadTargetMemo() || !colorProofMatches(targetProof, currentTargetProof(context)) || !std::ranges::all_of(targets, [](const TargetBinding& binding) { return binding.multisampled || binding.resident->Cached(); }))) {
         noteTargetMemo(TargetMemoEvent::PostDepthInvalidated);
         repeatedColors = false;
         admissionProof = currentTargetProof(context);
@@ -4418,6 +4453,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     }
     if (repeatedColors) {
         for (const auto& binding : targets) {
+            if (binding.multisampled) continue;
             binding.resident->NoteProved();
             binding.resident->NoteUsed();
         }
@@ -4452,8 +4488,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         const bool retainedOwner = ownsTargetMemo(ThreadTargetMemo());
         const auto preparedProof = currentTargetProof(context);
         const bool unchangedDepth = (ThreadTargetMemo().depth.valid && ThreadTargetMemo().depth.proof == preparedProof &&
-            (repeatedDepth || (!state.depth && !ThreadTargetMemo().depth.descriptor))) ||
-            (state.depth && state.depth->samples != 1u && !ThreadTargetMemo().depth.valid);
+            (repeatedDepth || (!state.depth && !ThreadTargetMemo().depth.descriptor)));
         const bool unchanged = retainedOwner && repeatedColors && ThreadTargetMemo().colors.valid &&
             ThreadTargetMemo().colors.proof == preparedProof && unchangedDepth;
         if (admissionProof == preparedProof) {

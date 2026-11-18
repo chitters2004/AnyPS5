@@ -207,7 +207,8 @@ enum class TargetMemoEvent : std::uint8_t {
     Epoch, Proofs, Pending, Unwatch, Allocations, Surfaces, Released, Claims, Recorder, Device,
     PostDepthInvalidated, DepthFallback, Admission, RecipeInvalidated, Build, VerifyChecked, PendingOwnRecording, PendingOther,
     InvalidNever, InvalidThreadChanged, InvalidOff, InvalidAdmission, InvalidFailed, InvalidRecipe, InvalidEpoch, InvalidNoColors, InvalidUncached, InvalidMultisampled, InvalidFmask, InvalidDepthOverlap, InvalidMetadata,
-    DepthNotServed, DepthMemoInvalid, DepthOwner, DepthProof, DepthNoDescriptor, DepthDescriptor, DepthView, DepthAfterColors, DepthVerify, Count
+    DepthNotServed, DepthMemoInvalid, DepthOwner, DepthProof, DepthNoDescriptor, DepthDescriptor, DepthView, DepthAfterColors, DepthVerify,
+    MultisampleHit, MultisampleGone, MultisampleDeclined, MultisampleDepthHit, Count
 };
 std::uint64_t TargetMemoEvents(TargetMemoEvent event);
 const char* TargetMemoEventName(TargetMemoEvent event);
