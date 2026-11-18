@@ -46,6 +46,7 @@ struct DeviceLibraries {
     std::vector<VkShaderModule> modules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
+    std::array<std::map<Key, bool>, 4> prebuilt;
     PipelineLibraryCounters counters;
 };
 
@@ -190,7 +191,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         auto key = Combined(*partKeys[part], *contextKeys[part]);
         key.push_back(static_cast<std::byte>(optimize));
         auto& cache = device.parts[part];
+        const auto useByDraw = [&] {
+            if (partsOnly) return;
+            const auto origin = device.prebuilt[part].find(key);
+            if (origin == device.prebuilt[part].end() || origin->second) return;
+            origin->second = true;
+            ++device.counters.prebuiltUsedByDraw[part];
+        };
         if (const auto found = cache.find(key); found != cache.end()) {
+            useByDraw();
             libraries.push_back(found->second);
             continue;
         }
@@ -244,10 +253,13 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);
+            useByDraw();
             libraries.push_back(raced->second);
             continue;
         }
         cache.emplace(key, handle);
+        if (partsOnly) device.prebuilt[part].emplace(key, false);
+        ++(partsOnly ? device.counters.builtByPrebuild : device.counters.builtByDraw)[part];
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {
