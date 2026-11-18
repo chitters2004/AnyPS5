@@ -519,6 +519,12 @@ int main(int argc, char** argv) {
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
         }
+        if (std::getenv("APS5_VERIFY_PASS_ATTACHMENTS") != nullptr && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+            const auto attachments = AgcDriver::Graphics::PassAttachmentTotals();
+            Require(attachments.hits == 0, "the pass attachment memo served draws while it was verified");
+            Require(attachments.wouldHit != 0, "no verified draw would have hit the pass attachment memo");
+            Require(attachments.wouldHit == attachments.verified + attachments.differed, "verified pass attachment draws were not each counted as would-hit: " + std::to_string(attachments.wouldHit) + " would hit, " + std::to_string(attachments.verified) + " checked, " + std::to_string(attachments.differed) + " differed");
+        }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");
         std::cout << "A repeated draw reused the cached draw " << (libraries ? "with" : "without") << " graphics pipeline libraries\n";

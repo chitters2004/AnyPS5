@@ -3421,6 +3421,23 @@ AttachmentMemoSerials CurrentAttachmentMemoSerials() {
     return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), RuntimeSwitches::Set(RuntimeSwitch::NoHoldSiteBreaks) ? 0 : GuestMemory::UnwatchSerial()};
 }
 
+namespace {
+
+enum class AttachmentEvent : std::size_t { Hit, NoMemo, Pass, Serials, Targets, Images, Depth, Stored, Ineligible, Verified, Mismatch, WouldHit, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AttachmentEvent::Count)>& attachmentTotals() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AttachmentEvent::Count)> totals{};
+    return totals;
+}
+
+}
+
+PassAttachmentCounts PassAttachmentTotals() {
+    auto& totals = attachmentTotals();
+    const auto take = [&](AttachmentEvent event) { return totals[static_cast<std::size_t>(event)].load(std::memory_order_relaxed); };
+    return {take(AttachmentEvent::Hit), take(AttachmentEvent::WouldHit), take(AttachmentEvent::Verified), take(AttachmentEvent::Mismatch)};
+}
+
 bool PassAttachmentMemoEnabled() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoPassAttachmentMemo) && DrawPipelineEnabled() && ShaderResources::EpochProofs();
 }
@@ -3432,11 +3449,10 @@ bool VerifyPassAttachments() {
     return verify;
 }
 
-enum class AttachmentEvent : std::size_t { Hit, NoMemo, Pass, Serials, Targets, Images, Depth, Stored, Ineligible, Verified, Mismatch, Count };
-
 void noteAttachments(AttachmentEvent event) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!stats) return;
+    attachmentTotals()[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(AttachmentEvent::Count)> counts{};
     static std::atomic<std::int64_t> reportedAt{0};
     counts[static_cast<std::size_t>(event)].fetch_add(1, std::memory_order_relaxed);
@@ -3444,7 +3460,7 @@ void noteAttachments(AttachmentEvent event) {
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
     std::array<unsigned long long, static_cast<std::size_t>(AttachmentEvent::Count)> taken{};
     for (std::size_t index = 0; index < taken.size(); ++index) taken[index] = counts[index].exchange(0, std::memory_order_relaxed);
-    AgcDriver::ProfilePrint_nid_no_patch("[pass-attachments] 10 s: %llu hits; misses: %llu no memo, %llu pass, %llu serials, %llu targets, %llu images, %llu depth; %llu stored, %llu ineligible; verify %llu checked, %llu differed\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], taken[8], taken[9], taken[10]);
+    AgcDriver::ProfilePrint_nid_no_patch("[pass-attachments] 10 s: %llu hits; misses: %llu no memo, %llu pass, %llu serials, %llu targets, %llu images, %llu depth; %llu stored, %llu ineligible; verify %llu checked, %llu differed, %llu would have hit\n", taken[0], taken[1], taken[2], taken[3], taken[4], taken[5], taken[6], taken[7], taken[8], taken[9], taken[10], taken[11]);
 }
 
 bool memoAttachments(const Context& context, const State& state, PreparedDraw& prepared, bool fill) {
@@ -3479,7 +3495,10 @@ bool memoAttachments(const Context& context, const State& state, PreparedDraw& p
         }
         if (fill) targets[index].resident = std::move(resident);
     }
-    if (!fill) return true;
+    if (!fill) {
+        noteAttachments(AttachmentEvent::WouldHit);
+        return true;
+    }
     noteAttachments(AttachmentEvent::Hit);
     auto& targetViews = prepared.targetViews;
     for (std::size_t index = 0; index < state.colors.size(); ++index) {

@@ -191,6 +191,13 @@ struct AttachmentMemoSerials {
 
 AttachmentMemoSerials CurrentAttachmentMemoSerials();
 bool PassAttachmentMemoEnabled();
+struct PassAttachmentCounts {
+    std::uint64_t hits = 0;
+    std::uint64_t wouldHit = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t differed = 0;
+};
+PassAttachmentCounts PassAttachmentTotals();
 struct FragmentOutputLookups {
     std::uint64_t last = 0;
     std::uint64_t memo = 0;
