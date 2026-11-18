@@ -13,6 +13,8 @@ struct Submission;
 namespace AgcDriver::DriverDetail::PacketRules {
 
 bool orderedFills();
+bool registerRunOpcode(std::uint32_t opcode);
+bool registerRuns();
 bool keepsDrawFinisher(std::uint32_t header, std::uint32_t opcode);
 bool waitTakesPendingLabel(std::span<const std::uint32_t> packet);
 bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode);

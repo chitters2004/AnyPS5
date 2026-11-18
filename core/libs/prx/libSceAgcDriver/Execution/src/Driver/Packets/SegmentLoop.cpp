@@ -683,6 +683,41 @@ void Driver::runLeanPackets(Submission& submission, QueueState& queue, PacketTab
             }
         } tagReset{tagged, entry.Has(LeanPacket::Plain) && !predicated};
         const bool verifyPacket = LeanFront::Due(frontLatch, LeanFront::Item::Packet);
+        if (!Timers && !report && !predicated && !flip && !verifyPacket && !run.packetEpoch && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::KeepsFinisher) && entry.pipeline == LeanPacket::Pipeline::Keeps && PacketRules::registerRunOpcode(opcode) && PacketRules::registerRuns()) {
+            FlushInputs flushInputs;
+            if (flushDue(run.gate, flushInputs)) {
+                if (flushInputs.given && (flushInputs.pending.has_value() || flushInputs.completions)) flushInputs.now = std::chrono::steady_clock::now();
+                flushBetweenPackets(submission.queue, header, false, flushInputs.given ? &flushInputs : nullptr);
+                tagged = NoTag;
+                ++run.gate.calls;
+            } else {
+                ++run.gate.skipped;
+            }
+            if (opcode != tagged) {
+                GuestMemory::SetCurrentPacket(opcode, submission.queue);
+                tagged = opcode;
+            }
+            std::uint64_t done = 0;
+            std::size_t at = index;
+            while (true) {
+                const LeanPacket& item = table.packets[at];
+                if (done != 0 && executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(item.cursor + 1) << 8u) | item.opcode, std::memory_order_relaxed);
+                Pm4::Execute(std::span<const std::uint32_t>(commands).subspan(item.cursor, item.words), queue);
+                recent.Record(item.cursor);
+                ++done;
+                ++at;
+                nextCursor = static_cast<std::size_t>(item.cursor) + item.words;
+                if (at >= table.packets.size()) break;
+                const LeanPacket& following = table.packets[at];
+                if (following.cursor != nextCursor) break;
+                if (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= following.cursor) break;
+                if (!following.Has(LeanPacket::Plain) || !following.Has(LeanPacket::KeepsFinisher) || following.pipeline != LeanPacket::Pipeline::Keeps || !PacketRules::registerRunOpcode(following.opcode)) break;
+            }
+            next = at;
+            run.packets += done - 1;
+            packetsDone.fetch_add(done);
+            continue;
+        }
         const auto pipelineVerdict = [&] {
             switch (entry.pipeline) {
                 case LeanPacket::Pipeline::Keeps: return true;
