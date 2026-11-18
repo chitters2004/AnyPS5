@@ -1410,6 +1410,155 @@ bool InstrumentedBuild() {
 #endif
 }
 
+template<typename Pfn>
+struct EmptyEntry;
+
+template<typename... Arguments>
+struct EmptyEntry<void(VKAPI_PTR*)(Arguments...)> {
+    static void VKAPI_CALL Call(Arguments...) {}
+};
+
+struct CallCost {
+    const char* name;
+    double raw = 0;
+    double direct = 0;
+    double append = 0;
+    double replay = 0;
+};
+
+constexpr int BatchCalls = 3000;
+
+template<typename Body>
+std::pair<double, double> streamedCost(const CommandFunctions& table, int calls, Body&& body) {
+    std::chrono::nanoseconds appended{};
+    std::chrono::nanoseconds replayed{};
+    const auto target = FakeCommandBuffer(1);
+    std::uint32_t call = 0;
+    for (int done = 0; done < calls; done += BatchCalls) {
+        const auto start = std::chrono::steady_clock::now();
+        CommandStream stream(table);
+        const auto handle = stream.Handle();
+        for (int index = 0; index < BatchCalls; ++index) body(handle, call++);
+        stream.Seal();
+        const auto sealed = std::chrono::steady_clock::now();
+        AgcDriver::Graphics::Replay(stream, target, table);
+        replayed += std::chrono::steady_clock::now() - sealed;
+        appended += sealed - start;
+    }
+    return {double(appended.count()) / call, double(replayed.count()) / call};
+}
+
+template<typename Pfn, typename Invoke>
+CallCost MeasureCall(const char* name, Pfn CommandFunctions::*member, Invoke invoke, int directCalls, int streamedCalls, int rounds) {
+    CommandFunctions table{};
+    table.*member = &EmptyEntry<Pfn>::Call;
+    const CommandFunctions* volatile rawTable = &table;
+    const Pfn thunk = thunked(name, &EmptyEntry<Pfn>::Call);
+    volatile Pfn thunkSlot = thunk;
+    const auto target = FakeCommandBuffer(1);
+    std::vector<double> raw, directOver, append, replay;
+    for (int round = 0; round < rounds; ++round) {
+        const double rawNs = nanosPerCall(directCalls, [&](std::uint32_t call) { invoke(rawTable->*member, target, call); });
+        const double thunkNs = nanosPerCall(directCalls, [&](std::uint32_t call) { invoke(Pfn(thunkSlot), target, call); });
+        raw.push_back(rawNs);
+        directOver.push_back(thunkNs - rawNs);
+        const auto [appendNs, replayNs] = streamedCost(table, streamedCalls, [&](VkCommandBuffer handle, std::uint32_t call) { invoke(Pfn(thunkSlot), handle, call); });
+        append.push_back(appendNs);
+        replay.push_back(replayNs);
+    }
+    CallCost cost{name};
+    cost.raw = median(raw);
+    cost.direct = cost.raw + median(directOver);
+    cost.append = median(append);
+    cost.replay = median(replay);
+    return cost;
+}
+
+int CallCosts() {
+    constexpr int DirectCalls = 2'000'000;
+    constexpr int StreamedCalls = 200'000;
+    constexpr int Rounds = 15;
+    const auto buffer = fake<VkBuffer>(1);
+    const std::array<VkBuffer, 2> buffers{fake<VkBuffer>(1), fake<VkBuffer>(2)};
+    const std::array<VkDeviceSize, 2> offsets{0, 256};
+    const VkViewport viewport{0, 0, 1920, 1080, 0, 1};
+    const VkRect2D scissor{{0, 0}, {1920, 1080}};
+    const std::array<std::uint32_t, 2> dynamicOffsets{0, 256};
+    const auto set = fake<VkDescriptorSet>(1);
+    std::array<std::uint32_t, 16> constants{};
+    VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memory.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    memory.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    std::vector<CallCost> costs;
+    costs.push_back(MeasureCall("vkCmdBindPipeline", &CommandFunctions::CmdBindPipeline, [&](PFN_vkCmdBindPipeline f, VkCommandBuffer c, std::uint32_t i) { f(c, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipeline>(1 + (i & 7))); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdBindDescriptorSets", &CommandFunctions::CmdBindDescriptorSets, [&](PFN_vkCmdBindDescriptorSets f, VkCommandBuffer c, std::uint32_t i) { f(c, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipelineLayout>(1 + (i & 3)), 0, 1, &set, 2, dynamicOffsets.data()); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdPushConstants", &CommandFunctions::CmdPushConstants, [&](PFN_vkCmdPushConstants f, VkCommandBuffer c, std::uint32_t i) { f(c, fake<VkPipelineLayout>(1 + (i & 3)), VK_SHADER_STAGE_ALL_GRAPHICS, 0, 64, constants.data()); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdBindVertexBuffers", &CommandFunctions::CmdBindVertexBuffers, [&](PFN_vkCmdBindVertexBuffers f, VkCommandBuffer c, std::uint32_t i) { f(c, i & 1, 2, buffers.data(), offsets.data()); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdBindIndexBuffer", &CommandFunctions::CmdBindIndexBuffer, [&](PFN_vkCmdBindIndexBuffer f, VkCommandBuffer c, std::uint32_t i) { f(c, buffer, i & 0xff, VK_INDEX_TYPE_UINT16); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdSetViewport", &CommandFunctions::CmdSetViewport, [&](PFN_vkCmdSetViewport f, VkCommandBuffer c, std::uint32_t i) { f(c, i & 1, 1, &viewport); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdSetScissor", &CommandFunctions::CmdSetScissor, [&](PFN_vkCmdSetScissor f, VkCommandBuffer c, std::uint32_t i) { f(c, i & 1, 1, &scissor); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdDrawIndexed", &CommandFunctions::CmdDrawIndexed, [&](PFN_vkCmdDrawIndexed f, VkCommandBuffer c, std::uint32_t i) { f(c, 3 + (i & 63), 1, i, 0, 0); }, DirectCalls, StreamedCalls, Rounds));
+    costs.push_back(MeasureCall("vkCmdPipelineBarrier", &CommandFunctions::CmdPipelineBarrier, [&](PFN_vkCmdPipelineBarrier f, VkCommandBuffer c, std::uint32_t i) { f(c, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, i & 1, 1, &memory, 0, nullptr, 0, nullptr); }, DirectCalls, StreamedCalls, Rounds));
+    std::printf("per-call cost, medians of %d interleaved rounds (ns): call, raw table, thunk direct (+over raw), thunk streamed append, replay per call\n", Rounds);
+    double raw = 0, direct = 0, append = 0, replay = 0;
+    for (const auto& cost : costs) {
+        std::printf("  %-26s raw %6.2f  direct %6.2f (+%5.2f)  append %6.2f  replay %6.2f\n", cost.name, cost.raw, cost.direct, cost.direct - cost.raw, cost.append, cost.replay);
+        raw += cost.raw;
+        direct += cost.direct;
+        append += cost.append;
+        replay += cost.replay;
+    }
+    std::printf("  one of each (%zu calls)      raw %6.2f  direct %6.2f (+%5.2f)  append %6.2f  replay %6.2f\n", costs.size(), raw, direct, direct - raw, append, replay);
+    struct DrawCalls {
+        PFN_vkCmdBindPipeline bindPipeline;
+        PFN_vkCmdBindDescriptorSets bindDescriptorSets;
+        PFN_vkCmdPushConstants pushConstants;
+        PFN_vkCmdBindVertexBuffers bindVertexBuffers;
+        PFN_vkCmdBindIndexBuffer bindIndexBuffer;
+        PFN_vkCmdSetViewport setViewport;
+        PFN_vkCmdSetScissor setScissor;
+        PFN_vkCmdDrawIndexed drawIndexed;
+    };
+    CommandFunctions table{};
+    table.CmdBindPipeline = &EmptyEntry<PFN_vkCmdBindPipeline>::Call;
+    table.CmdBindDescriptorSets = &EmptyEntry<PFN_vkCmdBindDescriptorSets>::Call;
+    table.CmdPushConstants = &EmptyEntry<PFN_vkCmdPushConstants>::Call;
+    table.CmdBindVertexBuffers = &EmptyEntry<PFN_vkCmdBindVertexBuffers>::Call;
+    table.CmdBindIndexBuffer = &EmptyEntry<PFN_vkCmdBindIndexBuffer>::Call;
+    table.CmdSetViewport = &EmptyEntry<PFN_vkCmdSetViewport>::Call;
+    table.CmdSetScissor = &EmptyEntry<PFN_vkCmdSetScissor>::Call;
+    table.CmdDrawIndexed = &EmptyEntry<PFN_vkCmdDrawIndexed>::Call;
+    const DrawCalls rawCalls{table.CmdBindPipeline, table.CmdBindDescriptorSets, table.CmdPushConstants, table.CmdBindVertexBuffers, table.CmdBindIndexBuffer, table.CmdSetViewport, table.CmdSetScissor, table.CmdDrawIndexed};
+    const DrawCalls thunkCalls{thunked("vkCmdBindPipeline", table.CmdBindPipeline), thunked("vkCmdBindDescriptorSets", table.CmdBindDescriptorSets), thunked("vkCmdPushConstants", table.CmdPushConstants), thunked("vkCmdBindVertexBuffers", table.CmdBindVertexBuffers), thunked("vkCmdBindIndexBuffer", table.CmdBindIndexBuffer), thunked("vkCmdSetViewport", table.CmdSetViewport), thunked("vkCmdSetScissor", table.CmdSetScissor), thunked("vkCmdDrawIndexed", table.CmdDrawIndexed)};
+    const DrawCalls* volatile rawSlot = &rawCalls;
+    const DrawCalls* volatile thunkSlot = &thunkCalls;
+    const auto draw = [&](const DrawCalls& calls, VkCommandBuffer commands, std::uint32_t index) {
+        calls.bindPipeline(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipeline>(1 + (index & 7)));
+        calls.bindDescriptorSets(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, fake<VkPipelineLayout>(1), 0, 1, &set, 2, dynamicOffsets.data());
+        calls.pushConstants(commands, fake<VkPipelineLayout>(1), VK_SHADER_STAGE_ALL_GRAPHICS, 0, 64, constants.data());
+        calls.bindVertexBuffers(commands, 0, 2, buffers.data(), offsets.data());
+        calls.bindIndexBuffer(commands, buffer, index & 0xff, VK_INDEX_TYPE_UINT16);
+        calls.setViewport(commands, 0, 1, &viewport);
+        calls.setScissor(commands, 0, 1, &scissor);
+        calls.drawIndexed(commands, 3 + (index & 63), 1, index, 0, 0);
+    };
+    constexpr int Draws = 300'000;
+    const auto target = FakeCommandBuffer(1);
+    std::vector<double> rawDraw, directOver, appendDraw, replayDraw;
+    for (int round = 0; round < Rounds; ++round) {
+        const double rawNs = nanosPerCall(Draws, [&](std::uint32_t index) { draw(*rawSlot, target, index); });
+        const double thunkNs = nanosPerCall(Draws, [&](std::uint32_t index) { draw(*thunkSlot, target, index); });
+        rawDraw.push_back(rawNs);
+        directOver.push_back(thunkNs - rawNs);
+        const auto [appendNs, replayNs] = streamedCost(table, Draws / 10, [&](VkCommandBuffer handle, std::uint32_t index) { draw(*thunkSlot, handle, index); });
+        appendDraw.push_back(appendNs);
+        replayDraw.push_back(replayNs);
+    }
+    const double rawPerDraw = median(rawDraw);
+    std::printf("one draw (8 calls; %d draws per stream): raw %.2f ns, thunk direct %.2f ns (+%.2f), streamed append %.2f ns, replay %.2f ns\n", BatchCalls, rawPerDraw, rawPerDraw + median(directOver), median(directOver), median(appendDraw), median(replayDraw));
+    return 0;
+}
+
 int DirectModeCost() {
     constexpr int DirectCalls = 5'000'000;
     constexpr int StreamedCalls = 1'000'000;
@@ -1438,6 +1587,7 @@ int DirectModeCost() {
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string_view(argv[1]) == "--bench") return DirectModeCost();
+        if (argc == 2 && std::string_view(argv[1]) == "--call-costs") return CallCosts();
         EveryListedCommandHasAThunk();
         EveryListedCommandStreams();
         DirectCallsReachTheirOwnEntryPoint();
