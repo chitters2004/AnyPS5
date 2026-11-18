@@ -99,6 +99,7 @@ public:
     explicit FrameCaptureWriter(const std::filesystem::path& directory, int level = 1, std::uint64_t cacheBudget = CachedDeltaBytes);
     FrameCaptureWriter(const FrameCaptureWriter&) = delete;
     FrameCaptureWriter& operator=(const FrameCaptureWriter&) = delete;
+    ~FrameCaptureWriter();
 
     void WriteCall(const FrameCall& call);
     void WriteRange(std::uint64_t address, std::uint64_t bytes, FrameRangeKind kind, std::uint32_t protection, std::uint32_t access);
@@ -114,6 +115,7 @@ public:
     const std::filesystem::path& Directory() const;
 
 private:
+    struct Compressor;
     using DeltaKey = std::pair<std::uint64_t, std::uint64_t>;
     struct DeltaPayload {
         std::uint64_t offset = 0;
@@ -124,6 +126,8 @@ private:
 
     std::uint64_t writeChunk(const FrameMemoryChunk& chunk, std::span<const std::byte> payload, std::uint64_t sharedOffset = 0);
     std::vector<std::byte> compress(std::span<const std::byte> bytes) const;
+    std::unique_ptr<Compressor> takeCompressor() const;
+    void returnCompressor(std::unique_ptr<Compressor> compressor) const;
     void cacheDelta(const DeltaKey& key, std::uint64_t offset, std::uint64_t compressedBytes, std::shared_ptr<const std::vector<std::byte>> bytes);
 
     std::filesystem::path directory;
@@ -140,6 +144,8 @@ private:
     std::uint64_t memoryOffset = 0;
     std::map<DeltaKey, DeltaPayload> deltaPayloads;
     std::list<DeltaKey> deltaUses;
+    mutable std::mutex compressorMutex;
+    mutable std::vector<std::unique_ptr<Compressor>> compressors;
     bool finished = false;
 };
 

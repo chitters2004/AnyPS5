@@ -413,12 +413,44 @@ void FrameCaptureWriter::cacheDelta(const DeltaKey& key, std::uint64_t offset, s
     deltaPayloads.emplace(key, DeltaPayload{offset, compressedBytes, std::move(bytes), std::prev(deltaUses.end())});
 }
 
+struct FrameCaptureWriter::Compressor {
+    ZSTD_CCtx* context = nullptr;
+
+    ~Compressor() {
+        ZSTD_freeCCtx(context);
+    }
+};
+
+FrameCaptureWriter::~FrameCaptureWriter() = default;
+
 std::vector<std::byte> FrameCaptureWriter::compress(std::span<const std::byte> bytes) const {
+    auto compressor = takeCompressor();
     std::vector<std::byte> output(ZSTD_compressBound(bytes.size()));
-    const auto written = ZSTD_compress(output.data(), output.size(), bytes.data(), bytes.size(), level);
+    const auto written = ZSTD_compressCCtx(compressor->context, output.data(), output.size(), bytes.data(), bytes.size(), level);
     requireCapture(ZSTD_isError(written) == 0, std::string("zstd: ") + ZSTD_getErrorName(written));
+    returnCompressor(std::move(compressor));
     output.resize(written);
     return output;
+}
+
+std::unique_ptr<FrameCaptureWriter::Compressor> FrameCaptureWriter::takeCompressor() const {
+    {
+        const std::lock_guard lock(compressorMutex);
+        if (!compressors.empty()) {
+            auto compressor = std::move(compressors.back());
+            compressors.pop_back();
+            return compressor;
+        }
+    }
+    auto compressor = std::make_unique<Compressor>();
+    compressor->context = ZSTD_createCCtx();
+    requireCapture(compressor->context != nullptr, "zstd: cannot create a compression context");
+    return compressor;
+}
+
+void FrameCaptureWriter::returnCompressor(std::unique_ptr<Compressor> compressor) const {
+    const std::lock_guard lock(compressorMutex);
+    compressors.push_back(std::move(compressor));
 }
 
 struct FrameCaptureReader::Stream {
