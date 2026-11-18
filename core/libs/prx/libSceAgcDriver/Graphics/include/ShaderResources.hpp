@@ -883,8 +883,10 @@ private:
     void noteRangeWrite() const;
     void noteUnwatchedRange() const;
     std::size_t rangeWriteOwner(std::uint64_t begin, std::uint64_t end, bool* tableBytesSame) const;
-    bool proofBytesUnchanged(std::uint64_t begin, std::uint64_t end) const;
+    bool proofBytesUnchanged(std::size_t index, std::uint64_t begin, std::uint64_t end);
+    std::vector<std::uint64_t> proofRangeGenerations;
     std::size_t rangePassedOnBytes = 0;
+    std::size_t rangePassedOnRebase = 0;
     std::pair<std::uint64_t, std::uint64_t> rangeDeclined{0, 0};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
     ProofFailure proveImports();

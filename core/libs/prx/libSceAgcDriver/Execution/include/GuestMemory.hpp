@@ -278,9 +278,13 @@ struct RangeVersionBaseline {
 };
 enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, CollectUnwatched, Collect, Changed, ChangedPossibly, ChangedBlock, ChangedRefused, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
 const char* RangeVersionDeclineName(RangeVersionDecline decline);
+bool SnapshotUnchangedSince(std::uint64_t address, std::span<std::byte> out, std::uint64_t generation);
+std::uint64_t SnapshotMatches(std::uint64_t address, std::span<const std::byte> snapshot);
 struct RangeValidation {
-    std::function<bool(std::uint64_t begin, std::uint64_t end)> bytesUnchanged;
+    std::function<bool(std::size_t index, std::uint64_t begin, std::uint64_t end)> bytesUnchanged;
+    std::span<const std::uint64_t> generations;
     std::size_t passedOnBytes = 0;
+    std::size_t passedOnRebase = 0;
     std::pair<std::uint64_t, std::uint64_t> declined{0, 0};
 };
 RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline, RangeValidation* validation = nullptr);

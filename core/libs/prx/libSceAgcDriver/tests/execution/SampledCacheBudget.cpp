@@ -1237,6 +1237,32 @@ void rangeVersionTests(Context context) {
         for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
         AgcDriver::GuestMemory::BumpCollectEpoch();
     });
+    static std::size_t byteCompares = 0;
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+    Require(!exitTaken(), "an unranged break did not force the full proof before the rebase check");
+    AgcDriver::GuestMemory::SetCompareMappedHook([](std::uint64_t, std::size_t) { ++byteCompares; });
+    struct CompareUnhook {
+        ~CompareUnhook() { AgcDriver::GuestMemory::SetCompareMappedHook(nullptr); }
+    } compareUnhook;
+    {
+        auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    byteCompares = 0;
+    Require(exitTaken(), "a rewrite of the same bytes did not take the exit before the rebase check");
+    const auto passCompares = byteCompares;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    byteCompares = 0;
+    const bool rebasedTaken = exitTaken();
+    const auto rebasedCompares = byteCompares;
+    AgcDriver::GuestMemory::SetCompareMappedHook(nullptr);
+    std::fprintf(stderr, "range versions: a new collect epoch after a byte pass: the exit %s, byte compares %zu (the byte pass took %zu)\n", rebasedTaken ? "was taken" : "was refused", rebasedCompares, passCompares);
+    Require(rebasedTaken && passCompares != 0 && rebasedCompares < passCompares, "a range passed on its bytes was compared again with no write since the pass");
+    last("a CPU write of new bytes into a range rebased by a byte pass, then a new collect epoch", [&] {
+        std::memset(reinterpret_cast<void*>(address + 8192u), 0xa5, 64u);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
     last("a CPU write into the set and a new collect epoch", [&] {
         std::memset(reinterpret_cast<void*>(address + 8192u), 0x6b, 4096u);
         AgcDriver::GuestMemory::BumpCollectEpoch();

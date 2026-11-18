@@ -3302,6 +3302,18 @@ const char* RangeVersionDeclineName(RangeVersionDecline decline) {
     return "?";
 }
 
+bool SnapshotUnchangedSince(std::uint64_t address, std::span<std::byte> out, std::uint64_t generation) {
+    if (out.empty() || generation == 0) return false;
+    if (CopyMapped(address, out) != Compare::Equal) return false;
+    const auto observed = Observe(address, out.size());
+    return observed.status == Observation::Status::Complete && UnchangedSince(address, out.size(), generation);
+}
+
+std::uint64_t SnapshotMatches(std::uint64_t address, std::span<const std::byte> snapshot) {
+    const auto generation = TrackerGeneration();
+    return CompareMapped(address, snapshot) == Compare::Equal ? std::max<std::uint64_t>(generation, 1) : 0;
+}
+
 RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline, RangeValidation* validation) {
     const auto declineOver = [&](RangeVersionDecline decline, std::uint64_t begin, std::uint64_t end) {
         if (validation != nullptr) validation->declined = {begin, end};
@@ -3315,7 +3327,11 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
         if (observed.status == Observation::Status::Uncovered) return declineOver(RangeVersionDecline::CollectUnwatched, begin, end);
         if (observed.status != Observation::Status::Complete || observed.generation == 0) return declineOver(RangeVersionDecline::Collect, begin, end);
     }
-    thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    const auto sinceFor = [&](std::size_t index) {
+        if (validation == nullptr || index >= validation->generations.size()) return baseline.generation;
+        return std::max(baseline.generation, validation->generations[index]);
+    };
+    thread_local std::vector<std::size_t> written;
     written.clear();
     const bool byBytes = validation != nullptr && validation->bytesUnchanged;
     {
@@ -3323,22 +3339,28 @@ RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t,
         const auto lock = lockTracker(tracker);
         tracker.initialize();
         if (!tracker.watched) return RangeVersionDecline::Uncovered;
-        for (const auto& [begin, end] : ranges) {
+        for (std::size_t index = 0; index < ranges.size(); ++index) {
+            const auto [begin, end] = ranges[index];
             const auto bytes = static_cast<std::size_t>(end - begin);
             if (!tracker.covers(begin, bytes)) return declineOver(RangeVersionDecline::Uncovered, begin, end);
-            if (tracker.rangeUnchanged(begin, bytes, baseline.generation)) continue;
-            if (!byBytes) return declineOver(tracker.changeEvidence(begin, end, baseline.generation), begin, end);
-            written.emplace_back(begin, end);
+            const auto since = sinceFor(index);
+            if (tracker.rangeUnchanged(begin, bytes, since)) {
+                if (since != baseline.generation) ++validation->passedOnRebase;
+                continue;
+            }
+            if (!byBytes) return declineOver(tracker.changeEvidence(begin, end, since), begin, end);
+            written.push_back(index);
         }
     }
-    for (const auto& [begin, end] : written) {
-        if (validation->bytesUnchanged(begin, end)) {
+    for (const auto index : written) {
+        const auto [begin, end] = ranges[index];
+        if (validation->bytesUnchanged(index, begin, end)) {
             ++validation->passedOnBytes;
             continue;
         }
         auto& tracker = Tracker();
         const auto lock = lockTracker(tracker);
-        return declineOver(tracker.changeEvidence(begin, end, baseline.generation), begin, end);
+        return declineOver(tracker.changeEvidence(begin, end, sinceFor(index)), begin, end);
     }
     for (std::uint32_t spins = 0; rangeStampsInFlight.load(std::memory_order_acquire) != 0; ++spins) {
         if (spins >= 256) return RangeVersionDecline::InFlight;
