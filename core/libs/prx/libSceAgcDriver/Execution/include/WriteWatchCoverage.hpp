@@ -6,8 +6,11 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <iterator>
 #include <limits>
+#include <map>
 #include <unordered_map>
+#include <utility>
 
 namespace AgcDriver::GuestMemory {
 
@@ -142,6 +145,72 @@ private:
     std::vector<std::uint16_t> excluded;
     std::vector<std::uint64_t> summary;
     std::unordered_map<std::uint64_t, std::array<std::uint64_t, PagesPerBlock>> excludedGenerations;
+};
+
+class RangeTags {
+public:
+    void Clear() { ranges.clear(); }
+
+    std::size_t Size() const { return ranges.size(); }
+
+    std::uint8_t First(std::uint64_t begin, std::uint64_t end) const {
+        auto at = overlapping(begin);
+        return at != ranges.end() && begin < end && at->first < end ? at->second.second : 0;
+    }
+
+    void Fill(std::uint64_t begin, std::uint64_t end, std::uint8_t tag) {
+        if (end <= begin || tag == 0) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> gaps;
+        auto from = begin;
+        for (auto at = overlapping(begin); at != ranges.end() && at->first < end; ++at) {
+            if (from < at->first) gaps.emplace_back(from, at->first);
+            from = std::max(from, at->second.first);
+        }
+        if (from < end) gaps.emplace_back(from, end);
+        for (const auto& [gapBegin, gapEnd] : gaps) insert(gapBegin, gapEnd, tag);
+    }
+
+    void Erase(std::uint64_t begin, std::uint64_t end) {
+        if (end <= begin) return;
+        auto at = overlapping(begin);
+        while (at != ranges.end() && at->first < end) {
+            const auto start = at->first;
+            const auto [stop, tag] = at->second;
+            at = ranges.erase(at);
+            if (start < begin) ranges.emplace(start, std::pair{begin, tag});
+            if (stop > end) {
+                ranges.emplace(end, std::pair{stop, tag});
+                break;
+            }
+        }
+    }
+
+private:
+    using Map = std::map<std::uint64_t, std::pair<std::uint64_t, std::uint8_t>>;
+
+    Map::const_iterator overlapping(std::uint64_t begin) const {
+        auto at = ranges.upper_bound(begin);
+        if (at != ranges.begin() && std::prev(at)->second.first > begin) --at;
+        return at;
+    }
+
+    void insert(std::uint64_t begin, std::uint64_t end, std::uint8_t tag) {
+        auto next = ranges.lower_bound(begin);
+        if (next != ranges.end() && next->first == end && next->second.second == tag) {
+            end = next->second.first;
+            next = ranges.erase(next);
+        }
+        if (next != ranges.begin()) {
+            auto previous = std::prev(next);
+            if (previous->second.first == begin && previous->second.second == tag) {
+                previous->second.first = end;
+                return;
+            }
+        }
+        ranges.emplace_hint(next, begin, std::pair{end, tag});
+    }
+
+    Map ranges;
 };
 
 }

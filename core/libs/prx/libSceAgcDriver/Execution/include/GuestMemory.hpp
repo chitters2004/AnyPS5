@@ -77,6 +77,14 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
+enum class UnwatchCause : std::uint8_t { Watched, NotWatching, OutsideArena, HostRegion, Explicit, ImportUnwatched, ImportSpanUnwalked, CollectRefused, Other, Count };
+inline const char* UnwatchCauseName(UnwatchCause cause) {
+    constexpr std::array<const char*, static_cast<std::size_t>(UnwatchCause::Count)> names{
+        "watched", "write watching off", "outside the arena", "host region", "explicit unwatch", "import that stays unwatched", "import span not walked", "collect refused", "other"};
+    const auto index = static_cast<std::size_t>(cause);
+    return index < names.size() ? names[index] : "unknown";
+}
+UnwatchCause UnwatchedCause(std::uint64_t address, std::size_t bytes);
 bool OnlyRewatchedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool Rewatched(std::uint64_t address, std::size_t bytes);
 void RewatchedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint8_t> rewatched);

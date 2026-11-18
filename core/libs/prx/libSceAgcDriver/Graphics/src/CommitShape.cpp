@@ -32,6 +32,10 @@ void CommitShape::Note(std::size_t kind, std::span<const double, Phases> phaseUs
                 if (lead.collectSource < CollectSourceCount) {
                     ++counts.fullCollects[lead.collectSource];
                     counts.fullCollectUs[lead.collectSource] += lead.revalidateUs;
+                    if (lead.collectSource == CollectUnwatched && lead.unwatchCause < UnwatchCauseCount) {
+                        ++counts.fullUnwatchCauses[lead.unwatchCause];
+                        counts.fullUnwatchCauseUs[lead.unwatchCause] += lead.revalidateUs;
+                    }
                 }
             }
         }
@@ -254,6 +258,16 @@ std::string CommitShape::ProofDeclineLine(const Report& report, std::span<const 
         std::snprintf(item, sizeof(item), " %s %llu x %.2f us%s", CollectSourceNames[source], static_cast<unsigned long long>(count), count != 0 ? report.fullCollectUs[source] / static_cast<double>(count) : 0.0, source + 1 < CollectSourceCount ? "," : "");
         text += item;
     }
+    text += "; unwatched collects behind full walks by cause:";
+    first = true;
+    for (std::size_t cause = 0; cause < UnwatchCauseCount; ++cause) {
+        const auto count = report.fullUnwatchCauses[cause];
+        if (count == 0) continue;
+        std::snprintf(item, sizeof(item), "%s %s %llu x %.2f us", first ? "" : ",", GuestMemory::UnwatchCauseName(static_cast<GuestMemory::UnwatchCause>(cause)), static_cast<unsigned long long>(count), report.fullUnwatchCauseUs[cause] / static_cast<double>(count));
+        text += item;
+        first = false;
+    }
+    if (first) text += " none";
     return text;
 }
 

@@ -7,6 +7,7 @@
 #include <span>
 #include <string>
 
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 
 namespace AgcDriver {
@@ -29,6 +30,7 @@ enum ProofDecline : std::size_t { DeclineTaken, DeclineGateOff, DeclineViews, De
 inline constexpr std::array<const char*, ProofDeclineCount> ProofDeclineNames{"exit taken", "epoch proofs off", "image views changed", "no collect epoch", "never proved", "reuse-lookup texture", "last proof refused", "collect epoch moved", "proof serial moved", "pending serial moved", "retired serial moved", "verify sample"};
 enum CollectSource : std::size_t { CollectUncommitted, CollectUnwatched, CollectOther, CollectSourceCount };
 inline constexpr std::array<const char*, CollectSourceCount> CollectSourceNames{"uncommitted pages", "unwatched", "other"};
+inline constexpr std::size_t UnwatchCauseCount = static_cast<std::size_t>(GuestMemory::UnwatchCause::Count);
 inline constexpr std::size_t FastFailSlots = 16;
 struct ProofLeadNote {
     bool looked = false;
@@ -47,6 +49,7 @@ struct ProofLeadNote {
     bool declineAlone = false;
     std::size_t fastFail = FastFailSlots;
     std::size_t collectSource = CollectSourceCount;
+    std::size_t unwatchCause = UnwatchCauseCount;
 };
 
 bool CommitShapeProfiled();
@@ -89,6 +92,8 @@ public:
         std::array<std::uint64_t, FastFailSlots + 1> fullFastFailServed{};
         std::array<std::uint64_t, CollectSourceCount> fullCollects{};
         std::array<double, CollectSourceCount> fullCollectUs{};
+        std::array<std::uint64_t, UnwatchCauseCount> fullUnwatchCauses{};
+        std::array<double, UnwatchCauseCount> fullUnwatchCauseUs{};
     };
 
     void Note(std::size_t kind, std::span<const double, Phases> phaseUs, std::uint64_t dependencies, const CommitStamps& stamps, std::uint64_t pipelines = 0, std::size_t buildReason = BuildReasonCount, const ProofLeadNote& lead = {});

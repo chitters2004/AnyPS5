@@ -378,6 +378,7 @@ public:
         bool declineAlone = false;
         std::size_t fastFail = std::numeric_limits<std::size_t>::max();
         std::size_t collectSource = std::numeric_limits<std::size_t>::max();
+        std::size_t unwatchCause = std::numeric_limits<std::size_t>::max();
     };
     static std::span<const char* const> FastFailNameList();
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);

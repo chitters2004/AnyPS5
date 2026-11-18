@@ -2329,6 +2329,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 outcome.proofLead.declineAlone = proofReport.declineAlone;
                 outcome.proofLead.fastFail = std::min<std::size_t>(proofReport.fastFail, FastFailSlots);
                 outcome.proofLead.collectSource = std::min<std::size_t>(proofReport.collectSource, CollectSourceCount);
+                outcome.proofLead.unwatchCause = std::min<std::size_t>(proofReport.unwatchCause, UnwatchCauseCount);
             }
             if (leadProfiled) {
                 outcome.proofLead.walked = proofReport.walked;

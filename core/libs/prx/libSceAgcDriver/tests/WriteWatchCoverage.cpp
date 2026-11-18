@@ -15,6 +15,7 @@ void require(bool condition, const char* message) {
 
 namespace {
 
+using AgcDriver::GuestMemory::RangeTags;
 using AgcDriver::GuestMemory::WriteWatchCoverage;
 
 constexpr std::uint64_t ModelBase = 0x200000000;
@@ -150,8 +151,54 @@ void checkAgainstModel(bool summarize) {
 
 }
 
+void testRangeTags() {
+    constexpr std::uint64_t base = 0x7000;
+    constexpr std::size_t units = 96;
+    std::array<std::uint8_t, units> model{};
+    RangeTags tags;
+    require(tags.First(base, base + units) == 0 && tags.Size() == 0, "empty tags hold a tag");
+    tags.Fill(base + 10, base + 20, 2);
+    tags.Fill(base + 5, base + 30, 3);
+    require(tags.First(base + 10, base + 11) == 2 && tags.First(base + 5, base + 6) == 3 && tags.First(base + 25, base + 26) == 3, "a fill retagged an earlier tag");
+    require(tags.First(base + 4, base + 12) == 3 && tags.First(base + 19, base + 21) == 2, "the first tag is not the lowest tagged byte");
+    tags.Erase(base + 8, base + 15);
+    require(tags.First(base + 8, base + 15) == 0 && tags.First(base + 7, base + 8) == 3 && tags.First(base + 15, base + 16) == 2, "an erase did not split its edge ranges");
+    tags.Fill(base, base, 1);
+    tags.Fill(base, base + 1, 0);
+    require(tags.First(base, base + 1) == 0, "an empty or untagged fill tagged memory");
+    tags.Clear();
+    tags.Fill(base, base + 4, 1);
+    tags.Fill(base + 8, base + 12, 1);
+    tags.Fill(base + 4, base + 8, 1);
+    require(tags.Size() == 1, "adjacent fills with one tag were not merged");
+    tags.Clear();
+    std::mt19937 random(1234);
+    for (int step = 0; step < 20000; ++step) {
+        const auto a = static_cast<std::uint64_t>(random() % (units + 1));
+        const auto b = static_cast<std::uint64_t>(random() % (units + 1));
+        const auto begin = std::min(a, b);
+        const auto end = std::max(a, b);
+        const auto tag = static_cast<std::uint8_t>(random() % 4);
+        if (random() % 3 == 0) {
+            tags.Erase(base + begin, base + end);
+            for (auto unit = begin; unit < end; ++unit) model[unit] = 0;
+        } else {
+            tags.Fill(base + begin, base + end, tag);
+            for (auto unit = begin; unit < end; ++unit) if (model[unit] == 0) model[unit] = tag;
+        }
+        std::uint8_t expected = 0;
+        for (auto unit = begin; unit < end && expected == 0; ++unit) expected = model[unit];
+        require(tags.First(base + begin, base + end) == expected, "the first tag of a range differs from the model");
+        std::size_t runs = 0;
+        for (std::size_t unit = 0; unit < units; ++unit) runs += model[unit] != 0 && (unit == 0 || model[unit - 1] != model[unit]);
+        require(tags.Size() == runs, "tagged ranges are not merged runs");
+        for (std::size_t unit = 0; unit < units; ++unit) require(tags.First(base + unit, base + unit + 1) == model[unit], "a byte's tag differs from the model");
+    }
+}
+
 int main(int argc, char** argv) {
     try {
+        testRangeTags();
         const bool summarize = argc < 2 || std::string_view(argv[1]) != "--no-summary";
         constexpr std::uint64_t base = 0x200000000;
         constexpr std::size_t block = 65536;

@@ -3505,11 +3505,18 @@ void countCollectRefusal(bool storage, std::uint64_t address, std::size_t bytes)
 }
 
 thread_local std::size_t collectSourceSeen = CollectSourceCount;
+thread_local std::size_t unwatchCauseSeen = UnwatchCauseCount;
 
 void noteCollectSource(std::uint64_t address, std::size_t bytes) {
     if (!CommitShapeProfiled()) return;
-    const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes);
-    collectSourceSeen = !accessible ? CollectUncommitted : !GuestMemory::Watched(address, bytes) ? CollectUnwatched : CollectOther;
+    unwatchCauseSeen = UnwatchCauseCount;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
+        collectSourceSeen = CollectUncommitted;
+        return;
+    }
+    const auto cause = GuestMemory::UnwatchedCause(address, bytes);
+    collectSourceSeen = cause == GuestMemory::UnwatchCause::Watched ? CollectOther : CollectUnwatched;
+    if (collectSourceSeen == CollectUnwatched) unwatchCauseSeen = static_cast<std::size_t>(cause);
 }
 
 void countOwnRefreshFallback(OwnRefreshFallback reason) {
@@ -4735,7 +4742,10 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
         report->audited = !fast && reason == FastFail::Audit;
         if (!fast && reason != FastFail::Count) report->fastFail = static_cast<std::size_t>(reason);
-        if (!fast && reason == FastFail::Collect) report->collectSource = collectSourceSeen;
+        if (!fast && reason == FastFail::Collect) {
+            report->collectSource = collectSourceSeen;
+            report->unwatchCause = unwatchCauseSeen;
+        }
     }
     if (!fast) {
         countFullWalk(reason);

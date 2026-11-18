@@ -1344,6 +1344,7 @@ struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
     bool watched = false;
+    RangeTags unwatchCauses;
     static constexpr std::size_t CoarseBlocks = 64;
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     struct Leaf {
@@ -1490,6 +1491,14 @@ struct WriteTracker {
         return coverage.Covers(address, bytes) && !GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #else
         return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchCovers_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+#endif
+    }
+
+    bool inArena(std::uint64_t address, std::size_t bytes) const {
+#ifdef _WIN32
+        return bytes <= size && address >= base && address - base <= size - bytes;
+#else
+        return address + bytes <= LeafCount * LeafBlocks * WriteBlockBytes && GuestWriteWatch::GuestWriteWatchOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 #endif
     }
 
@@ -2329,8 +2338,9 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
     beforeUnwatch(address, bytes);
 }
 
-void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes, UnwatchCause cause) {
     if (!tracker.watched) return;
+    if (bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.inArena(address, bytes)) tracker.unwatchCauses.Fill(address, address + bytes, static_cast<std::uint8_t>(cause));
 #ifdef _WIN32
     tracker.startHints(address, bytes);
     if (tracker.coverage.Exclude(address, bytes, GuestArena::GuestArenaCommitGeneration_nid_postfix())) {
@@ -2398,7 +2408,7 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();
-    unwatchLocked(tracker, address, bytes);
+    unwatchLocked(tracker, address, bytes, UnwatchCause::Explicit);
 }
 
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -2414,6 +2424,7 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         if (tracker.coverage.Covers(begin, bytes)) continue;
         GuestArena::GuestArenaCompareWhenShared_nid_no_patch(static_cast<std::uintptr_t>(begin), bytes);
         if (!walkWrites(tracker, begin, end, StampKind::Cpu) || !tracker.coverage.Restore(begin, bytes)) continue;
+        tracker.unwatchCauses.Erase(begin, end);
         ++tracker.generation;
         tracker.noteCpuStore(begin, end, tracker.generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
@@ -2463,8 +2474,8 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
         if (!runImport()) return false;
         bumpSubscriptions(first, stop - first, WriteBumpSource::Import);
-        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
-        unwatchLocked(tracker, address, bytes);
+        if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first), UnwatchCause::ImportUnwatched);
+        unwatchLocked(tracker, address, bytes, UnwatchCause::ImportUnwatched);
         return true;
     }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
@@ -2517,10 +2528,10 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     leave(leaving);
     auto unwatchedFrom = first;
     for (const auto& [begin, end] : spans) {
-        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom));
+        if (unwatchedFrom < begin) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(begin - unwatchedFrom), UnwatchCause::ImportSpanUnwalked);
         unwatchedFrom = end;
     }
-    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
+    if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom), UnwatchCause::ImportSpanUnwalked);
     return true;
 }
 
@@ -2583,6 +2594,21 @@ void RewatchedBlocks(std::uint64_t address, std::size_t bytes, std::span<const s
         const auto stamp = tracker.stampOf(block);
         if (since[k] == 0 || (stamp > since[k] && stamp == found->second)) rewatched[k] = 1;
     }
+}
+
+UnwatchCause UnwatchedCause(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return UnwatchCause::Other;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched) return UnwatchCause::NotWatching;
+    if (tracker.covers(address, bytes)) return UnwatchCause::Watched;
+    if (const auto tag = tracker.unwatchCauses.First(address, address + bytes); tag != 0) return static_cast<UnwatchCause>(tag);
+    if (!tracker.inArena(address, bytes)) return UnwatchCause::OutsideArena;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes)) return UnwatchCause::HostRegion;
+#endif
+    return UnwatchCause::Other;
 }
 
 bool Watched(std::uint64_t address, std::size_t bytes) {
@@ -2804,7 +2830,7 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
                 beforeUnwatchUnproven(blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
             }
             ++tracker.generation;
-            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst));
+            unwatchLocked(tracker, blockFirst, static_cast<std::size_t>(blockStop - blockFirst), UnwatchCause::CollectRefused);
             tracker.noteUnstampedStore(address, address + bytes);
             if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
             return 0;

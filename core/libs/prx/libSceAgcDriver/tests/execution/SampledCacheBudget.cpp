@@ -1408,6 +1408,7 @@ void collectRefusalTests(Context context) {
     Require(hosted->Revalidate(hostShader, &report) && report.path == ShaderResources::ProofPath::Full, "a template over a host-allocated surface did not take the full walk");
     Require(report.fastFail == collect, "the host-allocated template's full walk is not named by the collect check: " + FastFailName(report));
     Require(!AgcDriver::CommitShapeProfiled() || report.collectSource == AgcDriver::CollectUnwatched, "the host-allocated template's collect fail was given source " + std::to_string(report.collectSource));
+    Require(!AgcDriver::CommitShapeProfiled() || report.unwatchCause == static_cast<std::size_t>(AgcDriver::GuestMemory::UnwatchCause::OutsideArena), "the host-allocated template's unwatched collect was given cause " + std::to_string(report.unwatchCause));
     const auto outside = ShaderResources::CollectRefusalCounts();
     Require(outside.sampled - withStorage.sampled == 1 && outside.unwatched - withStorage.unwatched == 1, "a host-allocated surface's collect refusal was not counted as unwatched");
     Require(outside.uncommitted == withStorage.uncommitted && outside.other == withStorage.other, "a host-allocated surface's collect refusal was counted under another cause");

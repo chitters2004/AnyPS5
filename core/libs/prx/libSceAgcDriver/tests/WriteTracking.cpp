@@ -893,6 +893,8 @@ void CheckRewatch() {
     GuestArena::GuestArenaReset_nid_postfix(static_cast<std::uint8_t*>(memory) + 2 * Block, 16384);
     Rewatch(uncommitted);
     Require(!Watched(base + 2 * Block, Block), "a block with uncommitted pages returned to the write watch");
+    Require(UnwatchedCause(base + 2 * Block, Block) == UnwatchCause::Explicit, "a block left unwatched by a refused rewatch lost its unwatch cause");
+    Require(ImportWatched(imported, Block, [] { return true; }, false) && UnwatchedCause(imported, Block) == UnwatchCause::ImportUnwatched, "a rewatched block unwatched again kept the cause from before its rewatch");
     GuestArena::GuestArenaReset_nid_postfix(memory, 4 * Block);
     GuestArena::GuestArenaRelease_nid_postfix(memory, 4 * Block);
 }
@@ -1598,6 +1600,7 @@ void CheckFailedCollectUnwatch() {
     SetUnwatchHook(nullptr);
     Require(stored == 0, "a failed fresh collect produced trusted stamps");
     Require(!Watched(base + Block, Block), "a failed collect left its block watched");
+    Require(UnwatchedCause(base + Block, Block) == UnwatchCause::CollectRefused, std::string("a failed collect's block was given unwatch cause ") + UnwatchCauseName(UnwatchedCause(base + Block, Block)));
     Require(Watched(base, Block) && Watched(base + 2 * Block, Block), "a failed collect unwatched unrelated blocks");
     Require(failedCollectBegin == base + Block && failedCollectEnd == base + 2 * Block, "the failed fresh collect did not cover its block");
     Require(unwatchHookBegin <= base + Block && unwatchHookEnd >= base + 2 * Block, "a failed collect did not run the unwatch hook over its block");
@@ -2234,6 +2237,23 @@ void RecordImportHook(std::uint64_t address, std::size_t bytes) {
     importHookCalls.push_back({address, address + bytes, Watched(importHookProbe, Block), UnwatchWritesProven()});
 }
 
+void CheckUnwatchCauses() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x22, 4 * Block);
+    Require(UnwatchedCause(base, 4 * Block) == UnwatchCause::Watched, "a watched range was given an unwatch cause");
+    Require(UnwatchedCause(base, 0) == UnwatchCause::Other, "an empty range was given a cause other than other");
+    Require(ImportWatched(base, Block, [] { return true; }, false), "an import that leaves the watch failed");
+    Require(UnwatchedCause(base, Block) == UnwatchCause::ImportUnwatched, std::string("an import that leaves the watch was given cause ") + UnwatchCauseName(UnwatchedCause(base, Block)));
+    Unwatch(base, Block);
+    Require(UnwatchedCause(base, Block) == UnwatchCause::ImportUnwatched, "unwatching an unwatched import again replaced its cause");
+    Unwatch(base + 2 * Block, Block);
+    Require(UnwatchedCause(base + 2 * Block, Block) == UnwatchCause::Explicit, "an explicit unwatch was not given its cause");
+    Require(UnwatchedCause(base + Block, 2 * Block) == UnwatchCause::Explicit, "a range reaching an explicit unwatch was not given its cause");
+    Require(UnwatchedCause(base + 3 * Block, Block) == UnwatchCause::Watched, "a block next to an explicit unwatch lost its watch");
+    Require(std::string_view(UnwatchCauseName(UnwatchCause::ImportSpanUnwalked)) == "import span not walked" && std::string_view(UnwatchCauseName(UnwatchCause::Count)) == "unknown", "an unwatch cause is misnamed");
+}
+
 void CheckImportWalkUnwatchHooks() {
     void* memory = AllocateWatched(4 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
@@ -2266,6 +2286,7 @@ void CheckImportWalkUnwatchHooks() {
         Require(!call.proven, what + " ran the unwatch hook as if the CPU writes to its block were proven");
         Require(hookedBeforeImport == (walk == 1), what + (walk == 1 ? " ran the unwatch hook after the import" : " ran the unwatch hook before the import"));
         Require(!Watched(imported, Block), what + " left its block watched");
+        Require(UnwatchedCause(imported, Block) == UnwatchCause::ImportSpanUnwalked, what + " was given unwatch cause " + UnwatchCauseName(UnwatchedCause(imported, Block)));
     }
     importHookCalls.clear();
     importHookProbe = base + 3 * Block;
@@ -2764,6 +2785,7 @@ int main(int argc, char** argv) {
         CheckImportWindowFootprint();
         CheckUnwatchedImport();
         CheckImportWalkUnwatchHooks();
+        CheckUnwatchCauses();
         CheckImportWalkHookKeepsLaterWindows();
         CheckUnwatchHooks();
         CheckCommittedRanges();
