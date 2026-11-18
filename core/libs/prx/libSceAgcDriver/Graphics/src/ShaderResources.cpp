@@ -275,6 +275,15 @@ void noteUncached(const std::shared_ptr<StorageTexture>& image) {
 
 std::atomic<std::uint64_t> textureReleases{0};
 
+enum class ReleaseSite : std::uint8_t { None, TextureErased, TextureRefused, StorageMipAlias, StorageMetadataMoved, StorageBudget, StorageReclaim, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(ReleaseSite::Count)> ReleaseSiteNames{"none", "texture erased", "texture refused", "storage mip alias", "storage metadata moved", "storage budget", "storage reclaim"};
+std::atomic<std::uint8_t> lastRelease{0};
+
+void bumpTextureReleases(ReleaseSite site) {
+    lastRelease.store(static_cast<std::uint8_t>(site), std::memory_order_relaxed);
+    textureReleases.fetch_add(1, std::memory_order_release);
+}
+
 std::atomic<bool>& TexturesReleased() {
     static std::atomic<bool> released{false};
     return released;
@@ -291,9 +300,9 @@ void countIndex(IndexCount which, std::uint64_t amount = 1) {
     IndexCounts()[which].fetch_add(amount, std::memory_order_relaxed);
 }
 
-void noteReleased(const std::shared_ptr<Texture>& texture, std::uint64_t address) {
+void noteReleased(const std::shared_ptr<Texture>& texture, std::uint64_t address, ReleaseSite site) {
     texture->MarkReleased();
-    textureReleases.fetch_add(1, std::memory_order_release);
+    bumpTextureReleases(site);
     TexturesReleased().store(true, std::memory_order_release);
     GuestMemory::NoteTextureReleased(address);
 }
@@ -329,7 +338,7 @@ void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
             }
         }
     }
-    if (it->texture.use_count() > 1) noteReleased(it->texture, it->address);
+    if (it->texture.use_count() > 1) noteReleased(it->texture, it->address, ReleaseSite::TextureErased);
     cache.index.erase(it->key);
     cache.entries.erase(it);
     ++cache.erasures;
@@ -1360,7 +1369,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return record;
     };
     if (!admitTexture(cache, key, entry.accounted, budget)) {
-        noteReleased(texture, resource.baseAddress);
+        noteReleased(texture, resource.baseAddress, ReleaseSite::TextureRefused);
         logLookup(madeRecord());
         reportCacheCounts(cache, budget);
         reportTextureCounters();
@@ -1442,9 +1451,9 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 }
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
-std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, bool store = true, const char* reason = "cache eviction") {
+std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it, ReleaseSite site, bool store = true, const char* reason = "cache eviction") {
     auto texture = it->texture;
-    textureReleases.fetch_add(1, std::memory_order_release);
+    bumpTextureReleases(site);
     GuestMemory::NoteHoldPendingBump();
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -1570,12 +1579,12 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
         if (resource.mipCount > AllocatedLevels(resource)) {
             auto allocated = resource;
             allocated.mipCount = AllocatedLevels(resource);
-            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found));
+            if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evicted.push_back(evictStorage(cache, found, ReleaseSite::StorageMipAlias));
         }
         auto it = findStorage(cache, key);
         std::shared_ptr<StorageTexture> detached;
         if (it != cache.entries.end() && MetadataMoved(*it->texture, resource)) {
-            detached = evictStorage(cache, it, false);
+            detached = evictStorage(cache, it, ReleaseSite::StorageMetadataMoved, false);
             evicted.push_back(detached);
             it = cache.entries.end();
         }
@@ -1605,7 +1614,7 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             while (!cache.entries.empty()) {
                 const bool overBudget = cache.bytes + entry.accounted > budget;
                 if (!overBudget && cache.entries.size() < storageEntries()) break;
-                evicted.push_back(evictStorage(cache, std::prev(cache.entries.end()), true, overBudget ? "cache eviction" : "entry cap"));
+                evicted.push_back(evictStorage(cache, std::prev(cache.entries.end()), ReleaseSite::StorageBudget, true, overBudget ? "cache eviction" : "entry cap"));
             }
             cache.bytes += entry.accounted;
             texture = entry.texture;
@@ -1851,7 +1860,7 @@ std::uint64_t ReleaseTextureCaches(std::uint64_t bytes, bool newImage) {
                                 ++storageKept;
                                 continue;
                             }
-                            image = evictStorage(cache, it);
+                            image = evictStorage(cache, it, ReleaseSite::StorageReclaim);
                             break;
                         }
                         if (image == nullptr) break;
@@ -4418,6 +4427,44 @@ void reportScopeLevels(const GuestMemory::ProofBreakCounts& breaks) {
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) collect epochs %llu, sets first proved in a new epoch %llu; GPU-lock holds off the proof thread %llu, idle %llu (no other proof break or pending bump while held)\n", static_cast<unsigned long long>(newEpochs), static_cast<unsigned long long>(levels.setEpochs.Take()), static_cast<unsigned long long>(breaks.offThreadHolds), static_cast<unsigned long long>(breaks.idleHolds));
 }
 
+constexpr std::size_t EpochSources = static_cast<std::size_t>(GuestMemory::EpochBumpSource::Count);
+constexpr std::size_t PendingSources = static_cast<std::size_t>(PendingBump::Count);
+constexpr std::size_t ReleaseSources = static_cast<std::size_t>(ReleaseSite::Count);
+
+std::array<std::atomic<std::uint64_t>, EpochSources * PendingSources * ReleaseSources>& jointSources() {
+    static std::array<std::atomic<std::uint64_t>, EpochSources * PendingSources * ReleaseSources> counts{};
+    return counts;
+}
+
+void noteJointSources() {
+    const auto epoch = std::min(static_cast<std::size_t>(GuestMemory::LastCollectEpochSource()), EpochSources - 1);
+    const auto pending = std::min(static_cast<std::size_t>(LastPendingBump()), PendingSources - 1);
+    const auto release = std::min(static_cast<std::size_t>(lastRelease.load(std::memory_order_relaxed)), ReleaseSources - 1);
+    jointSources()[(epoch * PendingSources + pending) * ReleaseSources + release].fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportJointSources() {
+    std::vector<std::pair<std::uint64_t, std::size_t>> counted;
+    std::uint64_t total = 0;
+    auto& counts = jointSources();
+    for (std::size_t index = 0; index < counts.size(); ++index) {
+        const auto count = counts[index].exchange(0, std::memory_order_relaxed);
+        if (count == 0) continue;
+        total += count;
+        counted.emplace_back(count, index);
+    }
+    std::ranges::sort(counted, std::greater<>{});
+    std::string listed;
+    for (std::size_t rank = 0; rank < counted.size() && rank < 12; ++rank) {
+        const auto index = counted[rank].second;
+        const auto release = index % ReleaseSources;
+        const auto pending = index / ReleaseSources % PendingSources;
+        const auto epoch = index / ReleaseSources / PendingSources;
+        listed += (listed.empty() ? "" : ", ") + std::string(GuestMemory::EpochBumpSourceName(static_cast<GuestMemory::EpochBumpSource>(epoch))) + "/" + PendingBumpName(static_cast<PendingBump>(pending)) + "/" + ReleaseSiteNames[release] + " " + std::to_string(counted[rank].first);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits with epoch, pending and releases all moved %llu, by the latest bump of each when the miss was seen (epoch/pending/release, %zu combinations): %s\n", static_cast<unsigned long long>(total), counted.size(), listed.empty() ? "none" : listed.c_str());
+}
+
 void reportExitMisses() {
     auto& misses = exitMisses();
     std::string inputs;
@@ -4479,6 +4526,7 @@ void reportExitMisses() {
     const auto unranged = blockSites(misses.unrangedBlocks);
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) missed exits by the inputs that moved: %s; would hit if only that input were scoped: %s; with the proof scoped by the break log and only that input too: %s\n", combos.empty() ? "none" : combos.c_str(), only.c_str(), withLog.c_str());
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) break log: %llu exits taken because every break since the proof was outside the set (%s); over the proof-moved misses: %llu checked, clears %llu (%llu with nothing else moved), a set without recorded ranges %llu, a window the log cannot cover %llu; blocked by an overlapping break: %s; by an unranged break: %s\n", static_cast<unsigned long long>(logExits), RuntimeSwitches::Set(RuntimeSwitch::NoScopedProofs) ? "off, APS5_NO_SCOPED_PROOFS" : "on", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(clears), static_cast<unsigned long long>(clearsAlone), static_cast<unsigned long long>(unscopedSet), static_cast<unsigned long long>(incomplete), overlapping.c_str(), unranged.c_str());
+    reportJointSources();
     if (GuestMemory::ProofBreakCensusEnabled()) reportBreakCensus();
 }
 
@@ -4590,6 +4638,7 @@ void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResource
         auto& misses = exitMisses();
         misses.misses.Add();
         noteProofLog(moved, log);
+        if (moved[0] && moved[2] && moved[3]) noteJointSources();
         misses.missed[static_cast<std::size_t>(age)].Add();
         if (alone && moved[1]) misses.proofAlone[static_cast<std::size_t>(age)].Add();
         for (std::size_t input = 0; input < moved.size(); ++input) {
@@ -5726,10 +5775,11 @@ std::optional<bool> ShaderResources::certifiedRevalidate(std::span<const Compile
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
     thread_local std::uint64_t certifiedUses = 0;
     if (verify && ++certifiedUses % 64u == 0u) {
-        Certified().verified.fetch_add(1, std::memory_order_relaxed);
+        const auto checked = Certified().verified.fetch_add(1, std::memory_order_relaxed) + 1;
         const bool ok = revalidateFull(shaders, report);
+        const auto disagreed = !ok ? Certified().disagreed.fetch_add(1, std::memory_order_relaxed) + 1 : Certified().disagreed.load(std::memory_order_relaxed);
+        if ((checked & (checked - 1u)) == 0u || checked % 1024u == 0u) std::fprintf(stderr, "[rescache] verify: %llu certified template uses checked, %llu failed the full proof\n", static_cast<unsigned long long>(checked), static_cast<unsigned long long>(disagreed));
         if (!ok) {
-            Certified().disagreed.fetch_add(1, std::memory_order_relaxed);
             std::fprintf(stderr, "[rescache] APS5_VERIFY_DRAW_PIPELINE: a template whose certificate held failed its full proof (failure %zu)\n", report != nullptr ? static_cast<std::size_t>(report->failure) : static_cast<std::size_t>(ProofFailure::Count));
         }
         return ok;

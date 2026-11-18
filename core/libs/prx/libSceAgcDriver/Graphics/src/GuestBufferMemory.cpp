@@ -5949,10 +5949,18 @@ void noteEpochMirrors(bool reused, const GuestBufferMemory::AddressSpace& space)
     }
     thread_local std::uint64_t reuses = 0;
     if (!reused || !verify || reuses++ % 64u != 0u) return;
-    static std::atomic<std::uint64_t> compared{0}, differing{0};
+    static std::atomic<std::uint64_t> compared{0}, differing{0}, sampled{0}, writableRegions{0}, unshadowed{0}, readOnlyRegions{0}, heapRegions{0}, unmirrored{0};
+    sampled.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& region : space.base) {
+        if (region.mirror == nullptr) unmirrored.fetch_add(1, std::memory_order_relaxed);
+        else if (region.mirror->heap) heapRegions.fetch_add(1, std::memory_order_relaxed);
+        else if (!region.mirror->writable) readOnlyRegions.fetch_add(1, std::memory_order_relaxed);
+    }
     for (const auto index : space.writableMirrors) {
         const auto& region = space.base[index];
         const auto& mirror = *region.mirror;
+        writableRegions.fetch_add(1, std::memory_order_relaxed);
+        if (mirror.shadow.empty()) unshadowed.fetch_add(1, std::memory_order_relaxed);
         if (!mirror.writable || mirror.heap || mirror.shadow.empty()) continue;
         constexpr std::uint64_t block = 65536;
         for (auto at = region.begin; at < region.end;) {
@@ -5965,7 +5973,7 @@ void noteEpochMirrors(bool reused, const GuestBufferMemory::AddressSpace& space)
     }
     const auto checks = reuses / 64u + 1u;
     if ((checks & (checks - 1u)) == 0u || checks % 1024u == 0u) {
-        std::fprintf(stderr, "[epoch-mirrors] verify: %llu blocks compared, %llu differ\n", static_cast<unsigned long long>(compared.load()), static_cast<unsigned long long>(differing.load()));
+        std::fprintf(stderr, "[epoch-mirrors] verify: %llu blocks compared, %llu differ; over %llu sampled reuses the spaces held %llu writable mirrored regions (%llu without a shadow), %llu read-only mirrored, %llu heap mirrored (checked by write watch on every use, reused or not), %llu without a mirror\n", static_cast<unsigned long long>(compared.load()), static_cast<unsigned long long>(differing.load()), static_cast<unsigned long long>(sampled.load()), static_cast<unsigned long long>(writableRegions.load()), static_cast<unsigned long long>(unshadowed.load()), static_cast<unsigned long long>(readOnlyRegions.load()), static_cast<unsigned long long>(heapRegions.load()), static_cast<unsigned long long>(unmirrored.load()));
     }
 }
 

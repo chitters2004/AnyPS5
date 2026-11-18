@@ -285,6 +285,7 @@ private:
 enum class PendingBump : std::uint8_t { Unlabelled, MarkLent, Mark, Reconcile, Flush, FlushStarted, FlushEnded, Discard, ClearByKeys, Destroyed, Shadowed, Count };
 const char* PendingBumpName(PendingBump source);
 bool PendingBumpsCounted();
+PendingBump LastPendingBump();
 std::array<std::uint64_t, static_cast<std::size_t>(PendingBump::Count)> PendingBumpCounts();
 
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {

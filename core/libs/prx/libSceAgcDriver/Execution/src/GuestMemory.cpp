@@ -923,6 +923,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+std::atomic<std::uint8_t> lastEpochSource{0};
 std::atomic<std::uint64_t> followedEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -2844,7 +2845,22 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     return tracker.generation.load(std::memory_order_relaxed);
 }
 
+const char* EpochBumpSourceName(EpochBumpSource source) {
+    constexpr std::array<const char*, static_cast<std::size_t>(EpochBumpSource::Count)> names{"unlabelled", "submission", "packet", "drain", "wait", "reap", "followed"};
+    const auto index = static_cast<std::size_t>(source);
+    return index < names.size() ? names[index] : "unknown";
+}
+
+EpochBumpSource LastCollectEpochSource() {
+    return static_cast<EpochBumpSource>(lastEpochSource.load(std::memory_order_relaxed));
+}
+
 void BumpCollectEpoch() {
+    BumpCollectEpoch(EpochBumpSource::Unlabelled);
+}
+
+void BumpCollectEpoch(EpochBumpSource source) {
+    lastEpochSource.store(static_cast<std::uint8_t>(source), std::memory_order_relaxed);
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);

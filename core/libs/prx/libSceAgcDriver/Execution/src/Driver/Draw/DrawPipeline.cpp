@@ -301,7 +301,7 @@ void DrawPipeline::FollowEpoch(std::uint64_t token) {
     static thread_local std::uint64_t followed = 0;
     if (followed == token) return;
     followed = token;
-    GuestMemory::BumpCollectEpoch();
+    GuestMemory::BumpCollectEpoch(GuestMemory::EpochBumpSource::Followed);
     GuestMemory::NoteFollowedEpoch();
 }
 

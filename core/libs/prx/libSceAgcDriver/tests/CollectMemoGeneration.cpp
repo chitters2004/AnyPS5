@@ -420,6 +420,17 @@ void CheckLaterThreadReusesWalk() {
     Require(stage.load() == 3, "a walk made after another thread's ordering point did not answer that thread");
 }
 
+void CheckEpochBumpSources() {
+    BumpCollectEpoch(EpochBumpSource::Reap);
+    Require(LastCollectEpochSource() == EpochBumpSource::Reap, "an epoch bump did not record its source");
+    std::thread other([] { BumpCollectEpoch(EpochBumpSource::Followed); });
+    other.join();
+    Require(LastCollectEpochSource() == EpochBumpSource::Followed, "another thread's epoch bump did not replace the latest source");
+    BumpCollectEpoch();
+    Require(LastCollectEpochSource() == EpochBumpSource::Unlabelled, "an unlabelled epoch bump kept the previous source");
+    Require(std::string(EpochBumpSourceName(EpochBumpSource::Drain)) == "drain" && std::string(EpochBumpSourceName(EpochBumpSource::Count)) == "unknown", "epoch bump sources are misnamed");
+}
+
 void CheckEarlierWalkDoesNotAnswerLaterEpoch() {
     const auto address = Base + 49 * Block + 2 * Page;
     BumpCollectEpoch();
@@ -1084,6 +1095,7 @@ int main(int argc, char** argv) {
         const Arena arena;
 #else
         if (!writeIndexOnly) {
+            CheckEpochBumpSources();
             CheckMemoHitDuringWalk();
             CheckFailedWalkIsRetried();
             CheckSubBlockCollectThatCannotWidenIsObservedOnce();

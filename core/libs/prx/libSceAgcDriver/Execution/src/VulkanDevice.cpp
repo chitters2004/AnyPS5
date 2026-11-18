@@ -4012,9 +4012,13 @@ bool RefreshPresented(Graphics::StorageTexture& resident, const DisplayBuffer& b
     if (!noAdopt && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoHoldSiteBreaks)) GuestMemory::BreakProofs(GuestMemory::ProofBreakSite::HeldState, buffer.address, bytes);
     if (resident.ImageLayers() > 1) resident.RefreshLayers(layer, 1);
     else resident.Refresh();
-    if (verify && !GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes))) {
-        const auto stale = staleRefreshes.fetch_add(1, std::memory_order_relaxed) + 1;
-        std::fprintf(stderr, "[present] APS5_VERIFY_DRAW_PIPELINE: a present refresh left CPU writes unmerged at 0x%llx (stale %llu)\n", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(stale));
+    if (verify) {
+        static std::atomic<std::uint64_t> checked{0};
+        const bool stale = !GuestMemory::UnchangedSince(buffer.address, bytes, resident.GenerationFor(buffer.address, bytes));
+        const auto staleCount = stale ? staleRefreshes.fetch_add(1, std::memory_order_relaxed) + 1 : staleRefreshes.load(std::memory_order_relaxed);
+        if (stale) std::fprintf(stderr, "[present] APS5_VERIFY_DRAW_PIPELINE: a present refresh left CPU writes unmerged at 0x%llx (stale %llu)\n", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(staleCount));
+        const auto count = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((count & (count - 1u)) == 0u || count % 1024u == 0u) std::fprintf(stderr, "[present] verify: %llu present refreshes checked, %llu left CPU writes unmerged\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(staleCount));
     }
     return true;
 }

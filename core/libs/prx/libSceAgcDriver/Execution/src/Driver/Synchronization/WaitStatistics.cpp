@@ -34,7 +34,8 @@ std::chrono::steady_clock::time_point& Driver::lastEpochBump() {
 
 void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     lastEpochBump() = std::chrono::steady_clock::now();
-    GuestMemory::BumpCollectEpoch();
+    using Source = GuestMemory::EpochBumpSource;
+    GuestMemory::BumpCollectEpoch(counter == &EpochBumps::submissions ? Source::Submission : counter == &EpochBumps::packets ? Source::Packet : counter == &EpochBumps::drains ? Source::Drain : counter == &EpochBumps::waits ? Source::Wait : counter == &EpochBumps::reaps ? Source::Reap : Source::Unlabelled);
     if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
     ++(epochBumps().*counter);
 }

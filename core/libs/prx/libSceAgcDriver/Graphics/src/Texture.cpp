@@ -6320,12 +6320,17 @@ bool StorageTexture::OrderedFlushArmedForTest() {
 namespace {
 const bool pendingBumpsCounted = std::getenv("APS5_PROFILE_DRAW") != nullptr;
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(PendingBump::Count)> pendingBumps{};
+std::atomic<std::uint8_t> lastPendingBump{0};
 constexpr std::array<const char*, static_cast<std::size_t>(PendingBump::Count)> PendingBumpNames{"unlabelled", "mark-lent", "mark", "reconcile", "flush", "flush-started", "flush-ended", "discard", "clear-by-keys", "destroyed", "shadowed"};
 }
 
 const char* PendingBumpName(PendingBump source) {
     const auto index = static_cast<std::size_t>(source);
     return index < PendingBumpNames.size() ? PendingBumpNames[index] : "invalid";
+}
+
+PendingBump LastPendingBump() {
+    return static_cast<PendingBump>(lastPendingBump.load(std::memory_order_relaxed));
 }
 
 bool PendingBumpsCounted() {
@@ -6374,6 +6379,7 @@ void StorageTexture::BumpPendingSerial(PendingBump source) {
         logPendingBump(pendingSerial, false, 0, 0);
         GuestMemory::NoteHoldPendingBump();
     } else pendingSerial.fetch_add(1, std::memory_order_release);
+    lastPendingBump.store(static_cast<std::uint8_t>(source), std::memory_order_relaxed);
     if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
@@ -6382,6 +6388,7 @@ void StorageTexture::BumpPendingSerial(PendingBump source, std::uint64_t begin, 
         logPendingBump(pendingSerial, true, begin, end);
         GuestMemory::NoteHoldPendingBump();
     } else pendingSerial.fetch_add(1, std::memory_order_release);
+    lastPendingBump.store(static_cast<std::uint8_t>(source), std::memory_order_relaxed);
     if (pendingBumpsCounted) pendingBumps[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
 }
 
