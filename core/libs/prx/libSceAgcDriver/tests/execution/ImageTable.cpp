@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "tests/TemporaryFile.hpp"
 #include "Recompiler.hpp"
@@ -1955,7 +1956,11 @@ int main(int argc, char** argv) {
             return 0;
         }
         RunTests(*device);
+        const auto throwsBefore = AgcDriver::Graphics::ShaderResources::ImageTableThrowsForTest();
         RunBorderSwizzleTests(*device);
+        const auto throwsMade = AgcDriver::Graphics::ShaderResources::ImageTableThrowsForTest() - throwsBefore;
+        std::fprintf(stderr, "image table: exceptions caught resolving tables with rejected entries: %llu\n", static_cast<unsigned long long>(throwsMade));
+        Require(std::getenv("APS5_PROFILE_DRAW") == nullptr || throwsMade != 0, "image table: the rejected entries were not counted");
         RunAnisoOverrideTests(*device);
         RunReadTests(*device);
         RunLoopKeyTests(*device);

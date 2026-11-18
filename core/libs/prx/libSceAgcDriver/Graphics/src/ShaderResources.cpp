@@ -542,12 +542,29 @@ struct TextureCounters {
     // by a byte compare.
     std::atomic<std::uint64_t> untrackedKept{0};
     std::atomic<std::uint64_t> untrackedCompared{0};
+    std::array<std::atomic<std::uint64_t>, 6> tableThrows{};
+    std::atomic<std::uint64_t> tableThrowNanos{0};
     std::atomic<std::int64_t> lastReport{0};
 };
+
+enum class TableThrow : std::size_t { VariantScan, PartnerScan, Decode, Refusal, Lookup, Sampler };
 
 TextureCounters& TextureCounts() {
     static TextureCounters counters;
     return counters;
+}
+
+bool TextureCountersReported();
+
+std::chrono::steady_clock::time_point tableThrowClock() {
+    return TextureCountersReported() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+}
+
+void noteTableThrow(TableThrow site, std::chrono::steady_clock::time_point start) {
+    if (!TextureCountersReported()) return;
+    auto& counters = TextureCounts();
+    counters.tableThrows[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    counters.tableThrowNanos.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
 }
 
 thread_local std::uint64_t sampledLookupKeyScans = 0;
@@ -566,6 +583,8 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu cleared on the GPU, %llu uploaded on the GPU from host imports, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; dynamic-resolution variants: %llu surfaces, %llu entries substituted, %llu entries rejected; %llu one-layer 2D array entries bound to the 2D texture of their surface; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.cleared), count(counters.imported), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.variantSurfaces), count(counters.variantSubstituted), count(counters.variantRejected), count(counters.arrayViewsShared), count(counters.untrackedKept), count(counters.untrackedCompared));
+    const auto throws = [&](TableThrow site) { return count(counters.tableThrows[static_cast<std::size_t>(site)]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[textures] image table exceptions caught: variant scan %llu, array partner scan %llu, entry decode %llu, entry refusal %llu, entry lookup %llu, sampler entry %llu; %llu us from each throwing try to its catch\n", throws(TableThrow::VariantScan), throws(TableThrow::PartnerScan), throws(TableThrow::Decode), throws(TableThrow::Refusal), throws(TableThrow::Lookup), throws(TableThrow::Sampler), static_cast<unsigned long long>(counters.tableThrowNanos.load(std::memory_order_relaxed) / 1000u));
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -5771,6 +5790,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     return revalidateFull(shaders, report);
 }
 
+std::uint64_t ShaderResources::ImageTableThrowsForTest() {
+    std::uint64_t total = 0;
+    for (const auto& site : TextureCounts().tableThrows) total += site.load(std::memory_order_relaxed);
+    return total;
+}
+
 void ShaderResources::SetRangeSnapshotsEagerForTest(bool eager) {
     eagerRangeSnapshots.store(eager, std::memory_order_relaxed);
     if (eager) return;
@@ -7803,6 +7828,7 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
         std::string rejected;
         if (first + Abi::SamplerEntryElements > context.samplerTableCapacity) rejected = "the sampler table exceeds the device's capacity of " + std::to_string(context.samplerTableCapacity) + " samplers";
         for (std::uint32_t element = first; rejected.empty() && element < first + Abi::SamplerEntryElements; ++element) {
+            const auto start = tableThrowClock();
             try {
                 const auto elementWords = std::span<const std::uint32_t, 4>(binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u, 4u);
                 auto resource = DecodeSamplerResource(elementWords);
@@ -7814,6 +7840,7 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
                 Require(!resource.nonSeamlessCube || context.nonSeamlessCubeMap, "a sampler table entry that disables seamless cube filtering needs VK_EXT_non_seamless_cube_map because dynamic texture/sampler pairing is not implemented");
                 Require(!SingleLevelSamplerWords(elementWords, true, false).has_value(), "a sampler table entry with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Sampler, start);
                 rejected = error.what();
             }
         }
@@ -7865,10 +7892,12 @@ std::vector<std::uint32_t> variantRepresentatives(VkDevice device, const ShaderR
         if (element < binding.imageWritten.size() && binding.imageWritten[element]) continue;
         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
         GuestTextureResource resource{};
+        const auto start = tableThrowClock();
         try {
             if (IsNullTextureResource(words)) continue;
             resource = DecodeTextureResource(words);
         } catch (const std::runtime_error&) {
+            noteTableThrow(TableThrow::VariantScan, start);
             continue;
         }
         const FamilyKey key{resource.baseAddress, resource.pipeBankXor, resource.format, static_cast<std::uint32_t>(resource.tileMode), static_cast<std::uint32_t>(resource.dimension), resource.mipCount, resource.baseLevel, resource.lastLevel, resource.depthOrLastArray, resource.baseArray};
@@ -7928,10 +7957,12 @@ std::vector<std::uint32_t> arrayPartners(const ShaderRecompiler::DescriptorBindi
         if (element < binding.imageWritten.size() && binding.imageWritten[element]) continue;
         const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
         GuestTextureResource resource{};
+        const auto start = tableThrowClock();
         try {
             if (IsNullSampledTextureResource(words)) continue;
             resource = DecodeTextureResource(words);
         } catch (const std::runtime_error&) {
+            noteTableThrow(TableThrow::PartnerScan, start);
             continue;
         }
         std::array<std::uint32_t, 8> key{};
@@ -7983,6 +8014,7 @@ void ShaderResources::resolveImageTables() {
             item->imageAllocations[static_cast<std::size_t>(table.elementBase) + element] = textures.size() - 1u;
         };
         const auto refusal = [&](std::uint32_t element, std::span<const std::uint32_t> words, const std::shared_ptr<Texture>& texture, const GuestTextureResource& resource) -> std::string {
+            const auto start = tableThrowClock();
             try {
                 RequireFilterMinmax(context, texture->ViewFormat(), binding.imageSamplers.at(element), stageSamplers);
                 RequireBorderSwizzle(resource.bcSwizzle, binding.imageSamplers.at(element), stageSamplers);
@@ -8000,6 +8032,7 @@ void ShaderResources::resolveImageTables() {
                     Require(!SingleLevelSamplerWords(source.words, true, false).has_value(), "an image table entry paired with anisotropic ANISO_OVERRIDE needs dynamic texture mip-level pairing, which is not implemented");
                 }
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Refusal, start);
                 return error.what();
             }
             return {};
@@ -8070,9 +8103,11 @@ void ShaderResources::resolveImageTables() {
         };
         const auto resolveLive = [&](std::uint32_t element, std::span<const std::uint32_t> words) -> std::string {
             DecodedEntry decoded;
+            const auto start = tableThrowClock();
             try {
                 decoded = decodeEntry(element, words);
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Decode, start);
                 decoded.rejected = error.what();
             }
             if (!decoded.rejected.empty()) {
@@ -8081,9 +8116,11 @@ void ShaderResources::resolveImageTables() {
             }
             const auto sampled = prepareSampled(element, words, decoded);
             std::shared_ptr<Texture> texture;
+            const auto lookupStart = tableThrowClock();
             try {
                 texture = lookupSampled(element, sampled);
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Lookup, lookupStart);
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 return error.what();
             }
@@ -8213,9 +8250,11 @@ void ShaderResources::resolveImageTables() {
                 }
             }
             DecodedEntry decoded;
+            const auto start = tableThrowClock();
             try {
                 decoded = decodeEntry(element, words);
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Decode, start);
                 decoded.rejected = error.what();
             }
             if (!decoded.rejected.empty()) {
@@ -8271,9 +8310,11 @@ void ShaderResources::resolveImageTables() {
             }
             const auto sampled = prepareSampled(element, words, decoded);
             std::shared_ptr<Texture> texture;
+            const auto lookupStart = tableThrowClock();
             try {
                 texture = lookupSampled(element, sampled);
             } catch (const std::runtime_error& error) {
+                noteTableThrow(TableThrow::Lookup, lookupStart);
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
                 if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
                 continue;

@@ -1,6 +1,13 @@
 if(BUILD_TESTING)
     set_tests_properties(agc_driver_image_table PROPERTIES TIMEOUT 30
             FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-|was not found but was requested by env var VK_INSTANCE_LAYERS")
+    add_test(NAME agc_driver_image_table_throw_counts COMMAND agc_driver_image_table_tests)
+    set_tests_properties(agc_driver_image_table_throw_counts PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1" TIMEOUT 30
+            PASS_REGULAR_EXPRESSION "image table: exceptions caught resolving tables with rejected entries: [1-9][0-9]*\n.*image table tests passed"
+            FAIL_REGULAR_EXPRESSION "SYNC-HAZARD-|VUID-|was not found but was requested by env var VK_INSTANCE_LAYERS")
+    if(WIN32)
+        set_tests_properties(agc_driver_image_table_throw_counts PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_nested_image_table COMMAND agc_driver_image_table_tests --nested)
     add_test(NAME agc_driver_nested_image_table_large COMMAND agc_driver_image_table_tests --nested-large)
     add_test(NAME agc_driver_nested_image_table_budget COMMAND agc_driver_image_table_tests --nested-budget)
