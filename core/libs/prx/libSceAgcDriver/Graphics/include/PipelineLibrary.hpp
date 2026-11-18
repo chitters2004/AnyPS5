@@ -53,6 +53,7 @@ unsigned PipelineLibraryWorkers();
 
 struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> built{};
+    std::array<std::uint64_t, 4> builtNanoseconds{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };

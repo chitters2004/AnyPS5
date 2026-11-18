@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -231,11 +232,15 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         // journal replay) run at once; a part another thread built meanwhile is kept, this one dropped.
         lock.unlock();
         VkResult created;
+        std::chrono::steady_clock::duration elapsed{};
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            const auto started = std::chrono::steady_clock::now();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
+            elapsed = std::chrono::steady_clock::now() - started;
         }
         lock.lock();
+        device.counters.builtNanoseconds[part] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count());
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);
