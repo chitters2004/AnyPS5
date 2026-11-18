@@ -882,6 +882,9 @@ private:
     std::size_t rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes);
     void noteRangeWrite() const;
     void noteUnwatchedRange() const;
+    void noteRangedBreak() const;
+    void accountSnapshots(bool held);
+    std::uint64_t snapshotBytesHeld = 0;
     std::size_t rangeWriteOwner(std::uint64_t begin, std::uint64_t end, bool* tableBytesSame) const;
     bool proofBytesUnchanged(std::size_t index, std::uint64_t begin, std::uint64_t end);
     std::vector<std::uint64_t> proofRangeGenerations;

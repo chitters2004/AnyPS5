@@ -1317,15 +1317,22 @@ void rangeVersionStorageTests(Context context) {
         }
     } release{resources, context.device};
     Require(resources->Reusable() && resources->StorageImages().size() == 1, "the range-version storage template is not reusable");
-    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
-        std::puts("range versions over a storage image: skipped, its host import left the memory unwatched");
-        return;
-    }
     ShaderResources::ProofReport report{};
     const auto exitTaken = [&] {
         const auto proofs = EpochProofCounts().resourceProofs.Sum();
         return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
     };
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        if (AgcDriver::Graphics::EpochProofCountsProfiled()) {
+            for (int round = 0; round < 4; ++round) static_cast<void>(exitTaken());
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            const bool unwatched = exitTaken();
+            Require(!unwatched, "a storage template over an unwatched import took the range-version exit");
+            AgcDriver::Graphics::ReportEpochProofCounts();
+        }
+        std::puts("range versions over a storage image: skipped, its host import left the memory unwatched");
+        return;
+    }
     bool settled = false;
     for (int round = 0; round < 4 && !settled; ++round) settled = exitTaken();
     Require(settled, "an unchanged storage template never took the epoch exit");

@@ -4417,7 +4417,19 @@ struct RangeWriteCounts {
     ProfileCounter snapshotsDropped;
     std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unwatchedOwners;
     std::array<ProfileCounter, RangeWriteSizes.size()> unwatchedSizes;
+    std::array<ProfileCounter, 3> unwatchedImports;
+    ProfileCounter rangedBreakLogShort;
+    ProfileCounter rangedBreakBlockShared;
+    ProfileCounter rangedBreakUnranged;
+    std::array<ProfileCounter, GuestMemory::ProofBreakSiteCount> rangedBreakSites;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> rangedBreakOwners;
+    std::array<ProfileCounter, RangeWriteSizes.size()> rangedBreakSizes;
 };
+
+std::atomic<std::uint64_t> snapshotSetsHeld{0};
+std::atomic<std::uint64_t> snapshotRangesHeld{0};
+std::atomic<std::uint64_t> snapshotBytesHeldTotal{0};
+std::atomic<std::uint64_t> snapshotBytesHeldPeak{0};
 
 RangeWriteCounts& rangeWriteCounts() {
     static RangeWriteCounts counts;
@@ -4474,8 +4486,21 @@ std::string takeRangeWriteLine() {
     const auto taken = counts.snapshotsTaken.Take();
     const auto dropped = counts.snapshotsDropped.Take();
     const auto unwatchedOwners = list(counts.unwatchedOwners, RangeWriteOwnerNames);
+    std::array<const char*, GuestMemory::ProofBreakSiteCount> siteNames{};
+    for (std::size_t site = 0; site < siteNames.size(); ++site) siteNames[site] = GuestMemory::ProofBreakSiteName(static_cast<GuestMemory::ProofBreakSite>(site));
+    const auto unwatchedImported = counts.unwatchedImports[0].Take();
+    const auto watchedImported = counts.unwatchedImports[1].Take();
+    const auto notImported = counts.unwatchedImports[2].Take();
+    const auto logShort = counts.rangedBreakLogShort.Take();
+    const auto blockShared = counts.rangedBreakBlockShared.Take();
+    const auto rangedUnranged = counts.rangedBreakUnranged.Take();
+    const auto rangedSites = list(counts.rangedBreakSites, siteNames);
+    const auto rangedOwners = list(counts.rangedBreakOwners, RangeWriteOwnerNames);
+    const auto rangedSizes = list(counts.rangedBreakSizes, RangeWriteSizes);
+    const auto heldBytes = snapshotBytesHeldTotal.load(std::memory_order_relaxed);
+    const auto peakBytes = snapshotBytesHeldPeak.exchange(heldBytes, std::memory_order_relaxed);
     const auto unwatchedSizes = list(counts.unwatchedSizes, RangeWriteSizes);
-    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes;
+    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes + "; by host import: inside an import left unwatched " + std::to_string(unwatchedImported) + ", inside a watched import " + std::to_string(watchedImported) + ", in no import " + std::to_string(notImported) + "; ranged proof breaks: break log too short " + std::to_string(logShort) + ", no logged break over the range (a break elsewhere in its 64 KiB block) " + std::to_string(blockShared) + ", an unranged break in the window " + std::to_string(rangedUnranged) + ", by the overlapping break's site " + rangedSites + "; by the range's owner " + rangedOwners + "; by size " + rangedSizes + "; snapshots held now: sets " + std::to_string(snapshotSetsHeld.load(std::memory_order_relaxed)) + ", ranges " + std::to_string(snapshotRangesHeld.load(std::memory_order_relaxed)) + ", bytes " + std::to_string(heldBytes) + " (peak in the window " + std::to_string(std::max(peakBytes, heldBytes)) + ")";
     return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed) + "; sub-page ranges whose bytes match the proof's: " + (bytes.empty() ? "none compared" : bytes);
 }
 
@@ -5345,6 +5370,7 @@ void ShaderResources::recordProofRanges() {
         else proofRanges[kept++] = range;
     }
     proofRanges.resize(kept);
+    accountSnapshots(false);
     proofRangeBytes.clear();
     proofRangeGenerations.assign(proofRanges.size(), 0);
     if (!rangeVersionsOn()) return;
@@ -5363,6 +5389,26 @@ void ShaderResources::recordProofRanges() {
         proofRangeBytes.emplace_back(begin, std::move(copy));
         if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().snapshotsTaken.Add();
     }
+    accountSnapshots(true);
+}
+
+void ShaderResources::accountSnapshots(bool held) {
+    if (held) {
+        if (proofRangeBytes.empty()) return;
+        snapshotBytesHeld = 0;
+        for (const auto& [address, copy] : proofRangeBytes) snapshotBytesHeld += copy.size();
+        snapshotSetsHeld.fetch_add(1, std::memory_order_relaxed);
+        snapshotRangesHeld.fetch_add(proofRangeBytes.size(), std::memory_order_relaxed);
+        const auto total = snapshotBytesHeldTotal.fetch_add(snapshotBytesHeld, std::memory_order_relaxed) + snapshotBytesHeld;
+        auto peak = snapshotBytesHeldPeak.load(std::memory_order_relaxed);
+        while (peak < total && !snapshotBytesHeldPeak.compare_exchange_weak(peak, total, std::memory_order_relaxed)) {}
+        return;
+    }
+    if (proofRangeBytes.empty()) return;
+    snapshotSetsHeld.fetch_sub(1, std::memory_order_relaxed);
+    snapshotRangesHeld.fetch_sub(proofRangeBytes.size(), std::memory_order_relaxed);
+    snapshotBytesHeldTotal.fetch_sub(snapshotBytesHeld, std::memory_order_relaxed);
+    snapshotBytesHeld = 0;
 }
 
 bool ShaderResources::stalePlanesRead() {
@@ -5523,6 +5569,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
                 else rangeVersionCounts().declines[decline].Add();
                 if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Changed)) noteRangeWrite();
                 if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::CollectUnwatched)) noteUnwatchedRange();
+                if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Effect)) noteRangedBreak();
                 if (decline == 0 && rangePassedOnBytes != 0) {
                     rangeWriteCounts().byteExits.Add();
                     rangeWriteCounts().byteRanges.Add(rangePassedOnBytes);
@@ -5748,12 +5795,28 @@ bool ShaderResources::proofBytesUnchanged(std::size_t index, std::uint64_t begin
     return same;
 }
 
+void ShaderResources::noteRangedBreak() const {
+    const auto [begin, end] = rangeDeclined;
+    if (end <= begin) return;
+    auto& counts = rangeWriteCounts();
+    counts.rangedBreakOwners[rangeWriteOwner(begin, end, nullptr)].Add();
+    counts.rangedBreakSizes[rangeWriteSize(end - begin)].Add();
+    const std::pair<std::uint64_t, std::uint64_t> range{begin, end};
+    const auto window = GuestMemory::ProofBreaksSince(proved.proof, std::span(&range, 1));
+    if (!window.complete) counts.rangedBreakLogShort.Add();
+    else if (window.clear) counts.rangedBreakBlockShared.Add();
+    else if (window.unranged) counts.rangedBreakUnranged.Add();
+    else counts.rangedBreakSites[static_cast<std::size_t>(window.blocker)].Add();
+}
+
 void ShaderResources::noteUnwatchedRange() const {
     const auto [begin, end] = rangeDeclined;
     if (end <= begin) return;
     auto& counts = rangeWriteCounts();
     counts.unwatchedOwners[rangeWriteOwner(begin, end, nullptr)].Add();
     counts.unwatchedSizes[rangeWriteSize(end - begin)].Add();
+    const auto* import = ExistingHostImportFor(context, begin, static_cast<std::size_t>(end - begin));
+    counts.unwatchedImports[import == nullptr ? 2 : import->unwatched ? 0 : 1].Add();
 }
 
 void ShaderResources::noteRangeWrite() const {
@@ -8344,6 +8407,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    accountSnapshots(false);
     release();
 }
 
