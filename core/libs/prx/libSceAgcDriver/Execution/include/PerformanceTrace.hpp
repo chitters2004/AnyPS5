@@ -921,6 +921,10 @@ public:
         return AgcDriverTraceRecording_nid_postfix();
     }
 
+    static bool Slicing() {
+        return buffering.load(std::memory_order_relaxed);
+    }
+
     static TraceThread* Thread() {
         return AgcDriverTraceThread_nid_postfix();
     }

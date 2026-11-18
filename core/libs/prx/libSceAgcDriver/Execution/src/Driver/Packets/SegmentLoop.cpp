@@ -683,7 +683,7 @@ void Driver::runLeanPackets(Submission& submission, QueueState& queue, PacketTab
             }
         } tagReset{tagged, entry.Has(LeanPacket::Plain) && !predicated};
         const bool verifyPacket = LeanFront::Due(frontLatch, LeanFront::Item::Packet);
-        if (!Timers && !report && !predicated && !flip && !verifyPacket && !run.packetEpoch && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::KeepsFinisher) && entry.pipeline == LeanPacket::Pipeline::Keeps && PacketRules::registerRunOpcode(opcode) && PacketRules::registerRuns()) {
+        if (!report && !predicated && !flip && !verifyPacket && !run.packetEpoch && entry.Has(LeanPacket::Plain) && entry.Has(LeanPacket::KeepsFinisher) && entry.pipeline == LeanPacket::Pipeline::Keeps && PacketRules::registerRunOpcode(opcode) && PacketRules::registerRuns()) {
             FlushInputs flushInputs;
             if (flushDue(run.gate, flushInputs)) {
                 if (flushInputs.given && (flushInputs.pending.has_value() || flushInputs.completions)) flushInputs.now = std::chrono::steady_clock::now();
@@ -716,8 +716,11 @@ void Driver::runLeanPackets(Submission& submission, QueueState& queue, PacketTab
             next = at;
             run.packets += done - 1;
             packetsDone.fetch_add(done);
+            registerRunPackets.fetch_add(done, std::memory_order_relaxed);
+            if (PacketRules::registerRunStats()) PacketRules::noteRegisterRun(done);
             continue;
         }
+        if (!predicated && PacketRules::registerRunOpcode(opcode) && PacketRules::registerRunStats()) PacketRules::noteRegisterRun(0);
         const auto pipelineVerdict = [&] {
             switch (entry.pipeline) {
                 case LeanPacket::Pipeline::Keeps: return true;
