@@ -401,6 +401,10 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         appendKey(key, identity.low);
         appendKey(key, identity.high);
         appendKey(key, KeyedPushOffset(shader));
+        auto& modules = shader.stage == Stage::Fragment ? keys.fragmentModule : keys.preRasterizationModules;
+        appendKey(modules, shader.stage);
+        appendKey(modules, identity.low);
+        appendKey(modules, identity.high);
         appendKey(key, state.meshLayerBase);
         appendKey(key, state.meshLayerCount);
         if (resources.split) {

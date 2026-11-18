@@ -206,6 +206,11 @@ extern "C" void AgcDriverLibraryPartOrigins_nid_postfix(std::uint64_t* prebuilt,
     std::copy(counters.prebuiltUsedByDraw.begin(), counters.prebuiltUsedByDraw.end(), prebuiltUsed);
 }
 
+extern "C" void AgcDriverLibraryPartDetail_nid_postfix(std::uint64_t* fields) {
+    const auto counters = AgcDriver::DriverDetail::Driver::Get().LibraryCounters();
+    for (const auto* field : {&counters.drawNanoseconds, &counters.maxNanoseconds, &counters.waitNanoseconds, &counters.concurrentBuilds, &counters.specializationEntries, &counters.spirvBytes, &counters.drawBuiltWithPrebuiltModules}) fields = std::copy(field->begin(), field->end(), fields);
+}
+
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitSettledFor(std::chrono::milliseconds(milliseconds));
 }

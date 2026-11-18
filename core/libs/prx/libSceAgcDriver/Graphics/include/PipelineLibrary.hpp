@@ -22,6 +22,8 @@ struct PipelineLibraryKeys {
     std::vector<std::byte> layout;
     std::vector<std::byte> preRasterizationLayout;
     std::vector<std::byte> fragmentLayout;
+    std::vector<std::byte> preRasterizationModules;
+    std::vector<std::byte> fragmentModule;
     std::uint32_t preRasterizationSets = 0;
     std::uint32_t fragmentSets = 0;
 };
@@ -57,6 +59,13 @@ struct PipelineLibraryCounters {
     std::array<std::uint64_t, 4> builtByPrebuild{};
     std::array<std::uint64_t, 4> builtByDraw{};
     std::array<std::uint64_t, 4> prebuiltUsedByDraw{};
+    std::array<std::uint64_t, 4> drawNanoseconds{};
+    std::array<std::uint64_t, 4> maxNanoseconds{};
+    std::array<std::uint64_t, 4> waitNanoseconds{};
+    std::array<std::uint64_t, 4> concurrentBuilds{};
+    std::array<std::uint64_t, 4> specializationEntries{};
+    std::array<std::uint64_t, 4> spirvBytes{};
+    std::array<std::uint64_t, 4> drawBuiltWithPrebuiltModules{};
     std::uint64_t linked = 0;
     std::uint64_t optimized = 0;
 };
