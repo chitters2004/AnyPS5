@@ -13064,6 +13064,30 @@ void verifyRuntimeImageSwitchDeduplication() {
     require(mipTargets.at(0u) != mipTargets.at(1u), "runtime image switch deduplication: storage image modes with different mip modes shared an OpSwitch target");
 }
 
+void verifyBufferSubstituteSnapshots() {
+    using ShaderRecompiler::BufferSubstitute;
+    using ShaderRecompiler::BufferSubstituteTable;
+    std::vector<BufferSubstitute> slots(3);
+    slots[1] = {7u, 8u, 0u, 0u, true};
+    BufferSubstituteTable table(std::move(slots));
+    const auto first = table.Slots();
+    const auto before = allocationCount;
+    for (int read = 0; read < 1000; ++read) require(table.Slots() == first, "an unchanged substitute table gave a new snapshot");
+    require(allocationCount == before, "reading an unchanged substitute table allocated");
+    require(BufferSubstituteTable::View(first).size() == 3 && BufferSubstituteTable::View(nullptr).empty(), "a substitute snapshot view has the wrong size");
+    table.Learn(0, {5u, 6u, 1u, 2u, false});
+    const auto learned = table.Slots();
+    require(learned != first, "learning a substitute kept the old snapshot");
+    require(!(*first)[0].known && (*first)[0].word1 == 0u, "learning a substitute changed a snapshot already handed out");
+    require((*learned)[0].known && (*learned)[0].word1 == 5u && (*learned)[0].tail == 2u, "a learned substitute is missing from the next snapshot");
+    require((*learned)[1] == BufferSubstitute{7u, 8u, 0u, 0u, true}, "learning one substitute changed another");
+    table.Learn(0, {9u, 9u, 9u, 9u, false});
+    table.Learn(1, {9u, 9u, 9u, 9u, false});
+    table.Learn(3, {9u, 9u, 9u, 9u, false});
+    require(table.Slots() == learned, "learning a known or missing substitute gave a new snapshot");
+    require((*learned)[0].word1 == 5u && (*learned)[1].word1 == 7u, "learning a known substitute replaced it");
+}
+
 void verifyTableKeep() {
     using namespace ShaderRecompiler;
     std::vector<std::uint32_t> code{0xf40c0200u, 0xfa000000u, 0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf4000400u, 0xfa000050u, 0xf4080a00u, 0xfa000080u, 0xbf8cc07fu, 0xf42c0814u, 0xfa000000u, 0xbf8cc07fu, 0xbf068010u, 0xbf850008u};
@@ -13195,6 +13219,11 @@ int main(int argc, char** argv) {
         setenv("ANYPS5_NO_SHADER_CACHE", "1", 1);
 #endif
         using namespace ShaderRecompiler;
+        if (argc == 2 && std::string_view(argv[1]) == "--buffer-substitute-snapshots") {
+            verifyBufferSubstituteSnapshots();
+            std::cout << "Buffer substitute tables hand out shared snapshots and replace them when they learn\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--table-keep") {
             verifyTableKeep();
             std::cout << "A kept table is read as it was at the draw packet and listed with the capture's regions\n";
