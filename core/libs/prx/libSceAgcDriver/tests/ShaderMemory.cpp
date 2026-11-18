@@ -664,6 +664,13 @@ void verifyResultMemoReseenPatched() {
     require(!compileResultMemoPixel(3u) && ResultMemoReseenCounts().patchedBefore == 1u, "result memo reseen patched: a new patch was counted as patched before");
     const auto counts = ResultMemoReseenCounts();
     require(counts.evictedThenPatched == 0u && counts.evictedThenPopulated == 0u, "result memo reseen patched: a memo without evictions counted an evicted key");
+    const auto patchedResult = resultMemoPixel(4u);
+    require(patchedResult->bindings.empty() && !patchedResult->pushConstants.empty(), "result memo reseen patched: the pixel shader no longer patches push words alone");
+    const auto copies = ResultMemoReseenCounts();
+    require(copies.copyTouched == 4u && copies.copyUntouchedWords == 0u, ("result memo reseen patched: four patches of push words were not counted as one rewritten allocation each (" + std::to_string(copies.copyTouched) + " rewritten, " + std::to_string(copies.copyUntouchedWords) + " untouched)").c_str());
+    std::uint64_t allocations = 0;
+    for (const bool used : {!patchedResult->vertexInputPatches.empty(), !patchedResult->runtimeImageResources.empty(), !patchedResult->vertexInputs.empty(), !patchedResult->parameterExports.empty(), !patchedResult->fragmentParameters.empty(), !patchedResult->stencilReferences.empty(), !patchedResult->shaderDataUserWords.empty(), !patchedResult->specialization.empty(), !patchedResult->vertexAttributes.empty(), !patchedResult->imageTablePoison.empty(), !patchedResult->imageTableRanges.empty(), !patchedResult->imageTableReadRanges.empty()}) allocations += used ? 1u : 0u;
+    require(allocations != 0u && copies.copyInvariant == 4u * allocations, ("result memo reseen patched: " + std::to_string(copies.copyInvariant) + " invariant allocations over four patches, expected " + std::to_string(4u * allocations)).c_str());
 }
 
 void verifyResultMemoBudgetMasked() {

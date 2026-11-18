@@ -1051,6 +1051,9 @@ struct ResultMemoReseen {
     std::uint64_t spares = 0;
     std::array<std::uint64_t, ResultMemoHeldAges> heldAge{};
     std::array<std::uint64_t, ResultMemoHeldRefs> heldRefs{};
+    std::uint64_t copyTouched = 0;
+    std::uint64_t copyUntouchedWords = 0;
+    std::uint64_t copyInvariant = 0;
 };
 [[nodiscard]] ResultMemoReseen ResultMemoReseenCounts();
 void SetResultMemoRecycleGate(bool (*gate)());
