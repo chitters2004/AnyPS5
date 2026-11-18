@@ -27,7 +27,8 @@ if(BUILD_TESTING)
     set_property(TEST agc_driver_target_memo_draw_pipeline agc_driver_target_memo_plan_verify APPEND PROPERTY ENVIRONMENT APS5_NO_PASS_ATTACHMENT_MEMO=1)
     add_test(NAME agc_driver_target_memo_verify COMMAND agc_driver_target_memo_tests)
     add_test(NAME agc_driver_target_memo_disabled COMMAND agc_driver_target_memo_tests)
-    foreach(mode IN ITEMS verify disabled)
+    add_test(NAME agc_driver_target_memo_pass_memo COMMAND agc_driver_target_memo_tests)
+    foreach(mode IN ITEMS verify disabled pass_memo)
         set_tests_properties(agc_driver_target_memo_${mode} PROPERTIES
                 TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
                 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PROFILE_DRAW=1")

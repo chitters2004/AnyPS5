@@ -214,6 +214,10 @@ bool memoServes() {
     return serves && !memoSwitchedOff();
 }
 
+bool targetMemoServesInPass() {
+    return memoServes() && !passMemoServes() && (std::getenv("APS5_VERIFY_PASS_ATTACHMENTS") == nullptr || std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr);
+}
+
 bool memoCounted() {
     static const bool counted = std::getenv("APS5_PROFILE_TARGET_MEMO") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
     return counted;
@@ -239,13 +243,24 @@ void requireMemoEvent(const MemoEvents& before, TargetMemoEvent event, std::uint
     Require(before.Moved(event) == expected, what + ": " + TargetMemoEventName(event) + " counted " + std::to_string(before.Moved(event)) + ", expected " + std::to_string(expected) + " (" + before.Text() + ")");
 }
 
+void breakPass() {
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "no active recorder whose render pass the test can end");
+    static_cast<void>(recorder->Commands());
+}
+
 void arm(AgcDriver::VulkanDevice& device, const ColorTarget& color, const DrawOptions& options = {}) {
     for (int repeat = 0; repeat < 3; ++repeat) draw(device, color, options);
+    if (passMemoServes()) {
+        breakPass();
+        draw(device, color, options);
+    }
     const auto before = lookups();
     const MemoEvents events;
     draw(device, color, options);
     Require(!LookupOutcomes::Profiled() || (lookups() != before) == memoResolves(), memoResolves() ? "a draw without the memo did not look up its targets" : "a draw that repeats the previous draw's targets looked them up");
-    const auto served = memoServes() && memoCounted() ? 1u : 0u;
+    const auto served = targetMemoServesInPass() && memoCounted() ? 1u : 0u;
     requireMemoEvent(events, TargetMemoEvent::Hit, served, "a repeated draw's target memo count");
     requireMemoEvent(events, TargetMemoEvent::Accept, served, "a repeated draw's target memo count");
     requireMemoEvent(events, TargetMemoEvent::VerifyChecked, std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr ? served : 0u, "a repeated draw's target memo count");
@@ -1575,13 +1590,6 @@ void unchangedMemo(AgcDriver::VulkanDevice& device) {
     }
 }
 
-void breakPass() {
-    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-    auto* recorder = Recorder::Active();
-    Require(recorder != nullptr, "no active recorder whose render pass the test can end");
-    static_cast<void>(recorder->Commands());
-}
-
 enum class Server { Pass, Target, Full };
 
 void requireServedBy(AgcDriver::VulkanDevice& device, const ColorTarget& color, Server server, bool consulted, const std::string& what) {
@@ -1601,7 +1609,7 @@ void memoOrder(AgcDriver::VulkanDevice& device) {
     Require(LookupOutcomes::Profiled() && memoCounted(), "the memo order test needs APS5_PROFILE_DRAW");
     const bool pass = passMemoServes();
     const bool target = memoServes();
-    const bool targetInPass = target && !pass && (std::getenv("APS5_VERIFY_PASS_ATTACHMENTS") == nullptr || std::getenv("APS5_VERIFY_TARGET_MEMO") != nullptr);
+    const bool targetInPass = targetMemoServesInPass();
     const auto inPass = pass ? Server::Pass : targetInPass ? Server::Target : Server::Full;
     const auto afterBreak = target ? Server::Target : Server::Full;
     const auto color = colorTarget();
