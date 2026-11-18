@@ -3123,6 +3123,7 @@ void ShaderResources::noteReusable() {
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
         if (serial == 0) return;
         directRegions.push_back({begin, end, serial});
+        directRegions.back().mirror = !imported;
         mirrored = mirrored || !imported;
     }
     bool bounded = false;
@@ -4160,6 +4161,18 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
     return nullptr;
 }
 
+namespace {
+std::atomic<void (*)(ShaderResources::RangeVersionPoint)> rangeVersionHook{nullptr};
+
+void rangeVersionPoint(ShaderResources::RangeVersionPoint point) {
+    if (auto* hook = rangeVersionHook.load(std::memory_order_acquire); hook != nullptr) hook(point);
+}
+}
+
+void ShaderResources::SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point)) {
+    rangeVersionHook.store(hook, std::memory_order_release);
+}
+
 bool ShaderResources::EpochProofs() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoEpochProofs) && DriverDetail::DrawPipeline::Depth() != 0;
 }
@@ -4363,6 +4376,202 @@ ScopeLevels& scopeLevels() {
     return levels;
 }
 
+bool verifyingExits();
+
+constexpr std::size_t RangeExitChecks = 5;
+constexpr std::size_t RangeForeignPending = RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Count);
+constexpr std::size_t RangeSourceBehind = RangeForeignPending + 1;
+constexpr std::size_t RangeDeclineCount = RangeSourceBehind + 1;
+constexpr std::size_t ScopeRangeExit = 0;
+constexpr std::size_t ScopeRangeBytes = 1;
+constexpr std::size_t ScopeRangeRebase = 2;
+constexpr std::size_t ScopeRangeNotTried = 3;
+constexpr std::size_t ScopeRangeDeclines = 4;
+constexpr std::size_t ScopeRangeSlots = ScopeRangeDeclines + RangeDeclineCount;
+enum class RangeSetClass : std::uint8_t { Storage, Tables, Sampled, Count };
+
+struct RangeVersionCounts {
+    std::array<ProfileCounter, 2> exits;
+    std::array<ProfileCounter, RangeDeclineCount> declines;
+    std::array<std::array<ProfileCounter, static_cast<std::size_t>(RangeSetClass::Count)>, 2> verified;
+    ProfileCounter disagreements;
+    ProfileCounter concurrent;
+};
+
+RangeVersionCounts& rangeVersionCounts() {
+    static RangeVersionCounts counts;
+    return counts;
+}
+
+enum class RangeWriteOwner : std::size_t { TableSpan, DccKeys, ImageTable, Described, Texture, StorageImage, ImportedRegion, MirroredRegion, Subscription, Other, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(RangeWriteOwner::Count)> RangeWriteOwnerNames{"compared table span", "DCC keys", "described image table", "described range", "texture surface", "storage image", "imported buffer region", "mirrored image region", "write subscription span", "other recorded range"};
+constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::RangeWriteSource::Count)> RangeWriteSourceNames{"CPU page", "write-walk page", "driver block", "driver piece"};
+constexpr std::array<const char*, 4> RangeWriteShares{"under 1/16", "under 1/4", "under all", "all"};
+constexpr std::array<const char*, 4> RangeWriteSizes{"under 4 KiB", "under 64 KiB", "under 1 MiB", "1 MiB or more"};
+
+struct RangeWriteCounts {
+    std::array<ProfileCounter, static_cast<std::size_t>(GuestMemory::RangeWriteSource::Count)> sources;
+    ProfileCounter straddlesOnly;
+    std::array<ProfileCounter, RangeWriteShares.size()> shares;
+    std::array<ProfileCounter, RangeWriteSizes.size()> sizes;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> owners;
+    ProfileCounter sameTableBytes;
+    ProfileCounter undescribed;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> compared;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unchanged;
+    ProfileCounter byteExits;
+    ProfileCounter byteRanges;
+    ProfileCounter rebased;
+    ProfileCounter rebaseExits;
+    ProfileCounter rebaseRanges;
+    ProfileCounter compareCalls;
+    ProfileCounter compareBytes;
+    ProfileCounter compareDiffered;
+    ProfileCounter noSnapshot;
+    ProfileCounter snapshotsTaken;
+    ProfileCounter snapshotsDropped;
+    std::array<ProfileCounter, static_cast<std::size_t>(RangeWriteOwner::Count)> unwatchedOwners;
+    std::array<ProfileCounter, RangeWriteSizes.size()> unwatchedSizes;
+};
+
+RangeWriteCounts& rangeWriteCounts() {
+    static RangeWriteCounts counts;
+    return counts;
+}
+
+constexpr std::uint64_t RangeWriteSnapshotBytes = 4096;
+constexpr std::uint64_t RangeSnapshotSetBytes = 16384;
+std::atomic<std::uint64_t> rangeWriteSnapshotBytes{RangeWriteSnapshotBytes};
+
+std::size_t rangeWriteShare(std::uint64_t written, std::uint64_t bytes) {
+    if (written >= bytes) return 3;
+    if (written * 16 < bytes) return 0;
+    if (written * 4 < bytes) return 1;
+    return 2;
+}
+
+std::size_t rangeWriteSize(std::uint64_t bytes) {
+    if (bytes < 4096) return 0;
+    if (bytes < 65536) return 1;
+    if (bytes < 1048576) return 2;
+    return 3;
+}
+
+std::string takeRangeWriteLine() {
+    auto& counts = rangeWriteCounts();
+    const auto list = [](auto& counters, const auto& names) {
+        std::string text;
+        for (std::size_t index = 0; index < counters.size(); ++index) text += (index == 0 ? "" : ", ") + std::string(names[index]) + " " + std::to_string(counters[index].Take());
+        return text;
+    };
+    const auto sources = list(counts.sources, RangeWriteSourceNames);
+    const auto straddles = counts.straddlesOnly.Take();
+    const auto shares = list(counts.shares, RangeWriteShares);
+    const auto sizes = list(counts.sizes, RangeWriteSizes);
+    const auto owners = list(counts.owners, RangeWriteOwnerNames);
+    const auto same = counts.sameTableBytes.Take();
+    const auto undescribed = counts.undescribed.Take();
+    std::string bytes;
+    for (std::size_t owner = 0; owner < counts.compared.size(); ++owner) {
+        const auto compared = counts.compared[owner].Take();
+        const auto unchanged = counts.unchanged[owner].Take();
+        if (compared != 0) bytes += (bytes.empty() ? "" : ", ") + std::string(RangeWriteOwnerNames[owner]) + " " + std::to_string(unchanged) + " of " + std::to_string(compared);
+    }
+    const auto byteExits = counts.byteExits.Take();
+    const auto byteRanges = counts.byteRanges.Take();
+    const auto rebased = counts.rebased.Take();
+    const auto rebaseExits = counts.rebaseExits.Take();
+    const auto rebaseRanges = counts.rebaseRanges.Take();
+    const auto calls = counts.compareCalls.Take();
+    const auto compareBytes = counts.compareBytes.Take();
+    const auto differed = counts.compareDiffered.Take();
+    const auto noSnapshot = counts.noSnapshot.Take();
+    const auto taken = counts.snapshotsTaken.Take();
+    const auto dropped = counts.snapshotsDropped.Take();
+    const auto unwatchedOwners = list(counts.unwatchedOwners, RangeWriteOwnerNames);
+    const auto unwatchedSizes = list(counts.unwatchedSizes, RangeWriteSizes);
+    bytes += "; exits passed on matching bytes " + std::to_string(byteExits) + " (ranges " + std::to_string(byteRanges) + "); ranges rebased after a byte pass " + std::to_string(rebased) + ", exits with a range passing on its rebased generation " + std::to_string(rebaseExits) + " (ranges " + std::to_string(rebaseRanges) + "); byte compares " + std::to_string(calls) + " of " + std::to_string(compareBytes) + " bytes, differed " + std::to_string(differed) + "; written ranges without a snapshot " + std::to_string(noSnapshot) + "; snapshots kept " + std::to_string(taken) + ", dropped as written during the proof " + std::to_string(dropped) + "; collect over unwatched memory by owner " + unwatchedOwners + "; by size " + unwatchedSizes;
+    return "range written: write evidence " + sources + "; only coarse units straddling the range edge " + std::to_string(straddles) + "; written share of the range " + shares + "; range size " + sizes + "; first written owner " + owners + " (table spans holding their compared bytes " + std::to_string(same) + "); no write found " + std::to_string(undescribed) + "; sub-page ranges whose bytes match the proof's: " + (bytes.empty() ? "none compared" : bytes);
+}
+
+std::atomic<bool> rangeVersionsDisabled{false};
+std::atomic<std::uint32_t> rangeDisagreementsShown{0};
+
+bool rangeVersionsOn() {
+    return RuntimeSwitches::Set(RuntimeSwitch::RangeVersions) && !rangeVersionsDisabled.load(std::memory_order_relaxed);
+}
+
+std::uint64_t rangeVerifySample() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_VERIFY_RANGE_VERSIONS");
+        return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+    }();
+    return every;
+}
+
+bool rangeVerifyContinues() {
+    static const bool continues = [] {
+        const char* value = std::getenv("APS5_VERIFY_RANGE_VERSIONS_CONTINUE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return continues;
+}
+
+bool foreignPendingOverOwnImages(const std::vector<std::shared_ptr<Texture>>& textures, const std::vector<std::shared_ptr<StorageTexture>>& storageTextures) {
+    struct QueryTag {};
+    auto& queries = ThreadScratch<std::vector<StorageTexture::PendingQuery>, QueryTag>();
+    queries.clear();
+    const auto add = [&](const StorageTexture* image) {
+        if (image == nullptr) return;
+        const auto begin = image->Descriptor().baseAddress;
+        queries.push_back({begin, begin + image->GuestBytes(), image, nullptr, false});
+    };
+    for (const auto& texture : textures) {
+        if (texture != nullptr) add(texture->StorageSource());
+    }
+    for (const auto& image : storageTextures) add(image.get());
+    if (queries.empty()) return false;
+    static_cast<void>(StorageTexture::ScanPending(queries));
+    return std::any_of(queries.begin(), queries.end(), [](const StorageTexture::PendingQuery& query) { return query.overlaps; });
+}
+
+bool verifyRangeExit() {
+    if (verifyingExits()) return true;
+    const auto every = rangeVerifySample();
+    if (every == 0) return false;
+    thread_local std::uint64_t state = 0x9e3779b97f4a7c15ull ^ reinterpret_cast<std::uintptr_t>(&state);
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state % every == 0;
+}
+
+const char* rangeDeclineName(std::size_t decline) {
+    static constexpr std::array<const char*, RangeExitChecks> local{"none", "inputs moved", "stale planes or per-use copies", "storage image not cached", "own texture released"};
+    if (decline < local.size()) return local[decline];
+    if (decline == RangeExitChecks) return "CPU writes pending";
+    if (decline == RangeForeignPending) return "other results pending over an own image";
+    if (decline == RangeSourceBehind) return "storage source behind guest memory";
+    return GuestMemory::RangeVersionDeclineName(static_cast<GuestMemory::RangeVersionDecline>(decline - RangeExitChecks));
+}
+
+void reportRangeVersions() {
+    auto& counts = rangeVersionCounts();
+    std::string declines;
+    for (std::size_t decline = 1; decline < counts.declines.size(); ++decline) {
+        if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::None)) continue;
+        const auto count = counts.declines[decline].Take();
+        if (count == 0) continue;
+        declines += (declines.empty() ? "" : ", ") + std::string(rangeDeclineName(decline)) + " " + std::to_string(count);
+    }
+    std::array<std::array<std::uint64_t, static_cast<std::size_t>(RangeSetClass::Count)>, 2> verified{};
+    for (std::size_t kind = 0; kind < verified.size(); ++kind) {
+        for (std::size_t set = 0; set < verified[kind].size(); ++set) verified[kind][set] = counts.verified[kind][set].Take();
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) %s\n", takeRangeWriteLine().c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) range-version exits (APS5_RANGE_VERSIONS %s at the report): same epoch %llu, across epochs %llu%s; declined: %s; verified same epoch storage/tables/sampled %llu/%llu/%llu, across epochs %llu/%llu/%llu, disagreed %llu, broken meanwhile by other threads %llu\n", RuntimeSwitches::Set(RuntimeSwitch::RangeVersions) ? "on" : "off", static_cast<unsigned long long>(counts.exits[0].Take()), static_cast<unsigned long long>(counts.exits[1].Take()), rangeVersionsDisabled.load(std::memory_order_relaxed) ? " (off after a disagreement)" : "", declines.empty() ? "none" : declines.c_str(), static_cast<unsigned long long>(verified[0][0]), static_cast<unsigned long long>(verified[0][1]), static_cast<unsigned long long>(verified[0][2]), static_cast<unsigned long long>(verified[1][0]), static_cast<unsigned long long>(verified[1][1]), static_cast<unsigned long long>(verified[1][2]), static_cast<unsigned long long>(counts.disagreements.Take()), static_cast<unsigned long long>(counts.concurrent.Take()));
+}
+
 struct ScopeCheck {
     bool counted = false;
     bool blocked = false;
@@ -4491,6 +4700,7 @@ void reportExitMisses() {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s) proof breaks by site: %s; write-backs empty %llu, unchanged %llu\n", sites.c_str(), static_cast<unsigned long long>(breaks.emptyWriteBacks), static_cast<unsigned long long>(breaks.unchangedWriteBacks));
     reportScopeLevels(breaks);
+    reportRangeVersions();
     std::string combos;
     for (std::size_t mask = 1; mask < misses.combos.size(); ++mask) {
         const auto count = misses.combos[mask].Take();
@@ -4544,9 +4754,14 @@ ShaderResources::StampAge stampAge(const ShaderResources::ExitStamp& stamp, cons
 
 }
 
+namespace {
+void reportExitScope(bool forced = false);
+}
+
 void ReportEpochProofCounts() {
     auto& counts = EpochProofCounts();
     reportExitMisses();
+    reportExitScope(true);
     AgcDriver::ProfilePrint_nid_no_patch("[epoch-proofs] (10 s, proofs %s): resource proofs reused %llu, proved %llu; storage refreshes reused %llu; address spaces reused %llu, refreshed %llu\n", ShaderResources::EpochProofs() ? "on" : "off", static_cast<unsigned long long>(counts.resourceReuses.Take()), static_cast<unsigned long long>(counts.resourceProofs.Take()), static_cast<unsigned long long>(counts.storageReuses.Take()), static_cast<unsigned long long>(counts.mirrorReuses.Take()), static_cast<unsigned long long>(counts.mirrorRefreshes.Take()));
 }
 
@@ -4644,6 +4859,7 @@ struct ExitScopeCounts {
     ProfileCounter subscribed;
     std::array<ProfileCounter, static_cast<std::size_t>(ExitScope::Count)> outcomes;
     std::array<ProfileCounter, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> sources;
+    std::array<std::array<ProfileCounter, ScopeRangeSlots>, 2> ranged;
     std::atomic<std::int64_t> reportedAt{0};
 };
 
@@ -4652,11 +4868,14 @@ ExitScopeCounts& exitScopeCounts() {
     return counts;
 }
 
-void reportExitScope() {
+void reportExitScope(bool forced) {
+    if (forced && !exitScopeProfiled()) return;
     auto& counts = exitScopeCounts();
-    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-    const auto last = counts.reportedAt.exchange(tenSeconds, std::memory_order_relaxed);
-    if (last == tenSeconds) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() + 10;
+    auto last = counts.reportedAt.load(std::memory_order_relaxed);
+    do {
+        if (!forced && now - last < 10) return;
+    } while (!counts.reportedAt.compare_exchange_weak(last, now, std::memory_order_relaxed));
     std::string outcomes;
     for (std::size_t outcome = 0; outcome < counts.outcomes.size(); ++outcome) outcomes += (outcome == 0 ? "" : ", ") + std::string(ExitScopeNames[outcome]) + " " + std::to_string(counts.outcomes[outcome].Take());
     std::string sources;
@@ -4664,7 +4883,18 @@ void reportExitScope() {
         const auto count = counts.sources[source].Take();
         if (count != 0) sources += (sources.empty() ? "" : ", ") + std::string(WriteBumpSourceNames[source]) + " " + std::to_string(count);
     }
-    std::fprintf(stderr, "[exit-scope] (10 s) %llu missed exits with epoch, proof, pending and releases all moved checked against a write subscription over the proof's ranges (%llu proofs subscribed): %s; bumped misses by source: %s\n", static_cast<unsigned long long>(counts.checked.Take()), static_cast<unsigned long long>(counts.subscribed.Take()), outcomes.c_str(), sources.empty() ? "none" : sources.c_str());
+    std::string ranged;
+    for (std::size_t row = 0; row < counts.ranged.size(); ++row) {
+        std::array<std::uint64_t, ScopeRangeSlots> taken{};
+        std::uint64_t total = 0;
+        for (std::size_t slot = 0; slot < ScopeRangeSlots; ++slot) total += (taken[slot] = counts.ranged[row][slot].Take());
+        std::string declines;
+        for (std::size_t slot = ScopeRangeDeclines + 1; slot < ScopeRangeSlots; ++slot) {
+            if (taken[slot] != 0) declines += (declines.empty() ? "" : ", ") + std::string(rangeDeclineName(slot - ScopeRangeDeclines)) + " " + std::to_string(taken[slot]);
+        }
+        ranged += std::string(row == 0 ? "cpu-bumped " : "; other ") + std::to_string(total) + ": took it " + std::to_string(taken[ScopeRangeExit] + taken[ScopeRangeBytes] + taken[ScopeRangeRebase]) + " (on stamps " + std::to_string(taken[ScopeRangeExit]) + ", on matching bytes " + std::to_string(taken[ScopeRangeBytes]) + ", on a rebased generation " + std::to_string(taken[ScopeRangeRebase]) + "), not tried " + std::to_string(taken[ScopeRangeNotTried]) + ", declined: " + (declines.empty() ? "none" : declines);
+    }
+    std::fprintf(stderr, "[exit-scope] (10 s) %llu missed exits with epoch, proof, pending and releases all moved checked against a write subscription over the proof's ranges (%llu proofs subscribed): %s; bumped misses by source: %s; then the range-version exit, %s\n", static_cast<unsigned long long>(counts.checked.Take()), static_cast<unsigned long long>(counts.subscribed.Take()), outcomes.c_str(), sources.empty() ? "none" : sources.c_str(), ranged.c_str());
 }
 
 void noteExitMiss(const ShaderResources::ExitStamp& proved, const ShaderResources::ExitStamp& current, bool stalePlanes, bool copies, ShaderResources::StampAge age, const ProofLogCheck& log) {
@@ -5239,7 +5469,7 @@ void ShaderResources::storeExitScope(std::uint64_t generationAtStamp) {
     reportExitScope();
 }
 
-void ShaderResources::noteExitScope() {
+bool ShaderResources::noteExitScope() {
     auto& counts = exitScopeCounts();
     counts.checked.Add();
     std::uint32_t sources = 0;
@@ -5254,6 +5484,7 @@ void ShaderResources::noteExitScope() {
         }
     }
     reportExitScope();
+    return history && ((sources >> static_cast<std::uint32_t>(GuestMemory::WriteBumpSource::Cpu)) & 1u) != 0;
 }
 
 void ShaderResources::recordProofRanges() {
@@ -5278,6 +5509,24 @@ void ShaderResources::recordProofRanges() {
         else proofRanges[kept++] = range;
     }
     proofRanges.resize(kept);
+    proofRangeBytes.clear();
+    proofRangeGenerations.assign(proofRanges.size(), 0);
+    if (!rangeVersionsOn()) return;
+    const auto limit = rangeWriteSnapshotBytes.load(std::memory_order_relaxed);
+    const auto setLimit = std::max(limit, RangeSnapshotSetBytes);
+    std::uint64_t snapshotBytes = 0;
+    for (const auto& [begin, end] : proofRanges) {
+        const auto bytes = end - begin;
+        if (bytes > limit || snapshotBytes + bytes > setLimit) continue;
+        std::vector<std::byte> copy(static_cast<std::size_t>(bytes));
+        if (!GuestMemory::SnapshotUnchangedSince(begin, copy, provedGeneration)) {
+            if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().snapshotsDropped.Add();
+            continue;
+        }
+        snapshotBytes += bytes;
+        proofRangeBytes.emplace_back(begin, std::move(copy));
+        if (GuestMemory::ProofBreaksCounted()) rangeWriteCounts().snapshotsTaken.Add();
+    }
 }
 
 bool ShaderResources::stalePlanesRead() {
@@ -5367,6 +5616,33 @@ void ShaderResources::noteUncertified(UncertifiedCause cause, CertifyRefusal ref
     epochServed = false;
 }
 
+void ShaderResources::reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const {
+    std::string ranges;
+    for (const auto& [begin, end] : proofRanges) {
+        char text[64];
+        std::snprintf(text, sizeof(text), "%s0x%llx+0x%llx", ranges.empty() ? "" : ", ", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin));
+        ranges += text;
+    }
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofPath::Count)> paths{"fast", "own objects refreshed", "full walk"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(ProofFailure::Count)> failures{"none", "imports", "evicted", "pending", "changed", "keys", "other"};
+    std::fprintf(stderr, "[epoch-proofs]   the full proof took the %s path%s%s%s%s; work skipped: %llu CPU write syncs, %llu storage image uploads; proof ranges: %s\n", paths[static_cast<std::size_t>(verified.path)], verified.failure != ProofFailure::None ? " after a fast-proof failure (" : "", verified.failure != ProofFailure::None ? failures[static_cast<std::size_t>(verified.failure)] : "", verified.failure != ProofFailure::None ? ")" : "", verified.audited ? ", audited" : "", static_cast<unsigned long long>(work.Count(ProofWork::CpuWriteSync)), static_cast<unsigned long long>(work.Count(ProofWork::StorageUpload)), ranges.empty() ? "none" : ranges.c_str());
+    const auto describe = [&](const char* role, std::size_t index, const StorageTexture* image) {
+        if (image == nullptr) return;
+        StorageTexture::PendingQuery query{image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes(), image, nullptr, false};
+        static_cast<void>(StorageTexture::ScanPending(std::span(&query, 1)));
+        std::fprintf(stderr, "[epoch-proofs]   %s %zu: image 0x%llx+0x%llx dcc 0x%llx, %u layers, cached %d, own results pending %d, other results pending over it %d, version %llu, generation %llu (whole surface %llu)\n", role, index, static_cast<unsigned long long>(image->Descriptor().baseAddress), static_cast<unsigned long long>(image->GuestBytes()), static_cast<unsigned long long>(image->Descriptor().dccAddress), image->ImageLayers(), image->Cached() ? 1 : 0, image->AnyLayerPending() ? 1 : 0, query.overlaps ? 1 : 0, static_cast<unsigned long long>(image->Version()), static_cast<unsigned long long>(image->Generation()), static_cast<unsigned long long>(image->GenerationFor(image->Descriptor().baseAddress, image->GuestBytes())));
+    };
+    for (std::size_t i = 0; i < textures.size(); ++i) {
+        if (textures[i] != nullptr) describe("sampled texture's source", i, textures[i]->StorageSource());
+    }
+    for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (surface.source == nullptr) continue;
+        std::fprintf(stderr, "[epoch-proofs]   sampled view %zu: 0x%llx+0x%llx, its source's generation for it %llu, proved generation %llu\n", i, static_cast<unsigned long long>(surface.resource.baseAddress), static_cast<unsigned long long>(surface.bytes), static_cast<unsigned long long>(surface.source->GenerationFor(surface.resource.baseAddress, surface.bytes)), static_cast<unsigned long long>(provedGeneration));
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) describe("storage image", i, storageTextures[i].get());
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     GuestMemory::AssertGpuLockHeld("ShaderResources::Revalidate");
     if (CertifiedProofs() && HasCachedStorageImages()) {
@@ -5381,6 +5657,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (EpochProofs()) {
         const auto stamp = currentExitStamp();
         const auto scopeAtStamp = exitScopeProfiled() && scopeSubscription != nullptr ? GuestMemory::SubscriptionGeneration(*scopeSubscription) : 0;
+        const auto unrangedProof = GuestMemory::UnrangedProofSerial();
+        const auto unrangedPending = GuestMemory::UnrangedPendingSerial();
         if (exitMissesCounted() && stamp.epoch != epochSeen) {
             epochSeen = stamp.epoch;
             scopeLevels().setEpochs.Add();
@@ -5402,6 +5680,71 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             }
         }
         if (matched && !HasCachedStorageImages()) matched = false;
+        constexpr std::size_t NoScopeRow = 2;
+        const std::size_t scopeRow = exitScopeProfiled() && !matched && proved.epoch != 0 && proved.epoch != stamp.epoch && proved.proof != stamp.proof && proved.pending != stamp.pending && proved.releases != stamp.releases ? (noteExitScope() ? 0u : 1u) : NoScopeRow;
+        if (scopeRow != NoScopeRow && !(stamp.epoch != 0 && provedRanges && !proofRanges.empty() && rangeVersionsOn())) exitScopeCounts().ranged[scopeRow][ScopeRangeNotTried].Add();
+        if (!matched && stamp.epoch != 0 && proved.epoch != 0 && provedRanges && !proofRanges.empty() && rangeVersionsOn()) {
+            const auto decline = rangeVersionDecline(stamp, stalePlanes);
+            const bool epochMoved = proved.epoch != stamp.epoch;
+            if (scopeRow != NoScopeRow) exitScopeCounts().ranged[scopeRow][decline != 0 ? ScopeRangeDeclines + decline : rangePassedOnBytes != 0 ? ScopeRangeBytes : rangePassedOnRebase != 0 ? ScopeRangeRebase : ScopeRangeExit].Add();
+            if (GuestMemory::ProofBreaksCounted()) {
+                if (decline == 0) rangeVersionCounts().exits[epochMoved ? 1 : 0].Add();
+                else rangeVersionCounts().declines[decline].Add();
+                if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::Changed)) noteRangeWrite();
+                if (decline == RangeExitChecks + static_cast<std::size_t>(GuestMemory::RangeVersionDecline::CollectUnwatched)) noteUnwatchedRange();
+                if (decline == 0 && rangePassedOnBytes != 0) {
+                    rangeWriteCounts().byteExits.Add();
+                    rangeWriteCounts().byteRanges.Add(rangePassedOnBytes);
+                }
+                if (decline == 0 && rangePassedOnRebase != 0) {
+                    rangeWriteCounts().rebaseExits.Add();
+                    rangeWriteCounts().rebaseRanges.Add(rangePassedOnRebase);
+                }
+            }
+            if (decline == 0) {
+                rangeVersionPoint(RangeVersionPoint::AfterRangeValidation);
+                if (verifyRangeExit()) {
+                    const auto startSerial = GuestMemory::ProofSerial();
+                    GuestMemory::ProofBreakTrace trace;
+                    ProofWorkTrace work;
+                    ProofReport verified{};
+                    const bool ok = revalidateFull(shaders, report != nullptr ? report : &verified);
+                    if (report != nullptr) verified = *report;
+                    const bool stored = trace.Count() != 0;
+                    const bool worked = work.Total() != 0;
+                    const bool concurrent = !stored && GuestMemory::ProofSerial() != startSerial;
+                    auto& counts = rangeVersionCounts();
+                    const auto setClass = !storageTextures.empty() ? RangeSetClass::Storage : !comparedTableSpans.empty() ? RangeSetClass::Tables : RangeSetClass::Sampled;
+                    counts.verified[epochMoved ? 1 : 0][static_cast<std::size_t>(setClass)].Add();
+                    if (concurrent) counts.concurrent.Add();
+                    if (!ok || stored || worked) {
+                        counts.disagreements.Add();
+                        const bool continues = rangeVerifyContinues();
+                        if (!continues) rangeVersionsDisabled.store(true, std::memory_order_relaxed);
+                        if (continues || rangeDisagreementsShown.fetch_add(1, std::memory_order_relaxed) < 8) {
+                            std::fprintf(stderr, "[epoch-proofs] %s: the full proof behind a range-version exit %s (set %p, %s, %zu ranges; proved epoch %llu proof %llu pending %llu releases %llu, now epoch %llu proof %llu pending %llu releases %llu; generation %llu; %llu breaks, %llu units of work)\n", continues ? "range-version disagreement, range versions stay on" : "range versions off for the run", !ok ? "failed" : stored ? "stored" : "did work", static_cast<const void*>(this), epochMoved ? "across epochs" : "same epoch", proofRanges.size(), static_cast<unsigned long long>(proved.epoch), static_cast<unsigned long long>(proved.proof), static_cast<unsigned long long>(proved.pending), static_cast<unsigned long long>(proved.releases), static_cast<unsigned long long>(stamp.epoch), static_cast<unsigned long long>(stamp.proof), static_cast<unsigned long long>(stamp.pending), static_cast<unsigned long long>(stamp.releases), static_cast<unsigned long long>(provedGeneration), static_cast<unsigned long long>(trace.Count()), static_cast<unsigned long long>(work.Total()));
+                            for (const auto& entry : trace.Breaks()) std::fprintf(stderr, "[epoch-proofs]   break at %s 0x%llx+0x%llx\n", GuestMemory::ProofBreakSiteName(entry.site), static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes));
+                            if (continues) reportRangeDisagreement(work, verified);
+                        }
+                        proved.epoch = 0;
+                        noteEpochProof(false, false, false);
+                        return ok;
+                    }
+                    proved = stamp;
+                    provedUnrangedProof = unrangedProof;
+                    provedUnrangedPending = unrangedPending;
+                    noteEpochProof(true, false, false);
+                    return ok;
+                }
+                proved = stamp;
+                provedUnrangedProof = unrangedProof;
+                provedUnrangedPending = unrangedPending;
+                if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+                noteEpochProof(true, false, false);
+                if (!certified) epochServed = true;
+                return true;
+            }
+        }
         const bool copies = matched && !refreshPerUseCopies();
         if (matched && !copies) {
             if (verifyingExits()) {
@@ -5423,7 +5766,6 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return true;
         }
         const bool counted = exitMissesCounted();
-        if (exitScopeProfiled() && proved.epoch != 0 && proved.epoch != stamp.epoch && proved.proof != stamp.proof && proved.pending != stamp.pending && proved.releases != stamp.releases) noteExitScope();
         ProofLogCheck log;
         if (proved.epoch != 0 && (verifyingExits() || counted)) {
             if (counted && proved.proof != stamp.proof) {
@@ -5474,8 +5816,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         std::optional<GuestMemory::ProofBreakTrace> trace;
         if (counted) trace.emplace();
         std::uint64_t flushBreaks = 0;
-        const auto generation = counted ? GuestMemory::WriteGeneration() : 0;
+        const auto generation = GuestMemory::WriteGeneration();
         const bool ok = revalidateFull(shaders, report, counted ? &flushBreaks : nullptr, counted ? &*trace : nullptr);
+        rangeVersionPoint(RangeVersionPoint::AfterFullProof);
         if (scope.counted) {
             if (scope.epochMoved && provedRanges && provedGeneration != 0 && !proofRanges.empty()) {
                 std::vector<GuestMemory::UnchangedQuery> queries;
@@ -5488,6 +5831,8 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         noteEpochProof(false, false, false);
         proved = stamp;
         provedGeneration = generation;
+        provedUnrangedProof = unrangedProof;
+        provedUnrangedPending = unrangedPending;
         recordFlushRanges();
         provedRanges = !flushUnscoped;
         if (provedRanges) recordProofRanges();
@@ -5500,6 +5845,136 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         return ok;
     }
     return revalidateFull(shaders, report);
+}
+
+void ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes) {
+    rangeWriteSnapshotBytes.store(bytes == 0 ? RangeWriteSnapshotBytes : bytes, std::memory_order_relaxed);
+}
+
+std::size_t ShaderResources::rangeWriteOwner(std::uint64_t writeBegin, std::uint64_t writeEnd, bool* tableBytesSame) const {
+    const auto overlaps = [&](std::uint64_t begin, std::uint64_t end) { return begin < writeEnd && writeBegin < end; };
+    return static_cast<std::size_t>([&] {
+        bool table = false;
+        bool same = true;
+        for (const auto& [address, copy] : comparedTableSpans) {
+            if (!overlaps(address, address + copy.size())) continue;
+            table = true;
+            if (GuestMemory::CompareMapped(address, copy) != GuestMemory::Compare::Equal) same = false;
+        }
+        if (table) {
+            if (tableBytesSame != nullptr) *tableBytesSame = same;
+            return RangeWriteOwner::TableSpan;
+        }
+        const auto dccOver = [&](std::uint64_t dcc, std::uint64_t guestBytes) { return dcc != 0 && overlaps(dcc, dcc + DccKeyBytes(guestBytes)); };
+        for (const auto& range : describedRanges) {
+            if (dccOver(range.dccAddress, range.bytes)) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& surface : validatedTextures) {
+            if (surface.valid && dccOver(surface.resource.dccAddress, surface.bytes)) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr && dccOver(image->Descriptor().dccAddress, image->GuestBytes())) return RangeWriteOwner::DccKeys;
+        }
+        for (const auto& range : describedRanges) {
+            if (overlaps(range.address, range.address + range.bytes)) return range.imageTable ? RangeWriteOwner::ImageTable : RangeWriteOwner::Described;
+        }
+        for (const auto& surface : validatedTextures) {
+            if (overlaps(surface.resource.baseAddress, surface.resource.baseAddress + surface.bytes)) return RangeWriteOwner::Texture;
+        }
+        for (const auto& image : storageTextures) {
+            if (image != nullptr && overlaps(image->Descriptor().baseAddress, image->Descriptor().baseAddress + image->GuestBytes())) return RangeWriteOwner::StorageImage;
+        }
+        for (const auto& region : directRegions) {
+            if (overlaps(region.begin, region.end)) return region.mirror ? RangeWriteOwner::MirroredRegion : RangeWriteOwner::ImportedRegion;
+        }
+        if (writeSubscription != nullptr) {
+            for (const auto& [begin, end] : GuestMemory::SubscriptionSpans(*writeSubscription)) {
+                if (overlaps(begin, end)) return RangeWriteOwner::Subscription;
+            }
+        }
+        return RangeWriteOwner::Other;
+    }());
+}
+
+bool ShaderResources::proofBytesUnchanged(std::size_t index, std::uint64_t begin, std::uint64_t end) {
+    const bool counted = GuestMemory::ProofBreaksCounted();
+    const auto snapshot = std::find_if(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const auto& entry) { return entry.first == begin && entry.second.size() == end - begin; });
+    if (snapshot == proofRangeBytes.end()) {
+        if (counted) rangeWriteCounts().noSnapshot.Add();
+        return false;
+    }
+    const auto rebase = GuestMemory::SnapshotMatches(snapshot->first, snapshot->second);
+    const bool same = rebase != 0;
+    if (same && index < proofRangeGenerations.size() && rebase > proofRangeGenerations[index]) {
+        proofRangeGenerations[index] = rebase;
+        if (counted) rangeWriteCounts().rebased.Add();
+    }
+    if (counted) {
+        auto& counts = rangeWriteCounts();
+        counts.compareCalls.Add();
+        counts.compareBytes.Add(snapshot->second.size());
+        if (!same) counts.compareDiffered.Add();
+    }
+    return same;
+}
+
+void ShaderResources::noteUnwatchedRange() const {
+    const auto [begin, end] = rangeDeclined;
+    if (end <= begin) return;
+    auto& counts = rangeWriteCounts();
+    counts.unwatchedOwners[rangeWriteOwner(begin, end, nullptr)].Add();
+    counts.unwatchedSizes[rangeWriteSize(end - begin)].Add();
+}
+
+void ShaderResources::noteRangeWrite() const {
+    auto& counts = rangeWriteCounts();
+    const auto shape = GuestMemory::DescribeRangeWrite(proofRanges, provedGeneration);
+    if (shape.writeEnd <= shape.writeBegin) {
+        counts.undescribed.Add();
+        return;
+    }
+    for (std::size_t source = 0; source < shape.units.size(); ++source) {
+        if (shape.units[source] != 0) counts.sources[source].Add();
+    }
+    if (shape.straddlesOnly) counts.straddlesOnly.Add();
+    const auto bytes = shape.rangeEnd - shape.rangeBegin;
+    counts.shares[rangeWriteShare(shape.writtenBytes, bytes)].Add();
+    counts.sizes[rangeWriteSize(bytes)].Add();
+    bool tableBytesSame = false;
+    const auto owner = static_cast<RangeWriteOwner>(rangeWriteOwner(shape.writeBegin, shape.writeEnd, &tableBytesSame));
+    if (owner == RangeWriteOwner::TableSpan && tableBytesSame) counts.sameTableBytes.Add();
+    counts.owners[static_cast<std::size_t>(owner)].Add();
+    const auto snapshot = std::find_if(proofRangeBytes.begin(), proofRangeBytes.end(), [&](const auto& entry) { return entry.first == shape.rangeBegin && entry.second.size() == bytes; });
+    if (snapshot == proofRangeBytes.end()) return;
+    counts.compared[static_cast<std::size_t>(owner)].Add();
+    if (GuestMemory::CompareMapped(snapshot->first, snapshot->second) == GuestMemory::Compare::Equal) counts.unchanged[static_cast<std::size_t>(owner)].Add();
+}
+
+std::size_t ShaderResources::rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes) {
+    rangePassedOnBytes = 0;
+    rangePassedOnRebase = 0;
+    rangeDeclined = {0, 0};
+    if (proved.unwatch != stamp.unwatch || proved.importSet != stamp.importSet || proved.allocations != stamp.allocations || proved.retired != stamp.retired || proved.surfaces != stamp.surfaces) return 1;
+    if (stalePlanes) return 2;
+    if (!HasCachedStorageImages()) return 3;
+    if (proved.releases != stamp.releases && std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->Released(); })) return 4;
+    if (AnyPendingCpuWrites(context)) return RangeExitChecks;
+    GuestMemory::RangeValidation validation;
+    if (!proofRangeBytes.empty()) validation.bytesUnchanged = [this](std::size_t index, std::uint64_t begin, std::uint64_t end) { return proofBytesUnchanged(index, begin, end); };
+    validation.generations = proofRangeGenerations;
+    const auto decline = GuestMemory::ValidateProofRanges(proofRanges, {provedGeneration, proved.proof, proved.pending, provedUnrangedProof, provedUnrangedPending}, &validation);
+    rangePassedOnBytes = validation.passedOnBytes;
+    rangePassedOnRebase = validation.passedOnRebase;
+    rangeDeclined = validation.declined;
+    if (decline != GuestMemory::RangeVersionDecline::None) return RangeExitChecks + static_cast<std::size_t>(decline);
+    if (foreignPendingOverOwnImages(textures, storageTextures)) return RangeForeignPending;
+    for (const auto& surface : validatedTextures) {
+        if (surface.source == nullptr) continue;
+        const auto address = surface.resource.baseAddress;
+        const auto bytes = static_cast<std::size_t>(surface.bytes);
+        if (!GuestMemory::UnchangedSince(address, bytes, surface.source->GenerationFor(address, bytes))) return RangeSourceBehind;
+    }
+    return refreshPerUseCopies() ? 0 : 2;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks, const GuestMemory::ProofBreakTrace* trace) {

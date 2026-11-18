@@ -1088,6 +1088,586 @@ void epochScopeLevelsTests(Context context) {
     if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
 }
 
+void rangeVersionTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the range-version fixture needs epoch proofs on");
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, true);
+    struct Switches {
+        ~Switches() {
+            RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, false);
+        }
+    } switches;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the range-version template is not reusable");
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 3; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("an unchanged template did not take the epoch exit");
+    using Site = AgcDriver::GuestMemory::ProofBreakSite;
+    const auto address = surface.Address();
+    const auto distant = address + SurfaceBytes + (std::uint64_t{64} << 20u);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> distantRanges{{{distant, distant + 4096u}, {distant + 65536u, distant + 69632u}}};
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> nearRanges{{{distant, distant + 4096u}, {address + 256u, address + 512u}}};
+    const auto check = [&](const char* label, bool expected, auto&& move) {
+        move();
+        const bool taken = exitTaken();
+        std::fprintf(stderr, "range versions: %s: the exit %s\n", label, taken ? "was taken" : "was refused");
+        Require(taken == expected, std::string("range versions: ") + label + (expected ? ": the exit was refused" : ": the exit was taken"));
+        settle("the template did not take the exit again");
+    };
+    check("a new collect epoch with the surface unwritten", true, [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    check("a marked-written break outside the set in a new epoch", true, [&] {
+        AgcDriver::GuestMemory::BreakProofs(Site::Written, distant, 4096u);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    check("a packet break over two ranges outside the set", true, [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, distantRanges); });
+    check("an image entering pending outside the set in a new epoch", true, [&] {
+        StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + 4096u);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    check("an image leaving pending", true, [] { StorageTexture::BumpPendingSerial(PendingBump::Discard); });
+    check("a writeless packet break", true, [] { AgcDriver::GuestMemory::BreakProofsWithoutWrites(Site::Packet); });
+    check("a marked-written break over the set's surface", false, [&] { AgcDriver::GuestMemory::BreakProofs(Site::Written, address, 4096u); });
+    check("a packet break with one range over the set's surface", false, [&] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, nearRanges); });
+    check("an image entering pending over the set's surface", false, [&] { StorageTexture::BumpPendingSerial(PendingBump::Mark, address, address + 4096u); });
+    check("an image entering pending over more than 4096 blocks", false, [&] { StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + (std::uint64_t{257} << 20u)); });
+    check("a packet break without declared writes", false, [] { AgcDriver::GuestMemory::BreakProofsOver(Site::Packet, {}); });
+    check("a GPU-lock break from another thread", false, [] { AgcDriver::GuestMemory::BreakProofs(Site::GpuMutex); });
+    check("a driver store outside the set", AgcDriver::GuestMemory::ProofBreakScoped(Site::DriverStore), [&] { AgcDriver::GuestMemory::BreakProofs(Site::DriverStore, distant, 4096u); });
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false);
+    check("a new collect epoch with range versions off", false, [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    StorageTexture::BumpPendingSerial(PendingBump::Mark, address, address + 4096u);
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    check("an image entering pending over the set while range versions were off", false, [] {});
+    check("a new collect epoch with range versions on again", true, [] { AgcDriver::GuestMemory::BumpCollectEpoch(); });
+    static std::uint64_t hookAddress = 0;
+    static ShaderResources::RangeVersionPoint hookPoint = ShaderResources::RangeVersionPoint::AfterFullProof;
+    static bool hookFired = false;
+    hookAddress = address;
+    const auto arm = [](ShaderResources::RangeVersionPoint point) {
+        hookPoint = point;
+        hookFired = false;
+        ShaderResources::SetRangeVersionHookForTest([](ShaderResources::RangeVersionPoint at) {
+            if (at != hookPoint || hookFired) return;
+            hookFired = true;
+            if (at == ShaderResources::RangeVersionPoint::AfterRangeValidation) {
+                AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, hookAddress, 4096u);
+                return;
+            }
+            std::memset(reinterpret_cast<void*>(hookAddress + 12288u), 0x3c, 64u);
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(hookAddress, SurfaceBytes));
+        });
+    };
+    struct Unhook {
+        ~Unhook() { ShaderResources::SetRangeVersionHookForTest(nullptr); }
+    } unhook;
+    arm(ShaderResources::RangeVersionPoint::AfterRangeValidation);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool beforeBreak = exitTaken();
+    ShaderResources::SetRangeVersionHookForTest(nullptr);
+    Require(hookFired && beforeBreak, "the exit validated before the injected break was not taken");
+    const bool afterBreak = exitTaken();
+    std::fprintf(stderr, "range versions: a break over the set between the range check and the stamp save: the next exit %s\n", afterBreak ? "was taken" : "was refused");
+    Require(!afterBreak, "a break between the range check and the stamp save was hidden by the saved stamp");
+    settle("the template did not take the exit again after the injected break");
+    const auto expectLast = [&](const char* label, bool expected, auto&& move) {
+        move();
+        const bool taken = exitTaken();
+        std::fprintf(stderr, "range versions: %s: the exit %s\n", label, taken ? "was taken" : "was refused");
+        Require(taken == expected, std::string("range versions: ") + label + (expected ? ": the exit was refused" : ": the exit was taken"));
+        resources.reset();
+        ClearCachedTextures(context.device);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        resources = std::make_shared<ShaderResources>(context, shader);
+        settle("a rebuilt template did not take the epoch exit");
+    };
+    const auto last = [&](const char* label, auto&& move) { expectLast(label, false, move); };
+    last("a driver store into the set", [&] {
+        const std::array<std::byte, 64> stored{};
+        static_cast<void>(AgcDriver::GuestMemory::StoreOwnBytes(address + 256u, stored));
+    });
+    last("a write landing after the full proof's walk, then a new collect epoch", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        arm(ShaderResources::RangeVersionPoint::AfterFullProof);
+        Require(!exitTaken() && hookFired, "the injected write did not run after a full proof");
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t{1} << 30u);
+    struct Snapshots {
+        ~Snapshots() { ShaderResources::SetRangeWriteSnapshotBytesForTest(0); }
+    } snapshots;
+    last("a write landing after the full proof's walk with byte snapshots on, then a new collect epoch", [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        arm(ShaderResources::RangeVersionPoint::AfterFullProof);
+        Require(!exitTaken() && hookFired, "the injected write did not run after a full proof");
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    expectLast("a CPU write of the bytes already in the set and a new collect epoch", true, [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        Require(!exitTaken(), "an unranged break did not force the full proof that takes the byte snapshots");
+        auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    static std::size_t byteCompares = 0;
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+    Require(!exitTaken(), "an unranged break did not force the full proof before the rebase check");
+    AgcDriver::GuestMemory::SetCompareMappedHook([](std::uint64_t, std::size_t) { ++byteCompares; });
+    struct CompareUnhook {
+        ~CompareUnhook() { AgcDriver::GuestMemory::SetCompareMappedHook(nullptr); }
+    } compareUnhook;
+    {
+        auto* bytes = reinterpret_cast<volatile std::uint8_t*>(address + 8192u);
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+    }
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    byteCompares = 0;
+    Require(exitTaken(), "a rewrite of the same bytes did not take the exit before the rebase check");
+    const auto passCompares = byteCompares;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    byteCompares = 0;
+    const bool rebasedTaken = exitTaken();
+    const auto rebasedCompares = byteCompares;
+    AgcDriver::GuestMemory::SetCompareMappedHook(nullptr);
+    std::fprintf(stderr, "range versions: a new collect epoch after a byte pass: the exit %s, byte compares %zu (the byte pass took %zu)\n", rebasedTaken ? "was taken" : "was refused", rebasedCompares, passCompares);
+    Require(rebasedTaken && passCompares != 0 && rebasedCompares < passCompares, "a range passed on its bytes was compared again with no write since the pass");
+    last("a CPU write of new bytes into a range rebased by a byte pass, then a new collect epoch", [&] {
+        std::memset(reinterpret_cast<void*>(address + 8192u), 0xa5, 64u);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    last("a CPU write into the set and a new collect epoch", [&] {
+        std::memset(reinterpret_cast<void*>(address + 8192u), 0x6b, 4096u);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+    });
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+    std::fprintf(stderr, "range versions: exits matched the producers\n");
+}
+
+void rangeVersionStorageTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(SurfaceBytes, 65536));
+    Require(memory != nullptr, "the range-version storage fixture needs the guest write watch");
+    std::memset(memory, 0x5a, SurfaceBytes);
+    GuestAllocations::Mutation().Add(memory, SurfaceBytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false);
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, SurfaceBytes);
+        }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the range-version storage fixture needs epoch proofs on");
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(1, false);
+    binding.imageSamplers.assign(1, 0u);
+    const auto words = Descriptor(address);
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    ShaderRecompiler::RecompileResult program;
+    program.bindings.push_back(std::move(binding));
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->StorageImages().size() == 1, "the range-version storage template is not reusable");
+    if (!AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("range versions over a storage image: skipped, its host import left the memory unwatched");
+        return;
+    }
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    bool settled = false;
+    for (int round = 0; round < 4 && !settled; ++round) settled = exitTaken();
+    Require(settled, "an unchanged storage template never took the epoch exit");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool across = exitTaken();
+    std::fprintf(stderr, "range versions over a storage image: a new collect epoch: the exit %s\n", across ? "was taken" : "was refused");
+    Require(across, "a storage template did not take the range-version exit in a new epoch");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    ClearCachedTextures(context.device);
+    const bool evicted = exitTaken();
+    std::fprintf(stderr, "range versions over a storage image: evicted in a new collect epoch: the exit %s\n", evicted ? "was taken" : "was refused");
+    Require(!evicted, "a storage template took the range-version exit over an evicted storage image");
+}
+
+void rangeVersionScopeTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    WatchedSurface surface(context);
+    auto* elsewhere = static_cast<std::uint8_t*>(AllocateWatched(SurfaceBytes, 65536));
+    Require(elsewhere != nullptr, "the exit-scope fixture needs the guest write watch");
+    std::memset(elsewhere, 0x5a, SurfaceBytes);
+    GuestAllocations::Mutation().Add(elsewhere, SurfaceBytes, true, true, false);
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() {
+            RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, false);
+            ShaderResources::SetRangeWriteSnapshotBytesForTest(0);
+            GuestAllocations::Mutation().Remove(memory);
+            ReleaseWatched(memory, SurfaceBytes);
+        }
+    } cleanup{elsewhere};
+    ClearCachedTextures(context.device);
+    Require(ShaderResources::EpochProofs(), "the exit-scope fixture needs epoch proofs on");
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoScopedProofs, true);
+    ShaderResources::SetRangeWriteSnapshotBytesForTest(std::uint64_t{1} << 30u);
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(surface.Address());
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto resources = std::make_shared<ShaderResources>(context, shader);
+    struct Release {
+        std::shared_ptr<ShaderResources>& resources;
+        VkDevice device;
+        ~Release() {
+            resources.reset();
+            ClearCachedTextures(device);
+        }
+    } release{resources, context.device};
+    Require(resources->Reusable() && resources->SampledTextures().size() == 1, "the exit-scope template is not reusable");
+    ShaderRecompiler::DescriptorBinding binding{};
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    binding.descriptorSet = 0;
+    binding.binding = ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding + PlaceholderDimensionsPerClass + 2u;
+    binding.count = 1;
+    binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2D;
+    binding.imageWritten.assign(1, false);
+    binding.imageSamplers.assign(1, 0u);
+    const auto words = Descriptor(reinterpret_cast<std::uint64_t>(elsewhere));
+    binding.guestDescriptor.assign(words.begin(), words.end());
+    ShaderRecompiler::RecompileResult storageProgram;
+    storageProgram.bindings.push_back(std::move(binding));
+    const CompiledShader storageShader{ShaderRecompiler::ShaderStage::Compute, &storageProgram, 0};
+    const auto holdElsewhere = [&] { static_cast<void>(std::make_shared<ShaderResources>(context, storageShader)); };
+    const auto releaseElsewhere = [&] {
+        const auto before = TextureReleaseSerial();
+        static_cast<void>(ReleaseTextureCaches(1));
+        Require(TextureReleaseSerial() != before, "evicting a storage image outside the set did not move the release serial");
+    };
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return resources->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&] {
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+        for (int round = 0; round < 3; ++round) static_cast<void>(exitTaken());
+        Require(exitTaken(), "the exit-scope template did not settle on the epoch exit");
+    };
+    const auto distant = surface.Address() + SurfaceBytes + (std::uint64_t{64} << 20u);
+    auto* bytes = reinterpret_cast<volatile std::uint8_t*>(surface.Address() + 8192u);
+    const auto fourMoved = [&](const char* label, bool expected, auto&& write) {
+        holdElsewhere();
+        settle();
+        AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, distant, 4096u);
+        StorageTexture::BumpPendingSerial(PendingBump::Mark, distant, distant + 4096u);
+        releaseElsewhere();
+        write();
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const bool taken = exitTaken();
+        std::fprintf(stderr, "exit scope: epoch, proof, pending and releases moved with %s: the exit %s\n", label, taken ? "was taken" : "was refused");
+        Require(taken == expected, std::string("exit scope: ") + label + (expected ? ": the exit was refused" : ": the exit was taken"));
+        StorageTexture::BumpPendingSerial(PendingBump::Discard);
+        if (expected) return;
+        resources.reset();
+        ClearCachedTextures(context.device);
+        resources = std::make_shared<ShaderResources>(context, shader);
+    };
+    fourMoved("no write into the set", true, [] {});
+    fourMoved("a CPU write of the bytes already in the set", true, [&] {
+        for (std::size_t index = 0; index < 64u; ++index) bytes[index] = bytes[index];
+    });
+    fourMoved("a CPU write of new bytes into the set", false, [&] { std::memset(const_cast<std::uint8_t*>(bytes), 0x6b, 64u); });
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false);
+    fourMoved("a CPU write into the set and range versions off", false, [&] { std::memset(const_cast<std::uint8_t*>(bytes), 0x2d, 64u); });
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+}
+
+bool rangeVersionPendingTests(Context context) {
+    PlaceholderImages placeholders(context);
+    context.placeholderImages = &placeholders;
+    TextureCache textures(context);
+    context.textureCache = &textures;
+    if (context.hostImportAlignment == 0) {
+        Require(std::getenv("ANYPS5_REQUIRE_VULKAN") == nullptr, "the range-version pending fixture requires host imports");
+        std::puts("range versions with other results pending: skipped, host imports are unavailable");
+        return false;
+    }
+    WatchedSurface surface(context, 2u * SurfaceBytes);
+    ClearCachedTextures(context.device);
+    const auto address = surface.Address();
+    if (HostImportFor(context, address, SurfaceBytes) == nullptr || !AgcDriver::GuestMemory::Watched(address, SurfaceBytes)) {
+        std::puts("range versions with other results pending: skipped, the surface's host import is refused or unwatched");
+        return false;
+    }
+    Require(ShaderResources::EpochProofs(), "the range-version pending fixture needs epoch proofs on");
+    RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, true);
+    struct Switches {
+        ~Switches() { RuntimeSwitches::Assign(RuntimeSwitch::RangeVersions, false); }
+    } switches;
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const auto program = SampledProgram(address);
+    const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    auto sampled = std::make_shared<ShaderResources>(context, shader);
+    std::shared_ptr<StorageTexture> foreign;
+    struct Release {
+        std::shared_ptr<ShaderResources>& sampled;
+        std::shared_ptr<StorageTexture>& foreign;
+        VkDevice device;
+        ~Release() {
+            if (foreign != nullptr) foreign->Flush();
+            foreign.reset();
+            sampled.reset();
+            ClearCachedTextures(device);
+        }
+    } release{sampled, foreign, context.device};
+    Require(sampled->Reusable() && sampled->SampledTextures().size() == 1 && sampled->SampledTextures().front()->ViewsStorageImage(), "the range-version pending template does not bind a view of its storage image");
+    const auto source = sampled->SampledTextures().front()->SharedStorageSource();
+    ShaderResources::ProofReport report{};
+    const auto exitTaken = [&] {
+        const auto proofs = EpochProofCounts().resourceProofs.Sum();
+        return sampled->Revalidate(shader, &report) && EpochProofCounts().resourceProofs.Sum() == proofs;
+    };
+    const auto settle = [&](const char* label) {
+        for (int round = 0; round < 4; ++round) {
+            if (exitTaken()) return;
+        }
+        Require(false, label);
+    };
+    settle("the template over the imported surface never took the epoch exit");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool quiet = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: nothing pending, a new collect epoch: the exit %s\n", quiet ? "was taken" : "was refused");
+    Require(quiet, "the template over the imported surface did not take the range-version exit with nothing pending");
+    foreign = CachedStorageSurface(context, Resource(address + SurfaceBytes / 2u));
+    Require(foreign != nullptr && foreign != source, "no foreign storage image over the second half of the sampled surface");
+    foreign->MarkDirty();
+    source->MarkDirty();
+    settle("the template never took the epoch exit with its source and a foreign image pending");
+    Require(foreign->AnyLayerPending() && source->AnyLayerPending(), "the source and the foreign image are not both pending at the proof");
+    Require(StorageTexture::DiscardPendingInside(address, SurfaceBytes) != 0, "discarding the source's results discarded nothing");
+    Require(foreign->AnyLayerPending() && !source->AnyLayerPending(), "the foreign image did not stay pending alone over the source");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool pendingExit = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: a foreign image pending over the source since the proof, the source's own results discarded, a new collect epoch: the exit %s\n", pendingExit ? "was taken" : "was refused");
+    Require(!pendingExit, "a template took the range-version exit while another image's results stayed pending over its storage source");
+    foreign->Flush();
+    foreign.reset();
+    settle("the template did not take the epoch exit again after the foreign image was stored");
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const bool stored = exitTaken();
+    std::fprintf(stderr, "range versions with other results pending: the foreign image stored, a new collect epoch: the exit %s\n", stored ? "was taken" : "was refused");
+    Require(stored, "the template did not take the range-version exit once nothing stayed pending over its source");
+    if (std::getenv("APS5_VERIFY_RANGE_VERSIONS_CONTINUE") != nullptr) {
+        static std::uint64_t written = 0;
+        written = address;
+        ShaderResources::SetRangeVersionHookForTest([](ShaderResources::RangeVersionPoint at) {
+            if (at != ShaderResources::RangeVersionPoint::AfterRangeValidation || written == 0) return;
+            std::memset(reinterpret_cast<void*>(written + 8192u), 0x3c, 64u);
+            static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(written, SurfaceBytes));
+            written = 0;
+        });
+        struct Unhook {
+            ~Unhook() { ShaderResources::SetRangeVersionHookForTest(nullptr); }
+        } unhook;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        static_cast<void>(exitTaken());
+        ShaderResources::SetRangeVersionHookForTest(nullptr);
+        settle("the template did not take the epoch exit again after a disagreement under APS5_VERIFY_RANGE_VERSIONS_CONTINUE");
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        const bool after = exitTaken();
+        std::fprintf(stderr, "range versions with other results pending: after a disagreement, a new collect epoch: the exit %s\n", after ? "was taken" : "was refused");
+        Require(after, "range versions did not stay on after a disagreement under APS5_VERIFY_RANGE_VERSIONS_CONTINUE");
+    }
+    if (AgcDriver::Graphics::EpochProofCountsProfiled()) AgcDriver::Graphics::ReportEpochProofCounts();
+    return true;
+}
+
+void rangeValidateTests() {
+    using AgcDriver::GuestMemory::RangeVersionDecline;
+    constexpr std::size_t Bytes = 4u * 65536u;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes, 65536));
+    Require(memory != nullptr, "the range validation fixture needs the guest write watch");
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() { ReleaseWatched(memory, Bytes); }
+    } cleanup{memory};
+    std::memset(memory, 0x5a, Bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(address, Bytes) != 0, "the range validation fixture's memory is not collected");
+    const auto baselineNow = [] {
+        return AgcDriver::GuestMemory::RangeVersionBaseline{AgcDriver::GuestMemory::WriteGeneration(), AgcDriver::GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), AgcDriver::GuestMemory::UnrangedProofSerial(), AgcDriver::GuestMemory::UnrangedPendingSerial()};
+    };
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> set{{{address, address + 4096u}, {address + 2u * 65536u, address + 2u * 65536u + 4096u}}};
+    const auto name = [](RangeVersionDecline decline) { return AgcDriver::GuestMemory::RangeVersionDeclineName(decline); };
+    const auto expect = [&](const char* label, RangeVersionDecline got, RangeVersionDecline want) {
+        std::fprintf(stderr, "range validate: %s: %s\n", label, name(got));
+        Require(got == want, std::string("range validate: ") + label + ": got " + name(got) + ", want " + name(want));
+    };
+    auto baseline = baselineNow();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect("an unwritten set in a new epoch", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::None);
+    std::vector<std::uint8_t> host(8192, 0);
+    const auto unwatched = (reinterpret_cast<std::uint64_t>(host.data()) + 4095u) & ~std::uint64_t{4095};
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> partly{{{address, address + 4096u}, {unwatched, unwatched + 4096u}}};
+    expect("a set with one range outside the tracker", AgcDriver::GuestMemory::ValidateProofRanges(partly, baseline), RangeVersionDecline::CollectUnwatched);
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> beyond{{{std::uint64_t{1} << 48u, (std::uint64_t{1} << 48u) + 4096u}}};
+    expect("a range past the tick span", AgcDriver::GuestMemory::ValidateProofRanges(beyond, baseline), RangeVersionDecline::Uncovered);
+    auto wrapped = baseline;
+    wrapped.proof = std::uint64_t{1} << 62u;
+    expect("a proof serial at 2^62", AgcDriver::GuestMemory::ValidateProofRanges(set, wrapped), RangeVersionDecline::Wrapped);
+    {
+        const AgcDriver::GuestMemory::RangeStampScope open;
+        expect("a stamp left open", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::InFlight);
+    }
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Written, address + 2u * 65536u + 8192u, 64u);
+    expect("a ranged break into a block of the set", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::Effect);
+    baseline = baselineNow();
+    StorageTexture::BumpPendingSerial(PendingBump::Mark, address + 65536u, address + 65536u + 4096u);
+    expect("an entering pending bump into a block between the set's ranges", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::None);
+    StorageTexture::BumpPendingSerial(PendingBump::Mark, address + 512u, address + 1024u);
+    expect("an entering pending bump into the set", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::Pending);
+    baseline = baselineNow();
+    AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreakSite::Other);
+    expect("an unranged break", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::UnrangedProof);
+    baseline = baselineNow();
+    StorageTexture::BumpPendingSerial(PendingBump::Mark, address, address);
+    expect("an entering pending bump without a range", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::UnrangedPending);
+    baseline = baselineNow();
+    std::memset(memory + 2u * 65536u + 32768u, 0x6b, 64u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect("a CPU write into another page of a set's block and a new epoch", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::None);
+    baseline = baselineNow();
+    std::memset(memory + 2u * 65536u, 0x6b, 64u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    expect("a CPU write into the set and a new epoch", AgcDriver::GuestMemory::ValidateProofRanges(set, baseline), RangeVersionDecline::Changed);
+    using AgcDriver::GuestMemory::RangeWriteSource;
+    const auto pageUnits = [](const AgcDriver::GuestMemory::RangeWriteShape& shape) { return shape.units[static_cast<std::size_t>(RangeWriteSource::CpuPage)] + shape.units[static_cast<std::size_t>(RangeWriteSource::WalkPage)]; };
+    const auto inside = AgcDriver::GuestMemory::DescribeRangeWrite(set, baseline.generation);
+    std::fprintf(stderr, "range write shape: range 0x%llx+0x%llx, written 0x%llx..0x%llx (%llu bytes), page units %u, straddles only %d\n", static_cast<unsigned long long>(inside.rangeBegin), static_cast<unsigned long long>(inside.rangeEnd - inside.rangeBegin), static_cast<unsigned long long>(inside.writeBegin), static_cast<unsigned long long>(inside.writeEnd), static_cast<unsigned long long>(inside.writtenBytes), pageUnits(inside), inside.straddlesOnly ? 1 : 0);
+    Require(inside.rangeBegin == address + 2u * 65536u && inside.rangeEnd == address + 2u * 65536u + 4096u, "range write shape: the write is not placed in the set's second range");
+    Require(pageUnits(inside) == 1 && inside.writeBegin == inside.rangeBegin && inside.writeEnd == inside.rangeEnd && inside.writtenBytes == 4096u && !inside.straddlesOnly, "range write shape: a page inside the range is not one interior page unit covering it");
+    const auto straddleBaseline = baselineNow();
+    std::memset(memory + 3u * 65536u + 4096u, 0x6b, 64u);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> offset{{{address + 3u * 65536u + 6144u, address + 3u * 65536u + 14336u}}};
+    expect("a CPU write into the page under a range's first half page", AgcDriver::GuestMemory::ValidateProofRanges(offset, straddleBaseline), RangeVersionDecline::Changed);
+    const auto edge = AgcDriver::GuestMemory::DescribeRangeWrite(offset, straddleBaseline.generation);
+    Require(pageUnits(edge) == 1 && edge.writeBegin == offset[0].first && edge.writeEnd == address + 3u * 65536u + 8192u && edge.writtenBytes == 2048u && edge.straddlesOnly, "range write shape: a page straddling the range's start is not reported as an edge-only unit");
+    Require(AgcDriver::GuestMemory::DescribeRangeWrite(offset, AgcDriver::GuestMemory::WriteGeneration()).writeEnd == 0, "range write shape: a generation taken after the write still finds it");
+    auto late = baselineNow();
+    expect("the same write with the generation taken after it", AgcDriver::GuestMemory::ValidateProofRanges(set, late), RangeVersionDecline::None);
+    std::fprintf(stderr, "range validate: a generation taken after the write accepts it, so the exit takes its generation before the full proof\n");
+}
+
+void concurrentRangeValidateTests() {
+    using AgcDriver::GuestMemory::RangeVersionDecline;
+    using Site = AgcDriver::GuestMemory::ProofBreakSite;
+    constexpr std::size_t Bytes = 2u * 65536u;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(Bytes, 65536));
+    Require(memory != nullptr, "the concurrent range validation fixture needs the guest write watch");
+    struct Cleanup {
+        std::uint8_t* memory;
+        ~Cleanup() { ReleaseWatched(memory, Bytes); }
+    } cleanup{memory};
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    Require(AgcDriver::GuestMemory::CollectWritesUncached(address, Bytes) != 0, "the concurrent fixture's memory is not collected");
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> set{{{address, address + Bytes}}};
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> intoSet{0};
+    std::vector<std::thread> breakers;
+    for (unsigned thread = 0; thread < 4; ++thread) {
+        breakers.emplace_back([&, thread] {
+            std::uint64_t round = 0;
+            while (!stop.load(std::memory_order_relaxed)) {
+                const auto outside = address + (std::uint64_t{1} << 30u) + (round % 64u) * 65536u;
+                if (thread == 0) {
+                    AgcDriver::GuestMemory::BreakProofs(Site::Written, address + (round % 32u) * 4096u, 4096u);
+                    intoSet.fetch_add(1, std::memory_order_seq_cst);
+                } else if (thread == 1) StorageTexture::BumpPendingSerial(PendingBump::Mark, outside, outside + 4096u);
+                else AgcDriver::GuestMemory::BreakProofs(Site::Packet, outside, 4096u);
+                ++round;
+            }
+        });
+    }
+    std::uint64_t checks = 0;
+    std::uint64_t accepted = 0;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+    while (std::chrono::steady_clock::now() < until) {
+        const AgcDriver::GuestMemory::RangeVersionBaseline baseline{AgcDriver::GuestMemory::WriteGeneration(), AgcDriver::GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), AgcDriver::GuestMemory::UnrangedProofSerial(), AgcDriver::GuestMemory::UnrangedPendingSerial()};
+        const auto counted = intoSet.load(std::memory_order_seq_cst);
+        while (intoSet.load(std::memory_order_seq_cst) < counted + 2u) std::this_thread::yield();
+        ++checks;
+        if (AgcDriver::GuestMemory::ValidateProofRanges(set, baseline) == RangeVersionDecline::None) ++accepted;
+    }
+    stop.store(true);
+    for (auto& thread : breakers) thread.join();
+    const AgcDriver::GuestMemory::RangeVersionBaseline quiet{AgcDriver::GuestMemory::WriteGeneration(), AgcDriver::GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), AgcDriver::GuestMemory::UnrangedProofSerial(), AgcDriver::GuestMemory::UnrangedPendingSerial()};
+    AgcDriver::GuestMemory::BreakProofs(Site::Packet, address + (std::uint64_t{1} << 31u), 4096u);
+    const auto after = AgcDriver::GuestMemory::ValidateProofRanges(set, quiet);
+    std::fprintf(stderr, "range validate under 4 stamping threads: %llu checks, %llu accepted over a window with breaks into the set; a quiet window with one outside break: %s\n", static_cast<unsigned long long>(checks), static_cast<unsigned long long>(accepted), AgcDriver::GuestMemory::RangeVersionDeclineName(after));
+    Require(checks != 0, "the concurrent range validation never ran");
+    Require(accepted == 0, "range validation accepted a window holding breaks into the set");
+    Require(after == RangeVersionDecline::None, "range validation declined a quiet window with one outside break");
+}
+
 bool idleHoldTests() {
     if (!AgcDriver::GuestMemory::ProofBreaksCounted()) return false;
     static_cast<void>(AgcDriver::GuestMemory::TakeProofBreakCounts());
@@ -2054,6 +2634,16 @@ int main(int argc, char** argv) {
             std::puts("proof log concurrent tests passed");
             return 0;
         }
+        if (mode == "range-validate-concurrent") {
+            concurrentRangeValidateTests();
+            std::puts("range validate concurrent tests passed");
+            return 0;
+        }
+        if (mode == "range-validate") {
+            rangeValidateTests();
+            std::puts("range validate tests passed");
+            return 0;
+        }
         if (mode == "proof-break-idle-holds") {
             if (!idleHoldTests()) return VulkanTestSkipped;
             std::puts("idle hold tests passed");
@@ -2176,6 +2766,30 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             epochScopeLevelsTests(context);
             std::puts("resource cache epoch scope level tests passed");
+            return 0;
+        }
+        if (mode == "resource-range-versions") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            rangeVersionTests(context);
+            std::puts("resource cache range version tests passed");
+            return 0;
+        }
+        if (mode == "resource-range-versions-exit-scope") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            rangeVersionScopeTests(context);
+            std::puts("resource cache range version exit scope tests passed");
+            return 0;
+        }
+        if (mode == "resource-range-versions-pending") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            if (!rangeVersionPendingTests(context)) return VulkanTestSkipped;
+            std::puts("resource cache range version pending tests passed");
+            return 0;
+        }
+        if (mode == "resource-range-versions-storage") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            rangeVersionStorageTests(context);
+            std::puts("resource cache range version storage tests passed");
             return 0;
         }
         if (mode == "resource-epoch-gpu-label") {

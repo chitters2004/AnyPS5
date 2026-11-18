@@ -264,6 +264,46 @@ bool ProofBreakVoidsCertificates(ProofBreakSite site);
 std::uint64_t CertificateBreakSerial();
 void BreakProofsOver(ProofBreakSite site, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint8_t detail = 0);
 void BreakProofsWithoutWrites(ProofBreakSite site, std::uint8_t detail = 0);
+class RangeStampScope {
+public:
+    RangeStampScope();
+    ~RangeStampScope();
+    RangeStampScope(const RangeStampScope&) = delete;
+    RangeStampScope& operator=(const RangeStampScope&) = delete;
+};
+void StampPendingEntering(std::uint64_t begin, std::uint64_t end, std::uint64_t serial);
+std::uint64_t UnrangedProofSerial();
+std::uint64_t UnrangedPendingSerial();
+struct RangeVersionBaseline {
+    std::uint64_t generation = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::uint64_t unrangedProof = 0;
+    std::uint64_t unrangedPending = 0;
+};
+enum class RangeVersionDecline : std::uint8_t { None, Baseline, Wrapped, Uncovered, CollectUnwatched, Collect, Changed, ChangedPossibly, ChangedBlock, ChangedRefused, InFlight, UnrangedProof, UnrangedPending, Effect, Pending, Count };
+const char* RangeVersionDeclineName(RangeVersionDecline decline);
+bool SnapshotUnchangedSince(std::uint64_t address, std::span<std::byte> out, std::uint64_t generation);
+std::uint64_t SnapshotMatches(std::uint64_t address, std::span<const std::byte> snapshot);
+struct RangeValidation {
+    std::function<bool(std::size_t index, std::uint64_t begin, std::uint64_t end)> bytesUnchanged;
+    std::span<const std::uint64_t> generations;
+    std::size_t passedOnBytes = 0;
+    std::size_t passedOnRebase = 0;
+    std::pair<std::uint64_t, std::uint64_t> declined{0, 0};
+};
+RangeVersionDecline ValidateProofRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, const RangeVersionBaseline& baseline, RangeValidation* validation = nullptr);
+enum class RangeWriteSource : std::uint8_t { CpuPage, WalkPage, DriverBlock, DriverPiece, Count };
+struct RangeWriteShape {
+    std::uint64_t rangeBegin = 0;
+    std::uint64_t rangeEnd = 0;
+    std::uint64_t writeBegin = 0;
+    std::uint64_t writeEnd = 0;
+    std::uint64_t writtenBytes = 0;
+    std::array<std::uint32_t, static_cast<std::size_t>(RangeWriteSource::Count)> units{};
+    bool straddlesOnly = false;
+};
+RangeWriteShape DescribeRangeWrite(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 inline constexpr std::size_t ProofBreakDetails = 16;
 enum class PacketWrites : std::uint8_t { Declared, None, Empty, Writeless, Count };
 bool ProofBreakCensusEnabled();

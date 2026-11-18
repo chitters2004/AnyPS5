@@ -432,6 +432,9 @@ public:
     };
     bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
     static bool EpochProofs();
+    enum class RangeVersionPoint : std::uint8_t { AfterFullProof, AfterRangeValidation };
+    static void SetRangeVersionHookForTest(void (*hook)(RangeVersionPoint point));
+    static void SetRangeWriteSnapshotBytesForTest(std::uint64_t bytes);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -592,6 +595,7 @@ private:
         std::uint64_t serial;
         std::uint64_t regionEnd = 0;
         std::uint64_t committedEnd = 0;
+        bool mirror = false;
     };
 
     // The build is two stages. A (buildPrepare, no device lock): the binding plan with its layout
@@ -862,24 +866,37 @@ private:
     bool flushUnscoped = true;
     std::uint64_t planesClean = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> proofRanges;
+    std::vector<std::pair<std::uint64_t, std::vector<std::byte>>> proofRangeBytes;
     bool provedRanges = false;
     std::shared_ptr<GuestMemory::WriteSubscription> scopeSubscription;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> scopeRanges;
     std::uint64_t scopeGeneration = 0;
     bool scopeWatched = false;
     void storeExitScope(std::uint64_t generationAtStamp);
-    void noteExitScope();
+    bool noteExitScope();
     void recordFlushRanges();
     void recordProofRanges();
     bool stalePlanesRead();
     std::string rangeOwner(std::uint64_t address, std::uint64_t bytes) const;
     void reportVerifiedWork(const ProofWorkTrace& work) const;
+    void reportRangeDisagreement(const ProofWorkTrace& work, const ProofReport& verified) const;
     void reportVerifiedStore(std::uint64_t exitSerial, std::uint64_t startSerial, std::uint64_t endSerial, const GuestMemory::ProofBreakTrace& trace) const;
     bool refreshPerUseCopies();
     StampAge provedAge = StampAge::Current;
     std::uint64_t censusSeen = 0;
     std::uint64_t epochSeen = 0;
     std::uint64_t provedGeneration = 0;
+    std::uint64_t provedUnrangedProof = 0;
+    std::uint64_t provedUnrangedPending = 0;
+    std::size_t rangeVersionDecline(const ExitStamp& stamp, bool stalePlanes);
+    void noteRangeWrite() const;
+    void noteUnwatchedRange() const;
+    std::size_t rangeWriteOwner(std::uint64_t begin, std::uint64_t end, bool* tableBytesSame) const;
+    bool proofBytesUnchanged(std::size_t index, std::uint64_t begin, std::uint64_t end);
+    std::vector<std::uint64_t> proofRangeGenerations;
+    std::size_t rangePassedOnBytes = 0;
+    std::size_t rangePassedOnRebase = 0;
+    std::pair<std::uint64_t, std::uint64_t> rangeDeclined{0, 0};
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report, std::uint64_t* flushBreaks = nullptr, const GuestMemory::ProofBreakTrace* trace = nullptr);
     ProofFailure proveImports();
     ProofFailure recordStaging();
