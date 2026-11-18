@@ -1129,9 +1129,11 @@ private:
         VkDeviceSize offset = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    std::vector<std::unordered_map<std::uint64_t, UnwrittenSnapshot>::node_type> unwrittenNodes;
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
+    void recycleUnwrittenSnapshot(std::unordered_map<std::uint64_t, UnwrittenSnapshot>::iterator snapshot);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::size_t ownedDrawInputs = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);

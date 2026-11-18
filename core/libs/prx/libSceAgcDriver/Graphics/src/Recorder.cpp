@@ -3705,9 +3705,17 @@ Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     return {drawUpload, offset, drawUpload->Bytes().data() + offset};
 }
 
+void Recorder::recycleUnwrittenSnapshot(std::unordered_map<std::uint64_t, UnwrittenSnapshot>::iterator snapshot) {
+    unwrittenBytes -= snapshot->second.bytes;
+    auto node = unwrittenSnapshots.extract(snapshot);
+    node.mapped().buffer.reset();
+    if (unwrittenNodes.capacity() == 0) unwrittenNodes.reserve(UnwrittenSnapshotEntries);
+    if (unwrittenNodes.size() < UnwrittenSnapshotEntries) unwrittenNodes.push_back(std::move(node));
+}
+
 void Recorder::retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp) {
     if (stamp == unwrittenStamp) return;
-    unwrittenSnapshots.clear();
+    while (!unwrittenSnapshots.empty()) recycleUnwrittenSnapshot(unwrittenSnapshots.begin());
     unwrittenBytes = 0;
     unwrittenStamp = stamp;
 }
@@ -3722,12 +3730,17 @@ std::shared_ptr<Buffer> Recorder::UnwrittenDrawSnapshot(std::uint64_t address, s
 
 void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset) {
     retireUnwrittenSnapshots(stamp);
-    if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) {
-        unwrittenBytes -= found->second.bytes;
-        unwrittenSnapshots.erase(found);
-    }
+    if (const auto found = unwrittenSnapshots.find(address); found != unwrittenSnapshots.end()) recycleUnwrittenSnapshot(found);
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
-    unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+    if (unwrittenNodes.empty()) {
+        unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
+    } else {
+        auto node = std::move(unwrittenNodes.back());
+        unwrittenNodes.pop_back();
+        node.key() = address;
+        node.mapped() = UnwrittenSnapshot{bytes, std::move(buffer), offset};
+        unwrittenSnapshots.insert(std::move(node));
+    }
     unwrittenBytes += bytes;
 }
 

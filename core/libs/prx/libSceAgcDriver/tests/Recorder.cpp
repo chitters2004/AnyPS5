@@ -104,6 +104,20 @@
 #include <vector>
 
 namespace {
+std::atomic<std::uint64_t> testNewCalls{0};
+}
+
+#ifndef _WIN32
+void* operator new(std::size_t bytes) {
+    testNewCalls.fetch_add(1, std::memory_order_relaxed);
+    if (void* block = std::malloc(bytes != 0 ? bytes : 1)) return block;
+    throw std::bad_alloc();
+}
+void operator delete(void* block) noexcept { std::free(block); }
+void operator delete(void* block, std::size_t) noexcept { std::free(block); }
+#endif
+
+namespace {
 
 struct TestConfigurationError : std::runtime_error {
     using std::runtime_error::runtime_error;
@@ -6143,6 +6157,25 @@ void unwrittenSnapshotTests(const Device& device) {
     cache.NoteUnwrittenDrawSnapshot(address, 16, later, buffer, 256);
     VkDeviceSize offset = 0;
     Require(cache.UnwrittenDrawSnapshot(address, 16, later, &offset) == buffer && offset == 256, "an unwritten snapshot lost its offset in its buffer");
+    std::array<std::uint64_t, 3> round{2, 1, 1};
+    const auto noteRound = [&] {
+        for (std::uint64_t entry = 0; entry < 64; ++entry) cache.NoteUnwrittenDrawSnapshot(address + entry * 16, 16, round, buffer, entry);
+        cache.NoteUnwrittenDrawSnapshot(address + 16, 16, round, buffer, 4096);
+        ++round[1];
+    };
+    noteRound();
+    const auto before = testNewCalls.load(std::memory_order_relaxed);
+    for (int repeat = 0; repeat < 4; ++repeat) noteRound();
+    const auto allocated = testNewCalls.load(std::memory_order_relaxed) - before;
+#ifndef _WIN32
+    Require(allocated == 0, "noting unwritten snapshots again under new stamps allocated " + std::to_string(allocated) + " times");
+#endif
+    const std::array<std::uint64_t, 3> last{2, round[1] - 1, 1};
+    Require(cache.UnwrittenDrawSnapshot(address + 16, 16, last, &offset) == buffer && offset == 4096, "a recycled unwritten snapshot kept its old offset");
+    Require(cache.UnwrittenDrawSnapshot(address + 63 * 16, 16, last, &offset) == buffer && offset == 63, "a recycled unwritten snapshot lost its address or offset");
+    const auto held = buffer.use_count();
+    cache.UnwrittenDrawSnapshot(address, 16, std::array<std::uint64_t, 3>{3, 0, 0});
+    Require(buffer.use_count() == held - 64, "retired unwritten snapshots kept their buffers alive");
 }
 
 void drawSnapshotUploadTests(const Device& device, Recorder& recorder) {
