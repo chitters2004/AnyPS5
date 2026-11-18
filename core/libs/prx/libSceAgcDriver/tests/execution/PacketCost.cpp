@@ -236,17 +236,31 @@ int main(int argc, char** argv) {
             std::printf("[packet-cost] run lengths:");
             for (const auto& [bucket, count] : skeleton.lengths) std::printf(" %s%zu: %zu", bucket == 17 ? ">" : (bucket > 2 ? "<=" : ""), bucket == 17 ? std::size_t{16} : bucket, count);
             std::printf("\n");
-            const auto replay = [&](const std::vector<std::vector<std::uint32_t>>& streams) {
-                ++serial;
-                const auto start = std::chrono::steady_clock::now();
+            constexpr std::size_t ChunkWords = std::size_t{1} << 22u;
+            const auto join = [&](const std::vector<std::vector<std::uint32_t>>& streams) {
+                std::vector<std::vector<std::uint32_t>> chunks(1);
                 for (std::size_t pass = 0; pass < repeat; ++pass) {
-                    for (std::size_t index = 0; index < streams.size(); ++index) {
-                        auto words = streams[index];
-                        if (pass + 1 == repeat && index + 1 == streams.size()) Release(words, label, serial);
-                        Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
-                        AgcDriver::Submit(&packet, 0);
+                    for (const auto& stream : streams) {
+                        if (!chunks.back().empty() && chunks.back().size() + stream.size() + 2 > ChunkWords) chunks.emplace_back();
+                        chunks.back().insert(chunks.back().end(), stream.begin(), stream.end());
+                        PutNop(chunks.back(), 2);
                     }
                 }
+                return chunks;
+            };
+            const auto registerChunks = join(skeleton.registers);
+            const auto baselineChunks = join(skeleton.baseline);
+            const auto replay = [&](const std::vector<std::vector<std::uint32_t>>& chunks) {
+                ++serial;
+                auto last = chunks.back();
+                Release(last, label, serial);
+                const auto start = std::chrono::steady_clock::now();
+                for (std::size_t index = 0; index + 1 < chunks.size(); ++index) {
+                    Packet packet{const_cast<std::uint32_t*>(chunks[index].data()), static_cast<std::uint32_t>(chunks[index].size()), 0, {}};
+                    AgcDriver::Submit(&packet, 0);
+                }
+                Packet packet{last.data(), static_cast<std::uint32_t>(last.size()), 0, {}};
+                AgcDriver::Submit(&packet, 0);
                 Await(label, serial);
                 const auto landed = std::chrono::steady_clock::now();
                 AgcDriverWaitIdle_nid_postfix();
@@ -255,8 +269,8 @@ int main(int argc, char** argv) {
             namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
             using AgcDriver::Graphics::RuntimeSwitch;
             const bool initial = Switches::Set(RuntimeSwitch::RegisterRuns);
-            replay(skeleton.baseline);
-            replay(skeleton.registers);
+            replay(baselineChunks);
+            replay(registerChunks);
             std::vector<double> off;
             std::vector<double> on;
             std::vector<double> base;
@@ -268,13 +282,13 @@ int main(int argc, char** argv) {
                 double times[2] = {0, 0};
                 for (int step = 0; step < 3; ++step) {
                     if (step == 1) {
-                        baseline = replay(skeleton.baseline);
+                        baseline = replay(baselineChunks);
                         continue;
                     }
                     const bool runs = (step == 0) == onFirst;
                     Switches::Assign(RuntimeSwitch::RegisterRuns, runs);
                     const auto before = AgcDriverRegisterRunPackets_nid_postfix();
-                    times[runs ? 1 : 0] = replay(skeleton.registers);
+                    times[runs ? 1 : 0] = replay(registerChunks);
                     (runs ? coveredOn : coveredOff) += AgcDriverRegisterRunPackets_nid_postfix() - before;
                 }
                 base.push_back(baseline);
@@ -288,7 +302,7 @@ int main(int argc, char** argv) {
             std::vector<double> saved;
             for (std::size_t round = 0; round < rounds; ++round) saved.push_back(off[round] - on[round]);
             std::sort(saved.begin(), saved.end());
-            std::printf("[packet-cost] capture replay x%zu, median of %zu rounds: NOP skeleton %.1f us; per register packet above it: runs off %.1f ns, runs on %.1f ns, saved %.1f ns (paired rounds, min %.1f, max %.1f)\n", repeat, rounds, Median(base) / 1e3, offNs, onNs, Median(saved), saved.front(), saved.back());
+            std::printf("[packet-cost] capture replay x%zu in %zu submissions, median of %zu rounds: NOP skeleton %.1f us; per register packet above it: runs off %.1f ns, runs on %.1f ns, saved %.1f ns (paired rounds: min %.1f, quartiles %.1f..%.1f, max %.1f)\n", repeat, registerChunks.size(), rounds, Median(base) / 1e3, offNs, onNs, Median(saved), saved.front(), saved[(saved.size() - 1) / 4], saved[(3 * (saved.size() - 1)) / 4], saved.back());
             std::printf("[packet-cost] runs covered %.1f%% of register packets with the switch on, %.1f%% with it off\n", 100.0 * static_cast<double>(coveredOn) / static_cast<double>(skeleton.registerPackets * rounds * repeat), 100.0 * static_cast<double>(coveredOff) / static_cast<double>(skeleton.registerPackets * rounds * repeat));
             Require(coveredOff == 0, "runs fired with the switch off");
 #ifdef _WIN32
