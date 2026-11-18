@@ -10,6 +10,7 @@
 namespace {
 
 using AgcDriver::AllocationCensus::FormatWindow;
+using AgcDriver::AllocationCensus::PreferredImageBase;
 using AgcDriver::AllocationCensus::Site;
 using AgcDriver::AllocationCensus::Source;
 using AgcDriver::AllocationCensus::Table;
@@ -77,12 +78,35 @@ void LinesNameSitesAtThePreferredBase() {
     Check(cut >= static_cast<int>(sizeof(small)) && std::strlen(small) == sizeof(small) - 1, "a census line stops at its buffer");
 }
 
+void PreferredBasesComeFromTheFileHeader() {
+    std::array<unsigned char, 512> pe{};
+    pe[0] = 'M';
+    pe[1] = 'Z';
+    pe[0x3c] = 0x80;
+    pe[0x80] = 'P';
+    pe[0x81] = 'E';
+    pe[0x98] = 0x0b;
+    pe[0x99] = 0x02;
+    const std::uint64_t base = 0x298e10000ull;
+    for (std::size_t i = 0; i < 8; ++i) pe[0x98 + 0x18 + i] = static_cast<unsigned char>(base >> (8u * i));
+    Check(PreferredImageBase(pe.data(), pe.size()) == base, "a PE32+ header gives its ImageBase");
+    pe[0x98] = 0x0b;
+    pe[0x99] = 0x01;
+    for (std::size_t i = 0; i < 8; ++i) pe[0x98 + 0x18 + i] = 0;
+    for (std::size_t i = 0; i < 4; ++i) pe[0x98 + 0x1c + i] = static_cast<unsigned char>(0x00400000u >> (8u * i));
+    Check(PreferredImageBase(pe.data(), pe.size()) == 0x00400000u, "a PE32 header gives its ImageBase");
+    Check(PreferredImageBase(pe.data(), 0x90) == 0, "a header cut before its optional header gives no base");
+    pe[0x80] = 'X';
+    Check(PreferredImageBase(pe.data(), pe.size()) == 0, "a file without the PE signature gives no base");
+}
+
 }
 
 int main() {
     WindowsCountSitesSinceTheLastReport();
     FullTablesCountUntrackedSites();
     LinesNameSitesAtThePreferredBase();
+    PreferredBasesComeFromTheFileHeader();
     if (failures != 0) {
         std::fprintf(stderr, "%d allocation census checks failed\n", failures);
         return 1;

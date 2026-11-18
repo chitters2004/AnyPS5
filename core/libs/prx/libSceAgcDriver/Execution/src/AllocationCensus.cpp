@@ -41,10 +41,14 @@ Module FindModule() noexcept {
     HMODULE handle = nullptr;
     if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(&FindModule), &handle) && handle != nullptr) {
         module.base = reinterpret_cast<std::uintptr_t>(handle);
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(handle);
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(module.base + static_cast<std::uintptr_t>(dos->e_lfanew));
-        module.preferred = static_cast<std::uintptr_t>(nt->OptionalHeader.ImageBase);
         GetModuleFileNameA(handle, module.path, sizeof(module.path));
+        const HANDLE file = CreateFileA(module.path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            static unsigned char header[4096];
+            DWORD read = 0;
+            if (ReadFile(file, header, sizeof(header), &read, nullptr)) module.preferred = static_cast<std::uintptr_t>(PreferredImageBase(header, read));
+            CloseHandle(file);
+        }
     }
 #endif
     return module;
@@ -55,7 +59,7 @@ void Report(std::int64_t now, std::int64_t last) noexcept {
     static std::array<Site, TopSites> top{};
     static char line[8192];
     if (last == 0) {
-        std::fprintf(stderr, "[alloc-census] counting host allocations in %s (loaded at 0x%llx, preferred base 0x%llx); site addresses are at the preferred base for addr2line -f -C -e on that file; new = the driver's operator new (HostAllocator), malloc/calloc/realloc = calls linked through --wrap in the driver, the HostAllocator site's malloc being its cache misses\n", module.path[0] != 0 ? module.path : "the driver", static_cast<unsigned long long>(module.base), static_cast<unsigned long long>(module.preferred));
+        std::fprintf(stderr, "[alloc-census] counting host allocations in %s (loaded at 0x%llx, preferred base 0x%llx read from the file; 0 means unread and sites are offsets from the load address); site addresses are at the preferred base for addr2line -f -C -e on that file; new = the driver's operator new (HostAllocator), malloc/calloc/realloc = calls linked through --wrap in the driver, the HostAllocator site's malloc being its cache misses\n", module.path[0] != 0 ? module.path : "the driver", static_cast<unsigned long long>(module.base), static_cast<unsigned long long>(module.preferred));
     }
     const auto window = Census().Take(top);
     const double seconds = last != 0 ? static_cast<double>(now - last) / 1000.0 : 0.0;

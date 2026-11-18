@@ -141,6 +141,22 @@ inline int FormatWindow(char* line, std::size_t room, double seconds, const Wind
     return n;
 }
 
+inline std::uint64_t PreferredImageBase(const unsigned char* file, std::size_t bytes) noexcept {
+    const auto read = [&](std::size_t at, std::size_t width) {
+        std::uint64_t value = 0;
+        for (std::size_t i = 0; i < width; ++i) value |= static_cast<std::uint64_t>(file[at + i]) << (8u * i);
+        return value;
+    };
+    if (bytes < 0x40 || file[0] != 'M' || file[1] != 'Z') return 0;
+    const auto nt = static_cast<std::size_t>(read(0x3c, 4));
+    if (nt > bytes || bytes - nt < 0x18 + 0x20 || read(nt, 4) != 0x4550u) return 0;
+    const auto optional = nt + 0x18;
+    const auto magic = read(optional, 2);
+    if (magic == 0x20bu) return read(optional + 0x18, 8);
+    if (magic == 0x10bu) return read(optional + 0x1c, 4);
+    return 0;
+}
+
 bool Enabled() noexcept;
 void Note(Source source, const void* caller, std::size_t bytes) noexcept;
 void NoteDraw() noexcept;
