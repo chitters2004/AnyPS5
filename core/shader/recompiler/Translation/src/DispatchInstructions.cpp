@@ -133,9 +133,9 @@ const NanSpeculationConfig& NanSpeculation() {
                 }
             }
         }
-        result.minimumVectorInstructions = number(std::getenv("APS5_NAN_SPECULATION_MIN"), result.minimumVectorInstructions);
-        result.stageMinimum.fill(result.minimumVectorInstructions);
-        if (const char* minimum = std::getenv("APS5_NAN_SPECULATION_MIN"); minimum != nullptr && std::strchr(minimum, ':') != nullptr) {
+        const char* minimum = std::getenv("APS5_NAN_SPECULATION_MIN");
+        if (const auto all = minimum != nullptr && std::strchr(minimum, ':') == nullptr ? number(minimum, 0u) : 0u; all != 0u) result.stageMinimum.fill(all);
+        if (minimum != nullptr && std::strchr(minimum, ':') != nullptr) {
             std::string_view rest(minimum);
             while (!rest.empty()) {
                 const auto comma = rest.find(',');
@@ -163,8 +163,8 @@ const NanSpeculationConfig& NanSpeculation() {
             const auto value = std::strtoul(text, &end, 10);
             return end != text && *end == '\0' && value <= 4096u ? static_cast<std::uint32_t>(value) : 0u;
         };
-        result.minimumFastOps = percent(std::getenv("APS5_NAN_SPECULATION_MIN_OPS"));
-        result.minimumDensityPercent = percent(std::getenv("APS5_NAN_SPECULATION_MIN_DENSITY"));
+        result.minimumFastOps = percent(std::getenv("APS5_NAN_SPECULATION_MIN_OPS"), result.minimumFastOps);
+        result.minimumDensityPercent = percent(std::getenv("APS5_NAN_SPECULATION_MIN_DENSITY"), result.minimumDensityPercent);
         return result;
     }();
     return config;
