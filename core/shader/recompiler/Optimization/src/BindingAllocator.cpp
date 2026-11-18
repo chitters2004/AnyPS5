@@ -77,11 +77,7 @@ std::vector<std::uint32_t> RuntimeSpecializationIds(const ShaderInfo& info) {
         if (AppliesLodBiasInShader(sampler)) ids.push_back(PipelineSpecialization::SamplerLodBiasBase + index);
     }
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
-        const auto& image = info.images[index];
-        if (image.resourceClass == ImageResourceClass::Storage && image.written && !image.atomic) {
-            for (std::uint32_t word = 0; word < PipelineSpecialization::StoreQuantizeWords; ++word) ids.push_back(PipelineSpecialization::StoreQuantizeBase + index * PipelineSpecialization::StoreQuantizeWords + word);
-        }
-        if (image.table != NoTable) continue;
+        if (info.images[index].table != NoTable) continue;
         if (info.runtimeImageModes.at(index).size() > 1u) ids.push_back(PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords);
         ids.push_back(PipelineSpecialization::ImageComponentBase + index);
         ids.push_back(PipelineSpecialization::NormalizedImageBase + index);
